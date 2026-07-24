@@ -1,0 +1,8 @@
+/target
+
+# local stores, fold artifacts, scratch
+/store*
+/data
+/scratch
+/.claude
+*.fold
