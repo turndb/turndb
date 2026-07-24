@@ -1,0 +1,25 @@
+[package]
+name = "turndb"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+# Content identity. The fold's whole addressing scheme rests on this.
+blake3 = "1"
+anyhow = "1"
+# Frame/WAL integrity. BLAKE3 identifies CONTENT; crc32 detects a TORN WRITE cheaply on structures
+# that have no content hash of their own (segment tails, WAL frames, part footers).
+crc32fast = "1"
+# The manifest only. Everything on the hot path has an explicit byte layout — deliberately NOT serde,
+# so no dependency's encoding choices can silently become our on-disk format.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = "0.13"
+memmap2 = "0.9"
+# flock: the single-writer invariant, enforced by the OS rather than by convention.
+libc = "0.2"
+
+[profile.release]
+debug = true
