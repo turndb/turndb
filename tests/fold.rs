@@ -68,6 +68,7 @@ fn identical_content_is_stored_once() {
 
     let first = f.put(&blob).unwrap();
     assert!(!first.deduped);
+    f.sync().unwrap(); // seal the block so the measurement is against durable bytes
     let after_first = f.disk_bytes();
 
     for _ in 0..50 {
@@ -75,6 +76,7 @@ fn identical_content_is_stored_once() {
         assert!(again.deduped, "identical content must not be appended twice");
         assert_eq!(again.loc, first.loc, "a duplicate must resolve to the original location");
     }
+    f.sync().unwrap();
     assert_eq!(f.disk_bytes(), after_first, "dedup must write zero additional bytes");
     assert_eq!(f.read(first.loc).unwrap(), blob);
 
@@ -120,7 +122,7 @@ fn appends_continue_correctly_after_reopen() {
     };
     let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
     let lb = f.put(&b).unwrap().loc;
-    assert!(lb.off > la.off, "the new frame must land after the recovered tail");
+    assert!(lb.block_off > la.block_off, "the new frame must land after the recovered tail");
     assert_eq!(f.read(la).unwrap(), a);
     assert_eq!(f.read(lb).unwrap(), b);
     std::fs::remove_dir_all(&dir).ok();
@@ -179,7 +181,7 @@ fn corrupted_frame_is_refused_not_served() {
     {
         use std::os::unix::fs::FileExt;
         let seg = OpenOptions::new().read(true).write(true).open(dir.join("seg-00000000.fold")).unwrap();
-        let at = loc.off as u64 + 12 + 4;
+        let at = loc.block_off as u64 + 12 + 4;
         let mut b = [0u8; 1];
         seg.read_exact_at(&mut b, at).unwrap();
         b[0] ^= 0xFF;
@@ -195,7 +197,7 @@ fn corrupted_frame_is_refused_not_served() {
 fn segments_roll_and_locs_resolve_across_them() {
     let dir = tmp("roll");
     // tiny segments so a modest corpus spans several
-    let mut f = Fold::open(&dir, FoldCfg { seg_max: 64 * 1024 }).unwrap();
+    let mut f = Fold::open(&dir, FoldCfg { seg_max: 256 * 1024, ..Default::default() }).unwrap();
     let mut data = Vec::new();
     let mut locs = Vec::new();
     let mut seed = [3u8; 32];
@@ -215,7 +217,7 @@ fn segments_roll_and_locs_resolve_across_them() {
     f.sync().unwrap();
     drop(f);
 
-    let f = Fold::open(&dir, FoldCfg { seg_max: 64 * 1024 }).unwrap();
+    let f = Fold::open(&dir, FoldCfg { seg_max: 256 * 1024, ..Default::default() }).unwrap();
     for (d, l) in data.iter().zip(&locs) {
         assert_eq!(&f.read(*l).unwrap(), d, "cross-segment read failed");
     }
@@ -225,7 +227,7 @@ fn segments_roll_and_locs_resolve_across_them() {
 #[test]
 fn a_piece_larger_than_seg_max_gets_its_own_segment() {
     let dir = tmp("bigpiece");
-    let mut f = Fold::open(&dir, FoldCfg { seg_max: 4096 }).unwrap();
+    let mut f = Fold::open(&dir, FoldCfg { seg_max: 4096, ..Default::default() }).unwrap();
     let small = b"small".to_vec();
     let s = f.put(&small).unwrap();
     let mut big = Vec::new();
@@ -235,6 +237,7 @@ fn a_piece_larger_than_seg_max_gets_its_own_segment() {
         big.extend_from_slice(&seed);
     }
     let b = f.put(&big).unwrap();
+    f.sync().unwrap();
     assert_eq!(f.read(s.loc).unwrap(), small);
     assert_eq!(f.read(b.loc).unwrap(), big, "an oversized piece must still round-trip");
     std::fs::remove_dir_all(&dir).ok();
@@ -299,5 +302,49 @@ fn dedup_window_seals_without_affecting_reads() {
     // and re-putting after a seal is merely a duplicate append, never wrong
     let again = f.put(&blob).unwrap();
     assert_eq!(f.read(again.loc).unwrap(), blob);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pieces_written_together_share_a_block() {
+    // The locality that makes blocking pay: a record's pieces are captured together, so they land in
+    // one block and reconstructing the record costs one decompression, not one per piece.
+    let dir = tmp("locality");
+    let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
+    let mut locs = Vec::new();
+    for i in 0..40 {
+        locs.push(f.put(format!("{{\"role\":\"user\",\"content\":\"message {i}\"}}").as_bytes()).unwrap().loc);
+    }
+    let blocks: std::collections::HashSet<(u32, u32)> = locs.iter().map(|l| l.block_key()).collect();
+    assert_eq!(blocks.len(), 1, "40 small pieces written together must share one block");
+    // and their in-block offsets are strictly increasing — they were laid down in order
+    for w in locs.windows(2) {
+        assert!(w[1].in_off > w[0].in_off);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn block_cache_serves_neighbours() {
+    let dir = tmp("cache");
+    let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
+    let mut locs = Vec::new();
+    for i in 0..200 {
+        locs.push(f.put(format!("piece number {i} with some padding to give it size").as_bytes()).unwrap().loc);
+    }
+    f.sync().unwrap();
+    drop(f);
+
+    let f = Fold::open(&dir, FoldCfg::default()).unwrap();
+    for l in &locs {
+        f.read(*l).unwrap();
+    }
+    let s = f.cache_stats();
+    assert!(s.misses >= 1, "the first read of a block must miss");
+    assert!(
+        s.hits > s.misses * 10,
+        "neighbours must come from cache: {} hits vs {} misses",
+        s.hits, s.misses
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

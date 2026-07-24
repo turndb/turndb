@@ -1,10 +1,10 @@
-//! Piece compression — the one place zstd is called.
+//! Block compression — the one place zstd is called.
 //!
 //! The encoder always falls back to [`CODEC_STORED`] when compression does not shrink the input. That
 //! single rule makes `stored <= raw` a structural guarantee rather than a usual case, which is what
 //! lets `Loc.stored` be a `u32` that can never overflow and makes a fold at most `input + 16 B/piece`.
 
-use super::frame::{CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
+use super::block::{CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 use anyhow::{bail, Context, Result};
 use std::borrow::Cow;
 
@@ -32,27 +32,27 @@ pub fn encode<'a>(raw: &'a [u8], dict: Option<&[u8]>) -> Result<(u8, Cow<'a, [u8
     Ok((tag, Cow::Owned(compressed)))
 }
 
-/// Decode one frame's payload back to its exact original bytes.
+/// Decode one block's payload back to its exact original bytes.
 ///
-/// `raw_len` comes from the frame header and bounds the output — a payload that decodes to a different
+/// `raw_len` comes from the block header and bounds the output — a payload that decodes to a different
 /// length is corruption and fails loud rather than returning short or over-long bytes.
 pub fn decode(codec: u8, payload: &[u8], raw_len: u32, dict: Option<&[u8]>) -> Result<Vec<u8>> {
     let n = raw_len as usize;
     let out = match codec {
         CODEC_STORED => {
             if payload.len() != n {
-                bail!("stored frame payload {} != raw {}", payload.len(), n);
+                bail!("stored block payload {} != raw {}", payload.len(), n);
             }
             payload.to_vec()
         }
         CODEC_ZSTD => zstd::bulk::decompress(payload, n).context("zstd decompress")?,
         CODEC_ZSTD_DICT => {
-            let d = dict.ok_or_else(|| anyhow::anyhow!("dictionary frame but no dictionary loaded"))?;
+            let d = dict.ok_or_else(|| anyhow::anyhow!("dictionary block but no dictionary loaded"))?;
             let mut z = zstd::bulk::Decompressor::with_dictionary(d)
                 .context("zstd decompressor with dictionary")?;
             z.decompress(payload, n).context("zstd dictionary decompress")?
         }
-        other => bail!("unknown frame codec {other}"),
+        other => bail!("unknown block codec {other}"),
     };
     if out.len() != n {
         bail!("decoded length {} != declared raw {}", out.len(), n);
