@@ -121,12 +121,12 @@ fn main() -> anyhow::Result<()> {
     let (mut records, mut logical, mut refs, mut dups, mut lit_bytes) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut verified = 0u64;
     // Decompose the ratio: dedup and compression are different wins and must be reported apart.
-    let (mut distinct_raw, mut distinct_stored, mut stored_codec) = (0u64, 0u64, 0u64);
-    // Piece-size distribution — trained dictionaries only help pieces too small to build their own
-    // zstd context, so the small-piece share is what decides whether they are worth reaching for.
+    // Compression is now per BLOCK, so a per-piece stored size no longer exists — the compressed
+    // figure comes from the fold's durable bytes.
+    let mut distinct_raw = 0u64;
     const BUCKETS: [(&str, u32); 6] =
         [("<256B", 256), ("256B-1K", 1024), ("1K-4K", 4096), ("4K-16K", 16384), ("16K-64K", 65536), (">=64K", u32::MAX)];
-    let mut hist = [(0u64, 0u64, 0u64); 6]; // (count, raw, stored)
+    let mut hist = [(0u64, 0u64); 6]; // (count, raw)
     let t0 = Instant::now();
 
     for line in rdr.lines() {
@@ -152,17 +152,10 @@ fn main() -> anyhow::Result<()> {
                 if p.deduped {
                     dups += 1;
                 } else {
-                    // a newly folded piece: account its raw and stored sizes once
                     distinct_raw += p.loc.raw as u64;
-                    distinct_stored += p.loc.stored as u64;
-                    // the encoder falls back to stored exactly when compression did not shrink
-                    if p.loc.stored == p.loc.raw {
-                        stored_codec += 1;
-                    }
                     let b = BUCKETS.iter().position(|(_, hi)| p.loc.raw < *hi).unwrap_or(5);
                     hist[b].0 += 1;
                     hist[b].1 += p.loc.raw as u64;
-                    hist[b].2 += p.loc.stored as u64;
                 }
                 prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
@@ -212,29 +205,32 @@ fn main() -> anyhow::Result<()> {
     println!("-- where the ratio comes from --");
     println!("{:<28}{:>10.2} MiB", "logical", mib(logical));
     println!(
-        "{:<28}{:>10.2} MiB   {:.1}x  <- DEDUP alone (distinct pieces, uncompressed)",
+        "{:<28}{:>10.2} MiB   {:.1}x  <- DEDUP (distinct pieces, uncompressed)",
         "after dedup", mib(distinct_raw), logical as f64 / distinct_raw as f64
     );
     println!(
-        "{:<28}{:>10.2} MiB   {:.1}x  <- COMPRESSION alone (plain zstd, no dictionaries)",
-        "after zstd", mib(distinct_stored), distinct_raw as f64 / distinct_stored as f64
+        "{:<28}{:>10.2} MiB   {:.1}x  <- BLOCK COMPRESSION (64 KiB blocks, plain zstd)",
+        "fold on disk", mib(disk), distinct_raw as f64 / disk as f64
     );
-    println!("{:<28}{:>10.2} MiB   {:.1}x  <- framing overhead included", "fold on disk", mib(disk), logical as f64 / disk as f64);
+    println!("{:<28}{:>10.2} MiB   {:.1}x  <- overall", "", mib(disk), logical as f64 / disk as f64);
     println!();
-    println!("-- distinct piece sizes (where a trained dictionary could help) --");
-    println!("{:<10}{:>9} {:>12} {:>12} {:>8}", "size", "pieces", "raw MiB", "stored MiB", "ratio");
+    println!("-- distinct piece sizes --");
+    println!("{:<10}{:>9} {:>12}", "size", "pieces", "raw MiB");
     for (i, (name, _)) in BUCKETS.iter().enumerate() {
-        let (c, r, s) = hist[i];
+        let (c, r) = hist[i];
         if c == 0 {
             continue;
         }
-        println!("{:<10}{:>9} {:>12.2} {:>12.2} {:>7.1}x", name, c, mib(r), mib(s), r as f64 / s.max(1) as f64);
+        println!("{:<10}{:>9} {:>12.2}", name, c, mib(r));
     }
     let small: u64 = hist[0].1 + hist[1].1;
     println!(
-        "\npieces under 1 KiB hold {:.2} MiB of {:.2} MiB distinct ({:.1}%) — the only bytes a trained\ndictionary could improve. {} pieces were incompressible and stored verbatim.",
-        mib(small), mib(distinct_raw), small as f64 * 100.0 / distinct_raw as f64, stored_codec
+        "\npieces under 1 KiB hold {:.2} MiB of {:.2} MiB distinct ({:.1}%) — blocking is what stops\nthem being penalised, since they no longer compress alone.",
+        mib(small), mib(distinct_raw), small as f64 * 100.0 / distinct_raw as f64
     );
+    let cs = fold.cache_stats();
+    println!("{:<28}{} hits / {} misses ({:.1}% hit)", "block cache", cs.hits, cs.misses,
+        cs.hits as f64 * 100.0 / (cs.hits + cs.misses).max(1) as f64);
     println!("{:<28}{verified} records, ALL byte-exact", "verified");
     println!("{:<28}{:.1}s  ({:.0} rec/s, {:.1} MiB/s logical)", "elapsed", secs, records as f64 / secs, mib(logical) / secs);
     Ok(())

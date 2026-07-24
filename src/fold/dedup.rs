@@ -5,7 +5,7 @@
 //! | index state | consequence |
 //! |---|---|
 //! | complete | every duplicate piece is stored once |
-//! | cold / partial | duplicate frames appended — the fold is *larger*, every read still byte-exact |
+//! | cold / partial | duplicate bytes appended — the fold is *larger*, every read still byte-exact |
 //! | **false positive** | **catastrophic** — a distinct piece aliased to the wrong bytes |
 //!
 //! So the index is allowed to be lossy and is never allowed to be wrong. Truncated hashes may filter;
@@ -17,7 +17,7 @@
 //! parts' own dictionaries; pieces not yet sealed are replayed from the WAL, which carries the carved
 //! result. Nothing to persist, corrupt, recover, or keep consistent.
 
-use super::frame::Loc;
+use super::block::Loc;
 use crate::types::PieceHash;
 
 const EMPTY: [u8; 32] = [0u8; 32];
@@ -151,8 +151,8 @@ impl Default for DedupTable {
 mod tests {
     use super::*;
 
-    fn loc(off: u32) -> Loc {
-        Loc { seg: 0, off, stored: 10, raw: 20 }
+    fn loc(block_off: u32) -> Loc {
+        Loc { seg: 0, block_off, in_off: 0, raw: 20 }
     }
 
     #[test]

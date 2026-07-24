@@ -1,23 +1,22 @@
-//! Segment files: the append-only containers holding piece frames.
+//! Segment files: the append-only containers holding block frames.
 
-use super::frame::{self, FRAME_HDR_LEN, FRAME_XSUM_LEN};
+use super::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-/// Segment header length. The first frame begins here, so a `Loc.off` below it is invalid.
+/// Segment header length. The first block begins here, so a `Loc.block_off` below it is invalid.
 pub const SEG_HDR_LEN: u64 = 48;
 
 /// Identity assertion, not a version. A mismatch refuses — there is no negotiation anywhere.
 pub const MAGIC: &[u8; 8] = b"TURNFOLD";
 
-/// Default roll threshold. Smaller than it could be, on purpose: dictionaries are trained per segment,
-/// so shorter segments track a drifting corpus more closely, and a crash scan stays bounded.
+/// Default roll threshold. Bounded so a crash-time tail scan stays short and mmap granularity stays sane.
 pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
 
-/// Format bound. `Loc.off` is a `u32`, so a frame start must fit in one.
+/// Format bound. `Loc.block_off` is a `u32`, so a block start must fit in one.
 pub const SEG_MAX_LIMIT: u64 = 1 << 32;
 
 pub fn seg_name(n: u32) -> String {
@@ -116,7 +115,7 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
         .with_context(|| format!("open segment {}", path.display()))
 }
 
-/// Walk the frame chain from the header to the last **complete, checksum-valid** frame and return the
+/// Walk the block chain from the header to the last **complete, checksum-valid** block and return the
 /// offset just past it.
 ///
 /// This is how the fold finds its own last good byte with no external length authority. It never
@@ -124,33 +123,33 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
 pub fn scan_tail(f: &File, file_len: u64, has_dict: bool) -> Result<u64> {
     let mut off = SEG_HDR_LEN;
-    let mut hdr = [0u8; FRAME_HDR_LEN];
+    let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
     loop {
-        if off + (frame::FRAME_OVERHEAD as u64) > file_len {
-            break; // cannot hold even an empty frame
+        if off + (block::BLOCK_OVERHEAD as u64) > file_len {
+            break; // cannot hold even an empty block
         }
         if f.read_exact_at(&mut hdr, off).is_err() {
             break;
         }
-        let h = match frame::parse_hdr(&hdr, has_dict) {
+        let h = match block::parse_hdr(&hdr, has_dict) {
             Ok(h) => h,
             Err(_) => break,
         };
-        let end = match off.checked_add(FRAME_HDR_LEN as u64 + h.stored as u64 + FRAME_XSUM_LEN as u64) {
+        let end = match off.checked_add(BLOCK_HDR_LEN as u64 + h.stored as u64 + BLOCK_XSUM_LEN as u64) {
             Some(e) => e,
             None => break,
         };
         if end > file_len {
             break; // the promised payload/checksum never fully reached disk
         }
-        // verify the whole frame's bytes
-        let span = (FRAME_HDR_LEN + h.stored as usize + FRAME_XSUM_LEN) as usize;
+        // verify the whole block frame's bytes
+        let span = (BLOCK_HDR_LEN + h.stored as usize + BLOCK_XSUM_LEN) as usize;
         payload.resize(span, 0);
         if f.read_exact_at(&mut payload[..span], off).is_err() {
             break;
         }
-        if frame::verify_frame_bytes(&payload[..span], has_dict).is_err() {
+        if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
             break;
         }
         off = end;
