@@ -121,6 +121,19 @@ impl Store {
             parts.push(Arc::new(Part::open(&dir.join(&p.file))?));
         }
 
+        // A part file the manifest does not name was written by a flush or merge that crashed before
+        // committing, or superseded by a merge that committed. Either way it is unreachable. Safe to
+        // unlink even with readers attached: Unix keeps their open mappings alive.
+        let live: std::collections::HashSet<&str> = manifest.parts.iter().map(|p| p.file.as_str()).collect();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("part-") && n.ends_with(".part") && !live.contains(n.as_str()) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+
         let wal_path = dir.join("WAL");
         let frames = Wal::replay(&wal_path)?;
         let mut mem = BTreeMap::new();
@@ -195,7 +208,7 @@ impl Store {
         }
         let tail = self.fold.sync()?;
         let seq = self.manifest.next_seq + 1;
-        let file = format!("part-{:08}.part", self.manifest.parts.len());
+        let file = format!("part-{seq:08}.part");
         let path = self.dir.join(&file);
         let recs: Vec<Record> = self.mem.values().cloned().collect();
         let fold = &self.fold;
@@ -215,6 +228,57 @@ impl Store {
         // Only now: the records are in a committed part, so the log that carried them is redundant.
         self.wal.truncate()?;
         Ok(self.manifest.parts.last().cloned())
+    }
+
+    /// Merge a CONTIGUOUS run of live parts into one, and publish it atomically.
+    ///
+    /// Contiguity is the correctness gate: parts resolve versions by sequence, so merging a
+    /// non-adjacent set would drop whatever an excluded part said about a shared id. The range is
+    /// therefore expressed as a slice of the live list, which cannot express a gap.
+    pub fn merge_range(&mut self, lo: usize, len: usize) -> Result<Option<crate::part::merge::MergeStats>> {
+        if len < 2 || lo + len > self.parts.len() {
+            return Ok(None);
+        }
+        let inputs: Vec<Arc<Part>> = self.parts[lo..lo + len].to_vec();
+        let seq_hi = self.manifest.parts[lo + len - 1].seq_hi;
+        let file = format!("part-{seq_hi:08}-m{len}.part");
+        let path = self.dir.join(&file);
+        let (meta, stats) = crate::part::merge::merge(&path, &inputs, self.cfg.level)?;
+
+        // Publish: the merged part is durable (part::build fsyncs) before the manifest names it, and
+        // the manifest swap is the single linearization point. A crash before it leaves the merged
+        // file as an unreachable orphan; a crash after it leaves the inputs as orphans. Both are swept.
+        let mut m = self.manifest.clone();
+        let replaced: Vec<PartRef> = m.parts.splice(
+            lo..lo + len,
+            [PartRef {
+                file: file.clone(),
+                seq_lo: meta.seq_lo,
+                seq_hi: meta.seq_hi,
+                records: meta.n_records,
+            }],
+        ).collect();
+        m.commit(&self.dir)?;
+
+        self.parts.splice(lo..lo + len, [Arc::new(Part::open(&path)?)]);
+        self.manifest = m;
+        for r in replaced {
+            let _ = std::fs::remove_file(self.dir.join(&r.file));
+        }
+        Ok(Some(stats))
+    }
+
+    /// Size-tiered compaction: when parts pile up, fold the oldest run together.
+    ///
+    /// Merging the OLDEST parts keeps the run contiguous by construction and matches the access
+    /// pattern — old parts are cold and stop being rewritten. Bounding part count is not only about
+    /// read amplification: a Tier-1 dedup lookup is O(parts), so this is what keeps global dedup
+    /// affordable.
+    pub fn maybe_compact(&mut self, trigger: usize, run: usize) -> Result<Option<crate::part::merge::MergeStats>> {
+        if self.parts.len() < trigger {
+            return Ok(None);
+        }
+        self.merge_range(0, run.min(self.parts.len()))
     }
 
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.
