@@ -30,6 +30,7 @@ pub mod table;
 
 use crate::fold::Fold;
 use crate::part::{attrs, Part};
+use crate::types::AttrValue;
 use anyhow::{bail, Result};
 use datafusion::arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Array, Int64Builder, StringArray,
@@ -75,6 +76,23 @@ fn arrow_type(tag: u8) -> DataType {
     }
 }
 
+/// A comparison a scan can evaluate for itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmp { Eq, Ne, Lt, LtEq, Gt, GtEq }
+
+/// `field <op> value`, against a [`Lens`] schema field.
+///
+/// Pushed down as **Inexact**: the query engine re-applies the predicate above the scan, so this is
+/// only ever allowed to return EXTRA rows, never to drop a row that should match. That asymmetry is
+/// what makes it safe to be conservative — an unknown type, an absent column, a null all keep the row
+/// and cost nothing but a little work upstream.
+#[derive(Clone, Debug)]
+pub struct Pred {
+    pub field: usize,
+    pub op: Cmp,
+    pub val: AttrValue,
+}
+
 /// What a scan actually touched. Exists so that "projection avoids the fold" is a measurement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
@@ -84,6 +102,11 @@ pub struct ScanStats {
     pub columns_decoded: usize,
     /// Records whose body was reconstructed out of the fold. Zero unless `body` was projected.
     pub fold_reads: usize,
+    /// Rows a pushed-down predicate excluded before any array was built. The bodies among them were
+    /// never reconstructed, which is the entire point.
+    pub rows_filtered: usize,
+    /// Batches skipped whole because no row in them could match.
+    pub batches_skipped: usize,
     /// Occurrences hidden by the flat column view: a row that names one key several times surfaces its
     /// FIRST value here. Counted, never silent — the full interleaved sequence stays available through
     /// [`Part::record`].
@@ -99,6 +122,8 @@ impl ScanStats {
             batches: self.batches - prev.batches,
             columns_decoded: self.columns_decoded - prev.columns_decoded,
             fold_reads: self.fold_reads - prev.fold_reads,
+            rows_filtered: self.rows_filtered - prev.rows_filtered,
+            batches_skipped: self.batches_skipped - prev.batches_skipped,
             shadowed_occurrences: self.shadowed_occurrences - prev.shadowed_occurrences,
         }
     }
@@ -108,6 +133,8 @@ impl ScanStats {
         self.batches += o.batches;
         self.columns_decoded += o.columns_decoded;
         self.fold_reads += o.fold_reads;
+        self.rows_filtered += o.rows_filtered;
+        self.batches_skipped += o.batches_skipped;
         self.shadowed_occurrences += o.shadowed_occurrences;
     }
 }
@@ -174,6 +201,7 @@ impl Lens {
         part: &Arc<Part>,
         fold: Option<&Arc<Fold>>,
         projection: &[usize],
+        preds: &[Pred],
     ) -> Result<PartScan> {
         let proj: Vec<usize> = projection.to_vec();
         for &f in &proj {
@@ -219,6 +247,42 @@ impl Lens {
 
         // Ids are decoded once for the whole part and sliced per batch — the column is front-coded, so
         // there is no meaningful way to start decoding from the middle.
+        // Resolve each predicate against THIS part's columns, once. A string literal is located in the
+        // sorted dictionary here, so the per-row work is a u32 comparison rather than a string one —
+        // the dictionary encoding earning its keep at exactly the point a query engine can use it.
+        let mut tests: Vec<Test> = Vec::with_capacity(preds.len());
+        for p_ in preds {
+            let Some((key, tag)) = self.binding.get(p_.field).cloned().flatten() else {
+                continue; // id/body: not evaluated here, the engine filters them
+            };
+            let Some(c) = meta.iter().position(|(k, t, _, _)| *k == key && *t == tag) else {
+                // this part has no such column, so every row is null and none can match
+                tests.push(Test::Never);
+                continue;
+            };
+            let (_, tag, occ, kind) = meta[c].clone();
+            let rids = attrs::rids(part, c, occ, kind)?;
+            let k = match (&p_.val, tag) {
+                (AttrValue::Str(v), 0) => {
+                    let dict = attrs::read_dict(part, c)?;
+                    match dict.binary_search_by(|d| d.as_str().cmp(v.as_str())) {
+                        Ok(i) => Key::Ord { k: i as u32, exact: true },
+                        Err(i) => Key::Ord { k: i as u32, exact: false },
+                    }
+                }
+                (AttrValue::Int(v), 1) => Key::Int(*v),
+                (AttrValue::Float(v), 2) => Key::Float(*v),
+                (AttrValue::Bool(v), 3) => Key::Bool(*v),
+                // Literal type does not match the column type. Keeping every row is the safe
+                // direction under Inexact.
+                _ => {
+                    tests.push(Test::Present { rids });
+                    continue;
+                }
+            };
+            tests.push(Test::Col { tag, rids, val: part.column_values(c)?, op: p_.op, key: k });
+        }
+
         let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Vec::new() };
 
         Ok(PartScan {
@@ -231,7 +295,97 @@ impl Lens {
             row: 0,
             stats: ScanStats { columns_decoded: decoded, ..ScanStats::default() },
             fetch: None,
+            tests,
         })
+    }
+}
+
+/// A predicate resolved against one part's columns.
+enum Test {
+    /// No row in this part can match — the batch, and often the part, is skippable without reading.
+    Never,
+    /// Everything with a value matches; only nulls are excluded.
+    Present { rids: Arc<Vec<u32>> },
+    Col { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, op: Cmp, key: Key },
+}
+
+#[derive(Clone, Copy)]
+enum Key {
+    /// A dictionary ordinal. `exact` is false when the literal is absent and `k` is its insertion
+    /// point — which still answers every ORDER comparison, because the dictionary is sorted.
+    Ord { k: u32, exact: bool },
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+#[inline]
+fn cmp_ok<T: PartialOrd>(op: Cmp, v: T, k: T) -> bool {
+    match op {
+        Cmp::Eq => v == k,
+        Cmp::Ne => v != k,
+        Cmp::Lt => v < k,
+        Cmp::LtEq => v <= k,
+        Cmp::Gt => v > k,
+        Cmp::GtEq => v >= k,
+    }
+}
+
+impl Test {
+    /// Mark rows in `lo..hi` that match. Rows with no value stay unmarked, which is correct: a
+    /// comparison against NULL is NULL, and NULL does not pass a filter.
+    fn mark(&self, lo: usize, hi: usize, out: &mut [bool]) {
+        let (rids, body): (&Arc<Vec<u32>>, Option<(&u8, &Arc<Vec<u8>>, &Cmp, &Key)>) = match self {
+            Test::Never => return,
+            Test::Present { rids } => (rids, None),
+            Test::Col { tag, rids, val, op, key } => (rids, Some((tag, val, op, key))),
+        };
+        let mut k = rids.partition_point(|&x| (x as usize) < lo);
+        while k < rids.len() && (rids[k] as usize) < hi {
+            let slot = rids[k] as usize - lo;
+            let ok = match body {
+                None => true,
+                Some((tag, val, op, key)) => {
+                    let w = attrs::width(*tag);
+                    let o = k * w;
+                    if o + w > val.len() {
+                        true // malformed: keep the row, Inexact lets the engine decide
+                    } else {
+                        match (*tag, key) {
+                            (0, Key::Ord { k: kk, exact }) => {
+                                let v = u32::from_le_bytes(val[o..o + 4].try_into().unwrap());
+                                if *exact {
+                                    cmp_ok(*op, v, *kk)
+                                } else {
+                                    // literal absent from the dictionary: equality cannot hold, and
+                                    // every ordering question is answered by the insertion point
+                                    match op {
+                                        Cmp::Eq => false,
+                                        Cmp::Ne => true,
+                                        Cmp::Lt | Cmp::LtEq => v < *kk,
+                                        Cmp::Gt | Cmp::GtEq => v >= *kk,
+                                    }
+                                }
+                            }
+                            (1, Key::Int(kk)) => {
+                                cmp_ok(*op, i64::from_le_bytes(val[o..o + 8].try_into().unwrap()), *kk)
+                            }
+                            (2, Key::Float(kk)) => cmp_ok(
+                                *op,
+                                f64::from_bits(u64::from_le_bytes(val[o..o + 8].try_into().unwrap())),
+                                *kk,
+                            ),
+                            (3, Key::Bool(kk)) => cmp_ok(*op, val[o] != 0, *kk),
+                            _ => true, // type mismatch: keep it
+                        }
+                    }
+                }
+            };
+            if ok {
+                out[slot] = true;
+            }
+            k += 1;
+        }
     }
 }
 
@@ -259,6 +413,8 @@ pub struct PartScan {
     stats: ScanStats,
     /// Stop after this many rows. A LIMIT the query engine pushed down.
     fetch: Option<usize>,
+    /// Pushed-down predicates, resolved to this part's columns. Conjunctive.
+    tests: Vec<Test>,
 }
 
 impl PartScan {
@@ -286,6 +442,30 @@ impl PartScan {
         self
     }
 
+    /// Row offsets within `lo..cap` that survive every pushed-down predicate.
+    ///
+    /// Conjunctive: a row must be marked by all of them. With no predicates this is every row, and the
+    /// cost is one allocation.
+    fn select(&self, lo: usize, cap: usize) -> Vec<usize> {
+        let n = cap - lo;
+        if self.tests.is_empty() {
+            return (0..n).collect();
+        }
+        let mut keep = vec![true; n];
+        let mut scratch = vec![false; n];
+        for t in &self.tests {
+            if matches!(t, Test::Never) {
+                return Vec::new();
+            }
+            scratch.iter_mut().for_each(|b| *b = false);
+            t.mark(lo, cap, &mut scratch);
+            for i in 0..n {
+                keep[i] &= scratch[i];
+            }
+        }
+        (0..n).filter(|&i| keep[i]).collect()
+    }
+
     /// The next batch, or `None` at the end of the part.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         let end = match self.fetch {
@@ -295,39 +475,56 @@ impl PartScan {
         if self.row >= end {
             return Ok(None);
         }
-        let lo = self.row;
-        let cap = (lo + BATCH_ROWS).min(end);
+        // Find a window with at least one surviving row. Predicates are evaluated over ATTRIBUTE
+        // columns only, so a batch that matches nothing is skipped without opening the fold — which is
+        // the whole reason to push a filter down here rather than let the engine do it above.
+        let (lo, take) = loop {
+            if self.row >= end {
+                return Ok(None);
+            }
+            let lo = self.row;
+            let cap = (lo + BATCH_ROWS).min(end);
+            let take = self.select(lo, cap);
+            if take.is_empty() {
+                self.stats.rows_filtered += cap - lo;
+                self.stats.batches_skipped += 1;
+                self.row = cap;
+                continue;
+            }
+            self.stats.rows_filtered += (cap - lo) - take.len();
+            break (lo, take);
+        };
 
-        // Content is reconstructed FIRST, because it is what decides how many rows this batch can hold.
-        // Every other column then follows that decision, so all arrays end up the same length.
+        // Content is reconstructed FIRST, because it is what decides how many rows this batch can hold
+        // — and only for rows that survived the filter.
         let mut bodies: Option<Vec<Vec<u8>>> = None;
+        let mut take = take;
         if self.cols.iter().any(|c| matches!(c, Col::Body)) {
             let fold = self.fold.as_ref().expect("checked when the scan was built");
             let mut v = Vec::new();
             let mut bytes = 0usize;
-            for r in lo..cap {
-                let b = self.part.reconstruct(r, fold)?;
+            for (i, &r) in take.iter().enumerate() {
+                let b = self.part.reconstruct(lo + r, fold)?;
                 bytes += b.len();
                 v.push(b);
                 // At least one row always lands, however large it is — otherwise a single record
                 // bigger than the ceiling could never be read at all.
                 if bytes >= BATCH_BYTES {
+                    take.truncate(i + 1);
                     break;
                 }
             }
             bodies = Some(v);
         }
-        let hi = match &bodies {
-            Some(v) => lo + v.len(),
-            None => cap,
-        };
-        let len = hi - lo;
+        // Resume after the last row consumed, not after the last row examined.
+        let hi = lo + take.last().copied().map_or(0, |r| r + 1);
+        let len = take.len();
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len());
 
         for c in &self.cols {
             arrays.push(match c {
                 Col::Id => Arc::new(StringArray::from(
-                    self.ids[lo..hi].iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    take.iter().map(|&r| self.ids[lo + r].as_str()).collect::<Vec<_>>(),
                 )) as ArrayRef,
                 Col::Body => {
                     let mut b = BinaryBuilder::new();
@@ -339,7 +536,7 @@ impl PartScan {
                 }
                 Col::Missing(t) => datafusion::arrow::array::new_null_array(t, len),
                 Col::Attr { tag, rids, val, dict } => {
-                    scatter(*tag, rids, val, dict, lo, hi, &mut self.stats.shadowed_occurrences)?
+                    scatter(*tag, rids, val, dict, lo, hi, &take, &mut self.stats.shadowed_occurrences)?
                 }
             });
         }
@@ -370,21 +567,25 @@ fn scatter(
     dict: &[String],
     lo: usize,
     hi: usize,
+    take: &[usize],
     shadowed: &mut usize,
 ) -> Result<ArrayRef> {
-    let len = hi - lo;
+    let span = hi - lo;
     let start = rids.partition_point(|&x| (x as usize) < lo);
-    let mut taken: Vec<Option<usize>> = vec![None; len];
+    let mut by_row: Vec<Option<usize>> = vec![None; span];
     let mut k = start;
     while k < rids.len() && (rids[k] as usize) < hi {
         let slot = rids[k] as usize - lo;
-        if taken[slot].is_none() {
-            taken[slot] = Some(k);
+        if by_row[slot].is_none() {
+            by_row[slot] = Some(k);
         } else {
             *shadowed += 1;
         }
         k += 1;
     }
+    // Compact to the rows that survived the filter, in order.
+    let len = take.len();
+    let taken: Vec<Option<usize>> = take.iter().map(|&r| by_row[r]).collect();
 
     let w = attrs::width(tag);
     let at = |k: usize| -> Result<&[u8]> {
@@ -462,10 +663,21 @@ pub fn collect(
     lens: &Lens,
     projection: &[usize],
 ) -> Result<(Vec<RecordBatch>, ScanStats)> {
+    collect_where(parts, fold, lens, projection, &[])
+}
+
+/// [`collect`] with pushed-down predicates.
+pub fn collect_where(
+    parts: &[Arc<Part>],
+    fold: Option<&Arc<Fold>>,
+    lens: &Lens,
+    projection: &[usize],
+    preds: &[Pred],
+) -> Result<(Vec<RecordBatch>, ScanStats)> {
     let mut stats = ScanStats::default();
     let mut out = Vec::new();
     for p in parts {
-        let mut sc = lens.scan(p, fold, projection)?;
+        let mut sc = lens.scan(p, fold, projection, preds)?;
         while let Some(b) = sc.next_batch()? {
             out.push(b);
         }

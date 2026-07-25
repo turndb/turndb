@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         let mut bytes = 0usize;
         let mut peak = 0usize;
         for p in &parts {
-            let mut sc = lens.scan(p, need_fold.then_some(&fold), &proj)?;
+            let mut sc = lens.scan(p, need_fold.then_some(&fold), &proj, &[])?;
             while let Some(b) = sc.next_batch()? {
                 let n = b.get_array_memory_size();
                 bytes += n;
