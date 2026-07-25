@@ -186,9 +186,9 @@ impl Store {
     ///   append   genuinely novel content
     /// ```
     ///
-    /// Tier 1 is what makes dedup **unbounded**: Tier 0 is bounded by the flush interval by design (it
-    /// is released at every flush so resident memory tracks the interval, not the store), and without
-    /// Tier 1 the same content re-appended after a flush would be stored twice.
+    /// Tier 1 is what makes dedup **unbounded** while Tier 0 stays bounded: the window is released at
+    /// every flush (see [`Store::flush`]), so resident dedup memory tracks the flush interval rather
+    /// than the store, and Tier 1 is what keeps that from costing any dedup at all.
     ///
     /// Parts are consulted newest-first: recently written content is the content most likely to repeat.
     ///
@@ -309,6 +309,11 @@ impl Store {
         self.manifest = m;
         self.mem.clear();
         self.mem_bytes = 0;
+        // Release Tier 0 — but only HERE, after the part is committed and open. Sealing any earlier
+        // would drop the window while the part being built still needs it, and the part cannot answer
+        // a Tier-1 lookup until it is committed and in `self.parts`. Everything the window covered is
+        // now reachable through that part's dictionary, so nothing is lost but the memory.
+        self.fold.seal_window();
         // Only now: the records are in a committed part, so the log that carried them is redundant.
         self.wal.truncate()?;
         Ok(self.manifest.parts.last().cloned())
@@ -425,6 +430,11 @@ impl Store {
 
     pub fn part_count(&self) -> usize {
         self.parts.len()
+    }
+
+    /// Pieces resident in the Tier-0 dedup window. Bounded by the flush interval, not by store size.
+    pub fn dedup_window_len(&self) -> usize {
+        self.fold.window_len()
     }
     pub fn manifest(&self) -> &Manifest {
         &self.manifest

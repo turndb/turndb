@@ -589,3 +589,47 @@ fn merging_an_interior_run_does_not_unlink_its_own_output() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn the_dedup_window_is_actually_released_at_every_flush() {
+    // Three doc comments claimed this; nothing did it. `seal_window` was called only from a test, so
+    // Tier 0 grew for the process lifetime — 266,340 pieces resident at 400k records on a real corpus.
+    // Sealing was unsafe until flush learned to resolve through both tiers: the window and the part
+    // being built were the same bug from two sides.
+    let dir = tmp("seal");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut peak = 0usize;
+    let mut want = Vec::new();
+    for f in 0..25 {
+        for i in 0..20 {
+            let id = format!("w{f:02}-{i:02}");
+            // fresh content every round, so the window cannot stay small by dedup alone
+            let body = format!("round {f} item {i} with enough bytes to be a real piece").into_bytes();
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            want.push((id, body));
+        }
+        peak = peak.max(s.dedup_window_len());
+        s.sync().unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.dedup_window_len(), 0, "the window must be empty immediately after a flush");
+    }
+    assert!(peak <= 20, "the window peaked at {peak}; it must track ONE flush interval, not 500 pieces");
+
+    // and sealing must not cost dedup — the same content re-put after 25 flushes still costs nothing
+    let fold_before = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
+        .map(|e| e.metadata().unwrap().len()).sum::<u64>();
+    s.put("echo", &[Span::Piece(&want[0].1)], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let fold_after = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
+        .map(|e| e.metadata().unwrap().len()).sum::<u64>();
+    assert_eq!(fold_after, fold_before, "sealing Tier 0 must not cost dedup — Tier 1 covers it");
+
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "sealing lost {id}");
+    }
+    assert_eq!(s.reconstruct("echo").unwrap().unwrap(), want[0].1);
+    std::fs::remove_dir_all(&dir).ok();
+}
