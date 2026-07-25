@@ -145,8 +145,10 @@ pub fn build(
     w.section("layout.off", &u64s(&built.layout_off))?;
     w.section("colmeta", &built.meta)?;
     for (i, c) in built.cols.iter().enumerate() {
-        w.section(&format!("col.rid.{i}"), &c.rid)?;
         w.section(&format!("col.val.{i}"), &c.val)?;
+        if !c.rid.is_empty() {
+            w.section(&format!("col.rid.{i}"), &c.rid)?;
+        }
         if !c.dict.is_empty() {
             w.section(&format!("col.dict.{i}"), &c.dict)?;
         }
@@ -233,6 +235,8 @@ pub struct Part {
     toc: HashMap<String, Section>,
     meta: PartMeta,
     cache: Mutex<HashMap<String, std::sync::Arc<Vec<u8>>>>,
+    /// Decoded row-index arrays, per column. Without this every row read re-decoded a whole column.
+    rid_cache: Mutex<HashMap<usize, std::sync::Arc<Vec<u32>>>>,
 }
 
 impl Part {
@@ -282,6 +286,7 @@ impl Part {
             toc,
             meta: PartMeta { n_records, seq_lo, seq_hi },
             cache: Mutex::new(HashMap::new()),
+            rid_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -440,6 +445,23 @@ impl Part {
             Some(r) => Ok(Some(self.reconstruct(r, fold)?)),
             None => Ok(None),
         }
+    }
+
+    /// Every section: `(name, stored, raw, codec)` — the on-disk anatomy of this part.
+    pub fn sections(&self) -> Vec<(String, u32, u32, u8)> {
+        let mut v: Vec<(String, u32, u32, u8)> =
+            self.toc.iter().map(|(n, s)| (n.clone(), s.stored, s.raw, s.codec)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    pub(crate) fn rid_cached(&self, c: usize) -> Option<std::sync::Arc<Vec<u32>>> {
+        self.rid_cache.lock().unwrap().get(&c).cloned()
+    }
+    pub(crate) fn rid_cache_put(&self, c: usize, v: Vec<u32>) -> std::sync::Arc<Vec<u32>> {
+        let a = std::sync::Arc::new(v);
+        self.rid_cache.lock().unwrap().insert(c, a.clone());
+        a
     }
 
     pub(crate) fn section_bytes(&self, name: &str) -> Result<std::sync::Arc<Vec<u8>>> {

@@ -12,7 +12,7 @@
 //! identical columns. So each row also stores a **layout**: the exact sequence of column ordinals it
 //! used. Reconstruction walks the layout and draws the next value from each named column.
 
-use super::{as_u32s, as_u64s, Part};
+use super::{as_u64s, Part};
 use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, Record};
 use anyhow::{bail, Result};
@@ -29,8 +29,15 @@ pub fn width(tag: u8) -> usize {
     }
 }
 
+/// How a column's row-index array is stored.
+pub const RID_DENSE: u8 = 0;
+/// Ascending deltas as varints. Repeats (a duplicated key on one row) encode as a zero.
+pub const RID_DELTA: u8 = 1;
+
 pub struct BuiltCol {
+    /// Empty when `kind == RID_DENSE`.
     pub rid: Vec<u8>,
+    pub kind: u8,
     pub val: Vec<u8>,
     /// Empty for non-string columns.
     pub dict: Vec<u8>,
@@ -136,23 +143,37 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
             t => bail!("unknown attribute type tag {t}"),
         }
 
+        // A DENSE column — one occurrence per row, in row order — has a row-index array of exactly
+        // 0..n, which carries no information. Storing it explicitly was 39% of all part bytes on a
+        // real corpus. Elide it; everything else stores ascending deltas as varints (a duplicated key
+        // on one row is a zero delta), which zstd then crushes.
+        let dense = rid[c].len() == rows.len() && rid[c].iter().enumerate().all(|(i, &r)| r as usize == i);
+        let (kind, rid_bytes) = if dense {
+            (RID_DENSE, Vec::new())
+        } else {
+            let mut b = Vec::with_capacity(rid[c].len());
+            let mut prev = 0u32;
+            for &r in &rid[c] {
+                put_varint(&mut b, (r - prev) as u64);
+                prev = r;
+            }
+            (RID_DELTA, b)
+        };
+
         put_varint(&mut meta, key.len() as u64);
         meta.extend_from_slice(key.as_bytes());
         meta.push(*tag);
         put_varint(&mut meta, rid[c].len() as u64);
+        meta.push(kind);
 
-        out_cols.push(BuiltCol {
-            rid: rid[c].iter().flat_map(|x| x.to_le_bytes()).collect(),
-            val,
-            dict: dict_bytes,
-        });
+        out_cols.push(BuiltCol { rid: rid_bytes, kind, val, dict: dict_bytes });
     }
 
     Ok(BuiltCols { layout, layout_off, meta, cols: out_cols })
 }
 
-/// `(key, tag, occurrences)` per column, in ordinal order.
-pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize)>> {
+/// `(key, tag, occurrences, rid_kind)` per column, in ordinal order.
+pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize, u8)>> {
     let m = part.section_bytes("colmeta")?;
     let mut at = 0usize;
     let n = get_varint(&m, &mut at)? as usize;
@@ -164,7 +185,9 @@ pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize)>> {
         let tag = m[at];
         at += 1;
         let occ = get_varint(&m, &mut at)? as usize;
-        out.push((key, tag, occ));
+        let kind = m[at];
+        at += 1;
+        out.push((key, tag, occ, kind));
     }
     Ok(out)
 }
@@ -184,6 +207,28 @@ fn read_dict(part: &Part, c: usize) -> Result<Vec<String>> {
         at += l;
     }
     Ok(out)
+}
+
+/// A column's row indices, decoded. Dense columns are synthesised rather than read.
+pub fn rids(part: &Part, c: usize, occ: usize, kind: u8) -> Result<std::sync::Arc<Vec<u32>>> {
+    if let Some(v) = part.rid_cached(c) {
+        return Ok(v);
+    }
+    let v = match kind {
+        RID_DENSE => (0..occ as u32).collect::<Vec<u32>>(),
+        RID_DELTA => {
+            let b = part.section_bytes(&format!("col.rid.{c}"))?;
+            let mut out = Vec::with_capacity(occ);
+            let (mut at, mut cur) = (0usize, 0u32);
+            for _ in 0..occ {
+                cur += get_varint(&b, &mut at)? as u32;
+                out.push(cur);
+            }
+            out
+        }
+        k => bail!("unknown rid encoding {k}"),
+    };
+    Ok(part.rid_cache_put(c, v))
 }
 
 fn value_at(tag: u8, val: &[u8], k: usize, dict: &[String]) -> Result<AttrValue> {
@@ -230,13 +275,13 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
     let mut cursor: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
     for _ in 0..n {
         let c = get_varint(&layout, &mut at)? as usize;
-        let (key, tag, _) = meta
+        let (key, tag, occ, kind) = meta
             .get(c)
             .ok_or_else(|| anyhow::anyhow!("layout names column {c} which does not exist"))?;
         let entry = match cursor.get(&c) {
             Some(e) => *e,
             None => {
-                let rids = as_u32s(&part.section_bytes(&format!("col.rid.{c}"))?);
+                let rids = rids(part, c, *occ, *kind)?;
                 // first occurrence of this row in the column — rids are ascending
                 let first = rids.partition_point(|&x| (x as usize) < r);
                 if first >= rids.len() || rids[first] as usize != r {
