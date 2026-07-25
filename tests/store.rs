@@ -633,3 +633,86 @@ fn the_dedup_window_is_actually_released_at_every_flush() {
     assert_eq!(s.reconstruct("echo").unwrap().unwrap(), want[0].1);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_reader_survives_a_writer_merging_and_sweeping_underneath_it() {
+    // open_read reads the manifest and then opens the parts it names, which is not atomic. A writer
+    // that commits a merge in between unlinks the replaced inputs, and the reader is left opening a
+    // file that no longer exists. This is the real interleaving, not a simulated one.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+
+    let dir = tmp("readerrace");
+    let mut want = Vec::new();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        // Many parts on purpose: open_read's vulnerable window is the time between reading the
+        // manifest and finishing the LAST part open, so it widens with part count.
+        for b in 0..60 {
+            for i in 0..12 {
+                let id = format!("r{b:02}-{i:02}");
+                want.push((id.clone(), put(&mut s, &id, format!("body {b}/{i}").as_bytes())));
+            }
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        assert_eq!(s.part_count(), 60);
+    }
+
+    let stop = StdArc::new(AtomicBool::new(false));
+    let rdir = dir.clone();
+    let rstop = stop.clone();
+    let reader = std::thread::spawn(move || {
+        let mut opens = 0usize;
+        while !rstop.load(Ordering::Relaxed) {
+            // Any error here is the bug: the store is always in a committed, readable state.
+            let rs = Store::open_read(&rdir, cfg())
+                .unwrap_or_else(|e| panic!("open_read failed while a merge ran: {e}"));
+            let n = rs.ids().unwrap().len();
+            assert_eq!(n, 720, "a reader saw {n} of 720 ids mid-merge");
+            opens += 1;
+        }
+        opens
+    });
+
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        // merge repeatedly, each one committing then unlinking its inputs
+        while s.part_count() > 1 {
+            let n = s.part_count();
+            s.merge_range(0, 2.min(n)).unwrap();
+            std::thread::yield_now();
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let opens = reader.join().expect("the reader thread must not have panicked");
+    assert!(opens > 0, "the reader never got a chance to run");
+
+    let s = Store::open(&dir, cfg()).unwrap();
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_manifest_naming_a_truly_absent_part_errors_rather_than_spinning() {
+    // The retry that closes the reader race must be bounded: a part that is genuinely gone is a
+    // corrupt store, and it has to surface as an error rather than a loop.
+    let dir = tmp("absentpart");
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        put(&mut s, "a", b"x");
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let name = std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| n.ends_with(".part")).unwrap();
+    std::fs::remove_file(dir.join(&name)).unwrap();
+
+    let t = std::time::Instant::now();
+    assert!(Store::open_read(&dir, cfg()).is_err(), "a missing part must be an error");
+    assert!(t.elapsed().as_secs() < 5, "the retry is not bounded");
+    std::fs::remove_dir_all(&dir).ok();
+}
