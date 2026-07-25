@@ -128,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     let mut verified = 0u64;
     let t0 = Instant::now();
 
-    let mut flush = |fold: &mut Fold,
+    let flush = |fold: &mut Fold,
                      pending: &mut Vec<Record>,
                      originals: &mut Vec<Vec<u8>>,
                      parts: &mut Vec<PathBuf>,

@@ -12,7 +12,7 @@
 use super::block::{CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 use anyhow::Result;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// A sealed block on its way to disk.
 pub struct Job {
@@ -30,7 +30,10 @@ pub struct Done {
 
 pub struct Pool {
     tx: Option<SyncSender<Job>>,
-    rx: Receiver<Done>,
+    /// Behind a Mutex purely so `Pool` — and therefore `Fold` — is `Sync`. A `Receiver` is `Send` but
+    /// not `Sync`, and the query layer shares a read-only fold across scan partitions. Only the single
+    /// writer ever receives, so this lock is never contended.
+    rx: Mutex<Receiver<Done>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Blocks sealed but not yet written — reads are served from these, and `drain_all` waits on them.
     pub outstanding: usize,
@@ -71,7 +74,7 @@ impl Pool {
                 }
             }));
         }
-        Pool { tx: Some(jtx), rx: drx, workers, outstanding: 0 }
+        Pool { tx: Some(jtx), rx: Mutex::new(drx), workers, outstanding: 0 }
     }
 
     /// Hand a sealed block to the pool. Blocks when the pool is saturated (backpressure).
@@ -88,7 +91,7 @@ impl Pool {
     /// Take any finished blocks without waiting.
     pub fn try_take(&mut self) -> Vec<Done> {
         let mut out = Vec::new();
-        while let Ok(d) = self.rx.try_recv() {
+        while let Ok(d) = self.rx.lock().unwrap().try_recv() {
             self.outstanding -= 1;
             out.push(d);
         }
@@ -100,7 +103,7 @@ impl Pool {
     pub fn take_all(&mut self) -> Result<Vec<Done>> {
         let mut out = Vec::new();
         while self.outstanding > 0 {
-            let d = self.rx.recv().map_err(|_| anyhow::anyhow!("compression pool died with work outstanding"))?;
+            let d = self.rx.lock().unwrap().recv().map_err(|_| anyhow::anyhow!("compression pool died with work outstanding"))?;
             self.outstanding -= 1;
             out.push(d);
         }
