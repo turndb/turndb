@@ -307,7 +307,7 @@ impl Lens {
             tests.push(Test::Col { tag, rids, val: part.column_values(c)?, op: p_.op, key: k });
         }
 
-        let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Vec::new() };
+        let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Arc::new(Vec::new()) };
         let visible = self
             .visible
             .iter()
@@ -438,7 +438,7 @@ pub struct PartScan {
     fold: Option<Arc<Fold>>,
     schema: SchemaRef,
     cols: Vec<Col>,
-    ids: Vec<String>,
+    ids: Arc<Vec<String>>,
     row: usize,
     n: usize,
     stats: ScanStats,

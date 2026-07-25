@@ -82,7 +82,7 @@ fn records_round_trip_byte_exact() {
     let ids = p.ids().unwrap();
     let mut want: Vec<String> = recs.iter().map(|r| r.id.clone()).collect();
     want.sort();
-    assert_eq!(ids, want);
+    assert_eq!(*ids, want);
 
     for r in &recs {
         let row = p.find(&r.id).unwrap().expect("every id must be findable");
@@ -338,4 +338,5 @@ fn a_toc_pointing_past_the_file_is_refused() {
     }
     std::fs::remove_dir_all(&d).ok();
 }
+
 
