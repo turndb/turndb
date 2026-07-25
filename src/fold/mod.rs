@@ -126,7 +126,13 @@ impl BlockCache {
         self.clock += 1;
         let c = self.clock;
         self.bytes += add;
-        self.map.insert(k, (c, v));
+        // Re-inserting a key DISPLACES a value whose bytes are still counted. Two readers racing the
+        // same block is ordinary now that scan partitions run in parallel, and each race leaked a
+        // block's worth of budget — enough repeats and a 64 MiB cache believes it is full while
+        // holding one entry.
+        if let Some((_, old)) = self.map.insert(k, (c, v)) {
+            self.bytes -= old.len();
+        }
     }
 }
 
