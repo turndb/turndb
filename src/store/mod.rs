@@ -28,6 +28,7 @@
 //! which a part could reference content that never landed.
 
 pub mod read;
+pub mod refold;
 pub mod wal;
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
@@ -35,7 +36,7 @@ use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use std::collections::HashMap;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -63,6 +64,11 @@ pub struct PartRef {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Manifest {
     pub parts: Vec<PartRef>,
+    /// Which fold generation is live. A re-fold writes a new one and names it here, so the swap IS the
+    /// manifest commit. Absent in stores written before re-folding existed, which serde reads as 0 —
+    /// the original `fold/` directory, needing no migration.
+    #[serde(default)]
+    pub fold_gen: u32,
     pub fold_seg: u32,
     pub fold_off: u32,
     pub next_seq: u64,
@@ -132,7 +138,7 @@ impl Store {
 
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
         // is discarded, and the log regenerates it.
-        let mut fold = Fold::open_at(&dir.join("fold"), cfg, manifest.fold_tail())?;
+        let mut fold = Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
 
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -149,6 +155,11 @@ impl Store {
                 let n = e.file_name().to_string_lossy().to_string();
                 if n.starts_with("part-") && n.ends_with(".part") && !live.contains(n.as_str()) {
                     let _ = std::fs::remove_file(e.path());
+                }
+                // A fold generation the manifest does not name is either a re-fold that crashed before
+                // committing, or the one a committed re-fold replaced. Unreachable either way.
+                if e.path().is_dir() && refold::is_stale_fold(&n, manifest.fold_gen) {
+                    let _ = std::fs::remove_dir_all(e.path());
                 }
             }
         }
@@ -182,7 +193,7 @@ impl Store {
     /// invisible, which is the correct snapshot. Safe alongside a live writer because parts are
     /// immutable and the fold is append-only.
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<ReadStore> {
-        let fold = Fold::open_read(&dir.join("fold"), cfg)?;
+        let fold = Fold::open_read(&refold::fold_dir(dir, Manifest::load(dir)?.fold_gen), cfg)?;
 
         // Reading the manifest and opening the parts it names is not atomic, and a writer may commit a
         // merge and unlink the replaced inputs in between. The manifest IS the linearization point, so
@@ -525,6 +536,71 @@ impl Store {
         Ok(all)
     }
 
+    /// Rewrite the fold, keeping only content that live records still reference.
+    ///
+    /// The ONLY operation that touches content. Everything else asserts it does not, which is why this
+    /// is a separate call rather than a flag: a reader of the merge path should never have to wonder.
+    ///
+    /// Requires a flushed memtable — staged records reference the old fold, and rebuilding parts under
+    /// them would leave their pieces unresolvable.
+    pub fn refold(&mut self) -> Result<refold::RefoldStats> {
+        if !self.mem.is_empty() {
+            bail!("refold requires a flushed memtable; call sync() and flush() first");
+        }
+        if self.parts.is_empty() {
+            return Ok(refold::RefoldStats::default());
+        }
+        let seqs: Vec<(u64, u64)> =
+            self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
+        let (new_gen, built, stats) = refold::refold(
+            &self.dir,
+            &self.parts,
+            &seqs,
+            &self.fold,
+            self.manifest.fold_gen,
+            self.cfg,
+        )?;
+
+        // Data before pointers, exactly as everywhere else: the new fold and the new parts are durable
+        // before the manifest names either, and the manifest swap is the instant it takes effect.
+        let mut m = self.manifest.clone();
+        m.parts = built
+            .iter()
+            .map(|(file, lo, hi, n)| PartRef {
+                file: file.clone(),
+                seq_lo: *lo,
+                seq_hi: *hi,
+                records: *n,
+            })
+            .collect();
+        m.fold_gen = new_gen;
+        // The new fold starts empty of history, so the committed tail is its own.
+        let new_dir = refold::fold_dir(&self.dir, new_gen);
+        {
+            let f = Fold::open(&new_dir, self.cfg)?;
+            let t = f.tail();
+            m.fold_seg = t.seg;
+            m.fold_off = t.off;
+        }
+        m.commit(&self.dir)?; // <- the linearization point
+
+        // Everything past here is cleanup: a crash leaves orphans, which open() sweeps.
+        let old_gen = self.manifest.fold_gen;
+        let old_files: Vec<String> = self.manifest.parts.iter().map(|p| p.file.clone()).collect();
+        self.manifest = m;
+        self.pcache = SectionCache::shared();
+        self.parts.clear();
+        for p in &self.manifest.parts {
+            self.parts.push(Arc::new(Part::open_in(&self.dir.join(&p.file), self.pcache.clone())?));
+        }
+        self.fold = Fold::open_at(&new_dir, self.cfg, self.manifest.fold_tail())?;
+        for f in old_files {
+            let _ = std::fs::remove_file(self.dir.join(f));
+        }
+        let _ = std::fs::remove_dir_all(refold::fold_dir(&self.dir, old_gen));
+        Ok(stats)
+    }
+
     /// Bytes pinned by every open part's section caches, against their shared budget.
     pub fn part_cache_bytes(&self) -> (usize, usize) {
         (self.pcache.bytes(), self.pcache.budget())
@@ -617,13 +693,36 @@ mod tests {
             fold_seg: 2,
             fold_off: 4096,
             next_seq: 9,
+            fold_gen: 3,
         };
         m.commit(&d).unwrap();
         let got = super::Manifest::load(&d).unwrap();
         assert_eq!(got.parts.len(), 1);
         assert_eq!(got.fold_off, 4096);
+        assert_eq!(got.fold_gen, 3);
         assert_eq!(got.next_seq, 9);
         assert!(!d.join("MANIFEST.tmp").exists(), "staging file must not survive a commit");
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    /// A manifest written before fold generations existed must still load, naming generation 0 — the
+    /// original `fold/` directory. Otherwise this change would silently orphan every existing store.
+    #[test]
+    fn a_manifest_without_fold_gen_reads_as_generation_zero() {
+        let d = std::env::temp_dir().join(format!("turndb-oldman-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("MANIFEST"),
+            br#"{"parts":[],"fold_seg":0,"fold_off":48,"next_seq":4}"#,
+        )
+        .unwrap();
+        let m = super::Manifest::load(&d).unwrap();
+        assert_eq!(m.fold_gen, 0, "a pre-generation manifest must mean the original fold/");
+        assert_eq!(m.next_seq, 4);
+        assert_eq!(super::refold::fold_dir(&d, m.fold_gen), d.join("fold"));
         std::fs::remove_dir_all(&d).ok();
     }
 }

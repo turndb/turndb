@@ -275,6 +275,13 @@ fn run_seed(seed: u64, steps: usize) -> usize {
                 drop(s);
                 s = Store::open(&dir, cfg()).unwrap();
             }
+            // refold — the one operation that rewrites content, so the model must survive it exactly
+            97 => {
+                s.sync().unwrap();
+                m.sync();
+                s.flush().unwrap();
+                s.refold().unwrap();
+            }
             // CRASH: drop with no sync.
             _ => {
                 drop(s);
