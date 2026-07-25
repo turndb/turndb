@@ -362,6 +362,12 @@ impl Store {
     pub fn memtable_bytes(&self) -> usize {
         self.mem_bytes
     }
+    /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
+    /// of both; the manifest snapshot it was opened at is already baked into `parts`.
+    pub fn into_parts(self) -> (Fold, Vec<Arc<Part>>) {
+        (self.fold, self.parts)
+    }
+
     pub fn part_count(&self) -> usize {
         self.parts.len()
     }
@@ -406,6 +412,12 @@ impl ReadStore {
         all.sort();
         all.dedup();
         Ok(all)
+    }
+
+    /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
+    /// of both; the manifest snapshot it was opened at is already baked into `parts`.
+    pub fn into_parts(self) -> (Fold, Vec<Arc<Part>>) {
+        (self.fold, self.parts)
     }
 
     pub fn part_count(&self) -> usize {

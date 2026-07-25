@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::time::Instant;
 
 fn split_json_array(s: &[u8]) -> Option<Vec<(usize, usize)>> {
     let mut i = 0;

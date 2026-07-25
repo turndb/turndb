@@ -3,7 +3,19 @@ name = "turndb"
 version = "0.0.0"
 edition = "2021"
 
+[features]
+# SQL is a LENS, not the substrate. A storage engine should not force a query engine on every
+# embedder, so the whole plane is optional — but it is on by default, because a feature that is not
+# built by default is a feature that is not tested.
+default = ["sql"]
+sql = ["dep:datafusion", "dep:async-trait"]
+
 [dependencies]
+# The query lens. Arrow comes in THROUGH datafusion's re-export rather than as its own dependency,
+# so an arrow version mismatch between the two is structurally impossible.
+datafusion = { version = "54", optional = true }
+# TableProvider is an async trait; this is datafusion's own requirement, not an extra choice.
+async-trait = { version = "0.1", optional = true }
 # Content identity. The fold's whole addressing scheme rests on this.
 blake3 = "1"
 anyhow = "1"
@@ -23,3 +35,7 @@ libc = "0.2"
 
 [profile.release]
 debug = true
+
+[dev-dependencies]
+# DataFusion is async; the SQL tests need a runtime to drive it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

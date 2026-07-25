@@ -192,7 +192,8 @@ pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize, u8)>> {
     Ok(out)
 }
 
-fn read_dict(part: &Part, c: usize) -> Result<Vec<String>> {
+/// A string column's sorted distinct dictionary; empty for non-string columns.
+pub fn read_dict(part: &Part, c: usize) -> Result<Vec<String>> {
     let name = format!("col.dict.{c}");
     if !part.section_present(&name) {
         return Ok(Vec::new());

@@ -383,6 +383,16 @@ impl Part {
         Ok((loc, PieceHash(hash)))
     }
 
+    /// Whether this part carries any attribute columns at all.
+    pub fn has_columns(&self) -> bool {
+        self.has("colmeta")
+    }
+
+    /// A column's raw fixed-width value section — the columnar read path, one section per call.
+    pub fn column_values(&self, c: usize) -> Result<std::sync::Arc<Vec<u8>>> {
+        self.sect(&format!("col.val.{c}"))
+    }
+
     pub fn piece_count(&self) -> Result<usize> {
         Ok(self.sect("pdict.loc")?.len() / Loc::WIDTH)
     }

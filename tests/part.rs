@@ -110,7 +110,7 @@ fn records_round_trip_byte_exact() {
 fn float_bit_patterns_survive() {
     let dir = tmp("floats");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
+    let fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
     let odd = [
         f64::from_bits(0x7ff8_0000_0000_0001), // NaN with a payload
         -0.0,
@@ -248,7 +248,7 @@ fn a_torn_part_is_refused() {
 fn duplicate_ids_in_one_part_are_refused() {
     let dir = tmp("dupids");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
+    let fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
     let recs = vec![
         Record { id: "same".into(), body: Vec::new(), attrs: Vec::new() },
         Record { id: "same".into(), body: Vec::new(), attrs: Vec::new() },
