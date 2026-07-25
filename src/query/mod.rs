@@ -25,6 +25,13 @@
 //! Columns are keyed `(name, type)`, so a key carrying different types in different records yields
 //! several homogeneous columns. The lens names them `key` when a key has exactly one type across the
 //! scanned parts and `key#type` when it does not — never a silent merge of two types into one field.
+//!
+//! # One logical version, from many physical parts
+//!
+//! Parts may contain older versions and tombstones. The lens uses the store's committed read core to
+//! resolve those before projection or filtering: the newest row for an id is the only eligible row,
+//! and a newest tombstone makes the id absent. In particular, a predicate that rejects the newest
+//! version can never fall through and reveal an older version that happens to match.
 
 pub mod table;
 
@@ -105,6 +112,9 @@ pub struct ScanStats {
     /// Rows a pushed-down predicate excluded before any array was built. The bodies among them were
     /// never reconstructed, which is the entire point.
     pub rows_filtered: usize,
+    /// Physical rows hidden by a newer version or tombstone. These are resolved before predicates, so
+    /// an older version can never reappear merely because the newest one fails a filter.
+    pub rows_hidden: usize,
     /// Batches skipped whole because no row in them could match.
     pub batches_skipped: usize,
     /// Occurrences hidden by the flat column view: a row that names one key several times surfaces its
@@ -123,6 +133,7 @@ impl ScanStats {
             columns_decoded: self.columns_decoded - prev.columns_decoded,
             fold_reads: self.fold_reads - prev.fold_reads,
             rows_filtered: self.rows_filtered - prev.rows_filtered,
+            rows_hidden: self.rows_hidden - prev.rows_hidden,
             batches_skipped: self.batches_skipped - prev.batches_skipped,
             shadowed_occurrences: self.shadowed_occurrences - prev.shadowed_occurrences,
         }
@@ -134,6 +145,7 @@ impl ScanStats {
         self.columns_decoded += o.columns_decoded;
         self.fold_reads += o.fold_reads;
         self.rows_filtered += o.rows_filtered;
+        self.rows_hidden += o.rows_hidden;
         self.batches_skipped += o.batches_skipped;
         self.shadowed_occurrences += o.shadowed_occurrences;
     }
@@ -144,11 +156,18 @@ pub struct Lens {
     schema: SchemaRef,
     /// Per schema field beyond `id`/`body`: the `(key, tag)` it resolves to inside a part.
     binding: Vec<Option<(String, u8)>>,
+    /// The committed newest-wins rows for each part in this lens.
+    ///
+    /// The `Arc<Part>` is retained so a scan can identify its mask by pointer identity without adding
+    /// storage-format identity to `Part`'s public API.
+    visible: Vec<(Arc<Part>, Arc<Vec<usize>>)>,
 }
 
 impl Lens {
     /// Derive the row shape from the parts that will be scanned.
     pub fn new(parts: &[Arc<Part>]) -> Result<Lens> {
+        let visibility = crate::store::read::visibility(parts)?;
+
         // Which types does each key carry, across every part?
         let mut tags: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
         for p in parts {
@@ -173,7 +192,12 @@ impl Lens {
                 binding.push(Some((key.clone(), t)));
             }
         }
-        Ok(Lens { schema: Arc::new(Schema::new(fields)), binding })
+        let visible = parts
+            .iter()
+            .cloned()
+            .zip(visibility.rows.into_iter().map(Arc::new))
+            .collect();
+        Ok(Lens { schema: Arc::new(Schema::new(fields)), binding, visible })
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -284,6 +308,12 @@ impl Lens {
         }
 
         let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Vec::new() };
+        let visible = self
+            .visible
+            .iter()
+            .find(|(p, _)| Arc::ptr_eq(p, part))
+            .map(|(_, rows)| rows.clone())
+            .ok_or_else(|| anyhow::anyhow!("part is not a member of this lens snapshot"))?;
 
         Ok(PartScan {
             n: part.len(),
@@ -296,6 +326,7 @@ impl Lens {
             stats: ScanStats { columns_decoded: decoded, ..ScanStats::default() },
             fetch: None,
             tests,
+            visible,
         })
     }
 }
@@ -415,6 +446,8 @@ pub struct PartScan {
     fetch: Option<usize>,
     /// Pushed-down predicates, resolved to this part's columns. Conjunctive.
     tests: Vec<Test>,
+    /// Rows that survive newest-wins resolution across the whole lens snapshot.
+    visible: Arc<Vec<usize>>,
 }
 
 impl PartScan {
@@ -448,10 +481,19 @@ impl PartScan {
     /// cost is one allocation.
     fn select(&self, lo: usize, cap: usize) -> Vec<usize> {
         let n = cap - lo;
+        let start = self.visible.partition_point(|&row| row < lo);
+        let visible: Vec<usize> = self.visible[start..]
+            .iter()
+            .take_while(|&&row| row < cap)
+            .map(|&row| row - lo)
+            .collect();
         if self.tests.is_empty() {
-            return (0..n).collect();
+            return visible;
         }
-        let mut keep = vec![true; n];
+        let mut keep = vec![false; n];
+        for &row in &visible {
+            keep[row] = true;
+        }
         let mut scratch = vec![false; n];
         for t in &self.tests {
             if matches!(t, Test::Never) {
@@ -468,10 +510,10 @@ impl PartScan {
 
     /// The next batch, or `None` at the end of the part.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        let end = match self.fetch {
-            Some(f) => self.n.min(f),
-            None => self.n,
-        };
+        if self.fetch.is_some_and(|f| self.stats.rows >= f) {
+            return Ok(None);
+        }
+        let end = self.n;
         if self.row >= end {
             return Ok(None);
         }
@@ -485,13 +527,16 @@ impl PartScan {
             let lo = self.row;
             let cap = (lo + BATCH_ROWS).min(end);
             let take = self.select(lo, cap);
+            let first = self.visible.partition_point(|&row| row < lo);
+            let last = self.visible.partition_point(|&row| row < cap);
+            let visible = last - first;
+            self.stats.rows_hidden += (cap - lo) - visible;
+            self.stats.rows_filtered += visible - take.len();
             if take.is_empty() {
-                self.stats.rows_filtered += cap - lo;
                 self.stats.batches_skipped += 1;
                 self.row = cap;
                 continue;
             }
-            self.stats.rows_filtered += (cap - lo) - take.len();
             break (lo, take);
         };
 
@@ -499,6 +544,9 @@ impl PartScan {
         // — and only for rows that survived the filter.
         let mut bodies: Option<Vec<Vec<u8>>> = None;
         let mut take = take;
+        if let Some(fetch) = self.fetch {
+            take.truncate(fetch - self.stats.rows);
+        }
         if self.cols.iter().any(|c| matches!(c, Col::Body)) {
             let fold = self.fold.as_ref().expect("checked when the scan was built");
             let mut v = Vec::new();

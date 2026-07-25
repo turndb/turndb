@@ -193,19 +193,34 @@ impl Store {
     /// invisible, which is the correct snapshot. Safe alongside a live writer because parts are
     /// immutable and the fold is append-only.
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<ReadStore> {
-        let fold = Fold::open_read(&refold::fold_dir(dir, Manifest::load(dir)?.fold_gen), cfg)?;
-
-        // Reading the manifest and opening the parts it names is not atomic, and a writer may commit a
-        // merge and unlink the replaced inputs in between. The manifest IS the linearization point, so
-        // the fix is simply to start over: a re-read gets the newer manifest, whose parts exist. An
-        // already-open part is unaffected — Unix keeps it alive through the unlink — so this window is
-        // only ever about parts not yet opened.
+        // Reading the manifest and opening the fold generation plus parts it names is not atomic. A
+        // writer may commit a merge or re-fold and unlink the replaced files in between, or commit a
+        // flush whose new part names fold blocks a reader scanned just before they landed. The
+        // manifest IS the linearization point, so every attempt starts from one manifest and opens the
+        // fold and parts belonging to that exact snapshot. Once open, Unix keeps all of those handles
+        // alive through a later unlink.
         //
         // Bounded, because a manifest naming a genuinely absent part must eventually surface as an
         // error rather than spin.
         let mut last: Option<anyhow::Error> = None;
         for _ in 0..8 {
             let manifest = Manifest::load(dir)?;
+            let fold_path = refold::fold_dir(dir, manifest.fold_gen);
+            let fold = match Fold::open_read(&fold_path, cfg) {
+                Ok(fold) => fold,
+                Err(e) => {
+                    let gone = e
+                        .downcast_ref::<std::io::Error>()
+                        .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+                        .unwrap_or(false)
+                        || !fold_path.exists();
+                    if !gone {
+                        return Err(e);
+                    }
+                    last = Some(e);
+                    continue;
+                }
+            };
             let pcache = SectionCache::shared();
             let mut parts = Vec::with_capacity(manifest.parts.len());
             let mut missed = false;
@@ -228,10 +243,17 @@ impl Store {
                 }
             }
             if !missed {
-                return Ok(ReadStore { fold, parts, manifest, pcache });
+                // A re-fold commit changes the address space itself: the new parts' Locs are only
+                // meaningful against the new fold generation. If that swap happened while this
+                // attempt was opening files, retry even when every individual open succeeded.
+                if Manifest::load(dir)?.fold_gen != manifest.fold_gen {
+                    last = Some(anyhow::anyhow!("fold generation changed while opening a reader snapshot"));
+                    continue;
+                }
+                return Ok(ReadStore { fold, parts, manifest });
             }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("manifest names a part that does not exist")))
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("manifest snapshot names storage that does not exist")))
     }
 
     /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
@@ -626,7 +648,6 @@ pub struct ReadStore {
     fold: Fold,
     parts: Vec<Arc<Part>>,
     manifest: Manifest,
-    pcache: Arc<SectionCache>,
 }
 
 /// A read-only store IS the committed read core, with nothing layered on top — so every method here
