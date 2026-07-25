@@ -13,7 +13,6 @@ use crate::part::Part;
 use crate::store::ReadStore;
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::datasource::TableType;
@@ -22,9 +21,11 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
+use futures::stream;
 use datafusion::prelude::SessionContext;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -53,7 +54,7 @@ impl TurndbTable {
     /// Register a read-only store as table `name` in a fresh session.
     pub fn context(store: ReadStore, name: &str) -> Result<(SessionContext, Arc<TurndbTable>)> {
         let (fold, parts) = store.into_parts();
-        let t = Arc::new(TurndbTable::new(parts, Arc::new(fold))?);
+        let t = Arc::new(TurndbTable::new(parts, fold)?);
         let ctx = SessionContext::new();
         ctx.register_table(name, t.clone())?;
         Ok((ctx, t))
@@ -98,13 +99,11 @@ impl TableProvider for TurndbTable {
     }
 }
 
-/// One partition per part.
+/// One partition per part, streamed.
 ///
-/// Batches for a partition are produced eagerly when the partition is executed, rather than streamed
-/// lazily. That is a real limitation and it is bounded by the projection: with `body` projected, a
-/// partition materialises one part's reconstructed content. Attribute-only queries — the ones this
-/// design is for — materialise columns, which are small. Streaming this is a mechanical change to
-/// `execute`, not a design change, since [`super::PartScan`] is already lazy.
+/// Batches are produced on demand as the consumer pulls them, so peak residency is one batch —
+/// `BATCH_BYTES` of content — regardless of how large the part is. Materialising a partition instead
+/// would mean `SELECT id, body` over a 19 GiB corpus building 19 GiB of Arrow in one partition.
 struct TurndbExec {
     parts: Vec<Arc<Part>>,
     fold: Arc<Fold>,
@@ -173,28 +172,37 @@ impl ExecutionPlan for TurndbExec {
         // The fold is handed over only when `body` is in the projection, so an attribute-only query
         // cannot reach content even by mistake.
         let wants_body = self.schema.fields().iter().any(|f| f.name() == F_BODY);
-        let fold = wants_body.then(|| self.fold.as_ref());
+        let fold = wants_body.then(|| &self.fold);
 
-        let mut local = ScanStats::default();
-        let batches: Vec<RecordBatch> = {
-            let mut sc = self
-                .lens
-                .scan(part, fold, &self.projection, &mut local)
-                .map_err(|e| DataFusionError::External(e.into()))?;
-            let mut out = Vec::new();
-            while let Some(b) = sc.next_batch().map_err(|e| DataFusionError::External(e.into()))? {
-                out.push(b);
-            }
-            out
-        };
-        {
-            let mut s = self.stats.lock().unwrap();
-            s.rows += local.rows;
-            s.batches += local.batches;
-            s.columns_decoded += local.columns_decoded;
-            s.fold_reads += local.fold_reads;
-            s.shadowed_occurrences += local.shadowed_occurrences;
-        }
-        Ok(Box::pin(MemoryStream::try_new(batches, self.schema.clone(), None)?))
+        let scan = self
+            .lens
+            .scan(part, fold, &self.projection)
+            .map_err(|e| DataFusionError::External(e.into()))?;
+
+        // `unfold` drives the scan one batch at a time. Decoding runs inline on the polling thread —
+        // it is CPU work over already-cached sections rather than blocking I/O, and DataFusion spreads
+        // partitions across its own worker threads, so a part is the unit of parallelism.
+        // Progress is published per batch as a DELTA off the scan's own counters, so a query that
+        // stops early — LIMIT, an error, a dropped stream — reports what it genuinely touched rather
+        // than what a full scan would have.
+        let s = stream::unfold(
+            Some((scan, self.stats.clone(), ScanStats::default())),
+            move |st| async move {
+                let (mut scan, shared, prev) = st?;
+                match scan.next_batch() {
+                    Ok(Some(b)) => {
+                        let now = scan.stats();
+                        shared.lock().unwrap().add(now.since(prev));
+                        Some((Ok(b), Some((scan, shared, now))))
+                    }
+                    Ok(None) => {
+                        shared.lock().unwrap().add(scan.stats().since(prev));
+                        None
+                    }
+                    Err(e) => Some((Err(DataFusionError::External(e.into())), None)),
+                }
+            },
+        );
+        Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), s)))
     }
 }

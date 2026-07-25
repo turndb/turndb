@@ -8,7 +8,7 @@ edition = "2021"
 # embedder, so the whole plane is optional — but it is on by default, because a feature that is not
 # built by default is a feature that is not tested.
 default = ["sql"]
-sql = ["dep:datafusion", "dep:async-trait"]
+sql = ["dep:datafusion", "dep:async-trait", "dep:futures"]
 
 [dependencies]
 # The query lens. Arrow comes in THROUGH datafusion's re-export rather than as its own dependency,
@@ -16,6 +16,7 @@ sql = ["dep:datafusion", "dep:async-trait"]
 datafusion = { version = "54", optional = true }
 # TableProvider is an async trait; this is datafusion's own requirement, not an extra choice.
 async-trait = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
 # Content identity. The fold's whole addressing scheme rests on this.
 blake3 = "1"
 anyhow = "1"
@@ -39,3 +40,8 @@ debug = true
 [dev-dependencies]
 # DataFusion is async; the SQL tests need a runtime to drive it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# The query demo exercises the lens, so it only exists when the lens does.
+[[example]]
+name = "query_demo"
+required-features = ["sql"]
