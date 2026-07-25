@@ -148,12 +148,11 @@ fn main() -> anyhow::Result<()> {
             pending.clear();
             samples.clear();
             seen_ids.clear();
-            // NOTE: the dedup window is deliberately NOT sealed here. Sealing it bounds memory to the
-            // flush interval (the production posture) but confines dedup to one batch, which would
-            // understate the architecture on a corpus whose whole point is content recurring across
-            // trajectories. Keeping it resident measures TRUE GLOBAL dedup — what Tier-1 lookups
-            // against parts' hash columns would deliver once implemented. Memory is reported so the
-            // cost of that choice is visible.
+            // NOTE: the dedup window is deliberately NOT sealed here. This harness writes fold and
+            // parts directly, with no Store and therefore no Tier-1, so keeping the window resident is
+            // the only way it can measure TRUE GLOBAL dedup. `Store` now seals at every flush and
+            // recovers the same dedup through Tier-1 lookups against parts' hash columns — so the
+            // resident count printed below is the memory that posture COSTS, not a number to match.
             let el = t0.elapsed().as_secs_f64();
             eprint!("\r  {nrec} rec | {:.1} GiB logical | fold {:.2} GiB | {} parts | {:.0} rec/s | {:.0} MiB/s   ",
                 gib(logical), gib(fold.disk_bytes()), nparts, nrec as f64 / el, mib(logical) / el);
