@@ -37,6 +37,7 @@
 
 pub mod fold;
 pub mod part;
+pub mod store;
 pub mod types;
 
 pub use types::{AttrValue, BodyOp, PieceHash, Record};

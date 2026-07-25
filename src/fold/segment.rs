@@ -106,6 +106,12 @@ pub fn create(dir: &Path, n: u32, dict_id: [u8; 32]) -> Result<File> {
     Ok(f)
 }
 
+/// Read-only handle — never opens for write, so a reader cannot damage a store it does not own.
+pub fn open_read(dir: &Path, n: u32) -> Result<File> {
+    let path = dir.join(seg_name(n));
+    File::open(&path).with_context(|| format!("open segment {} read-only", path.display()))
+}
+
 pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
     let path = dir.join(seg_name(n));
     OpenOptions::new()
