@@ -155,7 +155,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- block framing across the curve ----
-    for block_bytes in [16 * 1024usize, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+    // The sweep used to stop at 4 MiB, so 4 MiB was chosen as the largest size TESTED rather than as
+    // a measured optimum. Extended, because the ratio was still climbing steeply there.
+    for block_bytes in [64 * 1024usize, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024] {
         // lay pieces into blocks in capture order
         let (mut blocks, mut where_of) = (Vec::<Vec<u8>>::new(), Vec::<(usize, usize, usize)>::new());
         let mut buf: Vec<u8> = Vec::new();
@@ -167,7 +169,7 @@ fn main() -> anyhow::Result<()> {
         }
         if !buf.is_empty() { blocks.push(buf); }
 
-        for lvl in [3, 19] {
+        for lvl in [19] {
             let comp: Vec<Vec<u8>> = blocks.iter().map(|b| zstd::bulk::compress(b, lvl).unwrap()).collect();
             let index_bytes = pieces.len() as u64 * 10 + blocks.len() as u64 * 8;
             let size: u64 = comp.iter().map(|c| c.len() as u64).sum::<u64>() + index_bytes;
