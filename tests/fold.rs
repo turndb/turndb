@@ -122,7 +122,7 @@ fn appends_continue_correctly_after_reopen() {
     };
     let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
     let lb = f.put(&b).unwrap().loc;
-    assert!(lb.block_off > la.block_off, "the new frame must land after the recovered tail");
+    assert!(lb.block_id > la.block_id, "the new piece must land in a later block than the recovered tail");
     assert_eq!(f.read(la).unwrap(), a);
     assert_eq!(f.read(lb).unwrap(), b);
     std::fs::remove_dir_all(&dir).ok();
@@ -181,7 +181,9 @@ fn corrupted_frame_is_refused_not_served() {
     {
         use std::os::unix::fs::FileExt;
         let seg = OpenOptions::new().read(true).write(true).open(dir.join("seg-00000000.fold")).unwrap();
-        let at = loc.block_off as u64 + 12 + 4;
+        // first block: segment header (48) + block header (16), then into the payload
+        let _ = loc;
+        let at = 48u64 + 16 + 4;
         let mut b = [0u8; 1];
         seg.read_exact_at(&mut b, at).unwrap();
         b[0] ^= 0xFF;
@@ -212,10 +214,12 @@ fn segments_roll_and_locs_resolve_across_them() {
         locs.push(p.loc);
         data.push(b);
     }
-    assert!(f.segment_count() > 1, "the corpus must have rolled at least one segment");
-    let segs_used: std::collections::HashSet<u32> = locs.iter().map(|l| l.seg).collect();
-    assert!(segs_used.len() > 1, "locs must span multiple segments");
+    // Blocks are compressed off the write path and land on completion, so segment state is not
+    // final until the pipeline drains.
     f.sync().unwrap();
+    assert!(f.segment_count() > 1, "the corpus must have rolled at least one segment");
+    let blocks_used: std::collections::HashSet<u32> = locs.iter().map(|l| l.block_id).collect();
+    assert!(blocks_used.len() > 1, "the corpus must span multiple blocks");
     drop(f);
 
     let f = Fold::open(&dir, cfg).unwrap();
@@ -316,7 +320,7 @@ fn pieces_written_together_share_a_block() {
     for i in 0..40 {
         locs.push(f.put(format!("{{\"role\":\"user\",\"content\":\"message {i}\"}}").as_bytes()).unwrap().loc);
     }
-    let blocks: std::collections::HashSet<(u32, u32)> = locs.iter().map(|l| l.block_key()).collect();
+    let blocks: std::collections::HashSet<u32> = locs.iter().map(|l| l.block_id).collect();
     assert_eq!(blocks.len(), 1, "40 small pieces written together must share one block");
     // and their in-block offsets are strictly increasing — they were laid down in order
     for w in locs.windows(2) {

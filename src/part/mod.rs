@@ -14,9 +14,9 @@
 //! # Invariants
 //! - Ids are strictly increasing. Version resolution across parts is by sequence range, so a part
 //!   never holds two versions of one id.
-//! - The piece dictionary is sorted by `(seg, block_off, in_off)` — fold order, not hash order. That
-//!   makes a merge's dictionary union a linear merge instead of a sort, and makes a scan read the
-//!   fold sequentially.
+//! - The piece dictionary is sorted by `(block_id, in_off)` — fold order, not hash order. That makes
+//!   a merge's dictionary union a linear merge instead of a sort, and makes a scan read the fold
+//!   sequentially. Block ids ascend with write order, so this is physical locality too.
 
 pub mod attrs;
 pub mod idcol;
@@ -99,7 +99,7 @@ pub fn build(
         }
     }
     let mut dict: Vec<(Loc, PieceHash)> = piece_of.iter().map(|(h, l)| (*l, *h)).collect();
-    dict.sort_by_key(|(l, _)| (l.seg, l.block_off, l.in_off));
+    dict.sort_by_key(|(l, _)| (l.block_id, l.in_off));
     let dict_index: HashMap<PieceHash, u32> =
         dict.iter().enumerate().map(|(i, (_, h))| (*h, i as u32)).collect();
 
@@ -345,17 +345,17 @@ impl Part {
     pub fn piece(&self, i: usize) -> Result<(Loc, PieceHash)> {
         let l = self.sect("pdict.loc")?;
         let h = self.sect("pdict.hash")?;
-        if (i + 1) * 16 > l.len() || (i + 1) * 32 > h.len() {
+        if (i + 1) * Loc::WIDTH > l.len() || (i + 1) * 32 > h.len() {
             bail!("piece dictionary index {i} out of range");
         }
-        let loc = Loc::decode(&l[i * 16..])?;
+        let loc = Loc::decode(&l[i * Loc::WIDTH..])?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&h[i * 32..i * 32 + 32]);
         Ok((loc, PieceHash(hash)))
     }
 
     pub fn piece_count(&self) -> Result<usize> {
-        Ok(self.sect("pdict.loc")?.len() / 16)
+        Ok(self.sect("pdict.loc")?.len() / Loc::WIDTH)
     }
 
     /// The body program of row `r`, with piece references resolved to content identity.

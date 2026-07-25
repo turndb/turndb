@@ -115,16 +115,19 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
         .with_context(|| format!("open segment {}", path.display()))
 }
 
-/// Walk the block chain from the header to the last **complete, checksum-valid** block and return the
-/// offset just past it.
+/// Walk the block chain to the last **complete, checksum-valid** block. Returns the offset just past
+/// it plus every `(block_id, offset)` seen, which is how the block directory is rebuilt at open.
 ///
 /// This is how the fold finds its own last good byte with no external length authority. It never
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
-pub fn scan_tail(f: &File, file_len: u64, has_dict: bool) -> Result<u64> {
+pub fn scan_tail(f: &File, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
+    // Blocks land in COMPLETION order, so position no longer implies identity — the directory is
+    // rebuilt from the ids the frames carry.
+    let mut dir: Vec<(u32, u32)> = Vec::new();
     loop {
         if off + (block::BLOCK_OVERHEAD as u64) > file_len {
             break; // cannot hold even an empty block
@@ -152,9 +155,10 @@ pub fn scan_tail(f: &File, file_len: u64, has_dict: bool) -> Result<u64> {
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
             break;
         }
+        dir.push((h.block_id, off as u32));
         off = end;
     }
-    Ok(off)
+    Ok((off, dir))
 }
 
 /// The durable end of the fold: everything strictly before this is committed.

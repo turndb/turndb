@@ -11,14 +11,24 @@
 //! than replacing it — nothing is foreclosed.
 //!
 //! ```text
-//!  <---------------- block frame, length = 16 + stored ---------------->
-//! +------+-------+--------+----------+------+--------------+---------+
-//! | tag  | codec |  raw   |  stored  | r16  |   payload    |  xsum   |
-//! |  1   |   1   |   4    |    4     |  2   |    stored    |    4    |
-//! +------+-------+--------+----------+------+--------------+---------+
-//! +0     +1      +2       +6         +10    +12            +12+stored
+//!  <------------------- block frame, length = 20 + stored ------------------->
+//! +------+-------+--------+----------+------+--------+--------------+---------+
+//! | tag  | codec |  raw   |  stored  | r16  |block_id|   payload    |  xsum   |
+//! |  1   |   1   |   4    |    4     |  2   |   4    |    stored    |    4    |
+//! +------+-------+--------+----------+------+--------+--------------+---------+
+//! +0     +1      +2       +6         +10    +12      +16            +16+stored
 //! ```
-//! The 16 bytes of overhead are now amortised across a whole block rather than paid per piece.
+//! The overhead is amortised across a whole block rather than paid per piece.
+//!
+//! # Why the frame carries its own id
+//!
+//! A piece is addressed by BLOCK ID, not by byte offset. Compression is the expensive half of an
+//! append, and a physical offset would chain every block to the compressed size of its predecessor —
+//! forcing compression onto the serial write path. With logical ids the writer assigns an id the
+//! instant a block seals, compression fans out across cores, and blocks land in completion order.
+//! Position therefore no longer implies identity, so the id must be in the frame for a tail scan to
+//! rebuild the directory. It also means a block can later be moved or recompressed by updating the
+//! directory alone, without touching a single part.
 
 use anyhow::{bail, Result};
 
@@ -26,7 +36,7 @@ use anyhow::{bail, Result};
 /// not ASCII, and far in Hamming distance from both.
 pub const BLOCK_TAG: u8 = 0xA5;
 
-pub const BLOCK_HDR_LEN: usize = 12;
+pub const BLOCK_HDR_LEN: usize = 16;
 pub const BLOCK_XSUM_LEN: usize = 4;
 pub const BLOCK_OVERHEAD: usize = BLOCK_HDR_LEN + BLOCK_XSUM_LEN;
 
@@ -51,9 +61,9 @@ pub const BLOCK_TARGET_DEFAULT: usize = 4 * 1024 * 1024;
 /// because the block header is their only authority — a second copy could disagree.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Loc {
-    pub seg: u32,
-    /// Byte offset of the block frame's `tag` within the segment.
-    pub block_off: u32,
+    /// Which block holds this piece. Logical: the fold's block directory maps it to a segment and
+    /// offset, so physical placement can change without rewriting any reference.
+    pub block_id: u32,
     /// Byte offset of this piece within the block's *decompressed* bytes.
     pub in_off: u32,
     /// This piece's length.
@@ -61,14 +71,13 @@ pub struct Loc {
 }
 
 impl Loc {
-    pub const WIDTH: usize = 16;
+    pub const WIDTH: usize = 12;
 
     pub fn encode(&self) -> [u8; Self::WIDTH] {
         let mut b = [0u8; Self::WIDTH];
-        b[0..4].copy_from_slice(&self.seg.to_le_bytes());
-        b[4..8].copy_from_slice(&self.block_off.to_le_bytes());
-        b[8..12].copy_from_slice(&self.in_off.to_le_bytes());
-        b[12..16].copy_from_slice(&self.raw.to_le_bytes());
+        b[0..4].copy_from_slice(&self.block_id.to_le_bytes());
+        b[4..8].copy_from_slice(&self.in_off.to_le_bytes());
+        b[8..12].copy_from_slice(&self.raw.to_le_bytes());
         b
     }
 
@@ -77,21 +86,16 @@ impl Loc {
             bail!("Loc needs {} bytes, got {}", Self::WIDTH, b.len());
         }
         Ok(Loc {
-            seg: u32::from_le_bytes(b[0..4].try_into().unwrap()),
-            block_off: u32::from_le_bytes(b[4..8].try_into().unwrap()),
-            in_off: u32::from_le_bytes(b[8..12].try_into().unwrap()),
-            raw: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+            block_id: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+            in_off: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+            raw: u32::from_le_bytes(b[8..12].try_into().unwrap()),
         })
-    }
-
-    /// The key a block cache is indexed by — every piece in one block shares it.
-    pub fn block_key(&self) -> (u32, u32) {
-        (self.seg, self.block_off)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct BlockHdr {
+    pub block_id: u32,
     pub codec: u8,
     /// Decompressed size of the whole block.
     pub raw: u32,
@@ -131,7 +135,8 @@ pub fn parse_hdr(b: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
     if codec == CODEC_ZSTD_DICT && !seg_has_dict {
         bail!("dictionary-coded block in a segment that names no dictionary");
     }
-    Ok(BlockHdr { codec, raw, stored, r16: [b[10], b[11]] })
+    let block_id = u32::from_le_bytes(b[12..16].try_into().unwrap());
+    Ok(BlockHdr { block_id, codec, raw, stored, r16: [b[10], b[11]] })
 }
 
 /// The 4-byte tail checksum over `frame[0 .. BLOCK_HDR_LEN + stored]`.
@@ -145,7 +150,7 @@ pub fn xsum(frame_prefix: &[u8]) -> [u8; BLOCK_XSUM_LEN] {
 }
 
 /// Build a complete block frame into `out` (cleared first). `raw_block` is the uncompressed block.
-pub fn encode(out: &mut Vec<u8>, codec: u8, raw_block: &[u8], payload: &[u8]) -> usize {
+pub fn encode(out: &mut Vec<u8>, block_id: u32, codec: u8, raw_block: &[u8], payload: &[u8]) -> usize {
     debug_assert!(payload.len() <= raw_block.len(), "encoder must fall back to CODEC_STORED");
     let rh = blake3::hash(raw_block);
     out.clear();
@@ -155,6 +160,7 @@ pub fn encode(out: &mut Vec<u8>, codec: u8, raw_block: &[u8], payload: &[u8]) ->
     out.extend_from_slice(&(raw_block.len() as u32).to_le_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&rh.as_bytes()[0..2]);
+    out.extend_from_slice(&block_id.to_le_bytes());
     out.extend_from_slice(payload);
     let sum = xsum(&out[..]);
     out.extend_from_slice(&sum);
@@ -180,22 +186,23 @@ mod tests {
 
     #[test]
     fn loc_roundtrips() {
-        let l = Loc { seg: 7, block_off: 48, in_off: 1200, raw: 340 };
+        let l = Loc { block_id: 7, in_off: 1200, raw: 340 };
         assert_eq!(Loc::decode(&l.encode()).unwrap(), l);
-        assert_eq!(l.block_key(), (7, 48));
+        assert_eq!(Loc::WIDTH, 12);
     }
 
     #[test]
     fn block_roundtrips_and_detects_tears() {
         let raw = "many pieces concatenated into one block. ".repeat(64).into_bytes();
         let mut buf = Vec::new();
-        let n = encode(&mut buf, CODEC_STORED, &raw, &raw);
+        let n = encode(&mut buf, 3, CODEC_STORED, &raw, &raw);
         assert_eq!(n, BLOCK_OVERHEAD + raw.len());
 
         let hdr = verify_frame_bytes(&buf, false).unwrap();
         assert_eq!(hdr.codec, CODEC_STORED);
         assert_eq!(hdr.raw as usize, raw.len());
         assert_eq!(hdr.r16, blake3::hash(&raw).as_bytes()[0..2]);
+        assert_eq!(hdr.block_id, 3);
 
         let mut torn = buf.clone();
         torn[BLOCK_HDR_LEN + 3] ^= 0x01;

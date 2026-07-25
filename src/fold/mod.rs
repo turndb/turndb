@@ -26,6 +26,7 @@
 pub mod block;
 pub mod codec;
 pub mod dedup;
+pub mod pipe;
 pub mod segment;
 
 pub use block::{Loc, BLOCK_TARGET_DEFAULT, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
@@ -40,6 +41,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::collections::hash_map::Entry;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FoldCfg {
@@ -56,6 +58,9 @@ pub struct FoldCfg {
     pub block_target: usize,
     /// zstd level. Also write-side only. Costs ingest throughput, barely affects reads.
     pub level: i32,
+    /// Compression threads. Compression is the expensive half of an append and blocks are
+    /// independent, so it runs off the write path. 0 = one per core.
+    pub compress_threads: usize,
 }
 
 impl Default for FoldCfg {
@@ -65,6 +70,7 @@ impl Default for FoldCfg {
             cache_bytes: 64 << 20,
             block_target: BLOCK_TARGET_DEFAULT,
             level: codec::LEVEL_DEFAULT,
+            compress_threads: 0,
         }
     }
 }
@@ -82,7 +88,7 @@ pub struct Put {
 struct BlockCache {
     budget: usize,
     bytes: usize,
-    map: HashMap<(u32, u32), (u64, Arc<Vec<u8>>)>,
+    map: HashMap<u32, (u64, Arc<Vec<u8>>)>,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -92,7 +98,7 @@ impl BlockCache {
     fn new(budget: usize) -> BlockCache {
         BlockCache { budget: budget.max(1), bytes: 0, map: HashMap::new(), clock: 0, hits: 0, misses: 0 }
     }
-    fn get(&mut self, k: (u32, u32)) -> Option<Arc<Vec<u8>>> {
+    fn get(&mut self, k: u32) -> Option<Arc<Vec<u8>>> {
         self.clock += 1;
         let c = self.clock;
         match self.map.get_mut(&k) {
@@ -107,7 +113,7 @@ impl BlockCache {
             }
         }
     }
-    fn put(&mut self, k: (u32, u32), v: Arc<Vec<u8>>) {
+    fn put(&mut self, k: u32, v: Arc<Vec<u8>>) {
         let add = v.len();
         // always admit one block, however large, then evict coldest until back inside the budget
         while self.bytes + add > self.budget && !self.map.is_empty() {
@@ -138,10 +144,16 @@ pub struct Fold {
     readers: Vec<Arc<File>>,
     dicts: HashMap<[u8; 32], Arc<Vec<u8>>>,
     active: u32,
-    /// Append point: where the NEXT block frame will be written. Also the `block_off` every piece
-    /// currently in the open buffer will carry, which is what lets `put` return a final `Loc` before
-    /// the block it belongs to has been sealed.
+    /// Physical append point in the active segment. No `Loc` refers to it — addressing is logical.
     cur_off: u32,
+    /// block id -> (segment, offset). Rebuilt at open by scanning the frames, which carry their ids.
+    blockdir: Vec<Option<(u32, u32)>>,
+    /// The id the next sealed block will take.
+    next_block: u32,
+    /// Sealed but not yet written (still compressing, or waiting to be appended). Reads are served
+    /// from here, so a piece is readable the instant `put` returns.
+    inflight: HashMap<u32, Arc<Vec<u8>>>,
+    pool: pipe::Pool,
     active_f: File,
     /// Pieces gathered but not yet compressed and appended.
     open_block: Vec<u8>,
@@ -195,6 +207,10 @@ impl Fold {
                 cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
                 poisoned: false,
                 scratch: Vec::new(),
+                blockdir: Vec::new(),
+                next_block: 0,
+                inflight: HashMap::new(),
+                pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
                 _lock: lock,
             });
         }
@@ -263,7 +279,7 @@ impl Fold {
         let flen = active_f.metadata()?.len();
         let has_dict = headers[active as usize].has_dict();
 
-        let good_tail = segment::scan_tail(&active_f, flen, has_dict)?;
+        let (good_tail, _) = segment::scan_tail(&active_f, flen, has_dict)?;
 
         let target = match committed {
             None => good_tail,
@@ -297,6 +313,22 @@ impl Fold {
             readers.push(Arc::new(segment::open_rw(dir, h.seg)?));
         }
 
+        // Rebuild the block directory across every segment. Frames carry their ids, so this works
+        // even though blocks were written in completion order rather than id order.
+        let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
+        let mut next_block = 0u32;
+        for (i, h) in headers.iter().enumerate() {
+            let len = readers[i].metadata()?.len();
+            let (_, entries) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+            for (id, off) in entries {
+                if blockdir.len() <= id as usize {
+                    blockdir.resize(id as usize + 1, None);
+                }
+                blockdir[id as usize] = Some((h.seg, off));
+                next_block = next_block.max(id + 1);
+            }
+        }
+
         Ok(Fold {
             dir: dir.to_path_buf(),
             cfg,
@@ -311,6 +343,10 @@ impl Fold {
             cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
             poisoned: false,
             scratch: Vec::new(),
+            blockdir,
+            next_block,
+            inflight: HashMap::new(),
+            pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
             _lock: lock,
         })
     }
@@ -321,30 +357,29 @@ impl Fold {
     /// offset is fixed when the block *opens* (it is the segment's append point), so a piece's address
     /// is known the moment it enters the buffer. Reads of an unsealed piece are served from the buffer.
     pub fn put(&mut self, raw: &[u8]) -> Result<Put> {
+        let hash = PieceHash::of(raw);
+        self.put_hashed(raw, hash)
+    }
+
+    /// `put` for a caller that has ALREADY hashed the content.
+    ///
+    /// Hashing is the parallelizable half of an append and the serialized writer is the scarce
+    /// resource, so an ingest pipeline hashes on worker threads and hands the digest in. The hash is
+    /// trusted: it is the caller's assertion about bytes it holds, exactly as `put` trusts its own.
+    pub fn put_hashed(&mut self, raw: &[u8], hash: PieceHash) -> Result<Put> {
         if self.poisoned {
             bail!("fold is poisoned by an earlier failed write; reopen to recover by tail scan");
         }
         if raw.len() as u64 > u32::MAX as u64 {
             bail!("piece of {} bytes exceeds the u32 length cap; carve smaller", raw.len());
         }
-        let hash = PieceHash::of(raw);
+        debug_assert_eq!(hash, PieceHash::of(raw), "put_hashed given a digest that is not its content's");
         if let Some(loc) = self.dedup.get(&hash) {
             return Ok(Put { hash, loc, deduped: true });
         }
 
-        // A block must fit in a segment. If the open buffer plus this piece could not, seal what we
-        // have and roll first, so a block never straddles a segment boundary.
-        let projected = self.open_block.len() + raw.len() + block::BLOCK_OVERHEAD;
-        if self.cur_off as u64 > SEG_HDR_LEN
-            && self.cur_off as u64 + projected as u64 > self.cfg.seg_max as u64
-        {
-            self.seal_block()?;
-            self.roll()?;
-        }
-
         let loc = Loc {
-            seg: self.active,
-            block_off: self.cur_off,
+            block_id: self.next_block,
             in_off: self.open_block.len() as u32,
             raw: raw.len() as u32,
         };
@@ -354,18 +389,27 @@ impl Fold {
         if self.open_block.len() >= self.cfg.block_target {
             self.seal_block()?;
         }
+        // Write anything the pool has finished. Cheap, and it keeps the backlog shallow.
+        self.write_ready(false)?;
         Ok(Put { hash, loc, deduped: false })
     }
 
     /// Read one piece back, exactly as it was written.
     pub fn read(&self, loc: Loc) -> Result<Vec<u8>> {
         let end = loc.in_off as u64 + loc.raw as u64;
-        // still in the open buffer — not yet compressed or on disk
-        if loc.seg == self.active && loc.block_off == self.cur_off {
+        // still gathering — not yet sealed
+        if loc.block_id == self.next_block {
             if end > self.open_block.len() as u64 {
                 bail!("Loc names bytes past the open block");
             }
             return Ok(self.open_block[loc.in_off as usize..end as usize].to_vec());
+        }
+        // sealed but still in the pipeline — already uncompressed, so serve it directly
+        if let Some(raw) = self.inflight.get(&loc.block_id) {
+            if end > raw.len() as u64 {
+                bail!("Loc names bytes past its block");
+            }
+            return Ok(raw[loc.in_off as usize..end as usize].to_vec());
         }
         let blk = self.block_bytes(loc)?;
         if end > blk.len() as u64 {
@@ -382,63 +426,104 @@ impl Fold {
         let out = self.read(loc)?;
         let got = PieceHash::of(&out);
         if got != expect {
-            bail!("content hash mismatch at seg {} block {}: got {got}, expected {expect}", loc.seg, loc.block_off);
+            bail!("content hash mismatch in block {} at +{}: got {got}, expected {expect}", loc.block_id, loc.in_off);
         }
         Ok(out)
     }
 
     /// The decompressed bytes of the block holding `loc`, through the cache.
     fn block_bytes(&self, loc: Loc) -> Result<Arc<Vec<u8>>> {
-        let key = loc.block_key();
-        if let Some(v) = self.cache.lock().unwrap().get(key) {
+        if let Some(v) = self.cache.lock().unwrap().get(loc.block_id) {
             return Ok(v);
         }
-        let seg = loc.seg as usize;
+        let (seg, off) = *self
+            .blockdir
+            .get(loc.block_id as usize)
+            .and_then(|e| e.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("block {} is not in the fold's directory", loc.block_id))?;
         let f = self
             .readers
-            .get(seg)
-            .ok_or_else(|| anyhow::anyhow!("Loc names segment {} which does not exist", loc.seg))?;
-        if (loc.block_off as u64) < SEG_HDR_LEN {
-            bail!("Loc block offset {} is inside the segment header", loc.block_off);
+            .get(seg as usize)
+            .ok_or_else(|| anyhow::anyhow!("block {} names segment {seg} which does not exist", loc.block_id))?;
+        if (off as u64) < SEG_HDR_LEN {
+            bail!("block {} offset {off} is inside the segment header", loc.block_id);
         }
-        let has_dict = self.headers[seg].has_dict();
+        let has_dict = self.headers[seg as usize].has_dict();
 
         let mut hb = [0u8; block::BLOCK_HDR_LEN];
-        f.read_exact_at(&mut hb, loc.block_off as u64)
-            .with_context(|| format!("read block header at seg {} off {}", loc.seg, loc.block_off))?;
+        f.read_exact_at(&mut hb, off as u64)
+            .with_context(|| format!("read block header at seg {seg} off {off}"))?;
         let hdr = block::parse_hdr(&hb, has_dict)?;
+        if hdr.block_id != loc.block_id {
+            bail!("directory sent block {} to a frame carrying id {}", loc.block_id, hdr.block_id);
+        }
 
         let span = hdr.frame_len() as usize;
         let mut buf = vec![0u8; span];
-        f.read_exact_at(&mut buf, loc.block_off as u64)
-            .with_context(|| format!("read block at seg {} off {}", loc.seg, loc.block_off))?;
+        f.read_exact_at(&mut buf, off as u64).with_context(|| format!("read block at seg {seg} off {off}"))?;
         block::verify_frame_bytes(&buf, has_dict)?;
 
-        let dict = self.dicts.get(&self.headers[seg].dict_id).cloned();
+        let dict = self.dicts.get(&self.headers[seg as usize].dict_id).cloned();
         let payload = &buf[block::BLOCK_HDR_LEN..block::BLOCK_HDR_LEN + hdr.stored as usize];
         let raw = codec::decode(hdr.codec, payload, hdr.raw, dict.as_deref().map(|v| &v[..]))?;
         if blake3::hash(&raw).as_bytes()[0..2] != hdr.r16 {
-            bail!("decoded block does not match its content prefix (seg {} off {})", loc.seg, loc.block_off);
+            bail!("decoded block does not match its content prefix (block {})", loc.block_id);
         }
         let arc = Arc::new(raw);
-        self.cache.lock().unwrap().put(key, arc.clone());
+        self.cache.lock().unwrap().put(loc.block_id, arc.clone());
         Ok(arc)
     }
 
-    /// Compress and append the open block, if any. Idempotent when the buffer is empty.
+    /// Seal the open block: assign its id and hand it to the compression pool. Does no compression
+    /// and no I/O — that is the whole point. Idempotent when the buffer is empty.
     fn seal_block(&mut self) -> Result<()> {
         if self.open_block.is_empty() {
             return Ok(());
         }
-        let dict = self.active_dict();
-        let (tag, payload) = codec::encode(&self.open_block, dict.as_deref().map(|v| &v[..]), self.cfg.level)?;
-        let n = block::encode(&mut self.scratch, tag, &self.open_block, &payload);
+        let id = self.next_block;
+        self.next_block = self
+            .next_block
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("block id space exhausted"))?;
+        let raw = Arc::new(std::mem::replace(
+            &mut self.open_block,
+            Vec::with_capacity(self.cfg.block_target * 2),
+        ));
+        self.inflight.insert(id, raw.clone());
+        self.pool.submit(id, raw)?;
+        Ok(())
+    }
+
+    /// Append every block the pool has finished. With `wait`, blocks until the pool is empty.
+    fn write_ready(&mut self, wait: bool) -> Result<()> {
+        let done = if wait { self.pool.take_all()? } else { self.pool.try_take() };
+        for d in done {
+            self.write_block(d)?;
+        }
+        Ok(())
+    }
+
+    fn write_block(&mut self, d: pipe::Done) -> Result<()> {
+        let n = block::encode(&mut self.scratch, d.block_id, d.codec, &d.raw, &d.payload);
+        // Roll if this block would not fit. Blocks are self-contained, so one never straddles.
+        if self.cur_off as u64 > SEG_HDR_LEN && self.cur_off as u64 + n as u64 > self.cfg.seg_max as u64 {
+            self.roll()?;
+        }
         if let Err(e) = self.active_f.write_all_at(&self.scratch[..n], self.cur_off as u64) {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }
+        if self.blockdir.len() <= d.block_id as usize {
+            self.blockdir.resize(d.block_id as usize + 1, None);
+        }
+        self.blockdir[d.block_id as usize] = Some((self.active, self.cur_off));
         self.cur_off += n as u32;
-        self.open_block.clear();
+        match self.inflight.entry(d.block_id) {
+            Entry::Occupied(e) => {
+                e.remove();
+            }
+            Entry::Vacant(_) => {}
+        }
         Ok(())
     }
 
@@ -449,6 +534,8 @@ impl Fold {
     /// blocks compress worse.
     pub fn sync(&mut self) -> Result<FoldTail> {
         self.seal_block()?;
+        // Every block must be compressed AND written before a tail can be reported durable.
+        self.write_ready(true)?;
         self.active_f.sync_all().context("fsync active fold segment")?;
         Ok(self.tail())
     }
@@ -511,7 +598,6 @@ impl Fold {
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
-        debug_assert!(self.open_block.is_empty(), "seal before rolling — a block must not straddle segments");
         self.active_f.sync_all().context("fsync before roll")?;
         let next = self
             .active
@@ -526,6 +612,15 @@ impl Fold {
         self.active = next;
         self.cur_off = SEG_HDR_LEN as u32;
         Ok(())
+    }
+}
+
+/// Compression threads: 0 means one per core.
+fn nthreads(cfg: usize) -> usize {
+    if cfg > 0 {
+        cfg
+    } else {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     }
 }
 
