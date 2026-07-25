@@ -338,3 +338,4 @@ fn a_toc_pointing_past_the_file_is_refused() {
     }
     std::fs::remove_dir_all(&d).ok();
 }
+

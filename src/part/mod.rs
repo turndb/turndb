@@ -116,9 +116,33 @@ pub fn build_retaining(
     seq_lo: u64,
     seq_hi: u64,
     level: i32,
+    resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+    retain: &HashMap<PieceHash, Loc>,
+) -> Result<PartMeta> {
+    build_full(path, records, &[], seq_lo, seq_hi, level, resolve, retain)
+}
+
+/// [`build_retaining`], plus which of `records` are TOMBSTONES.
+///
+/// A tombstone is a row like any other — it occupies its id, carries its sequence, and takes part in
+/// version resolution — but reading it yields nothing. It has to be a row rather than an absence,
+/// because a deletion must SHADOW older versions of the same id living in older parts, and an absence
+/// cannot shadow anything.
+///
+/// `tombs` is parallel to `records` and may be empty, meaning none.
+pub fn build_full(
+    path: &Path,
+    records: &[Record],
+    tombs: &[bool],
+    seq_lo: u64,
+    seq_hi: u64,
+    level: i32,
     mut resolve: impl FnMut(&PieceHash) -> Option<Loc>,
     retain: &HashMap<PieceHash, Loc>,
 ) -> Result<PartMeta> {
+    if !tombs.is_empty() && tombs.len() != records.len() {
+        bail!("tombstone flags ({}) must be parallel to records ({})", tombs.len(), records.len());
+    }
     // ---- order + uniqueness ----
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by(|&a, &b| records[a].id.cmp(&records[b].id));
@@ -200,6 +224,27 @@ pub fn build_retaining(
         bloom.insert(h);
     }
     w.section("pdict.bloom", &bloom.encode())?;
+    // Tombstoned ROW ordinals, ascending, delta-varint. Usually empty and always tiny; a section that
+    // is absent means "this part deletes nothing", so parts written before deletion existed read
+    // correctly with no version lever.
+    if !tombs.is_empty() {
+        let mut tb = Vec::new();
+        let mut prev = 0u64;
+        let mut n = 0u64;
+        for (row, &ri) in order.iter().enumerate() {
+            if tombs[ri] {
+                put_varint(&mut tb, row as u64 - prev);
+                prev = row as u64;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            let mut out = Vec::with_capacity(tb.len() + 4);
+            put_varint(&mut out, n);
+            out.extend_from_slice(&tb);
+            w.section("tomb", &out)?;
+        }
+    }
     w.section("layout", &built.layout)?;
     w.section("layout.off", &u64s(&built.layout_off))?;
     w.section("colmeta", &built.meta)?;
@@ -446,6 +491,35 @@ impl Part {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&h[i * 32..i * 32 + 32]);
         Ok((loc, PieceHash(hash)))
+    }
+
+    /// Rows this part deletes, ascending. Empty for a part that deletes nothing, and for every part
+    /// written before deletion existed.
+    pub fn tombstones(&self) -> Result<Arc<Vec<u64>>> {
+        if !self.has("tomb") {
+            return Ok(Arc::new(Vec::new()));
+        }
+        let k = cache::Kind::Nums("tomb".into());
+        if let Some(Held::Nums(v)) = self.cache.get(self.id, &k) {
+            return Ok(v);
+        }
+        let b = self.sect("tomb")?;
+        let mut at = 0usize;
+        let n = get_varint(&b, &mut at)? as usize;
+        let mut out = Vec::with_capacity(n);
+        let mut cur = 0u64;
+        for _ in 0..n {
+            cur += get_varint(&b, &mut at)?;
+            out.push(cur);
+        }
+        let a = Arc::new(out);
+        self.cache.put(self.id, k, Held::Nums(a.clone()));
+        Ok(a)
+    }
+
+    /// Is row `r` a deletion?
+    pub fn is_tombstone(&self, r: usize) -> Result<bool> {
+        Ok(self.tombstones()?.binary_search(&(r as u64)).is_ok())
     }
 
     /// Whether this part carries any attribute columns at all.

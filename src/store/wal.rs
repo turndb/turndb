@@ -22,11 +22,16 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 pub const FRAME_TAG: u8 = 0x57;
+/// A DELETION. Its payload is the id alone — a tombstone has no body, no attributes and no content, so
+/// it costs a frame and nothing else.
+pub const TOMB_TAG: u8 = 0x58;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
 /// A record plus the bytes of any piece that was new when it was written.
 pub struct Frame {
+    /// True when this frame deletes `record.id`. The record's body and attributes are empty.
+    pub tomb: bool,
     pub seq: u64,
     pub record: Record,
     /// `(hash, bytes)` for pieces this frame introduced.
@@ -166,6 +171,27 @@ impl Wal {
         Ok(Wal { w: BufWriter::with_capacity(1 << 20, f), path: path.to_path_buf(), len, scratch: Vec::new() })
     }
 
+    /// Log a deletion. Durable on the next [`Wal::sync`], exactly like a put.
+    pub fn append_tomb(&mut self, seq: u64, id: &str) -> Result<()> {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(id.as_bytes());
+        let mut hdr = Vec::with_capacity(13);
+        hdr.push(TOMB_TAG);
+        hdr.extend_from_slice(&seq.to_le_bytes());
+        hdr.extend_from_slice(&(self.scratch.len() as u32).to_le_bytes());
+        // The CRC covers the HEADER as well as the payload — replay checks both, so omitting the
+        // header here would make every tombstone frame read back as a torn write.
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&hdr);
+        crc.update(&self.scratch);
+        let c = crc.finalize();
+        self.w.write_all(&hdr)?;
+        self.w.write_all(&self.scratch)?;
+        self.w.write_all(&c.to_le_bytes())?;
+        self.len += (HDR + self.scratch.len() + CRC) as u64;
+        Ok(())
+    }
+
     pub fn append(&mut self, seq: u64, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
         self.scratch.clear();
         encode_record(&mut self.scratch, r, novel);
@@ -220,7 +246,7 @@ impl Wal {
             if off + HDR as u64 + CRC as u64 > len || f.read_exact_at(&mut hdr, off).is_err() {
                 break;
             }
-            if hdr[0] != FRAME_TAG {
+            if hdr[0] != FRAME_TAG && hdr[0] != TOMB_TAG {
                 break;
             }
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
@@ -243,9 +269,19 @@ impl Wal {
             if crc.finalize() != u32::from_le_bytes(cb) {
                 break; // torn write
             }
-            match decode_record(&payload) {
-                Ok((record, novel)) => out.push(Frame { seq, record, novel }),
-                Err(_) => break,
+            if hdr[0] == TOMB_TAG {
+                let Ok(id) = String::from_utf8(payload) else { break };
+                out.push(Frame {
+                    seq,
+                    tomb: true,
+                    record: Record { id, body: Vec::new(), attrs: Vec::new() },
+                    novel: Vec::new(),
+                });
+            } else {
+                match decode_record(&payload) {
+                    Ok((record, novel)) => out.push(Frame { seq, tomb: false, record, novel }),
+                    Err(_) => break,
+                }
             }
             off = end;
         }
