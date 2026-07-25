@@ -552,7 +552,7 @@ fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
     std::fs::remove_dir(&man).unwrap();
     std::fs::write(&man, serde_json::to_vec(&Manifest {
         parts: vec![PartRef { file: "part-00000001.part".into(), seq_lo: 1, seq_hi: 1, records: 20 }],
-        fold_seg: 0, fold_off: 0, next_seq: 1,
+        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0,
     }).unwrap()).unwrap();
     let s = Store::open(&dir, cfg()).unwrap();
     assert_eq!(s.part_count(), 1);
@@ -869,6 +869,215 @@ fn a_writer_and_a_reader_never_disagree() {
         // an id that was never written must be absent from both
         assert_eq!(s.reconstruct("never").unwrap(), None);
         assert_eq!(r.reconstruct("never").unwrap(), None);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The re-folding merge — the one operation that rewrites content.
+// ---------------------------------------------------------------------------------------------
+
+fn fold_gen_bytes(dir: &std::path::Path) -> u64 {
+    let mut n = 0u64;
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if e.path().is_dir() && (name == "fold" || name.starts_with("fold-")) {
+            for f in std::fs::read_dir(e.path()).unwrap().flatten() {
+                if f.file_name().to_string_lossy().ends_with(".fold") {
+                    n += f.metadata().unwrap().len();
+                }
+            }
+        }
+    }
+    n
+}
+
+/// A payload big enough that keeping or dropping it is unmistakable on disk.
+fn blob(seed: u32) -> Vec<u8> {
+    (0..60_000u32)
+        .flat_map(|j| blake3::hash(&(seed.wrapping_mul(7919) ^ j).to_le_bytes()).as_bytes()[..8].to_vec())
+        .collect()
+}
+
+#[test]
+fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
+    let dir = tmp("refold");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut keep = Vec::new();
+    for i in 0..10u32 {
+        let b = blob(i);
+        s.put(&format!("k{i:02}"), &[Span::Piece(&b)], vec![
+            ("n".into(), AttrValue::Int(i as i64)),
+        ]).unwrap();
+        keep.push((format!("k{i:02}"), b));
+    }
+    for i in 100..110u32 {
+        let b = blob(i);
+        s.put(&format!("d{i:03}"), &[Span::Piece(&b)], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let before = fold_gen_bytes(&dir);
+
+    for i in 100..110u32 {
+        s.delete(&format!("d{i:03}")).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    // Deleting reclaims nothing on its own — that is the whole reason this operation exists.
+    assert_eq!(fold_gen_bytes(&dir), before, "a delete must not touch the fold");
+
+    let st = s.refold().unwrap();
+    assert_eq!(st.tombstones_dropped, 10);
+    assert_eq!(st.records_kept, 10);
+    assert_eq!(st.pieces_dropped, 10, "the deleted records' content must be dropped");
+    let after = fold_gen_bytes(&dir);
+    // Half the content was deleted, so about half should be gone — "about", because a segment carries
+    // a header and each block a frame, and asserting an exact half would be asserting the framing.
+    assert!(after < before * 6 / 10,
+        "refold kept {after} of {before} bytes; roughly half should have gone");
+    assert!(st.bytes_reclaimed() > before * 4 / 10,
+        "stats claim {} reclaimed of {before}", st.bytes_reclaimed());
+
+    for (id, body) in &keep {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "refold corrupted {id}");
+        let rec = s.get(id).unwrap().unwrap();
+        assert_eq!(rec.attrs.len(), 1, "attributes must survive a refold");
+    }
+    for i in 100..110u32 {
+        assert_eq!(s.reconstruct(&format!("d{i:03}")).unwrap(), None);
+    }
+    assert_eq!(s.ids().unwrap().len(), 10);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_refolded_store_reopens_and_keeps_working() {
+    let dir = tmp("refoldreopen");
+    let mut want = Vec::new();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        for i in 0..24u32 {
+            let b = blob(i + 500);
+            s.put(&format!("x{i:02}"), &[Span::Piece(&b)], vec![]).unwrap();
+            want.push((format!("x{i:02}"), b));
+            if i % 8 == 7 {
+                s.sync().unwrap();
+                s.flush().unwrap();
+            }
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        for i in 0..24u32 {
+            if i % 3 == 0 {
+                s.delete(&format!("x{i:02}")).unwrap();
+            }
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.refold().unwrap();
+        drop(s);
+    }
+    // Exactly one fold generation must remain: the old one is swept.
+    let folds: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n == "fold" || n.starts_with("fold-")).collect();
+    assert_eq!(folds.len(), 1, "stale fold generations must be swept: {folds:?}");
+
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for (i, (id, body)) in want.iter().enumerate() {
+        if i % 3 == 0 {
+            assert_eq!(s.reconstruct(id).unwrap(), None, "{id} was deleted before the refold");
+        } else {
+            assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "{id} did not survive reopen");
+        }
+    }
+    // and the store still WRITES afterwards, into the new generation
+    let fresh = blob(9999);
+    s.put("after", &[Span::Piece(&fresh)], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.reconstruct("after").unwrap().unwrap(), fresh);
+
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct("after").unwrap().unwrap(), fresh);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn refold_still_dedups_against_the_new_fold() {
+    // The new fold's parts carry fresh dictionaries. If Tier-1 did not follow, every subsequent write
+    // of already-stored content would be appended again.
+    let dir = tmp("refolddedup");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let b = blob(4242);
+    s.put("orig", &[Span::Piece(&b)], vec![]).unwrap();
+    s.sync().unwrap(); s.flush().unwrap();
+    s.refold().unwrap();
+
+    let before = fold_gen_bytes(&dir);
+    s.put("copy", &[Span::Piece(&b)], vec![]).unwrap();
+    s.sync().unwrap(); s.flush().unwrap();
+    assert_eq!(fold_gen_bytes(&dir), before,
+        "content already in the NEW fold was stored twice — Tier-1 did not survive the refold");
+    assert_eq!(s.reconstruct("copy").unwrap().unwrap(), b);
+    assert_eq!(s.reconstruct("orig").unwrap().unwrap(), b);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn refold_refuses_with_a_dirty_memtable() {
+    let dir = tmp("refolddirty");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "a", b"x");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    put(&mut s, "b", b"y"); // staged, references the OLD fold
+    assert!(s.refold().is_err(), "refolding under a dirty memtable must refuse");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_crashed_refold_leaves_the_store_exactly_as_it_was() {
+    // A refold writes a new fold generation and new parts BEFORE the manifest names either. A crash in
+    // that window must leave nothing but orphans, and the store must open on the old generation as
+    // though the refold had never started.
+    let dir = tmp("refoldcrash");
+    let mut want = Vec::new();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        for i in 0..12u32 {
+            let b = blob(i + 300);
+            s.put(&format!("c{i:02}"), &[Span::Piece(&b)], vec![]).unwrap();
+            want.push((format!("c{i:02}"), b));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let manifest_before = std::fs::read(dir.join("MANIFEST")).unwrap();
+
+    // Exactly what a refold leaves behind when it dies before committing: a populated next-generation
+    // fold, and part files the manifest does not name.
+    let ghost = dir.join("fold-0001");
+    std::fs::create_dir_all(&ghost).unwrap();
+    std::fs::write(ghost.join("000000.fold"), vec![7u8; 4096]).unwrap();
+    std::fs::write(dir.join("part-r0001-00000001-00000001.part"), vec![9u8; 2048]).unwrap();
+
+    let s = Store::open(&dir, cfg()).unwrap();
+    assert!(!ghost.exists(), "an uncommitted fold generation must be swept");
+    assert!(!dir.join("part-r0001-00000001-00000001.part").exists(),
+        "parts the manifest does not name must be swept");
+    assert_eq!(std::fs::read(dir.join("MANIFEST")).unwrap(), manifest_before,
+        "the committed state must be untouched");
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "{id} did not survive a crashed refold");
+    }
+    // and a refold started afresh still works
+    drop(s);
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.refold().unwrap();
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
     }
     std::fs::remove_dir_all(&dir).ok();
 }
