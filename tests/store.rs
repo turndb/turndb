@@ -820,3 +820,55 @@ fn re_putting_a_deleted_id_brings_it_back() {
     assert_eq!(s.reconstruct("x").unwrap().unwrap(), again, "and survive a full merge");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_writer_and_a_reader_never_disagree() {
+    // The structural gate for the shared read core. Store layers a memtable over the committed parts;
+    // ReadStore is the committed parts alone. Once a writer has flushed, the two must answer every
+    // read identically — and three separate defects this session were exactly a fix landing in one of
+    // these paths and not the other.
+    let dir = tmp("agree");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut live: Vec<String> = Vec::new();
+
+    for round in 0..8 {
+        for i in 0..15 {
+            let id = format!("a{round}-{i:02}");
+            put(&mut s, &id, format!("body {round}/{i}").as_bytes());
+            live.push(id);
+        }
+        // delete a spread of earlier ids, including some already deleted
+        for k in (0..live.len()).step_by(7) {
+            s.delete(&live[k].clone()).unwrap();
+        }
+        // and bring one back
+        if round % 3 == 0 && !live.is_empty() {
+            let id = live[0].clone();
+            put(&mut s, &id, format!("revived at {round}").as_bytes());
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        if round % 4 == 3 && s.part_count() >= 2 {
+            s.merge_range(0, 2).unwrap();
+        }
+
+        let r = Store::open_read(&dir, cfg()).unwrap();
+        assert_eq!(s.ids().unwrap(), r.ids().unwrap(), "round {round}: ids() diverged");
+        for id in &live {
+            assert_eq!(
+                s.reconstruct(id).unwrap(),
+                r.reconstruct(id).unwrap(),
+                "round {round}: reconstruct({id}) diverged between writer and reader"
+            );
+            assert_eq!(
+                s.get(id).unwrap().map(|x| x.id),
+                r.get(id).unwrap().map(|x| x.id),
+                "round {round}: get({id}) diverged between writer and reader"
+            );
+        }
+        // an id that was never written must be absent from both
+        assert_eq!(s.reconstruct("never").unwrap(), None);
+        assert_eq!(r.reconstruct("never").unwrap(), None);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
