@@ -406,6 +406,8 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
     assert!(st.fold_reads < 300,
         "LIMIT 5 reconstructed {} of 300 bodies — the scan is not lazy", st.fold_reads);
     assert!(st.fold_reads >= 5, "it must have read at least the rows it returned");
+    assert!(st.fold_reads <= 20,
+        "LIMIT 5 reconstructed {} bodies — the limit is not reaching the scan", st.fold_reads);
 
     // and a full body scan still returns everything, byte-exact
     table.reset_stats();
@@ -424,5 +426,38 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
             assert_eq!(bodies.value(r), want.as_slice(), "streamed body diverged for {}", ids.value(r));
         }
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn limit_cost_does_not_scale_with_part_count() {
+    // Streaming bounds memory, not work. Every partition executes, so without limit pushdown a
+    // `LIMIT 1` reconstructs one BATCH of bodies per part — on a 400-part store, thousands of
+    // reconstructions to return one row.
+    let dir = tmp("limitparts");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for p in 0..8u32 {
+        for i in 0..40u32 {
+            let body: Vec<u8> = (0..2048u32)
+                .flat_map(|j| blake3::hash(&(p * 1_000_000 + i * 1000 + j).to_le_bytes()).as_bytes()[..32].to_vec())
+                .collect();
+            s.put(&format!("p{p}-{i:03}"), &[Span::Piece(&body)], vec![]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    assert_eq!(s.part_count(), 8);
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    table.reset_stats();
+    let r = ctx.sql("SELECT id, body FROM t LIMIT 1").await.unwrap().collect().await.unwrap();
+    assert_eq!(r.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let st = table.stats();
+    // 8 parts x 40 records = 320. Without pushdown this reconstructs all 320 (each part is one batch).
+    assert!(st.fold_reads <= 8,
+        "LIMIT 1 over 8 parts reconstructed {} bodies; cost is scaling with part count", st.fold_reads);
     std::fs::remove_dir_all(&dir).ok();
 }

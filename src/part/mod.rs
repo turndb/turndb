@@ -266,6 +266,14 @@ pub struct Part {
     cache: Mutex<HashMap<String, std::sync::Arc<Vec<u8>>>>,
     /// Decoded row-index arrays, per column. Without this every row read re-decoded a whole column.
     rid_cache: Mutex<HashMap<usize, std::sync::Arc<Vec<u32>>>>,
+    /// Decoded fixed-width offset/restart arrays, by section name.
+    ///
+    /// `prog.off`, `layout.off` and `ids.restart` are read on EVERY row access, and decoding them is
+    /// linear in the part. Re-decoding per row made every whole-part walk — merge above all — quadratic
+    /// in record count: measured at 493 s to merge 8 parts of 50k records.
+    num_cache: Mutex<HashMap<String, std::sync::Arc<Vec<u64>>>>,
+    /// Decoded string dictionaries, per column. Rebuilt per attribute per row before this existed.
+    dict_cache: Mutex<HashMap<usize, std::sync::Arc<Vec<String>>>>,
 }
 
 impl Part {
@@ -316,6 +324,8 @@ impl Part {
             meta: PartMeta { n_records, seq_lo, seq_hi },
             cache: Mutex::new(HashMap::new()),
             rid_cache: Mutex::new(HashMap::new()),
+            num_cache: Mutex::new(HashMap::new()),
+            dict_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -356,8 +366,7 @@ impl Part {
     /// All ids, in order.
     pub fn ids(&self) -> Result<Vec<String>> {
         let stream = self.sect("ids")?;
-        let r = self.sect("ids.restart")?;
-        let restarts = as_u32s(&r);
+        let restarts: Vec<u32> = self.nums("ids.restart", 4)?.iter().map(|&x| x as u32).collect();
         let c = IdCol::new(&stream, &restarts, self.len());
         c.iter()?.into_iter().map(|b| Ok(String::from_utf8(b)?)).collect()
     }
@@ -365,8 +374,7 @@ impl Part {
     /// Row index of `id`, or `None`.
     pub fn find(&self, id: &str) -> Result<Option<usize>> {
         let stream = self.sect("ids")?;
-        let r = self.sect("ids.restart")?;
-        let restarts = as_u32s(&r);
+        let restarts: Vec<u32> = self.nums("ids.restart", 4)?.iter().map(|&x| x as u32).collect();
         IdCol::new(&stream, &restarts, self.len()).find(id.as_bytes())
     }
 
@@ -412,8 +420,7 @@ impl Part {
         if !bloom::probe_encoded(&self.sect("pdict.bloom")?, h) {
             return Ok(None);
         }
-        let hs = self.sect("pdict.hsort")?;
-        let ord = as_u32s(&hs);
+        let ord = self.nums("pdict.hsort", 4)?;
         let hashes = self.sect("pdict.hash")?;
         // Binary search the permutation; each probe is a random read into the (cached) hash column.
         let mut lo = 0usize;
@@ -440,8 +447,7 @@ impl Part {
     /// The body program of row `r`, with piece references resolved to content identity.
     pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
         let prog = self.sect("prog")?;
-        let offs = self.sect("prog.off")?;
-        let offs = as_u64s(&offs);
+        let offs = self.nums("prog.off", 8)?;
         if r + 1 >= offs.len() {
             bail!("row {r} out of range");
         }
@@ -475,8 +481,7 @@ impl Part {
     /// The whole record at row `r`.
     pub fn record(&self, r: usize) -> Result<Record> {
         let ids = self.sect("ids")?;
-        let rs = self.sect("ids.restart")?;
-        let restarts = as_u32s(&rs);
+        let restarts: Vec<u32> = self.nums("ids.restart", 4)?.iter().map(|&x| x as u32).collect();
         let id = String::from_utf8(IdCol::new(&ids, &restarts, self.len()).get(r)?)?;
         Ok(Record { id, body: self.body(r)?, attrs: self.attrs(r)? })
     }
@@ -487,8 +492,7 @@ impl Part {
     /// never searched. The dictionary is in fold order, so a scan walks the fold forward.
     pub fn reconstruct(&self, r: usize, fold: &Fold) -> Result<Vec<u8>> {
         let prog = self.sect("prog")?;
-        let offs = self.sect("prog.off")?;
-        let offs = as_u64s(&offs);
+        let offs = self.nums("prog.off", 8)?;
         if r + 1 >= offs.len() {
             bail!("row {r} out of range");
         }
@@ -546,6 +550,32 @@ impl Part {
     pub(crate) fn section_bytes(&self, name: &str) -> Result<std::sync::Arc<Vec<u8>>> {
         self.sect(name)
     }
+    /// A fixed-width little-endian array section, decoded once and cached.
+    pub(crate) fn nums(&self, name: &str, width: usize) -> Result<std::sync::Arc<Vec<u64>>> {
+        if let Some(v) = self.num_cache.lock().unwrap().get(name) {
+            return Ok(v.clone());
+        }
+        let b = self.sect(name)?;
+        let v: Vec<u64> = match width {
+            4 => b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect(),
+            8 => b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(),
+            w => bail!("unsupported array width {w}"),
+        };
+        let a = std::sync::Arc::new(v);
+        self.num_cache.lock().unwrap().insert(name.to_string(), a.clone());
+        Ok(a)
+    }
+
+    pub(crate) fn dict_cached(&self, c: usize) -> Option<std::sync::Arc<Vec<String>>> {
+        self.dict_cache.lock().unwrap().get(&c).cloned()
+    }
+
+    pub(crate) fn dict_put(&self, c: usize, v: Vec<String>) -> std::sync::Arc<Vec<String>> {
+        let a = std::sync::Arc::new(v);
+        self.dict_cache.lock().unwrap().insert(c, a.clone());
+        a
+    }
+
     pub(crate) fn section_present(&self, name: &str) -> bool {
         self.has(name)
     }

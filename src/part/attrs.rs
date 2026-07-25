@@ -12,7 +12,7 @@
 //! identical columns. So each row also stores a **layout**: the exact sequence of column ordinals it
 //! used. Reconstruction walks the layout and draws the next value from each named column.
 
-use super::{as_u64s, Part};
+use super::Part;
 use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, Record};
 use anyhow::{bail, Result};
@@ -193,10 +193,13 @@ pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize, u8)>> {
 }
 
 /// A string column's sorted distinct dictionary; empty for non-string columns.
-pub fn read_dict(part: &Part, c: usize) -> Result<Vec<String>> {
+pub fn read_dict(part: &Part, c: usize) -> Result<std::sync::Arc<Vec<String>>> {
+    if let Some(v) = part.dict_cached(c) {
+        return Ok(v);
+    }
     let name = format!("col.dict.{c}");
     if !part.section_present(&name) {
-        return Ok(Vec::new());
+        return Ok(part.dict_put(c, Vec::new()));
     }
     let b = part.section_bytes(&name)?;
     let mut at = 0usize;
@@ -207,7 +210,7 @@ pub fn read_dict(part: &Part, c: usize) -> Result<Vec<String>> {
         out.push(String::from_utf8(b[at..at + l].to_vec())?);
         at += l;
     }
-    Ok(out)
+    Ok(part.dict_put(c, out))
 }
 
 /// A column's row indices, decoded. Dense columns are synthesised rather than read.
@@ -260,7 +263,7 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
         return Ok(Vec::new());
     }
     let layout = part.section_bytes("layout")?;
-    let offs = as_u64s(&part.section_bytes("layout.off")?);
+    let offs = part.nums("layout.off", 8)?;
     if r + 1 >= offs.len() {
         bail!("row {r} out of range for the layout");
     }
