@@ -90,7 +90,32 @@ pub fn build(
     seq_lo: u64,
     seq_hi: u64,
     level: i32,
+    resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+) -> Result<PartMeta> {
+    build_retaining(path, records, seq_lo, seq_hi, level, resolve, &HashMap::new())
+}
+
+/// [`build`], plus dictionary entries to keep even though no record here references them.
+///
+/// A part's dictionary is normally derived from what its records reference. A MERGE cannot use that
+/// rule alone: the fold is append-only and never forgets, so a piece whose only referencing record was
+/// superseded is still stored, still addressable, and still worth deduping against. Dropping it from
+/// the dictionary would quietly do two harmful things —
+///
+///  1. lose dedup for content we go on paying to store forever, and
+///  2. break resolvability for a record that is staged but not yet flushed, whose piece was matched
+///     against the very dictionary entry the merge removed. After a crash that record can be neither
+///     read nor flushed.
+///
+/// The dictionary is therefore the union of what is referenced and what was retained.
+pub fn build_retaining(
+    path: &Path,
+    records: &[Record],
+    seq_lo: u64,
+    seq_hi: u64,
+    level: i32,
     mut resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+    retain: &HashMap<PieceHash, Loc>,
 ) -> Result<PartMeta> {
     // ---- order + uniqueness ----
     let mut order: Vec<usize> = (0..records.len()).collect();
@@ -114,6 +139,9 @@ pub fn build(
                 }
             }
         }
+    }
+    for (h, l) in retain {
+        piece_of.entry(*h).or_insert(*l);
     }
     let mut dict: Vec<(Loc, PieceHash)> = piece_of.iter().map(|(h, l)| (*l, *h)).collect();
     dict.sort_by_key(|(l, _)| (l.block_id, l.in_off));

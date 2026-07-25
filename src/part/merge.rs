@@ -110,7 +110,19 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
         out_recs.push(parts[pi].record(row)?);
     }
 
-    let meta = super::build(out, &out_recs, seq_lo, seq_hi, level, |h| locs.get(h).copied())?;
+    // RETAIN the whole gathered union, not just what the surviving records reference. The fold never
+    // forgets, so every piece any input knew about is still stored and still worth deduping against —
+    // and a record staged but not yet flushed may have matched against an entry that is about to stop
+    // being referenced here.
+    let meta = super::build_retaining(
+        out,
+        &out_recs,
+        seq_lo,
+        seq_hi,
+        level,
+        |h| locs.get(h).copied(),
+        &locs,
+    )?;
     let stats = MergeStats {
         inputs: parts.len(),
         records_in,

@@ -198,17 +198,8 @@ impl Store {
     /// a crash discards.
     fn fold_piece(&mut self, b: &[u8]) -> Result<crate::fold::Put> {
         let hash = PieceHash::of(b);
-        if let Some(loc) = self.fold.lookup(hash) {
-            return Ok(crate::fold::Put { hash, loc, deduped: true });
-        }
-        let mut found = None;
-        for p in self.parts.iter().rev() {
-            if let Some(loc) = p.lookup_piece(&hash)? {
-                found = Some(loc);
-                break;
-            }
-        }
-        if let Some(loc) = found {
+        if let Some(loc) = self.locate(&hash)? {
+            // Seed the window so further references in this flush interval answer from memory.
             self.fold.note(hash, loc);
             return Ok(crate::fold::Put { hash, loc, deduped: true });
         }
@@ -276,23 +267,9 @@ impl Store {
                 if locs.contains_key(hash) {
                     continue;
                 }
-                let loc = match self.fold.lookup(*hash) {
-                    Some(l) => l,
-                    None => {
-                        let mut found = None;
-                        for p in self.parts.iter().rev() {
-                            if let Some(l) = p.lookup_piece(hash)? {
-                                found = Some(l);
-                                break;
-                            }
-                        }
-                        found.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "staged piece {hash} is in neither the fold window nor any live part"
-                            )
-                        })?
-                    }
-                };
+                let loc = self.locate(hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("staged piece {hash} is in neither the fold window nor any live part")
+                })?;
                 locs.insert(*hash, loc);
             }
         }
@@ -399,6 +376,25 @@ impl Store {
         Ok(None)
     }
 
+    /// Where content lives, through BOTH dedup tiers.
+    ///
+    /// The single answer to "where is this piece" for every caller that needs one — the write path,
+    /// the flush path, and the staged-record read path. They disagreed before, and each disagreement
+    /// was the same bug wearing a different hat: a piece deduped against a committed part is not in
+    /// the in-memory window, and after a crash nothing puts it back there, because the WAL carries no
+    /// bytes for content that was already durable.
+    fn locate(&self, h: &PieceHash) -> Result<Option<Loc>> {
+        if let Some(l) = self.fold.lookup(*h) {
+            return Ok(Some(l));
+        }
+        for p in self.parts.iter().rev() {
+            if let Some(l) = p.lookup_piece(h)? {
+                return Ok(Some(l));
+            }
+        }
+        Ok(None)
+    }
+
     fn rebuild(&self, r: &Record) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         for op in &r.body {
@@ -406,8 +402,7 @@ impl Store {
                 BodyOp::Lit(b) => out.extend_from_slice(b),
                 BodyOp::Piece { hash, .. } => {
                     let loc = self
-                        .fold
-                        .lookup(*hash)
+                        .locate(hash)?
                         .ok_or_else(|| anyhow::anyhow!("piece {hash} not resolvable"))?;
                     out.extend_from_slice(&self.fold.read_verified(loc, *hash)?);
                 }
@@ -430,6 +425,19 @@ impl Store {
 
     pub fn part_count(&self) -> usize {
         self.parts.len()
+    }
+
+    /// Every live id: committed parts plus the uncommitted memtable.
+    ///
+    /// Includes staged records, unlike [`ReadStore::ids`], because a writer can see its own writes.
+    pub fn ids(&self) -> Result<Vec<String>> {
+        let mut all: Vec<String> = self.mem.keys().cloned().collect();
+        for p in &self.parts {
+            all.extend(p.ids()?);
+        }
+        all.sort();
+        all.dedup();
+        Ok(all)
     }
 
     /// Pieces resident in the Tier-0 dedup window. Bounded by the flush interval, not by store size.
