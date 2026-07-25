@@ -716,3 +716,107 @@ fn a_manifest_naming_a_truly_absent_part_errors_rather_than_spinning() {
     assert!(t.elapsed().as_secs() < 5, "the retry is not bounded");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Deletion. Until now the store could only grow.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_deleted_record_is_gone_from_every_read_path() {
+    let dir = tmp("delete");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let keep = put(&mut s, "keep", b"still here");
+    put(&mut s, "gone", b"not for long");
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    s.delete("gone").unwrap();
+    // visible immediately, before any flush
+    assert_eq!(s.reconstruct("gone").unwrap(), None, "a staged delete must take effect at once");
+    assert_eq!(s.get("gone").unwrap(), None);
+    assert!(!s.ids().unwrap().contains(&"gone".to_string()));
+    assert_eq!(s.reconstruct("keep").unwrap().unwrap(), keep);
+
+    s.sync().unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.reconstruct("gone").unwrap(), None, "and after the tombstone is committed");
+    assert_eq!(s.get("gone").unwrap(), None);
+    assert_eq!(s.ids().unwrap(), vec!["keep".to_string()]);
+
+    // a lockless reader agrees
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct("gone").unwrap(), None);
+    assert_eq!(r.ids().unwrap(), vec!["keep".to_string()]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_deletion_survives_a_crash() {
+    let dir = tmp("delcrash");
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        put(&mut s, "a", b"alpha");
+        let beta = put(&mut s, "b", b"beta");
+        std::fs::write(dir.join("beta.expect"), &beta).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.delete("a").unwrap();
+        s.sync().unwrap(); // ACKed, never flushed
+        drop(s);
+    }
+    let s = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(s.reconstruct("a").unwrap(), None, "a SYNCED deletion must survive a crash");
+    let beta = std::fs::read(dir.join("beta.expect")).unwrap();
+    assert_eq!(s.reconstruct("b").unwrap().unwrap(), beta);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_partial_merge_must_not_resurrect_a_deleted_record() {
+    // THE gate. A tombstone exists to shadow older versions of its id. Dropping one while a part
+    // outside the merge still holds an older version brings deleted data back.
+    let dir = tmp("resurrect");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "victim", b"the original value");
+    s.sync().unwrap(); s.flush().unwrap();              // part 1: victim exists
+    let filler = put(&mut s, "filler", b"unrelated");
+    s.sync().unwrap(); s.flush().unwrap();              // part 2
+    s.delete("victim").unwrap();
+    s.sync().unwrap(); s.flush().unwrap();              // part 3: victim deleted
+    assert_eq!(s.part_count(), 3);
+    assert_eq!(s.reconstruct("victim").unwrap(), None);
+
+    // Merge only the NEWER two. Part 1 still holds the original, so the tombstone must survive.
+    let st = s.merge_range(1, 2).unwrap().unwrap();
+    assert_eq!(st.tombstones_dropped, 0, "a partial merge must not discard tombstones");
+    assert_eq!(st.tombstones_kept, 1);
+    assert_eq!(s.reconstruct("victim").unwrap(), None, "DELETED DATA CAME BACK");
+
+    // Now merge everything: nothing is left to shadow, so the tombstone can finally go.
+    let st = s.merge_range(0, s.part_count()).unwrap().unwrap();
+    assert_eq!(st.tombstones_dropped, 1, "a full merge should finally discard it");
+    assert_eq!(s.reconstruct("victim").unwrap(), None, "and it stays gone");
+    assert!(!s.ids().unwrap().contains(&"victim".to_string()));
+    assert_eq!(s.reconstruct("filler").unwrap().unwrap(), filler);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn re_putting_a_deleted_id_brings_it_back() {
+    let dir = tmp("undelete");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "x", b"first");
+    s.sync().unwrap(); s.flush().unwrap();
+    s.delete("x").unwrap();
+    s.sync().unwrap(); s.flush().unwrap();
+    assert_eq!(s.reconstruct("x").unwrap(), None);
+
+    let again = put(&mut s, "x", b"second life");
+    s.sync().unwrap(); s.flush().unwrap();
+    assert_eq!(s.reconstruct("x").unwrap().unwrap(), again, "a put after a delete must win");
+    assert!(s.ids().unwrap().contains(&"x".to_string()));
+
+    s.merge_range(0, s.part_count()).unwrap();
+    assert_eq!(s.reconstruct("x").unwrap().unwrap(), again, "and survive a full merge");
+    std::fs::remove_dir_all(&dir).ok();
+}

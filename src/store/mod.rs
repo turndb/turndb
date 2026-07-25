@@ -111,7 +111,9 @@ pub struct Store {
     parts: Vec<Arc<Part>>,
     manifest: Manifest,
     /// Uncommitted records, last-write-wins by id.
-    mem: BTreeMap<String, Record>,
+    /// Uncommitted records. `None` is a staged DELETION — it must be a value rather than an absence,
+    /// because it has to shadow whatever older parts still say about the id.
+    mem: BTreeMap<String, Option<Record>>,
     mem_bytes: usize,
     wal: Wal,
     cfg: FoldCfg,
@@ -152,7 +154,7 @@ impl Store {
 
         let wal_path = dir.join("WAL");
         let frames = Wal::replay(&wal_path)?;
-        let mut mem = BTreeMap::new();
+        let mut mem: BTreeMap<String, Option<Record>> = BTreeMap::new();
         let mut mem_bytes = 0usize;
         for f in frames {
             // Re-fold every piece this frame introduced. Content already below the committed tail
@@ -162,7 +164,11 @@ impl Store {
                 debug_assert_eq!(put.hash, *h);
             }
             mem_bytes += approx_bytes(&f.record);
-            mem.insert(f.record.id.clone(), f.record);
+            if f.tomb {
+                mem.insert(f.record.id, None);
+            } else {
+                mem.insert(f.record.id.clone(), Some(f.record));
+            }
         }
         let wal = Wal::open(&wal_path)?;
 
@@ -265,7 +271,21 @@ impl Store {
         let rec = Record { id: id.to_string(), body, attrs };
         self.wal.append(self.manifest.next_seq, &rec, &novel)?;
         self.mem_bytes += approx_bytes(&rec);
-        self.mem.insert(rec.id.clone(), rec);
+        self.mem.insert(rec.id.clone(), Some(rec));
+        Ok(())
+    }
+
+    /// Delete `id`. Durable only after [`sync`], exactly like a put.
+    ///
+    /// Recorded as a TOMBSTONE rather than by removing anything: older parts are immutable and still
+    /// hold the record, so a deletion has to be a newer version that says "absent". Space is not
+    /// reclaimed here — the content stays in the fold, which is append-only. Reclaiming it is a
+    /// separate, deliberate operation, because the fold is shared and the same bytes may be referenced
+    /// by records that are still live.
+    pub fn delete(&mut self, id: &str) -> Result<()> {
+        self.wal.append_tomb(self.manifest.next_seq, id)?;
+        self.mem_bytes += id.len() + 32;
+        self.mem.insert(id.to_string(), None);
         Ok(())
     }
 
@@ -286,7 +306,21 @@ impl Store {
         let seq = self.manifest.next_seq + 1;
         let file = format!("part-{seq:08}.part");
         let path = self.dir.join(&file);
-        let recs: Vec<Record> = self.mem.values().cloned().collect();
+        let mut recs: Vec<Record> = Vec::with_capacity(self.mem.len());
+        let mut tombs: Vec<bool> = Vec::with_capacity(self.mem.len());
+        for (id, v) in &self.mem {
+            match v {
+                Some(r) => {
+                    recs.push(r.clone());
+                    tombs.push(false);
+                }
+                // A tombstone still needs a row, so it gets an empty one carrying only its id.
+                None => {
+                    recs.push(Record { id: id.clone(), body: Vec::new(), attrs: Vec::new() });
+                    tombs.push(true);
+                }
+            }
+        }
 
         // Resolve every referenced piece through BOTH tiers, exactly as the write path does.
         //
@@ -311,7 +345,10 @@ impl Store {
                 locs.insert(*hash, loc);
             }
         }
-        let meta = part::build(&path, &recs, seq, seq, self.cfg.level, |h| locs.get(h).copied())?;
+        let meta = part::build_full(
+            &path, &recs, &tombs, seq, seq, self.cfg.level,
+            |h| locs.get(h).copied(), &HashMap::new(),
+        )?;
 
         let mut m = self.manifest.clone();
         m.parts.push(PartRef { file: file.clone(), seq_lo: seq, seq_hi: seq, records: meta.n_records });
@@ -355,7 +392,12 @@ impl Store {
             "merge output {file} collides with a live part"
         );
         let path = self.dir.join(&file);
-        let (meta, stats) = crate::part::merge::merge(&path, &inputs, self.cfg.level)?;
+        // A tombstone may only be discarded when this merge covers the ENTIRE live list — otherwise a
+        // part outside the run could still hold an older version of the deleted id, and dropping the
+        // tombstone would resurrect it.
+        let total = lo == 0 && len == self.parts.len();
+        let (meta, stats) =
+            crate::part::merge::merge_opts(&path, &inputs, self.cfg.level, total)?;
 
         // Publish: the merged part is durable (part::build fsyncs) before the manifest names it, and
         // the manifest swap is the single linearization point. A crash before it leaves the merged
@@ -395,19 +437,27 @@ impl Store {
 
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
-        if let Some(r) = self.mem.get(id) {
-            return Ok(Some(r.clone()));
+        if let Some(v) = self.mem.get(id) {
+            return Ok(v.clone());
         }
         newest(&self.parts, id)
     }
 
     /// Byte-exact content for `id`.
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
-        if let Some(r) = self.mem.get(id) {
-            return Ok(Some(self.rebuild(r)?));
+        if let Some(v) = self.mem.get(id) {
+            return match v {
+                Some(r) => Ok(Some(self.rebuild(r)?)),
+                None => Ok(None), // staged deletion
+            };
         }
         for p in self.parts.iter().rev() {
             if let Some(row) = p.find(id)? {
+                // The NEWEST part holding the id decides, and if it says deleted the answer is
+                // absent — older parts still holding it are superseded, not consulted.
+                if p.is_tombstone(row)? {
+                    return Ok(None);
+                }
                 return Ok(Some(p.reconstruct(row, &self.fold)?));
             }
         }
@@ -469,12 +519,19 @@ impl Store {
     ///
     /// Includes staged records, unlike [`ReadStore::ids`], because a writer can see its own writes.
     pub fn ids(&self) -> Result<Vec<String>> {
-        let mut all: Vec<String> = self.mem.keys().cloned().collect();
+        let mut all: Vec<String> = self.mem.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k.clone()).collect();
         for p in &self.parts {
-            all.extend(p.ids()?);
+            all.extend(live_ids(p)?);
         }
         all.sort();
         all.dedup();
+        // An id deleted in a newer part or staged as deleted must not appear because an older part
+        // still lists it.
+        all.retain(|id| match self.mem.get(id) {
+            Some(None) => false,
+            Some(Some(_)) => true,
+            None => newest_exists(&self.parts, id).unwrap_or(true),
+        });
         Ok(all)
     }
 
@@ -514,6 +571,9 @@ impl ReadStore {
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
         for p in self.parts.iter().rev() {
             if let Some(row) = p.find(id)? {
+                if p.is_tombstone(row)? {
+                    return Ok(None);
+                }
                 return Ok(Some(p.reconstruct(row, &self.fold)?));
             }
         }
@@ -524,10 +584,11 @@ impl ReadStore {
     pub fn ids(&self) -> Result<Vec<String>> {
         let mut all: Vec<String> = Vec::new();
         for p in &self.parts {
-            all.extend(p.ids()?);
+            all.extend(live_ids(p)?);
         }
         all.sort();
         all.dedup();
+        all.retain(|id| newest_exists(&self.parts, id).unwrap_or(true));
         Ok(all)
     }
 
@@ -546,9 +607,38 @@ impl ReadStore {
 }
 
 /// Later parts hold later sequence numbers, so the last hit wins.
+/// Ids a part lists that it does not itself delete.
+fn live_ids(p: &Arc<Part>) -> Result<Vec<String>> {
+    let tombs = p.tombstones()?;
+    if tombs.is_empty() {
+        return p.ids();
+    }
+    let ids = p.ids()?;
+    Ok(ids
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| tombs.binary_search(&(*i as u64)).is_err())
+        .map(|(_, id)| id)
+        .collect())
+}
+
+/// Does the NEWEST part holding `id` say it exists?
+fn newest_exists(parts: &[Arc<Part>], id: &str) -> Result<bool> {
+    for p in parts.iter().rev() {
+        if let Some(row) = p.find(id)? {
+            return Ok(!p.is_tombstone(row)?);
+        }
+    }
+    Ok(false)
+}
+
+/// The newest committed version of `id`, or `None` if the newest one is a deletion.
 fn newest(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
     for p in parts.iter().rev() {
         if let Some(row) = p.find(id)? {
+            if p.is_tombstone(row)? {
+                return Ok(None);
+            }
             return Ok(Some(p.record(row)?));
         }
     }

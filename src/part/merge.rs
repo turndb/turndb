@@ -39,12 +39,33 @@ pub struct MergeStats {
     pub records_out: usize,
     /// Records dropped because a later part carried a newer version of the same id.
     pub superseded: usize,
+    /// Deletions carried forward, because something outside this merge could still hold an older
+    /// version of the id.
+    pub tombstones_kept: usize,
+    /// Deletions finally discarded — only possible when the merge covered every live part.
+    pub tombstones_dropped: usize,
     /// Always zero. Asserted, because "merge never touches the fold" is the load-bearing claim.
     pub fold_bytes_touched: u64,
 }
 
 /// Merge a contiguous run of parts into `out`.
 pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, MergeStats)> {
+    merge_opts(out, inputs, level, false)
+}
+
+/// [`merge`], with the option to DROP tombstones rather than carry them forward.
+///
+/// A tombstone exists to shadow older versions of its id. It can only be discarded when there is
+/// nothing left for it to shadow — that is, when the merge covers every live part, so no part outside
+/// it can still hold an older version of that id. Dropping one otherwise RESURRECTS deleted data,
+/// which is the worst outcome available here and the reason this is a caller's decision rather than an
+/// inference: only the store knows whether the run it passed is the whole live list.
+pub fn merge_opts(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+) -> Result<(PartMeta, MergeStats)> {
     if inputs.is_empty() {
         bail!("merge needs at least one input part");
     }
@@ -81,7 +102,10 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
     let records_in: usize = ids.iter().map(|v| v.len()).sum();
     let mut cursor = vec![0usize; parts.len()];
     let mut out_recs: Vec<Record> = Vec::with_capacity(records_in);
+    let mut out_tombs: Vec<bool> = Vec::with_capacity(records_in);
     let mut superseded = 0usize;
+    let mut tombs_kept = 0usize;
+    let mut tombs_dropped = 0usize;
 
     loop {
         // smallest id across all cursors
@@ -107,16 +131,28 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
             }
         }
         let (pi, row) = winner.expect("an id was found, so some part holds it");
-        out_recs.push(parts[pi].record(row)?);
+        if parts[pi].is_tombstone(row)? {
+            if drop_tombstones {
+                tombs_dropped += 1;
+                continue;
+            }
+            tombs_kept += 1;
+            out_recs.push(Record { id, body: Vec::new(), attrs: Vec::new() });
+            out_tombs.push(true);
+        } else {
+            out_recs.push(parts[pi].record(row)?);
+            out_tombs.push(false);
+        }
     }
 
     // RETAIN the whole gathered union, not just what the surviving records reference. The fold never
     // forgets, so every piece any input knew about is still stored and still worth deduping against —
     // and a record staged but not yet flushed may have matched against an entry that is about to stop
     // being referenced here.
-    let meta = super::build_retaining(
+    let meta = super::build_full(
         out,
         &out_recs,
+        &out_tombs,
         seq_lo,
         seq_hi,
         level,
@@ -128,6 +164,8 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
         records_in,
         records_out: out_recs.len(),
         superseded,
+        tombstones_kept: tombs_kept,
+        tombstones_dropped: tombs_dropped,
         fold_bytes_touched: 0,
     };
     Ok((meta, stats))

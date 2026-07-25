@@ -58,15 +58,19 @@ type Attrs = Vec<(String, AttrValue)>;
 /// The reference. A map from id to the last thing written under it — nothing more.
 #[derive(Default, Clone)]
 struct Model {
-    /// Durable: written and synced. These MUST survive anything.
-    acked: BTreeMap<String, (Vec<u8>, Attrs)>,
+    /// Durable: written and synced. These MUST survive anything. `None` is a DELETION — an id the
+    /// store must report absent, which is a fact as durable as any value.
+    acked: BTreeMap<String, Option<(Vec<u8>, Attrs)>>,
     /// Written but not yet synced. These MAY be lost by a crash, and must be correct if present.
-    staged: BTreeMap<String, (Vec<u8>, Attrs)>,
+    staged: BTreeMap<String, Option<(Vec<u8>, Attrs)>>,
 }
 
 impl Model {
     fn put(&mut self, id: &str, body: Vec<u8>, attrs: Attrs) {
-        self.staged.insert(id.to_string(), (body, attrs));
+        self.staged.insert(id.to_string(), Some((body, attrs)));
+    }
+    fn delete(&mut self, id: &str) {
+        self.staged.insert(id.to_string(), None);
     }
     fn sync(&mut self) {
         for (k, v) in std::mem::take(&mut self.staged) {
@@ -95,8 +99,11 @@ impl Model {
                         .reconstruct(&id)
                         .unwrap_or_else(|e| panic!("{ctx}: reconstruct({id}) errored: {e}"))
                         .expect("get found it, so reconstruct must too");
-                    let is_staged = body == staged.0 && rec.attrs == staged.1;
-                    let is_acked = acked.as_ref().is_some_and(|a| body == a.0 && rec.attrs == a.1);
+                    let matches = |v: &Option<(Vec<u8>, Attrs)>| {
+                        v.as_ref().is_some_and(|a| body == a.0 && rec.attrs == a.1)
+                    };
+                    let is_staged = matches(&staged);
+                    let is_acked = acked.as_ref().is_some_and(matches);
                     assert!(
                         is_staged || is_acked,
                         "{ctx}: after a crash {id} holds a value that was never written for it"
@@ -105,10 +112,17 @@ impl Model {
                         self.acked.insert(id, staged);
                     }
                 }
-                None => assert!(
-                    acked.is_none(),
-                    "{ctx}: a SYNCED record ({id}) vanished across a crash"
-                ),
+                None => {
+                    // Absent is legal if it was DELETED (staged or acked), or if the staged write
+                    // simply did not survive and nothing was acked before it.
+                    let ok = staged.is_none()
+                        || acked.is_none()
+                        || acked.as_ref().is_some_and(|a| a.is_none());
+                    assert!(ok, "{ctx}: a SYNCED record ({id}) vanished across a crash");
+                    if staged.is_none() {
+                        self.acked.insert(id, None);
+                    }
+                }
             }
         }
     }
@@ -155,27 +169,34 @@ fn attrs_for(r: &mut Rng) -> Attrs {
 fn verify(s: &Store, m: &Model, ctx: &str) {
     // The EFFECTIVE view: a staged write shadows the acked one. Chaining the two maps would check an
     // id twice and assert its superseded value on the first pass.
-    let mut eff: BTreeMap<&String, &(Vec<u8>, Attrs)> = m.acked.iter().collect();
+    let mut eff: BTreeMap<&String, &Option<(Vec<u8>, Attrs)>> = m.acked.iter().collect();
     for (k, v) in &m.staged {
         eff.insert(k, v);
     }
-    for (id, (body, attrs)) in eff {
+    for (id, v) in &eff {
         let got = s
             .reconstruct(id)
             .unwrap_or_else(|e| panic!("{ctx}: reconstruct({id}) errored: {e}"));
-        let got = got.unwrap_or_else(|| panic!("{ctx}: {id} is missing"));
-        assert_eq!(&got, body, "{ctx}: {id} reconstructed to the wrong bytes");
-
-        let rec = s.get(id).unwrap().unwrap_or_else(|| panic!("{ctx}: get({id}) is missing"));
-        assert_eq!(&rec.attrs, attrs, "{ctx}: {id} attributes diverged");
+        match v {
+            Some((body, attrs)) => {
+                let got = got.unwrap_or_else(|| panic!("{ctx}: {id} is missing"));
+                assert_eq!(&got, body, "{ctx}: {id} reconstructed to the wrong bytes");
+                let rec = s.get(id).unwrap().unwrap_or_else(|| panic!("{ctx}: get({id}) is missing"));
+                assert_eq!(&rec.attrs, attrs, "{ctx}: {id} attributes diverged");
+            }
+            // A DELETED id must be absent from every read path — including after merges that may or
+            // may not have been allowed to discard the tombstone.
+            None => {
+                assert_eq!(got, None, "{ctx}: {id} was deleted but still reconstructs");
+                assert_eq!(s.get(id).unwrap(), None, "{ctx}: {id} was deleted but get returns it");
+            }
+        }
     }
-    // No id the model never wrote may exist.
     let live: Vec<String> = s.ids().unwrap();
     for id in &live {
-        assert!(
-            m.acked.contains_key(id) || m.staged.contains_key(id),
-            "{ctx}: store holds {id}, which was never written"
-        );
+        let known = eff.get(id).copied();
+        assert!(known.is_some(), "{ctx}: store holds {id}, which was never written");
+        assert!(known.unwrap().is_some(), "{ctx}: {id} was DELETED but still appears in ids()");
     }
 }
 
@@ -219,7 +240,13 @@ fn run_seed(seed: u64, steps: usize) -> usize {
                 body.extend_from_slice(&piece);
                 m.put(&id, body, attrs);
             }
-            65..=74 => {
+            // delete an id that probably exists
+            65..=71 => {
+                let id = format!("id{:03}", r.below(60));
+                s.delete(&id).unwrap();
+                m.delete(&id);
+            }
+            72..=74 => {
                 s.sync().unwrap();
                 m.sync();
             }
@@ -269,12 +296,19 @@ fn run_seed(seed: u64, steps: usize) -> usize {
 
     // a reader with no lock sees the same committed state
     let rs = Store::open_read(&dir, cfg()).unwrap();
-    for (id, (body, _)) in &m.acked {
-        assert_eq!(
-            &rs.reconstruct(id).unwrap().unwrap(),
-            body,
-            "seed {seed}: a lockless reader diverged on {id}"
-        );
+    for (id, v) in &m.acked {
+        match v {
+            Some((body, _)) => assert_eq!(
+                &rs.reconstruct(id).unwrap().unwrap(),
+                body,
+                "seed {seed}: a lockless reader diverged on {id}"
+            ),
+            None => assert_eq!(
+                rs.reconstruct(id).unwrap(),
+                None,
+                "seed {seed}: a lockless reader still sees deleted {id}"
+            ),
+        }
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -335,16 +369,24 @@ fn crash_never_resurrects_and_never_corrupts() {
         s = Store::open(&dir, cfg()).unwrap();
         m.reconcile(&s, &format!("round {round}"));
 
-        for (id, (body, _)) in &m.acked {
-            assert_eq!(
-                &s.reconstruct(id).unwrap().unwrap(),
-                body,
-                "round {round}: a SYNCED record did not survive the crash"
-            );
+        for (id, v) in &m.acked {
+            match v {
+                Some((body, _)) => assert_eq!(
+                    &s.reconstruct(id).unwrap().unwrap(),
+                    body,
+                    "round {round}: a SYNCED record did not survive the crash"
+                ),
+                None => assert_eq!(s.reconstruct(id).unwrap(), None,
+                    "round {round}: a SYNCED deletion did not survive the crash"),
+            }
         }
         // nothing may exist that was never written
         for id in s.ids().unwrap() {
-            assert!(m.acked.contains_key(&id), "round {round}: store holds {id}, never written");
+            match m.acked.get(&id) {
+                Some(Some(_)) => {}
+                Some(None) => panic!("round {round}: {id} was deleted but ids() still lists it"),
+                None => panic!("round {round}: store holds {id}, never written"),
+            }
         }
     }
     std::fs::remove_dir_all(&dir).ok();
