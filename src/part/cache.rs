@@ -55,6 +55,9 @@ pub enum Kind {
     Rids(usize),
     /// A decoded string dictionary, by column ordinal.
     Dict(usize),
+    /// The decoded id column. Front-coded on disk, so every read of it reconstructs prefixes and
+    /// validates UTF-8 — worth doing once.
+    Ids,
 }
 
 #[derive(Clone)]
@@ -62,7 +65,7 @@ pub enum Held {
     Bytes(Arc<Vec<u8>>),
     Nums(Arc<Vec<u64>>),
     Rids(Arc<Vec<u32>>),
-    Dict(Arc<Vec<String>>),
+    Strings(Arc<Vec<String>>),
 }
 
 impl Held {
@@ -73,7 +76,7 @@ impl Held {
             Held::Rids(v) => v.len() * 4,
             // A String is a pointer, length and capacity beyond its bytes; ignoring that would
             // under-count a dictionary of short strings several times over.
-            Held::Dict(v) => v.iter().map(|s| s.len() + std::mem::size_of::<String>()).sum(),
+            Held::Strings(v) => v.iter().map(|s| s.len() + std::mem::size_of::<String>()).sum(),
         }
     }
 }

@@ -98,7 +98,7 @@ pub fn merge_opts(
 
     // K-way merge over the id columns. Parts are id-sorted and hold one version per id, so a simple
     // positional walk suffices; later parts win ties.
-    let ids: Vec<Vec<String>> = parts.iter().map(|p| p.ids()).collect::<Result<_>>()?;
+    let ids: Vec<std::sync::Arc<Vec<String>>> = parts.iter().map(|p| p.ids()).collect::<Result<_>>()?;
     let records_in: usize = ids.iter().map(|v| v.len()).sum();
     let mut cursor = vec![0usize; parts.len()];
     let mut out_recs: Vec<Record> = Vec::with_capacity(records_in);

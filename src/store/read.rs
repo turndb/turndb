@@ -53,8 +53,8 @@ pub(crate) fn visibility(parts: &[Arc<Part>]) -> Result<Visibility> {
     for (pi, p) in parts.iter().enumerate().rev() {
         let ids = p.ids()?;
         let tombs = p.tombstones()?;
-        for (row, id) in ids.into_iter().enumerate() {
-            if !seen.insert(id) {
+        for (row, id) in ids.iter().enumerate() {
+            if !seen.insert(id.clone()) {
                 superseded += 1;
             } else if tombs.binary_search(&(row as u64)).is_ok() {
                 tombstones += 1;
