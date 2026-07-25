@@ -19,6 +19,7 @@
 //!   sequentially. Block ids ascend with write order, so this is physical locality too.
 
 pub mod attrs;
+pub mod bloom;
 pub mod idcol;
 pub mod merge;
 
@@ -142,6 +143,18 @@ pub fn build(
     w.section("prog.off", &u64s(&prog_off))?;
     w.section("pdict.loc", &dict.iter().flat_map(|(l, _)| l.encode()).collect::<Vec<u8>>())?;
     w.section("pdict.hash", &dict.iter().flat_map(|(_, h)| h.0).collect::<Vec<u8>>())?;
+    // The dictionary is sorted in FOLD order, which is what makes merge a gather and keeps decode
+    // sequential — but it cannot be searched by content. Tier-1 dedup therefore carries a hash-sorted
+    // permutation of it (4 B/piece) plus a filter (1.25 B/piece), rather than re-sorting the dictionary
+    // and giving up the fold-order property. Two orders over one dictionary, not two dictionaries.
+    let mut hsort: Vec<u32> = (0..dict.len() as u32).collect();
+    hsort.sort_by_key(|&i| dict[i as usize].1 .0);
+    w.section("pdict.hsort", &u32s(&hsort))?;
+    let mut bloom = bloom::Bloom::with_capacity(dict.len());
+    for (_, h) in &dict {
+        bloom.insert(h);
+    }
+    w.section("pdict.bloom", &bloom.encode())?;
     w.section("layout", &built.layout)?;
     w.section("layout.off", &u64s(&built.layout_off))?;
     w.section("colmeta", &built.meta)?;
@@ -357,6 +370,46 @@ impl Part {
 
     pub fn piece_count(&self) -> Result<usize> {
         Ok(self.sect("pdict.loc")?.len() / Loc::WIDTH)
+    }
+
+    /// **Tier-1 dedup.** Does this part already hold `h`, and if so, where in the fold?
+    ///
+    /// Filter first — that is the whole point, since at high duplication almost every write asks this
+    /// question of every part and nearly all answers are "no". Only on a filter hit does the sorted
+    /// permutation get searched, and only then is the answer definitive.
+    ///
+    /// Parts written before this section existed simply answer `None`: an older part is allowed to
+    /// decline to participate in dedup, because a miss costs bytes and never correctness.
+    pub fn lookup_piece(&self, h: &PieceHash) -> Result<Option<Loc>> {
+        if !self.has("pdict.bloom") || !self.has("pdict.hsort") {
+            return Ok(None);
+        }
+        if !bloom::probe_encoded(&self.sect("pdict.bloom")?, h) {
+            return Ok(None);
+        }
+        let hs = self.sect("pdict.hsort")?;
+        let ord = as_u32s(&hs);
+        let hashes = self.sect("pdict.hash")?;
+        // Binary search the permutation; each probe is a random read into the (cached) hash column.
+        let mut lo = 0usize;
+        let mut hi = ord.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let at = ord[mid] as usize * 32;
+            if at + 32 > hashes.len() {
+                bail!("piece dictionary permutation points outside the hash column");
+            }
+            match hashes[at..at + 32].cmp(&h.0[..]) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let l = self.sect("pdict.loc")?;
+                    let o = ord[mid] as usize * Loc::WIDTH;
+                    return Ok(Some(Loc::decode(&l[o..])?));
+                }
+            }
+        }
+        Ok(None) // filter false positive
     }
 
     /// The body program of row `r`, with piece references resolved to content identity.
