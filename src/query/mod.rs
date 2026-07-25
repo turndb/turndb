@@ -90,6 +90,28 @@ pub struct ScanStats {
     pub shadowed_occurrences: usize,
 }
 
+impl ScanStats {
+    /// What happened between `prev` and now. A lazy scan publishes progress by delta, so a query that
+    /// stops early (LIMIT, an error, a dropped stream) reports what it actually touched.
+    pub fn since(&self, prev: ScanStats) -> ScanStats {
+        ScanStats {
+            rows: self.rows - prev.rows,
+            batches: self.batches - prev.batches,
+            columns_decoded: self.columns_decoded - prev.columns_decoded,
+            fold_reads: self.fold_reads - prev.fold_reads,
+            shadowed_occurrences: self.shadowed_occurrences - prev.shadowed_occurrences,
+        }
+    }
+
+    pub fn add(&mut self, o: ScanStats) {
+        self.rows += o.rows;
+        self.batches += o.batches;
+        self.columns_decoded += o.columns_decoded;
+        self.fold_reads += o.fold_reads;
+        self.shadowed_occurrences += o.shadowed_occurrences;
+    }
+}
+
 /// A stable row shape over a set of parts, and the machinery to read batches through it.
 pub struct Lens {
     schema: SchemaRef,
@@ -147,13 +169,12 @@ impl Lens {
     ///
     /// `fold` is required only if the projection includes `body`; passing `None` otherwise makes it
     /// impossible for a scan to touch content by accident.
-    pub fn scan<'a>(
-        &'a self,
-        part: &'a Part,
-        fold: Option<&'a Fold>,
+    pub fn scan(
+        &self,
+        part: &Arc<Part>,
+        fold: Option<&Arc<Fold>>,
         projection: &[usize],
-        stats: &'a mut ScanStats,
-    ) -> Result<PartScan<'a>> {
+    ) -> Result<PartScan> {
         let proj: Vec<usize> = projection.to_vec();
         for &f in &proj {
             if f >= self.binding.len() {
@@ -171,6 +192,7 @@ impl Lens {
         // schema.
         let meta = if part.has_columns() { attrs::read_meta(part)? } else { Vec::new() };
         let mut cols: Vec<Col> = Vec::with_capacity(proj.len());
+        let mut decoded = 0usize;
         for &f in &proj {
             let name = self.schema.field(f).name().as_str();
             if name == F_ID {
@@ -182,7 +204,7 @@ impl Lens {
                 match meta.iter().position(|(k, t, _, _)| *k == want.0 && *t == want.1) {
                     Some(c) => {
                         let (_, tag, occ, kind) = meta[c].clone();
-                        stats.columns_decoded += 1;
+                        decoded += 1;
                         cols.push(Col::Attr {
                             tag,
                             rids: attrs::rids(part, c, occ, kind)?,
@@ -199,7 +221,16 @@ impl Lens {
         // there is no meaningful way to start decoding from the middle.
         let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Vec::new() };
 
-        Ok(PartScan { part, fold, schema: out_schema, cols, ids, row: 0, n: part.len(), stats })
+        Ok(PartScan {
+            n: part.len(),
+            part: part.clone(),
+            fold: fold.cloned(),
+            schema: out_schema,
+            cols,
+            ids,
+            row: 0,
+            stats: ScanStats { columns_decoded: decoded, ..ScanStats::default() },
+        })
     }
 }
 
@@ -213,20 +244,32 @@ enum Col {
 
 /// A lazy batch stream over one part. Holds every column's decoded handles, so per-batch work is a
 /// bounded scatter and nothing is re-decoded.
-pub struct PartScan<'a> {
-    part: &'a Part,
-    fold: Option<&'a Fold>,
+///
+/// Owns its handles rather than borrowing them — everything it needs is already reference-counted, and
+/// a borrowing scan could never become a `'static` stream, which is what a query engine requires.
+pub struct PartScan {
+    part: Arc<Part>,
+    fold: Option<Arc<Fold>>,
     schema: SchemaRef,
     cols: Vec<Col>,
     ids: Vec<String>,
     row: usize,
     n: usize,
-    stats: &'a mut ScanStats,
+    stats: ScanStats,
 }
 
-impl<'a> PartScan<'a> {
+impl PartScan {
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// What this scan has touched so far. Grows as batches are pulled, because the scan is lazy.
+    pub fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
+    pub fn rows_remaining(&self) -> usize {
+        self.n - self.row
     }
 
     /// The next batch, or `None` at the end of the part.
@@ -241,7 +284,7 @@ impl<'a> PartScan<'a> {
         // Every other column then follows that decision, so all arrays end up the same length.
         let mut bodies: Option<Vec<Vec<u8>>> = None;
         if self.cols.iter().any(|c| matches!(c, Col::Body)) {
-            let fold = self.fold.expect("checked when the scan was built");
+            let fold = self.fold.as_ref().expect("checked when the scan was built");
             let mut v = Vec::new();
             let mut bytes = 0usize;
             for r in lo..cap {
@@ -397,17 +440,18 @@ fn scatter(
 /// large scans should drive [`PartScan`] directly, or go through DataFusion.
 pub fn collect(
     parts: &[Arc<Part>],
-    fold: Option<&Fold>,
+    fold: Option<&Arc<Fold>>,
     lens: &Lens,
     projection: &[usize],
 ) -> Result<(Vec<RecordBatch>, ScanStats)> {
     let mut stats = ScanStats::default();
     let mut out = Vec::new();
     for p in parts {
-        let mut sc = lens.scan(p, fold, projection, &mut stats)?;
+        let mut sc = lens.scan(p, fold, projection)?;
         while let Some(b) = sc.next_batch()? {
             out.push(b);
         }
+        stats.add(sc.stats());
     }
     Ok((out, stats))
 }

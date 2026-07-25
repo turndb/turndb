@@ -357,8 +357,7 @@ fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id", "body"]).unwrap();
 
-    let mut stats = turndb::query::ScanStats::default();
-    let mut sc = lens.scan(&parts[0], Some(&fold), &proj, &mut stats).unwrap();
+    let mut sc = lens.scan(&parts[0], Some(&fold), &proj).unwrap();
     let (mut batches, mut rows, mut peak) = (0usize, 0usize, 0usize);
     let mut seen: Vec<Vec<u8>> = Vec::new();
     while let Some(b) = sc.next_batch().unwrap() {
@@ -376,5 +375,54 @@ fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     assert!(peak <= turndb::query::BATCH_BYTES + 300_000,
         "a batch carried {peak} content bytes, past the ceiling");
     assert_eq!(seen, want, "byte-bounded batching must not reorder or corrupt content");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_body_query_streams_instead_of_materialising_the_part() {
+    let dir = tmp("sqlstream");
+    // 300 records of ~256 KiB = ~75 MiB of content in ONE part. Eager materialisation would build all
+    // of it in the partition before yielding a single row; streaming yields it a batch at a time.
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for i in 0..300u32 {
+        let body: Vec<u8> = (0..8192u32)
+            .flat_map(|j| blake3::hash(&(i * 77_777 + j).to_le_bytes()).as_bytes()[..32].to_vec())
+            .collect();
+        s.put(&format!("s{i:04}"), &[Span::Piece(&body)], vec![("n".into(), AttrValue::Int(i as i64))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+
+    // LIMIT is the observable proof of laziness: an eager plan reconstructs every body in the
+    // partition regardless, a streaming one stops as soon as the consumer has enough.
+    table.reset_stats();
+    let r = ctx.sql("SELECT id, body FROM t LIMIT 5").await.unwrap().collect().await.unwrap();
+    let got: usize = r.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(got, 5);
+    let st = table.stats();
+    assert!(st.fold_reads < 300,
+        "LIMIT 5 reconstructed {} of 300 bodies — the scan is not lazy", st.fold_reads);
+    assert!(st.fold_reads >= 5, "it must have read at least the rows it returned");
+
+    // and a full body scan still returns everything, byte-exact
+    table.reset_stats();
+    let all = ctx.sql("SELECT id, body FROM t").await.unwrap().collect().await.unwrap();
+    let rows: usize = all.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 300);
+    assert!(all.len() > 1, "300 large records must arrive as several batches, not one");
+    for b in &all {
+        let ids = b.column(0).as_string::<i32>();
+        let bodies = b.column(1).as_binary::<i32>();
+        for r in 0..b.num_rows() {
+            let i: u32 = ids.value(r).trim_start_matches('s').parse().unwrap();
+            let want: Vec<u8> = (0..8192u32)
+                .flat_map(|j| blake3::hash(&(i * 77_777 + j).to_le_bytes()).as_bytes()[..32].to_vec())
+                .collect();
+            assert_eq!(bodies.value(r), want.as_slice(), "streamed body diverged for {}", ids.value(r));
+        }
+    }
     std::fs::remove_dir_all(&dir).ok();
 }

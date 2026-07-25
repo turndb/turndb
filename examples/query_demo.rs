@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
     paths.sort();
     let parts: Vec<Arc<Part>> = paths.iter().map(|p| Ok(Arc::new(Part::open(p)?))).collect::<anyhow::Result<_>>()?;
-    let fold = Fold::open_read(&dir.join("fold"), FoldCfg::default())?;
+    let fold = std::sync::Arc::new(Fold::open_read(&dir.join("fold"), FoldCfg::default())?);
     let lens = Lens::new(&parts)?;
 
     let names: Vec<String> = lens.schema().fields().iter().map(|f| f.name().clone()).collect();
@@ -40,12 +40,13 @@ fn main() -> anyhow::Result<()> {
         let mut bytes = 0usize;
         let mut peak = 0usize;
         for p in &parts {
-            let mut sc = lens.scan(p, need_fold.then_some(&fold), &proj, &mut st)?;
+            let mut sc = lens.scan(p, need_fold.then_some(&fold), &proj)?;
             while let Some(b) = sc.next_batch()? {
                 let n = b.get_array_memory_size();
                 bytes += n;
                 peak = peak.max(n);
             }
+            st.add(sc.stats());
         }
         let el = t.elapsed();
         println!(

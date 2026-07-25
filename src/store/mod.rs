@@ -364,8 +364,8 @@ impl Store {
     }
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
     /// of both; the manifest snapshot it was opened at is already baked into `parts`.
-    pub fn into_parts(self) -> (Fold, Vec<Arc<Part>>) {
-        (self.fold, self.parts)
+    pub fn into_parts(self) -> (Arc<Fold>, Vec<Arc<Part>>) {
+        (Arc::new(self.fold), self.parts)
     }
 
     pub fn part_count(&self) -> usize {
@@ -416,8 +416,8 @@ impl ReadStore {
 
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
     /// of both; the manifest snapshot it was opened at is already baked into `parts`.
-    pub fn into_parts(self) -> (Fold, Vec<Arc<Part>>) {
-        (self.fold, self.parts)
+    pub fn into_parts(self) -> (Arc<Fold>, Vec<Arc<Part>>) {
+        (Arc::new(self.fold), self.parts)
     }
 
     pub fn part_count(&self) -> usize {
