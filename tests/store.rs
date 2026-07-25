@@ -696,6 +696,63 @@ fn a_reader_survives_a_writer_merging_and_sweeping_underneath_it() {
 }
 
 #[test]
+fn readers_open_a_coherent_snapshot_while_refolding() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+
+    let dir = tmp("refoldreaderrace");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for i in 0..24u32 {
+        let id = format!("g{i:02}");
+        let body = (0..128u32)
+            .flat_map(|j| blake3::hash(&(i * 1000 + j).to_le_bytes()).as_bytes()[..16].to_vec())
+            .collect::<Vec<u8>>();
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.push((id, body));
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // A reader opened before the generation swap must remain valid after the old paths are unlinked.
+    let pinned = Store::open_read(&dir, cfg()).unwrap();
+
+    let stop = StdArc::new(AtomicBool::new(false));
+    let rstop = stop.clone();
+    let rdir = dir.clone();
+    let first = want[0].clone();
+    let reader = std::thread::spawn(move || {
+        let mut opens = 0usize;
+        while !rstop.load(Ordering::Relaxed) {
+            let rs = Store::open_read(&rdir, cfg())
+                .unwrap_or_else(|e| panic!("open_read paired different refold generations: {e}"));
+            assert_eq!(rs.ids().unwrap().len(), 24);
+            assert_eq!(rs.reconstruct(&first.0).unwrap().unwrap(), first.1);
+            opens += 1;
+        }
+        opens
+    });
+
+    // Repeated swaps widen the real race without test-only hooks.
+    for _ in 0..6 {
+        s.refold().unwrap();
+        std::thread::yield_now();
+    }
+    stop.store(true, Ordering::Relaxed);
+    let opens = reader.join().expect("reader thread must not panic");
+    assert!(opens > 0, "the reader never overlapped a refold");
+
+    for (id, body) in &want {
+        assert_eq!(
+            &pinned.reconstruct(id).unwrap().unwrap(),
+            body,
+            "a reader pinned before refold lost {id} after its generation was unlinked"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_manifest_naming_a_truly_absent_part_errors_rather_than_spinning() {
     // The retry that closes the reader race must be bounded: a part that is genuinely gone is a
     // corrupt store, and it has to surface as an error rather than a loop.

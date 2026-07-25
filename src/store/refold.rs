@@ -87,36 +87,6 @@ impl RefoldStats {
     }
 }
 
-/// What survives a re-fold: per input part, the rows still live.
-///
-/// Computed newest-part-first so the same newest-wins rule the read core uses decides here too — an id
-/// is resolved once, by the newest part holding it, and a tombstone resolves it to nothing.
-fn live_rows(parts: &[Arc<Part>]) -> Result<(Vec<Vec<usize>>, usize, usize)> {
-    let mut live: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
-    let mut seen: HashSet<String> = HashSet::new();
-    let (mut dropped, mut tombs) = (0usize, 0usize);
-    for (pi, p) in parts.iter().enumerate().rev() {
-        let ids = p.ids()?;
-        let tset = p.tombstones()?;
-        for (row, id) in ids.into_iter().enumerate() {
-            if !seen.insert(id) {
-                dropped += 1; // a newer part already answered for this id
-                continue;
-            }
-            if tset.binary_search(&(row as u64)).is_ok() {
-                tombs += 1;
-                dropped += 1;
-                continue;
-            }
-            live[pi].push(row);
-        }
-    }
-    for v in &mut live {
-        v.sort_unstable(); // parts are id-sorted; keep the output in the same order
-    }
-    Ok((live, dropped, tombs))
-}
-
 /// Rewrite the fold keeping only content live records reference, and rebuild the parts against it.
 ///
 /// `parts` must be the store's full live list — a re-fold is all-or-nothing by construction, because
@@ -141,9 +111,10 @@ pub fn refold(
     let mut st = RefoldStats { parts_in: parts.len(), ..Default::default() };
     st.fold_bytes_before = dir_bytes(&fold_dir(dir, old_gen));
 
-    let (live, dropped, tombs) = live_rows(parts)?;
-    st.records_dropped = dropped;
-    st.tombstones_dropped = tombs;
+    let visible = super::read::visibility(parts)?;
+    let live = visible.rows;
+    st.records_dropped = visible.superseded + visible.tombstones;
+    st.tombstones_dropped = visible.tombstones;
     st.records_kept = live.iter().map(|v| v.len()).sum();
 
     // Every piece a live record still references, with where it lives TODAY.

@@ -29,7 +29,43 @@ use crate::fold::Fold;
 use crate::part::Part;
 use crate::types::Record;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
+
+/// The live row ordinals in every part, under the store's newest-wins rule.
+///
+/// This is the bulk form of [`locate`]: visit parts newest-first, let the first row for an id decide,
+/// and let a tombstone decide that no row is visible. Keeping it here makes point reads, refolding and
+/// query scans share one definition of committed visibility.
+pub(crate) struct Visibility {
+    pub rows: Vec<Vec<usize>>,
+    /// Older rows hidden by a newer record or tombstone.
+    pub superseded: usize,
+    /// Newest rows that are tombstones and therefore resolve their ids to absence.
+    pub tombstones: usize,
+}
+
+pub(crate) fn visibility(parts: &[Arc<Part>]) -> Result<Visibility> {
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
+    let mut seen: HashSet<String> = HashSet::new();
+    let (mut superseded, mut tombstones) = (0usize, 0usize);
+
+    for (pi, p) in parts.iter().enumerate().rev() {
+        let ids = p.ids()?;
+        let tombs = p.tombstones()?;
+        for (row, id) in ids.into_iter().enumerate() {
+            if !seen.insert(id) {
+                superseded += 1;
+            } else if tombs.binary_search(&(row as u64)).is_ok() {
+                tombstones += 1;
+            } else {
+                rows[pi].push(row);
+            }
+        }
+    }
+
+    Ok(Visibility { rows, superseded, tombstones })
+}
 
 /// The newest committed version of `id`, or `None` if it is absent or deleted.
 pub fn get(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
@@ -72,29 +108,19 @@ fn locate<'a>(parts: &'a [Arc<Part>], id: &str) -> Result<Option<(&'a Arc<Part>,
 /// Two filters, and both are needed: a part's own tombstoned rows are skipped, and an id an OLDER part
 /// still lists is dropped when a newer part deletes it.
 pub fn ids(parts: &[Arc<Part>]) -> Result<Vec<String>> {
-    let mut all: Vec<String> = Vec::new();
-    for p in parts {
-        let tombs = p.tombstones()?;
+    let visible = visibility(parts)?;
+    let mut out = Vec::new();
+    for (p, rows) in parts.iter().zip(&visible.rows) {
         let listed = p.ids()?;
-        if tombs.is_empty() {
-            all.extend(listed);
-        } else {
-            all.extend(
+        for &row in rows {
+            out.push(
                 listed
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| tombs.binary_search(&(*i as u64)).is_err())
-                    .map(|(_, id)| id),
+                    .get(row)
+                    .ok_or_else(|| anyhow::anyhow!("visible row {row} is outside its part"))?
+                    .clone(),
             );
         }
     }
-    all.sort();
-    all.dedup();
-    let mut out = Vec::with_capacity(all.len());
-    for id in all {
-        if exists(parts, &id)? {
-            out.push(id);
-        }
-    }
+    out.sort();
     Ok(out)
 }

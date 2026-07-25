@@ -336,6 +336,117 @@ async fn sql_can_still_reach_content_when_it_asks_for_it() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test]
+async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
+    let dir = tmp("visibility");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put(
+        "x",
+        &[Span::Lit(b"old body")],
+        vec![("kind".into(), AttrValue::Str("old-match".into()))],
+    )
+    .unwrap();
+    s.put(
+        "deleted",
+        &[Span::Lit(b"must disappear")],
+        vec![("kind".into(), AttrValue::Str("old-match".into()))],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    s.put(
+        "x",
+        &[Span::Lit(b"new body")],
+        vec![("kind".into(), AttrValue::Str("new-value".into()))],
+    )
+    .unwrap();
+    s.delete("deleted").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+
+    let count = ctx.sql("SELECT count(*) FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        count[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        1,
+        "SQL must expose one live row, not physical versions or tombstones"
+    );
+
+    let rows = ctx.sql("SELECT id, body FROM t").await.unwrap().collect().await.unwrap();
+    let batch = rows.iter().find(|b| b.num_rows() > 0).expect("x is live");
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "x");
+    assert_eq!(batch.column(1).as_binary::<i32>().value(0), b"new body");
+
+    let old = ctx.sql("SELECT count(*) FROM t WHERE kind = 'old-match'")
+        .await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        old[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        0,
+        "a newest version that fails a predicate must not reveal an older matching version"
+    );
+    assert!(table.stats().rows_hidden >= 3, "two superseded rows and one tombstone should be hidden");
+
+    // Neither ordinary compaction nor the re-folding GC may change the logical SQL answer.
+    drop(ctx);
+    drop(table);
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let n = s.part_count();
+    s.merge_range(0, n).unwrap();
+    s.refold().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, _) = TurndbTable::context(store, "t").unwrap();
+    let count = ctx.sql("SELECT count(*) FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        count[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        1,
+        "compaction and refolding must preserve the logical SQL snapshot"
+    );
+    let old = ctx.sql("SELECT count(*) FROM t WHERE kind = 'old-match'")
+        .await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        old[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        0,
+        "physical reclamation must not change predicate results"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_limit_counts_visible_rows_not_physical_prefix_rows() {
+    let dir = tmp("visiblelimit");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    // In the older part, `a` is row zero and `z` is row one. A newer `a` hides row zero, so a
+    // physical-prefix interpretation of fetch=1 would return nothing instead of the visible `z`.
+    s.put("a", &[Span::Lit(b"old a")], vec![]).unwrap();
+    s.put("z", &[Span::Lit(b"live z")], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.put("a", &[Span::Lit(b"new a")], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (fold, parts) = store.into_parts();
+    let lens = Lens::new(&parts).unwrap();
+    let proj = lens.project(&["id"]).unwrap();
+    let mut scan = lens
+        .scan(&parts[0], Some(&fold), &proj, &[])
+        .unwrap()
+        .with_fetch(Some(1));
+    let batch = scan.next_batch().unwrap().expect("the older part still has one live row");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "z");
+    assert!(scan.next_batch().unwrap().is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     let dir = tmp("batchbytes");
