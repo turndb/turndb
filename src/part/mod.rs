@@ -35,6 +35,7 @@
 
 pub mod attrs;
 pub mod bloom;
+pub mod cache;
 pub mod idcol;
 pub mod merge;
 
@@ -47,7 +48,8 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Mutex;
+use cache::{Held, Kind, SectionCache};
+use std::sync::Arc;
 
 pub const MAGIC: &[u8; 8] = b"TURNPART";
 pub const FOOTER_LEN: u64 = 56;
@@ -291,21 +293,37 @@ pub struct Part {
     f: File,
     toc: HashMap<String, Section>,
     meta: PartMeta,
-    cache: Mutex<HashMap<String, std::sync::Arc<Vec<u8>>>>,
-    /// Decoded row-index arrays, per column. Without this every row read re-decoded a whole column.
-    rid_cache: Mutex<HashMap<usize, std::sync::Arc<Vec<u32>>>>,
-    /// Decoded fixed-width offset/restart arrays, by section name.
+    /// Identity within the shared cache.
+    id: u64,
+    /// Decompressed sections, decoded offset arrays, decoded row indices and string dictionaries — all
+    /// four live here, under one BYTE budget shared with every other part.
     ///
-    /// `prog.off`, `layout.off` and `ids.restart` are read on EVERY row access, and decoding them is
-    /// linear in the part. Re-decoding per row made every whole-part walk — merge above all — quadratic
-    /// in record count: measured at 493 s to merge 8 parts of 50k records.
-    num_cache: Mutex<HashMap<String, std::sync::Arc<Vec<u64>>>>,
-    /// Decoded string dictionaries, per column. Rebuilt per attribute per row before this existed.
-    dict_cache: Mutex<HashMap<usize, std::sync::Arc<Vec<String>>>>,
+    /// Each of them exists because dropping it made a whole-part walk quadratic (merge: 493s over
+    /// 8x50k records). Unbounded, they pinned 9.5x a part's on-disk size and never let go. Bounded and
+    /// shared, the asymptotics hold and the memory does not grow with part count.
+    cache: Arc<SectionCache>,
+}
+
+impl Drop for Part {
+    /// Release this part's entries rather than leaving them to be evicted eventually. A closed part
+    /// holding budget would push out entries belonging to parts that are still open.
+    fn drop(&mut self) {
+        self.cache.forget(self.id);
+    }
 }
 
 impl Part {
+    /// Open against the process-wide section-cache budget.
+    ///
+    /// Shared rather than private on purpose: a private budget per part would grow without bound in
+    /// part count, which is the thing the budget exists to stop. Use [`Part::open_in`] to account a
+    /// group of parts separately, as a `Store` does.
     pub fn open(path: &Path) -> Result<Part> {
+        Part::open_in(path, SectionCache::global())
+    }
+
+    /// Open sharing `cache` with other parts.
+    pub fn open_in(path: &Path, cache: Arc<SectionCache>) -> Result<Part> {
         let f = File::open(path).with_context(|| format!("open part {}", path.display()))?;
         let len = f.metadata()?.len();
         if len < FOOTER_LEN {
@@ -350,10 +368,8 @@ impl Part {
             f,
             toc,
             meta: PartMeta { n_records, seq_lo, seq_hi },
-            cache: Mutex::new(HashMap::new()),
-            rid_cache: Mutex::new(HashMap::new()),
-            num_cache: Mutex::new(HashMap::new()),
-            dict_cache: Mutex::new(HashMap::new()),
+            id: cache::next_part_id(),
+            cache,
         })
     }
 
@@ -370,9 +386,10 @@ impl Part {
     }
 
     /// A section's decompressed bytes, cached after first touch.
-    fn sect(&self, name: &str) -> Result<std::sync::Arc<Vec<u8>>> {
-        if let Some(v) = self.cache.lock().unwrap().get(name) {
-            return Ok(v.clone());
+    fn sect(&self, name: &str) -> Result<Arc<Vec<u8>>> {
+        let k = Kind::Section(name.to_string());
+        if let Some(Held::Bytes(v)) = self.cache.get(self.id, &k) {
+            return Ok(v);
         }
         let s = self
             .toc
@@ -382,8 +399,8 @@ impl Part {
         let mut buf = vec![0u8; s.stored as usize];
         self.f.read_exact_at(&mut buf, s.off)?;
         let raw = crate::fold::codec::decode(s.codec, &buf, s.raw, None)?;
-        let arc = std::sync::Arc::new(raw);
-        self.cache.lock().unwrap().insert(name.to_string(), arc.clone());
+        let arc = Arc::new(raw);
+        self.cache.put(self.id, k, Held::Bytes(arc.clone()));
         Ok(arc)
     }
 
@@ -566,12 +583,15 @@ impl Part {
         v
     }
 
-    pub(crate) fn rid_cached(&self, c: usize) -> Option<std::sync::Arc<Vec<u32>>> {
-        self.rid_cache.lock().unwrap().get(&c).cloned()
+    pub(crate) fn rid_cached(&self, c: usize) -> Option<Arc<Vec<u32>>> {
+        match self.cache.get(self.id, &Kind::Rids(c)) {
+            Some(Held::Rids(v)) => Some(v),
+            _ => None,
+        }
     }
-    pub(crate) fn rid_cache_put(&self, c: usize, v: Vec<u32>) -> std::sync::Arc<Vec<u32>> {
-        let a = std::sync::Arc::new(v);
-        self.rid_cache.lock().unwrap().insert(c, a.clone());
+    pub(crate) fn rid_cache_put(&self, c: usize, v: Vec<u32>) -> Arc<Vec<u32>> {
+        let a = Arc::new(v);
+        self.cache.put(self.id, Kind::Rids(c), Held::Rids(a.clone()));
         a
     }
 
@@ -579,9 +599,10 @@ impl Part {
         self.sect(name)
     }
     /// A fixed-width little-endian array section, decoded once and cached.
-    pub(crate) fn nums(&self, name: &str, width: usize) -> Result<std::sync::Arc<Vec<u64>>> {
-        if let Some(v) = self.num_cache.lock().unwrap().get(name) {
-            return Ok(v.clone());
+    pub(crate) fn nums(&self, name: &str, width: usize) -> Result<Arc<Vec<u64>>> {
+        let k = Kind::Nums(name.to_string());
+        if let Some(Held::Nums(v)) = self.cache.get(self.id, &k) {
+            return Ok(v);
         }
         let b = self.sect(name)?;
         let v: Vec<u64> = match width {
@@ -589,19 +610,33 @@ impl Part {
             8 => b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(),
             w => bail!("unsupported array width {w}"),
         };
-        let a = std::sync::Arc::new(v);
-        self.num_cache.lock().unwrap().insert(name.to_string(), a.clone());
+        let a = Arc::new(v);
+        self.cache.put(self.id, k, Held::Nums(a.clone()));
         Ok(a)
     }
 
-    pub(crate) fn dict_cached(&self, c: usize) -> Option<std::sync::Arc<Vec<String>>> {
-        self.dict_cache.lock().unwrap().get(&c).cloned()
+    pub(crate) fn dict_cached(&self, c: usize) -> Option<Arc<Vec<String>>> {
+        match self.cache.get(self.id, &Kind::Dict(c)) {
+            Some(Held::Dict(v)) => Some(v),
+            _ => None,
+        }
     }
 
-    pub(crate) fn dict_put(&self, c: usize, v: Vec<String>) -> std::sync::Arc<Vec<String>> {
-        let a = std::sync::Arc::new(v);
-        self.dict_cache.lock().unwrap().insert(c, a.clone());
+    pub(crate) fn dict_put(&self, c: usize, v: Vec<String>) -> Arc<Vec<String>> {
+        let a = Arc::new(v);
+        self.cache.put(self.id, Kind::Dict(c), Held::Dict(a.clone()));
         a
+    }
+
+    /// Bytes this part currently pins in its caches. Decompressed sections plus decoded arrays plus
+    /// string dictionaries — everything that survives a read and is never released.
+    pub fn cached_bytes(&self) -> usize {
+        self.cache.bytes()
+    }
+
+    /// The cache this part reads through, for a caller that wants to share or inspect it.
+    pub fn cache(&self) -> &Arc<SectionCache> {
+        &self.cache
     }
 
     pub(crate) fn section_present(&self, name: &str) -> bool {

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use turndb::part::cache::SectionCache;
 use turndb::part::{merge::merge, Part};
 
 fn main() -> anyhow::Result<()> {
@@ -12,7 +13,13 @@ fn main() -> anyhow::Result<()> {
         .filter(|p| p.extension().map(|e| e == "part").unwrap_or(false)).collect();
     paths.sort();
     paths.truncate(n);
-    let parts: Vec<Arc<Part>> = paths.iter().map(|p| Ok(Arc::new(Part::open(p)?))).collect::<anyhow::Result<_>>()?;
+    // Optional third arg: section-cache budget in MiB, to price the floor the cache doc claims.
+    let budget: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(512);
+    let cache = Arc::new(SectionCache::new(budget << 20));
+    let parts: Vec<Arc<Part>> = paths.iter()
+        .map(|p| Ok(Arc::new(Part::open_in(p, cache.clone())?)))
+        .collect::<anyhow::Result<_>>()?;
+    println!("section-cache budget {budget} MiB");
     let rows: usize = parts.iter().map(|p| p.len()).sum();
     println!("merging {} parts, {rows} records", parts.len());
 
