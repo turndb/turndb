@@ -36,6 +36,7 @@
 //! that breaks it.
 
 pub mod fold;
+pub mod part;
 pub mod types;
 
 pub use types::{AttrValue, BodyOp, PieceHash, Record};

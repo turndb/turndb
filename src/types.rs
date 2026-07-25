@@ -39,13 +39,32 @@ impl fmt::Display for PieceHash {
 
 /// A typed attribute value — the queryable metadata plane. Deliberately four scalars: these are what
 /// you filter and aggregate on. Bulk content is not an attribute; it is folded into pieces.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Equality compares floats by **bit pattern**, not by IEEE value. In a store whose contract is
+/// byte-exact round-trip, two values are the same exactly when they are stored the same — so NaN
+/// equals itself and `-0.0` differs from `0.0`. Derived `PartialEq` would say the opposite of both,
+/// and would silently mis-merge dictionary entries.
+#[derive(Clone, Debug)]
 pub enum AttrValue {
     Str(String),
     Int(i64),
     Float(f64),
     Bool(bool),
 }
+
+impl PartialEq for AttrValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AttrValue::Str(a), AttrValue::Str(b)) => a == b,
+            (AttrValue::Int(a), AttrValue::Int(b)) => a == b,
+            (AttrValue::Float(a), AttrValue::Float(b)) => a.to_bits() == b.to_bits(),
+            (AttrValue::Bool(a), AttrValue::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AttrValue {}
 
 impl AttrValue {
     /// The column type tag. One logical column per (key, tag), so a key carrying mixed types across
