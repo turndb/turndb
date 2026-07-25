@@ -216,10 +216,10 @@ fn piece_dictionary_is_in_fold_order() {
     let p = Part::open(&path).unwrap();
     let n = p.piece_count().unwrap();
     assert!(n > 1);
-    let mut prev = (0u32, 0u32, 0u32);
+    let mut prev = (0u32, 0u32);
     for i in 0..n {
         let (loc, _) = p.piece(i).unwrap();
-        let key = (loc.seg, loc.block_off, loc.in_off);
+        let key = (loc.block_id, loc.in_off);
         assert!(key > prev || i == 0, "piece dictionary must ascend in fold order at {i}");
         prev = key;
     }

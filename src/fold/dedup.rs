@@ -151,8 +151,8 @@ impl Default for DedupTable {
 mod tests {
     use super::*;
 
-    fn loc(block_off: u32) -> Loc {
-        Loc { seg: 0, block_off, in_off: 0, raw: 20 }
+    fn loc(block_id: u32) -> Loc {
+        Loc { block_id, in_off: 0, raw: 20 }
     }
 
     #[test]
