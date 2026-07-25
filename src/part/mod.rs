@@ -730,9 +730,3 @@ impl Part {
     }
 }
 
-pub(crate) fn as_u32s(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
-}
-pub(crate) fn as_u64s(b: &[u8]) -> Vec<u64> {
-    b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
-}

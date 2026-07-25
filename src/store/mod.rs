@@ -27,6 +27,7 @@
 //! Anything the fold wrote past that tail is discarded and regenerated, so there is no window in
 //! which a part could reference content that never landed.
 
+pub mod read;
 pub mod wal;
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
@@ -440,28 +441,20 @@ impl Store {
         if let Some(v) = self.mem.get(id) {
             return Ok(v.clone());
         }
-        newest(&self.parts, id)
+        read::get(&self.parts, id)
     }
 
     /// Byte-exact content for `id`.
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        // The memtable is newer than every part, so it is consulted first — and it is the ONLY thing
+        // this adds over the committed read core.
         if let Some(v) = self.mem.get(id) {
             return match v {
                 Some(r) => Ok(Some(self.rebuild(r)?)),
                 None => Ok(None), // staged deletion
             };
         }
-        for p in self.parts.iter().rev() {
-            if let Some(row) = p.find(id)? {
-                // The NEWEST part holding the id decides, and if it says deleted the answer is
-                // absent — older parts still holding it are superseded, not consulted.
-                if p.is_tombstone(row)? {
-                    return Ok(None);
-                }
-                return Ok(Some(p.reconstruct(row, &self.fold)?));
-            }
-        }
-        Ok(None)
+        read::reconstruct(&self.parts, &self.fold, id)
     }
 
     /// Where content lives, through BOTH dedup tiers.
@@ -519,19 +512,16 @@ impl Store {
     ///
     /// Includes staged records, unlike [`ReadStore::ids`], because a writer can see its own writes.
     pub fn ids(&self) -> Result<Vec<String>> {
-        let mut all: Vec<String> = self.mem.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k.clone()).collect();
-        for p in &self.parts {
-            all.extend(live_ids(p)?);
+        let mut all = read::ids(&self.parts)?;
+        // Overlay the memtable: a staged put adds an id, a staged delete removes one.
+        all.retain(|id| !matches!(self.mem.get(id), Some(None)));
+        for (id, v) in &self.mem {
+            if v.is_some() && !all.contains(id) {
+                all.push(id.clone());
+            }
         }
         all.sort();
         all.dedup();
-        // An id deleted in a newer part or staged as deleted must not appear because an older part
-        // still lists it.
-        all.retain(|id| match self.mem.get(id) {
-            Some(None) => false,
-            Some(Some(_)) => true,
-            None => newest_exists(&self.parts, id).unwrap_or(true),
-        });
         Ok(all)
     }
 
@@ -563,33 +553,20 @@ pub struct ReadStore {
     pcache: Arc<SectionCache>,
 }
 
+/// A read-only store IS the committed read core, with nothing layered on top — so every method here
+/// is a direct delegation, and there is no second implementation to keep in step.
 impl ReadStore {
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
-        newest(&self.parts, id)
+        read::get(&self.parts, id)
     }
 
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
-        for p in self.parts.iter().rev() {
-            if let Some(row) = p.find(id)? {
-                if p.is_tombstone(row)? {
-                    return Ok(None);
-                }
-                return Ok(Some(p.reconstruct(row, &self.fold)?));
-            }
-        }
-        Ok(None)
+        read::reconstruct(&self.parts, &self.fold, id)
     }
 
     /// Distinct committed ids, sorted — the union across parts, newest-wins.
     pub fn ids(&self) -> Result<Vec<String>> {
-        let mut all: Vec<String> = Vec::new();
-        for p in &self.parts {
-            all.extend(live_ids(p)?);
-        }
-        all.sort();
-        all.dedup();
-        all.retain(|id| newest_exists(&self.parts, id).unwrap_or(true));
-        Ok(all)
+        read::ids(&self.parts)
     }
 
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
@@ -606,44 +583,8 @@ impl ReadStore {
     }
 }
 
-/// Later parts hold later sequence numbers, so the last hit wins.
-/// Ids a part lists that it does not itself delete.
-fn live_ids(p: &Arc<Part>) -> Result<Vec<String>> {
-    let tombs = p.tombstones()?;
-    if tombs.is_empty() {
-        return p.ids();
-    }
-    let ids = p.ids()?;
-    Ok(ids
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| tombs.binary_search(&(*i as u64)).is_err())
-        .map(|(_, id)| id)
-        .collect())
-}
 
-/// Does the NEWEST part holding `id` say it exists?
-fn newest_exists(parts: &[Arc<Part>], id: &str) -> Result<bool> {
-    for p in parts.iter().rev() {
-        if let Some(row) = p.find(id)? {
-            return Ok(!p.is_tombstone(row)?);
-        }
-    }
-    Ok(false)
-}
 
-/// The newest committed version of `id`, or `None` if the newest one is a deletion.
-fn newest(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
-    for p in parts.iter().rev() {
-        if let Some(row) = p.find(id)? {
-            if p.is_tombstone(row)? {
-                return Ok(None);
-            }
-            return Ok(Some(p.record(row)?));
-        }
-    }
-    Ok(None)
-}
 
 fn approx_bytes(r: &Record) -> usize {
     r.id.len()
