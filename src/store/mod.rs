@@ -30,6 +30,7 @@
 pub mod wal;
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
+use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use std::collections::HashMap;
@@ -114,6 +115,10 @@ pub struct Store {
     mem_bytes: usize,
     wal: Wal,
     cfg: FoldCfg,
+    /// ONE budget for every part in this store, not one per part. Section caches are what make a
+    /// whole-part walk linear, so they cannot be removed — but unbounded they pinned 9.5x each part's
+    /// on-disk size, which is a per-part cost that multiplies by part count.
+    pcache: Arc<SectionCache>,
 }
 
 impl Store {
@@ -126,9 +131,10 @@ impl Store {
         // is discarded, and the log regenerates it.
         let mut fold = Fold::open_at(&dir.join("fold"), cfg, manifest.fold_tail())?;
 
+        let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(Part::open(&dir.join(&p.file))?));
+            parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
         }
 
         // A part file the manifest does not name was written by a flush or merge that crashed before
@@ -160,7 +166,7 @@ impl Store {
         }
         let wal = Wal::open(&wal_path)?;
 
-        Ok(Store { dir: dir.to_path_buf(), fold, parts, manifest, mem, mem_bytes, wal, cfg })
+        Ok(Store { dir: dir.to_path_buf(), fold, parts, manifest, mem, mem_bytes, wal, cfg, pcache })
     }
 
     /// Open for reading only: no lock, no replay, no daemon.
@@ -171,11 +177,12 @@ impl Store {
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<ReadStore> {
         let manifest = Manifest::load(dir)?;
         let fold = Fold::open_read(&dir.join("fold"), cfg)?;
+        let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(Part::open(&dir.join(&p.file))?));
+            parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
         }
-        Ok(ReadStore { fold, parts, manifest })
+        Ok(ReadStore { fold, parts, manifest, pcache })
     }
 
     /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
@@ -282,7 +289,7 @@ impl Store {
         m.next_seq = seq;
         m.commit(&self.dir)?; // <- the linearization point
 
-        self.parts.push(Arc::new(Part::open(&path)?));
+        self.parts.push(Arc::new(Part::open_in(&path, self.pcache.clone())?));
         self.manifest = m;
         self.mem.clear();
         self.mem_bytes = 0;
@@ -334,7 +341,7 @@ impl Store {
         ).collect();
         m.commit(&self.dir)?;
 
-        self.parts.splice(lo..lo + len, [Arc::new(Part::open(&path)?)]);
+        self.parts.splice(lo..lo + len, [Arc::new(Part::open_in(&path, self.pcache.clone())?)]);
         self.manifest = m;
         for r in replaced {
             let _ = std::fs::remove_file(self.dir.join(&r.file));
@@ -440,6 +447,11 @@ impl Store {
         Ok(all)
     }
 
+    /// Bytes pinned by every open part's section caches, against their shared budget.
+    pub fn part_cache_bytes(&self) -> (usize, usize) {
+        (self.pcache.bytes(), self.pcache.budget())
+    }
+
     /// Pieces resident in the Tier-0 dedup window. Bounded by the flush interval, not by store size.
     pub fn dedup_window_len(&self) -> usize {
         self.fold.window_len()
@@ -460,6 +472,7 @@ pub struct ReadStore {
     fold: Fold,
     parts: Vec<Arc<Part>>,
     manifest: Manifest,
+    pcache: Arc<SectionCache>,
 }
 
 impl ReadStore {
