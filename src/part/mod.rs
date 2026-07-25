@@ -14,9 +14,24 @@
 //! # Invariants
 //! - Ids are strictly increasing. Version resolution across parts is by sequence range, so a part
 //!   never holds two versions of one id.
-//! - The piece dictionary is sorted by `(block_id, in_off)` — fold order, not hash order. That makes
-//!   a merge's dictionary union a linear merge instead of a sort, and makes a scan read the fold
-//!   sequentially. Block ids ascend with write order, so this is physical locality too.
+//! - The piece dictionary is sorted by `(block_id, in_off)` — fold order, not hash order.
+//!
+//! # What fold order actually buys (measured, not assumed)
+//!
+//! A piece's ordinal *is* its dictionary row index, so the sort bundles three decisions that could be
+//! separate: which varint width every reference in `prog` pays, how well `pdict.loc` compresses, and
+//! what can be searched. The third is already unbundled — `pdict.hsort` carries hash order separately.
+//!
+//! Of the other two, only compression is real: `pdict.loc` compresses 2.3x because fold order makes it
+//! ascending. Reordering by reference frequency was measured on 10.2M refs over 267k pieces and saves
+//! 8.1% of `prog`'s reference bytes *before* a section that already compresses 29.5x — worthless. The
+//! histogram says why: 85.6% of pieces are referenced 10-99 times and the top 1% draw only 10.4% of
+//! references. There is no hot set, because a piece recurs across the turn-snapshots of its own
+//! trajectory and nowhere else. The structure worth exploiting is co-reference, and fold order already
+//! approximates it — capture order groups a trajectory's pieces together (worth 1.83x over hash order).
+//!
+//! NOT a benefit, despite an earlier claim here: merge does not exploit the sortedness. It gathers
+//! dictionaries through a hash map, so a linear union remains available but unimplemented.
 
 pub mod attrs;
 pub mod bloom;
