@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
-use turndb::store::{Span, Store};
+use turndb::store::{Manifest, PartRef, Span, Store};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -478,6 +478,114 @@ fn a_heavily_repeated_corpus_stores_one_copy_of_each_distinct_piece() {
     for (i, p) in pieces.iter().enumerate() {
         assert_eq!(&s.reconstruct(&format!("r99-{i}")).unwrap().unwrap(), p);
         assert_eq!(&s.reconstruct(&format!("r0-{i}")).unwrap().unwrap(), p);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Regressions found by audit. Each of these was reachable in ordinary operation.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_crash_after_tier1_dedup_does_not_wedge_the_store() {
+    // Tier-1 made this reachable: a piece deduped against an OLDER PART carries no WAL bytes, so
+    // replay never puts it in the fold's window. A flush that resolved only through the window then
+    // failed forever — records unreadable, WAL unbounded. On a high-duplication corpus that is nearly
+    // every record after the first flush.
+    let dir = tmp("wedge");
+    let payload: Vec<u8> = (0..40_000u32)
+        .flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..8].to_vec()).collect();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        s.put("first", &[Span::Piece(&payload)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap(); // now committed to a part
+        drop(s);
+    }
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        // Deduped against the part on disk -> no bytes in the WAL, by design.
+        s.put("second", &[Span::Piece(&payload)], vec![]).unwrap();
+        s.sync().unwrap();
+        drop(s); // CRASH: synced but never flushed
+    }
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let flushed = s.flush().expect("a crash after a Tier-1 dedup must not wedge the flush path");
+    assert!(flushed.is_some(), "the staged record must reach a part");
+    assert_eq!(s.reconstruct("first").unwrap().unwrap(), payload);
+    assert_eq!(s.reconstruct("second").unwrap().unwrap(), payload,
+        "the record staged before the crash must survive it");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
+    // The orphan sweep made this destructive: an unreadable manifest yielded the DEFAULT manifest,
+    // and the sweep then unlinked every part it did not name.
+    let dir = tmp("badmanifest");
+    let mut want = Vec::new();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        for i in 0..20 {
+            let id = format!("k{i:02}");
+            want.push((id.clone(), put(&mut s, &id, format!("v{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        drop(s);
+    }
+    let parts_before = std::fs::read_dir(&dir).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".part")).count();
+    assert_eq!(parts_before, 1);
+
+    // A read that fails for a reason OTHER than absence. A directory reads as EISDIR everywhere.
+    let man = dir.join("MANIFEST");
+    std::fs::remove_file(&man).unwrap();
+    std::fs::create_dir(&man).unwrap();
+
+    assert!(Store::open(&dir, cfg()).is_err(), "an unreadable manifest must refuse to open");
+    let parts_after = std::fs::read_dir(&dir).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".part")).count();
+    assert_eq!(parts_after, 1, "REFUSING TO OPEN MUST NOT DELETE DATA");
+
+    // and once the manifest is readable again the store is intact
+    std::fs::remove_dir(&man).unwrap();
+    std::fs::write(&man, serde_json::to_vec(&Manifest {
+        parts: vec![PartRef { file: "part-00000001.part".into(), seq_lo: 1, seq_hi: 1, records: 20 }],
+        fold_seg: 0, fold_off: 0, next_seq: 1,
+    }).unwrap()).unwrap();
+    let s = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(s.part_count(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn merging_an_interior_run_does_not_unlink_its_own_output() {
+    // merge_range is public and its `lo` exists precisely for this. The output used to be named from
+    // (seq_hi, len), which is not unique — a collision meant the post-commit sweep deleted the part
+    // the manifest had just committed, and the store never opened again.
+    let dir = tmp("interior");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for b in 0..6 {
+        for i in 0..6 {
+            let id = format!("p{b}-{i}");
+            want.push((id.clone(), put(&mut s, &id, format!("body {b}/{i}").as_bytes())));
+        }
+        s.sync().unwrap(); s.flush().unwrap();
+    }
+    // Two interior merges arranged so the second's output shares (seq_hi, len) with one of its own
+    // INPUTS — the case the old (seq_hi, len) naming could not distinguish.
+    //   parts: [1][2][3][4][5][6]
+    s.merge_range(3, 2).unwrap().unwrap(); //  -> [1][2][3][4-5][6]   seq_hi=5, len=2
+    s.merge_range(2, 2).unwrap().unwrap(); //  -> [1][2][3-5][6]      seq_hi=5, len=2  <- same name
+    assert_eq!(s.part_count(), 4);
+    drop(s);
+
+    let s = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(s.part_count(), 4, "the merged part must survive reopen");
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "interior merge lost {id}");
     }
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -29,9 +29,10 @@
 
 pub mod wal;
 
-use crate::fold::{Fold, FoldCfg, FoldTail};
+use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::{self, Part};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
+use std::collections::HashMap;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -66,10 +67,19 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// A MISSING manifest is a new store. An UNREADABLE one is an error.
+    ///
+    /// These were conflated, and the orphan sweep made the conflation destructive: a transient EACCES
+    /// or EIO yielded an empty manifest, and the sweep then unlinked every part it did not name. One
+    /// unreadable byte turned a live store into an empty directory.
     fn load(dir: &Path) -> Result<Manifest> {
         match std::fs::read(dir.join("MANIFEST")) {
             Ok(b) => Ok(serde_json::from_slice(&b).context("corrupt MANIFEST")?),
-            Err(_) => Ok(Manifest::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "cannot read {} — refusing to treat an unreadable manifest as an empty store",
+                dir.join("MANIFEST").display()
+            ))),
         }
     }
 
@@ -248,8 +258,45 @@ impl Store {
         let file = format!("part-{seq:08}.part");
         let path = self.dir.join(&file);
         let recs: Vec<Record> = self.mem.values().cloned().collect();
-        let fold = &self.fold;
-        let meta = part::build(&path, &recs, seq, seq, self.cfg.level, |h| fold.lookup(*h))?;
+
+        // Resolve every referenced piece through BOTH tiers, exactly as the write path does.
+        //
+        // A Tier-0-only resolve is correct only while the process that staged the records is still
+        // alive: `fold_piece` notes a Tier-1 hit into the window, so the window covers it. After a
+        // CRASH it does not. Replay re-folds only pieces the WAL carried bytes for, and a Tier-1 hit
+        // carries none by design — the content was already durable in an older part. Those pieces are
+        // then in no window at all, and a Tier-0-only resolve would fail here on every subsequent
+        // flush attempt, permanently: records unreadable, WAL growing without bound. On the
+        // high-duplication corpora this engine exists for, that is nearly every record after the
+        // first flush.
+        let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
+        for r in &recs {
+            for op in &r.body {
+                let BodyOp::Piece { hash, .. } = op else { continue };
+                if locs.contains_key(hash) {
+                    continue;
+                }
+                let loc = match self.fold.lookup(*hash) {
+                    Some(l) => l,
+                    None => {
+                        let mut found = None;
+                        for p in self.parts.iter().rev() {
+                            if let Some(l) = p.lookup_piece(hash)? {
+                                found = Some(l);
+                                break;
+                            }
+                        }
+                        found.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "staged piece {hash} is in neither the fold window nor any live part"
+                            )
+                        })?
+                    }
+                };
+                locs.insert(*hash, loc);
+            }
+        }
+        let meta = part::build(&path, &recs, seq, seq, self.cfg.level, |h| locs.get(h).copied())?;
 
         let mut m = self.manifest.clone();
         m.parts.push(PartRef { file: file.clone(), seq_lo: seq, seq_hi: seq, records: meta.n_records });
@@ -277,8 +324,16 @@ impl Store {
             return Ok(None);
         }
         let inputs: Vec<Arc<Part>> = self.parts[lo..lo + len].to_vec();
+        // Named by the sequence RANGE it spans. The output's range strictly contains every input's
+        // (the inputs are disjoint and there are at least two), so the name cannot collide with a part
+        // this merge is about to replace — which the post-commit sweep would otherwise unlink.
+        let seq_lo = self.manifest.parts[lo].seq_lo;
         let seq_hi = self.manifest.parts[lo + len - 1].seq_hi;
-        let file = format!("part-{seq_hi:08}-m{len}.part");
+        let file = format!("part-{seq_lo:08}-{seq_hi:08}.part");
+        debug_assert!(
+            !self.manifest.parts.iter().any(|p| p.file == file),
+            "merge output {file} collides with a live part"
+        );
         let path = self.dir.join(&file);
         let (meta, stats) = crate::part::merge::merge(&path, &inputs, self.cfg.level)?;
 
