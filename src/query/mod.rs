@@ -230,6 +230,7 @@ impl Lens {
             ids,
             row: 0,
             stats: ScanStats { columns_decoded: decoded, ..ScanStats::default() },
+            fetch: None,
         })
     }
 }
@@ -237,7 +238,7 @@ impl Lens {
 enum Col {
     Id,
     Body,
-    Attr { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, dict: Vec<String> },
+    Attr { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, dict: Arc<Vec<String>> },
     /// This part has no such column; the batch contributes nulls of the right type.
     Missing(DataType),
 }
@@ -256,6 +257,8 @@ pub struct PartScan {
     row: usize,
     n: usize,
     stats: ScanStats,
+    /// Stop after this many rows. A LIMIT the query engine pushed down.
+    fetch: Option<usize>,
 }
 
 impl PartScan {
@@ -272,13 +275,28 @@ impl PartScan {
         self.n - self.row
     }
 
+    /// Bound this scan to `n` rows.
+    ///
+    /// Streaming alone bounds MEMORY, not WORK: a consumer that wants one row still triggers a whole
+    /// batch, and a batch of bodies is BATCH_BYTES of fold reads — per part, since every partition
+    /// executes. Carrying the limit down is what makes `LIMIT 1` cost one row instead of one batch
+    /// times the part count.
+    pub fn with_fetch(mut self, n: Option<usize>) -> Self {
+        self.fetch = n;
+        self
+    }
+
     /// The next batch, or `None` at the end of the part.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        if self.row >= self.n {
+        let end = match self.fetch {
+            Some(f) => self.n.min(f),
+            None => self.n,
+        };
+        if self.row >= end {
             return Ok(None);
         }
         let lo = self.row;
-        let cap = (lo + BATCH_ROWS).min(self.n);
+        let cap = (lo + BATCH_ROWS).min(end);
 
         // Content is reconstructed FIRST, because it is what decides how many rows this batch can hold.
         // Every other column then follows that decision, so all arrays end up the same length.

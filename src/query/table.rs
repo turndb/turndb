@@ -112,6 +112,8 @@ struct TurndbExec {
     stats: Arc<Mutex<ScanStats>>,
     schema: SchemaRef,
     props: Arc<PlanProperties>,
+    /// A LIMIT pushed down by the planner. Bounds WORK, which streaming alone does not.
+    fetch: Option<usize>,
 }
 
 impl TurndbExec {
@@ -131,7 +133,7 @@ impl TurndbExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Ok(TurndbExec { parts, fold, lens, projection, stats, schema, props: Arc::new(props) })
+        Ok(TurndbExec { parts, fold, lens, projection, stats, schema, props: Arc::new(props), fetch: None })
     }
 }
 
@@ -161,6 +163,29 @@ impl ExecutionPlan for TurndbExec {
         vec![]
     }
 
+    // NOT supports_limit_pushdown: that means "a limit may be pushed THROUGH this node to its INPUT".
+    // A leaf has no input, so claiming it makes the planner drop the limit rather than apply it —
+    // which returned 300 rows for `LIMIT 5`. A leaf implements with_fetch/fetch and nothing else.
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    /// Each partition takes the FULL limit, not a share of it. Partitions are combined above, so a
+    /// per-partition share could under-deliver when one part is short; over-fetching is bounded and
+    /// correct, and still turns O(parts x batch) into O(parts x limit).
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(TurndbExec {
+            parts: self.parts.clone(),
+            fold: self.fold.clone(),
+            lens: self.lens.clone(),
+            projection: self.projection.clone(),
+            stats: self.stats.clone(),
+            schema: self.schema.clone(),
+            props: self.props.clone(),
+            fetch: limit,
+        }))
+    }
+
     fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
@@ -177,7 +202,8 @@ impl ExecutionPlan for TurndbExec {
         let scan = self
             .lens
             .scan(part, fold, &self.projection)
-            .map_err(|e| DataFusionError::External(e.into()))?;
+            .map_err(|e| DataFusionError::External(e.into()))?
+            .with_fetch(self.fetch);
 
         // `unfold` drives the scan one batch at a time. Decoding runs inline on the polling thread —
         // it is CPU work over already-cached sections rather than blocking I/O, and DataFusion spreads
