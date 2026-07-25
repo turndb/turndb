@@ -119,8 +119,11 @@ fn a_part_the_manifest_never_named_is_ignored() {
         s.flush().unwrap();
         drop(s);
     }
-    let real = dir.join("part-00000000.part");
-    std::fs::copy(&real, dir.join("part-00000001.part")).unwrap();
+    let real = std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".part"))
+        .expect("a committed part exists");
+    std::fs::copy(&real, dir.join("part-99999999.part")).unwrap();
     let s = Store::open(&dir, cfg()).unwrap();
     assert_eq!(s.part_count(), 1, "an uncommitted part file must be ignored");
     std::fs::remove_dir_all(&dir).ok();
@@ -242,6 +245,120 @@ fn dedup_survives_flush_and_reopen() {
     assert!(after >= before);
     for i in 0..60 {
         assert_eq!(s.reconstruct(&format!("d{i:03}")).unwrap().unwrap(), shared);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step-4 gate: merge consolidates parts without touching the fold, and never loses a record.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn merge_consolidates_and_preserves_every_record() {
+    let dir = tmp("merge");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for batch in 0..5 {
+        for i in 0..20 {
+            let id = format!("m{batch}-{i:03}");
+            want.push((id.clone(), put(&mut s, &id, format!("body {batch}/{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    assert_eq!(s.part_count(), 5);
+    let fold_before: u64 = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
+        .map(|e| e.metadata().unwrap().len()).sum();
+
+    let st = s.merge_range(0, 5).unwrap().unwrap();
+    assert_eq!(st.inputs, 5);
+    assert_eq!(st.records_out, 100);
+    assert_eq!(st.fold_bytes_touched, 0);
+    assert_eq!(s.part_count(), 1, "five parts must become one");
+
+    let fold_after: u64 = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
+        .map(|e| e.metadata().unwrap().len()).sum();
+    assert_eq!(fold_after, fold_before, "MERGE MUST NOT REWRITE CONTENT");
+
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "merge lost or corrupted {id}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn merge_keeps_the_newest_version_of_a_reput_id() {
+    let dir = tmp("mergedup");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "same", b"version one");
+    s.sync().unwrap(); s.flush().unwrap();
+    let other = put(&mut s, "other", b"unrelated");
+    s.sync().unwrap(); s.flush().unwrap();
+    let newest = put(&mut s, "same", b"version THREE");
+    s.sync().unwrap(); s.flush().unwrap();
+    assert_eq!(s.part_count(), 3);
+
+    let st = s.merge_range(0, 3).unwrap().unwrap();
+    assert_eq!(st.records_out, 2, "two distinct ids survive");
+    assert_eq!(st.superseded, 1);
+    assert_eq!(s.reconstruct("same").unwrap().unwrap(), newest, "the newest version must survive a merge");
+    assert_eq!(s.reconstruct("other").unwrap().unwrap(), other);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
+    let dir = tmp("mergereopen");
+    let mut want = Vec::new();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        for b in 0..4 {
+            for i in 0..10 {
+                let id = format!("s{b}-{i:02}");
+                want.push((id.clone(), put(&mut s, &id, format!("x{b}{i}").as_bytes())));
+            }
+            s.sync().unwrap(); s.flush().unwrap();
+        }
+        s.merge_range(0, 4).unwrap().unwrap();
+        drop(s);
+    }
+    let files: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".part")).collect();
+    assert_eq!(files.len(), 1, "superseded inputs must be swept, leaving only the merged part: {files:?}");
+
+    let s = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(s.part_count(), 1);
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
+    }
+    // and a plain reader sees the merged state with no lock
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.ids().unwrap().len(), 40);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn tiering_bounds_part_count_under_sustained_writes() {
+    let dir = tmp("tiering");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    let mut peak = 0usize;
+    for b in 0..30 {
+        for i in 0..5 {
+            let id = format!("t{b:02}-{i}");
+            want.push((id.clone(), put(&mut s, &id, format!("v{b}{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.maybe_compact(8, 4).unwrap();
+        peak = peak.max(s.part_count());
+    }
+    assert!(peak <= 8, "tiering must bound part count; peaked at {peak}");
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "tiering lost {id}");
     }
     std::fs::remove_dir_all(&dir).ok();
 }

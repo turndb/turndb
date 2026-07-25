@@ -20,6 +20,7 @@
 
 pub mod attrs;
 pub mod idcol;
+pub mod merge;
 
 use crate::fold::{Fold, Loc};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
