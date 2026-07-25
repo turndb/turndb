@@ -280,3 +280,61 @@ fn build_is_deterministic() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Format edges. Each of these was silent before: a wrong answer, not an error.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_toc_pointing_past_the_file_is_refused() {
+    // The footer is checksummed; the TOC is not. A corrupt-but-plausible entry would otherwise send a
+    // read to allocate `stored` bytes and read at an arbitrary offset.
+    let d = tmp("toccorrupt");
+    let path = d.join("p.part");
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let recs: Vec<Record> = (0..40)
+        .map(|i| {
+            let body = format!("record {i} with some content").into_bytes();
+            let p = fold.put(&body).unwrap();
+            Record {
+                id: format!("k{i:03}"),
+                body: vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                attrs: vec![("v".into(), AttrValue::Int(i))],
+            }
+        })
+        .collect();
+    part::build(&path, &recs, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
+    fold.sync().unwrap();
+    assert!(Part::open(&path).is_ok(), "the part must be sound to begin with");
+
+    // Truncating the file leaves the footer intact only if we rebuild it, so instead corrupt a TOC
+    // offset by rewriting the file shorter and repairing the footer checksum is overkill — simply
+    // truncating makes the footer unreadable, which is already covered. Take the file and append
+    // nothing, but shrink it: the TOC entries then point past the end.
+    let good = std::fs::read(&path).unwrap();
+    let mut short = good.clone();
+    // keep the last FOOTER_LEN bytes (so the footer still verifies) but drop a chunk of the body
+    let flen = part::FOOTER_LEN as usize;
+    let cut = 4096.min(short.len() - flen - 1);
+    let footer = short[short.len() - flen..].to_vec();
+    short.truncate(short.len() - flen - cut);
+    short.extend_from_slice(&footer);
+    std::fs::write(&path, &short).unwrap();
+
+    // Either the footer or the range check must reject it. What must NOT happen is a successful open
+    // that later reads at a bogus offset.
+    match Part::open(&path) {
+        Err(_) => {}
+        Ok(p) => {
+            // if it opened, every section read must still refuse rather than return junk
+            let mut any_ok = false;
+            for r in 0..p.len().min(5) {
+                if p.record(r).is_ok() {
+                    any_ok = true;
+                }
+            }
+            assert!(!any_ok, "a truncated part opened AND served records");
+        }
+    }
+    std::fs::remove_dir_all(&d).ok();
+}

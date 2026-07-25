@@ -354,3 +354,26 @@ fn block_cache_serves_neighbours() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn a_configuration_that_would_overflow_is_refused_at_open() {
+    let d = tmp("cfgguard");
+    // A block is admitted into a fresh segment however large, so block_target is what bounds the
+    // segment append point and Loc.in_off — both u32. Past 4 GiB they wrap, and in release that is a
+    // block directory pointing at the wrong offset with no error anywhere.
+    let huge = FoldCfg { block_target: 5 << 30, ..FoldCfg::default() };
+    assert!(Fold::open(&d.join("f1"), huge).is_err(), "an overflowing block_target must be refused");
+
+    let zero = FoldCfg { block_target: 0, ..FoldCfg::default() };
+    assert!(Fold::open(&d.join("f2"), zero).is_err(), "a zero block_target must be refused");
+
+    for lvl in [0i32, -3, 23, 100] {
+        let bad = FoldCfg { level: lvl, ..FoldCfg::default() };
+        assert!(Fold::open(&d.join(format!("f{lvl}")), bad).is_err(),
+            "zstd level {lvl} is out of range and must be refused at open, not at first write");
+    }
+
+    // and the defaults are, of course, accepted
+    assert!(Fold::open(&d.join("ok"), FoldCfg::default()).is_ok());
+    std::fs::remove_dir_all(&d).ok();
+}
