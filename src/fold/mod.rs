@@ -185,6 +185,28 @@ impl Fold {
         if (cfg.seg_max as u64) > SEG_MAX_LIMIT {
             bail!("seg_max {} exceeds the {} format bound (Loc.block_off is u32)", cfg.seg_max, SEG_MAX_LIMIT);
         }
+        // A block is admitted into a FRESH segment however large it is — otherwise a block bigger than
+        // seg_max could never be written at all. That admission is what makes block_target load-bearing
+        // for overflow: the segment append point and `Loc.in_off` are both u32, so a block target past
+        // 4 GiB wraps them and writes a block directory pointing at the wrong offset. In release that
+        // is silent.
+        if cfg.block_target == 0 {
+            bail!("block_target must be non-zero");
+        }
+        if cfg.block_target as u64 > (u32::MAX as u64) / 2 {
+            bail!(
+                "block_target {} is too large; the segment append point and Loc.in_off are u32, so a \
+                 block must stay well under 4 GiB",
+                cfg.block_target
+            );
+        }
+        // A deliberate NARROWING, not a bug fix: zstd itself accepts 0 (meaning "default") and
+        // negative "fast" levels. Neither belongs in a store whose stated posture is compression-first,
+        // and an invalid level otherwise surfaces at the first block write rather than at open — long
+        // after the caller could do anything about it.
+        if !(1..=22).contains(&cfg.level) {
+            bail!("zstd level {} is outside the 1..=22 range this fold accepts", cfg.level);
+        }
         std::fs::create_dir_all(dir).with_context(|| format!("create fold dir {}", dir.display()))?;
         let lock = acquire_writer_lock(dir)?;
 

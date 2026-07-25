@@ -238,6 +238,12 @@ impl Writer {
     }
 
     fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
+        // A section's `stored` and `raw` are u32 in the TOC. Truncating here would write a part that
+        // reads back as a shorter section with no error anywhere — silent corruption. Refuse instead:
+        // a part that cannot be written is recoverable, a part that lies is not.
+        if raw.len() as u64 > u32::MAX as u64 {
+            bail!("section {name} is {} bytes; the format caps a section at 4 GiB", raw.len());
+        }
         let (codec, payload) = crate::fold::codec::encode(raw, None, self.level)?;
         self.f.write_all(&payload)?;
         self.toc.push((
@@ -362,6 +368,12 @@ impl Part {
             let raw = get_varint(&toc_bytes, &mut at)? as u32;
             let codec = toc_bytes[at];
             at += 1;
+            // A corrupt-but-plausible TOC would otherwise send `sect` to allocate `stored` bytes and
+            // read at an arbitrary offset. The footer is checksummed; the TOC is not, so every entry
+            // is range-checked against the file it claims to live in.
+            if off.saturating_add(stored as u64) > len {
+                bail!("part TOC entry {name} runs past the end of the file");
+            }
             toc.insert(name, Section { off, stored, raw, codec });
         }
         Ok(Part {
