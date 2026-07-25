@@ -31,7 +31,7 @@ pub mod wal;
 
 use crate::fold::{Fold, FoldCfg, FoldTail};
 use crate::part::{self, Part};
-use crate::types::{AttrValue, BodyOp, Record};
+use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -168,6 +168,43 @@ impl Store {
         Ok(ReadStore { fold, parts, manifest })
     }
 
+    /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
+    ///
+    /// ```text
+    ///   Tier 0   the fold's in-memory window   — this flush's pieces, no I/O
+    ///   Tier 1   every live part's dictionary  — everything ever committed, filter then search
+    ///   append   genuinely novel content
+    /// ```
+    ///
+    /// Tier 1 is what makes dedup **unbounded**: Tier 0 is bounded by the flush interval by design (it
+    /// is released at every flush so resident memory tracks the interval, not the store), and without
+    /// Tier 1 the same content re-appended after a flush would be stored twice.
+    ///
+    /// Parts are consulted newest-first: recently written content is the content most likely to repeat.
+    ///
+    /// **Why a Tier-1 hit needs no WAL bytes.** A part is only named by the manifest after its content
+    /// was durable, and the committed fold tail only grows — so any location reachable through a part's
+    /// dictionary already sits below the tail that recovery truncates to. The bytes cannot be the ones
+    /// a crash discards.
+    fn fold_piece(&mut self, b: &[u8]) -> Result<crate::fold::Put> {
+        let hash = PieceHash::of(b);
+        if let Some(loc) = self.fold.lookup(hash) {
+            return Ok(crate::fold::Put { hash, loc, deduped: true });
+        }
+        let mut found = None;
+        for p in self.parts.iter().rev() {
+            if let Some(loc) = p.lookup_piece(&hash)? {
+                found = Some(loc);
+                break;
+            }
+        }
+        if let Some(loc) = found {
+            self.fold.note(hash, loc);
+            return Ok(crate::fold::Put { hash, loc, deduped: true });
+        }
+        self.fold.put_hashed(b, hash)
+    }
+
     /// Fold the spans, log the record, and stage it. Durable only after [`sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
         let mut body = Vec::with_capacity(spans.len());
@@ -176,7 +213,7 @@ impl Store {
             match s {
                 Span::Lit(b) => body.push(BodyOp::Lit(b.to_vec())),
                 Span::Piece(b) => {
-                    let put = self.fold.put(b)?;
+                    let put = self.fold_piece(b)?;
                     if !put.deduped {
                         // new content: the log must carry the bytes, because recovery discards
                         // anything the fold wrote past the committed tail

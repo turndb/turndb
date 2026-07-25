@@ -625,6 +625,15 @@ impl Fold {
         self.dedup.get(&hash)
     }
 
+    /// Record a location the caller resolved elsewhere (a Tier-1 part lookup), so that further
+    /// references to the same content in this flush window are answered from memory.
+    ///
+    /// This only ever populates a cache with a mapping that is already true on disk. It cannot create
+    /// content, and a wrong entry here would be indistinguishable from a wrong entry made by `put`.
+    pub fn note(&mut self, hash: PieceHash, loc: Loc) {
+        self.dedup.insert(hash, loc);
+    }
+
     pub fn window_len(&self) -> usize {
         self.dedup.len()
     }

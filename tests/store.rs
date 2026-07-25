@@ -362,3 +362,122 @@ fn tiering_bounds_part_count_under_sustained_writes() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Tier-1 dedup: content already committed to a part is never stored twice, no matter how much
+// time, how many flushes, or a process restart separates the two writes.
+// ---------------------------------------------------------------------------------------------
+
+/// Total bytes of fold segments — the only thing that grows when content is genuinely stored.
+fn fold_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
+        .map(|e| e.metadata().unwrap().len()).sum()
+}
+
+#[test]
+fn content_repeated_after_a_flush_costs_nothing() {
+    let dir = tmp("tier1");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    // A payload big enough that storing it twice is unmistakable in the segment size.
+    let payload: Vec<u8> = (0..200_000u32).flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..4].to_vec()).collect();
+
+    s.put("first", &[Span::Piece(&payload)], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let after_first = fold_bytes(&dir);
+
+    // Same content, new record, new flush window. Tier 0 was released at the flush, so only a part
+    // lookup can catch this.
+    s.put("second", &[Span::Piece(&payload)], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let after_second = fold_bytes(&dir);
+
+    assert_eq!(after_second, after_first,
+        "TIER-1 MISS: {} bytes of already-stored content were written again",
+        after_second - after_first);
+    assert_eq!(s.reconstruct("first").unwrap().unwrap(), payload);
+    assert_eq!(s.reconstruct("second").unwrap().unwrap(), payload, "the dedup'd record must still read back exactly");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dedup_survives_a_process_restart() {
+    let dir = tmp("tier1reopen");
+    let payload: Vec<u8> = (0..100_000u32).flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..4].to_vec()).collect();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        s.put("a", &[Span::Piece(&payload)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        drop(s);
+    }
+    let before = fold_bytes(&dir);
+    {
+        // A fresh process has no in-memory window whatsoever. Only the parts on disk can answer.
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        s.put("b", &[Span::Piece(&payload)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.reconstruct("a").unwrap().unwrap(), payload);
+        assert_eq!(s.reconstruct("b").unwrap().unwrap(), payload);
+        drop(s);
+    }
+    assert_eq!(fold_bytes(&dir), before, "dedup must not depend on process lifetime");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dedup_survives_a_merge() {
+    let dir = tmp("tier1merge");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let payload: Vec<u8> = (0..80_000u32).flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..4].to_vec()).collect();
+    for i in 0..4 {
+        s.put(&format!("r{i}"), &[Span::Piece(&payload)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let before = fold_bytes(&dir);
+    s.merge_range(0, 4).unwrap().unwrap();
+    // The merged part must carry the dictionary forward, filter and permutation included.
+    s.put("after-merge", &[Span::Piece(&payload)], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    assert_eq!(fold_bytes(&dir), before, "a merge must not blind the dedup index");
+    for i in 0..4 {
+        assert_eq!(s.reconstruct(&format!("r{i}")).unwrap().unwrap(), payload);
+    }
+    assert_eq!(s.reconstruct("after-merge").unwrap().unwrap(), payload);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_heavily_repeated_corpus_stores_one_copy_of_each_distinct_piece() {
+    let dir = tmp("tier1corpus");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    // 20 distinct pieces, referenced 500 times across 100 flushes.
+    let pieces: Vec<Vec<u8>> = (0..20u32)
+        .map(|i| (0..2000u32).flat_map(|j| blake3::hash(&(i * 100_000 + j).to_le_bytes()).as_bytes()[..8].to_vec()).collect())
+        .collect();
+    let distinct: u64 = pieces.iter().map(|p| p.len() as u64).sum();
+    for round in 0..100 {
+        for (i, p) in pieces.iter().enumerate() {
+            s.put(&format!("r{round}-{i}"), &[Span::Piece(p)], vec![]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let stored = fold_bytes(&dir);
+    // The content is deliberately incompressible, so one stored copy plus framing is a touch OVER the
+    // raw distinct size. The claim is the ratio: 100 rounds cost what one round costs.
+    let naive = distinct * 100;
+    assert!(stored < distinct * 11 / 10,
+        "stored {stored} vs {distinct} distinct bytes — dedup did not hold across 100 flushes");
+    eprintln!("100 rounds x 20 pieces: {stored} B stored, {naive} B without dedup ({:.0}x)", naive as f64 / stored as f64);
+    for (i, p) in pieces.iter().enumerate() {
+        assert_eq!(&s.reconstruct(&format!("r99-{i}")).unwrap().unwrap(), p);
+        assert_eq!(&s.reconstruct(&format!("r0-{i}")).unwrap().unwrap(), p);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
