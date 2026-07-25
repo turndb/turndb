@@ -351,6 +351,78 @@ impl Fold {
         })
     }
 
+    /// Open WITHOUT the writer lock, read-only.
+    ///
+    /// Takes no lock, truncates nothing, sweeps nothing — a reader must never mutate a store another
+    /// process is writing. Safe concurrently with a live writer: segments are append-only and blocks
+    /// are immutable once written, so a reader sees a prefix that only ever grows.
+    pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
+        let mut nums = list_segments(dir)?;
+        if nums.is_empty() {
+            bail!("no fold segments under {}", dir.display());
+        }
+        nums.sort_unstable();
+        let mut headers = Vec::with_capacity(nums.len());
+        let mut readers = Vec::with_capacity(nums.len());
+        for &n in &nums {
+            let f = segment::open_read(dir, n)?;
+            let mut hb = [0u8; SEG_HDR_LEN as usize];
+            f.read_exact_at(&mut hb, 0)?;
+            headers.push(SegHeader::decode(&hb, n)?);
+            readers.push(Arc::new(f));
+        }
+        let mut dicts: HashMap<[u8; 32], Arc<Vec<u8>>> = HashMap::new();
+        for h in &headers {
+            if !h.has_dict() || dicts.contains_key(&h.dict_id) {
+                continue;
+            }
+            let name = format!("zdict-{}.zd", PieceHash(h.dict_id).to_hex());
+            let bytes = std::fs::read(dir.join(&name))?;
+            let got: [u8; 32] = blake3::hash(&bytes).into();
+            if got != h.dict_id {
+                bail!("dictionary {name} does not match the id naming it");
+            }
+            dicts.insert(h.dict_id, Arc::new(bytes));
+        }
+        // The directory is rebuilt from the ids the frames carry — the same scan the writer does.
+        let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
+        let mut next_block = 0u32;
+        for (i, h) in headers.iter().enumerate() {
+            let len = readers[i].metadata()?.len();
+            let (_, entries) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+            for (id, off) in entries {
+                if blockdir.len() <= id as usize {
+                    blockdir.resize(id as usize + 1, None);
+                }
+                blockdir[id as usize] = Some((h.seg, off));
+                next_block = next_block.max(id + 1);
+            }
+        }
+        let active = *nums.last().unwrap();
+        let active_f = segment::open_read(dir, active)?;
+        let cur_off = active_f.metadata()?.len() as u32;
+        Ok(Fold {
+            dir: dir.to_path_buf(),
+            cfg,
+            headers,
+            readers,
+            dicts,
+            active,
+            cur_off,
+            active_f,
+            open_block: Vec::new(),
+            dedup: DedupTable::with_capacity(16),
+            cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
+            poisoned: true, // a read-only fold must refuse every append
+            scratch: Vec::new(),
+            blockdir,
+            next_block,
+            inflight: HashMap::new(),
+            pool: pipe::Pool::new(1, cfg.level, None),
+            _lock: File::open(dir)?,
+        })
+    }
+
     /// Append `raw`, or return the existing location if this content is already folded.
     ///
     /// The returned `Loc` is final even though the block holding it may not be sealed yet: a block's
@@ -584,6 +656,9 @@ impl Fold {
             .sum()
     }
 
+    /// The active segment's dictionary. Currently unused because the compression pool is handed its
+    /// dictionary at construction; when trained dictionaries land, the pool must be rebuilt on roll.
+    #[allow(dead_code)]
     fn active_dict(&self) -> Option<Arc<Vec<u8>>> {
         let id = self.headers[self.active as usize].dict_id;
         if id == [0u8; 32] {
