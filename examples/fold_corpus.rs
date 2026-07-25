@@ -112,9 +112,12 @@ fn main() -> anyhow::Result<()> {
         .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("turndb-fold-corpus"));
+    let d = FoldCfg::default();
+    let block_target: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(d.block_target);
+    let level: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(d.level);
     let _ = std::fs::remove_dir_all(&dir);
 
-    let mut fold = Fold::open(&dir, FoldCfg::default())?;
+    let mut fold = Fold::open(&dir, FoldCfg { block_target, level, ..Default::default() })?;
     let f = std::fs::File::open(&corpus)?;
     let rdr = BufReader::with_capacity(1 << 20, f);
 
@@ -193,7 +196,7 @@ fn main() -> anyhow::Result<()> {
     let disk = fold.disk_bytes();
     let distinct = refs - dups;
 
-    println!("\r{:<28}{}", "corpus", corpus.display());
+    println!("\r{:<28}{}  block={}K level={}", "corpus", corpus.display(), block_target / 1024, level);
     println!("{:<28}{records}", "records");
     println!("{:<28}{:.2} MiB", "logical body bytes", mib(logical));
     println!();
@@ -209,7 +212,7 @@ fn main() -> anyhow::Result<()> {
         "after dedup", mib(distinct_raw), logical as f64 / distinct_raw as f64
     );
     println!(
-        "{:<28}{:>10.2} MiB   {:.1}x  <- BLOCK COMPRESSION (64 KiB blocks, plain zstd)",
+        "{:<28}{:>10.2} MiB   {:.1}x  <- BLOCK COMPRESSION",
         "fold on disk", mib(disk), distinct_raw as f64 / disk as f64
     );
     println!("{:<28}{:>10.2} MiB   {:.1}x  <- overall", "", mib(disk), logical as f64 / disk as f64);

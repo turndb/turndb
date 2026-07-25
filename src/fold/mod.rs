@@ -7,7 +7,7 @@
 //! # Two units, deliberately separated
 //!
 //! A **piece** is the unit of identity and dedup. A **block** is the unit of compression and I/O.
-//! Pieces accumulate in an open buffer; at [`block::BLOCK_TARGET`] the buffer is compressed as one
+//! Pieces accumulate in an open buffer; at the configured block target the buffer is compressed as one
 //! block and appended. This captures the cross-piece redundancy that dominates trace data, and because
 //! a record's pieces are captured together they land in a handful of blocks — so reconstructing a
 //! record costs a few large decompressions instead of dozens of tiny ones. Measured on two real
@@ -28,7 +28,7 @@ pub mod codec;
 pub mod dedup;
 pub mod segment;
 
-pub use block::{Loc, BLOCK_TARGET, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
+pub use block::{Loc, BLOCK_TARGET_DEFAULT, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 pub use segment::FoldTail;
 
 use crate::types::PieceHash;
@@ -45,14 +45,27 @@ use std::sync::{Arc, Mutex};
 pub struct FoldCfg {
     /// Roll threshold. Bounded by [`SEG_MAX_LIMIT`] because `Loc.block_off` is a u32.
     pub seg_max: u32,
-    /// How many decompressed blocks a reader keeps. Blocking makes this load-bearing: a record's
-    /// pieces span a few blocks, so a small cache turns the rest of its reads into slices.
-    pub cache_blocks: usize,
+    /// Decompressed-block cache budget in BYTES. Sized in bytes rather than blocks on purpose: a
+    /// fixed block COUNT would make cache memory scale with the block-size dial, which is backwards.
+    /// Blocking makes this load-bearing — a record's pieces span a few blocks, so the cache turns the
+    /// rest of its reads into slices.
+    pub cache_bytes: usize,
+    /// Raw bytes gathered before a block seals. THE compression/read dial. Write-side only — a reader
+    /// never needs to know it. Bigger blocks compress harder (more cross-piece redundancy in reach)
+    /// and cost more to touch, since a read decompresses a whole block.
+    pub block_target: usize,
+    /// zstd level. Also write-side only. Costs ingest throughput, barely affects reads.
+    pub level: i32,
 }
 
 impl Default for FoldCfg {
     fn default() -> Self {
-        FoldCfg { seg_max: SEG_MAX_DEFAULT, cache_blocks: 64 }
+        FoldCfg {
+            seg_max: SEG_MAX_DEFAULT,
+            cache_bytes: 64 << 20,
+            block_target: BLOCK_TARGET_DEFAULT,
+            level: codec::LEVEL_DEFAULT,
+        }
     }
 }
 
@@ -65,9 +78,10 @@ pub struct Put {
     pub deduped: bool,
 }
 
-/// LRU of decompressed blocks, keyed by `(seg, block_off)`.
+/// LRU of decompressed blocks, keyed by `(seg, block_off)`, bounded by total decompressed bytes.
 struct BlockCache {
-    cap: usize,
+    budget: usize,
+    bytes: usize,
     map: HashMap<(u32, u32), (u64, Arc<Vec<u8>>)>,
     clock: u64,
     hits: u64,
@@ -75,8 +89,8 @@ struct BlockCache {
 }
 
 impl BlockCache {
-    fn new(cap: usize) -> BlockCache {
-        BlockCache { cap: cap.max(1), map: HashMap::new(), clock: 0, hits: 0, misses: 0 }
+    fn new(budget: usize) -> BlockCache {
+        BlockCache { budget: budget.max(1), bytes: 0, map: HashMap::new(), clock: 0, hits: 0, misses: 0 }
     }
     fn get(&mut self, k: (u32, u32)) -> Option<Arc<Vec<u8>>> {
         self.clock += 1;
@@ -94,13 +108,18 @@ impl BlockCache {
         }
     }
     fn put(&mut self, k: (u32, u32), v: Arc<Vec<u8>>) {
-        if self.map.len() >= self.cap {
+        let add = v.len();
+        // always admit one block, however large, then evict coldest until back inside the budget
+        while self.bytes + add > self.budget && !self.map.is_empty() {
             if let Some((&victim, _)) = self.map.iter().min_by_key(|(_, (t, _))| *t) {
-                self.map.remove(&victim);
+                if let Some((_, gone)) = self.map.remove(&victim) {
+                    self.bytes -= gone.len();
+                }
             }
         }
         self.clock += 1;
         let c = self.clock;
+        self.bytes += add;
         self.map.insert(k, (c, v));
     }
 }
@@ -171,9 +190,9 @@ impl Fold {
                 active: 0,
                 cur_off: SEG_HDR_LEN as u32,
                 active_f: f,
-                open_block: Vec::with_capacity(BLOCK_TARGET * 2),
+                open_block: Vec::with_capacity(cfg.block_target * 2),
                 dedup: DedupTable::new(),
-                cache: Mutex::new(BlockCache::new(cfg.cache_blocks)),
+                cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
                 poisoned: false,
                 scratch: Vec::new(),
                 _lock: lock,
@@ -287,9 +306,9 @@ impl Fold {
             active,
             cur_off: target as u32,
             active_f,
-            open_block: Vec::with_capacity(BLOCK_TARGET * 2),
+            open_block: Vec::with_capacity(cfg.block_target * 2),
             dedup: DedupTable::new(),
-            cache: Mutex::new(BlockCache::new(cfg.cache_blocks)),
+            cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
             poisoned: false,
             scratch: Vec::new(),
             _lock: lock,
@@ -332,7 +351,7 @@ impl Fold {
         self.open_block.extend_from_slice(raw);
         self.dedup.insert(hash, loc);
 
-        if self.open_block.len() >= BLOCK_TARGET {
+        if self.open_block.len() >= self.cfg.block_target {
             self.seal_block()?;
         }
         Ok(Put { hash, loc, deduped: false })
@@ -412,7 +431,7 @@ impl Fold {
             return Ok(());
         }
         let dict = self.active_dict();
-        let (tag, payload) = codec::encode(&self.open_block, dict.as_deref().map(|v| &v[..]))?;
+        let (tag, payload) = codec::encode(&self.open_block, dict.as_deref().map(|v| &v[..]), self.cfg.level)?;
         let n = block::encode(&mut self.scratch, tag, &self.open_block, &payload);
         if let Err(e) = self.active_f.write_all_at(&self.scratch[..n], self.cur_off as u64) {
             self.poisoned = true;
