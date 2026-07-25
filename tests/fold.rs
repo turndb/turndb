@@ -377,3 +377,69 @@ fn a_configuration_that_would_overflow_is_refused_at_open() {
     assert!(Fold::open(&d.join("ok"), FoldCfg::default()).is_ok());
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn recovery_rolls_back_across_segment_boundaries() {
+    // Everything about recovery has been exercised inside ONE segment. The multi-segment path is
+    // different code: it deletes whole segments above the committed one, pops their headers, and
+    // rebuilds the block directory across the survivors.
+    let d = tmp("multiseg");
+    let cfg = FoldCfg { seg_max: 1 << 18, block_target: 1 << 15, ..FoldCfg::default() };
+
+    let (committed, want) = {
+        let mut f = Fold::open(&d, cfg).unwrap();
+        let mut want = Vec::new();
+        // enough to fill several segments
+        for i in 0..400u32 {
+            let piece: Vec<u8> = (0..64u32)
+                .flat_map(|j| blake3::hash(&(i * 1000 + j).to_le_bytes()).as_bytes().to_vec())
+                .collect();
+            let p = f.put(&piece).unwrap();
+            want.push((p.hash, p.loc, piece));
+        }
+        let tail = f.sync().unwrap();
+        assert!(tail.seg > 0, "the test must actually cross a segment boundary; got seg {}", tail.seg);
+
+        // more content AFTER the committed tail, spilling into further segments
+        for i in 400..800u32 {
+            let piece: Vec<u8> = (0..64u32)
+                .flat_map(|j| blake3::hash(&(i * 1000 + j).to_le_bytes()).as_bytes().to_vec())
+                .collect();
+            f.put(&piece).unwrap();
+        }
+        f.sync().unwrap();
+        let after = f.segment_count();
+        assert!(after > tail.seg + 1, "the uncommitted writes must have rolled further");
+        drop(f);
+        (tail, want)
+    };
+
+    // Recover to the committed tail: segments above it must go, and everything at or below must read.
+    let f = Fold::open_at(&d, cfg, Some(committed)).unwrap();
+    assert_eq!(f.segment_count(), committed.seg + 1,
+        "segments above the committed tail must be removed");
+    for (hash, loc, piece) in &want {
+        let got = f.read_verified(*loc, *hash).unwrap();
+        assert_eq!(&got, piece, "a committed piece did not survive a multi-segment rollback");
+    }
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_committed_tail_beyond_the_data_is_refused() {
+    // The disk broke an fsync promise. Serving a fold that silently lost durable bytes is worse than
+    // refusing to open.
+    let d = tmp("liartail");
+    let cfg = FoldCfg { seg_max: 1 << 18, block_target: 1 << 15, ..FoldCfg::default() };
+    {
+        let mut f = Fold::open(&d, cfg).unwrap();
+        for i in 0..50u32 {
+            f.put(&blake3::hash(&i.to_le_bytes()).as_bytes().to_vec()).unwrap();
+        }
+        f.sync().unwrap();
+    }
+    let beyond = FoldTail { seg: 99, off: 4096 };
+    assert!(Fold::open_at(&d, cfg, Some(beyond)).is_err(),
+        "a committed tail past the last good block must refuse, not truncate to it");
+    std::fs::remove_dir_all(&d).ok();
+}

@@ -505,6 +505,18 @@ impl PartScan {
             let mut bytes = 0usize;
             for (i, &r) in take.iter().enumerate() {
                 let b = self.part.reconstruct(lo + r, fold)?;
+                // Arrow's Binary array indexes with i32 offsets, so 2 GiB is a hard ceiling on ONE
+                // array. BATCH_BYTES normally keeps a batch far below it, but a batch always admits at
+                // least one row however large, and that escape is the only way here. Refuse with the
+                // reason rather than let the builder overflow its offsets.
+                if b.len() > i32::MAX as usize {
+                    bail!(
+                        "record at row {} is {} bytes; an Arrow binary column cannot exceed 2 GiB. \
+                         Read it through Store::reconstruct instead of the query lens.",
+                        lo + r,
+                        b.len()
+                    );
+                }
                 bytes += b.len();
                 v.push(b);
                 // At least one row always lands, however large it is — otherwise a single record

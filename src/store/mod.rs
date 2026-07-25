@@ -175,14 +175,45 @@ impl Store {
     /// invisible, which is the correct snapshot. Safe alongside a live writer because parts are
     /// immutable and the fold is append-only.
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<ReadStore> {
-        let manifest = Manifest::load(dir)?;
         let fold = Fold::open_read(&dir.join("fold"), cfg)?;
-        let pcache = SectionCache::shared();
-        let mut parts = Vec::with_capacity(manifest.parts.len());
-        for p in &manifest.parts {
-            parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
+
+        // Reading the manifest and opening the parts it names is not atomic, and a writer may commit a
+        // merge and unlink the replaced inputs in between. The manifest IS the linearization point, so
+        // the fix is simply to start over: a re-read gets the newer manifest, whose parts exist. An
+        // already-open part is unaffected — Unix keeps it alive through the unlink — so this window is
+        // only ever about parts not yet opened.
+        //
+        // Bounded, because a manifest naming a genuinely absent part must eventually surface as an
+        // error rather than spin.
+        let mut last: Option<anyhow::Error> = None;
+        for _ in 0..8 {
+            let manifest = Manifest::load(dir)?;
+            let pcache = SectionCache::shared();
+            let mut parts = Vec::with_capacity(manifest.parts.len());
+            let mut missed = false;
+            for p in &manifest.parts {
+                match Part::open_in(&dir.join(&p.file), pcache.clone()) {
+                    Ok(part) => parts.push(Arc::new(part)),
+                    Err(e) => {
+                        let gone = e
+                            .downcast_ref::<std::io::Error>()
+                            .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+                            .unwrap_or(false)
+                            || !dir.join(&p.file).exists();
+                        if !gone {
+                            return Err(e);
+                        }
+                        last = Some(e);
+                        missed = true;
+                        break;
+                    }
+                }
+            }
+            if !missed {
+                return Ok(ReadStore { fold, parts, manifest, pcache });
+            }
         }
-        Ok(ReadStore { fold, parts, manifest, pcache })
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("manifest names a part that does not exist")))
     }
 
     /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
