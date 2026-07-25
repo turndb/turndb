@@ -196,8 +196,9 @@ fn corrupted_frame_is_refused_not_served() {
 #[test]
 fn segments_roll_and_locs_resolve_across_them() {
     let dir = tmp("roll");
-    // tiny segments so a modest corpus spans several
-    let mut f = Fold::open(&dir, FoldCfg { seg_max: 256 * 1024, ..Default::default() }).unwrap();
+    // tiny blocks AND tiny segments so a modest corpus seals many blocks across several segments
+    let cfg = FoldCfg { seg_max: 256 * 1024, block_target: 32 * 1024, ..Default::default() };
+    let mut f = Fold::open(&dir, cfg).unwrap();
     let mut data = Vec::new();
     let mut locs = Vec::new();
     let mut seed = [3u8; 32];
@@ -217,7 +218,7 @@ fn segments_roll_and_locs_resolve_across_them() {
     f.sync().unwrap();
     drop(f);
 
-    let f = Fold::open(&dir, FoldCfg { seg_max: 256 * 1024, ..Default::default() }).unwrap();
+    let f = Fold::open(&dir, cfg).unwrap();
     for (d, l) in data.iter().zip(&locs) {
         assert_eq!(&f.read(*l).unwrap(), d, "cross-segment read failed");
     }
@@ -327,7 +328,8 @@ fn pieces_written_together_share_a_block() {
 #[test]
 fn block_cache_serves_neighbours() {
     let dir = tmp("cache");
-    let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
+    let cfg = FoldCfg { block_target: 4096, ..Default::default() };
+    let mut f = Fold::open(&dir, cfg).unwrap();
     let mut locs = Vec::new();
     for i in 0..200 {
         locs.push(f.put(format!("piece number {i} with some padding to give it size").as_bytes()).unwrap().loc);
@@ -335,7 +337,7 @@ fn block_cache_serves_neighbours() {
     f.sync().unwrap();
     drop(f);
 
-    let f = Fold::open(&dir, FoldCfg::default()).unwrap();
+    let f = Fold::open(&dir, cfg).unwrap();
     for l in &locs {
         f.read(*l).unwrap();
     }

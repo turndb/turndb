@@ -37,12 +37,13 @@ pub const CODEC_ZSTD: u8 = 1;
 /// Payload is one zstd frame encoded against this segment's trained dictionary.
 pub const CODEC_ZSTD_DICT: u8 = 2;
 
-/// How much raw content a block gathers before sealing.
+/// Default raw content gathered before a block seals.
 ///
-/// A compile-time constant, never configuration: block boundaries determine the stored bytes, and
-/// determinism means no environment may influence them. 64 KiB is where the measured curve sits —
-/// smaller than per-piece framing on disk while still faster per record, on both corpora tested.
-pub const BLOCK_TARGET: usize = 64 * 1024;
+/// A WRITE-SIDE knob only: the block header carries `raw`, `stored` and `codec`, so a reader never
+/// needs to know what the writer chose, and changing it is neither a format change nor a
+/// compatibility question. Byte-identity holds for a given setting. Larger blocks compress harder and
+/// cost more per read; see `FoldCfg`. Default is compression-first (owner preference): 4 MiB.
+pub const BLOCK_TARGET_DEFAULT: usize = 4 * 1024 * 1024;
 
 /// Where a piece lives: which block, and where inside it.
 ///
