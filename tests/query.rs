@@ -357,7 +357,7 @@ fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id", "body"]).unwrap();
 
-    let mut sc = lens.scan(&parts[0], Some(&fold), &proj).unwrap();
+    let mut sc = lens.scan(&parts[0], Some(&fold), &proj, &[]).unwrap();
     let (mut batches, mut rows, mut peak) = (0usize, 0usize, 0usize);
     let mut seen: Vec<Vec<u8>> = Vec::new();
     while let Some(b) = sc.next_batch().unwrap() {
@@ -459,5 +459,124 @@ async fn limit_cost_does_not_scale_with_part_count() {
     // 8 parts x 40 records = 320. Without pushdown this reconstructs all 320 (each part is one batch).
     assert!(st.fold_reads <= 8,
         "LIMIT 1 over 8 parts reconstructed {} bodies; cost is scaling with part count", st.fold_reads);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Filter pushdown. The point is not fewer rows out — the engine could do that. It is less WORK in.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_filtered_body_query_reconstructs_only_matching_rows() {
+    let dir = tmp("filterbody");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for i in 0..600u32 {
+        let body: Vec<u8> = (0..512u32)
+            .flat_map(|j| blake3::hash(&(i * 4096 + j).to_le_bytes()).as_bytes()[..32].to_vec())
+            .collect();
+        // exactly 1 in 30 is "rare"
+        let kind = if i % 30 == 0 { "rare" } else { "common" };
+        s.put(&format!("f{i:04}"), &[Span::Piece(&body)], vec![
+            ("kind".into(), AttrValue::Str(kind.into())),
+            ("n".into(), AttrValue::Int(i as i64)),
+        ]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    table.reset_stats();
+
+    let r = ctx.sql("SELECT id, body FROM t WHERE kind = 'rare'").await.unwrap()
+        .collect().await.unwrap();
+    let rows: usize = r.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 20, "600/30 rows match");
+
+    let st = table.stats();
+    // Without pushdown every one of the 600 bodies is reconstructed and the engine filters after.
+    assert!(st.fold_reads <= 40,
+        "reconstructed {} bodies to return 20 — the predicate is not reaching the scan", st.fold_reads);
+    assert!(st.rows_filtered >= 500, "the scan should have excluded most rows itself");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_predicate_matching_nothing_skips_batches_whole() {
+    let dir = tmp("filternone");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for i in 0..500u32 {
+        s.put(&format!("z{i:04}"), &[Span::Lit(b"x")], vec![
+            ("kind".into(), AttrValue::Str("present".into())),
+        ]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    table.reset_stats();
+    // A literal that is not in the dictionary at all: the scan can prove no row matches without
+    // comparing a single value.
+    let r = ctx.sql("SELECT id FROM t WHERE kind = 'absent'").await.unwrap().collect().await.unwrap();
+    assert_eq!(r.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    assert!(table.stats().batches_skipped >= 1, "a provably-empty predicate must skip, not scan");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn pushdown_never_changes_an_answer() {
+    // The gate. Inexact pushdown is only allowed to return EXTRA rows; the engine re-filters. So for
+    // every predicate shape, the SQL answer must be identical to the same query with the filter
+    // applied by hand over a full scan.
+    let dir = tmp("filtersame");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let kinds = ["alpha", "beta", "gamma", "delta"];
+    for p in 0..3 {
+        for i in 0..200u32 {
+            let v = p * 200 + i;
+            s.put(&format!("q{v:04}"), &[Span::Lit(b"b")], vec![
+                ("kind".into(), AttrValue::Str(kinds[(v % 4) as usize].into())),
+                ("n".into(), AttrValue::Int(v as i64)),
+                ("ratio".into(), AttrValue::Float(v as f64 / 3.0)),
+                ("ok".into(), AttrValue::Bool(v % 7 == 0)),
+            ]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
+
+    for pred in [
+        "kind = 'beta'",
+        "kind <> 'beta'",
+        "kind < 'gamma'",
+        "kind >= 'delta'",
+        "kind = 'nonexistent'",
+        "n > 400",
+        "n <= 17",
+        "500 < n",
+        "ratio > 100.0",
+        "ok = true",
+        "kind = 'alpha' AND n > 300",
+        "n > 100 AND n < 120 AND kind = 'alpha'",
+    ] {
+        let pushed = ctx.sql(&format!("SELECT count(*) AS c FROM t WHERE {pred}"))
+            .await.unwrap().collect().await.unwrap();
+        let a = pushed[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
+
+        // same predicate, but forced above a subquery the optimizer cannot push through
+        let fenced = ctx.sql(&format!(
+            "SELECT count(*) AS c FROM (SELECT * FROM t ORDER BY id) WHERE {pred}"))
+            .await.unwrap().collect().await.unwrap();
+        let b = fenced[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
+
+        assert_eq!(a, b, "pushdown changed the answer for {pred:?}: {a} vs {b}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }

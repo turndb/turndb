@@ -7,15 +7,18 @@
 //! One partition per part, so parts scan in parallel and a merged part simply becomes one bigger
 //! partition.
 
-use super::{Lens, ScanStats, F_BODY};
+use super::{Cmp, Lens, Pred, ScanStats, F_BODY};
 use crate::fold::Fold;
 use crate::part::Part;
 use crate::store::ReadStore;
+use crate::types::AttrValue;
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::datasource::TableType;
+use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
+use datafusion::scalar::ScalarValue;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -80,23 +83,101 @@ impl TableProvider for TurndbTable {
         TableType::Base
     }
 
+    /// Every filter is INEXACT: the scan may return extra rows and the engine re-applies the
+    /// predicate above it. That asymmetry is deliberate — it lets the scan skip aggressively without
+    /// owning correctness, so an unhandled type or a malformed value costs work, never an answer.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::prelude::Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| match to_pred(f, &self.lens) {
+                Some(_) => TableProviderFilterPushDown::Inexact,
+                None => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[datafusion::prelude::Expr],
+        filters: &[datafusion::prelude::Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let full: Vec<usize> = (0..self.lens.schema().fields().len()).collect();
         let proj = projection.cloned().unwrap_or(full);
+        let preds: Vec<Pred> = filters.iter().filter_map(|f| to_pred(f, &self.lens)).collect();
         Ok(Arc::new(TurndbExec::try_new(
             self.parts.clone(),
             self.fold.clone(),
             self.lens.clone(),
             proj,
+            preds,
             self.stats.clone(),
         )?))
     }
+}
+
+/// `column <op> literal`, in either order. Anything else declines, and the engine keeps it.
+fn to_pred(e: &datafusion::prelude::Expr, lens: &Lens) -> Option<Pred> {
+    use datafusion::prelude::Expr;
+    let Expr::BinaryExpr(b) = e else { return None };
+    let (name, op, lit) = match (&*b.left, &*b.right) {
+        (Expr::Column(c), Expr::Literal(v, _)) => (&c.name, b.op, v),
+        // reversed: `5 < n` is `n > 5`
+        (Expr::Literal(v, _), Expr::Column(c)) => (&c.name, flip(b.op)?, v),
+        _ => return None,
+    };
+    let field = lens.schema().index_of(name).ok()?;
+    let op = match op {
+        Operator::Eq => Cmp::Eq,
+        Operator::NotEq => Cmp::Ne,
+        Operator::Lt => Cmp::Lt,
+        Operator::LtEq => Cmp::LtEq,
+        Operator::Gt => Cmp::Gt,
+        Operator::GtEq => Cmp::GtEq,
+        _ => return None,
+    };
+    let val = scalar_to_attr(lit)?;
+    Some(Pred { field, op, val })
+}
+
+/// A literal, unwrapped to the value the columns actually hold.
+///
+/// The dictionary case is the one that matters: a string column surfaces as `Dictionary(Int32, Utf8)`,
+/// so the planner coerces the literal to match and the comparison arrives wrapped. Missing that meant
+/// every string predicate silently declined to push down — the tests still passed, because Inexact
+/// pushdown failing simply means the engine does the work instead.
+fn scalar_to_attr(v: &ScalarValue) -> Option<AttrValue> {
+    Some(match v {
+        ScalarValue::Dictionary(_, inner) => return scalar_to_attr(inner),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
+            AttrValue::Str(s.clone())
+        }
+        ScalarValue::Int64(Some(i)) => AttrValue::Int(*i),
+        ScalarValue::Int32(Some(i)) => AttrValue::Int(*i as i64),
+        ScalarValue::Int16(Some(i)) => AttrValue::Int(*i as i64),
+        ScalarValue::Int8(Some(i)) => AttrValue::Int(*i as i64),
+        ScalarValue::UInt32(Some(i)) => AttrValue::Int(*i as i64),
+        ScalarValue::Float64(Some(f)) => AttrValue::Float(*f),
+        ScalarValue::Float32(Some(f)) => AttrValue::Float(*f as f64),
+        ScalarValue::Boolean(Some(b)) => AttrValue::Bool(*b),
+        _ => return None,
+    })
+}
+
+fn flip(op: Operator) -> Option<Operator> {
+    Some(match op {
+        Operator::Eq => Operator::Eq,
+        Operator::NotEq => Operator::NotEq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        _ => return None,
+    })
 }
 
 /// One partition per part, streamed.
@@ -109,6 +190,7 @@ struct TurndbExec {
     fold: Arc<Fold>,
     lens: Arc<Lens>,
     projection: Vec<usize>,
+    preds: Vec<Pred>,
     stats: Arc<Mutex<ScanStats>>,
     schema: SchemaRef,
     props: Arc<PlanProperties>,
@@ -122,6 +204,7 @@ impl TurndbExec {
         fold: Arc<Fold>,
         lens: Arc<Lens>,
         projection: Vec<usize>,
+        preds: Vec<Pred>,
         stats: Arc<Mutex<ScanStats>>,
     ) -> DfResult<TurndbExec> {
         let full = lens.schema();
@@ -133,7 +216,7 @@ impl TurndbExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Ok(TurndbExec { parts, fold, lens, projection, stats, schema, props: Arc::new(props), fetch: None })
+        Ok(TurndbExec { parts, fold, lens, projection, preds, stats, schema, props: Arc::new(props), fetch: None })
     }
 }
 
@@ -179,6 +262,7 @@ impl ExecutionPlan for TurndbExec {
             fold: self.fold.clone(),
             lens: self.lens.clone(),
             projection: self.projection.clone(),
+            preds: self.preds.clone(),
             stats: self.stats.clone(),
             schema: self.schema.clone(),
             props: self.props.clone(),
@@ -201,7 +285,7 @@ impl ExecutionPlan for TurndbExec {
 
         let scan = self
             .lens
-            .scan(part, fold, &self.projection)
+            .scan(part, fold, &self.projection, &self.preds)
             .map_err(|e| DataFusionError::External(e.into()))?
             .with_fetch(self.fetch);
 
