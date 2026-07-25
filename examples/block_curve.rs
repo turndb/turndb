@@ -62,28 +62,38 @@ fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
-/// A tiny LRU of decompressed blocks — what any real reader would hold.
+/// An LRU of decompressed blocks, bounded by BYTES — as the fold's own cache is.
+///
+/// This was bounded by block COUNT, which silently rigged the whole comparison: 8 blocks is 512 KiB
+/// of cache at 64 KiB blocks and 128 MiB at 16 MiB blocks, so the largest sizes were being handed 256x
+/// more memory than the smallest and then credited with the resulting hit rate. A byte budget is what
+/// a reader actually has, and it is the only way the read column means anything across the sweep.
 struct BlockCache {
-    cap: usize,
+    budget: usize,
+    bytes: usize,
     map: HashMap<usize, (u64, Vec<u8>)>,
     clock: u64,
     pub misses: u64,
 }
 
 impl BlockCache {
-    fn new(cap: usize) -> Self {
-        BlockCache { cap, map: HashMap::new(), clock: 0, misses: 0 }
+    fn new(budget: usize) -> Self {
+        BlockCache { budget, bytes: 0, map: HashMap::new(), clock: 0, misses: 0 }
     }
     fn get<'a>(&'a mut self, bi: usize, comp: &[Vec<u8>], raw_len: usize) -> &'a [u8] {
         self.clock += 1;
         if !self.map.contains_key(&bi) {
             self.misses += 1;
-            if self.map.len() >= self.cap {
+            // admit one block however large, then evict coldest back inside the budget
+            while self.bytes + raw_len > self.budget && !self.map.is_empty() {
                 if let Some((&victim, _)) = self.map.iter().min_by_key(|(_, (t, _))| *t) {
-                    self.map.remove(&victim);
+                    if let Some((_, gone)) = self.map.remove(&victim) {
+                        self.bytes -= gone.len();
+                    }
                 }
             }
             let d = zstd::bulk::decompress(&comp[bi], raw_len).unwrap();
+            self.bytes += d.len();
             self.map.insert(bi, (self.clock, d));
         }
         let e = self.map.get_mut(&bi).unwrap();
@@ -91,6 +101,9 @@ impl BlockCache {
         &e.1
     }
 }
+
+/// The reader's cache budget — the fold's own default, so the sweep is priced against reality.
+const CACHE_BYTES: usize = 64 << 20;
 
 fn main() -> anyhow::Result<()> {
     let corpus = PathBuf::from(std::env::args().nth(1).expect("usage: block_curve <corpus.jsonl> [field]"));
@@ -101,7 +114,11 @@ fn main() -> anyhow::Result<()> {
     let mut pieces: Vec<Vec<u8>> = Vec::new();
     let mut records: Vec<Vec<u32>> = Vec::new();
     let mut logical = 0u64;
-    let rdr = BufReader::with_capacity(1 << 20, std::fs::File::open(&corpus)?);
+    let rdr: Box<dyn BufRead> = if corpus.as_os_str() == "-" {
+        Box::new(BufReader::with_capacity(1 << 22, std::io::stdin().lock()))
+    } else {
+        Box::new(BufReader::with_capacity(1 << 22, std::fs::File::open(&corpus)?))
+    };
     for line in rdr.lines() {
         let line = line?;
         let v: serde_json::Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
@@ -184,7 +201,7 @@ fn main() -> anyhow::Result<()> {
             let one = t.elapsed().as_secs_f64() * 1e6 / sample.len() as f64;
 
             // a whole record, with a small block cache — the real read
-            let mut cache = BlockCache::new(8);
+            let mut cache = BlockCache::new(CACHE_BYTES);
             let t = Instant::now();
             for &r in &sample {
                 let mut out = Vec::new();
