@@ -54,6 +54,17 @@ use std::sync::Arc;
 pub const MAGIC: &[u8; 8] = b"TURNPART";
 pub const FOOTER_LEN: u64 = 56;
 
+/// The part layout this build writes, and the highest it will read.
+///
+/// The fold could always refuse an unknown future — a segment with unknown `flags` bails rather than
+/// negotiate — and the part could not. Magic plus a footer checksum is no defence, because a future
+/// writer computes a perfectly valid checksum over a layout this reader will then misparse at fixed
+/// offsets. One plane negotiated and the other silently misread.
+///
+/// This claims one of the footer's padding bytes, which cost nothing because they were already
+/// zero-filled: a part written before this existed reads as version 0, which is exactly what it is.
+pub const PART_VERSION: u8 = 1;
+
 /// Body-program op tags, packed into the low bit of a varint.
 const OP_LIT: u64 = 0;
 const OP_PIECE: u64 = 1;
@@ -65,6 +76,9 @@ struct Section {
     stored: u32,
     raw: u32,
     codec: u8,
+    /// crc32 of the STORED bytes. See the note in `finish` on why the field exists now and the
+    /// verification policy does not.
+    xsum: u32,
 }
 
 /// What a part says about itself.
@@ -293,7 +307,13 @@ impl Writer {
         self.f.write_all(&payload)?;
         self.toc.push((
             name.to_string(),
-            Section { off: self.off, stored: payload.len() as u32, raw: raw.len() as u32, codec },
+            Section {
+                off: self.off,
+                stored: payload.len() as u32,
+                raw: raw.len() as u32,
+                codec,
+                xsum: crc32fast::hash(&payload),
+            },
         ));
         self.off += payload.len() as u64;
         Ok(())
@@ -309,6 +329,15 @@ impl Writer {
             put_varint(&mut toc, s.stored as u64);
             put_varint(&mut toc, s.raw as u64);
             toc.push(s.codec);
+            // A section's own integrity, over its STORED bytes so it can be checked without
+            // decompressing. Content already carries BLAKE3 per piece and is verified on every read;
+            // this covers what content hashes do not — ids, attribute values, offsets, dictionaries —
+            // where a flipped bit is a wrong query answer with no error anywhere.
+            //
+            // The FIELD is the format decision and is taken now, because adding it later costs a
+            // version bump. WHEN to verify is runtime policy and is deliberately not decided here:
+            // hashing a 65 MiB section on every read would be a tax worth measuring first.
+            toc.extend_from_slice(&s.xsum.to_le_bytes());
         }
         let (toc_codec, toc_payload) = crate::fold::codec::encode(&toc, None, self.level)?;
         let toc_off = self.off;
@@ -323,6 +352,7 @@ impl Writer {
         foot.extend_from_slice(&meta.seq_lo.to_le_bytes());
         foot.extend_from_slice(&meta.seq_hi.to_le_bytes());
         foot.push(toc_codec);
+        foot.push(PART_VERSION);
         while foot.len() < FOOTER_LEN as usize - 4 {
             foot.push(0);
         }
@@ -396,6 +426,15 @@ impl Part {
         let seq_lo = u64::from_le_bytes(foot[28..36].try_into().unwrap());
         let seq_hi = u64::from_le_bytes(foot[36..44].try_into().unwrap());
         let toc_codec = foot[44];
+        // The reject-forward lever, matching the fold's `flags`. A part from a newer writer is refused
+        // rather than misparsed at offsets that may no longer mean what they did.
+        let version = foot[45];
+        if version > PART_VERSION {
+            bail!(
+                "part is format version {version}; this build reads up to {PART_VERSION} \
+                 — refusing rather than guessing at its layout"
+            );
+        }
 
         let mut tbuf = vec![0u8; toc_stored as usize];
         f.read_exact_at(&mut tbuf, toc_off)?;
@@ -413,13 +452,24 @@ impl Part {
             let raw = get_varint(&toc_bytes, &mut at)? as u32;
             let codec = toc_bytes[at];
             at += 1;
+            // Version 0 predates per-section checksums; 0 reads as "not recorded".
+            let xsum = if version >= 1 {
+                if at + 4 > toc_bytes.len() {
+                    bail!("part TOC entry {name} is truncated before its checksum");
+                }
+                let x = u32::from_le_bytes(toc_bytes[at..at + 4].try_into().unwrap());
+                at += 4;
+                x
+            } else {
+                0
+            };
             // A corrupt-but-plausible TOC would otherwise send `sect` to allocate `stored` bytes and
             // read at an arbitrary offset. The footer is checksummed; the TOC is not, so every entry
             // is range-checked against the file it claims to live in.
             if off.saturating_add(stored as u64) > len {
                 bail!("part TOC entry {name} runs past the end of the file");
             }
-            toc.insert(name, Section { off, stored, raw, codec });
+            toc.insert(name, Section { off, stored, raw, codec, xsum });
         }
         Ok(Part {
             f,
@@ -514,6 +564,29 @@ impl Part {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&h[i * 32..i * 32 + 32]);
         Ok((loc, PieceHash(hash)))
+    }
+
+    /// Check every section against its recorded checksum.
+    ///
+    /// Explicitly NOT done on the read path. Content is already verified per piece on every read; this
+    /// covers the columnar metadata, where the cost is proportional to the whole part rather than to
+    /// what a query touches. Offering it as a deliberate call keeps that a caller's choice — a
+    /// consistency check, a repair tool, an ingest gate — instead of a tax every scan pays.
+    pub fn verify_sections(&self) -> Result<usize> {
+        let mut checked = 0usize;
+        for (name, s) in &self.toc {
+            if s.xsum == 0 {
+                continue; // written before checksums existed
+            }
+            let mut buf = vec![0u8; s.stored as usize];
+            self.f.read_exact_at(&mut buf, s.off)?;
+            let got = crc32fast::hash(&buf);
+            if got != s.xsum {
+                bail!("section {name} fails its checksum ({got:#010x} != {:#010x})", s.xsum);
+            }
+            checked += 1;
+        }
+        Ok(checked)
     }
 
     /// Rows this part deletes, ascending. Empty for a part that deletes nothing, and for every part
