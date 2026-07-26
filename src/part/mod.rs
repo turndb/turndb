@@ -6,7 +6,7 @@
 //! a merge rewrites references and columns, never bytes.
 //!
 //! ```text
-//!   [ sections … ]  [ TOC ]  [ FOOTER (48B, at EOF) ]
+//!   [ sections … ]  [ TOC ]  [ FOOTER (56B, at EOF) ]
 //! ```
 //! The footer is written last and is the completeness marker: a part whose footer is absent or fails
 //! its checksum was torn mid-write and is discarded, never half-read.
@@ -271,6 +271,9 @@ pub fn build_full(
             w.section(&format!("col.dict.{i}"), &c.dict)?;
         }
     }
+    if ids.len() as u64 > u32::MAX as u64 {
+        bail!("{} records exceeds the u32 record count a part footer can name", ids.len());
+    }
     let meta = PartMeta { n_records: ids.len() as u32, seq_lo, seq_hi };
     w.finish(meta)?;
     Ok(meta)
@@ -353,6 +356,11 @@ impl Writer {
         foot.extend_from_slice(&meta.seq_hi.to_le_bytes());
         foot.push(toc_codec);
         foot.push(PART_VERSION);
+        // The TOC is where every section's checksum lives, so leaving the TOC itself unchecked made
+        // those checksums only as trustworthy as the bytes carrying them. This covers the STORED TOC
+        // payload, and the footer's own checksum covers this — so the chain is closed: footer verifies
+        // itself, footer verifies the TOC, TOC verifies each section.
+        foot.extend_from_slice(&crc32fast::hash(&toc_payload).to_le_bytes());
         while foot.len() < FOOTER_LEN as usize - 4 {
             foot.push(0);
         }
@@ -376,6 +384,9 @@ pub struct Part {
     meta: PartMeta,
     /// Identity within the shared cache.
     id: u64,
+    /// The format version this part declares. Decides whether optional fields are PRESENT, which is
+    /// not the same question as whether they are non-zero.
+    version: u8,
     /// Decompressed sections, decoded offset arrays, decoded row indices and string dictionaries — all
     /// four live here, under one BYTE budget shared with every other part.
     ///
@@ -436,8 +447,15 @@ impl Part {
             );
         }
 
+        let toc_xsum = u32::from_le_bytes(foot[46..50].try_into().unwrap());
+        if toc_off.saturating_add(toc_stored as u64) > len - FOOTER_LEN {
+            bail!("part TOC runs past where the footer says the sections end");
+        }
         let mut tbuf = vec![0u8; toc_stored as usize];
         f.read_exact_at(&mut tbuf, toc_off)?;
+        if version >= 1 && crc32fast::hash(&tbuf) != toc_xsum {
+            bail!("part TOC fails its checksum — every section checksum it carries is untrustworthy");
+        }
         let toc_bytes = crate::fold::codec::decode(toc_codec, &tbuf, toc_raw, None)?;
 
         let mut at = 0usize;
@@ -445,14 +463,21 @@ impl Part {
         let mut toc = HashMap::with_capacity(n);
         for _ in 0..n {
             let nl = get_varint(&toc_bytes, &mut at)? as usize;
+            if at + nl > toc_bytes.len() {
+                bail!("part TOC entry name runs past the end of the TOC");
+            }
             let name = String::from_utf8(toc_bytes[at..at + nl].to_vec())?;
             at += nl;
             let off = get_varint(&toc_bytes, &mut at)?;
             let stored = get_varint(&toc_bytes, &mut at)? as u32;
             let raw = get_varint(&toc_bytes, &mut at)? as u32;
+            if at >= toc_bytes.len() {
+                bail!("part TOC entry {name} is truncated before its codec");
+            }
             let codec = toc_bytes[at];
             at += 1;
-            // Version 0 predates per-section checksums; 0 reads as "not recorded".
+            // Presence is decided by VERSION, never by the value. crc32 can legitimately be zero, so
+            // treating zero as "absent" would silently skip a real checksum roughly once in 4 billion.
             let xsum = if version >= 1 {
                 if at + 4 > toc_bytes.len() {
                     bail!("part TOC entry {name} is truncated before its checksum");
@@ -471,8 +496,12 @@ impl Part {
             }
             toc.insert(name, Section { off, stored, raw, codec, xsum });
         }
+        if at != toc_bytes.len() {
+            bail!("part TOC has {} trailing bytes after its last entry", toc_bytes.len() - at);
+        }
         Ok(Part {
             f,
+            version,
             toc,
             meta: PartMeta { n_records, seq_lo, seq_hi },
             id: cache::next_part_id(),
@@ -574,10 +603,10 @@ impl Part {
     /// consistency check, a repair tool, an ingest gate — instead of a tax every scan pays.
     pub fn verify_sections(&self) -> Result<usize> {
         let mut checked = 0usize;
+        if self.version < 1 {
+            return Ok(0); // predates per-section checksums; nothing to check, and that is not an error
+        }
         for (name, s) in &self.toc {
-            if s.xsum == 0 {
-                continue; // written before checksums existed
-            }
             let mut buf = vec![0u8; s.stored as usize];
             self.f.read_exact_at(&mut buf, s.off)?;
             let got = crc32fast::hash(&buf);

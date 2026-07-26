@@ -57,7 +57,7 @@ pub const BLOCK_TARGET_DEFAULT: usize = 4 * 1024 * 1024;
 
 /// Where a piece lives: which block, and where inside it.
 ///
-/// Sixteen bytes, four u32s. Deliberately absent: the **codec** and the block's **stored length**,
+/// Twelve bytes, three u32s. Deliberately absent: the **codec** and the block's **stored length**,
 /// because the block header is their only authority — a second copy could disagree.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Loc {
@@ -155,6 +155,14 @@ pub fn encode(out: &mut Vec<u8>, block_id: u32, codec: u8, raw_block: &[u8], pay
     let rh = blake3::hash(raw_block);
     out.clear();
     out.reserve(BLOCK_OVERHEAD + payload.len());
+    // `raw` and `stored` are u32 on disk. A silent truncation here writes a frame that decodes to
+    // the wrong length, which is corruption a reader cannot distinguish from a bad disk.
+    assert!(
+        raw_block.len() as u64 <= u32::MAX as u64 && payload.len() as u64 <= u32::MAX as u64,
+        "block of {} raw / {} stored bytes exceeds the u32 frame fields; block_target must bound this",
+        raw_block.len(),
+        payload.len()
+    );
     out.push(BLOCK_TAG);
     out.push(codec);
     out.extend_from_slice(&(raw_block.len() as u32).to_le_bytes());
