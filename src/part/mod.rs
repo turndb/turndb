@@ -69,6 +69,20 @@ pub const PART_VERSION: u8 = 1;
 const OP_LIT: u64 = 0;
 const OP_PIECE: u64 = 1;
 
+/// RESERVED: the escape codepoint for a future op space.
+///
+/// The op tag is one bit and both values are taken, so there is no room for a third op — and the
+/// obvious fix, widening the tag, re-encodes every op in every part and was measured to cost 2.6% of
+/// compressed `prog` forever.
+///
+/// `tagged == 0` is a zero-length literal: reachable, semantically vacuous, and never emitted (0
+/// occurrences across 623,106 body ops on three corpora). Reserving it now buys an UNBOUNDED future op
+/// space for zero bytes — a later revision may define it as an escape followed by a varint op number —
+/// but only if today's readers refuse it. A shipped reader that decoded it as an empty literal would
+/// silently parse a future escape's payload as ops, which is the exact failure the version lever
+/// exists to prevent.
+const OP_ESCAPE_RESERVED: u64 = 0;
+
 /// One section's location and encoding.
 #[derive(Clone, Debug)]
 struct Section {
@@ -194,10 +208,17 @@ pub fn build_full(
     for &ri in &order {
         prog_off.push(prog.len() as u64);
         let r = &records[ri];
-        put_varint(&mut prog, r.body.len() as u64);
+        // An EMPTY literal would encode as tagged == 0, which is the reserved escape codepoint. It
+        // also contributes nothing to the body, so dropping it preserves byte-exactness exactly — but
+        // the op COUNT is written before the ops, so it must be the count of what is actually emitted.
+        let emitted = r.body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
+        put_varint(&mut prog, emitted as u64);
         for op in &r.body {
             match op {
                 BodyOp::Lit(b) => {
+                    if b.is_empty() {
+                        continue;
+                    }
                     put_varint(&mut prog, ((b.len() as u64) << 1) | OP_LIT);
                     prog.extend_from_slice(b);
                 }
@@ -447,6 +468,13 @@ impl Part {
             );
         }
 
+        // Reserved bytes must be ZERO, and a reader must refuse otherwise — the same rule the fold
+        // applies to segment `flags` ("unknown means stop, not adapt"). Reserving bytes in a document
+        // while the reader ignores them reserves nothing: a future writer could use them and this
+        // build would accept the part and misread it. Enforcement is what makes a reservation real.
+        if foot[50..52] != [0u8; 2] {
+            bail!("part footer reserved bytes are non-zero — refusing rather than guessing at a layout this build does not know");
+        }
         let toc_xsum = u32::from_le_bytes(foot[46..50].try_into().unwrap());
         if toc_off.saturating_add(toc_stored as u64) > len - FOOTER_LEN {
             bail!("part TOC runs past where the footer says the sections end");
@@ -712,6 +740,9 @@ impl Part {
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             let tagged = get_varint(&prog, &mut at)?;
+            if tagged == OP_ESCAPE_RESERVED {
+                bail!("body program uses the reserved op escape — this part needs a newer build");
+            }
             if tagged & 1 == OP_LIT {
                 let len = (tagged >> 1) as usize;
                 if at + len > end {
@@ -757,6 +788,9 @@ impl Part {
         let mut out = Vec::new();
         for _ in 0..n {
             let tagged = get_varint(&prog, &mut at)?;
+            if tagged == OP_ESCAPE_RESERVED {
+                bail!("body program uses the reserved op escape — this part needs a newer build");
+            }
             if tagged & 1 == OP_LIT {
                 let len = (tagged >> 1) as usize;
                 if at + len > end {

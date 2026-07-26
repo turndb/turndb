@@ -255,9 +255,15 @@ impl Wal {
             if off + HDR as u64 + CRC as u64 > len || f.read_exact_at(&mut hdr, off).is_err() {
                 break;
             }
-            if hdr[0] != FRAME_TAG && hdr[0] != TOMB_TAG {
-                break;
-            }
+            // An unknown tag is AMBIGUOUS and the two readings are opposite: a crash mid-append
+            // leaves garbage here (stop, the log ends), but a newer writer's frame type also lands
+            // here (refuse, or silently discard committed records). Treating both as "end of log" —
+            // which is what a bare `break` does — means a future frame type silently truncates the
+            // log and loses every record after it.
+            //
+            // The crc disambiguates: a torn tail does not checksum, a well-formed future frame does.
+            // So defer the decision until after the crc, below.
+            let known = hdr[0] == FRAME_TAG || hdr[0] == TOMB_TAG;
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
             let end = off + HDR as u64 + plen as u64 + CRC as u64;
@@ -276,7 +282,17 @@ impl Wal {
             crc.update(&hdr);
             crc.update(&payload);
             if crc.finalize() != u32::from_le_bytes(cb) {
-                break; // torn write
+                break; // torn write: the log genuinely ends here
+            }
+            if !known {
+                // Checksums correctly, so it was written deliberately — by a build that knows a frame
+                // type this one does not. Refusing is the only safe reading; skipping it would apply a
+                // suffix of the log without its prefix.
+                bail!(
+                    "wal frame tag {:#04x} is not a type this build knows, and it checksums — \
+                     refusing rather than discarding committed records",
+                    hdr[0]
+                );
             }
             if hdr[0] == TOMB_TAG {
                 let Ok(id) = String::from_utf8(payload) else { break };
