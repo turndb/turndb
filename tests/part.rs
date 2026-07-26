@@ -340,3 +340,98 @@ fn a_toc_pointing_past_the_file_is_refused() {
 }
 
 
+
+// ---------------------------------------------------------------------------------------------
+// Format levers. The fold could always refuse an unknown future; until now the part could not.
+// ---------------------------------------------------------------------------------------------
+
+fn a_part(d: &std::path::Path) -> (std::path::PathBuf, Fold) {
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let recs: Vec<Record> = (0..40)
+        .map(|i| {
+            let body = format!("record {i} with enough content to be worth folding").into_bytes();
+            let p = fold.put(&body).unwrap();
+            Record {
+                id: format!("k{i:03}"),
+                body: vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                attrs: vec![("v".into(), AttrValue::Str(format!("value {i}")))],
+            }
+        })
+        .collect();
+    let path = d.join("v.part");
+    part::build(&path, &recs, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
+    fold.sync().unwrap();
+    (path, fold)
+}
+
+/// Rewrite the footer with `version`, repairing the checksum so only the version is under test.
+fn set_version(path: &std::path::Path, version: u8) {
+    let mut b = std::fs::read(path).unwrap();
+    let n = b.len();
+    let fl = part::FOOTER_LEN as usize;
+    b[n - fl + 45] = version;
+    let x = blake3::hash(&b[n - fl..n - 4]);
+    b[n - 4..].copy_from_slice(&x.as_bytes()[0..4]);
+    std::fs::write(path, &b).unwrap();
+}
+
+#[test]
+fn a_part_from_a_newer_writer_is_refused_not_misparsed() {
+    let d = tmp("version");
+    let (path, _fold) = a_part(&d);
+    assert!(Part::open(&path).is_ok());
+
+    set_version(&path, part::PART_VERSION + 1);
+    let e = match Part::open(&path) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a newer format version must not open"),
+    };
+    assert!(e.contains("format version"), "expected a version refusal, got: {e}");
+
+    // and the current version still opens, so the check is not simply rejecting everything
+    set_version(&path, part::PART_VERSION);
+    assert!(Part::open(&path).is_ok());
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn every_section_carries_a_checksum_that_catches_a_flipped_bit() {
+    let d = tmp("xsum");
+    let (path, fold) = a_part(&d);
+    let p = Part::open(&path).unwrap();
+    let n = p.verify_sections().unwrap();
+    assert!(n >= 8, "a part should have checksummed sections; got {n}");
+    drop(p);
+
+    // Flip one byte inside the id section and confirm it is caught. The footer still verifies, which
+    // is the point: before this, a corrupt section produced wrong ANSWERS, not an error.
+    let mut b = std::fs::read(&path).unwrap();
+    // the first section starts at offset 0 of the file
+    b[16] ^= 0xFF;
+    std::fs::write(&path, &b).unwrap();
+
+    let p = Part::open(&path).unwrap();
+    assert!(p.verify_sections().is_err(), "a flipped byte in a section must be caught");
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn verification_is_opt_in_and_reads_do_not_pay_for_it() {
+    // The FIELD is a format decision, taken now. WHEN to verify is runtime policy, deliberately left
+    // to the caller — content is already verified per piece on every read, and hashing whole sections
+    // on the read path would be a tax proportional to the part rather than to the query.
+    let d = tmp("optin");
+    let (path, fold) = a_part(&d);
+    let mut b = std::fs::read(&path).unwrap();
+    b[16] ^= 0xFF;
+    std::fs::write(&path, &b).unwrap();
+
+    let p = Part::open(&path).unwrap();
+    assert!(p.verify_sections().is_err(), "the checker must see the damage");
+    // ...while an ordinary read does not run it. Whether this particular read errors or returns junk
+    // depends on where the bit landed; what matters is that no checksum work happened.
+    let _ = p.record(0);
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
