@@ -184,10 +184,30 @@ impl Lens {
             Field::new(F_BODY, DataType::Binary, true),
         ];
         let mut binding = vec![None, None];
+        // Field names must be UNIQUE, and nothing about the data guarantees it. An attribute literally
+        // named `id` or `body` collides with the synthesised columns; a key literally named `a#str`
+        // collides with the disambiguation of a multi-typed `a`. DataFusion rejects a duplicate at
+        // TABLE REGISTRATION, so either case made the whole store unqueryable — including
+        // `select count(*)` — rather than affecting only the offending column.
+        //
+        // Resolved by construction instead of by hoping: take the natural name if it is free, fall
+        // back to `key#type`, and only then to an ordinal. Renaming a column is a far smaller harm
+        // than refusing to answer any query at all.
+        let mut used: std::collections::HashSet<String> =
+            [F_ID, F_BODY].into_iter().map(String::from).collect();
         for (key, ts) in &tags {
             for &t in ts {
                 // A key with one type keeps its name. A key with several is never silently merged.
-                let name = if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                let mut name = if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                if used.contains(&name) {
+                    name = format!("{key}#{}", type_name(t));
+                }
+                let mut n = 2usize;
+                while used.contains(&name) {
+                    name = format!("{key}#{}#{n}", type_name(t));
+                    n += 1;
+                }
+                used.insert(name.clone());
                 fields.push(Field::new(&name, arrow_type(t), true));
                 binding.push(Some((key.clone(), t)));
             }

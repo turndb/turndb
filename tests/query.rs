@@ -691,3 +691,68 @@ async fn pushdown_never_changes_an_answer() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Field-name collisions. Found by a panel; verified to brick the whole table at registration.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
+    // `id` and `body` are synthesised columns. An attribute of the same name is an ordinary thing for
+    // a loader to produce, and it used to make DataFusion reject the table at REGISTRATION — so not
+    // one bad column, but every query including `select count(*)`.
+    let dir = tmp("collide");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put("r1", &[Span::Lit(b"content")], vec![
+        ("body".into(), AttrValue::Str("an attribute, not the body".into())),
+        ("id".into(), AttrValue::Int(7)),
+        ("fine".into(), AttrValue::Int(1)),
+    ]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
+    let n = ctx.sql("SELECT count(*) AS n FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 1);
+
+    // the builtins keep their names and their meaning
+    let r = ctx.sql("SELECT id, body FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(r[0].column(0).as_string::<i32>().value(0), "r1", "id is still the record id");
+    assert_eq!(r[0].column(1).as_binary::<i32>().value(0), b"content", "body is still the content");
+
+    // and the colliding attributes are still reachable, renamed rather than dropped
+    let lens = Lens::new(&parts_of(&dir)).unwrap();
+    let names: Vec<String> = lens.schema().fields().iter().map(|f| f.name().clone()).collect();
+    assert!(names.contains(&"body#str".to_string()), "the colliding attribute is renamed: {names:?}");
+    assert!(names.contains(&"id#int".to_string()), "the colliding attribute is renamed: {names:?}");
+    assert!(names.contains(&"fine".to_string()), "an uncontested key keeps its name");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
+    // A key literally named `a#str` beside a multi-typed `a` produces the same collision one level up.
+    let dir = tmp("collide2");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put("r1", &[Span::Lit(b"x")], vec![
+        ("a".into(), AttrValue::Str("as string".into())),
+        ("a#str".into(), AttrValue::Str("a literal key that looks like a disambiguation".into())),
+    ]).unwrap();
+    s.put("r2", &[Span::Lit(b"y")], vec![("a".into(), AttrValue::Int(1))]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
+    let n = ctx.sql("SELECT count(*) AS n FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 2);
+
+    let lens = Lens::new(&parts_of(&dir)).unwrap();
+    let names: Vec<String> = lens.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let uniq: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(uniq.len(), names.len(), "every field name must be unique: {names:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
