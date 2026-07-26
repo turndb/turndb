@@ -574,7 +574,7 @@ impl Store {
         }
         let seqs: Vec<(u64, u64)> =
             self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
-        let (new_gen, built, stats) = refold::refold(
+        let (new_gen, built, mut stats) = refold::refold(
             &self.dir,
             &self.parts,
             &seqs,
@@ -619,7 +619,15 @@ impl Store {
         for f in old_files {
             let _ = std::fs::remove_file(self.dir.join(f));
         }
-        let _ = std::fs::remove_dir_all(refold::fold_dir(&self.dir, old_gen));
+        // Reported, not swallowed. Discarding this error let `bytes_reclaimed()` claim a large
+        // reclaim while the old generation was still occupying the disk — a stat that says the
+        // opposite of the truth. The re-fold itself is already committed and correct, so this cannot
+        // fail the operation; it can only be honest about what is left behind.
+        if let Err(e) = std::fs::remove_dir_all(refold::fold_dir(&self.dir, old_gen)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                stats.stale_generation_left = true;
+            }
+        }
         Ok(stats)
     }
 

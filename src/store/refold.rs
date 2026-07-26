@@ -79,9 +79,17 @@ pub struct RefoldStats {
     pub pieces_dropped: usize,
     pub fold_bytes_before: u64,
     pub fold_bytes_after: u64,
+    /// The superseded fold generation could not be unlinked and is still on disk. The re-fold itself
+    /// committed and is correct; the space is simply not reclaimed yet, and a caller reading
+    /// [`RefoldStats::bytes_reclaimed`] needs to know that.
+    pub stale_generation_left: bool,
 }
 
 impl RefoldStats {
+    /// Bytes the re-fold removed — **provided [`stale_generation_left`] is false**. If the old
+    /// generation could not be unlinked, this is what WILL be reclaimed once it is, not what has been.
+    ///
+    /// [`stale_generation_left`]: RefoldStats::stale_generation_left
     pub fn bytes_reclaimed(&self) -> u64 {
         self.fold_bytes_before.saturating_sub(self.fold_bytes_after)
     }

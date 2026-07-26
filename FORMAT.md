@@ -39,7 +39,14 @@ is about to replace.
 Two planes, and the split is the whole design:
 
 * the **fold** holds content, addressed by identity, written once and never rewritten;
-* **parts** hold references and columns, and can be reorganised freely because they hold no content.
+* **parts** hold references and columns, and can be reorganised freely because they hold no *piece*
+  content — which is what makes a merge O(references) rather than O(bytes).
+
+> **The two-plane split is a performance boundary, not a security boundary.** A part carries record
+> ids, attribute values and their dictionaries, inline literals, piece lengths, and unkeyed BLAKE3 of
+> every piece — all in plaintext. Anyone who can read a part can confirm whether a guessed string was
+> in the store, without the fold and without the manifest. Do not ship a part to a tier that must not
+> see content.
 
 A merge rewrites parts and never touches the fold. That is what decouples compaction cost from data
 volume, and it is asserted in code (`MergeStats::fold_bytes_touched == 0`) rather than assumed. The one
@@ -150,7 +157,8 @@ the manifest does not name is unreachable and is swept at writer open.
 
 ## Parts
 
-A part is immutable, self-contained, and id-sorted. It holds no content.
+A part is immutable, self-contained, and id-sorted. It holds no *piece* content — but see the warning
+above about what it does hold in plaintext.
 
 ```
 [ section ][ section ] ... [ TOC ][ FOOTER (56 bytes, at EOF) ]
@@ -178,6 +186,10 @@ offset  size  field
     50     2  reserved, zero
     52     4  xsum          first 4 bytes of BLAKE3 over footer[0..52]
 ```
+
+Reserved bytes must be zero and a reader **must refuse** otherwise. Reserving a byte that the reader
+ignores reserves nothing — a future writer would use it and every shipped build would accept the part
+and misread it.
 
 `version` is the part plane's reject-forward lever, and the counterpart to the fold's `flags`. A reader
 refuses a part whose version exceeds its own rather than parsing fields at offsets that may no longer
@@ -342,7 +354,16 @@ repeated n_ops times:
 ```
 
 Concatenating the ops in order reproduces the record's body **byte for byte**. That is the format's
-central promise.
+central promise, and it has exactly one anticipated exception: content erased for privacy or retention
+reasons cannot be reproduced, by definition. A future revision that adds erasure must say what a
+reader gets instead, and must not make a partially-erased record unreadable — an audit record you are
+legally required to keep is not improved by refusing to serve the part of it that survives.
+
+`tagged == 0` is **RESERVED**. It would encode a zero-length literal, which contributes nothing; a
+writer must not emit one, and a reader must refuse it. A future revision may define it as an escape
+followed by a varint op number, which is what buys an unbounded op space out of a one-bit tag. Both
+halves are load-bearing: a reader that accepted it as an empty literal would parse a future escape's
+payload as ops.
 
 #### colmeta
 
@@ -450,6 +471,12 @@ and anything written past that tail is regenerated from these bytes.
 Replay stops at the first torn or corrupt frame. A partial tail is the end of the log, not an error: a
 crash mid-append leaves exactly that.
 
+An **unknown tag is different, and the two readings are opposite**: garbage from a crash means the log
+ends, while a frame type a newer build wrote means refusing is the only safe response — skipping it
+would apply a suffix of the log without its prefix, silently discarding committed records. The
+checksum disambiguates them: a torn tail does not verify, a deliberately written future frame does. So
+a well-formed frame with an unrecognised tag is **refused**, and only a failed checksum ends the log.
+
 ---
 
 ## The manifest
@@ -527,6 +554,9 @@ What that requires of a change:
 
 * a change a version-1 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
+* note what these levers do **not** cover: they guard against misparsing, not against a conformant
+  writer violating a privacy or retention invariant. A part that parses perfectly can still carry
+  content that should have been erased. That is a policy problem and no version byte solves it;
 * a change it would merely **not use** — a new optional section, a new manifest field — needs neither,
   because unknown sections must be ignored and an absent JSON field must have a documented default.
   A new manifest field without a default is a breaking change even though JSON tolerates it;

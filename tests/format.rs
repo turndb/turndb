@@ -420,3 +420,90 @@ fn a_fold_with_a_missing_segment_is_refused_by_readers_too() {
         "a reader must refuse a fold whose segments are not dense");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Reject-forward levers. A reservation the reader ignores reserves nothing.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn reserved_footer_bytes_are_enforced_not_merely_documented() {
+    // These were declared reserved and never read. A panel set them, repaired the footer checksum,
+    // and this reader accepted the part — so a future writer could have used them and every shipped
+    // build would have misread the result. The fold got this right from the start (`flags` bails);
+    // the part did not.
+    let dir = built("reserved");
+    let p = part_path(&dir);
+    edit_footer(&p, |f| f[50..52].copy_from_slice(&[0xAB, 0xCD]));
+    let e = match turndb::part::Part::open(&p) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("non-zero reserved footer bytes must be refused"),
+    };
+    assert!(e.contains("reserved"), "expected a reserved-bytes refusal, got: {e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_body_op_escape_is_reserved_and_never_written() {
+    // The op tag is one bit with both values taken, so a third op has nowhere to live. `tagged == 0`
+    // is a zero-length literal: reachable, contributes nothing, and never emitted. Reserving it buys
+    // an unbounded future op space for zero bytes — but only if today's reader refuses it, since
+    // otherwise it would parse a future escape's payload as ops.
+    let dir = tmp("escape");
+    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    // an empty literal is dropped rather than encoded, so the reserved codepoint never appears
+    s.put("r", &[Span::Lit(b""), Span::Lit(b"real"), Span::Lit(b"")], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.reconstruct("r").unwrap().unwrap(), b"real".to_vec(),
+        "dropping an empty literal must preserve the body exactly");
+    drop(s);
+
+    // and the encoded program contains no zero tag
+    let p = turndb::part::Part::open(&part_path(&dir)).unwrap();
+    let ops = p.body(0).unwrap();
+    assert_eq!(ops.len(), 1, "the two empty literals are gone, the real one remains: {ops:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
+    // An unknown tag is ambiguous: a crash mid-append leaves garbage (the log ends), and a newer
+    // writer's frame also lands here (refusing is the only safe reading). Treating both as "end of
+    // log" meant a future frame type would silently discard every committed record after it. The crc
+    // disambiguates — a torn tail does not checksum, a deliberate frame does.
+    let dir = tmp("walfuture");
+    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    s.put("a", &[Span::Lit(b"first")], vec![]).unwrap();
+    s.sync().unwrap();
+    drop(s);
+
+    // append a well-formed frame with an unknown tag
+    let path = dir.join("WAL");
+    let mut b = std::fs::read(&path).unwrap();
+    let payload = b"a frame type this build does not know";
+    let mut hdr = vec![0x5Fu8];
+    hdr.extend_from_slice(&99u64.to_le_bytes());
+    hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let mut h = crc32fast::Hasher::new();
+    h.update(&hdr);
+    h.update(payload);
+    b.extend_from_slice(&hdr);
+    b.extend_from_slice(payload);
+    b.extend_from_slice(&h.finalize().to_le_bytes());
+    std::fs::write(&path, &b).unwrap();
+
+    let e = match Store::open(&dir, FoldCfg::default()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a checksumming frame with an unknown tag must be refused"),
+    };
+    assert!(e.contains("tag"), "expected a frame-tag refusal, got: {e}");
+
+    // ...while a genuinely TORN tail still just ends the log, as it must
+    let mut torn = std::fs::read(&path).unwrap();
+    let n = torn.len();
+    torn[n - 1] ^= 0xFF; // break the crc
+    std::fs::write(&path, &torn).unwrap();
+    let s = Store::open(&dir, FoldCfg::default()).expect("a torn tail is the end of the log, not an error");
+    assert_eq!(s.reconstruct("a").unwrap().unwrap(), b"first".to_vec());
+    std::fs::remove_dir_all(&dir).ok();
+}
