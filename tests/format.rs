@@ -165,7 +165,7 @@ fn part_footer_matches_the_document() {
     // `merged_part_footer_distinguishes_seq_lo_from_seq_hi` is what pins their order.
     assert!(b[f + 44] <= 2, "toc_codec at footer+44");
     assert_eq!(b[f + 45], turndb::part::PART_VERSION, "version at footer+45");
-    assert_eq!(&b[f + 46..f + 52], &[0u8; 6], "footer+46..52 is reserved and zero");
+    assert_eq!(&b[f + 50..f + 52], &[0u8; 2], "footer+50..52 is reserved and zero");
 
     let x = blake3::hash(&b[f..f + 52]);
     assert_eq!(&b[f + 52..f + 56], &x.as_bytes()[0..4], "xsum over footer[0..52]");
@@ -173,6 +173,13 @@ fn part_footer_matches_the_document() {
     // the TOC lives where the footer says, and is the documented size
     assert!(toc_off as usize + toc_stored as usize <= f, "the TOC must precede the footer");
     assert!(toc_raw >= toc_stored, "a TOC never expands under compression");
+
+    // toc_xsum at footer+46 closes the chain: the footer checksums itself, this checksums the TOC,
+    // and the TOC carries a checksum for every section. Without it the section checksums lived in
+    // bytes nothing verified.
+    let toc_xsum = le32(&b, f + 46);
+    let toc_bytes = &b[toc_off as usize..toc_off as usize + toc_stored as usize];
+    assert_eq!(toc_xsum, crc32fast::hash(toc_bytes), "toc_xsum at footer+46 over the STORED TOC");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -293,5 +300,123 @@ fn the_documented_limits_refuse_rather_than_truncate() {
         turndb::fold::Fold::open(&dir.join("b"), FoldCfg { level: 99, ..FoldCfg::default() }).is_err(),
         "a zstd level outside 1..=22 must refuse at open"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Malformed input. Every writer-side assertion above says what a good part looks like; these say
+// what a reader must do about a bad one. A format spec without them describes only the happy path.
+// ---------------------------------------------------------------------------------------------
+
+/// Rewrite a part's footer with `f`, repairing the footer checksum so only the edited field is tested.
+fn edit_footer(path: &std::path::Path, f: impl Fn(&mut [u8])) {
+    let mut b = std::fs::read(path).unwrap();
+    let n = b.len();
+    let start = n - 56;
+    f(&mut b[start..n - 4]);
+    let x = blake3::hash(&b[start..n - 4]);
+    b[n - 4..].copy_from_slice(&x.as_bytes()[0..4]);
+    std::fs::write(path, &b).unwrap();
+}
+
+fn part_path(dir: &std::path::Path) -> PathBuf {
+    std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path())
+        .find(|p| p.extension().map(|e| e == "part").unwrap_or(false)).unwrap()
+}
+
+#[test]
+fn a_corrupt_toc_is_refused_rather_than_followed() {
+    let dir = built("badtoc");
+    let p = part_path(&dir);
+    // Flip a byte inside the TOC payload. The footer still verifies, so before toc_xsum existed this
+    // was followed straight into arbitrary offsets and allocations.
+    let b = std::fs::read(&p).unwrap();
+    let toc_off = le64(&b, b.len() - 56 + 8) as usize;
+    let mut c = b.clone();
+    c[toc_off] ^= 0xFF;
+    std::fs::write(&p, &c).unwrap();
+    assert!(turndb::part::Part::open(&p).is_err(), "a corrupt TOC must be refused");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_toc_pointing_past_itself_is_refused() {
+    let dir = built("tocpast");
+    let p = part_path(&dir);
+    edit_footer(&p, |f| {
+        // claim the TOC lives far beyond the file
+        f[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    });
+    assert!(turndb::part::Part::open(&p).is_err(), "a TOC offset past the file must be refused");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_future_version_is_refused_before_anything_is_parsed() {
+    let dir = built("future");
+    let p = part_path(&dir);
+    edit_footer(&p, |f| f[45] = 200);
+    let e = match turndb::part::Part::open(&p) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a future format version must not open"),
+    };
+    assert!(e.contains("format version"), "expected a version refusal, got: {e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_truncated_part_is_refused() {
+    let dir = built("trunc");
+    let p = part_path(&dir);
+    let b = std::fs::read(&p).unwrap();
+    for keep in [0usize, 8, 55, b.len() / 2] {
+        std::fs::write(&p, &b[..keep.min(b.len())]).unwrap();
+        assert!(turndb::part::Part::open(&p).is_err(),
+            "a part truncated to {keep} bytes must be refused, not half-read");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_segment_with_unknown_flags_is_refused() {
+    let dir = built("flags");
+    let mut sp: Vec<PathBuf> = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .map(|e| e.path()).filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false)).collect();
+    sp.sort();
+    let mut b = std::fs::read(&sp[0]).unwrap();
+    b[12..16].copy_from_slice(&1u32.to_le_bytes()); // set an unknown flag bit
+    std::fs::write(&sp[0], &b).unwrap();
+
+    let e = match Store::open_read(&dir, FoldCfg::default()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an unknown segment flag must not open"),
+    };
+    assert!(e.contains("flags"), "expected a flags refusal, got: {e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_fold_with_a_missing_segment_is_refused_by_readers_too() {
+    // The writer always refused a gap. A reader that did not would serve a fold with a hole in its
+    // block space instead of refusing — the worse half of an asymmetry.
+    let dir = tmp("gap");
+    let mut s = Store::open(&dir, FoldCfg { seg_max: 1 << 17, block_target: 1 << 14, ..FoldCfg::default() }).unwrap();
+    for i in 0..300u32 {
+        let body: Vec<u8> = (0..64u32)
+            .flat_map(|j| blake3::hash(&(i * 500 + j).to_le_bytes()).as_bytes().to_vec()).collect();
+        s.put(&format!("s{i:04}"), &[Span::Piece(&body)], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+        .map(|e| e.path()).filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false)).collect();
+    segs.sort();
+    assert!(segs.len() >= 3, "the fixture must produce several segments; got {}", segs.len());
+    std::fs::remove_file(&segs[0]).unwrap(); // punch a hole at seg 0
+
+    assert!(Store::open_read(&dir, FoldCfg::default()).is_err(),
+        "a reader must refuse a fold whose segments are not dense");
     std::fs::remove_dir_all(&dir).ok();
 }

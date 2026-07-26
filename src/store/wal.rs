@@ -175,6 +175,9 @@ impl Wal {
     pub fn append_tomb(&mut self, seq: u64, id: &str) -> Result<()> {
         self.scratch.clear();
         self.scratch.extend_from_slice(id.as_bytes());
+        if self.scratch.len() as u64 > u32::MAX as u64 {
+            bail!("wal tombstone id of {} bytes exceeds the u32 length field", self.scratch.len());
+        }
         let mut hdr = Vec::with_capacity(13);
         hdr.push(TOMB_TAG);
         hdr.extend_from_slice(&seq.to_le_bytes());
@@ -195,6 +198,12 @@ impl Wal {
     pub fn append(&mut self, seq: u64, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
         self.scratch.clear();
         encode_record(&mut self.scratch, r, novel);
+        // The frame length is a u32 on disk. Truncating here would write a frame whose header
+        // disagrees with its payload, which replay would read as a torn tail — silently losing every
+        // record after it.
+        if self.scratch.len() as u64 > u32::MAX as u64 {
+            bail!("wal frame payload of {} bytes exceeds the u32 length field", self.scratch.len());
+        }
         let mut hdr = Vec::with_capacity(HDR);
         hdr.push(FRAME_TAG);
         hdr.extend_from_slice(&seq.to_le_bytes());

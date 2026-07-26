@@ -157,7 +157,9 @@ A part is immutable, self-contained, and id-sorted. It holds no content.
 ```
 
 The footer lands last and is the completeness marker: a part whose footer is absent or fails its
-checksum was torn mid-write and is discarded, never half-read.
+checksum was torn mid-write and is **refused**, never half-read. Refused is not the same as removed —
+a part the manifest names is a hard error, and only files the manifest does *not* name are swept as
+unreachable.
 
 ### Footer — 56 bytes, at EOF
 
@@ -172,7 +174,8 @@ offset  size  field
     36     8  seq_hi
     44     1  toc_codec
     45     1  version       format version; 0 predates this field
-    46     6  reserved, zero
+    46     4  toc_xsum      crc32 of the STORED TOC payload      (version >= 1)
+    50     2  reserved, zero
     52     4  xsum          first 4 bytes of BLAKE3 over footer[0..52]
 ```
 
@@ -197,41 +200,68 @@ repeated n_sections times:
   varint  stored
   varint  raw
   u8      codec
-  u32     xsum       crc32 of the STORED bytes           (version >= 1 only)
+  u32     xsum       crc32 of the STORED bytes           (version >= 1; presence by VERSION, not value)
 ```
 
-The TOC is **not** checksummed as a whole; the footer is. Every entry is range-checked against the file
-at open, because a corrupt-but-plausible entry would otherwise direct a reader to allocate `stored`
-bytes and read at an arbitrary offset.
+Integrity is a **chain**, and every link is needed: the footer checksums itself, `toc_xsum` checksums
+the TOC, and the TOC carries a checksum for each section. Leaving any one out makes the ones below it
+worthless — section checksums stored in an unverified TOC are only as trustworthy as the bytes carrying
+them.
+
+Every entry is additionally range-checked at open, against `toc_off` rather than against the file:
+sections live *before* the TOC, so that is the tighter bound and it also rules out a section claiming
+to overlap the TOC or footer. A duplicate section name is refused rather than silently overwriting, and
+trailing bytes after the last entry are refused rather than ignored.
+
+Presence of `xsum` is decided by `version`, **never by its value**: crc32 can legitimately be zero, so
+treating zero as "absent" would silently skip a real checksum about once in four billion.
 
 Per-section `xsum` covers what content hashes do not. Content carries BLAKE3 per piece and is verified
 on **every** read; the columnar metadata — ids, attribute values, offset arrays, dictionaries — has no
 such cover, and a flipped bit there is a wrong query answer with no error anywhere. Verification is
 **not** performed on the read path: hashing a section costs time proportional to the whole part rather
-than to what a query touches. It is exposed as a deliberate call. A reader may ignore `xsum` entirely
-and still be correct; it may not write a part without one.
+than to what a query touches. It is exposed as a deliberate call. A reader may ignore `xsum` entirely and remain
+**format-compatible** — it cannot thereby remain *correct* under corruption, which is the whole point
+of the field. A writer may not omit one.
 
 ### Sections
 
-Absent means the feature is unused, never that the part is malformed. A reader must tolerate absence.
+Absence is meaningful, but it does **not** mean "anything may be missing". Three classes:
+
+**Required.** A part without these is malformed, and a reader must refuse rather than improvise.
 
 | name | contents |
 |---|---|
 | `ids` | front-coded id column, strictly increasing |
-| `ids.restart` | u32 stream offsets, one every 16 ids |
+| `ids.restart` | u32 stream offsets, one every `RESTART` = 16 ids |
 | `prog` | body programs, one per row |
 | `prog.off` | u64 offsets into `prog`, `n_records + 1` of them |
 | `pdict.loc` | piece dictionary `Loc`s, 12 bytes each, sorted in FOLD order |
 | `pdict.hash` | piece hashes, 32 bytes each, parallel to `pdict.loc` |
-| `pdict.hsort` | u32 permutation of the dictionary in HASH order |
-| `pdict.bloom` | filter over the dictionary's hashes |
-| `tomb` | tombstoned row ordinals; absent when the part deletes nothing |
-| `layout` | per-row attribute column ordinals |
-| `layout.off` | u64 offsets into `layout` |
-| `colmeta` | column descriptors, in ordinal order |
-| `col.val.N` | column N's fixed-width values |
-| `col.rid.N` | column N's row indices; absent when dense |
-| `col.dict.N` | column N's string dictionary; absent for non-string columns |
+
+`pdict.loc` and `pdict.hash` are required even when empty, because their length is what defines the
+dictionary's size.
+
+**Conditionally required.** Required exactly when the condition holds; absent otherwise.
+
+| name | required when |
+|---|---|
+| `layout`, `layout.off`, `colmeta` | any record carries an attribute |
+| `col.val.N` | column *N* exists in `colmeta` |
+| `col.rid.N` | column *N*'s `rid_kind` is 1 (delta); absent and **elided** when dense |
+| `col.dict.N` | column *N*'s tag is 0 (string) |
+
+**Optional / advisory.** A reader may ignore these entirely and remain correct, only slower or less
+strict. A writer at this version always emits the first two.
+
+| name | contents |
+|---|---|
+| `pdict.hsort` | u32 permutation of the dictionary in HASH order — an index, derivable by sorting |
+| `pdict.bloom` | filter over the dictionary's hashes — an accelerator with no false negatives |
+| `tomb` | tombstoned row ordinals; absent means the part deletes nothing |
+
+Unknown section names must be ignored, not rejected: that is what lets a later version add one without
+moving `version`.
 
 **The piece dictionary is sorted in fold order, not hash order**, and `pdict.hsort` carries hash order
 separately. Two orders over one dictionary rather than two dictionaries: fold order keeps `pdict.loc`
@@ -240,6 +270,64 @@ resolving a piece by content binary-searches `hsort`, dereferencing into `pdict.
 
 `pdict.bloom` answers "definitely not present" from memory. It has no false negatives, so it can cost a
 missed dedup and never a wrong answer.
+
+```
+offset  size  field
+     0     8  m            bit count
+     8  m/8   bits         rounded up to a byte
+```
+
+Probe positions come from the piece hash itself rather than a second hash function — BLAKE3 output is
+already uniform. With `a` = hash[0..8] and `b` = hash[8..16] read little-endian and `b |= 1`, probe *i*
+of `k` = 7 is `(a + i*b) mod m`. Sized at 10 bits per entry.
+
+#### ids
+
+Front-coded: each id stores how many leading bytes it shares with its predecessor, then its own tail.
+Every 16th id (`RESTART`) starts fresh, and `ids.restart` records that id's byte offset into the
+stream, which is what makes a binary search possible without decoding everything before it.
+
+```
+repeated n_records times:
+  varint  shared      leading bytes in common with the previous id; 0 at a restart
+  varint  tail_len
+  bytes   tail
+```
+
+#### tomb
+
+Absent when the part deletes nothing. Ordinals are **row indices**, ascending, after id sorting.
+
+```
+varint   n_tombstones
+repeated n_tombstones times:
+  varint  delta       from the previous ordinal; the first is absolute
+```
+
+#### col.dict.N
+
+Sorted and distinct, which is what lets a reader binary-search it for a value and compare ordinals
+instead of strings.
+
+```
+varint   n_entries
+repeated n_entries times:
+  varint  len
+  bytes   utf8
+```
+
+#### layout
+
+Per row, at `layout.off[row]`. Records the exact sequence of column ordinals the row used, which is
+what columns alone cannot reproduce.
+
+```
+varint   n_attrs
+repeated n_attrs times:
+  varint  column_ordinal
+```
+
+Reconstruction walks this sequence and draws the next unconsumed value from each named column.
 
 #### Body programs
 
@@ -319,8 +407,41 @@ offset  size  field
 13+len     4  crc32      over header AND payload
 ```
 
-A record payload carries the id, the body program, the attributes, and the **bytes** of every piece the
-record introduced. A tombstone payload is the id alone.
+A tombstone payload is the id alone, as UTF-8, with no framing. A record payload is:
+
+```
+varint   id_len
+bytes    id
+varint   n_ops
+repeated n_ops times:
+  u8      op               0 literal, 1 piece
+  op 0:   varint len, then len bytes
+  op 1:   32 bytes piece hash, then varint len
+varint   n_attrs
+repeated n_attrs times:
+  varint  key_len
+  bytes   key
+  u8      tag              0 string, 1 i64, 2 f64 bits, 3 bool
+  value   tag 0: varint len + utf8;  1: 8 bytes i64;  2: 8 bytes f64 BITS;  3: 1 byte
+varint   n_novel
+repeated n_novel times:
+  32 bytes hash
+  varint   len
+  bytes    piece content
+```
+
+Two differences from a part's `prog`, both deliberate and neither incidental:
+
+* the op tag is a **plain u8**, not the `(payload << 1) | op` varint packing a part uses — the packing
+  buys density in a section read millions of times, and the log is written once and discarded;
+* a piece is referenced by **hash**, not by dictionary ordinal, because the log predates every part and
+  there is no dictionary to index into yet.
+
+Floats are stored as **bits** here for the same reason they are in a column: `-0.0` and NaN payloads
+must replay exactly.
+
+`novel` carries bytes for genuinely new pieces only. Content that deduplicated is already durable, so
+replay does not need it.
 
 Bytes are carried for genuinely new pieces only. Content that deduplicated is already durable
 elsewhere, so replay does not need it — recovery truncates the fold to the committed tail and replays,
@@ -347,7 +468,9 @@ the sequence cursor. Everything else — the block directory, dedup indexes, par
 ```
 
 JSON on purpose: it is small, written once per flush, and self-describing, so a field can be added
-without a version lever. `fold_gen` was added exactly that way and absent means 0.
+without a version lever — **provided the new field has a documented default**, since older writers will
+keep omitting it. `fold_gen` was added exactly that way and absent means 0. A field without a default
+is a breaking change that JSON merely fails to announce.
 
 Committed with tmp + fsync + rename + fsync-dir, so a crash sees either the old manifest or the new
 one. **An unreadable manifest is an error, not an empty store** — conflating those with a sweep that
@@ -372,6 +495,8 @@ swept at writer open, and never a pointer to something that is not there.
 Enforced, not assumed. Each refuses rather than truncating, because a store that cannot be written is
 recoverable and one that lies is not.
 
+All are checked at the point of writing, and each refuses rather than truncating.
+
 | limit | value | why |
 |---|---|---|
 | piece length | 4 GiB | `Loc.raw` is u32 |
@@ -393,14 +518,18 @@ however large it is — so it, not `seg_max`, is what can overflow the segment a
 wholesale, so a format change is applied by re-folding forward rather than by re-ingesting. That makes
 the useful promise much weaker than permanence:
 
-> **A build will read the previous generation and re-fold it forward.**
+> **A build will read the immediately preceding on-disk format revision, and re-fold it forward.**
+
+"Revision" here means a format version, not a *fold generation* — the two are unrelated, and a store
+may sit at fold generation 40 while never having changed format revision at all.
 
 What that requires of a change:
 
 * a change a version-1 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
-* a change it would merely **not use** — a new section, a new manifest field — needs neither, because
-  absent sections and absent JSON fields are already defined as "unused";
+* a change it would merely **not use** — a new optional section, a new manifest field — needs neither,
+  because unknown sections must be ignored and an absent JSON field must have a documented default.
+  A new manifest field without a default is a breaking change even though JSON tolerates it;
 * removing or repurposing an existing field always moves the version.
 
 Both planes now have a lever. They did not always: the fold could refuse an unknown future from the

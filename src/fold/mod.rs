@@ -390,6 +390,14 @@ impl Fold {
             bail!("no fold segments under {}", dir.display());
         }
         nums.sort_unstable();
+        // The same density rule the writer applies. A gap means a segment is missing, and reading
+        // around it would silently serve a fold with a hole in its block space rather than refuse —
+        // the writer refused and the reader did not, which is the worse half of an asymmetry.
+        for (i, n) in nums.iter().enumerate() {
+            if *n != i as u32 {
+                bail!("fold segments are not dense: expected seg {i}, found {n}");
+            }
+        }
         let mut headers = Vec::with_capacity(nums.len());
         let mut readers = Vec::with_capacity(nums.len());
         for &n in &nums {
