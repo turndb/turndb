@@ -80,6 +80,10 @@ fn storm(
     seed: u64,
     f: impl Fn(&Path),
 ) {
+    // STORM_XOR varies every storm's seed for soak runs — unset, it is 0 and the run is the
+    // deterministic default. A finding reports the EFFECTIVE seed, so a soak discovery replays
+    // exactly by exporting that value.
+    let seed = seed ^ std::env::var("STORM_XOR").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     let mut rng = Rng(seed);
     for round in 0..rounds {
         let mut m = pristine.to_vec();
