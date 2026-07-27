@@ -835,11 +835,10 @@ impl Part {
                 let idx = (tagged >> 1) as usize;
                 let len = get_varint(&prog, &mut at)? as u32;
                 let (loc, hash) = self.piece(idx)?;
-                let bytes = fold.read_verified(loc, hash)?;
-                if bytes.len() as u32 != len {
-                    bail!("piece {hash} is {} bytes but the program says {len}", bytes.len());
+                if loc.raw != len {
+                    bail!("piece {hash} is {} bytes but the program says {len}", loc.raw);
                 }
-                out.extend_from_slice(&bytes);
+                fold.read_verified_into(loc, hash, &mut out)?;
             }
         }
         Ok(out)

@@ -84,11 +84,16 @@ pub struct Put {
     pub deduped: bool,
 }
 
-/// LRU of decompressed blocks, keyed by `(seg, block_off)`, bounded by total decompressed bytes.
+/// LRU of decompressed blocks, keyed by logical `block_id`, bounded by total decompressed bytes.
+///
+/// Recency lives in a second index (`order`: clock -> id) kept exactly in step with the map, so
+/// eviction pops the coldest entry in O(log n). The old shape scanned the whole map per eviction
+/// — O(n) per admit once warm, on a lock that every parallel scan partition contends for.
 struct BlockCache {
     budget: usize,
     bytes: usize,
     map: HashMap<u32, (u64, Arc<Vec<u8>>)>,
+    order: std::collections::BTreeMap<u64, u32>,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -96,16 +101,29 @@ struct BlockCache {
 
 impl BlockCache {
     fn new(budget: usize) -> BlockCache {
-        BlockCache { budget: budget.max(1), bytes: 0, map: HashMap::new(), clock: 0, hits: 0, misses: 0 }
+        BlockCache {
+            budget: budget.max(1),
+            bytes: 0,
+            map: HashMap::new(),
+            order: std::collections::BTreeMap::new(),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+    fn touch(&mut self, k: u32, old_clock: u64) -> u64 {
+        self.clock += 1;
+        self.order.remove(&old_clock);
+        self.order.insert(self.clock, k);
+        self.clock
     }
     fn get(&mut self, k: u32) -> Option<Arc<Vec<u8>>> {
-        self.clock += 1;
-        let c = self.clock;
-        match self.map.get_mut(&k) {
-            Some(e) => {
-                e.0 = c;
+        match self.map.get(&k).map(|e| (e.0, e.1.clone())) {
+            Some((old, v)) => {
+                let c = self.touch(k, old);
+                self.map.get_mut(&k).expect("just found").0 = c;
                 self.hits += 1;
-                Some(e.1.clone())
+                Some(v)
             }
             None => {
                 self.misses += 1;
@@ -116,22 +134,24 @@ impl BlockCache {
     fn put(&mut self, k: u32, v: Arc<Vec<u8>>) {
         let add = v.len();
         // always admit one block, however large, then evict coldest until back inside the budget
-        while self.bytes + add > self.budget && !self.map.is_empty() {
-            if let Some((&victim, _)) = self.map.iter().min_by_key(|(_, (t, _))| *t) {
-                if let Some((_, gone)) = self.map.remove(&victim) {
-                    self.bytes -= gone.len();
-                }
+        while self.bytes + add > self.budget && !self.order.is_empty() {
+            let (&coldest, &victim) = self.order.iter().next().expect("non-empty");
+            self.order.remove(&coldest);
+            if let Some((_, gone)) = self.map.remove(&victim) {
+                self.bytes -= gone.len();
             }
         }
         self.clock += 1;
         let c = self.clock;
         self.bytes += add;
+        self.order.insert(c, k);
         // Re-inserting a key DISPLACES a value whose bytes are still counted. Two readers racing the
         // same block is ordinary now that scan partitions run in parallel, and each race leaked a
         // block's worth of budget — enough repeats and a 64 MiB cache believes it is full while
         // holding one entry.
-        if let Some((_, old)) = self.map.insert(k, (c, v)) {
+        if let Some((old_clock, old)) = self.map.insert(k, (c, v)) {
             self.bytes -= old.len();
+            self.order.remove(&old_clock);
         }
     }
 }
@@ -530,22 +550,24 @@ impl Fold {
         Ok(Put { hash, loc, deduped: false })
     }
 
-    /// Read one piece back, exactly as it was written.
-    pub fn read(&self, loc: Loc) -> Result<Vec<u8>> {
+    /// Run `f` over the piece's bytes wherever they live — the open buffer, the compression
+    /// pipeline, or a (cached) decompressed block — WITHOUT copying them anywhere first. Every
+    /// read shape is a projection of this one.
+    fn with_piece<T>(&self, loc: Loc, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
         let end = loc.in_off as u64 + loc.raw as u64;
         // still gathering — not yet sealed
         if loc.block_id == self.next_block {
             if end > self.open_block.len() as u64 {
                 bail!("Loc names bytes past the open block");
             }
-            return Ok(self.open_block[loc.in_off as usize..end as usize].to_vec());
+            return Ok(f(&self.open_block[loc.in_off as usize..end as usize]));
         }
         // sealed but still in the pipeline — already uncompressed, so serve it directly
         if let Some(raw) = self.inflight.get(&loc.block_id) {
             if end > raw.len() as u64 {
                 bail!("Loc names bytes past its block");
             }
-            return Ok(raw[loc.in_off as usize..end as usize].to_vec());
+            return Ok(f(&raw[loc.in_off as usize..end as usize]));
         }
         let blk = self.block_bytes(loc)?;
         if end > blk.len() as u64 {
@@ -554,17 +576,37 @@ impl Fold {
                 loc.in_off, loc.raw, blk.len()
             );
         }
-        Ok(blk[loc.in_off as usize..end as usize].to_vec())
+        Ok(f(&blk[loc.in_off as usize..end as usize]))
+    }
+
+    /// Read one piece back, exactly as it was written.
+    pub fn read(&self, loc: Loc) -> Result<Vec<u8>> {
+        self.with_piece(loc, |s| s.to_vec())
     }
 
     /// Read and confirm full content identity — the caller knows what hash it expects.
     pub fn read_verified(&self, loc: Loc, expect: PieceHash) -> Result<Vec<u8>> {
-        let out = self.read(loc)?;
-        let got = PieceHash::of(&out);
-        if got != expect {
-            bail!("content hash mismatch in block {} at +{}: got {got}, expected {expect}", loc.block_id, loc.in_off);
-        }
-        Ok(out)
+        self.with_piece(loc, |s| -> Result<Vec<u8>> {
+            let got = PieceHash::of(s);
+            if got != expect {
+                bail!("content hash mismatch in block {} at +{}: got {got}, expected {expect}", loc.block_id, loc.in_off);
+            }
+            Ok(s.to_vec())
+        })?
+    }
+
+    /// [`Fold::read_verified`], appending straight into `out` — reconstruction's read. A body is
+    /// many pieces concatenated, and the intermediate Vec per piece was pure overhead: verify the
+    /// bytes where they sit in the block, then copy ONCE, into their final place.
+    pub fn read_verified_into(&self, loc: Loc, expect: PieceHash, out: &mut Vec<u8>) -> Result<()> {
+        self.with_piece(loc, |s| -> Result<()> {
+            let got = PieceHash::of(s);
+            if got != expect {
+                bail!("content hash mismatch in block {} at +{}: got {got}, expected {expect}", loc.block_id, loc.in_off);
+            }
+            out.extend_from_slice(s);
+            Ok(())
+        })?
     }
 
     /// The decompressed bytes of the block holding `loc`, through the cache.

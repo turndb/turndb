@@ -857,7 +857,7 @@ impl Store {
                     let loc = self
                         .locate(hash)?
                         .ok_or_else(|| anyhow::anyhow!("piece {hash} not resolvable"))?;
-                    out.extend_from_slice(&self.fold.read_verified(loc, *hash)?);
+                    self.fold.read_verified_into(loc, *hash, &mut out)?;
                 }
             }
         }
