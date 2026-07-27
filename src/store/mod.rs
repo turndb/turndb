@@ -39,8 +39,6 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
@@ -226,20 +224,21 @@ impl Manifest {
         self.commit += 1;
         let bytes = self.encode()?;
         {
-            let mut f = File::create(retained_path(dir, self.commit))?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
+            let p = retained_path(dir, self.commit);
+            let f = crate::vfs::create(&p)?;
+            crate::vfs::write_all_at(&f, &p, &bytes, 0)?;
+            crate::vfs::sync_file(&f, &p)?;
         }
         let tmp = dir.join("MANIFEST.tmp");
-        let mut f = File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        let f = crate::vfs::create(&tmp)?;
+        crate::vfs::write_all_at(&f, &tmp, &bytes, 0)?;
+        crate::vfs::sync_file(&f, &tmp)?;
         drop(f);
-        std::fs::rename(&tmp, dir.join("MANIFEST"))?;
-        File::open(dir)?.sync_all()?;
+        crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
+        crate::vfs::sync_dir(dir)?;
         for c in list_retained(dir) {
             if c + (MANIFEST_RETAIN as u64) <= self.commit {
-                let _ = std::fs::remove_file(retained_path(dir, c));
+                let _ = crate::vfs::unlink(&retained_path(dir, c));
             }
         }
         Ok(())
@@ -327,12 +326,12 @@ fn sweep_unreachable(dir: &Path) -> Result<()> {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().to_string();
             if n.starts_with("part-") && n.ends_with(".part") && !live_parts.contains(n.as_str()) {
-                let _ = std::fs::remove_file(e.path());
+                let _ = crate::vfs::unlink(&e.path());
             }
             if e.path().is_dir() {
                 if let Some(g) = refold::parse_fold_gen(&n) {
                     if !live_gens.contains(&g) {
-                        let _ = std::fs::remove_dir_all(e.path());
+                        let _ = crate::vfs::remove_tree(&e.path());
                     }
                 }
             }
@@ -367,15 +366,15 @@ pub fn recover_manifest(dir: &Path) -> Result<u64> {
         }
         let bytes = std::fs::read(retained_path(dir, c))?;
         let tmp = dir.join("MANIFEST.tmp");
-        let mut f = File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        let f = crate::vfs::create(&tmp)?;
+        crate::vfs::write_all_at(&f, &tmp, &bytes, 0)?;
+        crate::vfs::sync_file(&f, &tmp)?;
         drop(f);
-        std::fs::rename(&tmp, dir.join("MANIFEST"))?;
-        File::open(dir)?.sync_all()?;
+        crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
+        crate::vfs::sync_dir(dir)?;
         for n in list_retained(dir) {
             if n > c {
-                let _ = std::fs::remove_file(retained_path(dir, n));
+                let _ = crate::vfs::unlink(&retained_path(dir, n));
             }
         }
         return Ok(c);
@@ -404,8 +403,32 @@ pub struct Store {
 impl Store {
     /// Open for writing. Takes the writer lock (through the fold) and recovers.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
-        std::fs::create_dir_all(dir)?;
-        let manifest = Manifest::load(dir)?;
+        crate::vfs::mkdir_all(dir)?;
+        let manifest = match Manifest::load(dir) {
+            Ok(m) => m,
+            Err(e) => {
+                // A crash inside the FIRST commit is the one state where MANIFEST can be
+                // legitimately absent beside a commit log: the retained copy lands before the
+                // rename, and commit 1 has no previous manifest to leave behind. A log of exactly
+                // [1] with no MANIFEST is that signature — an intact copy COMPLETES the commit
+                // (data before pointers makes promotion indistinguishable from the crash landing
+                // a moment later), a torn copy VOIDS it (nothing was published). Every other
+                // missing-manifest shape means a manifest that once existed is gone, and stays a
+                // refusal. Found by the DST harness at the first flush's commit window.
+                let retained = list_retained(dir);
+                if !dir.join("MANIFEST").exists() && retained == [1] {
+                    if load_retained(dir, 1).is_ok() {
+                        recover_manifest(dir)?;
+                    } else {
+                        crate::vfs::unlink(&retained_path(dir, 1))?;
+                        crate::vfs::sync_dir(dir)?;
+                    }
+                    Manifest::load(dir)?
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
         // is discarded, and the log regenerates it.
@@ -954,7 +977,7 @@ impl Store {
         // Time travel does not cross a re-fold, by design; that is the point of running one.
         for c in list_retained(&self.dir) {
             if c != self.manifest.commit {
-                let _ = std::fs::remove_file(retained_path(&self.dir, c));
+                let _ = crate::vfs::unlink(&retained_path(&self.dir, c));
             }
         }
         self.pcache = SectionCache::shared();

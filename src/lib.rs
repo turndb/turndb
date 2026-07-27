@@ -42,5 +42,6 @@ pub mod query;
 pub mod readat;
 pub mod store;
 pub mod types;
+pub mod vfs;
 
 pub use types::{AttrValue, BodyOp, PieceHash, Record};

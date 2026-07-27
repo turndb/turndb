@@ -46,7 +46,6 @@ use anyhow::{bail, Context, Result};
 use idcol::{get_varint, put_varint, IdCol};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
 use std::path::Path;
 use cache::{Held, Kind, SectionCache};
 use std::sync::Arc;
@@ -309,6 +308,7 @@ fn u64s(v: &[u64]) -> Vec<u8> {
 
 struct Writer {
     f: File,
+    path: std::path::PathBuf,
     off: u64,
     toc: Vec<(String, Section)>,
     level: i32,
@@ -316,8 +316,8 @@ struct Writer {
 
 impl Writer {
     fn new(path: &Path, level: i32) -> Result<Writer> {
-        let f = File::create(path).with_context(|| format!("create part {}", path.display()))?;
-        Ok(Writer { f, off: 0, toc: Vec::new(), level })
+        let f = crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
+        Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level })
     }
 
     fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
@@ -328,7 +328,7 @@ impl Writer {
             bail!("section {name} is {} bytes; the format caps a section at 4 GiB", raw.len());
         }
         let (codec, payload) = crate::fold::codec::encode(raw, None, self.level)?;
-        self.f.write_all(&payload)?;
+        crate::vfs::write_all_at(&self.f, &self.path, &payload, self.off)?;
         self.toc.push((
             name.to_string(),
             Section {
@@ -343,7 +343,7 @@ impl Writer {
         Ok(())
     }
 
-    fn finish(mut self, meta: PartMeta) -> Result<()> {
+    fn finish(self, meta: PartMeta) -> Result<()> {
         let mut toc = Vec::new();
         put_varint(&mut toc, self.toc.len() as u64);
         for (name, s) in &self.toc {
@@ -365,7 +365,7 @@ impl Writer {
         }
         let (toc_codec, toc_payload) = crate::fold::codec::encode(&toc, None, self.level)?;
         let toc_off = self.off;
-        self.f.write_all(&toc_payload)?;
+        crate::vfs::write_all_at(&self.f, &self.path, &toc_payload, toc_off)?;
 
         let mut foot = Vec::with_capacity(FOOTER_LEN as usize);
         foot.extend_from_slice(MAGIC);
@@ -389,8 +389,8 @@ impl Writer {
         foot.extend_from_slice(&x.as_bytes()[0..4]);
         debug_assert_eq!(foot.len(), FOOTER_LEN as usize);
         // The footer lands LAST and is the completeness marker.
-        self.f.write_all(&foot)?;
-        self.f.sync_all()?;
+        crate::vfs::write_all_at(&self.f, &self.path, &foot, toc_off + toc_payload.len() as u64)?;
+        crate::vfs::sync_file(&self.f, &self.path)?;
         Ok(())
     }
 }
