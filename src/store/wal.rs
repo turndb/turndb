@@ -16,8 +16,7 @@
 use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -158,23 +157,52 @@ pub fn decode_record(b: &[u8]) -> Result<(Record, Vec<(PieceHash, Vec<u8>)>)> {
     Ok((Record { id, body, attrs }, novel))
 }
 
+/// Buffered writes are EXPLICIT here — an owned buffer flushed through the [`crate::vfs`] seam —
+/// rather than a `BufWriter`, whose internal flushes would write to the file behind the seam and
+/// leave the DST recorder blind to the very bytes whose crash behavior the log exists to test.
+///
+/// The file is deliberately NOT opened with `O_APPEND`: writes are positioned, and on Linux
+/// `O_APPEND` makes `pwrite` ignore its offset and append anyway — a portability trap that would
+/// turn a truncate-then-rewrite into interleaved garbage.
 pub struct Wal {
-    w: BufWriter<File>,
+    f: File,
     path: std::path::PathBuf,
-    len: u64,
+    /// Bytes durably ordered in the FILE (not necessarily fsynced).
+    file_len: u64,
+    /// Frames appended but not yet written to the file.
+    buf: Vec<u8>,
     scratch: Vec<u8>,
 }
 
+/// Flush the buffer once it holds this much — the same batching a BufWriter provided.
+const BUF_FLUSH: usize = 1 << 20;
+
 impl Wal {
     pub fn open(path: &Path) -> Result<Wal> {
-        let f = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("open wal {}", path.display()))?;
-        let len = f.metadata()?.len();
-        Ok(Wal { w: BufWriter::with_capacity(1 << 20, f), path: path.to_path_buf(), len, scratch: Vec::new() })
+        let (f, created) =
+            crate::vfs::open_or_create(path).with_context(|| format!("open wal {}", path.display()))?;
+        if created {
+            // A created file's NAME is volatile until its parent directory syncs — fsyncing the
+            // file alone leaves a dirent a power loss can drop, and an ACK backed by a WAL that
+            // can vanish is no ACK at all. Found by the DST harness under the strict-POSIX model:
+            // sync() had fsynced the file, the dirent evaporated, and acked records were lost.
+            if let Some(parent) = path.parent() {
+                crate::vfs::sync_dir(parent)
+                    .with_context(|| format!("fsync {} after creating the wal", parent.display()))?;
+            }
+        }
+        let file_len = f.metadata()?.len();
+        Ok(Wal { f, path: path.to_path_buf(), file_len, buf: Vec::new(), scratch: Vec::new() })
+    }
+
+    fn flush_buf(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        crate::vfs::write_all_at(&self.f, &self.path, &self.buf, self.file_len)?;
+        self.file_len += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
     }
 
     /// Frame `payload` under `tag` and append it. The CRC covers the HEADER as well as the payload —
@@ -194,10 +222,12 @@ impl Wal {
         crc.update(&hdr);
         crc.update(payload);
         let c = crc.finalize();
-        self.w.write_all(&hdr)?;
-        self.w.write_all(payload)?;
-        self.w.write_all(&c.to_le_bytes())?;
-        self.len += (HDR + payload.len() + CRC) as u64;
+        self.buf.extend_from_slice(&hdr);
+        self.buf.extend_from_slice(payload);
+        self.buf.extend_from_slice(&c.to_le_bytes());
+        if self.buf.len() >= BUF_FLUSH {
+            self.flush_buf()?;
+        }
         Ok(())
     }
 
@@ -251,24 +281,22 @@ impl Wal {
 
     /// The ACK point. Nothing may be reported durable before this returns.
     pub fn sync(&mut self) -> Result<()> {
-        self.w.flush()?;
-        self.w.get_ref().sync_all().context("fsync wal")?;
+        self.flush_buf()?;
+        crate::vfs::sync_file(&self.f, &self.path).context("fsync wal")?;
         Ok(())
     }
 
     /// Drop every frame — called once the records they cover are committed in a part.
     pub fn truncate(&mut self) -> Result<()> {
-        self.w.flush()?;
-        let f = OpenOptions::new().write(true).open(&self.path)?;
-        f.set_len(0)?;
-        f.sync_all()?;
-        self.w = BufWriter::with_capacity(1 << 20, OpenOptions::new().append(true).open(&self.path)?);
-        self.len = 0;
+        self.buf.clear();
+        crate::vfs::set_len(&self.f, &self.path, 0)?;
+        crate::vfs::sync_file(&self.f, &self.path)?;
+        self.file_len = 0;
         Ok(())
     }
 
     pub fn bytes(&self) -> u64 {
-        self.len
+        self.file_len + self.buf.len() as u64
     }
 
     /// Every intact, COMMITTED frame, in order. Stops at the first torn or corrupt one — a partial
@@ -392,6 +420,8 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn rec() -> (Record, Vec<(PieceHash, Vec<u8>)>) {
         let bytes = b"a novel piece".to_vec();

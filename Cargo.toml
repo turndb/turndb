@@ -9,6 +9,10 @@ edition = "2021"
 # built by default is a feature that is not tested.
 default = ["sql"]
 sql = ["dep:datafusion", "dep:async-trait", "dep:futures"]
+# Deterministic-simulation testing: arms a recorder inside the write-path seam (src/vfs.rs) so the
+# DST harness can reconstruct every crash state. Off by default and adds nothing when off; the
+# harness runs as `cargo test --features dst --test dst`.
+dst = []
 
 [dependencies]
 # The query lens. Arrow comes in THROUGH datafusion's re-export rather than as its own dependency,

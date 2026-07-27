@@ -111,7 +111,7 @@ pub fn refold(
     let new_gen = old_gen + 1;
     let new_dir = fold_dir(dir, new_gen);
     if new_dir.exists() {
-        std::fs::remove_dir_all(&new_dir)?;
+        crate::vfs::remove_tree(&new_dir)?;
     }
 
     let mut st = RefoldStats { parts_in: parts.len(), ..Default::default() };

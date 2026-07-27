@@ -4,7 +4,6 @@ use super::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
 use crate::readat::ReadAt;
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Segment header length. The first block begins here, so a `Loc.block_off` below it is invalid.
@@ -81,10 +80,7 @@ impl SegHeader {
 
 /// fsync a directory so a create/rename within it is durable.
 pub fn fsync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)
-        .with_context(|| format!("open dir {} for fsync", dir.display()))?
-        .sync_all()
-        .with_context(|| format!("fsync dir {}", dir.display()))
+    crate::vfs::sync_dir(dir).with_context(|| format!("fsync dir {}", dir.display()))
 }
 
 /// Create segment `n` with its header durable before any frame can follow it.
@@ -94,14 +90,10 @@ pub fn fsync_dir(dir: &Path) -> Result<()> {
 /// lets recovery delete such a file safely.
 pub fn create(dir: &Path, n: u32, dict_id: [u8; 32]) -> Result<File> {
     let path = dir.join(seg_name(n));
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .read(true)
-        .open(&path)
+    let f = crate::vfs::create_new(&path)
         .with_context(|| format!("create segment {}", path.display()))?;
-    f.write_all(&SegHeader { seg: n, dict_id }.encode())?;
-    f.sync_all()?;
+    crate::vfs::write_all_at(&f, &path, &SegHeader { seg: n, dict_id }.encode(), 0)?;
+    crate::vfs::sync_file(&f, &path)?;
     fsync_dir(dir)?;
     Ok(f)
 }
@@ -211,8 +203,8 @@ pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) 
     let crc = crc32fast::hash(&b);
     b.extend_from_slice(&crc.to_le_bytes());
     let tmp = dir.join(format!("seg-{n:08}.dir.tmp"));
-    std::fs::write(&tmp, &b)?;
-    std::fs::rename(&tmp, dir_path(dir, n))?;
+    crate::vfs::write_file(&tmp, &b)?;
+    crate::vfs::rename(&tmp, &dir_path(dir, n))?;
     Ok(())
 }
 

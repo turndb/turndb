@@ -229,19 +229,77 @@ impl Fold {
         if !(1..=22).contains(&cfg.level) {
             bail!("zstd level {} is outside the 1..=22 range this fold accepts", cfg.level);
         }
-        std::fs::create_dir_all(dir).with_context(|| format!("create fold dir {}", dir.display()))?;
+        crate::vfs::mkdir_all(dir).with_context(|| format!("create fold dir {}", dir.display()))?;
         let lock = acquire_writer_lock(dir)?;
 
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 if e.file_name().to_string_lossy().ends_with(".tmp") {
-                    let _ = std::fs::remove_file(e.path());
+                    let _ = crate::vfs::unlink(&e.path());
                 }
             }
         }
 
         let mut nums = list_segments(dir)?;
+        nums.sort_unstable();
+        for (i, n) in nums.iter().enumerate() {
+            if *n != i as u32 {
+                bail!("fold segments are not dense: expected seg {i}, found {n}");
+            }
+        }
+
+        let mut headers: Vec<SegHeader> = Vec::with_capacity(nums.len());
+        'scan: while !nums.is_empty() {
+            headers.clear();
+            let last = *nums.last().unwrap();
+            let mut retry = false;
+            for &n in &nums {
+                let path = segment::seg_path(dir, n);
+                let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+                let len = f.metadata()?.len();
+                let mut hb = [0u8; SEG_HDR_LEN as usize];
+                let ok = len >= SEG_HDR_LEN && f.read_exact_at(&mut hb, 0).is_ok();
+                match ok.then(|| SegHeader::decode(&hb, n)).transpose() {
+                    Ok(Some(h)) => headers.push(h),
+                    _ => {
+                        if n != last {
+                            bail!("segment {n} has an unreadable header — refusing (sealed history is corrupt)");
+                        }
+                        if len > SEG_HDR_LEN {
+                            bail!("active segment {n} has a bad header but holds {len} bytes — refusing");
+                        }
+                        drop(f);
+                        crate::vfs::unlink(&path)?;
+                        segment::fsync_dir(dir)?;
+                        // A torn create is not data — removing the last one may empty the fold
+                        // entirely, which the fresh path below handles. (This used to refuse,
+                        // which stranded a store that crashed during its very first segment's
+                        // creation: found by the DST harness at crash point 3.)
+                        nums.pop();
+                        retry = true;
+                        break;
+                    }
+                }
+            }
+            if !retry {
+                break 'scan;
+            }
+        }
+
         if nums.is_empty() {
+            // A virgin fold, or one whose only segment was a torn create, just removed. Either way
+            // no durable fold bytes exist — and a committed tail must AGREE with that: a manifest
+            // naming bytes an empty fold cannot serve means the fold lost durable data, and
+            // creating a fresh fold underneath it would bury the loss instead of reporting it.
+            if let Some(ct) = committed {
+                if ct > (FoldTail { seg: 0, off: SEG_HDR_LEN as u32 }) {
+                    bail!(
+                        "committed fold tail (seg {}, off {}) but the fold holds no durable bytes \
+                         — the fold lost durable data",
+                        ct.seg, ct.off
+                    );
+                }
+            }
             let f = segment::create(dir, 0, [0u8; 32])?;
             return Ok(Fold {
                 dir: dir.to_path_buf(),
@@ -263,50 +321,6 @@ impl Fold {
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
                 _lock: lock,
             });
-        }
-
-        nums.sort_unstable();
-        for (i, n) in nums.iter().enumerate() {
-            if *n != i as u32 {
-                bail!("fold segments are not dense: expected seg {i}, found {n}");
-            }
-        }
-
-        let mut headers: Vec<SegHeader> = Vec::with_capacity(nums.len());
-        loop {
-            headers.clear();
-            let last = *nums.last().unwrap();
-            let mut retry = false;
-            for &n in &nums {
-                let path = segment::seg_path(dir, n);
-                let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-                let len = f.metadata()?.len();
-                let mut hb = [0u8; SEG_HDR_LEN as usize];
-                let ok = len >= SEG_HDR_LEN && f.read_exact_at(&mut hb, 0).is_ok();
-                match ok.then(|| SegHeader::decode(&hb, n)).transpose() {
-                    Ok(Some(h)) => headers.push(h),
-                    _ => {
-                        if n != last {
-                            bail!("segment {n} has an unreadable header — refusing (sealed history is corrupt)");
-                        }
-                        if len > SEG_HDR_LEN {
-                            bail!("active segment {n} has a bad header but holds {len} bytes — refusing");
-                        }
-                        drop(f);
-                        std::fs::remove_file(&path)?;
-                        segment::fsync_dir(dir)?;
-                        nums.pop();
-                        if nums.is_empty() {
-                            bail!("every fold segment was a torn create — refusing to guess");
-                        }
-                        retry = true;
-                        break;
-                    }
-                }
-            }
-            if !retry {
-                break;
-            }
         }
 
         let mut dicts: HashMap<[u8; 32], Arc<Vec<u8>>> = HashMap::new();
@@ -344,7 +358,7 @@ impl Fold {
                 while active > ct.seg {
                     let p = segment::seg_path(dir, active);
                     drop(active_f);
-                    std::fs::remove_file(&p)?;
+                    crate::vfs::unlink(&p)?;
                     headers.pop();
                     active -= 1;
                     active_f = segment::open_rw(dir, active)?;
@@ -354,8 +368,9 @@ impl Fold {
             }
         };
 
-        active_f.set_len(target)?;
-        active_f.sync_all()?;
+        let active_path = segment::seg_path(dir, active);
+        crate::vfs::set_len(&active_f, &active_path, target)?;
+        crate::vfs::sync_file(&active_f, &active_path)?;
         segment::fsync_dir(dir)?;
 
         let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(headers.len());
@@ -687,9 +702,8 @@ impl Fold {
         if self.cur_off as u64 > SEG_HDR_LEN && self.cur_off as u64 + n as u64 > self.cfg.seg_max as u64 {
             self.roll()?;
         }
-        if let Err(e) =
-            std::os::unix::fs::FileExt::write_all_at(&self.active_f, &self.scratch[..n], self.cur_off as u64)
-        {
+        let path = segment::seg_path(&self.dir, self.active);
+        if let Err(e) = crate::vfs::write_all_at(&self.active_f, &path, &self.scratch[..n], self.cur_off as u64) {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }
@@ -716,7 +730,8 @@ impl Fold {
         self.seal_block()?;
         // Every block must be compressed AND written before a tail can be reported durable.
         self.write_ready(true)?;
-        self.active_f.sync_all().context("fsync active fold segment")?;
+        crate::vfs::sync_file(&self.active_f, &segment::seg_path(&self.dir, self.active))
+            .context("fsync active fold segment")?;
         Ok(self.tail())
     }
 
@@ -790,7 +805,8 @@ impl Fold {
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
-        self.active_f.sync_all().context("fsync before roll")?;
+        crate::vfs::sync_file(&self.active_f, &segment::seg_path(&self.dir, self.active))
+            .context("fsync before roll")?;
         // The segment being sealed gets its directory sidecar now — the write that turns the next
         // open's full scan of it into a 2 KB read. Best-effort, AFTER the fsync above: advisory
         // data must never fail a roll, and a sidecar must never describe bytes less durable than
