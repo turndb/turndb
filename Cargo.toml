@@ -1,3 +1,9 @@
+[workspace]
+# The crate stays the root package and stays PURE — no network, no runtime, no daemon. Anything
+# that listens on a socket lives in a member crate, where its dependency tree cannot leak into
+# the substrate.
+members = ["turnd"]
+
 [package]
 name = "turndb"
 version = "0.0.0"

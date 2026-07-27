@@ -1,0 +1,20 @@
+[package]
+name = "turnd"
+version = "0.0.0"
+edition = "2021"
+
+# The daemon: a ROLE around the store, never part of it. turnd holds the writer lock, speaks
+# OTLP/HTTP, and drives Store batches; everything it knows about bytes-on-disk it knows through
+# the turndb crate's public API.
+#
+# Transport posture (a deliberate decision): OTLP/HTTP with JSON encoding first. It is a
+# first-class OTLP transport every SDK can reach (directly, or through any OTel Collector's
+# otlphttp exporter with encoding: json), and it costs one tiny HTTP server and the serde_json
+# already in the tree — instead of the tonic/prost/tower forest that gRPC drags in. gRPC can be
+# added HERE later without the core crate ever knowing.
+
+[dependencies]
+turndb = { path = ".." }
+tiny_http = "0.12"
+serde_json = "1"
+anyhow = "1"
