@@ -270,7 +270,13 @@ fn wal_frame_matches_the_document() {
 fn manifest_carries_the_documented_fields() {
     let dir = built("manifest");
     let raw = std::fs::read_to_string(dir.join("MANIFEST")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    // FORMAT.md: compact JSON on the first line, then a `crc32=XXXXXXXX` trailer line over the
+    // JSON bytes. The trailer is what turns corruption-that-still-parses into a refusal.
+    let (json, trailer) = raw.split_once('\n').expect("a committed manifest carries a checksum trailer");
+    let hex = trailer.strip_prefix("crc32=").expect("trailer line is crc32=XXXXXXXX");
+    let want = u32::from_str_radix(hex, 16).expect("trailer carries hex");
+    assert_eq!(crc32fast::hash(json.as_bytes()), want, "trailer must checksum the JSON payload");
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
     for field in ["parts", "fold_seg", "fold_off", "next_seq", "fold_gen"] {
         assert!(v.get(field).is_some(), "FORMAT.md documents manifest field {field}: {raw}");
     }

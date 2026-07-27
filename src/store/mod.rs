@@ -40,6 +40,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
@@ -82,7 +83,7 @@ impl Manifest {
     /// unreadable byte turned a live store into an empty directory.
     fn load(dir: &Path) -> Result<Manifest> {
         match std::fs::read(dir.join("MANIFEST")) {
-            Ok(b) => Ok(serde_json::from_slice(&b).context("corrupt MANIFEST")?),
+            Ok(b) => Manifest::parse(&b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
             Err(e) => Err(anyhow::Error::new(e).context(format!(
                 "cannot read {} — refusing to treat an unreadable manifest as an empty store",
@@ -91,11 +92,48 @@ impl Manifest {
         }
     }
 
+    /// Parse manifest bytes, verifying the checksum trailer when one is present.
+    ///
+    /// The manifest is the one file whose corruption used to be able to DESTROY data with no error
+    /// anywhere: it is parsed JSON, so a flipped bit that still parses — a shortened `fold_off`, a
+    /// wrong generation — was believed, and recovery then truncated durable fold bytes to match it.
+    /// Every other structure in the store refuses corruption; this closes the last gap.
+    ///
+    /// A manifest written before the trailer existed is bare compact JSON and is accepted as-is:
+    /// the trailer is recognised by SHAPE (a final line `crc32=XXXXXXXX`), which compact JSON cannot
+    /// end with. Corruption cannot demote a checksummed manifest to a legacy one either way it
+    /// lands: mangling the trailer leaves trailing bytes that JSON parsing refuses, and mangling
+    /// the payload fails the checksum.
+    fn parse(bytes: &[u8]) -> Result<Manifest> {
+        let payload = match checksum_trailer(bytes) {
+            Some((payload, want)) => {
+                let got = crc32fast::hash(payload);
+                if got != want {
+                    bail!(
+                        "MANIFEST fails its checksum (crc32 {got:08x}, recorded {want:08x}) — \
+                         refusing to open from a corrupt commit point"
+                    );
+                }
+                payload
+            }
+            None => bytes,
+        };
+        serde_json::from_slice(payload).context("corrupt MANIFEST")
+    }
+
+    /// The bytes as committed: compact JSON, then a `\ncrc32=XXXXXXXX` trailer over the JSON.
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut buf = serde_json::to_vec(self)?;
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(format!("\ncrc32={crc:08x}").as_bytes());
+        Ok(buf)
+    }
+
     /// tmp + fsync + rename + fsync-dir: a crash sees either the old manifest or the new one.
     fn commit(&self, dir: &Path) -> Result<()> {
         let tmp = dir.join("MANIFEST.tmp");
-        let f = File::create(&tmp)?;
-        serde_json::to_writer(&f, self)?;
+        let mut f = File::create(&tmp)?;
+        f.write_all(&self.encode()?)?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, dir.join("MANIFEST"))?;
@@ -110,6 +148,22 @@ impl Manifest {
             Some(FoldTail { seg: self.fold_seg, off: self.fold_off })
         }
     }
+}
+
+/// The `(payload, recorded crc32)` of a checksummed manifest, or `None` for one written before the
+/// trailer existed. Recognition is by exact shape — a final line `crc32=` plus eight hex digits —
+/// so a legacy manifest (compact JSON, which cannot end that way) is never misread as checksummed,
+/// and a checksummed one whose trailer is damaged falls through to JSON parsing, which refuses the
+/// trailing bytes rather than silently accepting the payload unverified.
+fn checksum_trailer(bytes: &[u8]) -> Option<(&[u8], u32)> {
+    let pos = bytes.iter().rposition(|&b| b == b'\n')?;
+    let tail = &bytes[pos + 1..];
+    if tail.len() != 14 || !tail.starts_with(b"crc32=") {
+        return None;
+    }
+    let hex = std::str::from_utf8(&tail[6..]).ok()?;
+    let want = u32::from_str_radix(hex, 16).ok()?;
+    Some((&bytes[..pos], want))
 }
 
 pub struct Store {
@@ -713,6 +767,42 @@ compile_error!("turndb requires a Unix filesystem (flock, positioned reads, mmap
 
 #[cfg(test)]
 mod tests {
+    /// The bug this exists to prevent: corruption that still PARSES. A shortened `fold_off` here
+    /// would have been believed, and recovery would then have truncated durable fold bytes to
+    /// match it — data destroyed by one flipped bit with no error anywhere.
+    #[test]
+    fn a_flipped_byte_that_still_parses_is_refused() {
+        let d = std::env::temp_dir().join(format!("turndb-mancrc-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let m = super::Manifest { fold_off: 4096, next_seq: 9, ..Default::default() };
+        m.commit(&d).unwrap();
+
+        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
+        let at = b.windows(4).position(|w| w == b"4096").expect("fold_off literal in the JSON");
+        b[at] = b'1'; // now claims fold_off 1096 — valid JSON, wrong bytes
+        std::fs::write(d.join("MANIFEST"), &b).unwrap();
+
+        let err = super::Manifest::load(&d).unwrap_err().to_string();
+        assert!(err.contains("checksum"), "must refuse via the checksum, got: {err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Damage to the TRAILER must not demote a checksummed manifest to a trusted legacy one.
+    #[test]
+    fn a_damaged_trailer_is_not_read_as_legacy() {
+        let d = std::env::temp_dir().join(format!("turndb-mantrail-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        super::Manifest::default().commit(&d).unwrap();
+
+        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
+        let at = b.len() - 14; // the 'c' of the final "crc32=XXXXXXXX" line
+        b[at] = b'x';
+        std::fs::write(d.join("MANIFEST"), &b).unwrap();
+
+        assert!(super::Manifest::load(&d).is_err(), "trailing bytes must fail JSON parsing, not be ignored");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn manifest_roundtrips() {
         let d = std::env::temp_dir().join(format!("turndb-man-{}", std::process::id()));

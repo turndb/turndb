@@ -484,15 +484,24 @@ a well-formed frame with an unrecognised tag is **refused**, and only a failed c
 `MANIFEST`, JSON, the **only** commit point. It names the live parts, the fold generation and tail, and
 the sequence cursor. Everything else — the block directory, dedup indexes, part contents — is derived.
 
-```json
-{
-  "parts": [{"file": "part-00000001.part", "seq_lo": 1, "seq_hi": 1, "records": 40}],
-  "fold_seg": 0,
-  "fold_off": 4144,
-  "next_seq": 1,
-  "fold_gen": 0
-}
 ```
+{"parts":[{"file":"part-00000001.part","seq_lo":1,"seq_hi":1,"records":40}],"fold_gen":0,"fold_seg":0,"fold_off":4144,"next_seq":1}
+crc32=9a3fc217
+```
+
+Two lines: compact JSON, then a trailer `crc32=XXXXXXXX` — eight hex digits, crc32 over exactly the
+JSON bytes (not the newline). The trailer exists because the manifest was the one structure whose
+corruption could **destroy data while parsing cleanly**: every field is load-bearing, and a flipped
+bit that still reads as JSON — a shortened `fold_off`, a wrong generation — was *believed*, after
+which recovery truncated durable fold bytes to match it. A reader must verify the trailer and refuse
+on mismatch.
+
+The trailer is recognised by **shape**: a manifest written before it existed is bare compact JSON,
+which cannot end with that final line, and is accepted unverified — that is what "before anyone was
+watching" costs, exactly as part version 0 does. Corruption cannot demote a checksummed manifest to
+a legacy one: damage to the payload fails the checksum, and damage to the trailer leaves trailing
+bytes that JSON parsing refuses. A build predating the trailer refuses a manifest carrying one (as a
+parse error), which is the safe direction — refusal, never misreading.
 
 JSON on purpose: it is small, written once per flush, and self-describing, so a field can be added
 without a version lever — **provided the new field has a documented default**, since older writers will
