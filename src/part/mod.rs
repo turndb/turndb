@@ -37,6 +37,7 @@ pub mod attrs;
 pub mod bloom;
 pub mod cache;
 pub mod idcol;
+pub mod builder;
 pub mod merge;
 
 use crate::fold::{Fold, Loc};
@@ -65,8 +66,8 @@ pub const FOOTER_LEN: u64 = 56;
 pub const PART_VERSION: u8 = 1;
 
 /// Body-program op tags, packed into the low bit of a varint.
-const OP_LIT: u64 = 0;
-const OP_PIECE: u64 = 1;
+pub(crate) const OP_LIT: u64 = 0;
+pub(crate) const OP_PIECE: u64 = 1;
 
 /// RESERVED: the escape codepoint for a future op space.
 ///
@@ -306,7 +307,7 @@ fn u64s(v: &[u64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-struct Writer {
+pub(crate) struct Writer {
     f: File,
     path: std::path::PathBuf,
     off: u64,
@@ -315,12 +316,12 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(path: &Path, level: i32) -> Result<Writer> {
+    pub(crate) fn new(path: &Path, level: i32) -> Result<Writer> {
         let f = crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
         Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level })
     }
 
-    fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
+    pub(crate) fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
         // A section's `stored` and `raw` are u32 in the TOC. Truncating here would write a part that
         // reads back as a shorter section with no error anywhere — silent corruption. Refuse instead:
         // a part that cannot be written is recoverable, a part that lies is not.
@@ -343,7 +344,7 @@ impl Writer {
         Ok(())
     }
 
-    fn finish(self, meta: PartMeta) -> Result<()> {
+    pub(crate) fn finish(self, meta: PartMeta) -> Result<()> {
         let mut toc = Vec::new();
         put_varint(&mut toc, self.toc.len() as u64);
         for (name, s) in &self.toc {

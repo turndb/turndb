@@ -484,3 +484,65 @@ fn a_part_reads_identically_out_of_an_embedded_extent() {
     drop(fold);
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn the_streaming_builder_is_byte_identical_to_build_full() {
+    // The in-memory builder is the streaming builder's ORACLE: same rows, same universes, and the
+    // two files must match byte for byte — encodings, section order, TOC, footer, everything.
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    let d = tmp("streambuild");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let mut records = fixture(&mut fold);
+    records.push(Record { id: "zzz:tomb".into(), body: vec![], attrs: vec![] });
+    let tombs: Vec<bool> = records.iter().map(|r| r.id == "zzz:tomb").collect();
+    fold.sync().unwrap();
+
+    let p1 = d.join("a.part");
+    part::build_full(&p1, &records, &tombs, 3, 9, 3, |h| fold.lookup(*h), &HashMap::new()).unwrap();
+
+    // The streaming side gets what a merge can cheaply know up front: the piece dictionary, the
+    // column universe with string dictionaries — then rows in id order.
+    let mut dict_map = HashMap::new();
+    for r in &records {
+        for op in &r.body {
+            if let BodyOp::Piece { hash, .. } = op {
+                dict_map.entry(*hash).or_insert_with(|| fold.lookup(*hash).unwrap());
+            }
+        }
+    }
+    let dict: Vec<_> = dict_map.into_iter().map(|(h, l)| (l, h)).collect();
+    let mut cols: BTreeMap<(String, u8), BTreeSet<String>> = BTreeMap::new();
+    for r in &records {
+        for (k, v) in &r.attrs {
+            let e = cols.entry((k.clone(), v.type_tag())).or_default();
+            if let AttrValue::Str(s) = v {
+                e.insert(s.clone());
+            }
+        }
+    }
+    let columns: Vec<(String, u8)> = cols.keys().cloned().collect();
+    let dicts: Vec<Vec<String>> = cols.values().map(|s| s.iter().cloned().collect()).collect();
+
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_by(|&a, &b| records[a].id.cmp(&records[b].id));
+    let p2 = d.join("b.part");
+    let mut b = turndb::part::builder::StreamBuilder::new(&p2, 3, dict, columns, dicts).unwrap();
+    for &i in &order {
+        let r = &records[i];
+        b.push(r.id.as_bytes(), tombs[i], &r.body, &r.attrs).unwrap();
+    }
+    b.finish(3, 9).unwrap();
+
+    assert_eq!(
+        std::fs::read(&p1).unwrap(),
+        std::fs::read(&p2).unwrap(),
+        "the streaming builder must be BYTE-IDENTICAL to build_full"
+    );
+    assert!(
+        !std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".s")),
+        "spools must be cleaned up"
+    );
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
