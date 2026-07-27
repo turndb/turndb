@@ -35,6 +35,7 @@
 //! attribute order and duplicate keys. Every layer below is in service of it, and no change ships
 //! that breaks it.
 
+pub mod carve;
 pub mod fold;
 pub mod part;
 #[cfg(feature = "sql")]

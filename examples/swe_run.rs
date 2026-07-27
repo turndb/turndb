@@ -14,54 +14,16 @@ use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
 use turndb::{AttrValue, BodyOp, Record};
 
-fn split_json_array(s: &[u8]) -> Option<Vec<(usize, usize)>> {
-    let mut i = 0;
-    while i < s.len() && (s[i] as char).is_ascii_whitespace() { i += 1; }
-    if i >= s.len() || s[i] != b'[' { return None; }
-    i += 1;
-    let mut out = Vec::new();
-    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
-    let mut start: Option<usize> = None;
-    while i < s.len() {
-        let c = s[i];
-        if in_str {
-            if esc { esc = false; } else if c == b'\\' { esc = true; } else if c == b'"' { in_str = false; }
-        } else {
-            match c {
-                b'"' => { in_str = true; if start.is_none() { start = Some(i); } }
-                b'[' | b'{' => { if start.is_none() { start = Some(i); } depth += 1; }
-                b']' | b'}' => {
-                    if depth == 0 && c == b']' {
-                        if let Some(st) = start.take() { out.push((st, i)); }
-                        return Some(out);
-                    }
-                    depth -= 1;
-                }
-                b',' if depth == 0 => { if let Some(st) = start.take() { out.push((st, i)); } }
-                w if (w as char).is_ascii_whitespace() => {}
-                _ => { if start.is_none() { start = Some(i); } }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
+/// The engine's carve, as spans of (foldable, range). One historical difference, kept for
+/// comparability with earlier runs of this harness: a non-array body here folds WHOLE rather
+/// than falling back to CDC (this harness predates the fallback and its numbers were published).
 fn carve(body: &[u8]) -> Vec<(bool, std::ops::Range<usize>)> {
-    match split_json_array(body) {
-        Some(elems) if !elems.is_empty() => {
-            let mut out = Vec::with_capacity(elems.len() * 2 + 1);
-            let mut cur = 0usize;
-            for (a, b) in elems {
-                if a > cur { out.push((false, cur..a)); }
-                out.push((true, a..b));
-                cur = b;
-            }
-            if cur < body.len() { out.push((false, cur..body.len())); }
-            out
-        }
-        _ => vec![(true, 0..body.len())],
+    let r = turndb::carve::Carve::default().ranges(body);
+    // detect the CDC fallback (multiple foldable chunks with no lits) and collapse to whole-body
+    if r.iter().all(|(f, _)| *f) && r.len() > 1 {
+        return vec![(true, 0..body.len())];
     }
+    r
 }
 
 fn gib(b: u64) -> f64 { b as f64 / (1024.0 * 1024.0 * 1024.0) }

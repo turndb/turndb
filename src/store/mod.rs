@@ -91,6 +91,11 @@ impl Batch {
         self.items.push(BatchItem::Put { id: id.to_string(), spans, attrs });
     }
 
+    /// Stage a put carved by the engine's default opinion. See [`crate::carve`].
+    pub fn put_body(&mut self, id: &str, body: &[u8], attrs: Vec<(String, AttrValue)>) {
+        self.put(id, &crate::carve::Carve::default().carve(body), attrs);
+    }
+
     /// Stage a deletion.
     pub fn delete(&mut self, id: &str) {
         self.items.push(BatchItem::Delete { id: id.to_string() });
@@ -666,6 +671,23 @@ impl Store {
         self.mem_bytes += approx_bytes(&rec);
         self.mem.insert(rec.id.clone(), Some(rec));
         Ok(())
+    }
+
+    /// [`Store::put`], with the engine's default carve deciding the spans. The convenience most
+    /// ingest wants; see [`crate::carve`] for the opinion and its escape hatches.
+    pub fn put_body(&mut self, id: &str, body: &[u8], attrs: Vec<(String, AttrValue)>) -> Result<()> {
+        self.put_body_with(id, body, attrs, &crate::carve::Carve::default())
+    }
+
+    /// [`Store::put`], carved by an explicit strategy — the per-call escape hatch.
+    pub fn put_body_with(
+        &mut self,
+        id: &str,
+        body: &[u8],
+        attrs: Vec<(String, AttrValue)>,
+        carve: &crate::carve::Carve,
+    ) -> Result<()> {
+        self.put(id, &carve.carve(body), attrs)
     }
 
     /// Apply a [`Batch`]: every member, or — across a crash — none.
