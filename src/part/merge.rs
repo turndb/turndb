@@ -340,6 +340,28 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// A total merge of a store whose every record was deleted: the tombstones drop, and the
+    /// output is a VALID EMPTY part — zero records, empty sections, correct footer — not an error
+    /// and not a refusal. Deleting everything you stored is an ordinary thing to have done.
+    #[test]
+    fn a_total_merge_of_only_tombstones_yields_a_valid_empty_part() {
+        let d = tmpdir("allgone");
+        let r = Record { id: "x".into(), body: Vec::new(), attrs: Vec::new() };
+        let p1 = d.join("a.part");
+        super::super::build_full(&p1, &[r], &[true], 1, 1, 3, |_| None, &HashMap::new()).unwrap();
+        let a = Arc::new(Part::open(&p1).unwrap());
+
+        let out = d.join("m.part");
+        let (meta, st) = merge_opts(&out, &[a], 3, true).unwrap();
+        assert_eq!(meta.n_records, 0);
+        assert_eq!(st.tombstones_dropped, 1);
+        let m = Part::open(&out).unwrap();
+        assert_eq!(m.len(), 0);
+        assert!(m.ids().unwrap().is_empty());
+        assert!(m.find("x").unwrap().is_none());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn overlapping_sequence_ranges_are_refused() {
         let d = tmpdir("overlap");
