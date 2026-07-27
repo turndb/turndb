@@ -513,3 +513,45 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     assert_eq!(s.reconstruct("a").unwrap().unwrap(), b"first".to_vec());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------------------------
+// FORMAT.md § The pack
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn pack_footer_matches_the_documented_layout() {
+    let dir = built("packfmt");
+    let pk = dir.join("snapshot.turndb");
+    turndb::pack::write(&dir, &pk).unwrap();
+    let b = std::fs::read(&pk).unwrap();
+    let f = &b[b.len() - 40..];
+
+    assert_eq!(&f[0..8], b"TURNPACK", "magic at footer+0");
+    let toc_off = u64::from_le_bytes(f[8..16].try_into().unwrap());
+    let toc_stored = u32::from_le_bytes(f[16..20].try_into().unwrap());
+    let _toc_raw = u32::from_le_bytes(f[20..24].try_into().unwrap());
+    let n_files = u32::from_le_bytes(f[24..28].try_into().unwrap());
+    let _codec = f[28];
+    assert_eq!(f[29], 1, "this revision writes pack version 1 at footer+29");
+    assert_eq!(&f[30..32], &[0, 0], "reserved bytes at footer+30 are zero");
+    let toc_xsum = u32::from_le_bytes(f[32..36].try_into().unwrap());
+    let xsum = &f[36..40];
+
+    // the chain: footer checksums itself, and checksums the STORED TOC
+    assert_eq!(&blake3::hash(&f[..36]).as_bytes()[0..4], xsum, "footer BLAKE3 prefix at +36");
+    let toc = &b[toc_off as usize..toc_off as usize + toc_stored as usize];
+    assert_eq!(crc32fast::hash(toc), toc_xsum, "toc_xsum at footer+32 over the STORED TOC");
+
+    // files live strictly before the TOC; the TOC strictly before the footer
+    assert!(toc_off as usize + toc_stored as usize <= b.len() - 40);
+    assert!(n_files >= 3, "manifest + a part + a segment at minimum");
+
+    // and MANIFEST comes back verbatim through the reader
+    let pack = turndb::pack::Pack::open(&pk).unwrap();
+    assert_eq!(
+        pack.read_file("MANIFEST").unwrap(),
+        std::fs::read(dir.join("MANIFEST")).unwrap(),
+        "inner files are byte-verbatim"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
