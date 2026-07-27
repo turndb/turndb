@@ -216,7 +216,11 @@ pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) 
 /// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
 /// means the sidecar and the segment parted ways.
 pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
-    let b = std::fs::read(dir_path(dir, n)).ok()?;
+    parse_dir_sidecar(&std::fs::read(dir_path(dir, n)).ok()?, n, file_len)
+}
+
+/// [`read_dir_sidecar`]'s validation core, over bytes from ANY source — a directory or a pack.
+pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
     if b.len() < 24 || &b[0..8] != DIR_MAGIC {
         return None;
     }

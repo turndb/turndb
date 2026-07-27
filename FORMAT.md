@@ -637,6 +637,83 @@ swept at writer open, and never a pointer to something that is not there.
 
 ---
 
+## The pack
+
+A **pack** is a store in one file: the committed snapshot's files laid end to end, a table of
+contents, and a footer at EOF. It exists so a sealed store can be shipped, archived, produced in
+discovery, tiered to object storage, or dropped into a browser — anywhere "a directory" is the
+wrong shape and "one file readable by ranged requests" is the right one. A pack is **immutable and
+writer-less by definition**: the writer role is what directories are for, and a pack never has one.
+
+```
+[ file bytes ][ file bytes ] ... [ TOC ][ FOOTER (40 bytes, at EOF) ]
+```
+
+Footer-addressed like a part, and for the same reason: the footer lands last and is the
+completeness marker, and an EOF read plus one TOC read is all a reader — local or remote — needs
+before it can address any inner file.
+
+### Footer — 40 bytes, at EOF
+
+```
+offset  size  field
+     0     8  MAGIC = "TURNPACK"
+     8     8  toc_off      byte offset of the TOC payload
+    16     4  toc_stored   TOC payload size on disk
+    20     4  toc_raw      TOC size decompressed
+    24     4  n_files
+    28     1  toc_codec    0 stored, 1 zstd
+    29     1  version      the pack plane's reject-forward lever; this revision writes 1
+    30     2  reserved, MUST BE ZERO — and a reader must refuse otherwise
+    32     4  toc_xsum     crc32 of the STORED TOC payload
+    36     4  xsum         first 4 bytes of BLAKE3 over footer[0..36]
+```
+
+The same rules as the part footer, because they are the same rules: `version` above the reader's
+own refuses rather than misparses; reserved bytes are enforced, not decorative; the integrity
+chain is footer → TOC → per-file checksums, each link covering the one below.
+
+### TOC
+
+Compressed with `toc_codec`, located by `toc_off`. Decompressed:
+
+```
+varint   n_files
+repeated n_files times:
+  varint  name_len
+  bytes   name         the file's store-relative path, e.g. "MANIFEST", "fold/seg-00000000.fold"
+  varint  off          absolute offset of the file's first byte in the pack
+  varint  len
+  u32     xsum         crc32 of the file's bytes
+```
+
+Entries are sorted by name — determinism, exactly as everywhere else — and every entry is
+range-checked against `toc_off` at open. A duplicate name is refused. Per-file `xsum` follows the
+part sections' policy: not verified on the read path (the inner formats carry their own integrity,
+and content carries BLAKE3), verified by a deliberate scrub call; a reader may ignore it and remain
+format-compatible, a writer may not omit it.
+
+### What a pack holds
+
+The committed snapshot, exactly as a reader sees one: `MANIFEST` (verbatim, checksum trailer and
+all), every part it names, and the live fold generation's segments — plus their advisory sidecars
+and any dictionary files, so a pack opens as fast as the directory did. Deliberately absent:
+the WAL (a pack holds committed state; a packer must refuse a store with uncommitted records
+rather than silently drop them), the retained commit log (snapshots of an immutable artifact are
+meaningless), and the writer lock (no writer, ever).
+
+Names are paths, which is the multi-store door: a future pack may carry several stores under
+name prefixes with no format change — the TOC neither knows nor cares. This revision writes and
+reads single-store packs.
+
+### Unpacking
+
+Extraction is byte copying — every inner file lands exactly as it was, and the directory opens as
+an ordinary store, writer role available again. Both crossings are mechanical; nothing is
+reinterpreted in either direction.
+
+---
+
 ## Limits
 
 Enforced, not assumed. Each refuses rather than truncating, because a store that cannot be written is

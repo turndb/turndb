@@ -256,6 +256,39 @@ fn fold_open_never_panics_on_damage() {
 }
 
 #[test]
+fn pack_open_never_panics_on_damage() {
+    let dir = tmp("pack");
+    std::fs::create_dir_all(&dir).unwrap();
+    let store_dir = dir.join("store");
+    {
+        let mut s = Store::open(&store_dir, FoldCfg::default()).unwrap();
+        for i in 0..8 {
+            s.put(
+                &format!("p:{i}"),
+                &[Span::Piece(format!("pack storm body {i} {}", "q".repeat(i * 31)).as_bytes())],
+                vec![("n".into(), AttrValue::Int(i as i64))],
+            )
+            .unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let pk = dir.join("p.turndb");
+    turndb::pack::write(&store_dir, &pk).unwrap();
+    let pristine = std::fs::read(&pk).unwrap();
+    let target = dir.join("mutant.turndb");
+    storm("pack", &pristine, &target, 2500, 0x9AC4, |p| {
+        // the full read stack over a damaged pack: footer, TOC, manifest, fold, parts
+        let Ok(pack) = turndb::pack::Pack::open(p) else { return };
+        let _ = pack.verify();
+        let Ok(rs) = turndb::store::open_read_pack(p, FoldCfg::default()) else { return };
+        let _ = rs.ids();
+        let _ = rs.reconstruct("p:3");
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn store_open_never_panics_on_manifest_damage() {
     let dir = tmp("manifest");
     std::fs::create_dir_all(&dir).unwrap();
