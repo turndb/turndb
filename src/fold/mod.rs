@@ -163,6 +163,14 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
+/// One segment as a read source hands it to [`Fold::open_read_from`]: its number, its bytes, and
+/// its advisory sidecar if the source has one.
+pub struct SegmentInput {
+    pub seg: u32,
+    pub reader: Arc<dyn ReadAt>,
+    pub sidecar: Option<Vec<u8>>,
+}
+
 pub struct Fold {
     dir: PathBuf,
     cfg: FoldCfg,
@@ -182,14 +190,16 @@ pub struct Fold {
     /// from here, so a piece is readable the instant `put` returns.
     inflight: HashMap<u32, Arc<Vec<u8>>>,
     pool: pipe::Pool,
-    active_f: File,
+    /// `None` for a read-only fold with no directory behind it (a pack): there is nothing to
+    /// append to, and `poisoned` refuses every write long before this would matter.
+    active_f: Option<File>,
     /// Pieces gathered but not yet compressed and appended.
     open_block: Vec<u8>,
     dedup: DedupTable,
     cache: Mutex<BlockCache>,
     poisoned: bool,
     scratch: Vec<u8>,
-    _lock: File,
+    _lock: Option<File>,
 }
 
 impl Fold {
@@ -309,7 +319,7 @@ impl Fold {
                 dicts: HashMap::new(),
                 active: 0,
                 cur_off: SEG_HDR_LEN as u32,
-                active_f: f,
+                active_f: Some(f),
                 open_block: Vec::with_capacity(cfg.block_target * 2),
                 dedup: DedupTable::new(),
                 cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
@@ -319,7 +329,7 @@ impl Fold {
                 next_block: 0,
                 inflight: HashMap::new(),
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
-                _lock: lock,
+                _lock: Some(lock),
             });
         }
 
@@ -418,7 +428,7 @@ impl Fold {
             dicts,
             active,
             cur_off: target as u32,
-            active_f,
+            active_f: Some(active_f),
             open_block: Vec::with_capacity(cfg.block_target * 2),
             dedup: DedupTable::new(),
             cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
@@ -428,7 +438,7 @@ impl Fold {
             next_block,
             inflight: HashMap::new(),
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
-            _lock: lock,
+            _lock: Some(lock),
         })
     }
 
@@ -443,46 +453,83 @@ impl Fold {
             bail!("no fold segments under {}", dir.display());
         }
         nums.sort_unstable();
+        let mut segs = Vec::with_capacity(nums.len());
+        for &n in &nums {
+            segs.push(SegmentInput {
+                seg: n,
+                reader: Arc::new(segment::open_read(dir, n)?) as Arc<dyn ReadAt>,
+                sidecar: std::fs::read(segment::dir_path(dir, n)).ok(),
+            });
+        }
+        let mut dict_files = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("zdict-") && n.ends_with(".zd") {
+                    dict_files.push(std::fs::read(e.path())?);
+                }
+            }
+        }
+        Fold::open_read_from(segs, dict_files, cfg, dir)
+    }
+
+    /// Open read-only from prepared inputs — the entry every SOURCE uses. A directory hands in
+    /// files; a pack hands in extents; a remote store would hand in range readers. Nothing below
+    /// this knows or cares which.
+    ///
+    /// `dict_files` are candidate trained dictionaries, identified by content hash — a segment
+    /// naming a dictionary no candidate hashes to is refused. `label` names the source in errors
+    /// and [`Fold::dir`], and is never touched as a path.
+    pub fn open_read_from(
+        mut segs: Vec<SegmentInput>,
+        dict_files: Vec<Vec<u8>>,
+        cfg: FoldCfg,
+        label: &Path,
+    ) -> Result<Fold> {
+        if segs.is_empty() {
+            bail!("no fold segments under {}", label.display());
+        }
+        segs.sort_by_key(|s| s.seg);
         // The same density rule the writer applies. A gap means a segment is missing, and reading
         // around it would silently serve a fold with a hole in its block space rather than refuse —
         // the writer refused and the reader did not, which is the worse half of an asymmetry.
-        for (i, n) in nums.iter().enumerate() {
-            if *n != i as u32 {
-                bail!("fold segments are not dense: expected seg {i}, found {n}");
+        for (i, s) in segs.iter().enumerate() {
+            if s.seg != i as u32 {
+                bail!("fold segments are not dense: expected seg {i}, found {}", s.seg);
             }
         }
-        let mut headers = Vec::with_capacity(nums.len());
-        let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(nums.len());
-        for &n in &nums {
-            let f = segment::open_read(dir, n)?;
+        let mut headers = Vec::with_capacity(segs.len());
+        let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(segs.len());
+        for s in &segs {
             let mut hb = [0u8; SEG_HDR_LEN as usize];
-            f.read_exact_at(&mut hb, 0)?;
-            headers.push(SegHeader::decode(&hb, n)?);
-            readers.push(Arc::new(f));
+            s.reader.read_exact_at(&mut hb, 0)?;
+            headers.push(SegHeader::decode(&hb, s.seg)?);
+            readers.push(s.reader.clone());
         }
         let mut dicts: HashMap<[u8; 32], Arc<Vec<u8>>> = HashMap::new();
+        for bytes in dict_files {
+            let id: [u8; 32] = blake3::hash(&bytes).into();
+            dicts.insert(id, Arc::new(bytes));
+        }
         for h in &headers {
-            if !h.has_dict() || dicts.contains_key(&h.dict_id) {
-                continue;
+            if h.has_dict() && !dicts.contains_key(&h.dict_id) {
+                bail!(
+                    "segment {} names dictionary {} but no candidate hashes to it",
+                    h.seg,
+                    PieceHash(h.dict_id).to_hex()
+                );
             }
-            let name = format!("zdict-{}.zd", PieceHash(h.dict_id).to_hex());
-            let bytes = std::fs::read(dir.join(&name))?;
-            let got: [u8; 32] = blake3::hash(&bytes).into();
-            if got != h.dict_id {
-                bail!("dictionary {name} does not match the id naming it");
-            }
-            dicts.insert(h.dict_id, Arc::new(bytes));
         }
         // The directory is rebuilt from the ids the frames carry — the same sidecar-or-scan rule
         // the writer applies, except a reader NEVER writes a missing sidecar back: a reader must
         // not mutate a store it does not own, and a slower open is the whole cost.
-        let last = *nums.last().unwrap();
+        let last = segs.last().unwrap().seg;
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
             let entries = if h.seg != last {
-                match segment::read_dir_sidecar(dir, h.seg, len) {
+                match segs[i].sidecar.as_ref().and_then(|b| segment::parse_dir_sidecar(b, h.seg, len)) {
                     Some((_, e)) => e,
                     None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
                 }
@@ -497,18 +544,16 @@ impl Fold {
                 next_block = next_block.max(id + 1);
             }
         }
-        let active = *nums.last().unwrap();
-        let active_f = segment::open_read(dir, active)?;
-        let cur_off = active_f.metadata()?.len() as u32;
+        let cur_off = readers.last().unwrap().len()? as u32;
         Ok(Fold {
-            dir: dir.to_path_buf(),
+            dir: label.to_path_buf(),
             cfg,
             headers,
             readers,
             dicts,
-            active,
+            active: last,
             cur_off,
-            active_f,
+            active_f: None,
             open_block: Vec::new(),
             dedup: DedupTable::with_capacity(16),
             cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
@@ -518,7 +563,7 @@ impl Fold {
             next_block,
             inflight: HashMap::new(),
             pool: pipe::Pool::new(1, cfg.level, None),
-            _lock: File::open(dir)?,
+            _lock: None,
         })
     }
 
@@ -703,7 +748,8 @@ impl Fold {
             self.roll()?;
         }
         let path = segment::seg_path(&self.dir, self.active);
-        if let Err(e) = crate::vfs::write_all_at(&self.active_f, &path, &self.scratch[..n], self.cur_off as u64) {
+        let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot append"))?;
+        if let Err(e) = crate::vfs::write_all_at(f, &path, &self.scratch[..n], self.cur_off as u64) {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }
@@ -730,7 +776,8 @@ impl Fold {
         self.seal_block()?;
         // Every block must be compressed AND written before a tail can be reported durable.
         self.write_ready(true)?;
-        crate::vfs::sync_file(&self.active_f, &segment::seg_path(&self.dir, self.active))
+        let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot sync"))?;
+        crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
             .context("fsync active fold segment")?;
         Ok(self.tail())
     }
@@ -805,7 +852,8 @@ impl Fold {
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
-        crate::vfs::sync_file(&self.active_f, &segment::seg_path(&self.dir, self.active))
+        let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
+        crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
             .context("fsync before roll")?;
         // The segment being sealed gets its directory sidecar now — the write that turns the next
         // open's full scan of it into a 2 KB read. Best-effort, AFTER the fsync above: advisory
@@ -829,7 +877,7 @@ impl Fold {
         let f = segment::create(&self.dir, next, [0u8; 32])?;
         let reader = Arc::new(segment::open_rw(&self.dir, next)?);
 
-        self.active_f = f;
+        self.active_f = Some(f);
         self.headers.push(SegHeader { seg: next, dict_id: [0u8; 32] });
         self.readers.push(reader);
         self.active = next;

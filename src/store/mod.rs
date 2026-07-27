@@ -298,6 +298,53 @@ pub fn retained_commits(dir: &Path) -> Vec<u64> {
     list_retained(dir)
 }
 
+/// Parse manifest bytes from an external source (a pack), trailer verification included.
+pub(crate) fn manifest_from_bytes(b: &[u8]) -> Result<Manifest> {
+    Manifest::parse(b)
+}
+
+/// Open a READER over a pack — the store in one file, served through bounded extents.
+///
+/// Everything [`ReadStore`] can do over a directory it does here identically: same manifest, same
+/// parts, same fold, same version resolution. There is no writer role to take — a pack is
+/// immutable by definition — and no retry loop to need, because nothing can sweep files out from
+/// under an open handle on an immutable artifact.
+pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
+    let pack = crate::pack::Pack::open(path)?;
+    let manifest = Manifest::parse(&pack.read_file("MANIFEST")?)?;
+
+    let fold_rel = if manifest.fold_gen == 0 {
+        "fold".to_string()
+    } else {
+        format!("fold-{:04}", manifest.fold_gen)
+    };
+    let mut segs = Vec::new();
+    let mut dict_files = Vec::new();
+    for name in pack.names().map(String::from).collect::<Vec<_>>() {
+        let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
+        if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            segs.push(crate::fold::SegmentInput {
+                seg: n,
+                reader: Arc::new(pack.file(&name).expect("named file exists")) as Arc<dyn crate::readat::ReadAt>,
+                sidecar: pack.read_file(&format!("{fold_rel}/seg-{n:08}.dir")).ok(),
+            });
+        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
+            dict_files.push(pack.read_file(&name)?);
+        }
+    }
+    let fold = Fold::open_read_from(segs, dict_files, cfg, path)?;
+
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    for p in &manifest.parts {
+        let ext = pack
+            .file(&p.file)
+            .ok_or_else(|| anyhow::anyhow!("pack manifest names {} but the pack does not hold it", p.file))?;
+        parts.push(Arc::new(Part::open_reader(Box::new(ext), pcache.clone())?));
+    }
+    Ok(ReadStore { fold, parts, manifest })
+}
+
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
     let p = retained_path(dir, commit);
     let b = std::fs::read(&p)
