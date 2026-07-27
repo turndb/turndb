@@ -451,6 +451,20 @@ fn check_state(
     variant: Variant,
 ) {
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // The READER first, before the writer heals anything: a reader holds no lock and repairs
+    // nothing, so on a raw crash state it may serve committed state or refuse with an error —
+    // but it must never panic, and if it opens, what it serves must be readable. (The writer's
+    // open below sweeps, promotes, and replays; a reader must cope with the state as the crash
+    // left it.)
+    {
+        if let Ok(rs) = Store::open_read(stage, cfg) {
+            let _ = rs.ids().map(|ids| {
+                for id in ids.iter().take(64) {
+                    let _ = rs.reconstruct(id);
+                }
+            });
+        }
+    }
     let store = match Store::open(stage, cfg) {
         Ok(s) => s,
         Err(e) => {
