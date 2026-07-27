@@ -174,6 +174,81 @@ pub struct FoldTail {
     pub off: u32,
 }
 
+// ---------------------------------------------------------------------------------------------
+// The directory sidecar — advisory, derived, and the answer to O(store) opens
+// ---------------------------------------------------------------------------------------------
+
+/// Sidecar magic. `seg-NNNNNNNN.dir` beside a SEALED segment carries what `scan_tail` would
+/// recompute: the block ids and offsets, and the scan end.
+pub const DIR_MAGIC: &[u8; 8] = b"TURNSDIR";
+
+/// ```text
+/// offset  size  field
+///      0     8  MAGIC = "TURNSDIR"
+///      8     4  seg          must match the filename AND the segment beside it
+///     12     4  tail         scan end; for a sealed segment this IS the file length
+///     16     4  n_entries
+///     20   n*8  (block_id u32, offset u32) per block
+///  20+n*8    4  crc32 over everything before it
+/// ```
+pub fn dir_path(dir: &Path, n: u32) -> PathBuf {
+    dir.join(format!("seg-{n:08}.dir"))
+}
+
+/// Write the sidecar for a sealed segment. ADVISORY, so tmp + rename but no fsync anywhere: a
+/// sidecar lost to a crash costs one rescan at the next open, and a torn one fails its checksum
+/// and costs the same. Nothing durable depends on it.
+pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
+    let mut b = Vec::with_capacity(24 + entries.len() * 8);
+    b.extend_from_slice(DIR_MAGIC);
+    b.extend_from_slice(&n.to_le_bytes());
+    b.extend_from_slice(&tail.to_le_bytes());
+    b.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (id, off) in entries {
+        b.extend_from_slice(&id.to_le_bytes());
+        b.extend_from_slice(&off.to_le_bytes());
+    }
+    let crc = crc32fast::hash(&b);
+    b.extend_from_slice(&crc.to_le_bytes());
+    let tmp = dir.join(format!("seg-{n:08}.dir.tmp"));
+    std::fs::write(&tmp, &b)?;
+    std::fs::rename(&tmp, dir_path(dir, n))?;
+    Ok(())
+}
+
+/// The sidecar's entries, or `None` — absent, damaged, or not describing this file's bytes. The
+/// caller rescans on `None`; it must never trust a sidecar this refused.
+///
+/// `tail == file_len` is the staleness gate, not a nicety: recovery can truncate a once-sealed
+/// segment back into being the active one, and its leftover sidecar then describes blocks past
+/// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
+/// means the sidecar and the segment parted ways.
+pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
+    let b = std::fs::read(dir_path(dir, n)).ok()?;
+    if b.len() < 24 || &b[0..8] != DIR_MAGIC {
+        return None;
+    }
+    let crc = u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap());
+    if crc32fast::hash(&b[..b.len() - 4]) != crc {
+        return None;
+    }
+    let seg = u32::from_le_bytes(b[8..12].try_into().unwrap());
+    let tail = u32::from_le_bytes(b[12..16].try_into().unwrap());
+    let n_entries = u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize;
+    if seg != n || tail as u64 != file_len || b.len() != 24 + n_entries * 8 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(n_entries);
+    for i in 0..n_entries {
+        let at = 20 + i * 8;
+        entries.push((
+            u32::from_le_bytes(b[at..at + 4].try_into().unwrap()),
+            u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()),
+        ));
+    }
+    Some((tail, entries))
+}
+
 /// The full path of a segment, for callers that need it (tests, introspection).
 pub fn seg_path(dir: &Path, n: u32) -> PathBuf {
     dir.join(seg_name(n))

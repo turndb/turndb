@@ -443,3 +443,76 @@ fn a_committed_tail_beyond_the_data_is_refused() {
         "a committed tail past the last good block must refuse, not truncate to it");
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn sealed_segments_carry_sidecars_and_survive_losing_them() {
+    // The directory sidecar is what makes open O(active segment) instead of O(store) — and it is
+    // ADVISORY: absent, torn, or stale, the segment is rescanned and the answer is identical.
+    let dir = tmp("sidecar");
+    let cfg = FoldCfg { seg_max: 256 * 1024, block_target: 32 * 1024, ..Default::default() };
+    let mut want = Vec::new();
+    {
+        let mut f = Fold::open(&dir, cfg).unwrap();
+        for b in corpus() {
+            let p = f.put(&b).unwrap();
+            want.push((p.loc, p.hash, b));
+        }
+        f.sync().unwrap();
+        assert!(f.segment_count() > 1, "the corpus must roll at least one segment");
+    }
+    let segs = std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".fold")).count();
+    let sidecars = || std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".dir")).count();
+    assert_eq!(sidecars(), segs - 1, "every SEALED segment rolls with a sidecar; the active has none");
+
+    // Reads through sidecar-built directories are byte-exact.
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(&f.read_verified(*loc, *hash).unwrap(), b, "sidecar-directed read drifted");
+        }
+    }
+
+    // Delete one sidecar and corrupt another: open falls back to the scan, answers identically,
+    // and the WRITER regenerates what was lost.
+    std::fs::remove_file(dir.join("seg-00000000.dir")).unwrap();
+    if segs > 2 {
+        let p = dir.join("seg-00000001.dir");
+        let mut b = std::fs::read(&p).unwrap();
+        let mid = b.len() / 2;
+        b[mid] ^= 0xFF;
+        std::fs::write(&p, &b).unwrap();
+    }
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(&f.read_verified(*loc, *hash).unwrap(), b, "fallback-scan read drifted");
+        }
+    }
+    assert_eq!(sidecars(), segs - 1, "the writer must regenerate missing or damaged sidecars");
+
+    // A stale sidecar — right checksum, wrong length for the file — is refused and rescanned.
+    let p = dir.join("seg-00000000.dir");
+    let good = std::fs::read(&p).unwrap();
+    {
+        // shrink the SEGMENT's sidecar claim by rebuilding one for a different length: simulate by
+        // truncating nothing and instead poking the tail field then re-checksumming
+        let mut b = good.clone();
+        let tail = u32::from_le_bytes(b[12..16].try_into().unwrap());
+        b[12..16].copy_from_slice(&(tail - 1).to_le_bytes());
+        let n = b.len();
+        let crc = crc32fast::hash(&b[..n - 4]);
+        b[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &b).unwrap();
+    }
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(&f.read_verified(*loc, *hash).unwrap(), b, "stale sidecar must be refused, not trusted");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
