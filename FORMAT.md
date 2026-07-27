@@ -452,11 +452,16 @@ boundary.
 ```
 offset  size  field
      0     1  tag        see below
-     1     8  seq
+     1     8  seq        informative only — see below
      9     4  len        payload size
     13   len  payload
 13+len     4  crc32      over header AND payload
 ```
+
+`seq` carries the store's sequence cursor as of the frame's flush interval, which means every frame
+between two flushes carries the SAME value. Replay order is file order, and nothing may be inferred
+from `seq` — it exists for a human reading a hex dump to correlate a frame with a manifest, not for
+a reader to act on.
 
 | tag | meaning | payload |
 |---|---|---|

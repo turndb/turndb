@@ -30,7 +30,6 @@ serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
-memmap2 = "0.9"
 # flock: the single-writer invariant, enforced by the OS rather than by convention.
 libc = "0.2"
 
