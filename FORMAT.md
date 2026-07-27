@@ -423,14 +423,36 @@ boundary.
 
 ```
 offset  size  field
-     0     1  tag        0x57 record, 0x58 tombstone
+     0     1  tag        see below
      1     8  seq
      9     4  len        payload size
     13   len  payload
 13+len     4  crc32      over header AND payload
 ```
 
-A tombstone payload is the id alone, as UTF-8, with no framing. A record payload is:
+| tag | meaning | payload |
+|---|---|---|
+| 0x57 | record | see below |
+| 0x58 | tombstone | the id alone, UTF-8, no framing |
+| 0x5A | record, **inside a batch** | as 0x57 |
+| 0x5B | tombstone, inside a batch | as 0x58 |
+| 0x59 | **batch commit** | varint member count |
+
+A batch is a group of writes that replays **all or none** — the unit an ingest source actually
+sent, kept whole across a crash. Its members are ordinary record and tombstone payloads under the
+in-batch tags, followed by one commit marker. Replay holds in-batch frames in a pen; a marker seals
+**exactly the `count` members immediately before it** and applies them in order. Everything else in
+the pen is a batch whose marker never landed, and is discarded: members before the sealed run (an
+append that errored partway), members under a later standalone frame, and an unsealed run at the
+log's end. A marker claiming more members than precede it is corruption that checksums —
+the frame chain is unbroken back to the last commit point, so the log is not what a writer put
+down — and the reader must refuse. The marker's count is one byte of redundancy that keeps a batch
+from being quietly shrunk.
+
+A build predating batches refuses these tags by the unknown-tag rule below, which is the safe
+direction; a log without them replays exactly as before.
+
+A record payload is:
 
 ```
 varint   id_len

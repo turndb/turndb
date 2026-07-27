@@ -25,6 +25,16 @@ pub const FRAME_TAG: u8 = 0x57;
 /// A DELETION. Its payload is the id alone — a tombstone has no body, no attributes and no content, so
 /// it costs a frame and nothing else.
 pub const TOMB_TAG: u8 = 0x58;
+/// A BATCH COMMIT. Everything since the previous commit point that carries an in-batch tag is
+/// applied by this frame, and is applied not at all without it. Its payload is the member count,
+/// as a varint — redundant with what replay observed, and checked against it, because a marker
+/// sealing a different number of frames than the writer put down means the log is not what was
+/// written.
+pub const BATCH_COMMIT_TAG: u8 = 0x59;
+/// [`FRAME_TAG`], inside a batch: applied only when a [`BATCH_COMMIT_TAG`] seals it.
+pub const BATCH_FRAME_TAG: u8 = 0x5A;
+/// [`TOMB_TAG`], inside a batch.
+pub const BATCH_TOMB_TAG: u8 = 0x5B;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
@@ -171,51 +181,76 @@ impl Wal {
         Ok(Wal { w: BufWriter::with_capacity(1 << 20, f), path: path.to_path_buf(), len, scratch: Vec::new() })
     }
 
-    /// Log a deletion. Durable on the next [`Wal::sync`], exactly like a put.
-    pub fn append_tomb(&mut self, seq: u64, id: &str) -> Result<()> {
-        self.scratch.clear();
-        self.scratch.extend_from_slice(id.as_bytes());
-        if self.scratch.len() as u64 > u32::MAX as u64 {
-            bail!("wal tombstone id of {} bytes exceeds the u32 length field", self.scratch.len());
-        }
-        let mut hdr = Vec::with_capacity(13);
-        hdr.push(TOMB_TAG);
-        hdr.extend_from_slice(&seq.to_le_bytes());
-        hdr.extend_from_slice(&(self.scratch.len() as u32).to_le_bytes());
-        // The CRC covers the HEADER as well as the payload — replay checks both, so omitting the
-        // header here would make every tombstone frame read back as a torn write.
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&hdr);
-        crc.update(&self.scratch);
-        let c = crc.finalize();
-        self.w.write_all(&hdr)?;
-        self.w.write_all(&self.scratch)?;
-        self.w.write_all(&c.to_le_bytes())?;
-        self.len += (HDR + self.scratch.len() + CRC) as u64;
-        Ok(())
-    }
-
-    pub fn append(&mut self, seq: u64, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
-        self.scratch.clear();
-        encode_record(&mut self.scratch, r, novel);
+    /// Frame `payload` under `tag` and append it. The CRC covers the HEADER as well as the payload —
+    /// replay checks both, so omitting the header would make every frame read back as a torn write.
+    fn append_frame(&mut self, tag: u8, seq: u64, payload: &[u8]) -> Result<()> {
         // The frame length is a u32 on disk. Truncating here would write a frame whose header
         // disagrees with its payload, which replay would read as a torn tail — silently losing every
         // record after it.
-        if self.scratch.len() as u64 > u32::MAX as u64 {
-            bail!("wal frame payload of {} bytes exceeds the u32 length field", self.scratch.len());
+        if payload.len() as u64 > u32::MAX as u64 {
+            bail!("wal frame payload of {} bytes exceeds the u32 length field", payload.len());
         }
         let mut hdr = Vec::with_capacity(HDR);
-        hdr.push(FRAME_TAG);
+        hdr.push(tag);
         hdr.extend_from_slice(&seq.to_le_bytes());
-        hdr.extend_from_slice(&(self.scratch.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         let mut crc = crc32fast::Hasher::new();
         crc.update(&hdr);
-        crc.update(&self.scratch);
+        crc.update(payload);
+        let c = crc.finalize();
         self.w.write_all(&hdr)?;
-        self.w.write_all(&self.scratch)?;
-        self.w.write_all(&crc.finalize().to_le_bytes())?;
-        self.len += (HDR + self.scratch.len() + CRC) as u64;
+        self.w.write_all(payload)?;
+        self.w.write_all(&c.to_le_bytes())?;
+        self.len += (HDR + payload.len() + CRC) as u64;
         Ok(())
+    }
+
+    /// Log a deletion. Durable on the next [`Wal::sync`], exactly like a put.
+    pub fn append_tomb(&mut self, seq: u64, id: &str) -> Result<()> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.extend_from_slice(id.as_bytes());
+        let r = self.append_frame(TOMB_TAG, seq, &scratch);
+        self.scratch = scratch;
+        r
+    }
+
+    pub fn append(&mut self, seq: u64, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        encode_record(&mut scratch, r, novel);
+        let res = self.append_frame(FRAME_TAG, seq, &scratch);
+        self.scratch = scratch;
+        res
+    }
+
+    /// Append records and tombstones as ONE atomic unit: the members under in-batch tags, then the
+    /// commit marker that seals them. Replay applies all of them or none — a crash anywhere before
+    /// the marker lands leaves members that no marker seals, and they are discarded.
+    ///
+    /// `items`: `(record, novel, is_tombstone)`; a tombstone's record carries only its id.
+    pub fn append_batch(
+        &mut self,
+        seq: u64,
+        items: &[(Record, Vec<(PieceHash, Vec<u8>)>, bool)],
+    ) -> Result<()> {
+        for (r, novel, tomb) in items {
+            let mut scratch = std::mem::take(&mut self.scratch);
+            scratch.clear();
+            let tag = if *tomb {
+                scratch.extend_from_slice(r.id.as_bytes());
+                BATCH_TOMB_TAG
+            } else {
+                encode_record(&mut scratch, r, novel);
+                BATCH_FRAME_TAG
+            };
+            let res = self.append_frame(tag, seq, &scratch);
+            self.scratch = scratch;
+            res?;
+        }
+        let mut count = Vec::with_capacity(4);
+        put_varint(&mut count, items.len() as u64);
+        self.append_frame(BATCH_COMMIT_TAG, seq, &count)
     }
 
     /// The ACK point. Nothing may be reported durable before this returns.
@@ -240,8 +275,14 @@ impl Wal {
         self.len
     }
 
-    /// Every intact frame, in order. Stops at the first torn or corrupt one — a partial tail is the
-    /// end of the log, not an error, because a crash mid-append leaves exactly that.
+    /// Every intact, COMMITTED frame, in order. Stops at the first torn or corrupt one — a partial
+    /// tail is the end of the log, not an error, because a crash mid-append leaves exactly that.
+    ///
+    /// Batch members ride in a holding pen until their commit marker seals them. The marker seals
+    /// exactly the `count` members immediately before it; members before those belong to a batch
+    /// whose marker never landed — an append that errored partway — and are discarded, exactly as
+    /// an unsealed run at the end of the log is. A standalone frame arriving over a non-empty pen
+    /// discards the pen the same way: whatever batch those members belonged to never committed.
     pub fn replay(path: &Path) -> Result<Vec<Frame>> {
         let f = match File::open(path) {
             Ok(f) => f,
@@ -249,6 +290,7 @@ impl Wal {
         };
         let len = f.metadata()?.len();
         let mut out = Vec::new();
+        let mut pending: Vec<Frame> = Vec::new();
         let mut off = 0u64;
         let mut hdr = [0u8; HDR];
         loop {
@@ -263,7 +305,10 @@ impl Wal {
             //
             // The crc disambiguates: a torn tail does not checksum, a well-formed future frame does.
             // So defer the decision until after the crc, below.
-            let known = hdr[0] == FRAME_TAG || hdr[0] == TOMB_TAG;
+            let known = matches!(
+                hdr[0],
+                FRAME_TAG | TOMB_TAG | BATCH_COMMIT_TAG | BATCH_FRAME_TAG | BATCH_TOMB_TAG
+            );
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
             let end = off + HDR as u64 + plen as u64 + CRC as u64;
@@ -294,22 +339,56 @@ impl Wal {
                     hdr[0]
                 );
             }
-            if hdr[0] == TOMB_TAG {
-                let Ok(id) = String::from_utf8(payload) else { break };
-                out.push(Frame {
-                    seq,
-                    tomb: true,
-                    record: Record { id, body: Vec::new(), attrs: Vec::new() },
-                    novel: Vec::new(),
-                });
-            } else {
-                match decode_record(&payload) {
-                    Ok((record, novel)) => out.push(Frame { seq, tomb: false, record, novel }),
-                    Err(_) => break,
+            match hdr[0] {
+                BATCH_COMMIT_TAG => {
+                    let mut at = 0usize;
+                    let Ok(n) = get_varint(&payload, &mut at) else { break };
+                    if at != payload.len() {
+                        break; // a malformed marker cannot say what it seals
+                    }
+                    let n = n as usize;
+                    if n > pending.len() {
+                        // The frame chain is unbroken back to the last commit point, so a marker
+                        // sealing more members than preceded it means the log is not what a writer
+                        // put down. That is corruption that CHECKSUMS, and it must not quietly
+                        // shrink a batch.
+                        bail!("wal batch commit seals {n} frames but only {} precede it", pending.len());
+                    }
+                    let start = pending.len() - n;
+                    // Members before the sealed run belong to a batch whose marker never landed.
+                    out.extend(pending.drain(..).skip(start));
                 }
+                TOMB_TAG | BATCH_TOMB_TAG => {
+                    let Ok(id) = String::from_utf8(payload) else { break };
+                    let fr = Frame {
+                        seq,
+                        tomb: true,
+                        record: Record { id, body: Vec::new(), attrs: Vec::new() },
+                        novel: Vec::new(),
+                    };
+                    if hdr[0] == BATCH_TOMB_TAG {
+                        pending.push(fr);
+                    } else {
+                        pending.clear();
+                        out.push(fr);
+                    }
+                }
+                _ => match decode_record(&payload) {
+                    Ok((record, novel)) => {
+                        let fr = Frame { seq, tomb: false, record, novel };
+                        if hdr[0] == BATCH_FRAME_TAG {
+                            pending.push(fr);
+                        } else {
+                            pending.clear();
+                            out.push(fr);
+                        }
+                    }
+                    Err(_) => break,
+                },
             }
             off = end;
         }
+        // An unsealed run at the end of the log is a batch that never committed.
         Ok(out)
     }
 }
@@ -378,6 +457,61 @@ mod tests {
         let frames = Wal::replay(&p).unwrap();
         assert_eq!(frames.len(), 5, "a torn tail is the end of the log, not an error");
         assert_eq!(frames[4].seq, 5);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_batch_replays_all_or_nothing() {
+        let d = std::env::temp_dir().join(format!("turndb-walbatch-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("wal");
+        let mk = |id: &str| {
+            let (mut r, n) = rec();
+            r.id = id.into();
+            (r, n)
+        };
+        let (a, na) = mk("a");
+        let (b, nb) = mk("b");
+        {
+            let mut w = Wal::open(&p).unwrap();
+            w.append(1, &a, &na).unwrap();
+            let tomb = Record { id: "z".into(), body: Vec::new(), attrs: Vec::new() };
+            w.append_batch(2, &[(a.clone(), na.clone(), false), (tomb, Vec::new(), true), (b.clone(), nb.clone(), false)])
+                .unwrap();
+            w.sync().unwrap();
+        }
+        let f = Wal::replay(&p).unwrap();
+        assert_eq!(f.len(), 4, "standalone + three sealed members");
+        assert!(f[2].tomb && f[2].record.id == "z");
+        assert_eq!(f[3].record.id, "b");
+
+        // Tear the marker off: the members are unsealed and contribute NOTHING.
+        let flen = std::fs::metadata(&p).unwrap().len();
+        let fh = OpenOptions::new().write(true).open(&p).unwrap();
+        fh.set_len(flen - (HDR as u64 + 1 + CRC as u64)).unwrap();
+        let f = Wal::replay(&p).unwrap();
+        assert_eq!(f.len(), 1, "an unsealed batch must not replay a prefix of itself");
+
+        // A sealed batch after the abandoned run: its marker seals ITS members, not the strays.
+        {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_batch(3, &[(b.clone(), nb.clone(), false)]).unwrap();
+            w.sync().unwrap();
+        }
+        let f = Wal::replay(&p).unwrap();
+        assert_eq!(f.len(), 2, "abandoned members stay discarded: {:?}", f.iter().map(|x| &x.record.id).collect::<Vec<_>>());
+        assert_eq!(f[1].record.id, "b");
+
+        // A marker claiming more members than precede it is corruption that checksums: refuse.
+        let p2 = d.join("wal2");
+        {
+            let mut w = Wal::open(&p2).unwrap();
+            let mut count = Vec::new();
+            put_varint(&mut count, 5);
+            w.append_frame(BATCH_COMMIT_TAG, 1, &count).unwrap();
+            w.sync().unwrap();
+        }
+        assert!(Wal::replay(&p2).is_err(), "a marker sealing absent frames must refuse the log");
         std::fs::remove_dir_all(&d).ok();
     }
 
