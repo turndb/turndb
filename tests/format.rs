@@ -277,7 +277,7 @@ fn manifest_carries_the_documented_fields() {
     let want = u32::from_str_radix(hex, 16).expect("trailer carries hex");
     assert_eq!(crc32fast::hash(json.as_bytes()), want, "trailer must checksum the JSON payload");
     let v: serde_json::Value = serde_json::from_str(json).unwrap();
-    for field in ["parts", "fold_seg", "fold_off", "next_seq", "fold_gen"] {
+    for field in ["parts", "fold_seg", "fold_off", "next_seq", "fold_gen", "commit"] {
         assert!(v.get(field).is_some(), "FORMAT.md documents manifest field {field}: {raw}");
     }
     let p = &v["parts"][0];

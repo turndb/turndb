@@ -35,7 +35,7 @@ use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -61,6 +61,14 @@ pub struct PartRef {
     pub records: u32,
 }
 
+/// How many committed manifests are RETAINED beside the live one, as `MANIFEST.<commit>`.
+///
+/// Retention is what turns the commit point into a log: every file a retained manifest names
+/// survives the sweep, so a reader holding any manifest in the window sees its whole snapshot on
+/// disk, and a corrupt `MANIFEST` is recoverable by explicit promotion instead of surgery. The
+/// window is a count of COMMITS, not time — each flush, merge, or re-fold advances it by one.
+pub const MANIFEST_RETAIN: usize = 4;
+
 /// The committed state of the store. Small, atomic, and the only source of truth about what is live.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Manifest {
@@ -73,6 +81,11 @@ pub struct Manifest {
     pub fold_seg: u32,
     pub fold_off: u32,
     pub next_seq: u64,
+    /// Monotonic commit counter — the retained log's namespace. `next_seq` cannot serve here: it
+    /// only advances at flush, and merges and re-folds commit without flushing. Absent in stores
+    /// written before the log existed, which serde reads as 0.
+    #[serde(default)]
+    pub commit: u64,
 }
 
 impl Manifest {
@@ -84,7 +97,23 @@ impl Manifest {
     fn load(dir: &Path) -> Result<Manifest> {
         match std::fs::read(dir.join("MANIFEST")) {
             Ok(b) => Manifest::parse(&b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A missing manifest is a new store — UNLESS a commit log exists, in which case
+                // this store has committed before and `MANIFEST` was lost. Opening it as new
+                // would be the destructive conflation all over again, one deletion further
+                // upstream: an empty manifest followed by the sweep.
+                let retained = list_retained(dir);
+                if retained.is_empty() {
+                    Ok(Manifest::default())
+                } else {
+                    bail!(
+                        "MANIFEST is missing but {} retained commits exist at {} — a damaged \
+                         store, not a new one; recover_manifest() can promote the newest intact copy",
+                        retained.len(),
+                        dir.display()
+                    )
+                }
+            }
             Err(e) => Err(anyhow::Error::new(e).context(format!(
                 "cannot read {} — refusing to treat an unreadable manifest as an empty store",
                 dir.join("MANIFEST").display()
@@ -130,14 +159,35 @@ impl Manifest {
     }
 
     /// tmp + fsync + rename + fsync-dir: a crash sees either the old manifest or the new one.
-    fn commit(&self, dir: &Path) -> Result<()> {
+    ///
+    /// Bumps the commit counter, and writes the retained copy `MANIFEST.<commit>` BEFORE the
+    /// rename: if the live manifest is later corrupted, the copy of the very state it carried is
+    /// what recovery promotes. A crash between the copy and the rename leaves a retained manifest
+    /// describing a commit that never took effect — which is exactly the old manifest's state plus
+    /// a counter bump, and harmless: promotion would reproduce the state the store is already in.
+    ///
+    /// One directory fsync at the end covers both dirents. Pruning runs last and is best-effort —
+    /// a retained manifest that outlives its window is swept space, never a correctness problem.
+    fn commit(&mut self, dir: &Path) -> Result<()> {
+        self.commit += 1;
+        let bytes = self.encode()?;
+        {
+            let mut f = File::create(retained_path(dir, self.commit))?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
         let tmp = dir.join("MANIFEST.tmp");
         let mut f = File::create(&tmp)?;
-        f.write_all(&self.encode()?)?;
+        f.write_all(&bytes)?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, dir.join("MANIFEST"))?;
         File::open(dir)?.sync_all()?;
+        for c in list_retained(dir) {
+            if c + (MANIFEST_RETAIN as u64) <= self.commit {
+                let _ = std::fs::remove_file(retained_path(dir, c));
+            }
+        }
         Ok(())
     }
 
@@ -164,6 +214,119 @@ fn checksum_trailer(bytes: &[u8]) -> Option<(&[u8], u32)> {
     let hex = std::str::from_utf8(&tail[6..]).ok()?;
     let want = u32::from_str_radix(hex, 16).ok()?;
     Some((&bytes[..pos], want))
+}
+
+fn retained_path(dir: &Path, commit: u64) -> PathBuf {
+    dir.join(format!("MANIFEST.{commit:08}"))
+}
+
+/// Retained commits on disk, ascending. Parsed NUMERICALLY, the same rule as segment names:
+/// lexicographic order breaks past the padding width. `MANIFEST.tmp` does not match.
+fn list_retained(dir: &Path) -> Vec<u64> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_prefix("MANIFEST.") {
+                if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(n) = rest.parse::<u64>() {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The snapshot commits currently available to [`Store::open_read_at`], ascending.
+pub fn retained_commits(dir: &Path) -> Vec<u64> {
+    list_retained(dir)
+}
+
+fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
+    let p = retained_path(dir, commit);
+    let b = std::fs::read(&p)
+        .with_context(|| format!("no retained manifest {} — the retention window has moved past it", p.display()))?;
+    Manifest::parse(&b).with_context(|| format!("retained manifest {} is corrupt", p.display()))
+}
+
+/// Delete every file that no manifest — live or retained — names. THE deletion path: flush, merge,
+/// re-fold, and writer open all converge here, so there is exactly one place that decides
+/// reachability. A file a retained manifest names is a live snapshot's file and survives; it is
+/// swept only when the window prunes past its last naming manifest.
+///
+/// A retained manifest that fails its checksum (a torn copy from a crash) pins nothing — it can
+/// describe no snapshot anyone can open.
+fn sweep_unreachable(dir: &Path) -> Result<()> {
+    let mut keep: Vec<Manifest> = vec![Manifest::load(dir)?];
+    for c in list_retained(dir) {
+        if let Ok(m) = load_retained(dir, c) {
+            keep.push(m);
+        }
+    }
+    let live_parts: HashSet<&str> =
+        keep.iter().flat_map(|m| m.parts.iter().map(|p| p.file.as_str())).collect();
+    let live_gens: HashSet<u32> = keep.iter().map(|m| m.fold_gen).collect();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("part-") && n.ends_with(".part") && !live_parts.contains(n.as_str()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+            if e.path().is_dir() {
+                if let Some(g) = refold::parse_fold_gen(&n) {
+                    if !live_gens.contains(&g) {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Promote the newest intact retained manifest over a damaged `MANIFEST`.
+///
+/// EXPLICITLY an operator action, never automatic. In the common case — bit rot in `MANIFEST`
+/// itself — the newest retained copy carries the very same commit, and promotion loses nothing.
+/// Only when the newest copies are also damaged does promotion become a ROLLBACK to an older
+/// commit, discarding acknowledged flushes; an `open()` that silently fell back would make that
+/// loss invisible, which is why open refuses and this function exists to be called on purpose.
+///
+/// Promoting a copy whose rename never landed (a crash inside `commit`) is safe by the same rule
+/// as everything else here: data before pointers — everything a manifest names was durable before
+/// the manifest was written, so completing the commit is indistinguishable from the crash having
+/// happened a moment later.
+///
+/// Refuses when `MANIFEST` is intact, and when nothing intact remains to promote. Retained copies
+/// NEWER than the promoted commit necessarily failed to parse (an intact one would have been
+/// promoted instead) and are removed, so the log ends at the commit the store resumes from.
+pub fn recover_manifest(dir: &Path) -> Result<u64> {
+    if Manifest::load(dir).is_ok() {
+        bail!("MANIFEST at {} is intact — refusing to roll back a healthy store", dir.display());
+    }
+    for c in list_retained(dir).into_iter().rev() {
+        if load_retained(dir, c).is_err() {
+            continue;
+        }
+        let bytes = std::fs::read(retained_path(dir, c))?;
+        let tmp = dir.join("MANIFEST.tmp");
+        let mut f = File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, dir.join("MANIFEST"))?;
+        File::open(dir)?.sync_all()?;
+        for n in list_retained(dir) {
+            if n > c {
+                let _ = std::fs::remove_file(retained_path(dir, n));
+            }
+        }
+        return Ok(c);
+    }
+    bail!("MANIFEST at {} is damaged and no retained manifest is intact", dir.display());
 }
 
 pub struct Store {
@@ -200,23 +363,11 @@ impl Store {
             parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
         }
 
-        // A part file the manifest does not name was written by a flush or merge that crashed before
-        // committing, or superseded by a merge that committed. Either way it is unreachable. Safe to
-        // unlink even with readers attached: Unix keeps their open mappings alive.
-        let live: std::collections::HashSet<&str> = manifest.parts.iter().map(|p| p.file.as_str()).collect();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("part-") && n.ends_with(".part") && !live.contains(n.as_str()) {
-                    let _ = std::fs::remove_file(e.path());
-                }
-                // A fold generation the manifest does not name is either a re-fold that crashed before
-                // committing, or the one a committed re-fold replaced. Unreachable either way.
-                if e.path().is_dir() && refold::is_stale_fold(&n, manifest.fold_gen) {
-                    let _ = std::fs::remove_dir_all(e.path());
-                }
-            }
-        }
+        // A part file or fold generation no manifest names was written by a flush, merge, or
+        // re-fold that crashed before committing, or has aged out of the retention window. Either
+        // way it is unreachable. Safe to unlink even with readers attached: Unix keeps their open
+        // mappings alive.
+        sweep_unreachable(dir)?;
 
         let wal_path = dir.join("WAL");
         let frames = Wal::replay(&wal_path)?;
@@ -308,6 +459,26 @@ impl Store {
             }
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("manifest snapshot names storage that does not exist")))
+    }
+
+    /// Open a READER on a retained snapshot: the store exactly as commit `commit` left it.
+    ///
+    /// Only commits still inside the retention window exist — [`retained_commits`] lists them, and
+    /// a re-fold empties the list on purpose (time travel must not resurrect erased content).
+    ///
+    /// No retry loop, unlike [`Store::open_read`], deliberately: the files a LIVE manifest names
+    /// can be superseded while opening them, but a retained snapshot's files are pinned on disk by
+    /// its manifest, and the one way they vanish is the window advancing past it — a real error,
+    /// reported as one.
+    pub fn open_read_at(dir: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
+        let manifest = load_retained(dir, commit)?;
+        let fold = Fold::open_read(&refold::fold_dir(dir, manifest.fold_gen), cfg)?;
+        let pcache = SectionCache::shared();
+        let mut parts = Vec::with_capacity(manifest.parts.len());
+        for p in &manifest.parts {
+            parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
+        }
+        Ok(ReadStore { fold, parts, manifest })
     }
 
     /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
@@ -447,6 +618,8 @@ impl Store {
 
         self.parts.push(Arc::new(Part::open_in(&path, self.pcache.clone())?));
         self.manifest = m;
+        // The commit may have pruned a retained manifest; whatever only it named is now sweepable.
+        sweep_unreachable(&self.dir)?;
         self.mem.clear();
         self.mem_bytes = 0;
         // Release Tier 0 — but only HERE, after the part is committed and open. Sealing any earlier
@@ -489,9 +662,11 @@ impl Store {
 
         // Publish: the merged part is durable (part::build fsyncs) before the manifest names it, and
         // the manifest swap is the single linearization point. A crash before it leaves the merged
-        // file as an unreachable orphan; a crash after it leaves the inputs as orphans. Both are swept.
+        // file as an unreachable orphan. The INPUTS are not deleted here: retained manifests still
+        // name them, so a reader inside the retention window keeps a complete snapshot on disk.
+        // They fall to the sweep when the window prunes past their last naming manifest.
         let mut m = self.manifest.clone();
-        let replaced: Vec<PartRef> = m.parts.splice(
+        m.parts.splice(
             lo..lo + len,
             [PartRef {
                 file: file.clone(),
@@ -499,14 +674,12 @@ impl Store {
                 seq_hi: meta.seq_hi,
                 records: meta.n_records,
             }],
-        ).collect();
+        );
         m.commit(&self.dir)?;
 
         self.parts.splice(lo..lo + len, [Arc::new(Part::open_in(&path, self.pcache.clone())?)]);
         self.manifest = m;
-        for r in replaced {
-            let _ = std::fs::remove_file(self.dir.join(&r.file));
-        }
+        sweep_unreachable(&self.dir)?;
         Ok(Some(stats))
     }
 
@@ -662,25 +835,28 @@ impl Store {
 
         // Everything past here is cleanup: a crash leaves orphans, which open() sweeps.
         let old_gen = self.manifest.fold_gen;
-        let old_files: Vec<String> = self.manifest.parts.iter().map(|p| p.file.clone()).collect();
         self.manifest = m;
+        // PURGE the retained log down to this commit alone. Erasure semantics trump snapshots: a
+        // re-fold exists to make dropped content GONE, and a retained manifest would keep the old
+        // generation — deleted records included — readable for MANIFEST_RETAIN more commits.
+        // Time travel does not cross a re-fold, by design; that is the point of running one.
+        for c in list_retained(&self.dir) {
+            if c != self.manifest.commit {
+                let _ = std::fs::remove_file(retained_path(&self.dir, c));
+            }
+        }
         self.pcache = SectionCache::shared();
         self.parts.clear();
         for p in &self.manifest.parts {
             self.parts.push(Arc::new(Part::open_in(&self.dir.join(&p.file), self.pcache.clone())?));
         }
         self.fold = Fold::open_at(&new_dir, self.cfg, self.manifest.fold_tail())?;
-        for f in old_files {
-            let _ = std::fs::remove_file(self.dir.join(f));
-        }
-        // Reported, not swallowed. Discarding this error let `bytes_reclaimed()` claim a large
-        // reclaim while the old generation was still occupying the disk — a stat that says the
-        // opposite of the truth. The re-fold itself is already committed and correct, so this cannot
-        // fail the operation; it can only be honest about what is left behind.
-        if let Err(e) = std::fs::remove_dir_all(refold::fold_dir(&self.dir, old_gen)) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                stats.stale_generation_left = true;
-            }
+        sweep_unreachable(&self.dir)?;
+        // Reported, not swallowed. Claiming `bytes_reclaimed()` while the old generation still
+        // occupies the disk would be a stat that says the opposite of the truth. The re-fold itself
+        // is already committed and correct; this is only honest about what is left behind.
+        if refold::fold_dir(&self.dir, old_gen).exists() {
+            stats.stale_generation_left = true;
         }
         Ok(stats)
     }
@@ -774,7 +950,7 @@ mod tests {
     fn a_flipped_byte_that_still_parses_is_refused() {
         let d = std::env::temp_dir().join(format!("turndb-mancrc-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let m = super::Manifest { fold_off: 4096, next_seq: 9, ..Default::default() };
+        let mut m = super::Manifest { fold_off: 4096, next_seq: 9, ..Default::default() };
         m.commit(&d).unwrap();
 
         let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
@@ -792,7 +968,8 @@ mod tests {
     fn a_damaged_trailer_is_not_read_as_legacy() {
         let d = std::env::temp_dir().join(format!("turndb-mantrail-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        super::Manifest::default().commit(&d).unwrap();
+        let mut m = super::Manifest::default();
+        m.commit(&d).unwrap();
 
         let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
         let at = b.len() - 14; // the 'c' of the final "crc32=XXXXXXXX" line
@@ -803,16 +980,61 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// The retained log: every commit leaves a copy, the window prunes, recovery promotes.
+    #[test]
+    fn the_commit_log_retains_prunes_and_recovers() {
+        let d = std::env::temp_dir().join(format!("turndb-manlog-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut m = super::Manifest::default();
+        for i in 1..=6u32 {
+            m.fold_off = i * 100; // distinguishable states
+            m.commit(&d).unwrap();
+        }
+        assert_eq!(m.commit, 6);
+        assert_eq!(super::list_retained(&d), vec![3, 4, 5, 6], "window of {} commits", super::MANIFEST_RETAIN);
+
+        // Bit rot in MANIFEST: open refuses; recovery promotes the newest copy — same commit,
+        // nothing lost.
+        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
+        b[10] ^= 0xFF;
+        std::fs::write(d.join("MANIFEST"), &b).unwrap();
+        assert!(super::Manifest::load(&d).is_err());
+        assert_eq!(super::recover_manifest(&d).unwrap(), 6);
+        assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 600);
+
+        // MANIFEST *and* the newest copies damaged: recovery rolls back to the newest intact one
+        // and truncates the log to it — the abandoned copies cannot be promoted later.
+        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
+        b[10] ^= 0xFF;
+        std::fs::write(d.join("MANIFEST"), &b).unwrap();
+        std::fs::write(super::retained_path(&d, 6), b"garbage").unwrap();
+        std::fs::write(super::retained_path(&d, 5), b"garbage").unwrap();
+        assert_eq!(super::recover_manifest(&d).unwrap(), 4);
+        assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 400);
+        assert_eq!(super::list_retained(&d), vec![3, 4], "the abandoned timeline is cleared");
+
+        // An intact store refuses rollback.
+        assert!(super::recover_manifest(&d).is_err(), "recovery of a healthy store must refuse");
+
+        // A MISSING manifest beside a commit log is damage, not a new store.
+        std::fs::remove_file(d.join("MANIFEST")).unwrap();
+        assert!(super::Manifest::load(&d).is_err(), "missing MANIFEST + commit log must refuse");
+        assert_eq!(super::recover_manifest(&d).unwrap(), 4);
+        assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 400);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn manifest_roundtrips() {
         let d = std::env::temp_dir().join(format!("turndb-man-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let m = super::Manifest {
+        let mut m = super::Manifest {
             parts: vec![super::PartRef { file: "p.part".into(), seq_lo: 1, seq_hi: 1, records: 7 }],
             fold_seg: 2,
             fold_off: 4096,
             next_seq: 9,
             fold_gen: 3,
+            commit: 0,
         };
         m.commit(&d).unwrap();
         let got = super::Manifest::load(&d).unwrap();
@@ -820,6 +1042,7 @@ mod tests {
         assert_eq!(got.fold_off, 4096);
         assert_eq!(got.fold_gen, 3);
         assert_eq!(got.next_seq, 9);
+        assert_eq!(got.commit, 1, "commit() must advance the commit counter");
         assert!(!d.join("MANIFEST.tmp").exists(), "staging file must not survive a commit");
         std::fs::remove_dir_all(&d).ok();
     }

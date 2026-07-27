@@ -22,6 +22,8 @@ A server is a role a process takes when it holds the writer lock, not something 
 mystore/
   MANIFEST                  the only commit point
   MANIFEST.tmp              transient; a crash may leave one behind
+  MANIFEST.00000041         the commit log: the last few commits, retained verbatim
+  MANIFEST.00000042
   WAL                       uncommitted records
   fold/                     content, generation 0
     seg-00000000.fold       segments, numbered densely from 0
@@ -32,9 +34,10 @@ mystore/
   part-r0001-00000001-00000003.part  written by a re-fold into generation 1
 ```
 
-Part filenames are informative only — the manifest names what is live, and any file it does not name
-is unreachable and swept. The three forms exist so a merge output can never collide with an input it
-is about to replace.
+Part filenames are informative only — the manifests name what is reachable, and any file that no
+manifest (live or retained — see [The manifest](#the-manifest)) names is unreachable and swept. The
+three part-name forms exist so a merge output can never collide with an input it is about to
+replace.
 
 Two planes, and the split is the whole design:
 
@@ -151,7 +154,7 @@ commit is the swap.
 
 It has to work this way. A reader holding an older manifest is still reading the old generation, and
 rewriting underneath it would hand back **wrong bytes rather than an error**. A generation directory
-the manifest does not name is unreachable and is swept at writer open.
+no manifest names is unreachable and is swept at writer open.
 
 ---
 
@@ -166,8 +169,7 @@ above about what it does hold in plaintext.
 
 The footer lands last and is the completeness marker: a part whose footer is absent or fails its
 checksum was torn mid-write and is **refused**, never half-read. Refused is not the same as removed —
-a part the manifest names is a hard error, and only files the manifest does *not* name are swept as
-unreachable.
+a part a manifest names is a hard error, and only files no manifest names are swept as unreachable.
 
 ### Footer — 56 bytes, at EOF
 
@@ -485,7 +487,7 @@ a well-formed frame with an unrecognised tag is **refused**, and only a failed c
 the sequence cursor. Everything else — the block directory, dedup indexes, part contents — is derived.
 
 ```
-{"parts":[{"file":"part-00000001.part","seq_lo":1,"seq_hi":1,"records":40}],"fold_gen":0,"fold_seg":0,"fold_off":4144,"next_seq":1}
+{"parts":[{"file":"part-00000001.part","seq_lo":1,"seq_hi":1,"records":40}],"fold_gen":0,"fold_seg":0,"fold_off":4144,"next_seq":1,"commit":7}
 crc32=9a3fc217
 ```
 
@@ -505,12 +507,44 @@ parse error), which is the safe direction — refusal, never misreading.
 
 JSON on purpose: it is small, written once per flush, and self-describing, so a field can be added
 without a version lever — **provided the new field has a documented default**, since older writers will
-keep omitting it. `fold_gen` was added exactly that way and absent means 0. A field without a default
-is a breaking change that JSON merely fails to announce.
+keep omitting it. `fold_gen` was added exactly that way and absent means 0, and `commit` likewise. A
+field without a default is a breaking change that JSON merely fails to announce.
 
 Committed with tmp + fsync + rename + fsync-dir, so a crash sees either the old manifest or the new
 one. **An unreadable manifest is an error, not an empty store** — conflating those with a sweep that
 unlinks unnamed files turns one bad byte into an empty directory.
+
+### The commit log
+
+`commit` is a monotonic counter, advanced by every commit — flush, merge, or re-fold. (`next_seq`
+cannot serve here: it advances only at flush.) Each commit also writes its exact bytes to
+`MANIFEST.<commit>`, eight digits zero-padded, parsed **numerically** like segment names. The copy
+lands, fsynced, *before* the rename that publishes `MANIFEST`; one directory fsync covers both. The
+newest few commits are retained — this implementation keeps 4 — and older copies are pruned.
+
+The log buys three things, and changes one rule:
+
+* **Snapshots.** A reader may open any retained commit and see the store exactly as that commit
+  left it. This works because of the rule change: the sweep unlinks only files that **no** manifest
+  — live or retained — names, so a retained manifest's parts and fold generation stay on disk until
+  the window prunes past it. A part replaced by a merge is therefore *deferred* to the sweep, not
+  unlinked at commit.
+* **Recovery.** A damaged `MANIFEST` beside an intact retained copy is recoverable by promoting the
+  copy — verbatim bytes, checksum and all. In the common case (bit rot in `MANIFEST` itself) the
+  newest copy carries the very same commit and nothing is lost. Promotion of an older copy is a
+  **rollback** that discards acknowledged commits, so promotion is an explicit operator action;
+  an implementation must not fall back silently on open.
+* **A missing-manifest tripwire.** A store with retained commits and no `MANIFEST` is damage, not a
+  new store, and must refuse to open — otherwise the sweep of an "empty" store unlinks everything
+  the log still pins.
+
+A retained copy that fails its checksum pins nothing and cannot be promoted. A **re-fold purges the
+log** down to its own commit: erasure semantics trump snapshots, and a retained manifest would
+otherwise keep the superseded generation — deleted content included — readable and on disk. Time
+travel does not cross a re-fold; that is the point of running one.
+
+A store written before the log existed has no retained copies and `commit` 0, and reads fine; the
+log begins at its next commit.
 
 ### Ordering
 

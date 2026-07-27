@@ -55,15 +55,13 @@ pub fn fold_dir(dir: &Path, gen: u32) -> PathBuf {
     }
 }
 
-/// Is `name` a fold directory for some generation other than `live`?
-pub fn is_stale_fold(name: &str, live: u32) -> bool {
+/// The generation a fold directory name denotes: `fold` is 0, `fold-NNNN` is N. `None` for a name
+/// that is not a fold directory at all.
+pub fn parse_fold_gen(name: &str) -> Option<u32> {
     if name == "fold" {
-        return live != 0;
+        return Some(0);
     }
-    match name.strip_prefix("fold-").and_then(|g| g.parse::<u32>().ok()) {
-        Some(g) => g != live,
-        None => false,
-    }
+    name.strip_prefix("fold-").and_then(|g| g.parse::<u32>().ok())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
