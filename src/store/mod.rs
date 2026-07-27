@@ -453,6 +453,10 @@ pub struct Store {
 }
 
 impl Store {
+    /// Part count at which [`Store::auto_compact`] runs a total merge. Chosen by measurement, not
+    /// taste — see that method's numbers.
+    pub const AUTO_COMPACT_K: usize = 8;
+
     /// Open for writing. Takes the writer lock (through the fold) and recovers.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
         crate::vfs::mkdir_all(dir)?;
@@ -903,11 +907,36 @@ impl Store {
     /// pattern — old parts are cold and stop being rewritten. Bounding part count is not only about
     /// read amplification: a Tier-1 dedup lookup is O(parts), so this is what keeps global dedup
     /// affordable.
+    ///
+    /// This is the MANUAL dial; [`Store::auto_compact`] is the engine's measured default policy.
     pub fn maybe_compact(&mut self, trigger: usize, run: usize) -> Result<Option<crate::part::merge::MergeStats>> {
         if self.parts.len() < trigger {
             return Ok(None);
         }
         self.merge_range(0, run.min(self.parts.len()))
+    }
+
+    /// The engine's compaction opinion: a TOTAL merge whenever the live list reaches
+    /// [`Store::AUTO_COMPACT_K`] parts. Call it after flushes; it is cheap to call and refuses
+    /// below the threshold.
+    ///
+    /// The classic LSM tradeoff — write amplification against read amplification — collapses
+    /// here, because a merge rewrites references and columns and never content. Measured on 20k
+    /// real records (examples/compact_bench): the whole policy space lands within 0.008–0.011 ms
+    /// per point lookup, so read amp does not discriminate; merge WALL is the only real cost, and
+    /// total-at-8 paid 0.7s across the run where tiered(8,4) paid 1.7s for MORE final parts and
+    /// no tombstone settlement. Total merges are also the only ones allowed to drop tombstones,
+    /// so deletes actually settle instead of shadowing forever.
+    ///
+    /// The honest caveat, documented as the dial it is: a total merge costs O(live records) of
+    /// wall time, so at some store size a young/old split becomes worth it. That crossover is far
+    /// beyond current scale; when it arrives, `maybe_compact` is the young tier's tool and this
+    /// policy becomes the old tier's slow beat.
+    pub fn auto_compact(&mut self) -> Result<Option<crate::part::merge::MergeStats>> {
+        if self.parts.len() < Self::AUTO_COMPACT_K {
+            return Ok(None);
+        }
+        self.merge_range(0, self.parts.len())
     }
 
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.

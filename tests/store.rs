@@ -1269,3 +1269,38 @@ fn a_crashed_refold_leaves_the_store_exactly_as_it_was() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn auto_compact_settles_the_store_and_its_deletes() {
+    let dir = tmp("autocompact");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for f in 0..turndb::store::Store::AUTO_COMPACT_K {
+        for i in 0..5 {
+            let id = format!("a{f:02}-{i}");
+            want.push((id.clone(), put(&mut s, &id, format!("v{f}{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.auto_compact().unwrap();
+    }
+    s.delete("a00-0").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    want.retain(|(id, _)| id != "a00-0");
+    // drive to the threshold so the delete's tombstone rides through a TOTAL merge
+    while s.part_count() < turndb::store::Store::AUTO_COMPACT_K {
+        let n = s.part_count();
+        put(&mut s, &format!("pad-{n}"), b"p");
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let stats = s.auto_compact().unwrap().expect("at threshold, the policy must merge");
+    assert_eq!(s.part_count(), 1, "a total merge leaves one part");
+    assert_eq!(stats.tombstones_dropped, 1, "a total merge SETTLES deletes");
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
+    }
+    assert!(s.reconstruct("a00-0").unwrap().is_none(), "the delete holds after settlement");
+    std::fs::remove_dir_all(&dir).ok();
+}
