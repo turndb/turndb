@@ -543,6 +543,48 @@ fn a_crash_after_tier1_dedup_does_not_wedge_the_store() {
 }
 
 #[test]
+fn a_batch_is_all_or_nothing_across_a_crash() {
+    let dir = tmp("batch");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "x", b"pre-batch");
+    s.sync().unwrap();
+
+    // One batch: two puts and a delete, applied, ACKed, then "crash" (drop without flush).
+    let mut bt = turndb::store::Batch::new();
+    bt.put("a", &[Span::Piece(b"batch content A, long enough to be worth folding")], vec![]);
+    bt.put("b", &[Span::Lit(b"lit-"), Span::Piece(b"batch content B")], vec![]);
+    bt.delete("x");
+    s.apply(bt).unwrap();
+    s.sync().unwrap();
+    drop(s);
+
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(s.reconstruct("a").unwrap().unwrap(), b"batch content A, long enough to be worth folding");
+    assert_eq!(s.reconstruct("b").unwrap().unwrap(), b"lit-batch content B");
+    assert!(s.reconstruct("x").unwrap().is_none(), "the batched delete applied with the batch");
+
+    // Another batch, ACKed — then its commit marker is torn off, as a crash mid-append would.
+    // NONE of it may replay: half an export surviving is the anomaly batches exist to prevent.
+    let mut bt = turndb::store::Batch::new();
+    bt.put("c", &[Span::Piece(b"doomed content C")], vec![]);
+    bt.put("d", &[Span::Piece(b"doomed content D")], vec![]);
+    s.apply(bt).unwrap();
+    s.sync().unwrap();
+    drop(s);
+    let wal = dir.join("WAL");
+    let len = std::fs::metadata(&wal).unwrap().len();
+    // the marker is the last frame: 13-byte header + 1-byte count + 4-byte crc
+    std::fs::OpenOptions::new().write(true).open(&wal).unwrap().set_len(len - 18).unwrap();
+
+    let s = Store::open(&dir, cfg()).unwrap();
+    assert!(s.reconstruct("c").unwrap().is_none(), "an unsealed batch member must not replay");
+    assert!(s.reconstruct("d").unwrap().is_none(), "an unsealed batch member must not replay");
+    assert_eq!(s.reconstruct("b").unwrap().unwrap(), b"lit-batch content B", "earlier state intact");
+    assert!(s.reconstruct("x").unwrap().is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_retained_snapshot_reads_the_past() {
     let dir = tmp("timetravel");
     let mut s = Store::open(&dir, cfg()).unwrap();

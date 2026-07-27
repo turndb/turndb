@@ -53,6 +53,60 @@ pub enum Span<'a> {
     Piece(&'a [u8]),
 }
 
+/// A group of writes that commits ATOMICALLY: after a crash, either every member replays or none
+/// does. A lone `put` is durable per record, which means a crash can land between the records of
+/// one logical ingest — half an export survived is an anomaly the source then has to reconcile.
+/// A batch is the unit the source actually sent.
+///
+/// A `Batch` is pure staging: it owns copies of its spans and touches neither the fold nor the log
+/// until [`Store::apply`], so a batch that is dropped instead of applied leaves NOTHING behind —
+/// no fold content, no dedup-window entries, no frames.
+#[derive(Default)]
+pub struct Batch {
+    items: Vec<BatchItem>,
+}
+
+enum BatchItem {
+    Put { id: String, spans: Vec<OwnedSpan>, attrs: Vec<(String, AttrValue)> },
+    Delete { id: String },
+}
+
+enum OwnedSpan {
+    Lit(Vec<u8>),
+    Piece(Vec<u8>),
+}
+
+impl Batch {
+    pub fn new() -> Batch {
+        Batch::default()
+    }
+
+    /// Stage a put. Same shape as [`Store::put`]; nothing happens until [`Store::apply`].
+    pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) {
+        let spans = spans
+            .iter()
+            .map(|s| match s {
+                Span::Lit(b) => OwnedSpan::Lit(b.to_vec()),
+                Span::Piece(b) => OwnedSpan::Piece(b.to_vec()),
+            })
+            .collect();
+        self.items.push(BatchItem::Put { id: id.to_string(), spans, attrs });
+    }
+
+    /// Stage a deletion.
+    pub fn delete(&mut self, id: &str) {
+        self.items.push(BatchItem::Delete { id: id.to_string() });
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct PartRef {
     pub file: String,
@@ -531,6 +585,64 @@ impl Store {
         self.wal.append(self.manifest.next_seq, &rec, &novel)?;
         self.mem_bytes += approx_bytes(&rec);
         self.mem.insert(rec.id.clone(), Some(rec));
+        Ok(())
+    }
+
+    /// Apply a [`Batch`]: every member, or — across a crash — none.
+    ///
+    /// Fold work happens first, so each member's novel bytes are known; then every member frame
+    /// plus the commit marker goes to the log in one append. Replay applies the members only when
+    /// the marker sealed them, so a crash anywhere inside this call replays nothing of the batch.
+    /// (Content the fold gathered for an unreplayed batch is beyond the committed tail and is
+    /// truncated at open, exactly like content from an unsynced put.)
+    ///
+    /// Durability is unchanged: the batch is ACKed by [`Store::sync`], like everything else.
+    /// Within the batch, later members win over earlier ones on the same id, exactly as two puts
+    /// would.
+    pub fn apply(&mut self, batch: Batch) -> Result<()> {
+        if batch.items.is_empty() {
+            return Ok(());
+        }
+        let mut framed: Vec<(Record, Vec<(PieceHash, Vec<u8>)>, bool)> =
+            Vec::with_capacity(batch.items.len());
+        for item in &batch.items {
+            match item {
+                BatchItem::Put { id, spans, attrs } => {
+                    let mut body = Vec::with_capacity(spans.len());
+                    let mut novel = Vec::new();
+                    for s in spans {
+                        match s {
+                            OwnedSpan::Lit(b) => body.push(BodyOp::Lit(b.clone())),
+                            OwnedSpan::Piece(b) => {
+                                let put = self.fold_piece(b)?;
+                                if !put.deduped {
+                                    novel.push((put.hash, b.clone()));
+                                }
+                                body.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
+                            }
+                        }
+                    }
+                    framed.push((Record { id: id.clone(), body, attrs: attrs.clone() }, novel, false));
+                }
+                BatchItem::Delete { id } => {
+                    framed.push((
+                        Record { id: id.clone(), body: Vec::new(), attrs: Vec::new() },
+                        Vec::new(),
+                        true,
+                    ));
+                }
+            }
+        }
+        self.wal.append_batch(self.manifest.next_seq, &framed)?;
+        for (rec, _, tomb) in framed {
+            if tomb {
+                self.mem_bytes += rec.id.len() + 32;
+                self.mem.insert(rec.id, None);
+            } else {
+                self.mem_bytes += approx_bytes(&rec);
+                self.mem.insert(rec.id.clone(), Some(rec));
+            }
+        }
         Ok(())
     }
 
