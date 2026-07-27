@@ -310,8 +310,17 @@ fn merge_keeps_the_newest_version_of_a_reput_id() {
 
 #[test]
 fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
+    // "Sweeps" now means AFTER the retention window: replaced inputs stay on disk while a retained
+    // manifest still names them — that is what keeps a reader's snapshot whole — and fall to the
+    // sweep when the window prunes past their last naming manifest.
     let dir = tmp("mergereopen");
     let mut want = Vec::new();
+    let part_files = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir).unwrap().flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".part")).collect()
+    };
+    let inputs;
     {
         let mut s = Store::open(&dir, cfg()).unwrap();
         for b in 0..4 {
@@ -321,22 +330,37 @@ fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
             }
             s.sync().unwrap(); s.flush().unwrap();
         }
+        inputs = part_files(&dir);
+        assert_eq!(inputs.len(), 4);
         s.merge_range(0, 4).unwrap().unwrap();
         drop(s);
     }
-    let files: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".part")).collect();
-    assert_eq!(files.len(), 1, "superseded inputs must be swept, leaving only the merged part: {files:?}");
+    // Inside the window: every input is still pinned by a retained manifest.
+    let now = part_files(&dir);
+    for f in &inputs {
+        assert!(now.contains(f), "input {f} is named by a retained manifest and must survive the merge");
+    }
 
-    let s = Store::open(&dir, cfg()).unwrap();
-    assert_eq!(s.part_count(), 1);
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(s.part_count(), 1, "the LIVE view is the merged part alone");
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
     }
     // and a plain reader sees the merged state with no lock
     let r = Store::open_read(&dir, cfg()).unwrap();
     assert_eq!(r.ids().unwrap().len(), 40);
+    drop(r);
+
+    // Advance the window past every manifest that named the inputs; the sweep takes them.
+    for i in 0..turndb::store::MANIFEST_RETAIN {
+        put(&mut s, &format!("later-{i}"), b"z");
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let now = part_files(&dir);
+    for f in &inputs {
+        assert!(!now.contains(f), "input {f} outlived the retention window: {now:?}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -519,6 +543,71 @@ fn a_crash_after_tier1_dedup_does_not_wedge_the_store() {
 }
 
 #[test]
+fn a_retained_snapshot_reads_the_past() {
+    let dir = tmp("timetravel");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let v1 = put(&mut s, "k", b"v1");
+    s.sync().unwrap(); s.flush().unwrap();
+    let c1 = s.manifest().commit;
+    let v2 = put(&mut s, "k", b"v2");
+    put(&mut s, "gone", b"soon");
+    s.sync().unwrap(); s.flush().unwrap();
+    s.delete("gone").unwrap();
+    s.sync().unwrap(); s.flush().unwrap();
+    drop(s);
+
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct("k").unwrap().unwrap(), v2);
+    assert!(r.reconstruct("gone").unwrap().is_none());
+    drop(r);
+
+    // The snapshot at c1 is the first flush, exactly: the old version, and no `gone` — it did not
+    // exist yet, rather than "was deleted".
+    assert!(turndb::store::retained_commits(&dir).contains(&c1));
+    let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
+    assert_eq!(old.reconstruct("k").unwrap().unwrap(), v1);
+    assert!(old.reconstruct("gone").unwrap().is_none());
+    assert_eq!(old.ids().unwrap(), vec!["k".to_string()]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_corrupt_manifest_recovers_from_the_commit_log() {
+    let dir = tmp("manrecover");
+    let mut want = Vec::new();
+    {
+        let mut s = Store::open(&dir, cfg()).unwrap();
+        for i in 0..10 {
+            let id = format!("k{i}");
+            want.push((id.clone(), put(&mut s, &id, format!("v{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        drop(s);
+    }
+    let man = dir.join("MANIFEST");
+    let mut b = std::fs::read(&man).unwrap();
+    b[10] ^= 0xFF;
+    std::fs::write(&man, &b).unwrap();
+
+    assert!(Store::open(&dir, cfg()).is_err(), "a corrupt manifest must refuse, not open empty");
+    let c = turndb::store::recover_manifest(&dir).unwrap();
+    assert!(c > 0);
+
+    // The newest retained copy carried the same commit, so recovery lost nothing — and the store
+    // is a working store again, not merely a readable one.
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "recovery lost {id}");
+    }
+    let after = put(&mut s, "after", b"recovery");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.reconstruct("after").unwrap().unwrap(), after);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
     // The orphan sweep made this destructive: an unreadable manifest yielded the DEFAULT manifest,
     // and the sweep then unlinked every part it did not name.
@@ -552,7 +641,7 @@ fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
     std::fs::remove_dir(&man).unwrap();
     std::fs::write(&man, serde_json::to_vec(&Manifest {
         parts: vec![PartRef { file: "part-00000001.part".into(), seq_lo: 1, seq_hi: 1, records: 20 }],
-        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0,
+        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0, commit: 1,
     }).unwrap()).unwrap();
     let s = Store::open(&dir, cfg()).unwrap();
     assert_eq!(s.part_count(), 1);
