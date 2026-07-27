@@ -39,6 +39,7 @@ pub mod fold;
 pub mod part;
 #[cfg(feature = "sql")]
 pub mod query;
+pub mod readat;
 pub mod store;
 pub mod types;
 

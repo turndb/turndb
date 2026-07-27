@@ -435,3 +435,52 @@ fn verification_is_opt_in_and_reads_do_not_pay_for_it() {
     drop(fold);
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn a_part_reads_identically_out_of_an_embedded_extent() {
+    // The pack concept, proven at the part level: a part is footer-addressed, so it can live at an
+    // offset inside a bigger file and be read through a bounded extent with no code knowing the
+    // difference. Byte-identical answers, and no read may wander outside the extent.
+    let d = tmp("embedded");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let records = fixture(&mut fold);
+    let path = d.join("plain.part");
+    part::build(&path, &records, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
+    fold.sync().unwrap();
+    let part_bytes = std::fs::read(&path).unwrap();
+
+    // A "pack": garbage, the part, more garbage. Only the extent bounds say where the part is.
+    let packish = d.join("packish.bin");
+    let prefix = b"NOT-A-PART-PREFIX-0123456789".repeat(7);
+    let mut whole = prefix.clone();
+    whole.extend_from_slice(&part_bytes);
+    whole.extend_from_slice(&b"TRAILING-GARBAGE".repeat(11));
+    std::fs::write(&packish, &whole).unwrap();
+
+    let plain = Part::open(&path).unwrap();
+    let f = std::fs::File::open(&packish).unwrap();
+    let extent = turndb::readat::Slice::new(f, prefix.len() as u64, part_bytes.len() as u64);
+    let embedded = Part::open_reader(
+        Box::new(extent),
+        turndb::part::cache::SectionCache::shared(),
+    )
+    .unwrap();
+
+    assert_eq!(plain.meta(), embedded.meta());
+    assert_eq!(plain.ids().unwrap(), embedded.ids().unwrap());
+    for r in 0..plain.len() {
+        assert_eq!(
+            plain.record(r).unwrap(),
+            embedded.record(r).unwrap(),
+            "row {r} must read identically out of the extent"
+        );
+        assert_eq!(
+            plain.reconstruct(r, &fold).unwrap(),
+            embedded.reconstruct(r, &fold).unwrap(),
+            "row {r} content must reconstruct identically out of the extent"
+        );
+    }
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}

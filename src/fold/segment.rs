@@ -1,10 +1,10 @@
 //! Segment files: the append-only containers holding block frames.
 
 use super::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
+use crate::readat::ReadAt;
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// Segment header length. The first block begins here, so a `Loc.block_off` below it is invalid.
@@ -127,7 +127,7 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// This is how the fold finds its own last good byte with no external length authority. It never
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
-pub fn scan_tail(f: &File, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
+pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
