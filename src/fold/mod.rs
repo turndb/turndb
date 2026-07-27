@@ -344,12 +344,28 @@ impl Fold {
         }
 
         // Rebuild the block directory across every segment. Frames carry their ids, so this works
-        // even though blocks were written in completion order rather than id order.
+        // even though blocks were written in completion order rather than id order. Sealed
+        // segments answer from their directory sidecars when they can — that is what keeps open
+        // O(active segment) instead of O(store) — and are rescanned (and their sidecar
+        // regenerated) when they cannot.
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
-            let (_, entries) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+            let entries = if h.seg != active {
+                match segment::read_dir_sidecar(dir, h.seg, len) {
+                    Some((_, e)) => e,
+                    None => {
+                        let (tail, e) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+                        // Regenerate so the next open finds it. Best-effort: advisory data must
+                        // never fail an open, only slow one down.
+                        let _ = segment::write_dir_sidecar(dir, h.seg, tail as u32, &e);
+                        e
+                    }
+                }
+            } else {
+                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+            };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
                     blockdir.resize(id as usize + 1, None);
@@ -422,12 +438,22 @@ impl Fold {
             }
             dicts.insert(h.dict_id, Arc::new(bytes));
         }
-        // The directory is rebuilt from the ids the frames carry — the same scan the writer does.
+        // The directory is rebuilt from the ids the frames carry — the same sidecar-or-scan rule
+        // the writer applies, except a reader NEVER writes a missing sidecar back: a reader must
+        // not mutate a store it does not own, and a slower open is the whole cost.
+        let last = *nums.last().unwrap();
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
-            let (_, entries) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+            let entries = if h.seg != last {
+                match segment::read_dir_sidecar(dir, h.seg, len) {
+                    Some((_, e)) => e,
+                    None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
+                }
+            } else {
+                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+            };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
                     blockdir.resize(id as usize + 1, None);
@@ -723,6 +749,21 @@ impl Fold {
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
         self.active_f.sync_all().context("fsync before roll")?;
+        // The segment being sealed gets its directory sidecar now — the write that turns the next
+        // open's full scan of it into a 2 KB read. Best-effort, AFTER the fsync above: advisory
+        // data must never fail a roll, and a sidecar must never describe bytes less durable than
+        // itself.
+        let mut entries: Vec<(u32, u32)> = self
+            .blockdir
+            .iter()
+            .enumerate()
+            .filter_map(|(id, e)| match e {
+                Some((s, o)) if *s == self.active => Some((id as u32, *o)),
+                _ => None,
+            })
+            .collect();
+        entries.sort_by_key(|&(_, off)| off);
+        let _ = segment::write_dir_sidecar(&self.dir, self.active, self.cur_off, &entries);
         let next = self
             .active
             .checked_add(1)

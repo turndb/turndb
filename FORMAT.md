@@ -137,6 +137,34 @@ offset  size  field
      8     4  raw          length of this piece
 ```
 
+### The directory sidecar (advisory)
+
+The mapping `block_id -> (segment, offset)` is derived, and deriving it by scan costs a read of the
+whole segment. A **sealed** segment may therefore carry `seg-NNNNNNNN.dir` beside it:
+
+```
+offset  size  field
+     0     8  MAGIC = "TURNSDIR"
+     8     4  seg          must match the filename and the segment beside it
+    12     4  tail         scan end; for a sealed segment this IS the file length
+    16     4  n_entries
+    20   n*8  (block_id u32, offset u32) per block
+ 20+n*8    4  crc32 over everything before it
+```
+
+Strictly **advisory and derived**, in the same sense as `pdict.hsort`: a reader may ignore it and
+scan, must fall back to the scan whenever it is absent, fails its checksum, names the wrong
+segment, or — the staleness gate — its `tail` is not the segment's exact file length. That last
+rule is load-bearing: recovery can truncate a once-sealed segment back into being the active one,
+and the leftover sidecar then describes blocks past the committed tail; a sealed segment ends
+exactly at its last block, so any length mismatch means the sidecar and the segment parted ways.
+A trusted-but-wrong sidecar can only misdirect a read into the frame checks (`block_id` match,
+`xsum`, per-piece BLAKE3), which refuse — an error, never wrong bytes.
+
+A writer seals the sidecar at roll, regenerates a missing or refused one after the rescan, and
+never treats a sidecar failure as a fold failure. The active segment has no sidecar; it is scanned
+at every open, which is also what tail recovery requires anyway.
+
 ### Recovery
 
 Two layers answer two different questions. A self-scan of the frame chain answers *"where do my blocks
