@@ -13,7 +13,7 @@
 
 use super::{PartMeta, Writer, OP_LIT, OP_PIECE};
 use crate::fold::Loc;
-use crate::part::attrs::{RID_DELTA, RID_DENSE};
+use crate::part::attrs::{encode_zones, ZoneAcc, RID_DELTA, RID_DENSE};
 use crate::part::bloom;
 use crate::part::idcol::{put_varint, RESTART};
 use crate::types::{AttrValue, BodyOp, PieceHash};
@@ -68,6 +68,7 @@ struct Col {
     occurrences: u64,
     dense: bool,
     prev_rid: u32,
+    zone: ZoneAcc,
     val: Spool,
     rid: Spool,
 }
@@ -139,6 +140,7 @@ impl StreamBuilder {
                 occurrences: 0,
                 dense: true,
                 prev_rid: 0,
+                zone: ZoneAcc::new(tag),
                 val: spool(path)?,
                 rid: spool(path)?,
             });
@@ -247,6 +249,7 @@ impl StreamBuilder {
             col.rid.append(&d)?;
             col.prev_rid = row as u32;
             col.occurrences += 1;
+            col.zone.add(v);
             match v {
                 AttrValue::Str(s) => {
                     let ord = col
@@ -320,6 +323,8 @@ impl StreamBuilder {
             meta.push(if c.dense && c.occurrences == n { RID_DENSE } else { RID_DELTA });
         }
         self.w.section("colmeta", &meta)?;
+        let zones: Vec<ZoneAcc> = self.cols.iter().map(|c| c.zone.clone()).collect();
+        self.w.section("zone", &encode_zones(&zones))?;
 
         for (i, c) in self.cols.into_iter().enumerate() {
             let dense = c.dense && c.occurrences == n;

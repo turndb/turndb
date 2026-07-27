@@ -546,3 +546,39 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
     drop(fold);
     std::fs::remove_dir_all(&d).ok();
 }
+
+#[test]
+fn zone_maps_bound_columns_and_refuse_to_lie() {
+    let d = tmp("zones");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let rec = |id: &str, n: i64, t: f64, nanf: f64| Record {
+        id: id.into(),
+        body: vec![BodyOp::Lit(b"x".to_vec())],
+        attrs: vec![
+            ("n".into(), AttrValue::Int(n)),
+            ("t".into(), AttrValue::Float(t)),
+            ("nanf".into(), AttrValue::Float(nanf)),
+            ("ok".into(), AttrValue::Bool(true)),
+            ("s".into(), AttrValue::Str(format!("v{n}"))),
+        ],
+    };
+    let records = vec![
+        rec("a", 5, 1.5, 0.0),
+        rec("b", -3, 2.5, f64::NAN),
+        rec("c", 42, -9.25, 1.0),
+    ];
+    let path = d.join("z.part");
+    part::build(&path, &records, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
+    let p = Part::open(&path).unwrap();
+
+    // colmeta ordinals are sorted (key, tag): n=0, nanf=1, ok=2, s=3, t=4
+    assert_eq!(p.zone(0).unwrap(), Some((AttrValue::Int(-3), AttrValue::Int(42))));
+    assert_eq!(p.zone(1).unwrap(), None, "a NaN anywhere makes a float column unprunable");
+    assert_eq!(p.zone(2).unwrap(), Some((AttrValue::Bool(true), AttrValue::Bool(true))));
+    assert_eq!(p.zone(3).unwrap(), None, "strings carry no zone — the dictionary already bounds them");
+    assert_eq!(p.zone(4).unwrap(), Some((AttrValue::Float(-9.25), AttrValue::Float(2.5))));
+    assert_eq!(p.zone(9).unwrap(), None, "an out-of-range ordinal is no pruning, not an error");
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}

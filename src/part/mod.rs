@@ -283,6 +283,7 @@ pub fn build_full(
     w.section("layout", &built.layout)?;
     w.section("layout.off", &u64s(&built.layout_off))?;
     w.section("colmeta", &built.meta)?;
+    w.section("zone", &built.zones)?;
     for (i, c) in built.cols.iter().enumerate() {
         w.section(&format!("col.val.{i}"), &c.val)?;
         if !c.rid.is_empty() {
@@ -794,6 +795,14 @@ impl Part {
     /// Row `r`'s attributes, in their exact original order, duplicates included.
     pub fn attrs(&self, r: usize) -> Result<Vec<(String, AttrValue)>> {
         attrs::read_row(self, r)
+    }
+
+    /// Column `c`'s zone map: `(min, max)` over every value the column holds, or `None` when no
+    /// pruning is possible — an older part, a string column (its sorted dictionary already bounds
+    /// it), a float column that saw NaN, or a damaged section. Advisory by construction: `None`
+    /// only ever costs a scan, never an answer.
+    pub fn zone(&self, c: usize) -> Result<Option<(AttrValue, AttrValue)>> {
+        attrs::read_zone(self, c)
     }
 
     /// The whole record at row `r`.

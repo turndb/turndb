@@ -294,13 +294,14 @@ dictionary's size.
 | `col.dict.N` | column *N*'s tag is 0 (string) |
 
 **Optional / advisory.** A reader may ignore these entirely and remain correct, only slower or less
-strict. A writer at this version always emits the first two.
+strict. A writer at this version always emits all of them except `tomb`.
 
 | name | contents |
 |---|---|
 | `pdict.hsort` | u32 permutation of the dictionary in HASH order — an index, derivable by sorting |
 | `pdict.bloom` | filter over the dictionary's hashes — an accelerator with no false negatives |
 | `tomb` | tombstoned row ordinals; absent means the part deletes nothing |
+| `zone` | per-column min/max — a pruning accelerator, derivable by scanning |
 
 Unknown section names must be ignored, not rejected: that is what lets a later version add one without
 moving `version`.
@@ -409,6 +410,27 @@ repeated n_columns times:
   varint  occurrences   entries in this column's rid/val arrays
   u8      rid_kind      0 dense (rid elided), 1 ascending varint deltas
 ```
+
+#### zone
+
+Advisory min/max per column, in colmeta ordinal order — what lets a reader skip a part whose
+ranges cannot satisfy a predicate.
+
+```
+varint   n_columns        must equal colmeta's count
+repeated n_columns times:
+  u8     present          0 = no pruning possible for this column
+  if 1:  8 bytes min, 8 bytes max
+```
+
+Min and max encode in the column's own width rules: i64 little-endian, f64 as **bits** (compared
+as floats by the reader), bool widened to 8 bytes as 0 or 1. Three deliberate absences: a string
+column never carries a zone, because its sorted-distinct dictionary already bounds it and bytes
+repeating that would say nothing; a float column that ever saw a **NaN** declares itself
+unprunable, because NaN is unordered and any range claiming to cover it would prune wrongly; and a
+column with no occurrences has nothing to bound. A reader resolves **every** doubt — absent
+section, damaged entry, out-of-range ordinal — to "no pruning": a zone map may only ever widen
+what gets scanned, never narrow it wrongly.
 
 #### Attribute columns
 
