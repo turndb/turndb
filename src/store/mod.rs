@@ -1095,6 +1095,10 @@ impl ReadStore {
     pub fn part_count(&self) -> usize {
         self.parts.len()
     }
+    /// The live parts, oldest to newest — for tools that walk them (verification, inspection).
+    pub fn parts(&self) -> &[Arc<Part>] {
+        &self.parts
+    }
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }

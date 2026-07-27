@@ -8,7 +8,7 @@ edition = "2021"
 # embedder, so the whole plane is optional — but it is on by default, because a feature that is not
 # built by default is a feature that is not tested.
 default = ["sql"]
-sql = ["dep:datafusion", "dep:async-trait", "dep:futures"]
+sql = ["dep:datafusion", "dep:async-trait", "dep:futures", "dep:tokio"]
 # Deterministic-simulation testing: arms a recorder inside the write-path seam (src/vfs.rs) so the
 # DST harness can reconstruct every crash state. Off by default and adds nothing when off; the
 # harness runs as `cargo test --features dst --test dst`.
@@ -21,6 +21,9 @@ datafusion = { version = "54", optional = true }
 # TableProvider is an async trait; this is datafusion's own requirement, not an extra choice.
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
+# The runtime datafusion requires to drive a query — already in the tree through datafusion
+# itself; declaring it lets the CLI block_on a SQL statement. Adds nothing new to the build.
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # Content identity. The fold's whole addressing scheme rests on this.
 blake3 = "1"
 anyhow = "1"
