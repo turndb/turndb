@@ -31,12 +31,21 @@ usage: turndb <verb> [args]
     recover   <DIR>              promote the newest intact retained manifest over a damaged one
     snapshots <DIR>              list retained commits available to time travel
 
+  ingesting:
+    import    <DIR> <JSONL>      ingest records ({\"body\": ..., attrs...} per line; - for stdin),
+                                 carved by the engine's default opinion, batched per 1000
+
   shipping:
     pack      <DIR> <OUT>        the committed snapshot as one file
     unpack    <PACK> <OUTDIR>    extract back into an ordinary store directory
 ";
 
 fn main() {
+    // A CLI that panics when its stdout pipe closes (`| head`) is broken by Unix's rules, not its
+    // own: restore default SIGPIPE so truncated output ends the process quietly.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&args) {
         eprintln!("turndb: {e:#}");
@@ -124,6 +133,11 @@ fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        "import" => {
+            let dir = arg(0, "DIR")?;
+            let src = arg(1, "JSONL")?;
+            import(&dir, &src)
+        }
         "pack" => {
             let st = turndb::pack::write(&arg(0, "DIR")?, &arg(1, "OUT")?)?;
             println!("packed {} files, {} bytes", st.files, st.bytes);
@@ -198,6 +212,84 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
         println!("deep: {} records reconstruct byte-exact ({bytes} content bytes verified)", ids.len());
     }
     println!("ok");
+    Ok(())
+}
+
+/// JSONL in, records out: `body` is the record body (carved by the default opinion), every other
+/// scalar field is an attribute, and `id` (or trace_id:span_id#kind, or a line counter) names it.
+/// Batched per 1000 lines — each batch replays all-or-nothing — and flushed at the end.
+fn import(dir: &Path, src: &Path) -> Result<()> {
+    use std::io::BufRead;
+    let reader: Box<dyn std::io::Read> = if src.as_os_str() == "-" {
+        Box::new(std::io::stdin().lock())
+    } else {
+        Box::new(std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?)
+    };
+    let reader = std::io::BufReader::with_capacity(1 << 22, reader);
+    let mut s = Store::open(dir, FoldCfg::default())?;
+    let mut batch = turndb::store::Batch::new();
+    let (mut n, mut skipped, mut logical) = (0u64, 0u64, 0u64);
+    let t = std::time::Instant::now();
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            skipped += 1;
+            continue;
+        };
+        let Some(body) = v.get("body").and_then(|b| b.as_str()) else {
+            skipped += 1;
+            continue;
+        };
+        let id = match (v.get("id").and_then(|x| x.as_str()), v.get("trace_id").and_then(|x| x.as_str())) {
+            (Some(id), _) => id.to_string(),
+            (None, Some(t)) => format!(
+                "{t}:{}#{}",
+                v.get("span_id").and_then(|x| x.as_str()).unwrap_or("s"),
+                v.get("kind").and_then(|x| x.as_str()).unwrap_or("k")
+            ),
+            (None, None) => format!("import:{n:09}"),
+        };
+        let mut attrs = Vec::new();
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                if k == "body" {
+                    continue;
+                }
+                let av = match val {
+                    serde_json::Value::String(x) => turndb::AttrValue::Str(x.clone()),
+                    serde_json::Value::Bool(x) => turndb::AttrValue::Bool(*x),
+                    serde_json::Value::Number(x) if x.is_i64() => turndb::AttrValue::Int(x.as_i64().unwrap()),
+                    serde_json::Value::Number(x) => turndb::AttrValue::Float(x.as_f64().unwrap_or(0.0)),
+                    _ => continue,
+                };
+                attrs.push((k.clone(), av));
+            }
+        }
+        logical += body.len() as u64;
+        batch.put_body(&id, body.as_bytes(), attrs);
+        n += 1;
+        if batch.len() >= 1000 {
+            s.apply(std::mem::take(&mut batch))?;
+            s.sync()?;
+            s.flush()?;
+        }
+    }
+    if !batch.is_empty() {
+        s.apply(batch)?;
+        s.sync()?;
+        s.flush()?;
+    }
+    let el = t.elapsed().as_secs_f64();
+    println!(
+        "imported {n} records ({skipped} skipped), {:.2} GiB logical, {:.1}s ({:.0} rec/s); parts: {}",
+        logical as f64 / (1u64 << 30) as f64,
+        el,
+        n as f64 / el.max(0.001),
+        s.part_count()
+    );
     Ok(())
 }
 
