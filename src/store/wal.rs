@@ -55,7 +55,9 @@ fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 
 fn get_bytes<'a>(b: &'a [u8], at: &mut usize) -> Result<&'a [u8]> {
     let n = get_varint(b, at)? as usize;
-    if *at + n > b.len() {
+    // `n > len - at`, never `at + n > len`: the left side cannot overflow (at <= len always), the
+    // right side can — a huge declared length wrapped the sum and PASSED the check.
+    if n > b.len() - *at {
         bail!("wal: byte string runs past the frame");
     }
     let s = &b[*at..*at + n];
@@ -98,23 +100,31 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
     }
 }
 
+/// Decode a record payload. Replay hands this only frames whose crc verified, but the crc is a
+/// TORN-WRITE detector, not a validity proof — a buggy writer checksums its bugs perfectly. So
+/// every count is capped by the bytes that would have to carry it before it sizes an allocation,
+/// and every fixed-width read is bounds-checked: corrupt input is an error, never a panic.
 pub fn decode_record(b: &[u8]) -> Result<(Record, Vec<(PieceHash, Vec<u8>)>)> {
+    fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
+        if n > b.len() - *at {
+            bail!("wal: field of {n} bytes runs past the frame");
+        }
+        let s = &b[*at..*at + n];
+        *at += n;
+        Ok(s)
+    }
     let mut at = 0usize;
     let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
     let n_ops = get_varint(b, &mut at)? as usize;
-    let mut body = Vec::with_capacity(n_ops);
+    let mut body = Vec::with_capacity(n_ops.min(b.len()));
     for _ in 0..n_ops {
         let tag = *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: truncated op"))?;
         at += 1;
         match tag {
             0 => body.push(BodyOp::Lit(get_bytes(b, &mut at)?.to_vec())),
             1 => {
-                if at + 32 > b.len() {
-                    bail!("wal: truncated piece hash");
-                }
                 let mut h = [0u8; 32];
-                h.copy_from_slice(&b[at..at + 32]);
-                at += 32;
+                h.copy_from_slice(take(b, &mut at, 32)?);
                 let len = get_varint(b, &mut at)? as u32;
                 body.push(BodyOp::Piece { hash: PieceHash(h), len });
             }
@@ -122,41 +132,27 @@ pub fn decode_record(b: &[u8]) -> Result<(Record, Vec<(PieceHash, Vec<u8>)>)> {
         }
     }
     let n_attrs = get_varint(b, &mut at)? as usize;
-    let mut attrs = Vec::with_capacity(n_attrs);
+    let mut attrs = Vec::with_capacity(n_attrs.min(b.len()));
     for _ in 0..n_attrs {
         let key = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
         let tag = *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: truncated attr"))?;
         at += 1;
         let v = match tag {
             0 => AttrValue::Str(String::from_utf8(get_bytes(b, &mut at)?.to_vec())?),
-            1 => {
-                let x = i64::from_le_bytes(b[at..at + 8].try_into()?);
-                at += 8;
-                AttrValue::Int(x)
-            }
-            2 => {
-                let x = f64::from_bits(u64::from_le_bytes(b[at..at + 8].try_into()?));
-                at += 8;
-                AttrValue::Float(x)
-            }
-            3 => {
-                let x = b[at] != 0;
-                at += 1;
-                AttrValue::Bool(x)
-            }
+            1 => AttrValue::Int(i64::from_le_bytes(take(b, &mut at, 8)?.try_into().unwrap())),
+            2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
+                take(b, &mut at, 8)?.try_into().unwrap(),
+            ))),
+            3 => AttrValue::Bool(take(b, &mut at, 1)?[0] != 0),
             t => bail!("wal: unknown attr type tag {t}"),
         };
         attrs.push((key, v));
     }
     let n_novel = get_varint(b, &mut at)? as usize;
-    let mut novel = Vec::with_capacity(n_novel);
+    let mut novel = Vec::with_capacity(n_novel.min(b.len() / 33 + 1));
     for _ in 0..n_novel {
-        if at + 32 > b.len() {
-            bail!("wal: truncated novel hash");
-        }
         let mut h = [0u8; 32];
-        h.copy_from_slice(&b[at..at + 32]);
-        at += 32;
+        h.copy_from_slice(take(b, &mut at, 32)?);
         novel.push((PieceHash(h), get_bytes(b, &mut at)?.to_vec()));
     }
     Ok((Record { id, body, attrs }, novel))
