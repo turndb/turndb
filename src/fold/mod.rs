@@ -32,13 +32,13 @@ pub mod segment;
 pub use block::{Loc, BLOCK_TARGET_DEFAULT, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 pub use segment::FoldTail;
 
+use crate::readat::ReadAt;
 use crate::types::PieceHash;
 use anyhow::{bail, Context, Result};
 use dedup::DedupTable;
 use segment::{SegHeader, SEG_HDR_LEN, SEG_MAX_DEFAULT, SEG_MAX_LIMIT};
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::collections::hash_map::Entry;
@@ -147,7 +147,9 @@ pub struct Fold {
     dir: PathBuf,
     cfg: FoldCfg,
     headers: Vec<SegHeader>,
-    readers: Vec<Arc<File>>,
+    /// Read handles, one per segment — behind [`ReadAt`] so a sealed fold can later be read out of
+    /// a pack extent or a remote range exactly as it is read out of a directory.
+    readers: Vec<Arc<dyn ReadAt>>,
     dicts: HashMap<[u8; 32], Arc<Vec<u8>>>,
     active: u32,
     /// Physical append point in the active segment. No `Loc` refers to it — addressing is logical.
@@ -336,7 +338,7 @@ impl Fold {
         active_f.sync_all()?;
         segment::fsync_dir(dir)?;
 
-        let mut readers = Vec::with_capacity(headers.len());
+        let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(headers.len());
         for h in &headers {
             readers.push(Arc::new(segment::open_rw(dir, h.seg)?));
         }
@@ -346,7 +348,7 @@ impl Fold {
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
         for (i, h) in headers.iter().enumerate() {
-            let len = readers[i].metadata()?.len();
+            let len = readers[i].len()?;
             let (_, entries) = segment::scan_tail(&readers[i], len, h.has_dict())?;
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -399,7 +401,7 @@ impl Fold {
             }
         }
         let mut headers = Vec::with_capacity(nums.len());
-        let mut readers = Vec::with_capacity(nums.len());
+        let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(nums.len());
         for &n in &nums {
             let f = segment::open_read(dir, n)?;
             let mut hb = [0u8; SEG_HDR_LEN as usize];
@@ -424,7 +426,7 @@ impl Fold {
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
         for (i, h) in headers.iter().enumerate() {
-            let len = readers[i].metadata()?.len();
+            let len = readers[i].len()?;
             let (_, entries) = segment::scan_tail(&readers[i], len, h.has_dict())?;
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -617,7 +619,9 @@ impl Fold {
         if self.cur_off as u64 > SEG_HDR_LEN && self.cur_off as u64 + n as u64 > self.cfg.seg_max as u64 {
             self.roll()?;
         }
-        if let Err(e) = self.active_f.write_all_at(&self.scratch[..n], self.cur_off as u64) {
+        if let Err(e) =
+            std::os::unix::fs::FileExt::write_all_at(&self.active_f, &self.scratch[..n], self.cur_off as u64)
+        {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }

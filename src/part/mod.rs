@@ -40,13 +40,13 @@ pub mod idcol;
 pub mod merge;
 
 use crate::fold::{Fold, Loc};
+use crate::readat::ReadAt;
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
 use idcol::{get_varint, put_varint, IdCol};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use cache::{Held, Kind, SectionCache};
 use std::sync::Arc;
@@ -400,7 +400,7 @@ impl Writer {
 // ---------------------------------------------------------------------------------------------
 
 pub struct Part {
-    f: File,
+    f: Box<dyn ReadAt>,
     toc: HashMap<String, Section>,
     meta: PartMeta,
     /// Identity within the shared cache.
@@ -438,9 +438,15 @@ impl Part {
     /// Open sharing `cache` with other parts.
     pub fn open_in(path: &Path, cache: Arc<SectionCache>) -> Result<Part> {
         let f = File::open(path).with_context(|| format!("open part {}", path.display()))?;
-        let len = f.metadata()?.len();
+        Part::open_reader(Box::new(f), cache)
+    }
+
+    /// Open from any [`ReadAt`] — a plain file, an extent of a pack, a remote range. The format is
+    /// footer-addressed precisely so that THIS is the only entry a backend needs.
+    pub fn open_reader(f: Box<dyn ReadAt>, cache: Arc<SectionCache>) -> Result<Part> {
+        let len = f.len()?;
         if len < FOOTER_LEN {
-            bail!("part {} is too short to hold a footer", path.display());
+            bail!("part of {len} bytes is too short to hold a footer");
         }
         let mut foot = [0u8; FOOTER_LEN as usize];
         f.read_exact_at(&mut foot, len - FOOTER_LEN)?;
