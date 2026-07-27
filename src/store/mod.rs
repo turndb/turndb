@@ -492,6 +492,16 @@ impl Store {
         // way it is unreachable. Safe to unlink even with readers attached: Unix keeps their open
         // mappings alive.
         sweep_unreachable(dir)?;
+        // Crash litter: builder spools and staging files are all *.tmp, and every one of them is
+        // pre-commit garbage. Swept ONLY at writer open, not at flush — an external packer's
+        // staging file must not race a live writer's flush.
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().ends_with(".tmp") && e.path().is_file() {
+                    let _ = crate::vfs::unlink(&e.path());
+                }
+            }
+        }
 
         let wal_path = dir.join("WAL");
         let frames = Wal::replay(&wal_path)?;
