@@ -756,3 +756,51 @@ async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
     assert_eq!(uniq.len(), names.len(), "every field name must be unique: {names:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn zone_maps_prune_a_part_without_decoding_it() {
+    use turndb::query::{Cmp, Pred};
+    let dir = tmp("zoneprune");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for i in 0..20i64 {
+        s.put(&format!("a{i:02}"), &[Span::Lit(b"x")], vec![("tokens".into(), AttrValue::Int(i))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    for i in 0..20i64 {
+        s.put(&format!("b{i:02}"), &[Span::Lit(b"x")], vec![("tokens".into(), AttrValue::Int(10_000 + i))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let parts = parts_of(&dir);
+    assert_eq!(parts.len(), 2);
+    let lens = Lens::new(&parts).unwrap();
+    let proj = lens.project(&["id"]).unwrap();
+    let tokens_field = lens
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == "tokens")
+        .expect("tokens in schema");
+    let pred = Pred { field: tokens_field, op: Cmp::Gt, val: AttrValue::Int(5_000) };
+
+    // Part 1 holds tokens [0, 19]: the zone DISPROVES the predicate, so the scan yields nothing
+    // and decodes NO attribute section at all — the id projection needs none, and the predicate's
+    // column was pruned before its rids were touched.
+    let mut sc = lens.scan(&parts[0], None, &proj, std::slice::from_ref(&pred)).unwrap();
+    assert!(sc.next_batch().unwrap().is_none(), "a zone-disproven part must yield nothing");
+    let st = sc.stats();
+    assert_eq!(st.rows, 0);
+    assert_eq!(st.columns_decoded, 0, "pruning must decode no attribute section");
+
+    // Part 2 holds tokens [10000, 10019]: the zone cannot disprove it, and every row survives.
+    let mut sc = lens.scan(&parts[1], None, &proj, std::slice::from_ref(&pred)).unwrap();
+    let mut rows = 0;
+    while let Some(b) = sc.next_batch().unwrap() {
+        rows += b.num_rows();
+    }
+    assert_eq!(rows, 20, "the matching part must be untouched by pruning");
+    std::fs::remove_dir_all(&dir).ok();
+}

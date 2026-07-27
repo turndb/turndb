@@ -87,6 +87,33 @@ fn arrow_type(tag: u8) -> DataType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cmp { Eq, Ne, Lt, LtEq, Gt, GtEq }
 
+/// Does the zone `(min, max)` PROVE that `<op> val` matches nothing in it? `false` on any doubt —
+/// a type mismatch, a NaN literal — because a zone may only ever widen a scan, never wrongly
+/// narrow one. `Ne` is disproven only when the column is constant at exactly `val`.
+fn zone_disproves(op: Cmp, val: &AttrValue, zone: &(AttrValue, AttrValue)) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    fn ord(a: &AttrValue, b: &AttrValue) -> Option<std::cmp::Ordering> {
+        match (a, b) {
+            (AttrValue::Int(x), AttrValue::Int(y)) => Some(x.cmp(y)),
+            (AttrValue::Float(x), AttrValue::Float(y)) => x.partial_cmp(y),
+            (AttrValue::Bool(x), AttrValue::Bool(y)) => Some(x.cmp(y)),
+            _ => None,
+        }
+    }
+    let (min, max) = zone;
+    let (Some(lo), Some(hi)) = (ord(val, min), ord(val, max)) else {
+        return false;
+    };
+    match op {
+        Cmp::Eq => lo == Less || hi == Greater,
+        Cmp::Ne => lo == Equal && hi == Equal,
+        Cmp::Lt => lo != Greater,  // every value >= min >= val
+        Cmp::LtEq => lo == Less,   // every value >= min > val
+        Cmp::Gt => hi != Less,     // every value <= max <= val
+        Cmp::GtEq => hi == Greater, // every value <= max < val
+    }
+}
+
 /// `field <op> value`, against a [`Lens`] schema field.
 ///
 /// Pushed down as **Inexact**: the query engine re-applies the predicate above the scan, so this is
@@ -304,6 +331,16 @@ impl Lens {
                 tests.push(Test::Never);
                 continue;
             };
+            // Zone pruning: when the column's recorded [min, max] PROVES this predicate can match
+            // no row of the part, no section of the column is decoded at all — placed before the
+            // rid decode on purpose. Conservative twice over: the zone reader resolves every doubt
+            // to None, and the disproof compares only exactly-matching types.
+            if let Some(zone) = part.zone(c)? {
+                if zone_disproves(p_.op, &p_.val, &zone) {
+                    tests.push(Test::Never);
+                    continue;
+                }
+            }
             let (_, tag, occ, kind) = meta[c].clone();
             let rids = attrs::rids(part, c, occ, kind)?;
             let k = match (&p_.val, tag) {
