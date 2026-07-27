@@ -47,6 +47,8 @@ pub struct BuiltCols {
     pub layout: Vec<u8>,
     pub layout_off: Vec<u64>,
     pub meta: Vec<u8>,
+    /// The encoded `zone` section — per-column min/max, advisory.
+    pub zones: Vec<u8>,
     pub cols: Vec<BuiltCol>,
 }
 
@@ -169,7 +171,149 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
         out_cols.push(BuiltCol { rid: rid_bytes, kind, val, dict: dict_bytes });
     }
 
-    Ok(BuiltCols { layout, layout_off, meta, cols: out_cols })
+    let mut zones: Vec<ZoneAcc> = cols.iter().map(|(_, tag)| ZoneAcc::new(*tag)).collect();
+    for (c, values) in raw.iter().enumerate() {
+        for v in values {
+            zones[c].add(v);
+        }
+    }
+
+    Ok(BuiltCols { layout, layout_off, meta, zones: encode_zones(&zones), cols: out_cols })
+}
+
+/// Streaming min/max for one column — the `zone` section's accumulator, shared by both builders
+/// so their bytes cannot drift.
+///
+/// Strings deliberately carry no zone: their sorted-distinct dictionary already IS one (the first
+/// and last entries bound the column) and repeating it would be bytes spent saying so. A float
+/// column that ever sees a NaN declares itself unprunable — NaN is unordered, so any range
+/// claiming to cover it would prune wrongly, and soundness beats cleverness.
+#[derive(Clone)]
+pub struct ZoneAcc {
+    tag: u8,
+    seen: bool,
+    poisoned: bool,
+    min_i: i64,
+    max_i: i64,
+    min_f: f64,
+    max_f: f64,
+    min_b: u8,
+    max_b: u8,
+}
+
+impl ZoneAcc {
+    pub fn new(tag: u8) -> ZoneAcc {
+        ZoneAcc {
+            tag,
+            seen: false,
+            poisoned: tag == 0, // strings: the dictionary is the zone map
+            min_i: i64::MAX,
+            max_i: i64::MIN,
+            min_f: f64::INFINITY,
+            max_f: f64::NEG_INFINITY,
+            min_b: 1,
+            max_b: 0,
+        }
+    }
+
+    pub fn add(&mut self, v: &AttrValue) {
+        self.seen = true;
+        match v {
+            AttrValue::Str(_) => {}
+            AttrValue::Int(x) => {
+                self.min_i = self.min_i.min(*x);
+                self.max_i = self.max_i.max(*x);
+            }
+            AttrValue::Float(x) => {
+                if x.is_nan() {
+                    self.poisoned = true;
+                } else {
+                    self.min_f = self.min_f.min(*x);
+                    self.max_f = self.max_f.max(*x);
+                }
+            }
+            AttrValue::Bool(x) => {
+                self.min_b = self.min_b.min(u8::from(*x));
+                self.max_b = self.max_b.max(u8::from(*x));
+            }
+        }
+    }
+
+    /// One entry: a presence byte, then 8-byte min and max when present.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        if !self.seen || self.poisoned {
+            out.push(0);
+            return;
+        }
+        out.push(1);
+        match self.tag {
+            1 => {
+                out.extend_from_slice(&self.min_i.to_le_bytes());
+                out.extend_from_slice(&self.max_i.to_le_bytes());
+            }
+            2 => {
+                // bit patterns, like the column itself — a reader compares as floats
+                out.extend_from_slice(&self.min_f.to_bits().to_le_bytes());
+                out.extend_from_slice(&self.max_f.to_bits().to_le_bytes());
+            }
+            _ => {
+                out.extend_from_slice(&(self.min_b as i64).to_le_bytes());
+                out.extend_from_slice(&(self.max_b as i64).to_le_bytes());
+            }
+        }
+    }
+}
+
+/// Encode the whole `zone` section from per-column accumulators.
+pub fn encode_zones(zones: &[ZoneAcc]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + zones.len() * 17);
+    put_varint(&mut out, zones.len() as u64);
+    for z in zones {
+        z.encode_into(&mut out);
+    }
+    out
+}
+
+/// Column `c`'s zone, as `(min, max)` in the column's own type. `None` when the section is absent
+/// (an older part), the ordinal is out of range, the column declared itself unprunable, or the
+/// section is malformed — a zone map may only ever WIDEN what a reader scans, never wrongly
+/// narrow it, so every doubt resolves to "no pruning".
+pub fn read_zone(part: &Part, c: usize) -> Result<Option<(AttrValue, AttrValue)>> {
+    if !part.section_present("zone") {
+        return Ok(None);
+    }
+    let meta = read_meta(part)?;
+    let Some((_, tag, _, _)) = meta.get(c) else {
+        return Ok(None);
+    };
+    let b = part.section_bytes("zone")?;
+    let mut at = 0usize;
+    let Ok(n) = get_varint(&b, &mut at) else {
+        return Ok(None);
+    };
+    if c as u64 >= n {
+        return Ok(None);
+    }
+    // walk entries to ordinal c — entries are 1 or 17 bytes, decided by their presence byte
+    for _ in 0..c {
+        let Some(&flag) = b.get(at) else { return Ok(None) };
+        at += if flag == 1 { 17 } else { 1 };
+    }
+    let Some(&flag) = b.get(at) else { return Ok(None) };
+    if flag != 1 {
+        return Ok(None);
+    }
+    if 16 > b.len().saturating_sub(at + 1) {
+        return Ok(None);
+    }
+    let lo = u64::from_le_bytes(b[at + 1..at + 9].try_into().unwrap());
+    let hi = u64::from_le_bytes(b[at + 9..at + 17].try_into().unwrap());
+    Ok(match tag {
+        1 => Some((AttrValue::Int(lo as i64), AttrValue::Int(hi as i64))),
+        2 => Some((AttrValue::Float(f64::from_bits(lo)), AttrValue::Float(f64::from_bits(hi)))),
+        3 => Some((AttrValue::Bool(lo != 0), AttrValue::Bool(hi != 0))),
+        _ => None,
+    })
 }
 
 /// `(key, tag, occurrences, rid_kind)` per column, in ordinal order.

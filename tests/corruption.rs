@@ -144,6 +144,9 @@ fn part_parsers_never_panic_on_damage() {
         let _ = part.find("rec:005");
         let _ = part.tombstones();
         let _ = part.lookup_piece(&probe);
+        for c in 0..8 {
+            let _ = part.zone(c);
+        }
         let n = part.len().min(64);
         for r in 0..n {
             let _ = part.body(r);
