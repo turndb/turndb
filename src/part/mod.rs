@@ -488,10 +488,14 @@ impl Part {
 
         let mut at = 0usize;
         let n = get_varint(&toc_bytes, &mut at)? as usize;
-        let mut toc = HashMap::with_capacity(n);
+        // An entry costs several bytes, so the byte count bounds the entry count — checked before
+        // the count sizes an allocation, because `n` is exactly as trustworthy as the TOC carrying
+        // it, and on a version-0 part the TOC has no checksum at all.
+        let mut toc = HashMap::with_capacity(n.min(toc_bytes.len()));
         for _ in 0..n {
             let nl = get_varint(&toc_bytes, &mut at)? as usize;
-            if at + nl > toc_bytes.len() {
+            // `nl > len - at`, never `at + nl > len`: the sum overflows on a hostile length.
+            if nl > toc_bytes.len() - at {
                 bail!("part TOC entry name runs past the end of the TOC");
             }
             let name = String::from_utf8(toc_bytes[at..at + nl].to_vec())?;
@@ -526,6 +530,21 @@ impl Part {
         }
         if at != toc_bytes.len() {
             bail!("part TOC has {} trailing bytes after its last entry", toc_bytes.len() - at);
+        }
+        // The footer's n_records is load-bearing everywhere — row bounds, dense-column synthesis —
+        // and it is a bare integer a flipped bit can inflate to anything. `prog.off` is REQUIRED
+        // and its RAW size is (n_records + 1) u64s, so the two must agree; after this check the
+        // count is as trustworthy as the section sizes, which are range-checked above.
+        match toc.get("prog.off") {
+            Some(s) => {
+                if s.raw as u64 != (n_records as u64 + 1) * 8 {
+                    bail!(
+                        "footer claims {n_records} records but prog.off holds {} offsets",
+                        s.raw / 8
+                    );
+                }
+            }
+            None => bail!("part is missing its required prog.off section"),
         }
         Ok(Part {
             f,
@@ -614,7 +633,9 @@ impl Part {
     pub fn piece(&self, i: usize) -> Result<(Loc, PieceHash)> {
         let l = self.sect("pdict.loc")?;
         let h = self.sect("pdict.hash")?;
-        if (i + 1) * Loc::WIDTH > l.len() || (i + 1) * 32 > h.len() {
+        // Compared by division, not `(i + 1) * WIDTH`: `i` arrives from a body-program varint and a
+        // hostile value overflows the multiplication.
+        if i >= l.len() / Loc::WIDTH || i >= h.len() / 32 {
             bail!("piece dictionary index {i} out of range");
         }
         let loc = Loc::decode(&l[i * Loc::WIDTH..])?;
@@ -659,7 +680,7 @@ impl Part {
         let b = self.sect("tomb")?;
         let mut at = 0usize;
         let n = get_varint(&b, &mut at)? as usize;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(b.len()));
         let mut cur = 0u64;
         for _ in 0..n {
             cur += get_varint(&b, &mut at)?;
@@ -736,8 +757,11 @@ impl Part {
             bail!("row {r} out of range");
         }
         let (mut at, end) = (offs[r] as usize, offs[r + 1] as usize);
+        if end > prog.len() || at > end {
+            bail!("prog.off names a program outside the prog section");
+        }
         let n = get_varint(&prog, &mut at)? as usize;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(end.saturating_sub(at)));
         for _ in 0..n {
             let tagged = get_varint(&prog, &mut at)?;
             if tagged == OP_ESCAPE_RESERVED {
@@ -745,7 +769,7 @@ impl Part {
             }
             if tagged & 1 == OP_LIT {
                 let len = (tagged >> 1) as usize;
-                if at + len > end {
+                if at > end || len > end - at {
                     bail!("literal runs past the program");
                 }
                 out.push(BodyOp::Lit(prog[at..at + len].to_vec()));
@@ -784,6 +808,9 @@ impl Part {
             bail!("row {r} out of range");
         }
         let (mut at, end) = (offs[r] as usize, offs[r + 1] as usize);
+        if end > prog.len() || at > end {
+            bail!("prog.off names a program outside the prog section");
+        }
         let n = get_varint(&prog, &mut at)? as usize;
         let mut out = Vec::new();
         for _ in 0..n {
@@ -793,7 +820,7 @@ impl Part {
             }
             if tagged & 1 == OP_LIT {
                 let len = (tagged >> 1) as usize;
-                if at + len > end {
+                if at > end || len > end - at {
                     bail!("literal runs past the program");
                 }
                 out.extend_from_slice(&prog[at..at + len]);

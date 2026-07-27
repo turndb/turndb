@@ -107,7 +107,8 @@ impl<'a> IdCol<'a> {
         for _ in 0..=(i % RESTART) {
             let shared = get_varint(self.stream, &mut at)? as usize;
             let suffix_len = get_varint(self.stream, &mut at)? as usize;
-            if shared > cur.len() || at + suffix_len > self.stream.len() {
+            // `suffix_len > len - at` and not `at + suffix_len > len`: the sum can overflow.
+            if shared > cur.len() || suffix_len > self.stream.len() - at {
                 bail!("corrupt id column entry");
             }
             cur.truncate(shared);
@@ -158,7 +159,7 @@ impl<'a> IdCol<'a> {
         for _ in 0..self.len {
             let shared = get_varint(self.stream, &mut at)? as usize;
             let suffix_len = get_varint(self.stream, &mut at)? as usize;
-            if shared > cur.len() || at + suffix_len > self.stream.len() {
+            if shared > cur.len() || suffix_len > self.stream.len() - at {
                 bail!("corrupt id column entry");
             }
             cur.truncate(shared);

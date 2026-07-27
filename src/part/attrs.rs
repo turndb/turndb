@@ -173,18 +173,30 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
 }
 
 /// `(key, tag, occurrences, rid_kind)` per column, in ordinal order.
+///
+/// This — like every reader below — parses section bytes that carry NO verified checksum on the
+/// read path (that is `verify_sections`' deliberate territory). Corrupt bytes must surface as
+/// errors, never as panics or wild allocations: every slice is bounds-checked first, and every
+/// count is capped by the bytes that would have to carry it before it sizes an allocation.
 pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize, u8)>> {
     let m = part.section_bytes("colmeta")?;
     let mut at = 0usize;
     let n = get_varint(&m, &mut at)? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n.min(m.len()));
     for _ in 0..n {
         let kl = get_varint(&m, &mut at)? as usize;
+        // `kl >= len - at`, never `at + kl + 1 > len`: the sum can overflow, the subtraction cannot.
+        if kl >= m.len() - at {
+            bail!("colmeta entry runs past the section");
+        }
         let key = String::from_utf8(m[at..at + kl].to_vec())?;
         at += kl;
         let tag = m[at];
         at += 1;
         let occ = get_varint(&m, &mut at)? as usize;
+        if at >= m.len() {
+            bail!("colmeta entry is truncated before its rid kind");
+        }
         let kind = m[at];
         at += 1;
         out.push((key, tag, occ, kind));
@@ -204,9 +216,12 @@ pub fn read_dict(part: &Part, c: usize) -> Result<std::sync::Arc<Vec<String>>> {
     let b = part.section_bytes(&name)?;
     let mut at = 0usize;
     let n = get_varint(&b, &mut at)? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n.min(b.len()));
     for _ in 0..n {
         let l = get_varint(&b, &mut at)? as usize;
+        if l > b.len() - at {
+            bail!("column dictionary entry runs past the section");
+        }
         out.push(String::from_utf8(b[at..at + l].to_vec())?);
         at += l;
     }
@@ -218,14 +233,27 @@ pub fn rids(part: &Part, c: usize, occ: usize, kind: u8) -> Result<std::sync::Ar
     if let Some(v) = part.rid_cached(c) {
         return Ok(v);
     }
+    // `occ` comes from colmeta and is untrusted. No column can have more occurrences than it has
+    // rows carrying them... times the attrs a row can hold — but a DENSE column is one occurrence
+    // per row exactly, and a delta column cannot outnumber the bytes that encode it. Both bounds
+    // are checked before they size anything.
     let v = match kind {
-        RID_DENSE => (0..occ as u32).collect::<Vec<u32>>(),
+        RID_DENSE => {
+            if occ > part.len() {
+                bail!("dense column claims {occ} occurrences in a part of {} rows", part.len());
+            }
+            (0..occ as u32).collect::<Vec<u32>>()
+        }
         RID_DELTA => {
             let b = part.section_bytes(&format!("col.rid.{c}"))?;
-            let mut out = Vec::with_capacity(occ);
+            let mut out = Vec::with_capacity(occ.min(b.len()));
             let (mut at, mut cur) = (0usize, 0u32);
             for _ in 0..occ {
-                cur += get_varint(&b, &mut at)? as u32;
+                let d = get_varint(&b, &mut at)?;
+                cur = u32::try_from(d)
+                    .ok()
+                    .and_then(|d| cur.checked_add(d))
+                    .ok_or_else(|| anyhow::anyhow!("rid delta overflows the u32 row space"))?;
                 out.push(cur);
             }
             out
@@ -274,7 +302,7 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
     }
     let meta = read_meta(part)?;
 
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n.min(layout.len()));
     // per column: the index of this row's first occurrence, then how many we have consumed
     let mut cursor: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
     for _ in 0..n {
