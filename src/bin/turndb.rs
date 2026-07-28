@@ -327,8 +327,8 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
     ids.sort();
     ids.dedup();
 
-    // The resolved set is digested rather than listed by default: an erasure record OUTLIVES the
-    // data it documents, and re-stating the erased identifiers would re-leak what was erased.
+    // The resolved set is digested rather than listed by default: whatever captures this output
+    // outlives the data, and re-stating the erased identifiers would re-leak what was erased.
     let mut h = blake3::Hasher::new();
     for id in &ids {
         h.update(id.as_bytes());

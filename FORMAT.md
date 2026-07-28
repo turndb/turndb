@@ -535,7 +535,7 @@ log begins at its next commit.
 
 ### The hash chain
 
-Two more defaulted fields turn the commit log into tamper-evidence:
+Two more defaulted fields make the commit log self-checking:
 
 * `prev` — BLAKE3 of the **previous manifest's exact bytes**, hex. Every commit chains onto what
   it replaced, at zero marginal cost. Absent on a store's first commit and in pre-chain manifests.
@@ -543,12 +543,16 @@ Two more defaulted fields turn the commit log into tamper-evidence:
   committed. Absent in pre-chain entries.
 
 Content is pinned **transitively**: `b3` covers the part, the part's `pdict.hash` carries
-per-piece BLAKE3, and every content read verifies against those — so tampering with the fold is
-detectable through the parts, and no segment-level digest is needed. The chain's honest span:
+per-piece BLAKE3, and every content read verifies against those — so a fold that has drifted from
+what its parts expect is detectable through them, and no segment-level digest is needed. The chain's honest span:
 pruned manifests take their bytes with them, so links are verifiable across the retained window
-plus whatever manifests an operator archived. The chain is tamper-*evidence* for what is present,
-never a claim about what is not — and it supports the ordinary business-records foundation; it
-does not replace it.
+plus whatever manifests an operator archived; it is silent about commits whose bytes have been
+pruned.
+
+What the chain is *for*: catching what per-section checksums cannot. A part swapped for another
+valid part, a manifest restored out of order, a file replaced wholesale — each is internally
+consistent, and only the chain notices. That is an integrity property, and this document claims
+nothing beyond it.
 
 ### Ordering
 
