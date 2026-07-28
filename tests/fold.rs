@@ -463,7 +463,7 @@ fn a_committed_tail_beyond_the_data_is_refused() {
     {
         let mut f = Fold::open(&d, cfg).unwrap();
         for i in 0..50u32 {
-            f.put(&blake3::hash(&i.to_le_bytes()).as_bytes().to_vec()).unwrap();
+            f.put(blake3::hash(&i.to_le_bytes()).as_bytes().as_ref()).unwrap();
         }
         f.sync().unwrap();
     }

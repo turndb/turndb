@@ -158,6 +158,11 @@ pub fn build_retaining(
 /// cannot shadow anything.
 ///
 /// `tombs` is parallel to `records` and may be empty, meaning none.
+// Eight arguments, all distinct and none derivable from the others: where to write, what to
+// write, which of it is a tombstone, the sequence range the part claims, the compression level,
+// how to resolve a piece to a location, and which locations to retain. Bundling them into a struct
+// would move the same eight names one level down for no gain in clarity.
+#[allow(clippy::too_many_arguments)]
 pub fn build_full(
     path: &Path,
     records: &[Record],
@@ -403,6 +408,9 @@ impl Writer {
 // ---------------------------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------------------------
+
+/// One section's on-disk anatomy: `(name, stored, raw, codec)`.
+pub type SectionInfo = (String, u32, u32, u8);
 
 pub struct Part {
     f: Box<dyn ReadAt>,
@@ -890,11 +898,11 @@ impl Part {
         }
     }
 
-    /// Every section: `(name, stored, raw, codec)` — the on-disk anatomy of this part.
-    pub fn sections(&self) -> Vec<(String, u32, u32, u8)> {
-        let mut v: Vec<(String, u32, u32, u8)> =
+    /// Every section — the on-disk anatomy of this part.
+    pub fn sections(&self) -> Vec<SectionInfo> {
+        let mut v: Vec<SectionInfo> =
             self.toc.iter().map(|(n, s)| (n.clone(), s.stored, s.raw, s.codec)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|s| std::cmp::Reverse(s.1));
         v
     }
 

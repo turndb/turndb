@@ -7,7 +7,7 @@
 #![cfg(feature = "sql")]
 
 use datafusion::arrow::array::{Array, AsArray};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turndb::fold::FoldCfg;
 use turndb::part::Part;
@@ -25,7 +25,7 @@ fn cfg() -> FoldCfg {
 }
 
 /// A store of `n` records per flush over `flushes` flushes, with a realistic attribute mix.
-fn build(dir: &PathBuf, flushes: usize, per: usize) -> Vec<(String, Vec<u8>)> {
+fn build(dir: &Path, flushes: usize, per: usize) -> Vec<(String, Vec<u8>)> {
     let mut s = Store::open(dir, cfg()).unwrap();
     let mut want = Vec::new();
     for f in 0..flushes {
@@ -350,7 +350,7 @@ async fn sql_selects_filters_and_aggregates() {
         for i in 0..b.num_rows() {
             let n: usize = ids.value(i).split('-').nth(1).unwrap().parse().unwrap();
             assert!(
-                n % 3 == 0 && n * 10 > 2900,
+                n.is_multiple_of(3) && n * 10 > 2900,
                 "row {} does not satisfy the predicate",
                 ids.value(i)
             );

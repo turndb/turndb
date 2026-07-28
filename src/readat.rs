@@ -24,6 +24,11 @@ pub trait ReadAt: Send + Sync {
 
     /// Total addressable length.
     fn len(&self) -> io::Result<u64>;
+
+    /// Whether the source holds no bytes at all — an empty file, or a zero-length pack extent.
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
 }
 
 impl ReadAt for File {

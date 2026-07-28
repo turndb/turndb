@@ -48,7 +48,9 @@ usage: turndb <verb> [args]
 
 fn main() {
     // A CLI that panics when its stdout pipe closes (`| head`) is broken by Unix's rules, not its
-    // own: restore default SIGPIPE so truncated output ends the process quietly.
+    // own: restore default SIGPIPE so truncated output ends the process quietly. Unix-only because
+    // the signal is — WASI has no SIGPIPE, and nothing to restore.
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }

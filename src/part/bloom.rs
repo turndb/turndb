@@ -60,7 +60,7 @@ pub fn probe_encoded(sec: &[u8], h: &PieceHash) -> bool {
 impl Bloom {
     pub fn with_capacity(n: usize) -> Bloom {
         let m = ((n as u64).max(1) * BITS_PER).max(64);
-        Bloom { bits: vec![0u8; ((m + 7) / 8) as usize], m }
+        Bloom { bits: vec![0u8; m.div_ceil(8) as usize], m }
     }
 
     pub fn insert(&mut self, h: &PieceHash) {
@@ -90,7 +90,7 @@ impl Bloom {
             bail!("bloom section truncated");
         }
         let m = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        if m == 0 || b.len() - 8 < ((m + 7) / 8) as usize {
+        if m == 0 || b.len() - 8 < m.div_ceil(8) as usize {
             bail!("bloom bit array does not match its declared size");
         }
         Ok(Bloom { m, bits: b[8..].to_vec() })

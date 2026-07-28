@@ -148,8 +148,9 @@ fn main() -> anyhow::Result<()> {
     // ---- Design A: content addressed. Fold = distinct pieces, block compressed. ----
     println!("-- A: content-addressed (distinct pieces block-compressed) --");
     println!("{:<14}{:>12}{:>14}{:>16}", "block/level", "fold MiB", "B/distinct p", "+identity h");
-    let mut a_fold = 0u64;
-    for (blk, lvl) in [(4 << 20, 19)] {
+    let a_fold;
+    {
+        let (blk, lvl) = (4 << 20, 19);
         a_fold = blocked(&pieces, blk, lvl);
         let p = a_fold as f64 / d_count as f64;
         println!(

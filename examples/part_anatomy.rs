@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         "section", "stored MiB", "% meta", "raw MiB", "ratio", "B/record"
     );
     let mut rows: Vec<_> = agg.into_iter().collect();
-    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1 .0));
     for (name, (stored, raw, _)) in &rows {
         println!(
             "{:<16}{:>11.3}{:>8.1}%{:>12.2}{:>7.1}x{:>12.1}",

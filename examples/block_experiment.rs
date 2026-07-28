@@ -83,6 +83,9 @@ fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
+/// Where a piece landed: `(block index, offset within it, length)`.
+type PiecePlacement = (usize, usize, usize);
+
 fn main() -> anyhow::Result<()> {
     let corpus =
         PathBuf::from(std::env::args().nth(1).expect("usage: block_experiment <corpus.jsonl>"));
@@ -184,7 +187,7 @@ fn main() -> anyhow::Result<()> {
                 nblocks,
                 secs
             );
-            if best.as_ref().map_or(true, |(_, b, _)| on_disk < *b) {
+            if best.as_ref().is_none_or(|(_, b, _)| on_disk < *b) {
                 best = Some((name, on_disk, block_bytes));
             }
         }
@@ -206,7 +209,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some((_, _, bb)) = &best {
         // rebuild blocks at the winning size, record which block each piece landed in
-        let (mut blocks, mut where_of): (Vec<Vec<u8>>, Vec<(usize, usize, usize)>) =
+        let (mut blocks, mut where_of): (Vec<Vec<u8>>, Vec<PiecePlacement>) =
             (Vec::new(), Vec::new());
         let mut buf: Vec<u8> = Vec::new();
         for p in &pieces {
