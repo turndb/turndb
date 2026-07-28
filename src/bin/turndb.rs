@@ -32,28 +32,14 @@ usage: turndb <verb> [args]
                                  erasure; no offsets move, no parts are rebuilt
     recover   <DIR>              promote the newest intact retained manifest over a damaged one
     snapshots <DIR>              list retained commits available to time travel
-    erase     <DIR> (--id ID ... | --attr KEY=VALUE) [--include-ids]
+    erase     <DIR> (--id ID ... | --attr KEY=VALUE)
                                  tombstone, settle, and REWRITE until content and metadata are
-                                 physically gone; writes an erasure record under erasures/ and
-                                 prints its digest (sign it with your own PKI — this tool records
-                                 process, it does not claim proof)
+                                 physically gone. Prints what it did; capturing that output is
+                                 your compliance programme's job, not this tool's
 
   ingesting:
     import    <DIR> <JSONL>      ingest records ({\"body\": ..., attrs...} per line; - for stdin),
                                  carved by the engine's default opinion, batched per 1000
-
-  constellations (a directory of member stores and packs):
-    catalog   <ROOT> [rebuild]   list the members, or reconstruct the catalog by scanning
-    cids      <ROOT>             every live id across the constellation
-    cget      <ROOT> <ID>        reconstruct one record, later members winning
-    hold      <ROOT> <MEMBER> <REASON>     place a legal hold — retention will refuse this member
-    release   <ROOT> <MEMBER> <REASON>     release one hold (a member is free only when all are)
-    retention <ROOT> <BEFORE> [--apply]    plan (default) or apply expiry of windows before BEFORE;
-                                           apply drops members from the catalog and NEVER deletes
-                                           bytes — the paths it prints are yours to remove
-    reseal    <ROOT> <OUT> <MEMBER>...
-                                 collapse a contiguous run of members into one sealed pack and
-                                 swap the catalog to it; inputs are left on disk for you to remove
 
   shipping:
     pack      <DIR> <OUT>        the committed snapshot as one file
@@ -162,106 +148,6 @@ fn run(args: &[String]) -> Result<()> {
             for c in turndb::store::retained_commits(&arg(0, "DIR")?) {
                 println!("{c}");
             }
-            Ok(())
-        }
-        "catalog" => {
-            let root = arg(0, "ROOT")?;
-            if rest.get(1) == Some(&"rebuild") {
-                let mut c = turndb::catalog::Catalog::rebuild(&root)?;
-                c.commit(&root)?;
-                println!("rebuilt: {} members (windows and seal flags are policy and are not recovered)", c.members.len());
-                return Ok(());
-            }
-            let c = turndb::catalog::Catalog::load(&root)?;
-            println!("catalog: commit {}, {} members", c.commit, c.members.len());
-            for m in &c.members {
-                println!(
-                    "  [{}] {}{}{}",
-                    m.ordinal,
-                    m.path,
-                    m.window.as_deref().map(|w| format!("  window={w}")).unwrap_or_default(),
-                    if m.sealed { "  sealed" } else { "" }
-                );
-            }
-            Ok(())
-        }
-        "cids" => {
-            let r = turndb::catalog::CatalogReader::open(&arg(0, "ROOT")?, FoldCfg::default())?;
-            let mut out = std::io::stdout().lock();
-            for id in r.ids()? {
-                writeln!(out, "{id}")?;
-            }
-            Ok(())
-        }
-        "cget" => {
-            let r = turndb::catalog::CatalogReader::open(&arg(0, "ROOT")?, FoldCfg::default())?;
-            let id = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing ID\n\n{USAGE}"))?;
-            match r.reconstruct(id)? {
-                Some(b) => {
-                    std::io::stdout().lock().write_all(&b)?;
-                    Ok(())
-                }
-                None => bail!("no record {id:?} in this constellation"),
-            }
-        }
-        "hold" | "release" => {
-            let root = arg(0, "ROOT")?;
-            let member = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing MEMBER\n\n{USAGE}"))?;
-            let reason = rest.get(2).ok_or_else(|| anyhow::anyhow!("missing REASON\n\n{USAGE}"))?;
-            let mut c = turndb::catalog::Catalog::load(&root)?;
-            if verb == "hold" {
-                c.hold(member, reason)?;
-                c.commit(&root)?;
-                println!("{member} is under legal hold: {reason}");
-            } else {
-                let had = c.release(member, reason)?;
-                c.commit(&root)?;
-                let left = c.members.iter().find(|m| m.path == *member).map(|m| m.holds.len()).unwrap_or(0);
-                println!(
-                    "{}{member}: {left} hold(s) remain",
-                    if had { "released; " } else { "no such hold; " }
-                );
-            }
-            Ok(())
-        }
-        "retention" => {
-            let root = arg(0, "ROOT")?;
-            let before = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing BEFORE\n\n{USAGE}"))?;
-            let mut c = turndb::catalog::Catalog::load(&root)?;
-            let plan = c.plan_retention(before);
-            for (m, reasons) in &plan.held {
-                println!("HELD    {m}  ({})", reasons.join(", "));
-            }
-            for m in &plan.expired {
-                println!("EXPIRE  {m}");
-            }
-            if !rest.contains(&"--apply") {
-                println!(
-                    "plan only ({} to expire, {} held) — rerun with --apply",
-                    plan.expired.len(),
-                    plan.held.len()
-                );
-                return Ok(());
-            }
-            let removed = c.apply_retention(&root, &plan)?;
-            println!(
-                "removed {} member(s) from the catalog. THE BYTES REMAIN — delete when satisfied:",
-                removed.len()
-            );
-            for m in &removed {
-                println!("  {}", root.join(m).display());
-            }
-            Ok(())
-        }
-        "reseal" => {
-            let root = arg(0, "ROOT")?;
-            let out = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing OUT\n\n{USAGE}"))?;
-            let members: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
-            let st = turndb::catalog::reseal(&root, &members, out, FoldCfg::default())?;
-            println!(
-                "collapsed {} members into {out}: {} records, {} bytes (inputs left on disk)",
-                st.members_collapsed, st.records, st.bytes
-            );
             Ok(())
         }
         "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
@@ -413,13 +299,10 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
             other => bail!("unknown erase argument {other:?}"),
         }
     }
-    let request = match (&ids.is_empty(), &attr) {
-        (false, None) => serde_json::json!({"kind": "ids", "count": ids.len()}),
-        (true, Some((k, v))) => serde_json::json!({"kind": "attr", "key": k, "value": v}),
-        _ => bail!("erase needs exactly one of --id ... or --attr KEY=VALUE\n\n{USAGE}"),
-    };
+    if ids.is_empty() == attr.is_none() {
+        bail!("erase needs exactly one of --id ... or --attr KEY=VALUE\n\n{USAGE}");
+    }
 
-    let started = unix_now();
     let pre_manifest = blake3::hash(&std::fs::read(dir.join("MANIFEST"))?).to_hex().to_string();
 
     let mut s = Store::open(dir, FoldCfg::default())?;
@@ -457,54 +340,27 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
     drop(s);
     let post_manifest = blake3::hash(&std::fs::read(dir.join("MANIFEST"))?).to_hex().to_string();
 
-    let mut record = serde_json::json!({
-        "record": "turndb erasure",
-        "wording": "this documents a process executed against ONE store; it makes no claim about \
-                    copies elsewhere (earlier packs, replicas, backups), and it is a record, not a proof",
-        "tool": {"name": "turndb", "version": env!("CARGO_PKG_VERSION")},
-        "store": dir.display().to_string(),
-        "started_unix": started,
-        "finished_unix": unix_now(),
-        "request": request,
-        "resolved": {"count": ids.len(), "ids_blake3": resolved_digest},
-        "outcome": {
-            "tombstoned": stats.tombstoned,
-            "already_absent": stats.absent,
-            "records_dropped": stats.refold.map(|r| r.records_dropped),
-            "pieces_dropped": stats.refold.map(|r| r.pieces_dropped),
-            "bytes_reclaimed": stats.refold.map(|r| r.bytes_reclaimed()),
-            "stale_generation_left": stats.refold.map(|r| r.stale_generation_left),
-            "metadata_rebuilt": stats.refold.is_some(),
-            "snapshots_purged": stats.refold.is_some()
-        },
-        "manifest_blake3": {"before": pre_manifest, "after": post_manifest}
-    });
-    if include_ids {
-        record["resolved"]["ids"] = serde_json::json!(ids);
-    }
-
-    let edir = dir.join("erasures");
-    std::fs::create_dir_all(&edir)?;
-    let path = edir.join(format!("erasure-{started}.json"));
-    let bytes = serde_json::to_vec_pretty(&record)?;
-    std::fs::write(&path, &bytes)?;
     println!(
-        "erased {} of {} requested ({} already absent); record: {}\nrecord blake3: {}",
-        stats.tombstoned,
-        stats.requested,
-        stats.absent,
-        path.display(),
-        blake3::hash(&bytes).to_hex()
+        "erased {} of {} requested ({} already absent)",
+        stats.tombstoned, stats.requested, stats.absent
     );
+    if let Some(r) = stats.refold {
+        println!(
+            "  dropped {} pieces, reclaimed {} bytes; parts rebuilt, snapshots purged",
+            r.pieces_dropped,
+            r.bytes_reclaimed()
+        );
+    }
+    println!("  manifest blake3: {pre_manifest} -> {post_manifest}");
+    println!("  resolved-set blake3: {resolved_digest}");
+    if include_ids {
+        for id in &ids {
+            println!("  erased: {id}");
+        }
+    }
     Ok(())
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// JSONL in, records out: `body` is the record body (carved by the default opinion), every other
 /// scalar field is an attribute, and `id` (or trace_id:span_id#kind, or a line counter) names it.
