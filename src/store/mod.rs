@@ -118,8 +118,8 @@ pub struct PartRef {
     pub records: u32,
     /// BLAKE3 of the part file's bytes, hex — the manifest PINNING the part. Content is pinned
     /// transitively from here: this digest covers `pdict.hash`, which carries per-piece BLAKE3,
-    /// so fold tampering is detectable without any segment-level digest. Absent in manifests
-    /// written before the chain existed.
+    /// so a fold that drifted from what a part expects is detectable without any segment-level
+    /// digest. Absent in manifests written before the chain existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub b3: Option<String>,
 }
@@ -159,9 +159,12 @@ pub struct Manifest {
     pub punched: Vec<(u32, u32)>,
     /// BLAKE3 of the PREVIOUS manifest's exact bytes, hex — the commit log as a hash chain, at
     /// zero marginal cost. Absent on a store's first commit and in manifests written before the
-    /// chain existed. Honesty note: pruned manifests take their bytes with them, so the VERIFIABLE
-    /// chain spans the retained window plus whatever manifests an operator archived; the chain is
-    /// tamper-EVIDENCE for what is present, never a claim about what is not.
+    /// chain existed.
+    ///
+    /// This is an INTEGRITY check, not a security claim: it catches a manifest that was replaced,
+    /// reordered, or restored out of band, which section checksums cannot see because each one is
+    /// individually valid. Pruned manifests take their bytes with them, so the chain is verifiable
+    /// across the retained window and says nothing about what is no longer there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev: Option<String>,
 }
@@ -432,9 +435,10 @@ pub struct ChainReport {
 
 /// Verify the manifest hash chain and every part pin it carries, across the retained window.
 ///
-/// The chain's honest span: pruned manifests take their bytes with them, so links are checkable
-/// for what is present (plus whatever an operator archived elsewhere). Failure is an error naming
-/// the broken link or drifted part — tamper-EVIDENCE, presented for a human to act on.
+/// Catches what the per-section checksums cannot: a part swapped for another valid part, a
+/// manifest restored out of order, a file replaced wholesale. Each of those is internally
+/// consistent and only the chain notices. Verifiable across the retained window; silent about
+/// commits whose bytes have been pruned.
 pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
     let mut report = ChainReport::default();
     let commits = list_retained(dir);
@@ -1139,8 +1143,8 @@ impl Store {
     /// the erased record is not erasure.
     ///
     /// What this does NOT promise, stated because overclaiming here is a liability: nothing about
-    /// copies outside this store — packs written earlier, replicas, backups. An erasure record
-    /// documents a process faithfully executed against THIS store, and only that.
+    /// copies outside this store — packs written earlier, replicas, backups. It removes data from
+    /// THIS store, and only that.
     ///
     /// Ids that do not exist are counted, not errored: a DSAR naming already-gone data is a
     /// normal outcome, and the record should say so rather than fail.
@@ -1351,7 +1355,7 @@ fn to_ranges(ids: &[u32]) -> Vec<(u32, u32)> {
     out
 }
 
-/// What an erasure did — the facts an erasure record is built from.
+/// What an erasure did.
 #[derive(Clone, Copy, Debug)]
 pub struct ErasureStats {
     pub requested: usize,
