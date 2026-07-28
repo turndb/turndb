@@ -113,6 +113,12 @@ impl BlockHdr {
 }
 
 pub fn parse_hdr(b: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
+    parse_hdr_in(b, seg_has_dict, false)
+}
+
+/// [`parse_hdr`], told whether its segment is encrypted — because two of the invariants below are
+/// statements about *plaintext* framing and stop holding once a payload is ciphertext.
+pub fn parse_hdr_in(b: &[u8], seg_has_dict: bool, seg_encrypted: bool) -> Result<BlockHdr> {
     if b.len() < BLOCK_HDR_LEN {
         bail!("block header truncated: {} bytes", b.len());
     }
@@ -125,18 +131,86 @@ pub fn parse_hdr(b: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
     }
     let raw = u32::from_le_bytes(b[2..6].try_into().unwrap());
     let stored = u32::from_le_bytes(b[6..10].try_into().unwrap());
-    // Guaranteed by the encoder's codec-0 fallback, so a violation means corruption.
-    if stored > raw {
-        bail!("block stored {stored} > raw {raw}");
-    }
-    if codec == CODEC_STORED && raw != stored {
-        bail!("stored-codec block with raw {raw} != stored {stored}");
+    if seg_encrypted {
+        // An encrypted payload carries key id, nonce and tag on top of ciphertext, and ciphertext
+        // of incompressible content does not shrink — so `stored <= raw` is simply false here, and
+        // asserting it would refuse perfectly good blocks. What replaces it: the payload must at
+        // least be able to HOLD its own framing.
+        if (stored as usize) < crate::cipher::AEAD_OVERHEAD {
+            bail!("encrypted block payload of {stored} bytes cannot hold its {} bytes of framing",
+                  crate::cipher::AEAD_OVERHEAD);
+        }
+        // `r16` is a prefix of BLAKE3 over the PLAINTEXT block. In an encrypted fold that is a
+        // 16-bit confirmation oracle sitting in cleartext next to the ciphertext it describes, so
+        // the writer zeroes it and the reader refuses anything else. The AEAD tag already provides
+        // — properly — the integrity check r16 approximated.
+        if b[10] != 0 || b[11] != 0 {
+            bail!("encrypted block carries a plaintext content hash in r16 — refusing");
+        }
+    } else {
+        // Guaranteed by the encoder's codec-0 fallback, so a violation means corruption.
+        if stored > raw {
+            bail!("block stored {stored} > raw {raw}");
+        }
+        if codec == CODEC_STORED && raw != stored {
+            bail!("stored-codec block with raw {raw} != stored {stored}");
+        }
     }
     if codec == CODEC_ZSTD_DICT && !seg_has_dict {
         bail!("dictionary-coded block in a segment that names no dictionary");
     }
     let block_id = u32::from_le_bytes(b[12..16].try_into().unwrap());
     Ok(BlockHdr { block_id, codec, raw, stored, r16: [b[10], b[11]] })
+}
+
+/// Build an ENCRYPTED block frame: the same 16-byte header (so a tail scan is unchanged), with the
+/// payload replaced by `key_id || nonce || ciphertext||tag` and `r16` zeroed.
+///
+/// The header is the AEAD's associated data, which is what stops ciphertext being moved to another
+/// block id, another offset, or another segment and still opening.
+pub fn encode_sealed(
+    out: &mut Vec<u8>,
+    block_id: u32,
+    codec: u8,
+    raw_len: usize,
+    key: crate::cipher::KeyId,
+    nonce: &[u8; crate::cipher::NONCE_LEN],
+    sealed: &[u8],
+) -> usize {
+    let stored = crate::cipher::AEAD_OVERHEAD - crate::cipher::TAG_LEN + sealed.len();
+    assert!(
+        raw_len as u64 <= u32::MAX as u64 && stored as u64 <= u32::MAX as u64,
+        "encrypted block of {raw_len} raw / {stored} stored bytes exceeds the u32 frame fields"
+    );
+    out.clear();
+    out.reserve(BLOCK_OVERHEAD + stored);
+    out.push(BLOCK_TAG);
+    out.push(codec);
+    out.extend_from_slice(&(raw_len as u32).to_le_bytes());
+    out.extend_from_slice(&(stored as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8, 0u8]); // r16: never a plaintext hash in an encrypted fold
+    out.extend_from_slice(&block_id.to_le_bytes());
+    out.extend_from_slice(&key.0);
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(sealed);
+    let sum = xsum(&out[..]);
+    out.extend_from_slice(&sum);
+    out.len()
+}
+
+/// Split an encrypted payload into `(key_id, nonce, ciphertext||tag)`.
+pub fn split_sealed(
+    payload: &[u8],
+) -> Result<(crate::cipher::KeyId, [u8; crate::cipher::NONCE_LEN], &[u8])> {
+    use crate::cipher::{KeyId, KEY_ID_LEN, NONCE_LEN, TAG_LEN};
+    if payload.len() < KEY_ID_LEN + NONCE_LEN + TAG_LEN {
+        bail!("encrypted payload of {} bytes is shorter than its framing", payload.len());
+    }
+    let mut key = [0u8; KEY_ID_LEN];
+    key.copy_from_slice(&payload[..KEY_ID_LEN]);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&payload[KEY_ID_LEN..KEY_ID_LEN + NONCE_LEN]);
+    Ok((KeyId(key), nonce, &payload[KEY_ID_LEN + NONCE_LEN..]))
 }
 
 /// The 4-byte tail checksum over `frame[0 .. BLOCK_HDR_LEN + stored]`.
@@ -177,7 +251,12 @@ pub fn encode(out: &mut Vec<u8>, block_id: u32, codec: u8, raw_block: &[u8], pay
 
 /// Verify a whole block frame's bytes without decoding the payload.
 pub fn verify_frame_bytes(frame: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
-    let hdr = parse_hdr(frame, seg_has_dict)?;
+    verify_frame_bytes_in(frame, seg_has_dict, false)
+}
+
+/// [`verify_frame_bytes`], told whether its segment is encrypted.
+pub fn verify_frame_bytes_in(frame: &[u8], seg_has_dict: bool, seg_encrypted: bool) -> Result<BlockHdr> {
+    let hdr = parse_hdr_in(frame, seg_has_dict, seg_encrypted)?;
     let end = BLOCK_HDR_LEN + hdr.stored as usize;
     if frame.len() < end + BLOCK_XSUM_LEN {
         bail!("block truncated: have {} bytes, need {}", frame.len(), end + BLOCK_XSUM_LEN);

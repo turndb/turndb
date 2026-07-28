@@ -87,11 +87,44 @@ bit, and that is what the field is reserved for.
 | 0 | `ENCRYPTED` | this segment's block payloads are ciphertext; reading requires keys |
 | 1.. | — | unassigned; a reader must refuse any of them |
 
-Bit 0 is **reserved and refused, and no writer sets it yet**. That ordering is the point: a
-reject-forward lever only protects readers that already refuse before a writer can produce the
-thing, so the bit is claimed — and named in the refusal, so an operator meeting an encrypted fold
-hears "this is encrypted and you have no way in" rather than "unknown flags", which would send
-them hunting corruption that is not there — ahead of the encryption work rather than alongside it.
+A **known** bit is acted on; an unknown one stops the open. An encrypted segment therefore *opens*
+— ids, attributes, and every part-plane answer stay available, because only content needs keys —
+and a block read without them refuses **by name**, distinguishing three states an operator must
+never see conflated:
+
+| state | what a reader says |
+|---|---|
+| keys present | the content |
+| no cipher attached | "encrypted; unreadable without keys" |
+| key destroyed | "**ERASED**; permanently unreadable" |
+| key present, tag fails | damage or tampering — an error, and a different one |
+
+### Encrypted block frames
+
+In a segment carrying `ENCRYPTED`, the 16-byte block header is unchanged — so a tail scan walks
+the chain exactly as it always did — and the payload becomes:
+
+```
+key_id (16) || nonce (12) || ciphertext || tag (16)
+```
+
+`stored` covers all of it. Two header invariants change with it, and both changes are load-bearing:
+
+* `stored <= raw` **does not hold**: ciphertext of incompressible content does not shrink and 44
+  bytes of framing are added. What replaces it is that the payload must be able to hold its own
+  framing.
+* `r16` **must be zero**. It is a prefix of BLAKE3 over the *plaintext* block, which beside its own
+  ciphertext is a 16-bit confirmation oracle. The AEAD tag already provides — properly — the
+  integrity check `r16` approximated, so a writer zeroes it and a reader refuses anything else.
+
+Compress **then** encrypt: the other order yields ciphertext that will not compress. The block
+header is the AEAD's associated data, so ciphertext cannot be relocated to another block id,
+offset, or segment and still open.
+
+What encryption does **not** erase, and what any erasure claim must say: piece **lengths** in
+`pdict.loc` and piece **hashes** in `pdict.hash` are required plaintext sections of every part.
+Measured on a real corpus, 59.9% of pieces are under 1 KiB, so the length profile is a genuine
+fingerprint. Only a re-fold or re-seal rebuilds the parts and removes it.
 
 `dict_id` names a dictionary file `zdict-<hex>.zd` beside the segments, whose contents must hash to
 the id naming it. No writer currently produces one; the field is honoured on read.

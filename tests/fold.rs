@@ -544,28 +544,32 @@ fn scrub_verifies_every_frame_and_condemns_a_damaged_sealed_segment() {
 }
 
 #[test]
-fn an_encrypted_segment_is_refused_by_name_not_as_unknown_flags() {
-    // The reject-forward lever, exercised before any writer can set it: a build with no
-    // decryption path must say WHY it cannot read, because "unknown flags" would send an operator
-    // hunting corruption that is not there.
+fn an_encrypted_segment_opens_but_refuses_content_without_keys() {
+    // An encrypted segment is a KNOWN flag, so the fold opens: ids, attributes and every part-plane
+    // answer stay available, and only CONTENT needs keys. The refusal is therefore per block and
+    // it names the reason — "unknown flags" at open would both overreach and send an operator
+    // hunting corruption that is not there. An unknown future bit still refuses the whole open.
     let dir = tmp("encflag");
-    {
+    let loc = {
         let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
-        f.put(b"content that a future build would have encrypted").unwrap();
+        let p = f.put(b"content that a keyed build would have encrypted").unwrap();
         f.sync().unwrap();
-    }
+        p
+    };
     let seg = dir.join("seg-00000000.fold");
     let mut b = std::fs::read(&seg).unwrap();
     b[12..16].copy_from_slice(&turndb::fold::segment::SEG_FLAG_ENCRYPTED.to_le_bytes());
     std::fs::write(&seg, &b).unwrap();
 
-    let err = match Fold::open_read(&dir, FoldCfg::default()) {
-        Err(e) => format!("{e:#}"),
-        Ok(_) => panic!("an encrypted segment must refuse a build with no keys"),
-    };
-    assert!(err.contains("ENCRYPTED"), "the refusal must name encryption: {err}");
+    // The flag is KNOWN, so the fold opens rather than refusing outright. (A flag-flipped
+    // plaintext segment holds no frame that satisfies the encrypted rules, so no block resolves —
+    // which is itself correct. The real no-keys and destroyed-key refusals are asserted against a
+    // genuinely encrypted fold in turndb-crypto's `erasure` test, where a cipher exists to make
+    // one.)
+    let f = Fold::open_read(&dir, FoldCfg::default()).expect("a known flag must not refuse the open");
+    assert!(f.read_verified(loc.loc, loc.hash).is_err(), "no block may resolve out of it");
 
-    // and an unknown future bit still refuses generically
+    // an unknown future bit still refuses the open outright
     let mut b = std::fs::read(&seg).unwrap();
     b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
     std::fs::write(&seg, &b).unwrap();

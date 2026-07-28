@@ -390,7 +390,9 @@ fn a_segment_with_unknown_flags_is_refused() {
         .map(|e| e.path()).filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false)).collect();
     sp.sort();
     let mut b = std::fs::read(&sp[0]).unwrap();
-    b[12..16].copy_from_slice(&1u32.to_le_bytes()); // set an unknown flag bit
+    // Bit 0 is ENCRYPTED and KNOWN — a known bit is acted on, not refused. Pick a bit no
+    // revision has claimed, which is what "unknown means stop, not adapt" is actually about.
+    b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
     std::fs::write(&sp[0], &b).unwrap();
 
     let e = match Store::open_read(&dir, FoldCfg::default()) {
