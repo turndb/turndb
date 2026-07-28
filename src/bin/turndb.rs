@@ -243,6 +243,20 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
             }
         }
         println!("deep: {} records reconstruct byte-exact ({bytes} content bytes verified)", ids.len());
+        // ... and the fold scrub covers what reconstruction cannot: blocks holding only retained
+        // or unreferenced pieces.
+        let fs = rs.fold().scrub().context("fold scrub failed")?;
+        println!(
+            "fold: {} blocks across {} segments verify ({} bytes){}",
+            fs.blocks,
+            fs.segments,
+            fs.bytes,
+            if fs.trailing_uncommitted > 0 {
+                format!("; {} uncommitted trailing bytes await the next writer open", fs.trailing_uncommitted)
+            } else {
+                String::new()
+            }
+        );
     }
     println!("ok");
     Ok(())

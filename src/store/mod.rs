@@ -1306,6 +1306,10 @@ impl ReadStore {
     pub fn parts(&self) -> &[Arc<Part>] {
         &self.parts
     }
+    /// The fold, for tools that scrub or measure it.
+    pub fn fold(&self) -> &Fold {
+        &self.fold
+    }
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }

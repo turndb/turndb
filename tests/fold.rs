@@ -516,3 +516,29 @@ fn sealed_segments_carry_sidecars_and_survive_losing_them() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn scrub_verifies_every_frame_and_condemns_a_damaged_sealed_segment() {
+    let dir = tmp("scrub");
+    let cfg = FoldCfg { seg_max: 128 * 1024, block_target: 16 * 1024, ..Default::default() };
+    {
+        let mut f = Fold::open(&dir, cfg).unwrap();
+        for b in corpus() {
+            f.put(&b).unwrap();
+        }
+        f.sync().unwrap();
+        assert!(f.segment_count() > 1);
+        let report = f.scrub().unwrap();
+        assert!(report.blocks > 2, "a real fold scrubs real blocks: {report:?}");
+        assert_eq!(report.trailing_uncommitted, 0, "a synced fold has no residue");
+    }
+    // one flipped byte inside a SEALED segment's frame region must condemn it
+    let seg0 = dir.join("seg-00000000.fold");
+    let mut b = std::fs::read(&seg0).unwrap();
+    let mid = 48 + (b.len() - 48) / 2;
+    b[mid] ^= 0x01;
+    std::fs::write(&seg0, &b).unwrap();
+    let f = Fold::open_read(&dir, cfg).unwrap();
+    assert!(f.scrub().is_err(), "a damaged sealed segment must fail the scrub");
+    std::fs::remove_dir_all(&dir).ok();
+}
