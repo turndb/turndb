@@ -828,6 +828,27 @@ however large it is — so it, not `seg_max`, is what can overflow the segment a
 
 ---
 
+## Non-goals
+
+Things a reader might reasonably expect to find here, and the reason each is absent. A format
+document that only lists what exists leaves the next person to rediscover these arguments.
+
+**Parity / erasure coding for repair.** The format detects corruption at every level — frame
+checksums, section checksums, the TOC and footer chains, per-piece BLAKE3 on every content read,
+and manifest-pinned part digests — and repairs none of it. Reed-Solomon companions would solve bit
+rot *on a single copy*, which is not the failure this system is deployed into: cold tiers live on
+object storage with its own durability, sealed packs are copied, and the honest recovery for a
+damaged member is to restore it. Adding an erasure-coding dependency to duplicate what the storage
+layer already provides would read as thorough and be surface. Where belt-and-braces is wanted,
+external PAR2 over a sealed pack is an operations recipe and needs nothing from this format.
+
+**Compression of the fold's ciphertext.** There is none to do — see the ordering note under
+[Encrypted block frames](#encrypted-block-frames).
+
+**A second content hash.** BLAKE3 identifies content, and one identity function is the whole point
+of content addressing. Where a cheaper check is wanted for a hot path, `r16` and the frame
+checksums already provide it; neither ever concludes identity.
+
 ## Compatibility
 
 **The format is not frozen, and does not need to be.** A re-fold rewrites every part and the fold
