@@ -12,6 +12,16 @@ pub const SEG_HDR_LEN: u64 = 48;
 /// Identity assertion, not a version. A mismatch refuses — there is no negotiation anywhere.
 pub const MAGIC: &[u8; 8] = b"TURNFOLD";
 
+/// Segment flag: this segment's block payloads are ENCRYPTED, and reading them requires keys this
+/// build may not have.
+///
+/// RESERVED, not yet written by anything — and reserved *early on purpose*. The whole value of a
+/// reject-forward lever is that shipped readers already refuse the thing before any writer can
+/// produce it; a bit reserved at the same moment it is first set protects nobody who is already
+/// running. This is the same discipline the part footer's reserved bytes follow, applied in
+/// advance of the work that will need it.
+pub const SEG_FLAG_ENCRYPTED: u32 = 1 << 0;
+
 /// Default roll threshold. Bounded so a crash-time tail scan stays short and mmap granularity stays sane.
 pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
 
@@ -69,6 +79,18 @@ impl SegHeader {
             bail!("segment header says seg {seg} but the file is named for {expect_seg}");
         }
         let flags = u32::from_le_bytes(b[12..16].try_into().unwrap());
+        // The reject-forward lever, and the ONE place a future format change gets to announce
+        // itself. `SEG_FLAG_ENCRYPTED` is named so that a build which cannot decrypt says exactly
+        // that — a reader meeting encrypted blocks it has no keys for should hear "this fold is
+        // encrypted and you have no way in", not "flags 0x1 unknown". The refusal must ship
+        // BEFORE any writer can set the bit; that is the entire reason this lands ahead of the
+        // AEAD path rather than with it.
+        if flags & SEG_FLAG_ENCRYPTED != 0 {
+            bail!(
+                "segment {expect_seg} is ENCRYPTED (flags {flags:#x}) and this build has no \
+                 decryption path — refusing rather than serving ciphertext as content"
+            );
+        }
         if flags != 0 {
             bail!("segment flags {flags:#x} unknown — refusing (no compatibility negotiation)");
         }
