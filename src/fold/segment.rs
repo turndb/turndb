@@ -22,6 +22,9 @@ pub const MAGIC: &[u8; 8] = b"TURNFOLD";
 /// advance of the work that will need it.
 pub const SEG_FLAG_ENCRYPTED: u32 = 1 << 0;
 
+/// Every flag bit this build understands. Anything outside it refuses the open.
+pub const KNOWN_SEG_FLAGS: u32 = SEG_FLAG_ENCRYPTED;
+
 /// Default roll threshold. Bounded so a crash-time tail scan stays short and mmap granularity stays sane.
 pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
 
@@ -46,6 +49,8 @@ pub fn parse_seg_name(name: &str) -> Option<u32> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegHeader {
     pub seg: u32,
+    /// See [`SEG_FLAG_ENCRYPTED`]. Zero for a plaintext segment.
+    pub flags: u32,
     /// BLAKE3 of this segment's trained dictionary, or all-zero for "no dictionary".
     pub dict_id: [u8; 32],
 }
@@ -55,12 +60,15 @@ impl SegHeader {
         self.dict_id != [0u8; 32]
     }
 
+    pub fn is_encrypted(&self) -> bool {
+        self.flags & SEG_FLAG_ENCRYPTED != 0
+    }
+
     pub fn encode(&self) -> [u8; SEG_HDR_LEN as usize] {
         let mut b = [0u8; SEG_HDR_LEN as usize];
         b[0..8].copy_from_slice(MAGIC);
         b[8..12].copy_from_slice(&self.seg.to_le_bytes());
-        // flags: must be zero. Unknown means stop, not adapt.
-        b[12..16].copy_from_slice(&0u32.to_le_bytes());
+        b[12..16].copy_from_slice(&self.flags.to_le_bytes());
         b[16..48].copy_from_slice(&self.dict_id);
         b
     }
@@ -79,24 +87,16 @@ impl SegHeader {
             bail!("segment header says seg {seg} but the file is named for {expect_seg}");
         }
         let flags = u32::from_le_bytes(b[12..16].try_into().unwrap());
-        // The reject-forward lever, and the ONE place a future format change gets to announce
-        // itself. `SEG_FLAG_ENCRYPTED` is named so that a build which cannot decrypt says exactly
-        // that — a reader meeting encrypted blocks it has no keys for should hear "this fold is
-        // encrypted and you have no way in", not "flags 0x1 unknown". The refusal must ship
-        // BEFORE any writer can set the bit; that is the entire reason this lands ahead of the
-        // AEAD path rather than with it.
-        if flags & SEG_FLAG_ENCRYPTED != 0 {
-            bail!(
-                "segment {expect_seg} is ENCRYPTED (flags {flags:#x}) and this build has no \
-                 decryption path — refusing rather than serving ciphertext as content"
-            );
-        }
-        if flags != 0 {
+        // The reject-forward lever. Bits this build knows are accepted and acted on; anything
+        // else stops the open, because unknown means stop, not adapt. An encrypted segment is
+        // openable — the fold reports ERASED per block when no key opens it, which is the honest
+        // answer — but a bit from a future format is not, and never becomes one by guessing.
+        if flags & !KNOWN_SEG_FLAGS != 0 {
             bail!("segment flags {flags:#x} unknown — refusing (no compatibility negotiation)");
         }
         let mut dict_id = [0u8; 32];
         dict_id.copy_from_slice(&b[16..48]);
-        Ok(SegHeader { seg, dict_id })
+        Ok(SegHeader { seg, flags, dict_id })
     }
 }
 
@@ -111,10 +111,15 @@ pub fn fsync_dir(dir: &Path) -> Result<()> {
 /// this makes "file exists but is shorter than a header" provably hold no durable frame — which is what
 /// lets recovery delete such a file safely.
 pub fn create(dir: &Path, n: u32, dict_id: [u8; 32]) -> Result<File> {
+    create_flagged(dir, n, dict_id, 0)
+}
+
+/// [`create`], with segment flags — how an encrypted segment announces itself.
+pub fn create_flagged(dir: &Path, n: u32, dict_id: [u8; 32], flags: u32) -> Result<File> {
     let path = dir.join(seg_name(n));
     let f = crate::vfs::create_new(&path)
         .with_context(|| format!("create segment {}", path.display()))?;
-    crate::vfs::write_all_at(&f, &path, &SegHeader { seg: n, dict_id }.encode(), 0)?;
+    crate::vfs::write_all_at(&f, &path, &SegHeader { seg: n, flags, dict_id }.encode(), 0)?;
     crate::vfs::sync_file(&f, &path)?;
     fsync_dir(dir)?;
     Ok(f)
@@ -173,6 +178,11 @@ pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_in(f, file_len, has_dict, false)
+}
+
+/// [`scan_tail`], told whether the segment is encrypted — the frame invariants differ.
+pub fn scan_tail_in(f: &dyn ReadAt, file_len: u64, has_dict: bool, encrypted: bool) -> Result<(u64, Vec<(u32, u32)>)> {
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
@@ -186,7 +196,7 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
         if f.read_exact_at(&mut hdr, off).is_err() {
             break;
         }
-        let h = match block::parse_hdr(&hdr, has_dict) {
+        let h = match block::parse_hdr_in(&hdr, has_dict, encrypted) {
             Ok(h) => h,
             Err(_) => break,
         };
@@ -203,7 +213,7 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
         if f.read_exact_at(&mut payload[..span], off).is_err() {
             break;
         }
-        if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
+        if block::verify_frame_bytes_in(&payload[..span], has_dict, encrypted).is_err() {
             // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
             // it (that is what keeping the header buys) and the block is left OUT of the
             // directory, so nothing can resolve a Loc into erased bytes. Anything else that fails
@@ -330,7 +340,7 @@ mod tests {
 
     #[test]
     fn header_roundtrips_and_validates() {
-        let h = SegHeader { seg: 5, dict_id: [0u8; 32] };
+        let h = SegHeader { seg: 5, flags: 0, dict_id: [0u8; 32] };
         let b = h.encode();
         assert_eq!(b.len(), SEG_HDR_LEN as usize);
         assert_eq!(SegHeader::decode(&b, 5).unwrap(), h);
@@ -344,9 +354,15 @@ mod tests {
         bad[0] = b'X';
         assert!(SegHeader::decode(&bad, 5).is_err());
 
-        // nonzero flags refuse rather than negotiate
+        // A KNOWN flag is accepted and acted on — bit 0 means encrypted, which this build can
+        // hold (and reports per block when it has no key).
         let mut flagged = b;
-        flagged[12] = 1;
-        assert!(SegHeader::decode(&flagged, 5).is_err());
+        flagged[12] = SEG_FLAG_ENCRYPTED as u8;
+        let h = SegHeader::decode(&flagged, 5).unwrap();
+        assert!(h.is_encrypted());
+        // An UNKNOWN bit still refuses rather than negotiates.
+        let mut future = b;
+        future[13] = 0x04;
+        assert!(SegHeader::decode(&future, 5).is_err(), "unknown flags must refuse");
     }
 }

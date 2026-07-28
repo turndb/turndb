@@ -2,7 +2,7 @@
 # The crate stays the root package and stays PURE — no network, no runtime, no daemon. Anything
 # that listens on a socket lives in a member crate, where its dependency tree cannot leak into
 # the substrate.
-members = ["turnd"]
+members = ["turnd", "turndb-crypto"]
 
 [package]
 name = "turndb"

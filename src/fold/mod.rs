@@ -218,12 +218,46 @@ pub struct Fold {
     cache: Mutex<BlockCache>,
     poisoned: bool,
     scratch: Vec<u8>,
+    /// When present, block payloads are sealed under it and the segments they land in carry
+    /// [`segment::SEG_FLAG_ENCRYPTED`]. Absent for a plaintext fold, and absent on a reader that
+    /// was handed no keys — which is exactly when reads report ERASED rather than corrupt.
+    cipher: Option<Arc<dyn crate::cipher::BlockCipher>>,
     _lock: Option<File>,
 }
 
 impl Fold {
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
         Fold::open_at(dir, cfg, None)
+    }
+
+    /// Attach a cipher to a READ-ONLY fold: no segment is created or rolled, because nothing here
+    /// will ever write. The separate entry point exists so `with_cipher`'s roll — which is
+    /// mandatory for a writer and impossible for a reader — cannot be reached by accident.
+    pub fn with_cipher_readonly(mut self, cipher: Arc<dyn crate::cipher::BlockCipher>) -> Fold {
+        debug_assert!(self.poisoned, "read-only folds are poisoned against appends");
+        self.cipher = Some(cipher);
+        self
+    }
+
+    /// Attach a cipher. Content written from here on is sealed under it, and content already in
+    /// the fold is not — which is why a segment carries the ENCRYPTED flag rather than the fold
+    /// doing so: the two can coexist, and a reader learns per segment which it is holding.
+    ///
+    /// Deliberately not part of [`FoldCfg`]: the config is `Copy` plain data describing sizes and
+    /// levels, and threading a key provider through it would make every config value a thing that
+    /// can hold a KMS connection.
+    pub fn with_cipher(mut self, cipher: Arc<dyn crate::cipher::BlockCipher>) -> Result<Fold> {
+        // A fold that is about to write ciphertext must roll first: a segment's flag describes the
+        // whole segment, so plaintext and ciphertext blocks can never share one.
+        if self.cur_off as u64 > SEG_HDR_LEN {
+            self.seal_block()?;
+            self.write_ready(true)?;
+            self.roll_flagged(segment::SEG_FLAG_ENCRYPTED)?;
+        } else {
+            self.recreate_active_flagged(segment::SEG_FLAG_ENCRYPTED)?;
+        }
+        self.cipher = Some(cipher);
+        Ok(self)
     }
 
     /// Open, recovering to `committed`: the tail some higher layer durably recorded.
@@ -333,7 +367,7 @@ impl Fold {
             return Ok(Fold {
                 dir: dir.to_path_buf(),
                 cfg,
-                headers: vec![SegHeader { seg: 0, dict_id: [0u8; 32] }],
+                headers: vec![SegHeader { seg: 0, flags: 0, dict_id: [0u8; 32] }],
                 readers: vec![Arc::new(segment::open_rw(dir, 0)?)],
                 dicts: HashMap::new(),
                 active: 0,
@@ -348,6 +382,7 @@ impl Fold {
                 next_block: 0,
                 inflight: HashMap::new(),
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
+                cipher: None,
                 _lock: Some(lock),
             });
         }
@@ -420,7 +455,7 @@ impl Fold {
                 match segment::read_dir_sidecar(dir, h.seg, len) {
                     Some((_, e)) => e,
                     None => {
-                        let (tail, e) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+                        let (tail, e) = segment::scan_tail_in(&readers[i], len, h.has_dict(), h.is_encrypted())?;
                         // Regenerate so the next open finds it. Best-effort: advisory data must
                         // never fail an open, only slow one down.
                         let _ = segment::write_dir_sidecar(dir, h.seg, tail as u32, &e);
@@ -428,7 +463,7 @@ impl Fold {
                     }
                 }
             } else {
-                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+                segment::scan_tail_in(&readers[i], len, h.has_dict(), h.is_encrypted())?.1
             };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -457,6 +492,7 @@ impl Fold {
             next_block,
             inflight: HashMap::new(),
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
+            cipher: None,
             _lock: Some(lock),
         })
     }
@@ -550,10 +586,10 @@ impl Fold {
             let entries = if h.seg != last {
                 match segs[i].sidecar.as_ref().and_then(|b| segment::parse_dir_sidecar(b, h.seg, len)) {
                     Some((_, e)) => e,
-                    None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
+                    None => segment::scan_tail_in(&readers[i], len, h.has_dict(), h.is_encrypted())?.1,
                 }
             } else {
-                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+                segment::scan_tail_in(&readers[i], len, h.has_dict(), h.is_encrypted())?.1
             };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -582,6 +618,7 @@ impl Fold {
             next_block,
             inflight: HashMap::new(),
             pool: pipe::Pool::new(1, cfg.level, None),
+            cipher: None,
             _lock: None,
         })
     }
@@ -720,7 +757,8 @@ impl Fold {
                 loc.block_id
             );
         }
-        let hdr = block::parse_hdr(&hb, has_dict)?;
+        let encrypted = self.headers[seg as usize].is_encrypted();
+        let hdr = block::parse_hdr_in(&hb, has_dict, encrypted)?;
         if hdr.block_id != loc.block_id {
             bail!("directory sent block {} to a frame carrying id {}", loc.block_id, hdr.block_id);
         }
@@ -728,12 +766,42 @@ impl Fold {
         let span = hdr.frame_len() as usize;
         let mut buf = vec![0u8; span];
         f.read_exact_at(&mut buf, off as u64).with_context(|| format!("read block at seg {seg} off {off}"))?;
-        block::verify_frame_bytes(&buf, has_dict)?;
+        block::verify_frame_bytes_in(&buf, has_dict, encrypted)?;
 
         let dict = self.dicts.get(&self.headers[seg as usize].dict_id).cloned();
         let payload = &buf[block::BLOCK_HDR_LEN..block::BLOCK_HDR_LEN + hdr.stored as usize];
+        let decrypted;
+        let payload: &[u8] = if encrypted {
+            let cipher = self.cipher.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "block {} is encrypted and this fold holds no cipher — content is unreadable \
+                     without keys",
+                    loc.block_id
+                )
+            })?;
+            let (key, nonce, sealed) = block::split_sealed(payload)?;
+            match cipher.open(key, &nonce, sealed, &buf[..block::BLOCK_HDR_LEN])? {
+                Some(pt) => {
+                    decrypted = pt;
+                    &decrypted
+                }
+                // The key is gone. This is ERASURE, reported as itself: the distinction between
+                // "destroyed on purpose" and "damaged" is the whole reason `open` returns an
+                // Option rather than an error.
+                None => bail!(
+                    "block {} was ERASED: its key ({}) has been destroyed and the content is \
+                     permanently unreadable",
+                    loc.block_id,
+                    key.to_hex()
+                ),
+            }
+        } else {
+            payload
+        };
         let raw = codec::decode(hdr.codec, payload, hdr.raw, dict.as_deref().map(|v| &v[..]))?;
-        if blake3::hash(&raw).as_bytes()[0..2] != hdr.r16 {
+        // r16 is zero in an encrypted fold (it would be a plaintext oracle); the AEAD tag has
+        // already authenticated these bytes, which is a strictly stronger check.
+        if !encrypted && blake3::hash(&raw).as_bytes()[0..2] != hdr.r16 {
             bail!("decoded block does not match its content prefix (block {})", loc.block_id);
         }
         let arc = Arc::new(raw);
@@ -771,7 +839,27 @@ impl Fold {
     }
 
     fn write_block(&mut self, d: pipe::Done) -> Result<()> {
-        let n = block::encode(&mut self.scratch, d.block_id, d.codec, &d.raw, &d.payload);
+        let n = match &self.cipher {
+            // Compress THEN encrypt — the other order produces ciphertext that does not compress.
+            // The frame header is the AEAD's associated data, so ciphertext cannot be relocated to
+            // another block id or segment and still open.
+            Some(c) => {
+                let key = c.current()?;
+                let mut hdr = Vec::with_capacity(block::BLOCK_HDR_LEN);
+                let stored = crate::cipher::AEAD_OVERHEAD + d.payload.len();
+                hdr.push(block::BLOCK_TAG);
+                hdr.push(d.codec);
+                hdr.extend_from_slice(&(d.raw.len() as u32).to_le_bytes());
+                hdr.extend_from_slice(&(stored as u32).to_le_bytes());
+                hdr.extend_from_slice(&[0u8, 0u8]);
+                hdr.extend_from_slice(&d.block_id.to_le_bytes());
+                let (nonce, sealed) = c.seal(key, &d.payload, &hdr)?;
+                block::encode_sealed(
+                    &mut self.scratch, d.block_id, d.codec, d.raw.len(), key, &nonce, &sealed,
+                )
+            }
+            None => block::encode(&mut self.scratch, d.block_id, d.codec, &d.raw, &d.payload),
+        };
         // Roll if this block would not fit. Blocks are self-contained, so one never straddles.
         if self.cur_off as u64 > SEG_HDR_LEN && self.cur_off as u64 + n as u64 > self.cfg.seg_max as u64 {
             self.roll()?;
@@ -868,7 +956,8 @@ impl Fold {
                 continue;
             }
             let has_dict = self.headers[seg as usize].has_dict();
-            let Ok(hdr) = block::parse_hdr(&hb, has_dict) else { continue };
+            let enc = self.headers[seg as usize].is_encrypted();
+            let Ok(hdr) = block::parse_hdr_in(&hb, has_dict, enc) else { continue };
             if hdr.block_id != id {
                 bail!("directory sent block {id} to a frame carrying id {}", hdr.block_id);
             }
@@ -907,7 +996,7 @@ impl Fold {
         let mut report = FoldScrub::default();
         for (i, h) in self.headers.iter().enumerate() {
             let len = self.readers[i].len()?;
-            let (end, entries) = segment::scan_tail(&self.readers[i], len, h.has_dict())?;
+            let (end, entries) = segment::scan_tail_in(&self.readers[i], len, h.has_dict(), h.is_encrypted())?;
             report.segments += 1;
             report.blocks += entries.len();
             report.bytes += end.saturating_sub(segment::SEG_HDR_LEN);
@@ -971,7 +1060,26 @@ impl Fold {
     /// leaves nothing changed and the caller's retry re-enters cleanly. (An earlier generation of this
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
+    /// The active segment is empty (header only), so it can simply be replaced by one carrying
+    /// `flags` — no roll, no wasted segment number.
+    fn recreate_active_flagged(&mut self, flags: u32) -> Result<()> {
+        let path = segment::seg_path(&self.dir, self.active);
+        self.active_f = None;
+        crate::vfs::unlink(&path)?;
+        let f = segment::create_flagged(&self.dir, self.active, [0u8; 32], flags)?;
+        self.headers[self.active as usize] = SegHeader { seg: self.active, flags, dict_id: [0u8; 32] };
+        self.readers[self.active as usize] = Arc::new(segment::open_rw(&self.dir, self.active)?);
+        self.active_f = Some(f);
+        self.cur_off = SEG_HDR_LEN as u32;
+        Ok(())
+    }
+
     fn roll(&mut self) -> Result<()> {
+        let flags = self.headers[self.active as usize].flags;
+        self.roll_flagged(flags)
+    }
+
+    fn roll_flagged(&mut self, flags: u32) -> Result<()> {
         let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
         crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
             .context("fsync before roll")?;
@@ -994,11 +1102,11 @@ impl Fold {
             .active
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("segment number space exhausted"))?;
-        let f = segment::create(&self.dir, next, [0u8; 32])?;
+        let f = segment::create_flagged(&self.dir, next, [0u8; 32], flags)?;
         let reader = Arc::new(segment::open_rw(&self.dir, next)?);
 
         self.active_f = Some(f);
-        self.headers.push(SegHeader { seg: next, dict_id: [0u8; 32] });
+        self.headers.push(SegHeader { seg: next, flags, dict_id: [0u8; 32] });
         self.readers.push(reader);
         self.active = next;
         self.cur_off = SEG_HDR_LEN as u32;
