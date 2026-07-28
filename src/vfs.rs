@@ -107,7 +107,7 @@ pub(crate) fn create_new(path: &Path) -> Result<File> {
 
 #[inline]
 pub(crate) fn write_all_at(f: &File, path: &Path, buf: &[u8], off: u64) -> Result<()> {
-    std::os::unix::fs::FileExt::write_all_at(f, buf, off)?;
+    crate::sys::write_all_at(f, buf, off)?;
     #[cfg(feature = "dst")]
     push(Op::WriteAt { path: path.to_path_buf(), off, data: buf.to_vec() });
     #[cfg(not(feature = "dst"))]

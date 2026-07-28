@@ -17,7 +17,6 @@ use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 pub const FRAME_TAG: u8 = 0x57;
@@ -318,7 +317,7 @@ impl Wal {
         let mut off = 0u64;
         let mut hdr = [0u8; HDR];
         loop {
-            if off + HDR as u64 + CRC as u64 > len || f.read_exact_at(&mut hdr, off).is_err() {
+            if off + HDR as u64 + CRC as u64 > len || crate::sys::read_exact_at(&f, &mut hdr, off).is_err() {
                 break;
             }
             // An unknown tag is AMBIGUOUS and the two readings are opposite: a crash mid-append
@@ -340,11 +339,11 @@ impl Wal {
                 break;
             }
             let mut payload = vec![0u8; plen];
-            if f.read_exact_at(&mut payload, off + HDR as u64).is_err() {
+            if crate::sys::read_exact_at(&f, &mut payload, off + HDR as u64).is_err() {
                 break;
             }
             let mut cb = [0u8; CRC];
-            if f.read_exact_at(&mut cb, off + HDR as u64 + plen as u64).is_err() {
+            if crate::sys::read_exact_at(&f, &mut cb, off + HDR as u64 + plen as u64).is_err() {
                 break;
             }
             let mut crc = crc32fast::Hasher::new();

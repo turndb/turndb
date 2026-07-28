@@ -1492,8 +1492,15 @@ pub fn looks_like_store(dir: &Path) -> bool {
     dir.join("MANIFEST").exists() || dir.join("fold").exists()
 }
 
-#[cfg(not(unix))]
-compile_error!("turndb requires a Unix filesystem (flock, positioned reads, mmap-survives-unlink)");
+// Positioned reads are the one thing with no fallback: every read in the engine is "n bytes at
+// offset o", and emulating that with seek-then-read is not safe across threads. Unix and WASI both
+// provide it. What WASI does NOT provide — advisory locking and hole punching — is degraded
+// explicitly in `crate::sys` rather than refused here.
+#[cfg(not(any(unix, target_os = "wasi")))]
+compile_error!(
+    "turndb needs positioned file reads (pread). Unix and WASI provide them; \
+     wasm32-unknown-unknown has no filesystem at all — build for wasm32-wasip1 instead."
+);
 
 #[cfg(test)]
 mod tests {

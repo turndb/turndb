@@ -43,6 +43,7 @@ pub mod query;
 pub mod pack;
 pub mod readat;
 pub mod store;
+mod sys;
 pub mod types;
 pub mod vfs;
 
