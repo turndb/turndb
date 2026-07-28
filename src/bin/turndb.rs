@@ -42,6 +42,11 @@ usage: turndb <verb> [args]
     import    <DIR> <JSONL>      ingest records ({\"body\": ..., attrs...} per line; - for stdin),
                                  carved by the engine's default opinion, batched per 1000
 
+  constellations (a directory of member stores and packs):
+    catalog   <ROOT> [rebuild]   list the members, or reconstruct the catalog by scanning
+    cids      <ROOT>             every live id across the constellation
+    cget      <ROOT> <ID>        reconstruct one record, later members winning
+
   shipping:
     pack      <DIR> <OUT>        the committed snapshot as one file
     unpack    <PACK> <OUTDIR>    extract back into an ordinary store directory
@@ -150,6 +155,46 @@ fn run(args: &[String]) -> Result<()> {
                 println!("{c}");
             }
             Ok(())
+        }
+        "catalog" => {
+            let root = arg(0, "ROOT")?;
+            if rest.get(1) == Some(&"rebuild") {
+                let mut c = turndb::catalog::Catalog::rebuild(&root)?;
+                c.commit(&root)?;
+                println!("rebuilt: {} members (windows and seal flags are policy and are not recovered)", c.members.len());
+                return Ok(());
+            }
+            let c = turndb::catalog::Catalog::load(&root)?;
+            println!("catalog: commit {}, {} members", c.commit, c.members.len());
+            for m in &c.members {
+                println!(
+                    "  [{}] {}{}{}",
+                    m.ordinal,
+                    m.path,
+                    m.window.as_deref().map(|w| format!("  window={w}")).unwrap_or_default(),
+                    if m.sealed { "  sealed" } else { "" }
+                );
+            }
+            Ok(())
+        }
+        "cids" => {
+            let r = turndb::catalog::CatalogReader::open(&arg(0, "ROOT")?, FoldCfg::default())?;
+            let mut out = std::io::stdout().lock();
+            for id in r.ids()? {
+                writeln!(out, "{id}")?;
+            }
+            Ok(())
+        }
+        "cget" => {
+            let r = turndb::catalog::CatalogReader::open(&arg(0, "ROOT")?, FoldCfg::default())?;
+            let id = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing ID\n\n{USAGE}"))?;
+            match r.reconstruct(id)? {
+                Some(b) => {
+                    std::io::stdout().lock().write_all(&b)?;
+                    Ok(())
+                }
+                None => bail!("no record {id:?} in this constellation"),
+            }
         }
         "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
         "import" => {
