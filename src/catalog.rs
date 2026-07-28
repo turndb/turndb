@@ -501,11 +501,11 @@ mod tests {
     fn commits_reloads_and_refuses_damage() {
         let d = tmp("commit");
         let mut c = Catalog::default();
-        c.add(Member { path: "w1".into(), ordinal: 0, window: Some("2026-W30".into()), sealed: true })
+        c.add(Member { path: "w1".into(), ordinal: 0, window: Some("2026-W30".into()), sealed: true, holds: Vec::new() })
             .unwrap();
-        c.add(Member { path: "w2".into(), ordinal: 1, window: Some("2026-W31".into()), sealed: false })
+        c.add(Member { path: "w2".into(), ordinal: 1, window: Some("2026-W31".into()), sealed: false, holds: Vec::new() })
             .unwrap();
-        assert!(c.add(Member { path: "w1".into(), ordinal: 9, window: None, sealed: false }).is_err(),
+        assert!(c.add(Member { path: "w1".into(), ordinal: 9, window: None, sealed: false, holds: Vec::new() }).is_err(),
             "a duplicate member path must refuse — resolution would depend on which was consulted");
         c.commit(&d).unwrap();
 
@@ -524,8 +524,8 @@ mod tests {
     fn ordinals_order_members_and_retention_selects_by_window() {
         let d = tmp("order");
         let mut c = Catalog::default();
-        c.add(Member { path: "late".into(), ordinal: 20, window: Some("2026-W31".into()), sealed: false }).unwrap();
-        c.add(Member { path: "early".into(), ordinal: 10, window: Some("2026-W30".into()), sealed: true }).unwrap();
+        c.add(Member { path: "late".into(), ordinal: 20, window: Some("2026-W31".into()), sealed: false, holds: Vec::new() }).unwrap();
+        c.add(Member { path: "early".into(), ordinal: 10, window: Some("2026-W30".into()), sealed: true, holds: Vec::new() }).unwrap();
         assert_eq!(c.members[0].path, "early", "members must sit in ordinal order");
 
         let old = c.in_window(|w| w < "2026-W31");
