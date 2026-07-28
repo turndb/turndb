@@ -36,6 +36,7 @@
 //! that breaks it.
 
 pub mod carve;
+pub mod catalog;
 pub mod cipher;
 pub mod fold;
 pub mod keyring;
