@@ -1304,3 +1304,50 @@ fn auto_compact_settles_the_store_and_its_deletes() {
     assert!(s.reconstruct("a00-0").unwrap().is_none(), "the delete holds after settlement");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
+    let dir = tmp("erase");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut keep = Vec::new();
+    for f in 0..3 {
+        for i in 0..8 {
+            let id = format!("e{f}-{i}");
+            let body = put(&mut s, &id, format!("unique payload {f}/{i} {}", "q".repeat(200 + i)).as_bytes());
+            if !(f == 0 && i < 2) {
+                keep.push((id, body));
+            }
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let before = s.fold().disk_bytes();
+
+    let stats = s
+        .erase_ids(&["e0-0".into(), "e0-1".into(), "never-existed".into()])
+        .unwrap();
+    assert_eq!(stats.tombstoned, 2);
+    assert_eq!(stats.absent, 1);
+    let refold = stats.refold.expect("content existed, so the fold must have been rewritten");
+    assert!(refold.pieces_dropped > 0, "the erased records' unique pieces must be dropped");
+    assert!(s.fold().disk_bytes() < before, "bytes must actually leave the disk");
+
+    // content gone, everything else byte-exact
+    assert!(s.reconstruct("e0-0").unwrap().is_none());
+    assert!(s.reconstruct("e0-1").unwrap().is_none());
+    for (id, body) in &keep {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "{id} damaged by erasure");
+    }
+
+    // METADATA gone: no part row carries the erased ids, tombstones included — the parts were
+    // rebuilt, not merely shadowed
+    for p in s.parts() {
+        assert!(p.find("e0-0").unwrap().is_none(), "an erased id must not remain as any row");
+        assert_eq!(p.tombstones().unwrap().len(), 0, "settlement must leave no tombstones");
+    }
+
+    // and TIME TRAVEL cannot resurrect it: the retained log was purged to the erasure's commit
+    let snaps = turndb::store::retained_commits(&dir);
+    assert_eq!(snaps.len(), 1, "erasure must purge every snapshot that could still serve the data");
+    std::fs::remove_dir_all(&dir).ok();
+}

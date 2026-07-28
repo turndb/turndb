@@ -30,6 +30,11 @@ usage: turndb <verb> [args]
     refold    <DIR>              rewrite the fold, dropping content no live record references
     recover   <DIR>              promote the newest intact retained manifest over a damaged one
     snapshots <DIR>              list retained commits available to time travel
+    erase     <DIR> (--id ID ... | --attr KEY=VALUE) [--include-ids]
+                                 tombstone, settle, and REWRITE until content and metadata are
+                                 physically gone; writes an erasure record under erasures/ and
+                                 prints its digest (sign it with your own PKI — this tool records
+                                 process, it does not claim proof)
 
   ingesting:
     import    <DIR> <JSONL>      ingest records ({\"body\": ..., attrs...} per line; - for stdin),
@@ -133,6 +138,7 @@ fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
         "import" => {
             let dir = arg(0, "DIR")?;
             let src = arg(1, "JSONL")?;
@@ -213,6 +219,124 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
     }
     println!("ok");
     Ok(())
+}
+
+/// The erase verb: resolve the request to ids, run [`Store::erase_ids`], and leave behind an
+/// erasure RECORD — canonical JSON documenting a process faithfully executed, digested so a copy
+/// can be certified, worded to claim exactly what is true and nothing more. Signing is the
+/// operator's PKI's job (`ssh-keygen -Y sign` works on any file); building a signer in would add
+/// a crypto dependency to buy nothing a detached signature does not already provide.
+fn erase(dir: &Path, args: &[&str]) -> Result<()> {
+    // ---- parse the request ----
+    let mut ids: Vec<String> = Vec::new();
+    let mut attr: Option<(String, String)> = None;
+    let mut include_ids = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--id" => ids.push(
+                it.next().ok_or_else(|| anyhow::anyhow!("--id needs a value"))?.to_string(),
+            ),
+            "--attr" => {
+                let kv = it.next().ok_or_else(|| anyhow::anyhow!("--attr needs KEY=VALUE"))?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--attr needs KEY=VALUE"))?;
+                attr = Some((k.to_string(), v.to_string()));
+            }
+            "--include-ids" => include_ids = true,
+            other => bail!("unknown erase argument {other:?}"),
+        }
+    }
+    let request = match (&ids.is_empty(), &attr) {
+        (false, None) => serde_json::json!({"kind": "ids", "count": ids.len()}),
+        (true, Some((k, v))) => serde_json::json!({"kind": "attr", "key": k, "value": v}),
+        _ => bail!("erase needs exactly one of --id ... or --attr KEY=VALUE\n\n{USAGE}"),
+    };
+
+    let started = unix_now();
+    let pre_manifest = blake3::hash(&std::fs::read(dir.join("MANIFEST"))?).to_hex().to_string();
+
+    let mut s = Store::open(dir, FoldCfg::default())?;
+    // ---- resolve an attribute request against the committed state ----
+    if let Some((k, v)) = &attr {
+        for id in s.ids()? {
+            let Some(rec) = s.get(&id)? else { continue };
+            let hit = rec.attrs.iter().any(|(key, val)| {
+                key == k
+                    && match val {
+                        turndb::AttrValue::Str(x) => x == v,
+                        turndb::AttrValue::Int(x) => v.parse::<i64>() == Ok(*x),
+                        turndb::AttrValue::Float(x) => v.parse::<f64>().is_ok_and(|p| p.to_bits() == x.to_bits()),
+                        turndb::AttrValue::Bool(x) => v.parse::<bool>() == Ok(*x),
+                    }
+            });
+            if hit {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+
+    // The resolved set is digested rather than listed by default: an erasure record OUTLIVES the
+    // data it documents, and re-stating the erased identifiers would re-leak what was erased.
+    let mut h = blake3::Hasher::new();
+    for id in &ids {
+        h.update(id.as_bytes());
+        h.update(&[0]);
+    }
+    let resolved_digest = h.finalize().to_hex().to_string();
+
+    let stats = s.erase_ids(&ids)?;
+    drop(s);
+    let post_manifest = blake3::hash(&std::fs::read(dir.join("MANIFEST"))?).to_hex().to_string();
+
+    let mut record = serde_json::json!({
+        "record": "turndb erasure",
+        "wording": "this documents a process executed against ONE store; it makes no claim about \
+                    copies elsewhere (earlier packs, replicas, backups), and it is a record, not a proof",
+        "tool": {"name": "turndb", "version": env!("CARGO_PKG_VERSION")},
+        "store": dir.display().to_string(),
+        "started_unix": started,
+        "finished_unix": unix_now(),
+        "request": request,
+        "resolved": {"count": ids.len(), "ids_blake3": resolved_digest},
+        "outcome": {
+            "tombstoned": stats.tombstoned,
+            "already_absent": stats.absent,
+            "records_dropped": stats.refold.map(|r| r.records_dropped),
+            "pieces_dropped": stats.refold.map(|r| r.pieces_dropped),
+            "bytes_reclaimed": stats.refold.map(|r| r.bytes_reclaimed()),
+            "stale_generation_left": stats.refold.map(|r| r.stale_generation_left),
+            "metadata_rebuilt": stats.refold.is_some(),
+            "snapshots_purged": stats.refold.is_some()
+        },
+        "manifest_blake3": {"before": pre_manifest, "after": post_manifest}
+    });
+    if include_ids {
+        record["resolved"]["ids"] = serde_json::json!(ids);
+    }
+
+    let edir = dir.join("erasures");
+    std::fs::create_dir_all(&edir)?;
+    let path = edir.join(format!("erasure-{started}.json"));
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    std::fs::write(&path, &bytes)?;
+    println!(
+        "erased {} of {} requested ({} already absent); record: {}\nrecord blake3: {}",
+        stats.tombstoned,
+        stats.requested,
+        stats.absent,
+        path.display(),
+        blake3::hash(&bytes).to_hex()
+    );
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// JSONL in, records out: `body` is the record body (carved by the default opinion), every other

@@ -1011,6 +1011,11 @@ impl Store {
         self.parts.len()
     }
 
+    /// The live parts, oldest to newest — the writer-side twin of [`ReadStore::parts`].
+    pub fn parts(&self) -> &[Arc<Part>] {
+        &self.parts
+    }
+
     /// Every live id: committed parts plus the uncommitted memtable.
     ///
     /// Includes staged records, unlike [`ReadStore::ids`], because a writer can see its own writes.
@@ -1026,6 +1031,46 @@ impl Store {
         all.sort();
         all.dedup();
         Ok(all)
+    }
+
+    /// ERASE records: tombstone, settle, and rewrite until the content is physically gone.
+    ///
+    /// This is the compliance path, and it composes three operations that each already existed:
+    /// deletes shadow the ids; a TOTAL merge drops the tombstones once nothing remains for them
+    /// to shadow; and the re-fold rewrites the fold without the dropped content and rebuilds
+    /// every part — so both the bytes AND the columnar metadata (ids, piece lengths, attribute
+    /// values) of the erased records are gone when this returns. The re-fold also purges the
+    /// retained commit log, which the erasure story REQUIRES: a snapshot that could still serve
+    /// the erased record is not erasure.
+    ///
+    /// What this does NOT promise, stated because overclaiming here is a liability: nothing about
+    /// copies outside this store — packs written earlier, replicas, backups. An erasure record
+    /// documents a process faithfully executed against THIS store, and only that.
+    ///
+    /// Ids that do not exist are counted, not errored: a DSAR naming already-gone data is a
+    /// normal outcome, and the record should say so rather than fail.
+    pub fn erase_ids(&mut self, ids: &[String]) -> Result<ErasureStats> {
+        let mut tombstoned = 0usize;
+        let mut absent = 0usize;
+        for id in ids {
+            if self.get(id)?.is_some() {
+                self.delete(id)?;
+                tombstoned += 1;
+            } else {
+                absent += 1;
+            }
+        }
+        if tombstoned == 0 {
+            return Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: None });
+        }
+        self.sync()?;
+        self.flush()?;
+        if self.parts.len() > 1 {
+            // TOTAL, so the tombstones can drop — a partial merge would carry them forward.
+            self.merge_range(0, self.parts.len())?;
+        }
+        let refold = self.refold()?;
+        Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: Some(refold) })
     }
 
     /// Rewrite the fold, keeping only content that live records still reference.
@@ -1122,6 +1167,17 @@ impl Store {
     pub fn wal_bytes(&self) -> u64 {
         self.wal.bytes()
     }
+}
+
+/// What an erasure did — the facts an erasure record is built from.
+#[derive(Clone, Copy, Debug)]
+pub struct ErasureStats {
+    pub requested: usize,
+    pub tombstoned: usize,
+    /// Named but already gone. A normal outcome, recorded rather than errored.
+    pub absent: usize,
+    /// `None` when nothing existed to erase and the store was left untouched.
+    pub refold: Option<refold::RefoldStats>,
 }
 
 /// A reader over the committed state. No lock, no writer, no daemon.
