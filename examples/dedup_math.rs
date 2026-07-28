@@ -37,25 +37,44 @@ fn split_json_array(s: &[u8]) -> Option<Vec<(usize, usize)>> {
             }
         } else {
             match c {
-                b'"' => { in_str = true; if start.is_none() { start = Some(i); } }
-                b'[' | b'{' => { if start.is_none() { start = Some(i); } depth += 1; }
+                b'"' => {
+                    in_str = true;
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                }
+                b'[' | b'{' => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
                 b']' | b'}' => {
                     if depth == 0 && c == b']' {
-                        if let Some(st) = start.take() { out.push((st, i)); }
+                        if let Some(st) = start.take() {
+                            out.push((st, i));
+                        }
                         return Some(out);
                     }
                     depth -= 1;
                 }
-                b',' if depth == 0 => { if let Some(st) = start.take() { out.push((st, i)); } }
+                b',' if depth == 0 => {
+                    if let Some(st) = start.take() {
+                        out.push((st, i));
+                    }
+                }
                 w if (w as char).is_ascii_whitespace() => {}
-                _ => { if start.is_none() { start = Some(i); } }
+                _ => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                }
             }
         }
         i += 1;
     }
     None
 }
-
 
 fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
@@ -79,7 +98,8 @@ fn blocked(all: &[Vec<u8>], block: usize, level: i32) -> u64 {
 }
 
 fn main() -> anyhow::Result<()> {
-    let corpus = PathBuf::from(std::env::args().nth(1).expect("usage: dedup_math <corpus.jsonl> [field]"));
+    let corpus =
+        PathBuf::from(std::env::args().nth(1).expect("usage: dedup_math <corpus.jsonl> [field]"));
     let field = std::env::args().nth(2).unwrap_or_else(|| "body".to_string());
 
     let mut index: HashMap<[u8; 32], u32> = HashMap::new();
@@ -89,15 +109,27 @@ fn main() -> anyhow::Result<()> {
     let rdr = BufReader::with_capacity(1 << 20, std::fs::File::open(&corpus)?);
     for line in rdr.lines() {
         let line = line?;
-        let v: serde_json::Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
-        let body = match v.get(&field).and_then(|b| b.as_str()) { Some(b) => b.as_bytes().to_vec(), None => continue };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let body = match v.get(&field).and_then(|b| b.as_str()) {
+            Some(b) => b.as_bytes().to_vec(),
+            None => continue,
+        };
         logical += body.len() as u64;
-        let spans = match split_json_array(&body) { Some(e) if !e.is_empty() => e, _ => vec![(0, body.len())] };
+        let spans = match split_json_array(&body) {
+            Some(e) if !e.is_empty() => e,
+            _ => vec![(0, body.len())],
+        };
         for (a, b) in spans {
             let span = &body[a..b];
             refs += 1;
             let h: [u8; 32] = blake3::hash(span).into();
-            index.entry(h).or_insert_with(|| { pieces.push(span.to_vec()); (pieces.len() - 1) as u32 });
+            index.entry(h).or_insert_with(|| {
+                pieces.push(span.to_vec());
+                (pieces.len() - 1) as u32
+            });
         }
         bodies.push(body);
     }
@@ -120,7 +152,13 @@ fn main() -> anyhow::Result<()> {
     for (blk, lvl) in [(4 << 20, 19)] {
         a_fold = blocked(&pieces, blk, lvl);
         let p = a_fold as f64 / d_count as f64;
-        println!("{:<14}{:>12.2}{:>14.1}{:>16.1}", format!("{}M/z{lvl}", blk >> 20), mib(a_fold), p, p + 37.1);
+        println!(
+            "{:<14}{:>12.2}{:>14.1}{:>16.1}",
+            format!("{}M/z{lvl}", blk >> 20),
+            mib(a_fold),
+            p,
+            p + 37.1
+        );
     }
 
     // ---- Design B: no dedup. Every occurrence stored; zstd finds what it can within the window. ----
@@ -131,7 +169,10 @@ fn main() -> anyhow::Result<()> {
         let b = blocked(&bodies, blk, lvl);
         println!(
             "{:<14}{:>12.2}{:>11.1}x{:>15.2}x",
-            format!("{}M/z{lvl}", blk >> 20), mib(b), logical as f64 / b as f64, b as f64 / a_total
+            format!("{}M/z{lvl}", blk >> 20),
+            mib(b),
+            logical as f64 / b as f64,
+            b as f64 / a_total
         );
     }
     println!("\nA total (fold + measured part metadata) = {:.2} MiB", a_total / 1048576.0);
@@ -144,7 +185,10 @@ fn main() -> anyhow::Result<()> {
     println!("  d* = (p + h) / (s/c' - r),  where p = compressed bytes per distinct piece");
     println!("  when zstd cannot see the duplicates (s/c' -> p):   d* ~= 1 + h/p");
     println!("  here p = {p:.1} B, h = {h:.1} B  =>  d* = {:.2}x", 1.0 + h / (p - r));
-    println!("  this corpus runs at d = {dup:.1}x  ({:.0}x past break-even)", dup / (1.0 + h / (p - r)));
+    println!(
+        "  this corpus runs at d = {dup:.1}x  ({:.0}x past break-even)",
+        dup / (1.0 + h / (p - r))
+    );
     println!("\n  break-even by piece size (h = {h:.0} B):");
     println!("  {:>14}{:>12}", "compressed p", "d* needed");
     for pp in [8.0, 16.0, 37.0, 64.0, 116.0, 256.0, 1024.0] {

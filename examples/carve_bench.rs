@@ -24,7 +24,8 @@ fn dir_bytes(d: &std::path::Path) -> u64 {
     if let Ok(rd) = std::fs::read_dir(d) {
         for e in rd.flatten() {
             let p = e.path();
-            total += if p.is_dir() { dir_bytes(&p) } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+            total +=
+                if p.is_dir() { dir_bytes(&p) } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
         }
     }
     total

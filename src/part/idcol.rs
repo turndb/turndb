@@ -99,10 +99,9 @@ impl<'a> IdCol<'a> {
             bail!("id index {i} out of range ({} ids)", self.len);
         }
         let group = i / RESTART;
-        let mut at = *self
-            .restarts
-            .get(group)
-            .ok_or_else(|| anyhow::anyhow!("missing restart {group}"))? as usize;
+        let mut at =
+            *self.restarts.get(group).ok_or_else(|| anyhow::anyhow!("missing restart {group}"))?
+                as usize;
         let mut cur: Vec<u8> = Vec::new();
         for _ in 0..=(i % RESTART) {
             let shared = get_varint(self.stream, &mut at)? as usize;
@@ -298,7 +297,12 @@ mod tests {
         let ids = ids();
         let raw: usize = ids.iter().map(|s| s.len()).sum();
         let (stream, _) = build(&ids).unwrap();
-        assert!(stream.len() * 2 < raw, "front coding must roughly halve highly-shared ids: {} vs {}", stream.len(), raw);
+        assert!(
+            stream.len() * 2 < raw,
+            "front coding must roughly halve highly-shared ids: {} vs {}",
+            stream.len(),
+            raw
+        );
     }
 
     #[test]

@@ -113,7 +113,8 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
                         AttrValue::Str(s) => s.as_str(),
                         _ => unreachable!(),
                     };
-                    let ord = distinct.binary_search(&s).expect("value must be in its own dictionary");
+                    let ord =
+                        distinct.binary_search(&s).expect("value must be in its own dictionary");
                     val.extend_from_slice(&(ord as u32).to_le_bytes());
                 }
             }
@@ -149,7 +150,8 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
         // 0..n, which carries no information. Storing it explicitly was 39% of all part bytes on a
         // real corpus. Elide it; everything else stores ascending deltas as varints (a duplicated key
         // on one row is a zero delta), which zstd then crushes.
-        let dense = rid[c].len() == rows.len() && rid[c].iter().enumerate().all(|(i, &r)| r as usize == i);
+        let dense =
+            rid[c].len() == rows.len() && rid[c].iter().enumerate().all(|(i, &r)| r as usize == i);
         let (kind, rid_bytes) = if dense {
             (RID_DENSE, Vec::new())
         } else {
@@ -423,7 +425,9 @@ fn value_at(tag: u8, val: &[u8], k: usize, dict: &[String]) -> Result<AttrValue>
             )
         }
         1 => AttrValue::Int(i64::from_le_bytes(val[at..at + 8].try_into().unwrap())),
-        2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(val[at..at + 8].try_into().unwrap()))),
+        2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
+            val[at..at + 8].try_into().unwrap(),
+        ))),
         3 => AttrValue::Bool(val[at] != 0),
         t => bail!("unknown attribute type tag {t}"),
     })
@@ -448,7 +452,8 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
 
     let mut out = Vec::with_capacity(n.min(layout.len()));
     // per column: the index of this row's first occurrence, then how many we have consumed
-    let mut cursor: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+    let mut cursor: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
     for _ in 0..n {
         let c = get_varint(&layout, &mut at)? as usize;
         let (key, tag, occ, kind) = meta

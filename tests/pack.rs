@@ -152,7 +152,10 @@ fn a_pack_refuses_what_it_must() {
     let xat = b.len() - 4;
     b[xat..].copy_from_slice(&x.as_bytes()[0..4]);
     std::fs::write(&pk, &b).unwrap();
-    let err = match turndb::pack::Pack::open(&pk) { Err(e) => e.to_string(), Ok(_) => panic!("must refuse") };
+    let err = match turndb::pack::Pack::open(&pk) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("must refuse"),
+    };
     assert!(err.contains("version"), "a future version must refuse by name, got: {err}");
 
     // reserved bytes are enforced, not decorative
@@ -162,7 +165,10 @@ fn a_pack_refuses_what_it_must() {
     let x = blake3::hash(&b[foot_start..foot_start + 36]);
     b[xat..].copy_from_slice(&x.as_bytes()[0..4]);
     std::fs::write(&pk, &b).unwrap();
-    let err = match turndb::pack::Pack::open(&pk) { Err(e) => e.to_string(), Ok(_) => panic!("must refuse") };
+    let err = match turndb::pack::Pack::open(&pk) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("must refuse"),
+    };
     assert!(err.contains("reserved"), "non-zero reserved bytes must refuse, got: {err}");
     std::fs::remove_dir_all(&root).ok();
 }

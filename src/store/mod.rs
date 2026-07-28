@@ -35,10 +35,10 @@ use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
-use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
@@ -253,9 +253,8 @@ impl Manifest {
         self.commit += 1;
         // Chain onto whatever is being replaced. Hashed from disk rather than from memory,
         // because the chain's claim is about the BYTES a verifier can read back.
-        self.prev = std::fs::read(dir.join("MANIFEST"))
-            .ok()
-            .map(|b| blake3::hash(&b).to_hex().to_string());
+        self.prev =
+            std::fs::read(dir.join("MANIFEST")).ok().map(|b| blake3::hash(&b).to_hex().to_string());
         let bytes = self.encode()?;
         {
             let p = retained_path(dir, self.commit);
@@ -359,7 +358,8 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
         if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
             segs.push(crate::fold::SegmentInput {
                 seg: n,
-                reader: Arc::new(pack.file(&name).expect("named file exists")) as Arc<dyn crate::readat::ReadAt>,
+                reader: Arc::new(pack.file(&name).expect("named file exists"))
+                    as Arc<dyn crate::readat::ReadAt>,
                 sidecar: pack.read_file(&format!("{fold_rel}/seg-{n:08}.dir")).ok(),
             });
         } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
@@ -371,9 +371,9 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     for p in &manifest.parts {
-        let ext = pack
-            .file(&p.file)
-            .ok_or_else(|| anyhow::anyhow!("pack manifest names {} but the pack does not hold it", p.file))?;
+        let ext = pack.file(&p.file).ok_or_else(|| {
+            anyhow::anyhow!("pack manifest names {} but the pack does not hold it", p.file)
+        })?;
         parts.push(Arc::new(Part::open_reader(Box::new(ext), pcache.clone())?));
     }
     Ok(ReadStore { fold, parts, manifest })
@@ -381,8 +381,9 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
 
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
     let p = retained_path(dir, commit);
-    let b = std::fs::read(&p)
-        .with_context(|| format!("no retained manifest {} — the retention window has moved past it", p.display()))?;
+    let b = std::fs::read(&p).with_context(|| {
+        format!("no retained manifest {} — the retention window has moved past it", p.display())
+    })?;
     Manifest::parse(&b).with_context(|| format!("retained manifest {} is corrupt", p.display()))
 }
 
@@ -445,8 +446,8 @@ pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
     let mut prev_bytes: Option<Vec<u8>> = None;
     for &c in &commits {
         let bytes = std::fs::read(retained_path(dir, c))?;
-        let m = Manifest::parse(&bytes)
-            .with_context(|| format!("retained manifest {c} is corrupt"))?;
+        let m =
+            Manifest::parse(&bytes).with_context(|| format!("retained manifest {c} is corrupt"))?;
         if let (Some(want), Some(pb)) = (&m.prev, &prev_bytes) {
             let got = blake3::hash(pb).to_hex().to_string();
             if *want != got {
@@ -580,7 +581,8 @@ impl Store {
 
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
         // is discarded, and the log regenerates it.
-        let mut fold = Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
+        let mut fold =
+            Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
 
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -624,7 +626,17 @@ impl Store {
         }
         let wal = Wal::open(&wal_path)?;
 
-        Ok(Store { dir: dir.to_path_buf(), fold, parts, manifest, mem, mem_bytes, wal, cfg, pcache })
+        Ok(Store {
+            dir: dir.to_path_buf(),
+            fold,
+            parts,
+            manifest,
+            mem,
+            mem_bytes,
+            wal,
+            cfg,
+            pcache,
+        })
     }
 
     /// Open for reading only: no lock, no replay, no daemon.
@@ -687,13 +699,17 @@ impl Store {
                 // meaningful against the new fold generation. If that swap happened while this
                 // attempt was opening files, retry even when every individual open succeeded.
                 if Manifest::load(dir)?.fold_gen != manifest.fold_gen {
-                    last = Some(anyhow::anyhow!("fold generation changed while opening a reader snapshot"));
+                    last = Some(anyhow::anyhow!(
+                        "fold generation changed while opening a reader snapshot"
+                    ));
                     continue;
                 }
                 return Ok(ReadStore { fold, parts, manifest });
             }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("manifest snapshot names storage that does not exist")))
+        Err(last.unwrap_or_else(|| {
+            anyhow::anyhow!("manifest snapshot names storage that does not exist")
+        }))
     }
 
     /// Open a READER on a retained snapshot: the store exactly as commit `commit` left it.
@@ -771,7 +787,12 @@ impl Store {
 
     /// [`Store::put`], with the engine's default carve deciding the spans. The convenience most
     /// ingest wants; see [`crate::carve`] for the opinion and its escape hatches.
-    pub fn put_body(&mut self, id: &str, body: &[u8], attrs: Vec<(String, AttrValue)>) -> Result<()> {
+    pub fn put_body(
+        &mut self,
+        id: &str,
+        body: &[u8],
+        attrs: Vec<(String, AttrValue)>,
+    ) -> Result<()> {
         self.put_body_with(id, body, attrs, &crate::carve::Carve::default())
     }
 
@@ -820,7 +841,11 @@ impl Store {
                             }
                         }
                     }
-                    framed.push((Record { id: id.clone(), body, attrs: attrs.clone() }, novel, false));
+                    framed.push((
+                        Record { id: id.clone(), body, attrs: attrs.clone() },
+                        novel,
+                        false,
+                    ));
                 }
                 BatchItem::Delete { id } => {
                     framed.push((
@@ -909,14 +934,22 @@ impl Store {
                     continue;
                 }
                 let loc = self.locate(hash)?.ok_or_else(|| {
-                    anyhow::anyhow!("staged piece {hash} is in neither the fold window nor any live part")
+                    anyhow::anyhow!(
+                        "staged piece {hash} is in neither the fold window nor any live part"
+                    )
                 })?;
                 locs.insert(*hash, loc);
             }
         }
         let meta = part::build_full(
-            &path, &recs, &tombs, seq, seq, self.cfg.level,
-            |h| locs.get(h).copied(), &HashMap::new(),
+            &path,
+            &recs,
+            &tombs,
+            seq,
+            seq,
+            self.cfg.level,
+            |h| locs.get(h).copied(),
+            &HashMap::new(),
         )?;
 
         let mut m = self.manifest.clone();
@@ -953,7 +986,11 @@ impl Store {
     /// Contiguity is the correctness gate: parts resolve versions by sequence, so merging a
     /// non-adjacent set would drop whatever an excluded part said about a shared id. The range is
     /// therefore expressed as a slice of the live list, which cannot express a gap.
-    pub fn merge_range(&mut self, lo: usize, len: usize) -> Result<Option<crate::part::merge::MergeStats>> {
+    pub fn merge_range(
+        &mut self,
+        lo: usize,
+        len: usize,
+    ) -> Result<Option<crate::part::merge::MergeStats>> {
         if len < 2 || lo + len > self.parts.len() {
             return Ok(None);
         }
@@ -973,8 +1010,7 @@ impl Store {
         // part outside the run could still hold an older version of the deleted id, and dropping the
         // tombstone would resurrect it.
         let total = lo == 0 && len == self.parts.len();
-        let (meta, stats) =
-            crate::part::merge::merge_opts(&path, &inputs, self.cfg.level, total)?;
+        let (meta, stats) = crate::part::merge::merge_opts(&path, &inputs, self.cfg.level, total)?;
 
         // Publish: the merged part is durable (part::build fsyncs) before the manifest names it, and
         // the manifest swap is the single linearization point. A crash before it leaves the merged
@@ -1008,7 +1044,11 @@ impl Store {
     /// affordable.
     ///
     /// This is the MANUAL dial; [`Store::auto_compact`] is the engine's measured default policy.
-    pub fn maybe_compact(&mut self, trigger: usize, run: usize) -> Result<Option<crate::part::merge::MergeStats>> {
+    pub fn maybe_compact(
+        &mut self,
+        trigger: usize,
+        run: usize,
+    ) -> Result<Option<crate::part::merge::MergeStats>> {
         if self.parts.len() < trigger {
             return Ok(None);
         }
@@ -1251,19 +1291,11 @@ impl Store {
             }
         }
         // ... against every block the fold holds.
-        let mut dead: Vec<u32> = self
-            .fold
-            .block_ids()
-            .into_iter()
-            .filter(|b| !live_blocks.contains(b))
-            .collect();
+        let mut dead: Vec<u32> =
+            self.fold.block_ids().into_iter().filter(|b| !live_blocks.contains(b)).collect();
         dead.sort_unstable();
-        let already: HashSet<u32> = self
-            .manifest
-            .punched
-            .iter()
-            .flat_map(|&(lo, hi)| lo..=hi)
-            .collect();
+        let already: HashSet<u32> =
+            self.manifest.punched.iter().flat_map(|&(lo, hi)| lo..=hi).collect();
         dead.retain(|b| !already.contains(b));
         if dead.is_empty() {
             return Ok(PunchStats::default());
@@ -1317,7 +1349,9 @@ impl Store {
                     seq_lo: *lo,
                     seq_hi: *hi,
                     records: *n,
-                    b3: Some(blake3::hash(&std::fs::read(self.dir.join(file))?).to_hex().to_string()),
+                    b3: Some(
+                        blake3::hash(&std::fs::read(self.dir.join(file))?).to_hex().to_string(),
+                    ),
                 })
             })
             .collect::<Result<_>>()?;
@@ -1472,9 +1506,6 @@ impl ReadStore {
     }
 }
 
-
-
-
 fn approx_bytes(r: &Record) -> usize {
     r.id.len()
         + r.body
@@ -1537,7 +1568,10 @@ mod tests {
         b[at] = b'x';
         std::fs::write(d.join("MANIFEST"), &b).unwrap();
 
-        assert!(super::Manifest::load(&d).is_err(), "trailing bytes must fail JSON parsing, not be ignored");
+        assert!(
+            super::Manifest::load(&d).is_err(),
+            "trailing bytes must fail JSON parsing, not be ignored"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -1552,7 +1586,12 @@ mod tests {
             m.commit(&d).unwrap();
         }
         assert_eq!(m.commit, 6);
-        assert_eq!(super::list_retained(&d), vec![3, 4, 5, 6], "window of {} commits", super::MANIFEST_RETAIN);
+        assert_eq!(
+            super::list_retained(&d),
+            vec![3, 4, 5, 6],
+            "window of {} commits",
+            super::MANIFEST_RETAIN
+        );
 
         // Bit rot in MANIFEST: open refuses; recovery promotes the newest copy — same commit,
         // nothing lost.
@@ -1590,7 +1629,13 @@ mod tests {
         let d = std::env::temp_dir().join(format!("turndb-man-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let mut m = super::Manifest {
-            parts: vec![super::PartRef { file: "p.part".into(), seq_lo: 1, seq_hi: 1, records: 7, b3: None }],
+            parts: vec![super::PartRef {
+                file: "p.part".into(),
+                seq_lo: 1,
+                seq_hi: 1,
+                records: 7,
+                b3: None,
+            }],
             fold_seg: 2,
             fold_off: 4096,
             next_seq: 9,

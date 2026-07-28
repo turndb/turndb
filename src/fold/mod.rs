@@ -37,11 +37,11 @@ use crate::types::PieceHash;
 use anyhow::{bail, Context, Result};
 use dedup::DedupTable;
 use segment::{SegHeader, SEG_HDR_LEN, SEG_MAX_DEFAULT, SEG_MAX_LIMIT};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::collections::hash_map::Entry;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FoldCfg {
@@ -234,7 +234,11 @@ impl Fold {
     /// refuse rather than serve a fold that silently lost durable bytes.
     pub fn open_at(dir: &Path, cfg: FoldCfg, committed: Option<FoldTail>) -> Result<Fold> {
         if (cfg.seg_max as u64) > SEG_MAX_LIMIT {
-            bail!("seg_max {} exceeds the {} format bound (Loc.block_off is u32)", cfg.seg_max, SEG_MAX_LIMIT);
+            bail!(
+                "seg_max {} exceeds the {} format bound (Loc.block_off is u32)",
+                cfg.seg_max,
+                SEG_MAX_LIMIT
+            );
         }
         // A block is admitted into a FRESH segment however large it is — otherwise a block bigger than
         // seg_max could never be written at all. That admission is what makes block_target load-bearing
@@ -325,7 +329,8 @@ impl Fold {
                     bail!(
                         "committed fold tail (seg {}, off {}) but the fold holds no durable bytes \
                          — the fold lost durable data",
-                        ct.seg, ct.off
+                        ct.seg,
+                        ct.off
                     );
                 }
             }
@@ -348,7 +353,7 @@ impl Fold {
                 next_block: 0,
                 inflight: HashMap::new(),
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
-                    _lock: Some(lock),
+                _lock: Some(lock),
             });
         }
 
@@ -358,8 +363,9 @@ impl Fold {
                 continue;
             }
             let name = format!("zdict-{}.zd", PieceHash(h.dict_id).to_hex());
-            let bytes = std::fs::read(dir.join(&name))
-                .with_context(|| format!("segment {} names dictionary {name} but it is unreadable", h.seg))?;
+            let bytes = std::fs::read(dir.join(&name)).with_context(|| {
+                format!("segment {} names dictionary {name} but it is unreadable", h.seg)
+            })?;
             let got: [u8; 32] = blake3::hash(&bytes).into();
             if got != h.dict_id {
                 bail!("dictionary {name} content hash does not match the id naming it");
@@ -548,7 +554,11 @@ impl Fold {
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
             let entries = if h.seg != last {
-                match segs[i].sidecar.as_ref().and_then(|b| segment::parse_dir_sidecar(b, h.seg, len)) {
+                match segs[i]
+                    .sidecar
+                    .as_ref()
+                    .and_then(|b| segment::parse_dir_sidecar(b, h.seg, len))
+                {
                     Some((_, e)) => e,
                     None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
                 }
@@ -608,7 +618,11 @@ impl Fold {
         if raw.len() as u64 > u32::MAX as u64 {
             bail!("piece of {} bytes exceeds the u32 length cap; carve smaller", raw.len());
         }
-        debug_assert_eq!(hash, PieceHash::of(raw), "put_hashed given a digest that is not its content's");
+        debug_assert_eq!(
+            hash,
+            PieceHash::of(raw),
+            "put_hashed given a digest that is not its content's"
+        );
         if let Some(loc) = self.dedup.get(&hash) {
             return Ok(Put { hash, loc, deduped: true });
         }
@@ -652,7 +666,9 @@ impl Fold {
         if end > blk.len() as u64 {
             bail!(
                 "Loc (in_off {}, raw {}) exceeds its block of {} bytes",
-                loc.in_off, loc.raw, blk.len()
+                loc.in_off,
+                loc.raw,
+                blk.len()
             );
         }
         Ok(f(&blk[loc.in_off as usize..end as usize]))
@@ -668,7 +684,11 @@ impl Fold {
         self.with_piece(loc, |s| -> Result<Vec<u8>> {
             let got = PieceHash::of(s);
             if got != expect {
-                bail!("content hash mismatch in block {} at +{}: got {got}, expected {expect}", loc.block_id, loc.in_off);
+                bail!(
+                    "content hash mismatch in block {} at +{}: got {got}, expected {expect}",
+                    loc.block_id,
+                    loc.in_off
+                );
             }
             Ok(s.to_vec())
         })?
@@ -681,7 +701,11 @@ impl Fold {
         self.with_piece(loc, |s| -> Result<()> {
             let got = PieceHash::of(s);
             if got != expect {
-                bail!("content hash mismatch in block {} at +{}: got {got}, expected {expect}", loc.block_id, loc.in_off);
+                bail!(
+                    "content hash mismatch in block {} at +{}: got {got}, expected {expect}",
+                    loc.block_id,
+                    loc.in_off
+                );
             }
             out.extend_from_slice(s);
             Ok(())
@@ -693,15 +717,13 @@ impl Fold {
         if let Some(v) = self.cache.lock().unwrap().get(loc.block_id) {
             return Ok(v);
         }
-        let (seg, off) = *self
-            .blockdir
-            .get(loc.block_id as usize)
-            .and_then(|e| e.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("block {} is not in the fold's directory", loc.block_id))?;
-        let f = self
-            .readers
-            .get(seg as usize)
-            .ok_or_else(|| anyhow::anyhow!("block {} names segment {seg} which does not exist", loc.block_id))?;
+        let (seg, off) =
+            *self.blockdir.get(loc.block_id as usize).and_then(|e| e.as_ref()).ok_or_else(
+                || anyhow::anyhow!("block {} is not in the fold's directory", loc.block_id),
+            )?;
+        let f = self.readers.get(seg as usize).ok_or_else(|| {
+            anyhow::anyhow!("block {} names segment {seg} which does not exist", loc.block_id)
+        })?;
         if (off as u64) < SEG_HDR_LEN {
             bail!("block {} offset {off} is inside the segment header", loc.block_id);
         }
@@ -727,7 +749,8 @@ impl Fold {
 
         let span = hdr.frame_len() as usize;
         let mut buf = vec![0u8; span];
-        f.read_exact_at(&mut buf, off as u64).with_context(|| format!("read block at seg {seg} off {off}"))?;
+        f.read_exact_at(&mut buf, off as u64)
+            .with_context(|| format!("read block at seg {seg} off {off}"))?;
         block::verify_frame_bytes(&buf, has_dict)?;
 
         let dict = self.dicts.get(&self.headers[seg as usize].dict_id).cloned();
@@ -775,12 +798,18 @@ impl Fold {
     fn write_block(&mut self, d: pipe::Done) -> Result<()> {
         let n = block::encode(&mut self.scratch, d.block_id, d.codec, &d.raw, &d.payload);
         // Roll if this block would not fit. Blocks are self-contained, so one never straddles.
-        if self.cur_off as u64 > SEG_HDR_LEN && self.cur_off as u64 + n as u64 > self.cfg.seg_max as u64 {
+        if self.cur_off as u64 > SEG_HDR_LEN
+            && self.cur_off as u64 + n as u64 > self.cfg.seg_max as u64
+        {
             self.roll()?;
         }
         let path = segment::seg_path(&self.dir, self.active);
-        let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot append"))?;
-        if let Err(e) = crate::vfs::write_all_at(f, &path, &self.scratch[..n], self.cur_off as u64) {
+        let f = self
+            .active_f
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("read-only fold cannot append"))?;
+        if let Err(e) = crate::vfs::write_all_at(f, &path, &self.scratch[..n], self.cur_off as u64)
+        {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }
@@ -807,7 +836,8 @@ impl Fold {
         self.seal_block()?;
         // Every block must be compressed AND written before a tail can be reported durable.
         self.write_ready(true)?;
-        let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot sync"))?;
+        let f =
+            self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot sync"))?;
         crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
             .context("fsync active fold segment")?;
         Ok(self.tail())
@@ -934,11 +964,7 @@ impl Fold {
 
     /// Every block id the directory knows — the universe a reachability sweep works against.
     pub fn block_ids(&self) -> Vec<u32> {
-        self.blockdir
-            .iter()
-            .enumerate()
-            .filter_map(|(id, e)| e.map(|_| id as u32))
-            .collect()
+        self.blockdir.iter().enumerate().filter_map(|(id, e)| e.map(|_| id as u32)).collect()
     }
 
     pub fn segment_count(&self) -> u32 {
@@ -975,7 +1001,8 @@ impl Fold {
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
         let flags = self.headers[self.active as usize].flags;
-        let f = self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
+        let f =
+            self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
         crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
             .context("fsync before roll")?;
         // The segment being sealed gets its directory sidecar now — the write that turns the next
@@ -1047,9 +1074,7 @@ fn acquire_writer_lock(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    if !crate::sys::lock_exclusive(&f)
-        .with_context(|| format!("locking {}", path.display()))?
-    {
+    if !crate::sys::lock_exclusive(&f).with_context(|| format!("locking {}", path.display()))? {
         bail!("fold at {} is already open by another writer", dir.display());
     }
     Ok(f)

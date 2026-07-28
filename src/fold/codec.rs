@@ -117,13 +117,14 @@ pub fn decode(codec: u8, payload: &[u8], raw_len: u32, dict: Option<&[u8]>) -> R
             Ok(payload.to_vec())
         }
         CODEC_ZSTD | CODEC_ZSTD_DICT => {
-            let d = if codec == CODEC_ZSTD_DICT {
-                Some(dict.ok_or_else(|| {
-                    anyhow::anyhow!("dictionary block but no dictionary loaded")
-                })?)
-            } else {
-                None
-            };
+            let d =
+                if codec == CODEC_ZSTD_DICT {
+                    Some(dict.ok_or_else(|| {
+                        anyhow::anyhow!("dictionary block but no dictionary loaded")
+                    })?)
+                } else {
+                    None
+                };
             let mut out = vec![0u8; n];
             let got = z::decompress_into(payload, d, &mut out)?;
             // A frame that decodes SHORT is as much a corruption as one that overruns; without

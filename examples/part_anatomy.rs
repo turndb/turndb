@@ -44,17 +44,24 @@ fn main() -> anyhow::Result<()> {
             total_stored += stored as u64;
         }
     }
-    let file_bytes: u64 = paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let file_bytes: u64 =
+        paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
 
     println!("{} parts, {records} records, {:.2} MiB on disk\n", paths.len(), mib(file_bytes));
-    println!("{:<16}{:>11}{:>9}{:>12}{:>8}{:>12}", "section", "stored MiB", "% meta", "raw MiB", "ratio", "B/record");
+    println!(
+        "{:<16}{:>11}{:>9}{:>12}{:>8}{:>12}",
+        "section", "stored MiB", "% meta", "raw MiB", "ratio", "B/record"
+    );
     let mut rows: Vec<_> = agg.into_iter().collect();
     rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     for (name, (stored, raw, _)) in &rows {
         println!(
             "{:<16}{:>11.3}{:>8.1}%{:>12.2}{:>7.1}x{:>12.1}",
-            name, mib(*stored), *stored as f64 * 100.0 / total_stored as f64,
-            mib(*raw), *raw as f64 / (*stored).max(1) as f64,
+            name,
+            mib(*stored),
+            *stored as f64 * 100.0 / total_stored as f64,
+            mib(*raw),
+            *raw as f64 / (*stored).max(1) as f64,
             *stored as f64 / records as f64
         );
     }

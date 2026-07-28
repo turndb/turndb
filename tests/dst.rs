@@ -159,12 +159,8 @@ impl Fs {
                 }
             }
             Op::RemoveTree { path } => {
-                let doomed: Vec<PathBuf> = self
-                    .volatile_ns
-                    .keys()
-                    .filter(|p| p.starts_with(path))
-                    .cloned()
-                    .collect();
+                let doomed: Vec<PathBuf> =
+                    self.volatile_ns.keys().filter(|p| p.starts_with(path)).cloned().collect();
                 for p in doomed {
                     self.volatile_ns.remove(&p);
                 }
@@ -245,7 +241,8 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
                             let mut img = node.durable.clone();
                             let cut = torn.unwrap().1;
                             for (k, (off, data)) in node.pending.iter().enumerate() {
-                                let take = if k + 1 == node.pending.len() { cut } else { data.len() };
+                                let take =
+                                    if k + 1 == node.pending.len() { cut } else { data.len() };
                                 if *off == u64::MAX {
                                     img = data[..take.min(data.len())].to_vec();
                                     continue;
@@ -288,7 +285,8 @@ fn body_for(i: usize) -> Vec<u8> {
     // shared prefix (dedups across records) + unique tail
     format!(
         "{{\"system\":\"the shared system prompt, {} bytes of it {}\",\"turn\":{i}}}",
-        64, "x".repeat(64)
+        64,
+        "x".repeat(64)
     )
     .into_bytes()
 }
@@ -427,10 +425,13 @@ fn every_crash_state_recovers_to_an_acked_consistent_store() {
 }
 
 fn op_summary(op: &Op) -> String {
-    let short = |p: &Path| p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let short =
+        |p: &Path| p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     match op {
         Op::Create { path } => format!("Create      {}", short(path)),
-        Op::WriteAt { path, off, data } => format!("WriteAt     {} off={off} len={}", short(path), data.len()),
+        Op::WriteAt { path, off, data } => {
+            format!("WriteAt     {} off={off} len={}", short(path), data.len())
+        }
         Op::SetLen { path, len } => format!("SetLen      {} len={len}", short(path)),
         Op::WriteFile { path, data } => format!("WriteFile   {} len={}", short(path), data.len()),
         Op::SyncFile { path } => format!("SyncFile    {}", short(path)),
@@ -472,7 +473,8 @@ fn check_state(
         }
     };
     // Read the whole recovered logical state.
-    let ids = store.ids().unwrap_or_else(|e| panic!("crash point {k} {variant:?}: ids() failed: {e:#}"));
+    let ids =
+        store.ids().unwrap_or_else(|e| panic!("crash point {k} {variant:?}: ids() failed: {e:#}"));
     let mut recovered: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     for id in ids {
         let v = store

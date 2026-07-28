@@ -85,7 +85,8 @@ fn main() -> anyhow::Result<()> {
                 if merged.is_some() {
                     merges += 1;
                     merge_wall += tm.elapsed().as_secs_f64();
-                    merge_meta_bytes += dir_part_bytes(&dir).saturating_sub(before / 2); // new part written
+                    merge_meta_bytes += dir_part_bytes(&dir).saturating_sub(before / 2);
+                    // new part written
                 }
             }
         }

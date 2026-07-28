@@ -178,16 +178,17 @@ const BUF_FLUSH: usize = 1 << 20;
 
 impl Wal {
     pub fn open(path: &Path) -> Result<Wal> {
-        let (f, created) =
-            crate::vfs::open_or_create(path).with_context(|| format!("open wal {}", path.display()))?;
+        let (f, created) = crate::vfs::open_or_create(path)
+            .with_context(|| format!("open wal {}", path.display()))?;
         if created {
             // A created file's NAME is volatile until its parent directory syncs — fsyncing the
             // file alone leaves a dirent a power loss can drop, and an ACK backed by a WAL that
             // can vanish is no ACK at all. Found by the DST harness under the strict-POSIX model:
             // sync() had fsynced the file, the dirent evaporated, and acked records were lost.
             if let Some(parent) = path.parent() {
-                crate::vfs::sync_dir(parent)
-                    .with_context(|| format!("fsync {} after creating the wal", parent.display()))?;
+                crate::vfs::sync_dir(parent).with_context(|| {
+                    format!("fsync {} after creating the wal", parent.display())
+                })?;
             }
         }
         let file_len = f.metadata()?.len();
@@ -317,7 +318,9 @@ impl Wal {
         let mut off = 0u64;
         let mut hdr = [0u8; HDR];
         loop {
-            if off + HDR as u64 + CRC as u64 > len || crate::sys::read_exact_at(&f, &mut hdr, off).is_err() {
+            if off + HDR as u64 + CRC as u64 > len
+                || crate::sys::read_exact_at(&f, &mut hdr, off).is_err()
+            {
                 break;
             }
             // An unknown tag is AMBIGUOUS and the two readings are opposite: a crash mid-append
@@ -375,7 +378,10 @@ impl Wal {
                         // sealing more members than preceded it means the log is not what a writer
                         // put down. That is corruption that CHECKSUMS, and it must not quietly
                         // shrink a batch.
-                        bail!("wal batch commit seals {n} frames but only {} precede it", pending.len());
+                        bail!(
+                            "wal batch commit seals {n} frames but only {} precede it",
+                            pending.len()
+                        );
                     }
                     let start = pending.len() - n;
                     // Members before the sealed run belong to a batch whose marker never landed.
@@ -428,7 +434,10 @@ mod tests {
         (
             Record {
                 id: "genai:aé#in".into(),
-                body: vec![BodyOp::Lit(b"[".to_vec()), BodyOp::Piece { hash: h, len: bytes.len() as u32 }],
+                body: vec![
+                    BodyOp::Lit(b"[".to_vec()),
+                    BodyOp::Piece { hash: h, len: bytes.len() as u32 },
+                ],
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
                     ("k".into(), AttrValue::Int(-5)),
@@ -501,8 +510,15 @@ mod tests {
             let mut w = Wal::open(&p).unwrap();
             w.append(1, &a, &na).unwrap();
             let tomb = Record { id: "z".into(), body: Vec::new(), attrs: Vec::new() };
-            w.append_batch(2, &[(a.clone(), na.clone(), false), (tomb, Vec::new(), true), (b.clone(), nb.clone(), false)])
-                .unwrap();
+            w.append_batch(
+                2,
+                &[
+                    (a.clone(), na.clone(), false),
+                    (tomb, Vec::new(), true),
+                    (b.clone(), nb.clone(), false),
+                ],
+            )
+            .unwrap();
             w.sync().unwrap();
         }
         let f = Wal::replay(&p).unwrap();
@@ -524,7 +540,12 @@ mod tests {
             w.sync().unwrap();
         }
         let f = Wal::replay(&p).unwrap();
-        assert_eq!(f.len(), 2, "abandoned members stay discarded: {:?}", f.iter().map(|x| &x.record.id).collect::<Vec<_>>());
+        assert_eq!(
+            f.len(),
+            2,
+            "abandoned members stay discarded: {:?}",
+            f.iter().map(|x| &x.record.id).collect::<Vec<_>>()
+        );
         assert_eq!(f[1].record.id, "b");
 
         // A marker claiming more members than precede it is corruption that checksums: refuse.

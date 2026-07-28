@@ -27,20 +27,45 @@ pub mod record {
     #[derive(Clone, Debug)]
     pub enum Op {
         /// `File::create`: truncate-or-create. The dirent is NOT durable until its dir syncs.
-        Create { path: PathBuf },
+        Create {
+            path: PathBuf,
+        },
         /// Positioned write.
-        WriteAt { path: PathBuf, off: u64, data: Vec<u8> },
+        WriteAt {
+            path: PathBuf,
+            off: u64,
+            data: Vec<u8>,
+        },
         /// `set_len` — truncation (or extension) of the file's content.
-        SetLen { path: PathBuf, len: u64 },
+        SetLen {
+            path: PathBuf,
+            len: u64,
+        },
         /// Whole-file write (create + contents), as `std::fs::write`.
-        WriteFile { path: PathBuf, data: Vec<u8> },
-        SyncFile { path: PathBuf },
-        SyncDir { path: PathBuf },
-        Rename { from: PathBuf, to: PathBuf },
-        Unlink { path: PathBuf },
-        Mkdir { path: PathBuf },
+        WriteFile {
+            path: PathBuf,
+            data: Vec<u8>,
+        },
+        SyncFile {
+            path: PathBuf,
+        },
+        SyncDir {
+            path: PathBuf,
+        },
+        Rename {
+            from: PathBuf,
+            to: PathBuf,
+        },
+        Unlink {
+            path: PathBuf,
+        },
+        Mkdir {
+            path: PathBuf,
+        },
         /// `remove_dir_all`.
-        RemoveTree { path: PathBuf },
+        RemoveTree {
+            path: PathBuf,
+        },
     }
 
     thread_local! {

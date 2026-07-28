@@ -87,11 +87,16 @@ fn main() -> anyhow::Result<()> {
         distinct += n as u64;
     }
 
-    println!("{} parts, {refs} piece refs over {distinct} distinct pieces ({:.1} refs/piece)\n",
-        paths.len(), refs as f64 / distinct as f64);
+    println!(
+        "{} parts, {refs} piece refs over {distinct} distinct pieces ({:.1} refs/piece)\n",
+        paths.len(),
+        refs as f64 / distinct as f64
+    );
 
-    println!("reference skew (per part, top 1% of pieces): {:.1}% of all refs",
-        top_share.iter().sum::<f64>() / top_share.len() as f64);
+    println!(
+        "reference skew (per part, top 1% of pieces): {:.1}% of all refs",
+        top_share.iter().sum::<f64>() / top_share.len() as f64
+    );
     let names = ["unreferenced", "1 ref", "2-9 refs", "10-99 refs", "100+ refs"];
     for (i, n) in names.iter().enumerate() {
         println!("  {:<14}{:>10}  ({:.1}%)", n, hist[i], hist[i] as f64 * 100.0 / distinct as f64);
@@ -99,7 +104,10 @@ fn main() -> anyhow::Result<()> {
 
     println!("\nprog piece-reference bytes (pre-compression):");
     println!("  fold order (today)      {:>9.3} MiB", mib(cur));
-    println!("  frequency order         {:>9.3} MiB  ({:.1}% smaller)",
-        mib(byfreq), (cur - byfreq.min(cur)) as f64 * 100.0 / cur as f64);
+    println!(
+        "  frequency order         {:>9.3} MiB  ({:.1}% smaller)",
+        mib(byfreq),
+        (cur - byfreq.min(cur)) as f64 * 100.0 / cur as f64
+    );
     Ok(())
 }

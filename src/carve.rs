@@ -60,13 +60,7 @@ impl Carve {
         let ranges = self.ranges(body);
         ranges
             .into_iter()
-            .map(|(foldable, r)| {
-                if foldable {
-                    Span::Piece(&body[r])
-                } else {
-                    Span::Lit(&body[r])
-                }
-            })
+            .map(|(foldable, r)| if foldable { Span::Piece(&body[r]) } else { Span::Lit(&body[r]) })
             .collect()
     }
 
@@ -258,7 +252,8 @@ mod tests {
     fn every_strategy_reassembles_exactly() {
         let bodies: Vec<Vec<u8>> = vec![
             br#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]"#.to_vec(),
-            br#"[{"a":"br,ack]ets \" in [strings"},{"b":[1,2,{"c":"}]"}]},  "bare string"  ]"#.to_vec(),
+            br#"[{"a":"br,ack]ets \" in [strings"},{"b":[1,2,{"c":"}]"}]},  "bare string"  ]"#
+                .to_vec(),
             br#"{"not":"an array"}"#.to_vec(),
             (0u8..=255).cycle().take(40_000).collect(),
             b"tiny".to_vec(),
@@ -291,19 +286,16 @@ mod tests {
     #[test]
     fn appending_a_turn_preserves_every_earlier_piece() {
         let turn = |i: usize| {
-            format!(r#"{{"role":"user","content":"turn {i} with some padding {}"}}"#, "x".repeat(i * 13))
+            format!(
+                r#"{{"role":"user","content":"turn {i} with some padding {}"}}"#,
+                "x".repeat(i * 13)
+            )
         };
-        let conv = |n: usize| {
-            format!("[{}]", (0..n).map(turn).collect::<Vec<_>>().join(",")).into_bytes()
-        };
+        let conv =
+            |n: usize| format!("[{}]", (0..n).map(turn).collect::<Vec<_>>().join(",")).into_bytes();
         let carve = Carve::default();
         let pieces = |b: &[u8]| -> Vec<Vec<u8>> {
-            carve
-                .ranges(b)
-                .into_iter()
-                .filter(|(f, _)| *f)
-                .map(|(_, r)| b[r].to_vec())
-                .collect()
+            carve.ranges(b).into_iter().filter(|(f, _)| *f).map(|(_, r)| b[r].to_vec()).collect()
         };
         let five = conv(5);
         let six = conv(6);
@@ -381,8 +373,9 @@ mod tests {
         assert_eq!(fold_count(&plain), 2);
         assert!(fold_count(&hybrid) > 2, "the oversized element must chunk");
         // and the small element's piece is identical in both
-        let first_piece =
-            |v: &[(bool, Range<usize>)]| v.iter().find(|(f, _)| *f).map(|(_, r)| r.clone()).unwrap();
+        let first_piece = |v: &[(bool, Range<usize>)]| {
+            v.iter().find(|(f, _)| *f).map(|(_, r)| r.clone()).unwrap()
+        };
         assert_eq!(first_piece(&plain), first_piece(&hybrid));
     }
 }

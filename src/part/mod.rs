@@ -35,20 +35,20 @@
 
 pub mod attrs;
 pub mod bloom;
+pub mod builder;
 pub mod cache;
 pub mod idcol;
-pub mod builder;
 pub mod merge;
 
 use crate::fold::{Fold, Loc};
 use crate::readat::ReadAt;
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
+use cache::{Held, Kind, SectionCache};
 use idcol::{get_varint, put_varint, IdCol};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use cache::{Held, Kind, SectionCache};
 use std::sync::Arc;
 
 pub const MAGIC: &[u8; 8] = b"TURNPART";
@@ -187,8 +187,9 @@ pub fn build_full(
         for op in &r.body {
             if let BodyOp::Piece { hash, .. } = op {
                 if !piece_of.contains_key(hash) {
-                    let loc = resolve(hash)
-                        .ok_or_else(|| anyhow::anyhow!("piece {hash} is referenced but not in the fold"))?;
+                    let loc = resolve(hash).ok_or_else(|| {
+                        anyhow::anyhow!("piece {hash} is referenced but not in the fold")
+                    })?;
                     piece_of.insert(*hash, loc);
                 }
             }
@@ -211,7 +212,8 @@ pub fn build_full(
         // An EMPTY literal would encode as tagged == 0, which is the reserved escape codepoint. It
         // also contributes nothing to the body, so dropping it preserves byte-exactness exactly — but
         // the op COUNT is written before the ops, so it must be the count of what is actually emitted.
-        let emitted = r.body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
+        let emitted =
+            r.body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
         put_varint(&mut prog, emitted as u64);
         for op in &r.body {
             match op {
@@ -318,7 +320,8 @@ pub(crate) struct Writer {
 
 impl Writer {
     pub(crate) fn new(path: &Path, level: i32) -> Result<Writer> {
-        let f = crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
+        let f =
+            crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
         Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level })
     }
 
@@ -490,7 +493,9 @@ impl Part {
         let mut tbuf = vec![0u8; toc_stored as usize];
         f.read_exact_at(&mut tbuf, toc_off)?;
         if version >= 1 && crc32fast::hash(&tbuf) != toc_xsum {
-            bail!("part TOC fails its checksum — every section checksum it carries is untrustworthy");
+            bail!(
+                "part TOC fails its checksum — every section checksum it carries is untrustworthy"
+            );
         }
         let toc_bytes = crate::fold::codec::decode(toc_codec, &tbuf, toc_raw, None)?;
 
@@ -634,7 +639,11 @@ impl Part {
     ///
     /// `from`/`to` are open-ended when `None`. Costs a binary search plus a walk of exactly the
     /// matching run, rather than decoding the whole id column.
-    pub fn rows_in_range(&self, from: Option<&str>, to: Option<&str>) -> Result<std::ops::Range<usize>> {
+    pub fn rows_in_range(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<std::ops::Range<usize>> {
         let stream = self.sect("ids")?;
         let restarts = self.restarts()?;
         let c = IdCol::new(&stream, &restarts, self.len());
@@ -912,7 +921,10 @@ impl Part {
         }
         let b = self.sect(name)?;
         let v: Vec<u64> = match width {
-            4 => b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect(),
+            4 => b
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64)
+                .collect(),
             8 => b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(),
             w => bail!("unsupported array width {w}"),
         };
@@ -949,4 +961,3 @@ impl Part {
         self.has(name)
     }
 }
-

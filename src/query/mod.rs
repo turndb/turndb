@@ -85,7 +85,14 @@ fn arrow_type(tag: u8) -> DataType {
 
 /// A comparison a scan can evaluate for itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cmp { Eq, Ne, Lt, LtEq, Gt, GtEq }
+pub enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
 
 /// Does the zone `(min, max)` PROVE that `<op> val` matches nothing in it? `false` on any doubt —
 /// a type mismatch, a NaN literal — because a zone may only ever widen a scan, never wrongly
@@ -107,9 +114,9 @@ fn zone_disproves(op: Cmp, val: &AttrValue, zone: &(AttrValue, AttrValue)) -> bo
     match op {
         Cmp::Eq => lo == Less || hi == Greater,
         Cmp::Ne => lo == Equal && hi == Equal,
-        Cmp::Lt => lo != Greater,  // every value >= min >= val
-        Cmp::LtEq => lo == Less,   // every value >= min > val
-        Cmp::Gt => hi != Less,     // every value <= max <= val
+        Cmp::Lt => lo != Greater,   // every value >= min >= val
+        Cmp::LtEq => lo == Less,    // every value >= min > val
+        Cmp::Gt => hi != Less,      // every value <= max <= val
         Cmp::GtEq => hi == Greater, // every value <= max < val
     }
 }
@@ -225,7 +232,8 @@ impl Lens {
         for (key, ts) in &tags {
             for &t in ts {
                 // A key with one type keeps its name. A key with several is never silently merged.
-                let mut name = if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                let mut name =
+                    if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
                 if used.contains(&name) {
                     name = format!("{key}#{}", type_name(t));
                 }
@@ -239,11 +247,8 @@ impl Lens {
                 binding.push(Some((key.clone(), t)));
             }
         }
-        let visible = parts
-            .iter()
-            .cloned()
-            .zip(visibility.rows.into_iter().map(Arc::new))
-            .collect();
+        let visible =
+            parts.iter().cloned().zip(visibility.rows.into_iter().map(Arc::new)).collect();
         Ok(Lens { schema: Arc::new(Schema::new(fields)), binding, visible })
     }
 
@@ -364,7 +369,11 @@ impl Lens {
             tests.push(Test::Col { tag, rids, val: part.column_values(c)?, op: p_.op, key: k });
         }
 
-        let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Arc::new(Vec::new()) };
+        let ids = if cols.iter().any(|c| matches!(c, Col::Id)) {
+            part.ids()?
+        } else {
+            Arc::new(Vec::new())
+        };
         let visible = self
             .visible
             .iter()
@@ -393,15 +402,26 @@ enum Test {
     /// No row in this part can match — the batch, and often the part, is skippable without reading.
     Never,
     /// Everything with a value matches; only nulls are excluded.
-    Present { rids: Arc<Vec<u32>> },
-    Col { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, op: Cmp, key: Key },
+    Present {
+        rids: Arc<Vec<u32>>,
+    },
+    Col {
+        tag: u8,
+        rids: Arc<Vec<u32>>,
+        val: Arc<Vec<u8>>,
+        op: Cmp,
+        key: Key,
+    },
 }
 
 #[derive(Clone, Copy)]
 enum Key {
     /// A dictionary ordinal. `exact` is false when the literal is absent and `k` is its insertion
     /// point — which still answers every ORDER comparison, because the dictionary is sorted.
-    Ord { k: u32, exact: bool },
+    Ord {
+        k: u32,
+        exact: bool,
+    },
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -455,12 +475,16 @@ impl Test {
                                     }
                                 }
                             }
-                            (1, Key::Int(kk)) => {
-                                cmp_ok(*op, i64::from_le_bytes(val[o..o + 8].try_into().unwrap()), *kk)
-                            }
+                            (1, Key::Int(kk)) => cmp_ok(
+                                *op,
+                                i64::from_le_bytes(val[o..o + 8].try_into().unwrap()),
+                                *kk,
+                            ),
                             (2, Key::Float(kk)) => cmp_ok(
                                 *op,
-                                f64::from_bits(u64::from_le_bytes(val[o..o + 8].try_into().unwrap())),
+                                f64::from_bits(u64::from_le_bytes(
+                                    val[o..o + 8].try_into().unwrap(),
+                                )),
                                 *kk,
                             ),
                             (3, Key::Bool(kk)) => cmp_ok(*op, val[o] != 0, *kk),
@@ -480,7 +504,12 @@ impl Test {
 enum Col {
     Id,
     Body,
-    Attr { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, dict: Arc<Vec<String>> },
+    Attr {
+        tag: u8,
+        rids: Arc<Vec<u32>>,
+        val: Arc<Vec<u8>>,
+        dict: Arc<Vec<String>>,
+    },
     /// This part has no such column; the batch contributes nulls of the right type.
     Missing(DataType),
 }
@@ -652,9 +681,16 @@ impl PartScan {
                     Arc::new(b.finish()) as ArrayRef
                 }
                 Col::Missing(t) => datafusion::arrow::array::new_null_array(t, len),
-                Col::Attr { tag, rids, val, dict } => {
-                    scatter(*tag, rids, val, dict, lo, hi, &take, &mut self.stats.shadowed_occurrences)?
-                }
+                Col::Attr { tag, rids, val, dict } => scatter(
+                    *tag,
+                    rids,
+                    val,
+                    dict,
+                    lo,
+                    hi,
+                    &take,
+                    &mut self.stats.shadowed_occurrences,
+                )?,
             });
         }
 
@@ -752,7 +788,9 @@ fn scatter(
             for t in &taken {
                 match *t {
                     // from_bits, not from a float parse: -0.0 and NaN payloads round-trip exactly
-                    Some(k) => b.append_value(f64::from_bits(u64::from_le_bytes(at(k)?.try_into().unwrap()))),
+                    Some(k) => b.append_value(f64::from_bits(u64::from_le_bytes(
+                        at(k)?.try_into().unwrap(),
+                    ))),
                     None => b.append_null(),
                 }
             }

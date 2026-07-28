@@ -26,8 +26,12 @@ fn carve(body: &[u8]) -> Vec<(bool, std::ops::Range<usize>)> {
     r
 }
 
-fn gib(b: u64) -> f64 { b as f64 / (1024.0 * 1024.0 * 1024.0) }
-fn mib(b: u64) -> f64 { b as f64 / (1024.0 * 1024.0) }
+fn gib(b: u64) -> f64 {
+    b as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+fn mib(b: u64) -> f64 {
+    b as f64 / (1024.0 * 1024.0)
+}
 
 fn main() -> anyhow::Result<()> {
     let mut a = std::env::args().skip(1);
@@ -51,24 +55,40 @@ fn main() -> anyhow::Result<()> {
 
     for line in rdr.lines() {
         let line = line?;
-        if line.is_empty() { continue; }
-        let v: serde_json::Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
-        let body = match v.get("body").and_then(|b| b.as_str()) { Some(b) => b.as_bytes().to_vec(), None => continue };
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let body = match v.get("body").and_then(|b| b.as_str()) {
+            Some(b) => b.as_bytes().to_vec(),
+            None => continue,
+        };
         let id = format!(
             "{}:{}#{}",
             v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("t"),
             v.get("span_id").and_then(|x| x.as_str()).unwrap_or("s"),
-            v.get("kind").and_then(|x| x.as_str()).unwrap_or("k"));
-        if !seen_ids.insert(id.clone()) { skipped += 1; continue; }
+            v.get("kind").and_then(|x| x.as_str()).unwrap_or("k")
+        );
+        if !seen_ids.insert(id.clone()) {
+            skipped += 1;
+            continue;
+        }
 
         let mut attrs = Vec::new();
         if let Some(obj) = v.as_object() {
             for (k, val) in obj {
-                if k == "body" { continue; }
+                if k == "body" {
+                    continue;
+                }
                 let av = match val {
                     serde_json::Value::String(s) => AttrValue::Str(s.clone()),
                     serde_json::Value::Bool(b) => AttrValue::Bool(*b),
-                    serde_json::Value::Number(n) if n.is_i64() => AttrValue::Int(n.as_i64().unwrap()),
+                    serde_json::Value::Number(n) if n.is_i64() => {
+                        AttrValue::Int(n.as_i64().unwrap())
+                    }
                     serde_json::Value::Number(n) => AttrValue::Float(n.as_f64().unwrap_or(0.0)),
                     _ => continue,
                 };
@@ -84,13 +104,17 @@ fn main() -> anyhow::Result<()> {
             if foldable {
                 let p = fold.put(span)?;
                 refs += 1;
-                if p.deduped { dups += 1; }
+                if p.deduped {
+                    dups += 1;
+                }
                 prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
                 prog.push(BodyOp::Lit(span.to_vec()));
             }
         }
-        if nrec % verify_every as u64 == 0 { samples.push((pending.len(), body)); }
+        if nrec % verify_every as u64 == 0 {
+            samples.push((pending.len(), body));
+        }
         pending.push(Record { id, body: prog, attrs });
 
         if pending.len() >= per_part {
@@ -102,8 +126,12 @@ fn main() -> anyhow::Result<()> {
             for (idx, orig) in &samples {
                 let r = &pending[*idx];
                 let row = p.find(&r.id)?.expect("sampled id must be findable");
-                if &p.reconstruct(row, &fold)? != orig { anyhow::bail!("BYTE DRIFT for {}", r.id); }
-                if p.attrs(row)? != r.attrs { anyhow::bail!("ATTR DRIFT for {}", r.id); }
+                if &p.reconstruct(row, &fold)? != orig {
+                    anyhow::bail!("BYTE DRIFT for {}", r.id);
+                }
+                if p.attrs(row)? != r.attrs {
+                    anyhow::bail!("ATTR DRIFT for {}", r.id);
+                }
                 verified += 1;
             }
             nparts += 1;
@@ -130,7 +158,9 @@ fn main() -> anyhow::Result<()> {
         for (idx, orig) in &samples {
             let r = &pending[*idx];
             let row = p.find(&r.id)?.expect("sampled id must be findable");
-            if &p.reconstruct(row, &fold)? != orig { anyhow::bail!("BYTE DRIFT for {}", r.id); }
+            if &p.reconstruct(row, &fold)? != orig {
+                anyhow::bail!("BYTE DRIFT for {}", r.id);
+            }
             verified += 1;
         }
         nparts += 1;
@@ -140,23 +170,58 @@ fn main() -> anyhow::Result<()> {
     let fold_b = fold.disk_bytes();
     let part_b: u64 = (0..nparts)
         .filter_map(|i| std::fs::metadata(dir.join(format!("part-{i:05}.part"))).ok())
-        .map(|m| m.len()).sum();
+        .map(|m| m.len())
+        .sum();
     let total = fold_b + part_b;
     let distinct = refs - dups;
 
     eprintln!();
     println!("{:<26}{nrec} records, {nparts} parts  ({skipped} duplicate ids skipped)", "ingested");
     println!("{:<26}{:.2} GiB", "logical body bytes", gib(logical));
-    println!("{:<26}{refs} refs, {distinct} distinct ({:.1}x collapsed)", "pieces", refs as f64 / distinct as f64);
+    println!(
+        "{:<26}{refs} refs, {distinct} distinct ({:.1}x collapsed)",
+        "pieces",
+        refs as f64 / distinct as f64
+    );
     println!();
-    println!("{:<26}{:>9.3} GiB   {:.1}%", "fold (content)", gib(fold_b), fold_b as f64 * 100.0 / total as f64);
-    println!("{:<26}{:>9.3} GiB   {:.1}%", "parts (metadata)", gib(part_b), part_b as f64 * 100.0 / total as f64);
-    println!("{:<26}{:>9.3} GiB   {:.1}x overall", "TOTAL", gib(total), logical as f64 / total as f64);
+    println!(
+        "{:<26}{:>9.3} GiB   {:.1}%",
+        "fold (content)",
+        gib(fold_b),
+        fold_b as f64 * 100.0 / total as f64
+    );
+    println!(
+        "{:<26}{:>9.3} GiB   {:.1}%",
+        "parts (metadata)",
+        gib(part_b),
+        part_b as f64 * 100.0 / total as f64
+    );
+    println!(
+        "{:<26}{:>9.3} GiB   {:.1}x overall",
+        "TOTAL",
+        gib(total),
+        logical as f64 / total as f64
+    );
     println!();
     println!("{:<26}{:.1} B/distinct piece", "identity floor (32B hash)", 32.0);
-    println!("{:<26}{:.3} GiB  ({:.1}% of store)", "  = hashes alone", distinct as f64 * 32.0 / (1024.0*1024.0*1024.0), distinct as f64 * 32.0 * 100.0 / total as f64);
+    println!(
+        "{:<26}{:.3} GiB  ({:.1}% of store)",
+        "  = hashes alone",
+        distinct as f64 * 32.0 / (1024.0 * 1024.0 * 1024.0),
+        distinct as f64 * 32.0 * 100.0 / total as f64
+    );
     println!("{:<26}{verified} records (1 in {verify_every}), ALL byte-exact", "verified");
-    println!("{:<26}{:.0}s ({:.0} rec/s, {:.0} MiB/s logical)", "elapsed", secs, nrec as f64 / secs, mib(logical) / secs);
-    println!("{:<26}{} distinct pieces resident (global dedup window, not sealed)", "dedup window", fold.window_len());
+    println!(
+        "{:<26}{:.0}s ({:.0} rec/s, {:.0} MiB/s logical)",
+        "elapsed",
+        secs,
+        nrec as f64 / secs,
+        mib(logical) / secs
+    );
+    println!(
+        "{:<26}{} distinct pieces resident (global dedup window, not sealed)",
+        "dedup window",
+        fold.window_len()
+    );
     Ok(())
 }

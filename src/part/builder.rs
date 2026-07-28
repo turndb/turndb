@@ -182,7 +182,11 @@ impl StreamBuilder {
 
         // ---- id column, front-coded with restarts ----
         if row > 0 && id <= self.prev_id.as_slice() {
-            bail!("streaming builder requires strictly increasing ids: {:?} then {:?}", self.prev_id, id);
+            bail!(
+                "streaming builder requires strictly increasing ids: {:?} then {:?}",
+                self.prev_id,
+                id
+            );
         }
         let mut e = Vec::with_capacity(id.len() + 8);
         let shared = if row as usize % RESTART == 0 {
@@ -207,7 +211,8 @@ impl StreamBuilder {
         // ---- body program ----
         self.prog_off.append(&self.prog_len.to_le_bytes())?;
         let mut p = Vec::new();
-        let emitted = body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
+        let emitted =
+            body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
         put_varint(&mut p, emitted as u64);
         for op in body {
             match op {
@@ -219,10 +224,9 @@ impl StreamBuilder {
                     p.extend_from_slice(b);
                 }
                 BodyOp::Piece { hash, len } => {
-                    let idx = *self
-                        .dict_index
-                        .get(hash)
-                        .ok_or_else(|| anyhow::anyhow!("piece {hash} is not in the builder's dictionary"))?;
+                    let idx = *self.dict_index.get(hash).ok_or_else(|| {
+                        anyhow::anyhow!("piece {hash} is not in the builder's dictionary")
+                    })?;
                     put_varint(&mut p, ((idx as u64) << 1) | OP_PIECE);
                     put_varint(&mut p, *len as u64);
                 }
@@ -236,10 +240,9 @@ impl StreamBuilder {
         let mut l = Vec::new();
         put_varint(&mut l, attrs.len() as u64);
         for (k, v) in attrs {
-            let &c = self
-                .col_of
-                .get(&(k.clone(), v.type_tag()))
-                .ok_or_else(|| anyhow::anyhow!("attribute {k:?} is outside the declared column universe"))?;
+            let &c = self.col_of.get(&(k.clone(), v.type_tag())).ok_or_else(|| {
+                anyhow::anyhow!("attribute {k:?} is outside the declared column universe")
+            })?;
             put_varint(&mut l, c as u64);
             let col = &mut self.cols[c];
             // dense means: the k-th occurrence sits at row k, for every occurrence
@@ -252,10 +255,9 @@ impl StreamBuilder {
             col.zone.add(v);
             match v {
                 AttrValue::Str(s) => {
-                    let ord = col
-                        .dict
-                        .binary_search(s)
-                        .map_err(|_| anyhow::anyhow!("string value outside the declared dictionary for {k:?}"))?;
+                    let ord = col.dict.binary_search(s).map_err(|_| {
+                        anyhow::anyhow!("string value outside the declared dictionary for {k:?}")
+                    })?;
                     col.val.append(&(ord as u32).to_le_bytes())?;
                 }
                 AttrValue::Int(x) => col.val.append(&x.to_le_bytes())?,
@@ -291,8 +293,10 @@ impl StreamBuilder {
         self.w.section("ids.restart", &restarts)?;
         self.w.section("prog", &self.prog.take()?)?;
         self.w.section("prog.off", &self.prog_off.take()?)?;
-        self.w
-            .section("pdict.loc", &self.dict.iter().flat_map(|(l, _)| l.encode()).collect::<Vec<u8>>())?;
+        self.w.section(
+            "pdict.loc",
+            &self.dict.iter().flat_map(|(l, _)| l.encode()).collect::<Vec<u8>>(),
+        )?;
         self.w
             .section("pdict.hash", &self.dict.iter().flat_map(|(_, h)| h.0).collect::<Vec<u8>>())?;
         let mut hsort: Vec<u32> = (0..self.dict.len() as u32).collect();

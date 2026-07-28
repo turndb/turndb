@@ -4,12 +4,17 @@ use std::path::PathBuf;
 use turndb::part::cache::SectionCache;
 use turndb::part::Part;
 
-fn mib(b: usize) -> f64 { b as f64 / (1024.0 * 1024.0) }
+fn mib(b: usize) -> f64 {
+    b as f64 / (1024.0 * 1024.0)
+}
 
 fn main() -> anyhow::Result<()> {
     let dir = PathBuf::from(std::env::args().nth(1).expect("usage: cache_footprint <dir>"));
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "part").unwrap_or(false)).collect();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "part").unwrap_or(false))
+        .collect();
     paths.sort();
 
     // All parts share ONE budget, as a store's do.
@@ -27,8 +32,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("{} parts, {:.2} MiB on disk\n", paths.len(), fs as f64 / 1048576.0);
-    println!("  pinned      {:>9.2} MiB   ({:.1}x on-disk)", mib(shared.bytes()),
-        shared.bytes() as f64 / fs as f64);
+    println!(
+        "  pinned      {:>9.2} MiB   ({:.1}x on-disk)",
+        mib(shared.bytes()),
+        shared.bytes() as f64 / fs as f64
+    );
     println!("  budget      {:>9.2} MiB", mib(shared.budget()));
     println!("  entries     {:>9}", shared.entries());
     println!("  per part    {:>9.2} MiB", mib(shared.bytes() / paths.len()));
@@ -45,7 +53,10 @@ fn main() -> anyhow::Result<()> {
             let _ = part.record(r)?;
         }
     }
-    println!("\n  with a 32 MiB budget: pinned {:.2} MiB, {} entries",
-        mib(tight.bytes()), tight.entries());
+    println!(
+        "\n  with a 32 MiB budget: pinned {:.2} MiB, {} entries",
+        mib(tight.bytes()),
+        tight.entries()
+    );
     Ok(())
 }

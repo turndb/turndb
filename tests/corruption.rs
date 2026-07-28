@@ -72,18 +72,12 @@ fn mutate(bytes: &mut Vec<u8>, rng: &mut Rng) {
 
 /// Run `f` against `rounds` mutants of `pristine`, writing each to `path` first. `f` may error all
 /// it likes; a panic is the failure, reported with the seed and round that reproduce it.
-fn storm(
-    tag: &str,
-    pristine: &[u8],
-    path: &Path,
-    rounds: usize,
-    seed: u64,
-    f: impl Fn(&Path),
-) {
+fn storm(tag: &str, pristine: &[u8], path: &Path, rounds: usize, seed: u64, f: impl Fn(&Path)) {
     // STORM_XOR varies every storm's seed for soak runs — unset, it is 0 and the run is the
     // deterministic default. A finding reports the EFFECTIVE seed, so a soak discovery replays
     // exactly by exporting that value.
-    let seed = seed ^ std::env::var("STORM_XOR").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let seed =
+        seed ^ std::env::var("STORM_XOR").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     let mut rng = Rng(seed);
     for round in 0..rounds {
         let mut m = pristine.to_vec();
@@ -184,7 +178,8 @@ fn wal_replay_never_panics_on_damage() {
             w.append(i, &r, &[(h, bytes)]).unwrap();
         }
         w.append_tomb(10, "w:3").unwrap();
-        let extra = Record { id: "b:1".into(), body: vec![BodyOp::Lit(b"lit".to_vec())], attrs: vec![] };
+        let extra =
+            Record { id: "b:1".into(), body: vec![BodyOp::Lit(b"lit".to_vec())], attrs: vec![] };
         w.append_batch(11, &[(extra, Vec::new(), false)]).unwrap();
         w.sync().unwrap();
     }
@@ -239,7 +234,8 @@ fn fold_open_never_panics_on_damage() {
     let src = dir.join("fold");
     let mut locs = Vec::new();
     {
-        let mut fold = Fold::open(&src, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+        let mut fold =
+            Fold::open(&src, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
         for i in 0..50 {
             let body = format!("fold piece {i} {}", "z".repeat(i * 13));
             let p = fold.put(body.as_bytes()).unwrap();
@@ -306,7 +302,7 @@ fn store_open_never_panics_on_manifest_damage() {
     let pristine = std::fs::read(&man).unwrap();
     // Mutate MANIFEST in place and open READ-ONLY: a reader must refuse damage without panicking —
     // and without mutating anything, which is why the writer's open is not the probe here.
-    storm("manifest", &pristine, &man, 3000, 0x3A21F&0xFFFF, |_| {
+    storm("manifest", &pristine, &man, 3000, 0x3A21F & 0xFFFF, |_| {
         let _ = Store::open_read(&dir, FoldCfg::default());
     });
     std::fs::remove_dir_all(&dir).ok();

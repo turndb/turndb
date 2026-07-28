@@ -150,7 +150,13 @@ pub fn xsum(frame_prefix: &[u8]) -> [u8; BLOCK_XSUM_LEN] {
 }
 
 /// Build a complete block frame into `out` (cleared first). `raw_block` is the uncompressed block.
-pub fn encode(out: &mut Vec<u8>, block_id: u32, codec: u8, raw_block: &[u8], payload: &[u8]) -> usize {
+pub fn encode(
+    out: &mut Vec<u8>,
+    block_id: u32,
+    codec: u8,
+    raw_block: &[u8],
+    payload: &[u8],
+) -> usize {
     debug_assert!(payload.len() <= raw_block.len(), "encoder must fall back to CODEC_STORED");
     let rh = blake3::hash(raw_block);
     out.clear();
@@ -215,7 +221,10 @@ mod tests {
         let mut torn = buf.clone();
         torn[BLOCK_HDR_LEN + 3] ^= 0x01;
         assert!(verify_frame_bytes(&torn, false).is_err(), "a flipped payload byte must be caught");
-        assert!(verify_frame_bytes(&buf[..buf.len() - 1], false).is_err(), "a truncated tail must be caught");
+        assert!(
+            verify_frame_bytes(&buf[..buf.len() - 1], false).is_err(),
+            "a truncated tail must be caught"
+        );
     }
 
     #[test]

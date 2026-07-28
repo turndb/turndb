@@ -37,10 +37,10 @@
 
 pub mod carve;
 pub mod fold;
+pub mod pack;
 pub mod part;
 #[cfg(feature = "sql")]
 pub mod query;
-pub mod pack;
 pub mod readat;
 pub mod store;
 mod sys;

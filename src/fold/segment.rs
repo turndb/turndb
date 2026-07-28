@@ -182,10 +182,11 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
             Ok(h) => h,
             Err(_) => break,
         };
-        let end = match off.checked_add(BLOCK_HDR_LEN as u64 + h.stored as u64 + BLOCK_XSUM_LEN as u64) {
-            Some(e) => e,
-            None => break,
-        };
+        let end =
+            match off.checked_add(BLOCK_HDR_LEN as u64 + h.stored as u64 + BLOCK_XSUM_LEN as u64) {
+                Some(e) => e,
+                None => break,
+            };
         if end > file_len {
             break; // the promised payload/checksum never fully reached disk
         }
