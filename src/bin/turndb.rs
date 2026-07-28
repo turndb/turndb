@@ -46,6 +46,9 @@ usage: turndb <verb> [args]
     catalog   <ROOT> [rebuild]   list the members, or reconstruct the catalog by scanning
     cids      <ROOT>             every live id across the constellation
     cget      <ROOT> <ID>        reconstruct one record, later members winning
+    reseal    <ROOT> <OUT> <MEMBER>...
+                                 collapse a contiguous run of members into one sealed pack and
+                                 swap the catalog to it; inputs are left on disk for you to remove
 
   shipping:
     pack      <DIR> <OUT>        the committed snapshot as one file
@@ -195,6 +198,17 @@ fn run(args: &[String]) -> Result<()> {
                 }
                 None => bail!("no record {id:?} in this constellation"),
             }
+        }
+        "reseal" => {
+            let root = arg(0, "ROOT")?;
+            let out = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing OUT\n\n{USAGE}"))?;
+            let members: Vec<String> = rest[2..].iter().map(|s| s.to_string()).collect();
+            let st = turndb::catalog::reseal(&root, &members, out, FoldCfg::default())?;
+            println!(
+                "collapsed {} members into {out}: {} records, {} bytes (inputs left on disk)",
+                st.members_collapsed, st.records, st.bytes
+            );
+            Ok(())
         }
         "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
         "import" => {

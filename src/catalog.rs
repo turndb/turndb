@@ -170,6 +170,128 @@ impl Catalog {
     }
 }
 
+/// What a re-seal did.
+#[derive(Clone, Debug)]
+pub struct ResealStats {
+    pub members_collapsed: usize,
+    pub records: usize,
+    pub bytes: u64,
+}
+
+/// Collapse a run of members into ONE sealed pack, and swap the catalog to it.
+///
+/// The other half of the overlay pattern. Overlay *resolution* needs nothing but catalog order —
+/// later members win — but a constellation that only ever grows members is one that slowly loses
+/// the point of sealing. Re-sealing folds the corrections back down.
+///
+/// Written BESIDE the members it replaces and published by a catalog commit, which is the same
+/// data-before-pointers discipline every other layer follows: a crash before the commit leaves an
+/// unreferenced pack (sweepable), never a catalog naming something that is not there. The old
+/// members' bytes are left on disk for the operator to remove — deliberately, because deleting
+/// the inputs of an operation in the same breath as committing its output is how a mistake
+/// becomes unrecoverable.
+///
+/// Resolution is preserved exactly: members are read in catalog order, later winning, and the
+/// result is written as one store then packed.
+pub fn reseal(
+    root: &Path,
+    members: &[String],
+    out_name: &str,
+    cfg: crate::fold::FoldCfg,
+) -> Result<ResealStats> {
+    if members.len() < 2 {
+        bail!("re-sealing needs at least two members to collapse");
+    }
+    let mut cat = Catalog::load(root)?;
+    let mut chosen: Vec<&Member> = Vec::new();
+    for name in members {
+        let m = cat
+            .members
+            .iter()
+            .find(|m| m.path == *name)
+            .ok_or_else(|| anyhow::anyhow!("catalog holds no member {name}"))?;
+        chosen.push(m);
+    }
+    // Contiguity is a correctness gate, exactly as it is for a part merge: collapsing members
+    // with another member interleaved between them in resolution order would silently change
+    // which version of a shared id wins.
+    let mut ords: Vec<u64> = chosen.iter().map(|m| m.ordinal).collect();
+    ords.sort_unstable();
+    let between = cat
+        .members
+        .iter()
+        .filter(|m| m.ordinal > ords[0] && m.ordinal < ords[ords.len() - 1])
+        .filter(|m| !members.contains(&m.path))
+        .count();
+    if between > 0 {
+        bail!("re-seal inputs are not contiguous in resolution order — {between} member(s) sit between them");
+    }
+    let lowest = ords[0];
+
+    // Read every input in resolution order, writing the winner of each id into a staging store.
+    let staging = root.join(format!("{out_name}.staging"));
+    let _ = std::fs::remove_dir_all(&staging);
+    let mut opened: Vec<crate::store::ReadStore> = Vec::new();
+    for m in &chosen {
+        let p = root.join(&m.path);
+        opened.push(if m.is_pack(root) {
+            crate::store::open_read_pack(&p, cfg)?
+        } else {
+            crate::store::Store::open_read(&p, cfg)?
+        });
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for s in &opened {
+        ids.extend(s.ids()?);
+    }
+    ids.sort();
+    ids.dedup();
+
+    let mut records = 0usize;
+    {
+        let mut out = crate::store::Store::open(&staging, cfg)?;
+        for id in &ids {
+            // LATER members win — the same rule CatalogReader applies, so a re-seal cannot change
+            // what a reader saw a moment before it ran.
+            let mut winner = None;
+            for s in opened.iter().rev() {
+                if let Some(r) = s.get(id)? {
+                    winner = Some((r, s));
+                    break;
+                }
+            }
+            let Some((rec, src)) = winner else { continue };
+            let body = src.reconstruct(id)?.unwrap_or_default();
+            // Spans are re-derived by the engine's carve: the pieces themselves are what dedup
+            // works on, and a re-seal is exactly when to let the current opinion apply.
+            out.put_body(&rec.id, &body, rec.attrs.clone())?;
+            records += 1;
+            if records % 2000 == 0 {
+                out.sync()?;
+                out.flush()?;
+            }
+        }
+        out.sync()?;
+        out.flush()?;
+        if out.part_count() > 1 {
+            out.merge_range(0, out.part_count())?;
+        }
+    }
+
+    let pack_path = root.join(out_name);
+    let stats = crate::pack::write(&staging, &pack_path)?;
+    std::fs::remove_dir_all(&staging)?;
+
+    // Publish: the pack is durable before the catalog names it.
+    for name in members {
+        cat.remove(name);
+    }
+    cat.add(Member { path: out_name.to_string(), ordinal: lowest, window: None, sealed: true })?;
+    cat.commit(root)?;
+
+    Ok(ResealStats { members_collapsed: members.len(), records, bytes: stats.bytes })
+}
+
 fn split_trailer(bytes: &[u8]) -> Option<(&[u8], u32)> {
     let pos = bytes.iter().rposition(|&b| b == b'\n')?;
     let tail = &bytes[pos + 1..];
