@@ -205,6 +205,33 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
         sections += p.verify_sections()?;
     }
     println!("parts: {} sections pass their checksums", sections);
+    if path.is_dir() {
+        let chain = turndb::store::verify_chain(path).context("chain verification failed")?;
+        println!(
+            "chain: {} links and {} part pins verified{}",
+            chain.links,
+            chain.part_digests,
+            if chain.undigested > 0 {
+                format!(" ({} parts predate digests)", chain.undigested)
+            } else {
+                String::new()
+            }
+        );
+    } else {
+        // A pack carries its manifest verbatim: verify each part pin against the pack extents.
+        let pk = turndb::pack::Pack::open(path)?;
+        let mut pins = 0usize;
+        for p in &rs.manifest().parts {
+            if let Some(want) = &p.b3 {
+                let got = blake3::hash(&pk.read_file(&p.file)?).to_hex().to_string();
+                if *want != got {
+                    bail!("packed part {} drifted from its manifest pin", p.file);
+                }
+                pins += 1;
+            }
+        }
+        println!("chain: {pins} part pins verified inside the pack");
+    }
     if deep {
         // The strongest check the format offers: reconstruct every live record, which verifies
         // every referenced piece against its BLAKE3 identity.

@@ -682,8 +682,8 @@ fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
     // and once the manifest is readable again the store is intact
     std::fs::remove_dir(&man).unwrap();
     std::fs::write(&man, serde_json::to_vec(&Manifest {
-        parts: vec![PartRef { file: "part-00000001.part".into(), seq_lo: 1, seq_hi: 1, records: 20 }],
-        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0, commit: 1,
+        parts: vec![PartRef { file: "part-00000001.part".into(), seq_lo: 1, seq_hi: 1, records: 20, b3: None }],
+        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0, commit: 1, prev: None,
     }).unwrap()).unwrap();
     let s = Store::open(&dir, cfg()).unwrap();
     assert_eq!(s.part_count(), 1);
@@ -1349,5 +1349,34 @@ fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
     // and TIME TRAVEL cannot resurrect it: the retained log was purged to the erasure's commit
     let snaps = turndb::store::retained_commits(&dir);
     assert_eq!(snaps.len(), 1, "erasure must purge every snapshot that could still serve the data");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_manifest_chain_links_and_pins_and_notices_tampering() {
+    let dir = tmp("chain");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for f in 0..3 {
+        put(&mut s, &format!("c{f}"), format!("body {f}").as_bytes());
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    s.merge_range(0, 2).unwrap().unwrap();
+    drop(s);
+
+    let report = turndb::store::verify_chain(&dir).unwrap();
+    assert!(report.links >= 3, "commits must chain: {report:?}");
+    assert!(report.part_digests >= 4, "every named part must be pinned: {report:?}");
+    assert_eq!(report.undigested, 0, "a fresh store has no undigested parts");
+
+    // tamper INSIDE a part (past the footer's own reach): the manifest pin must notice
+    let part = std::fs::read_dir(&dir).unwrap().flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|e| e == "part").unwrap_or(false))
+        .unwrap();
+    let mut b = std::fs::read(&part).unwrap();
+    b[2] ^= 0xFF;
+    std::fs::write(&part, &b).unwrap();
+    assert!(turndb::store::verify_chain(&dir).is_err(), "a drifted part must break verification");
     std::fs::remove_dir_all(&dir).ok();
 }
