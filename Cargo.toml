@@ -1,3 +1,8 @@
+[workspace]
+# The ABI lives in its own crate so the engine never carries one. `turndb` stays a Rust library
+# with a Rust API; `turndb-wasm` is the only place that speaks in pointers and status codes.
+members = [".", "bindings/wasm"]
+
 [package]
 name = "turndb"
 version = "0.1.0"
@@ -82,6 +87,18 @@ structured-zstd = "=0.0.49"
 
 [profile.release]
 debug = true
+
+# The shipped .wasm. A workspace root's profiles win over a member's, so this has to live here even
+# though only `turndb-wasm` uses it. Optimised for SIZE because the artifact is downloaded by every
+# npm install, and debug info in a binding nobody debugs at the Rust level is dead weight.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+panic = "abort"
 
 # DataFusion is async; the SQL tests need a runtime to drive it. Scoped away from wasm because
 # dev-dependencies are built for examples too, and a multi-thread runtime does not compile there —
