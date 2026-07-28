@@ -58,11 +58,6 @@ usage: turndb <verb> [args]
   shipping:
     pack      <DIR> <OUT>        the committed snapshot as one file
     unpack    <PACK> <OUTDIR>    extract back into an ordinary store directory
-    certify   <STORE|PACK> [--out FILE]
-                                 emit a certification of digests for a production: the artifact's
-                                 hash, each part's, and each record's. Sign it with your own PKI;
-                                 FRE 902(13)-(14) self-authentication rests on the certification,
-                                 not on this tool
 ";
 
 fn main() {
@@ -269,7 +264,6 @@ fn run(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
-        "certify" => certify(&arg(0, "STORE")?, &rest[1..]),
         "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
         "import" => {
             let dir = arg(0, "DIR")?;
@@ -391,114 +385,6 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
         );
     }
     println!("ok");
-    Ok(())
-}
-
-/// The certify verb: a digest manifest for a production.
-///
-/// Federal Rule of Evidence 902(13)–(14) lets a record be self-authenticating when a qualified
-/// person certifies that a copy is identical to the original, established by a process of digital
-/// identification — a hash comparison. That is the ONE place in this project where hashing has
-/// direct legal standing, and it is worth being precise about what does the work: the
-/// **certification** is the evidence, and it is a human's sworn statement. This tool emits the
-/// digests that statement refers to and computes them the same way anyone verifying can. It does
-/// not certify anything; it cannot, and saying otherwise would be exactly the overclaim this
-/// project refuses.
-///
-/// Three levels, because a production may be challenged at any of them: the artifact as a whole,
-/// each part file (so a subset can be produced without the rest), and each record's reconstructed
-/// content (so a single record can be authenticated on its own, which is what actually gets
-/// disputed).
-fn certify(path: &Path, args: &[&str]) -> Result<()> {
-    let mut out_path: Option<PathBuf> = None;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match *a {
-            "--out" => {
-                out_path =
-                    Some(PathBuf::from(it.next().ok_or_else(|| anyhow::anyhow!("--out needs a path"))?))
-            }
-            other => bail!("unknown certify argument {other:?}"),
-        }
-    }
-
-    let rs = open_read(path)?;
-    let is_pack = path.is_file();
-
-    // The artifact digest: for a pack, the file — one hash covering the entire production.
-    let artifact = if is_pack {
-        Some(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
-    } else {
-        None
-    };
-
-    let mut parts = Vec::new();
-    for p in &rs.manifest().parts {
-        let b3 = match &p.b3 {
-            Some(h) => h.clone(),
-            None => {
-                let bytes = if is_pack {
-                    turndb::pack::Pack::open(path)?.read_file(&p.file)?
-                } else {
-                    std::fs::read(path.join(&p.file))?
-                };
-                blake3::hash(&bytes).to_hex().to_string()
-            }
-        };
-        parts.push(serde_json::json!({"file": p.file, "records": p.records, "blake3": b3}));
-    }
-
-    let ids = rs.ids()?;
-    let mut records = Vec::with_capacity(ids.len());
-    let mut total = 0u64;
-    for id in &ids {
-        if let Some(body) = rs.reconstruct(id)? {
-            total += body.len() as u64;
-            records.push(serde_json::json!({
-                "id": id,
-                "bytes": body.len(),
-                "blake3": blake3::hash(&body).to_hex().to_string()
-            }));
-        }
-    }
-
-    let doc = serde_json::json!({
-        "document": "turndb digest certification",
-        "what_this_is": "digests of a production, computed by the turndb tool. The digests are \
-                         facts anyone can recompute; the CERTIFICATION contemplated by FRE \
-                         902(13)-(14) is a qualified person's statement about them, which this \
-                         tool does not and cannot make.",
-        "algorithm": "BLAKE3-256, hex",
-        "tool": {"name": "turndb", "version": env!("CARGO_PKG_VERSION")},
-        "source": {"path": path.display().to_string(), "kind": if is_pack { "pack" } else { "store" }},
-        "generated_unix": unix_now(),
-        "artifact_blake3": artifact,
-        "manifest": {
-            "commit": rs.manifest().commit,
-            "blake3": if is_pack {
-                blake3::hash(&turndb::pack::Pack::open(path)?.read_file("MANIFEST")?).to_hex().to_string()
-            } else {
-                blake3::hash(&std::fs::read(path.join("MANIFEST"))?).to_hex().to_string()
-            }
-        },
-        "parts": parts,
-        "records": {"count": records.len(), "content_bytes": total, "entries": records}
-    });
-
-    let bytes = serde_json::to_vec_pretty(&doc)?;
-    match out_path {
-        Some(p) => {
-            std::fs::write(&p, &bytes)?;
-            println!(
-                "certified {} records ({} content bytes) -> {}\ncertification blake3: {}",
-                records.len(),
-                total,
-                p.display(),
-                blake3::hash(&bytes).to_hex()
-            );
-        }
-        None => std::io::stdout().lock().write_all(&bytes)?,
-    }
     Ok(())
 }
 
