@@ -13,7 +13,7 @@
 //! became; that is the whole failure mode being guarded against.
 
 use std::path::PathBuf;
-use turndb::fold::{Loc, FoldCfg};
+use turndb::fold::{FoldCfg, Loc};
 use turndb::store::{Span, Store};
 use turndb::AttrValue;
 
@@ -30,10 +30,14 @@ fn built(tag: &str) -> PathBuf {
         let body: Vec<u8> = (0..400u32)
             .flat_map(|j| blake3::hash(&(i * 1000 + j).to_le_bytes()).as_bytes()[..8].to_vec())
             .collect();
-        s.put(&format!("f{i:03}"), &[Span::Piece(&body)], vec![
-            ("kind".into(), AttrValue::Str("req".into())),
-            ("n".into(), AttrValue::Int(i as i64)),
-        ])
+        s.put(
+            &format!("f{i:03}"),
+            &[Span::Piece(&body)],
+            vec![
+                ("kind".into(), AttrValue::Str("req".into())),
+                ("n".into(), AttrValue::Int(i as i64)),
+            ],
+        )
         .unwrap();
     }
     s.sync().unwrap();
@@ -49,7 +53,9 @@ fn le64(b: &[u8], at: usize) -> u64 {
 }
 
 fn segment(dir: &std::path::Path) -> Vec<u8> {
-    let mut p: Vec<PathBuf> = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+    let mut p: Vec<PathBuf> = std::fs::read_dir(dir.join("fold"))
+        .unwrap()
+        .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false))
         .collect();
@@ -58,7 +64,9 @@ fn segment(dir: &std::path::Path) -> Vec<u8> {
 }
 
 fn part(dir: &std::path::Path) -> Vec<u8> {
-    let p = std::fs::read_dir(dir).unwrap().flatten()
+    let p = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
         .map(|e| e.path())
         .find(|p| p.extension().map(|e| e == "part").unwrap_or(false))
         .expect("a flushed part");
@@ -85,11 +93,16 @@ fn segment_header_matches_the_document() {
 #[test]
 fn segment_files_are_named_and_ordered_numerically() {
     let dir = built("segname");
-    let names: Vec<String> = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
+    let names: Vec<String> = std::fs::read_dir(dir.join("fold"))
+        .unwrap()
+        .flatten()
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".fold")).collect();
-    assert!(names.contains(&"seg-00000000.fold".to_string()),
-        "FORMAT.md documents seg-%08u.fold; found {names:?}");
+        .filter(|n| n.ends_with(".fold"))
+        .collect();
+    assert!(
+        names.contains(&"seg-00000000.fold".to_string()),
+        "FORMAT.md documents seg-%08u.fold; found {names:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -122,7 +135,11 @@ fn block_frame_matches_the_document() {
 
     // r16 at frame+10 is the first two bytes of BLAKE3 over the block's RAW bytes
     let payload = &b[f + 16..end];
-    let decoded = if codec == 0 { payload.to_vec() } else { zstd::bulk::decompress(payload, raw as usize).unwrap() };
+    let decoded = if codec == 0 {
+        payload.to_vec()
+    } else {
+        zstd::bulk::decompress(payload, raw as usize).unwrap()
+    };
     assert_eq!(decoded.len(), raw as usize, "raw is the DECOMPRESSED size of the whole block");
     let h = blake3::hash(&decoded);
     assert_eq!(&b[f + 10..f + 12], &h.as_bytes()[0..2], "r16 at frame+10");
@@ -209,17 +226,32 @@ fn merged_part_footer_distinguishes_seq_lo_from_seq_hi() {
 fn a_part_declares_the_sections_the_document_lists() {
     let dir = built("sections");
     let p = turndb::part::Part::open(
-        &std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path())
-            .find(|p| p.extension().map(|e| e == "part").unwrap_or(false)).unwrap(),
-    ).unwrap();
+        &std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().map(|e| e == "part").unwrap_or(false))
+            .unwrap(),
+    )
+    .unwrap();
     let names: Vec<String> = p.sections().into_iter().map(|(n, _, _, _)| n).collect();
     for required in [
-        "ids", "ids.restart", "prog", "prog.off",
-        "pdict.loc", "pdict.hash", "pdict.hsort", "pdict.bloom",
-        "layout", "layout.off", "colmeta",
+        "ids",
+        "ids.restart",
+        "prog",
+        "prog.off",
+        "pdict.loc",
+        "pdict.hash",
+        "pdict.hsort",
+        "pdict.bloom",
+        "layout",
+        "layout.off",
+        "colmeta",
     ] {
-        assert!(names.contains(&required.to_string()),
-            "FORMAT.md lists section {required}, which this part does not have: {names:?}");
+        assert!(
+            names.contains(&required.to_string()),
+            "FORMAT.md lists section {required}, which this part does not have: {names:?}"
+        );
     }
     // and the optional ones are absent exactly when unused, never malformed
     assert!(!names.contains(&"tomb".to_string()), "this part deletes nothing, so `tomb` is absent");
@@ -228,8 +260,11 @@ fn a_part_declares_the_sections_the_document_lists() {
     let secs = p.sections();
     let loc = secs.iter().find(|(n, _, _, _)| n == "pdict.loc").unwrap();
     let hash = secs.iter().find(|(n, _, _, _)| n == "pdict.hash").unwrap();
-    assert_eq!(loc.2 as usize / 12, hash.2 as usize / 32,
-        "pdict.loc (12 B/piece) and pdict.hash (32 B/piece) must describe the same pieces");
+    assert_eq!(
+        loc.2 as usize / 12,
+        hash.2 as usize / 32,
+        "pdict.loc (12 B/piece) and pdict.hash (32 B/piece) must describe the same pieces"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -272,7 +307,8 @@ fn manifest_carries_the_documented_fields() {
     let raw = std::fs::read_to_string(dir.join("MANIFEST")).unwrap();
     // FORMAT.md: compact JSON on the first line, then a `crc32=XXXXXXXX` trailer line over the
     // JSON bytes. The trailer is what turns corruption-that-still-parses into a refusal.
-    let (json, trailer) = raw.split_once('\n').expect("a committed manifest carries a checksum trailer");
+    let (json, trailer) =
+        raw.split_once('\n').expect("a committed manifest carries a checksum trailer");
     let hex = trailer.strip_prefix("crc32=").expect("trailer line is crc32=XXXXXXXX");
     let want = u32::from_str_radix(hex, 16).expect("trailer carries hex");
     assert_eq!(crc32fast::hash(json.as_bytes()), want, "trailer must checksum the JSON payload");
@@ -299,11 +335,16 @@ fn the_documented_limits_refuse_rather_than_truncate() {
     // end (a 4 GiB section, a 4 GiB piece) cannot be exercised in a test.
     let dir = tmp("limits");
     assert!(
-        turndb::fold::Fold::open(&dir.join("a"), FoldCfg { block_target: 5 << 30, ..FoldCfg::default() }).is_err(),
+        turndb::fold::Fold::open(
+            &dir.join("a"),
+            FoldCfg { block_target: 5 << 30, ..FoldCfg::default() }
+        )
+        .is_err(),
         "a block_target that would overflow the u32 segment append point must refuse"
     );
     assert!(
-        turndb::fold::Fold::open(&dir.join("b"), FoldCfg { level: 99, ..FoldCfg::default() }).is_err(),
+        turndb::fold::Fold::open(&dir.join("b"), FoldCfg { level: 99, ..FoldCfg::default() })
+            .is_err(),
         "a zstd level outside 1..=22 must refuse at open"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -326,8 +367,12 @@ fn edit_footer(path: &std::path::Path, f: impl Fn(&mut [u8])) {
 }
 
 fn part_path(dir: &std::path::Path) -> PathBuf {
-    std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path())
-        .find(|p| p.extension().map(|e| e == "part").unwrap_or(false)).unwrap()
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|e| e == "part").unwrap_or(false))
+        .unwrap()
 }
 
 #[test]
@@ -377,8 +422,10 @@ fn a_truncated_part_is_refused() {
     let b = std::fs::read(&p).unwrap();
     for keep in [0usize, 8, 55, b.len() / 2] {
         std::fs::write(&p, &b[..keep.min(b.len())]).unwrap();
-        assert!(turndb::part::Part::open(&p).is_err(),
-            "a part truncated to {keep} bytes must be refused, not half-read");
+        assert!(
+            turndb::part::Part::open(&p).is_err(),
+            "a part truncated to {keep} bytes must be refused, not half-read"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -386,8 +433,12 @@ fn a_truncated_part_is_refused() {
 #[test]
 fn a_segment_with_unknown_flags_is_refused() {
     let dir = built("flags");
-    let mut sp: Vec<PathBuf> = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
-        .map(|e| e.path()).filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false)).collect();
+    let mut sp: Vec<PathBuf> = std::fs::read_dir(dir.join("fold"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false))
+        .collect();
     sp.sort();
     let mut b = std::fs::read(&sp[0]).unwrap();
     // Bit 0 is ENCRYPTED and KNOWN — a known bit is acted on, not refused. Pick a bit no
@@ -408,24 +459,35 @@ fn a_fold_with_a_missing_segment_is_refused_by_readers_too() {
     // The writer always refused a gap. A reader that did not would serve a fold with a hole in its
     // block space instead of refusing — the worse half of an asymmetry.
     let dir = tmp("gap");
-    let mut s = Store::open(&dir, FoldCfg { seg_max: 1 << 17, block_target: 1 << 14, ..FoldCfg::default() }).unwrap();
+    let mut s = Store::open(
+        &dir,
+        FoldCfg { seg_max: 1 << 17, block_target: 1 << 14, ..FoldCfg::default() },
+    )
+    .unwrap();
     for i in 0..300u32 {
         let body: Vec<u8> = (0..64u32)
-            .flat_map(|j| blake3::hash(&(i * 500 + j).to_le_bytes()).as_bytes().to_vec()).collect();
+            .flat_map(|j| blake3::hash(&(i * 500 + j).to_le_bytes()).as_bytes().to_vec())
+            .collect();
         s.put(&format!("s{i:04}"), &[Span::Piece(&body)], vec![]).unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
     drop(s);
 
-    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("fold")).unwrap().flatten()
-        .map(|e| e.path()).filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false)).collect();
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("fold"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false))
+        .collect();
     segs.sort();
     assert!(segs.len() >= 3, "the fixture must produce several segments; got {}", segs.len());
     std::fs::remove_file(&segs[0]).unwrap(); // punch a hole at seg 0
 
-    assert!(Store::open_read(&dir, FoldCfg::default()).is_err(),
-        "a reader must refuse a fold whose segments are not dense");
+    assert!(
+        Store::open_read(&dir, FoldCfg::default()).is_err(),
+        "a reader must refuse a fold whose segments are not dense"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -462,8 +524,11 @@ fn the_body_op_escape_is_reserved_and_never_written() {
     s.put("r", &[Span::Lit(b""), Span::Lit(b"real"), Span::Lit(b"")], vec![]).unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
-    assert_eq!(s.reconstruct("r").unwrap().unwrap(), b"real".to_vec(),
-        "dropping an empty literal must preserve the body exactly");
+    assert_eq!(
+        s.reconstruct("r").unwrap().unwrap(),
+        b"real".to_vec(),
+        "dropping an empty literal must preserve the body exactly"
+    );
     drop(s);
 
     // and the encoded program contains no zero tag
@@ -511,7 +576,8 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     let n = torn.len();
     torn[n - 1] ^= 0xFF; // break the crc
     std::fs::write(&path, &torn).unwrap();
-    let s = Store::open(&dir, FoldCfg::default()).expect("a torn tail is the end of the log, not an error");
+    let s = Store::open(&dir, FoldCfg::default())
+        .expect("a torn tail is the end of the log, not an error");
     assert_eq!(s.reconstruct("a").unwrap().unwrap(), b"first".to_vec());
     std::fs::remove_dir_all(&dir).ok();
 }

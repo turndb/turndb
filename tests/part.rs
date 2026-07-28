@@ -37,7 +37,10 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
             id: "genai:aè#input".into(),
             body: vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }],
             // the SAME key at a different type — must become a separate column
-            attrs: vec![("mixed".into(), AttrValue::Str("7".into())), ("g".into(), AttrValue::Float(0.0))],
+            attrs: vec![
+                ("mixed".into(), AttrValue::Str("7".into())),
+                ("g".into(), AttrValue::Float(0.0)),
+            ],
         },
         Record {
             // interleaving that column storage alone cannot reproduce: a, b, a
@@ -55,7 +58,11 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
                 ("a".into(), AttrValue::Str("two".into())),
             ],
         },
-        Record { id: "rec:no-attrs".into(), body: vec![BodyOp::Lit(b"bare".to_vec())], attrs: Vec::new() },
+        Record {
+            id: "rec:no-attrs".into(),
+            body: vec![BodyOp::Lit(b"bare".to_vec())],
+            attrs: Vec::new(),
+        },
         Record {
             id: "rec:empty-body".into(),
             body: Vec::new(),
@@ -153,7 +160,12 @@ fn scales_to_many_records_with_shared_content() {
 
     // 2,000 records over a small shared piece pool — the dedup shape a real trace store has
     let pieces: Vec<_> = (0..40)
-        .map(|i| fold.put(format!("shared message body number {i}, with padding to give it size").as_bytes()).unwrap())
+        .map(|i| {
+            fold.put(
+                format!("shared message body number {i}, with padding to give it size").as_bytes(),
+            )
+            .unwrap()
+        })
         .collect();
     let recs: Vec<Record> = (0..2000)
         .map(|i| Record {
@@ -200,12 +212,16 @@ fn piece_dictionary_is_in_fold_order() {
     // this ordering, so it is asserted rather than assumed.
     let dir = tmp("dictorder");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut fold = Fold::open(&dir.join("fold"), FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+    let mut fold =
+        Fold::open(&dir.join("fold"), FoldCfg { block_target: 4096, ..Default::default() })
+            .unwrap();
     let recs: Vec<Record> = (0..200)
         .map(|i| Record {
             id: format!("r{i:04}"),
             body: vec![{
-                let p = fold.put(format!("piece {i} with enough bytes to matter for blocking").as_bytes()).unwrap();
+                let p = fold
+                    .put(format!("piece {i} with enough bytes to matter for blocking").as_bytes())
+                    .unwrap();
                 BodyOp::Piece { hash: p.hash, len: p.loc.raw }
             }],
             attrs: Vec::new(),
@@ -240,7 +256,10 @@ fn a_torn_part_is_refused() {
     let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(len - 8).unwrap();
     drop(f);
-    assert!(Part::open(&path).is_err(), "a part without its footer must be refused, never half-read");
+    assert!(
+        Part::open(&path).is_err(),
+        "a part without its footer must be refused, never half-read"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -338,8 +357,6 @@ fn a_toc_pointing_past_the_file_is_refused() {
     }
     std::fs::remove_dir_all(&d).ok();
 }
-
-
 
 // ---------------------------------------------------------------------------------------------
 // Format levers. The fold could always refuse an unknown future; until now the part could not.
@@ -461,11 +478,8 @@ fn a_part_reads_identically_out_of_an_embedded_extent() {
     let plain = Part::open(&path).unwrap();
     let f = std::fs::File::open(&packish).unwrap();
     let extent = turndb::readat::Slice::new(f, prefix.len() as u64, part_bytes.len() as u64);
-    let embedded = Part::open_reader(
-        Box::new(extent),
-        turndb::part::cache::SectionCache::shared(),
-    )
-    .unwrap();
+    let embedded =
+        Part::open_reader(Box::new(extent), turndb::part::cache::SectionCache::shared()).unwrap();
 
     assert_eq!(plain.meta(), embedded.meta());
     assert_eq!(plain.ids().unwrap(), embedded.ids().unwrap());
@@ -540,7 +554,10 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
         "the streaming builder must be BYTE-IDENTICAL to build_full"
     );
     assert!(
-        !std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".s")),
+        !std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".s")),
         "spools must be cleaned up"
     );
     drop(fold);
@@ -563,11 +580,8 @@ fn zone_maps_bound_columns_and_refuse_to_lie() {
             ("s".into(), AttrValue::Str(format!("v{n}"))),
         ],
     };
-    let records = vec![
-        rec("a", 5, 1.5, 0.0),
-        rec("b", -3, 2.5, f64::NAN),
-        rec("c", 42, -9.25, 1.0),
-    ];
+    let records =
+        vec![rec("a", 5, 1.5, 0.0), rec("b", -3, 2.5, f64::NAN), rec("c", 42, -9.25, 1.0)];
     let path = d.join("z.part");
     part::build(&path, &records, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
     let p = Part::open(&path).unwrap();
@@ -576,7 +590,11 @@ fn zone_maps_bound_columns_and_refuse_to_lie() {
     assert_eq!(p.zone(0).unwrap(), Some((AttrValue::Int(-3), AttrValue::Int(42))));
     assert_eq!(p.zone(1).unwrap(), None, "a NaN anywhere makes a float column unprunable");
     assert_eq!(p.zone(2).unwrap(), Some((AttrValue::Bool(true), AttrValue::Bool(true))));
-    assert_eq!(p.zone(3).unwrap(), None, "strings carry no zone — the dictionary already bounds them");
+    assert_eq!(
+        p.zone(3).unwrap(),
+        None,
+        "strings carry no zone — the dictionary already bounds them"
+    );
     assert_eq!(p.zone(4).unwrap(), Some((AttrValue::Float(-9.25), AttrValue::Float(2.5))));
     assert_eq!(p.zone(9).unwrap(), None, "an out-of-range ordinal is no pruning, not an error");
     drop(fold);

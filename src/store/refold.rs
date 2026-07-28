@@ -37,7 +37,6 @@
 //! referenced. Tombstones themselves go too: a re-fold covers every part, so nothing survives for them
 //! to shadow.
 
-
 use crate::fold::{Fold, FoldCfg, Loc};
 use crate::part::{self, Part};
 use crate::types::{BodyOp, PieceHash, Record};
@@ -132,9 +131,9 @@ pub fn refold(
                 if wanted.contains_key(&hash) {
                     continue;
                 }
-                let loc = parts[pi]
-                    .lookup_piece(&hash)?
-                    .ok_or_else(|| anyhow::anyhow!("live record references piece {hash}, which no part locates"))?;
+                let loc = parts[pi].lookup_piece(&hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("live record references piece {hash}, which no part locates")
+                })?;
                 wanted.insert(hash, loc);
             }
         }

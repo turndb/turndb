@@ -119,10 +119,8 @@ impl Pack {
 
     /// The inner file, loaded whole — for the small ones (manifest, sidecars, dictionaries).
     pub fn read_file(&self, name: &str) -> Result<Vec<u8>> {
-        let &(off, len, _) = self
-            .toc
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("pack has no file {name}"))?;
+        let &(off, len, _) =
+            self.toc.get(name).ok_or_else(|| anyhow::anyhow!("pack has no file {name}"))?;
         let mut b = vec![0u8; len as usize];
         ReadAt::read_exact_at(&self.f, &mut b, off)?;
         Ok(b)
@@ -191,7 +189,9 @@ pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
         .flatten()
     {
         let n = e.file_name().to_string_lossy().to_string();
-        let keep = n.ends_with(".fold") || n.ends_with(".dir") || (n.starts_with("zdict-") && n.ends_with(".zd"));
+        let keep = n.ends_with(".fold")
+            || n.ends_with(".dir")
+            || (n.starts_with("zdict-") && n.ends_with(".zd"));
         if keep {
             fold_files.push(format!("{fold_rel}/{n}"));
         }
@@ -205,8 +205,8 @@ pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
     let mut entries: Vec<(String, Entry)> = Vec::with_capacity(names.len());
     let mut buf = vec![0u8; 1 << 20];
     for name in &names {
-        let mut src = File::open(dir.join(name))
-            .with_context(|| format!("open {name} for packing"))?;
+        let mut src =
+            File::open(dir.join(name)).with_context(|| format!("open {name} for packing"))?;
         let start = off;
         let mut h = crc32fast::Hasher::new();
         loop {

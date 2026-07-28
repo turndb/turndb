@@ -11,7 +11,12 @@ fn main() -> anyhow::Result<()> {
     let total: u64 = a.next().and_then(|s| s.parse().ok()).unwrap_or(256);
     let seg: u32 = a.next().and_then(|s| s.parse().ok()).unwrap_or(32);
     let _ = std::fs::remove_dir_all(&dir);
-    let cfg = FoldCfg { seg_max: seg * 1024 * 1024, block_target: 4 << 20, level: 1, ..Default::default() };
+    let cfg = FoldCfg {
+        seg_max: seg * 1024 * 1024,
+        block_target: 4 << 20,
+        level: 1,
+        ..Default::default()
+    };
     let mut f = Fold::open(&dir, cfg)?;
     let mut h = blake3::hash(b"seed");
     let mut piece = Vec::with_capacity(64 * 1024);

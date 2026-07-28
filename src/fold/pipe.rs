@@ -67,14 +67,16 @@ impl Pool {
                         Err(_) => return,
                     }
                 };
-                let (codec, payload) = match super::codec::encode(&job.raw, dict.as_deref().map(|v| &v[..]), level) {
-                    Ok((c, p)) => (c, p.into_owned()),
-                    // A compression failure must not be silently dropped: fall back to stored, which
-                    // is always valid, and let the frame's own checks catch anything worse.
-                    Err(_) => (CODEC_STORED, job.raw.as_ref().clone()),
-                };
+                let (codec, payload) =
+                    match super::codec::encode(&job.raw, dict.as_deref().map(|v| &v[..]), level) {
+                        Ok((c, p)) => (c, p.into_owned()),
+                        // A compression failure must not be silently dropped: fall back to stored, which
+                        // is always valid, and let the frame's own checks catch anything worse.
+                        Err(_) => (CODEC_STORED, job.raw.as_ref().clone()),
+                    };
                 debug_assert!(matches!(codec, CODEC_STORED | CODEC_ZSTD | CODEC_ZSTD_DICT));
-                if dtx.send(Done { block_id: job.block_id, codec, raw: job.raw, payload }).is_err() {
+                if dtx.send(Done { block_id: job.block_id, codec, raw: job.raw, payload }).is_err()
+                {
                     return;
                 }
             }));
@@ -108,7 +110,12 @@ impl Pool {
     pub fn take_all(&mut self) -> Result<Vec<Done>> {
         let mut out = Vec::new();
         while self.outstanding > 0 {
-            let d = self.rx.lock().unwrap().recv().map_err(|_| anyhow::anyhow!("compression pool died with work outstanding"))?;
+            let d = self
+                .rx
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| anyhow::anyhow!("compression pool died with work outstanding"))?;
             self.outstanding -= 1;
             out.push(d);
         }

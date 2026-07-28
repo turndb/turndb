@@ -53,23 +53,56 @@ fn carve(body: &[u8]) -> Vec<(usize, usize)> {
     while i < body.len() {
         let c = body[i];
         if instr {
-            if esc { esc = false } else if c == b'\\' { esc = true } else if c == b'"' { instr = false }
+            if esc {
+                esc = false
+            } else if c == b'\\' {
+                esc = true
+            } else if c == b'"' {
+                instr = false
+            }
         } else {
             match c {
-                b'"' => { instr = true; if start.is_none() { start = Some(i) } }
-                b'{' | b'[' => { depth += 1; if start.is_none() { start = Some(i) } }
+                b'"' => {
+                    instr = true;
+                    if start.is_none() {
+                        start = Some(i)
+                    }
+                }
+                b'{' | b'[' => {
+                    depth += 1;
+                    if start.is_none() {
+                        start = Some(i)
+                    }
+                }
                 b'}' | b']' => {
-                    if depth == 0 { if let Some(st) = start.take() { out.push((st, i)); } break }
+                    if depth == 0 {
+                        if let Some(st) = start.take() {
+                            out.push((st, i));
+                        }
+                        break;
+                    }
                     depth -= 1;
                 }
-                b',' if depth == 0 => { if let Some(st) = start.take() { out.push((st, i)); } }
+                b',' if depth == 0 => {
+                    if let Some(st) = start.take() {
+                        out.push((st, i));
+                    }
+                }
                 w if (w as char).is_ascii_whitespace() => {}
-                _ => { if start.is_none() { start = Some(i) } }
+                _ => {
+                    if start.is_none() {
+                        start = Some(i)
+                    }
+                }
             }
         }
         i += 1;
     }
-    if out.is_empty() { vec![(0, body.len())] } else { out }
+    if out.is_empty() {
+        vec![(0, body.len())]
+    } else {
+        out
+    }
 }
 
 fn mib(b: usize) -> f64 {
@@ -124,19 +157,28 @@ fn main() -> anyhow::Result<()> {
     }
     println!(
         "{} distinct pieces, {:.1} MiB distinct out of {:.1} MiB logical\n",
-        pieces.len(), mib(stored_raw), mib(logical)
+        pieces.len(),
+        mib(stored_raw),
+        mib(logical)
     );
 
     // Train on a stratified sample so the dictionary is not just the first few pieces.
     let step = (pieces.len() / 8000).max(1);
-    let samples: Vec<&[u8]> = pieces.iter().step_by(step).map(|p| p.as_slice()).take(8000)
-        .map(|p| &p[..p.len().min(16 << 10)]).collect();
+    let samples: Vec<&[u8]> = pieces
+        .iter()
+        .step_by(step)
+        .map(|p| p.as_slice())
+        .take(8000)
+        .map(|p| &p[..p.len().min(16 << 10)])
+        .collect();
     println!("training on {} sampled pieces...", samples.len());
     let dict = zstd::dict::from_samples(&samples, 112 << 10)?;
     println!("dictionary {:.1} KiB\n", dict.len() as f64 / 1024.0);
 
-    println!("{:<14}{:>10}{:>14}{:>14}{:>12}{:>10}",
-        "block target", "blocks", "no dict MiB", "trained MiB", "delta", "ratio");
+    println!(
+        "{:<14}{:>10}{:>14}{:>14}{:>12}{:>10}",
+        "block target", "blocks", "no dict MiB", "trained MiB", "delta", "ratio"
+    );
 
     for target in [4 << 10, 64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20] {
         let bs = blocks_of(&pieces, target);
@@ -150,7 +192,10 @@ fn main() -> anyhow::Result<()> {
         let d = plain as f64 - trained as f64;
         println!(
             "{:<14}{:>10}{:>14.3}{:>14.3}{:>11.2}%{:>9.2}x",
-            format!("{} KiB", target / 1024), bs.len(), mib(plain), mib(trained),
+            format!("{} KiB", target / 1024),
+            bs.len(),
+            mib(plain),
+            mib(trained),
             d * 100.0 / plain as f64,
             stored_raw as f64 / plain as f64
         );

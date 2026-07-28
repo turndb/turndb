@@ -31,9 +31,13 @@ fn build(dir: &PathBuf, flushes: usize, per: usize) -> Vec<(String, Vec<u8>)> {
     for f in 0..flushes {
         for i in 0..per {
             let id = format!("t{f:02}-{i:04}");
-            let body = format!("body of {id}, with enough text to be worth folding at all").into_bytes();
+            let body =
+                format!("body of {id}, with enough text to be worth folding at all").into_bytes();
             let attrs = vec![
-                ("model".to_string(), AttrValue::Str(if i % 3 == 0 { "opus" } else { "sonnet" }.into())),
+                (
+                    "model".to_string(),
+                    AttrValue::Str(if i % 3 == 0 { "opus" } else { "sonnet" }.into()),
+                ),
                 ("tokens".to_string(), AttrValue::Int((i * 10) as i64)),
                 ("cost".to_string(), AttrValue::Float(i as f64 * 0.001)),
                 ("ok".to_string(), AttrValue::Bool(i % 5 != 0)),
@@ -48,7 +52,9 @@ fn build(dir: &PathBuf, flushes: usize, per: usize) -> Vec<(String, Vec<u8>)> {
 }
 
 fn parts_of(dir: &PathBuf) -> Vec<Arc<Part>> {
-    let mut ps: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().flatten()
+    let mut ps: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().map(|e| e == "part").unwrap_or(false))
         .collect();
@@ -74,8 +80,11 @@ fn schema_names_columns_by_key_and_never_merges_two_types() {
     let lens = Lens::new(&parts_of(&dir)).unwrap();
     let names: Vec<String> = lens.schema().fields().iter().map(|f| f.name().clone()).collect();
     // Split fields order by type tag (str=0, int=1), which is stable across runs and across parts.
-    assert_eq!(names, vec!["id", "body", "only", "v#str", "v#int"],
-        "a single-typed key keeps its name; a multi-typed key is split, never merged");
+    assert_eq!(
+        names,
+        vec!["id", "body", "only", "v#str", "v#int"],
+        "a single-typed key keeps its name; a multi-typed key is split, never merged"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -84,10 +93,12 @@ fn parts_with_different_columns_share_one_row_shape() {
     let dir = tmp("union");
     let mut s = Store::open(&dir, cfg()).unwrap();
     s.put("a", &[Span::Lit(b"x")], vec![("early".into(), AttrValue::Int(1))]).unwrap();
-    s.sync().unwrap(); s.flush().unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
     // A column that did not exist when the first part was written.
     s.put("b", &[Span::Lit(b"y")], vec![("late".into(), AttrValue::Int(2))]).unwrap();
-    s.sync().unwrap(); s.flush().unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
 
     let parts = parts_of(&dir);
     let lens = Lens::new(&parts).unwrap();
@@ -107,10 +118,11 @@ fn parts_with_different_columns_share_one_row_shape() {
             ));
         }
     }
-    assert_eq!(seen, vec![
-        ("a".to_string(), Some(1), None),
-        ("b".to_string(), None, Some(2)),
-    ], "a part lacking a column contributes nulls, not a schema mismatch");
+    assert_eq!(
+        seen,
+        vec![("a".to_string(), Some(1), None), ("b".to_string(), None, Some(2)),],
+        "a part lacking a column contributes nulls, not a schema mismatch"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -131,7 +143,10 @@ fn an_attribute_scan_never_opens_the_fold() {
     assert_eq!(stats.rows, 600);
     assert_eq!(stats.fold_reads, 0, "AN ATTRIBUTE-ONLY SCAN MUST NOT TOUCH CONTENT");
     assert_eq!(stats.columns_decoded, 6, "two columns per part, three parts — not all four");
-    assert!(batches.iter().all(|b| b.num_columns() == 2), "only projected columns are materialised");
+    assert!(
+        batches.iter().all(|b| b.num_columns() == 2),
+        "only projected columns are materialised"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -142,8 +157,10 @@ fn projecting_body_without_a_fold_is_refused_rather_than_wrong() {
     let parts = parts_of(&dir);
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id", "body"]).unwrap();
-    assert!(collect(&parts, None, &lens, &proj).is_err(),
-        "asking for content with no fold must fail, never return nulls");
+    assert!(
+        collect(&parts, None, &lens, &proj).is_err(),
+        "asking for content with no fold must fail, never return nulls"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -188,15 +205,30 @@ fn columnar_and_row_paths_agree_exactly() {
         for r in 0..p.len() {
             let rec = p.record(r).unwrap();
             let get = |k: &str| rec.attrs.iter().find(|(a, _)| a == k).unwrap().1.clone();
-            let s = match get("model") { AttrValue::Str(s) => s, v => panic!("model was {v:?}") };
-            let t = match get("tokens") { AttrValue::Int(i) => i, v => panic!("tokens was {v:?}") };
-            let c = match get("cost") { AttrValue::Float(f) => f, v => panic!("cost was {v:?}") };
-            let o = match get("ok") { AttrValue::Bool(b) => b, v => panic!("ok was {v:?}") };
+            let s = match get("model") {
+                AttrValue::Str(s) => s,
+                v => panic!("model was {v:?}"),
+            };
+            let t = match get("tokens") {
+                AttrValue::Int(i) => i,
+                v => panic!("tokens was {v:?}"),
+            };
+            let c = match get("cost") {
+                AttrValue::Float(f) => f,
+                v => panic!("cost was {v:?}"),
+            };
+            let o = match get("ok") {
+                AttrValue::Bool(b) => b,
+                v => panic!("ok was {v:?}"),
+            };
             expect.push((rec.id, s, t, c, o));
         }
     }
     assert_eq!(got.len(), expect.len());
-    assert_eq!(got, expect, "THE COLUMNAR AND ROW DECODERS DISAGREE — one of them is silently wrong");
+    assert_eq!(
+        got, expect,
+        "THE COLUMNAR AND ROW DECODERS DISAGREE — one of them is silently wrong"
+    );
 
     // And the body column must reconstruct byte-exactly, same as the row path.
     let store = Store::open_read(&dir, cfg()).unwrap();
@@ -235,12 +267,18 @@ fn the_body_column_is_byte_exact() {
 fn a_repeated_key_surfaces_its_first_value_and_counts_the_rest() {
     let dir = tmp("shadow");
     let mut s = Store::open(&dir, cfg()).unwrap();
-    s.put("r", &[Span::Lit(b"x")], vec![
-        ("tag".into(), AttrValue::Str("first".into())),
-        ("tag".into(), AttrValue::Str("second".into())),
-        ("tag".into(), AttrValue::Str("third".into())),
-    ]).unwrap();
-    s.sync().unwrap(); s.flush().unwrap();
+    s.put(
+        "r",
+        &[Span::Lit(b"x")],
+        vec![
+            ("tag".into(), AttrValue::Str("first".into())),
+            ("tag".into(), AttrValue::Str("second".into())),
+            ("tag".into(), AttrValue::Str("third".into())),
+        ],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
 
     let parts = parts_of(&dir);
     let lens = Lens::new(&parts).unwrap();
@@ -249,11 +287,18 @@ fn a_repeated_key_surfaces_its_first_value_and_counts_the_rest() {
     let d = batches[0].column(0).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
     let v = d.values().as_string::<i32>();
     assert_eq!(v.value(d.key(0).unwrap()), "first", "the flat view takes the first occurrence");
-    assert_eq!(stats.shadowed_occurrences, 2, "the other two must be COUNTED, not silently dropped");
+    assert_eq!(
+        stats.shadowed_occurrences, 2,
+        "the other two must be COUNTED, not silently dropped"
+    );
 
     // and the substrate still holds all three, in order
     let rec = parts[0].record(0).unwrap();
-    assert_eq!(rec.attrs.len(), 3, "the row path is lossless regardless of what the flat view shows");
+    assert_eq!(
+        rec.attrs.len(),
+        3,
+        "the row path is lossless regardless of what the flat view shows"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -270,7 +315,10 @@ async fn sql_selects_filters_and_aggregates() {
 
     // count(*) projects ZERO columns — the batch must still carry its row count.
     let n = ctx.sql("SELECT count(*) AS n FROM traces").await.unwrap().collect().await.unwrap();
-    assert_eq!(n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 900);
+    assert_eq!(
+        n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        900
+    );
 
     let r = ctx
         .sql("SELECT model, count(*) AS n, sum(tokens) AS t FROM traces GROUP BY model ORDER BY model")
@@ -282,19 +330,30 @@ async fn sql_selects_filters_and_aggregates() {
     let rows: Vec<(String, i64)> = (0..b.num_rows())
         .map(|i| (mv.value(m.key(i).unwrap()).to_string(), cnt.value(i)))
         .collect();
-    assert_eq!(rows, vec![("opus".to_string(), 300), ("sonnet".to_string(), 600)],
-        "100 of every 300 rows are opus, across 3 parts");
+    assert_eq!(
+        rows,
+        vec![("opus".to_string(), 300), ("sonnet".to_string(), 600)],
+        "100 of every 300 rows are opus, across 3 parts"
+    );
 
     let f = ctx
         .sql("SELECT id FROM traces WHERE model = 'opus' AND tokens > 2900 ORDER BY id")
-        .await.unwrap().collect().await.unwrap();
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let total: usize = f.iter().map(|b| b.num_rows()).sum();
     assert!(total > 0, "the filter must match something");
     for b in &f {
         let ids = b.column(0).as_string::<i32>();
         for i in 0..b.num_rows() {
             let n: usize = ids.value(i).split('-').nth(1).unwrap().parse().unwrap();
-            assert!(n % 3 == 0 && n * 10 > 2900, "row {} does not satisfy the predicate", ids.value(i));
+            assert!(
+                n % 3 == 0 && n * 10 > 2900,
+                "row {} does not satisfy the predicate",
+                ids.value(i)
+            );
         }
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -309,7 +368,11 @@ async fn sql_over_attributes_reads_no_content() {
     table.reset_stats();
 
     ctx.sql("SELECT model, avg(cost) FROM traces GROUP BY model")
-        .await.unwrap().collect().await.unwrap();
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     let st = table.stats();
     assert_eq!(st.fold_reads, 0,
@@ -326,8 +389,13 @@ async fn sql_can_still_reach_content_when_it_asks_for_it() {
     let store = Store::open_read(&dir, cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "traces").unwrap();
 
-    let r = ctx.sql("SELECT id, body FROM traces WHERE id = 't00-0007'")
-        .await.unwrap().collect().await.unwrap();
+    let r = ctx
+        .sql("SELECT id, body FROM traces WHERE id = 't00-0007'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let b = r.iter().find(|b| b.num_rows() > 0).expect("the row exists");
     let body = b.column(1).as_binary::<i32>().value(0);
     let expect = &want.iter().find(|(i, _)| i == "t00-0007").unwrap().1;
@@ -381,14 +449,22 @@ async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
     assert_eq!(batch.column(0).as_string::<i32>().value(0), "x");
     assert_eq!(batch.column(1).as_binary::<i32>().value(0), b"new body");
 
-    let old = ctx.sql("SELECT count(*) FROM t WHERE kind = 'old-match'")
-        .await.unwrap().collect().await.unwrap();
+    let old = ctx
+        .sql("SELECT count(*) FROM t WHERE kind = 'old-match'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
         old[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
         0,
         "a newest version that fails a predicate must not reveal an older matching version"
     );
-    assert!(table.stats().rows_hidden >= 3, "two superseded rows and one tombstone should be hidden");
+    assert!(
+        table.stats().rows_hidden >= 3,
+        "two superseded rows and one tombstone should be hidden"
+    );
 
     // Neither ordinary compaction nor the re-folding GC may change the logical SQL answer.
     drop(ctx);
@@ -407,8 +483,13 @@ async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
         1,
         "compaction and refolding must preserve the logical SQL snapshot"
     );
-    let old = ctx.sql("SELECT count(*) FROM t WHERE kind = 'old-match'")
-        .await.unwrap().collect().await.unwrap();
+    let old = ctx
+        .sql("SELECT count(*) FROM t WHERE kind = 'old-match'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     assert_eq!(
         old[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
         0,
@@ -436,10 +517,7 @@ fn a_limit_counts_visible_rows_not_physical_prefix_rows() {
     let (fold, parts) = store.into_parts();
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id"]).unwrap();
-    let mut scan = lens
-        .scan(&parts[0], Some(&fold), &proj, &[])
-        .unwrap()
-        .with_fetch(Some(1));
+    let mut scan = lens.scan(&parts[0], Some(&fold), &proj, &[]).unwrap().with_fetch(Some(1));
     let batch = scan.next_batch().unwrap().expect("the older part still has one live row");
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(batch.column(0).as_string::<i32>().value(0), "z");
@@ -472,7 +550,8 @@ fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     let (mut batches, mut rows, mut peak) = (0usize, 0usize, 0usize);
     let mut seen: Vec<Vec<u8>> = Vec::new();
     while let Some(b) = sc.next_batch().unwrap() {
-        let bytes: usize = (0..b.num_rows()).map(|r| b.column(1).as_binary::<i32>().value(r).len()).sum();
+        let bytes: usize =
+            (0..b.num_rows()).map(|r| b.column(1).as_binary::<i32>().value(r).len()).sum();
         peak = peak.max(bytes);
         rows += b.num_rows();
         batches += 1;
@@ -483,8 +562,10 @@ fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     assert_eq!(rows, 400, "every row must still be delivered");
     assert!(batches > 1, "400 huge records must not arrive as one batch (got {batches})");
     // One row always lands however big it is, so the ceiling can be exceeded by at most one record.
-    assert!(peak <= turndb::query::BATCH_BYTES + 300_000,
-        "a batch carried {peak} content bytes, past the ceiling");
+    assert!(
+        peak <= turndb::query::BATCH_BYTES + 300_000,
+        "a batch carried {peak} content bytes, past the ceiling"
+    );
     assert_eq!(seen, want, "byte-bounded batching must not reorder or corrupt content");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -499,7 +580,12 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
         let body: Vec<u8> = (0..8192u32)
             .flat_map(|j| blake3::hash(&(i * 77_777 + j).to_le_bytes()).as_bytes()[..32].to_vec())
             .collect();
-        s.put(&format!("s{i:04}"), &[Span::Piece(&body)], vec![("n".into(), AttrValue::Int(i as i64))]).unwrap();
+        s.put(
+            &format!("s{i:04}"),
+            &[Span::Piece(&body)],
+            vec![("n".into(), AttrValue::Int(i as i64))],
+        )
+        .unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
@@ -514,11 +600,17 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
     let got: usize = r.iter().map(|b| b.num_rows()).sum();
     assert_eq!(got, 5);
     let st = table.stats();
-    assert!(st.fold_reads < 300,
-        "LIMIT 5 reconstructed {} of 300 bodies — the scan is not lazy", st.fold_reads);
+    assert!(
+        st.fold_reads < 300,
+        "LIMIT 5 reconstructed {} of 300 bodies — the scan is not lazy",
+        st.fold_reads
+    );
     assert!(st.fold_reads >= 5, "it must have read at least the rows it returned");
-    assert!(st.fold_reads <= 20,
-        "LIMIT 5 reconstructed {} bodies — the limit is not reaching the scan", st.fold_reads);
+    assert!(
+        st.fold_reads <= 20,
+        "LIMIT 5 reconstructed {} bodies — the limit is not reaching the scan",
+        st.fold_reads
+    );
 
     // and a full body scan still returns everything, byte-exact
     table.reset_stats();
@@ -532,9 +624,16 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
         for r in 0..b.num_rows() {
             let i: u32 = ids.value(r).trim_start_matches('s').parse().unwrap();
             let want: Vec<u8> = (0..8192u32)
-                .flat_map(|j| blake3::hash(&(i * 77_777 + j).to_le_bytes()).as_bytes()[..32].to_vec())
+                .flat_map(|j| {
+                    blake3::hash(&(i * 77_777 + j).to_le_bytes()).as_bytes()[..32].to_vec()
+                })
                 .collect();
-            assert_eq!(bodies.value(r), want.as_slice(), "streamed body diverged for {}", ids.value(r));
+            assert_eq!(
+                bodies.value(r),
+                want.as_slice(),
+                "streamed body diverged for {}",
+                ids.value(r)
+            );
         }
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -550,7 +649,10 @@ async fn limit_cost_does_not_scale_with_part_count() {
     for p in 0..8u32 {
         for i in 0..40u32 {
             let body: Vec<u8> = (0..2048u32)
-                .flat_map(|j| blake3::hash(&(p * 1_000_000 + i * 1000 + j).to_le_bytes()).as_bytes()[..32].to_vec())
+                .flat_map(|j| {
+                    blake3::hash(&(p * 1_000_000 + i * 1000 + j).to_le_bytes()).as_bytes()[..32]
+                        .to_vec()
+                })
                 .collect();
             s.put(&format!("p{p}-{i:03}"), &[Span::Piece(&body)], vec![]).unwrap();
         }
@@ -568,8 +670,11 @@ async fn limit_cost_does_not_scale_with_part_count() {
 
     let st = table.stats();
     // 8 parts x 40 records = 320. Without pushdown this reconstructs all 320 (each part is one batch).
-    assert!(st.fold_reads <= 8,
-        "LIMIT 1 over 8 parts reconstructed {} bodies; cost is scaling with part count", st.fold_reads);
+    assert!(
+        st.fold_reads <= 8,
+        "LIMIT 1 over 8 parts reconstructed {} bodies; cost is scaling with part count",
+        st.fold_reads
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -587,10 +692,15 @@ async fn a_filtered_body_query_reconstructs_only_matching_rows() {
             .collect();
         // exactly 1 in 30 is "rare"
         let kind = if i % 30 == 0 { "rare" } else { "common" };
-        s.put(&format!("f{i:04}"), &[Span::Piece(&body)], vec![
-            ("kind".into(), AttrValue::Str(kind.into())),
-            ("n".into(), AttrValue::Int(i as i64)),
-        ]).unwrap();
+        s.put(
+            &format!("f{i:04}"),
+            &[Span::Piece(&body)],
+            vec![
+                ("kind".into(), AttrValue::Str(kind.into())),
+                ("n".into(), AttrValue::Int(i as i64)),
+            ],
+        )
+        .unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
@@ -600,15 +710,23 @@ async fn a_filtered_body_query_reconstructs_only_matching_rows() {
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
     table.reset_stats();
 
-    let r = ctx.sql("SELECT id, body FROM t WHERE kind = 'rare'").await.unwrap()
-        .collect().await.unwrap();
+    let r = ctx
+        .sql("SELECT id, body FROM t WHERE kind = 'rare'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let rows: usize = r.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 20, "600/30 rows match");
 
     let st = table.stats();
     // Without pushdown every one of the 600 bodies is reconstructed and the engine filters after.
-    assert!(st.fold_reads <= 40,
-        "reconstructed {} bodies to return 20 — the predicate is not reaching the scan", st.fold_reads);
+    assert!(
+        st.fold_reads <= 40,
+        "reconstructed {} bodies to return 20 — the predicate is not reaching the scan",
+        st.fold_reads
+    );
     assert!(st.rows_filtered >= 500, "the scan should have excluded most rows itself");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -618,9 +736,12 @@ async fn a_predicate_matching_nothing_skips_batches_whole() {
     let dir = tmp("filternone");
     let mut s = Store::open(&dir, cfg()).unwrap();
     for i in 0..500u32 {
-        s.put(&format!("z{i:04}"), &[Span::Lit(b"x")], vec![
-            ("kind".into(), AttrValue::Str("present".into())),
-        ]).unwrap();
+        s.put(
+            &format!("z{i:04}"),
+            &[Span::Lit(b"x")],
+            vec![("kind".into(), AttrValue::Str("present".into()))],
+        )
+        .unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
@@ -631,7 +752,8 @@ async fn a_predicate_matching_nothing_skips_batches_whole() {
     table.reset_stats();
     // A literal that is not in the dictionary at all: the scan can prove no row matches without
     // comparing a single value.
-    let r = ctx.sql("SELECT id FROM t WHERE kind = 'absent'").await.unwrap().collect().await.unwrap();
+    let r =
+        ctx.sql("SELECT id FROM t WHERE kind = 'absent'").await.unwrap().collect().await.unwrap();
     assert_eq!(r.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     assert!(table.stats().batches_skipped >= 1, "a provably-empty predicate must skip, not scan");
     std::fs::remove_dir_all(&dir).ok();
@@ -648,12 +770,17 @@ async fn pushdown_never_changes_an_answer() {
     for p in 0..3 {
         for i in 0..200u32 {
             let v = p * 200 + i;
-            s.put(&format!("q{v:04}"), &[Span::Lit(b"b")], vec![
-                ("kind".into(), AttrValue::Str(kinds[(v % 4) as usize].into())),
-                ("n".into(), AttrValue::Int(v as i64)),
-                ("ratio".into(), AttrValue::Float(v as f64 / 3.0)),
-                ("ok".into(), AttrValue::Bool(v % 7 == 0)),
-            ]).unwrap();
+            s.put(
+                &format!("q{v:04}"),
+                &[Span::Lit(b"b")],
+                vec![
+                    ("kind".into(), AttrValue::Str(kinds[(v % 4) as usize].into())),
+                    ("n".into(), AttrValue::Int(v as i64)),
+                    ("ratio".into(), AttrValue::Float(v as f64 / 3.0)),
+                    ("ok".into(), AttrValue::Bool(v % 7 == 0)),
+                ],
+            )
+            .unwrap();
         }
         s.sync().unwrap();
         s.flush().unwrap();
@@ -677,15 +804,26 @@ async fn pushdown_never_changes_an_answer() {
         "kind = 'alpha' AND n > 300",
         "n > 100 AND n < 120 AND kind = 'alpha'",
     ] {
-        let pushed = ctx.sql(&format!("SELECT count(*) AS c FROM t WHERE {pred}"))
-            .await.unwrap().collect().await.unwrap();
-        let a = pushed[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
+        let pushed = ctx
+            .sql(&format!("SELECT count(*) AS c FROM t WHERE {pred}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let a =
+            pushed[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
 
         // same predicate, but forced above a subquery the optimizer cannot push through
-        let fenced = ctx.sql(&format!(
-            "SELECT count(*) AS c FROM (SELECT * FROM t ORDER BY id) WHERE {pred}"))
-            .await.unwrap().collect().await.unwrap();
-        let b = fenced[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
+        let fenced = ctx
+            .sql(&format!("SELECT count(*) AS c FROM (SELECT * FROM t ORDER BY id) WHERE {pred}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let b =
+            fenced[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
 
         assert_eq!(a, b, "pushdown changed the answer for {pred:?}: {a} vs {b}");
     }
@@ -703,11 +841,16 @@ async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
     // one bad column, but every query including `select count(*)`.
     let dir = tmp("collide");
     let mut s = Store::open(&dir, cfg()).unwrap();
-    s.put("r1", &[Span::Lit(b"content")], vec![
-        ("body".into(), AttrValue::Str("an attribute, not the body".into())),
-        ("id".into(), AttrValue::Int(7)),
-        ("fine".into(), AttrValue::Int(1)),
-    ]).unwrap();
+    s.put(
+        "r1",
+        &[Span::Lit(b"content")],
+        vec![
+            ("body".into(), AttrValue::Str("an attribute, not the body".into())),
+            ("id".into(), AttrValue::Int(7)),
+            ("fine".into(), AttrValue::Int(1)),
+        ],
+    )
+    .unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
     drop(s);
@@ -715,7 +858,10 @@ async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
     let store = Store::open_read(&dir, cfg()).unwrap();
     let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
     let n = ctx.sql("SELECT count(*) AS n FROM t").await.unwrap().collect().await.unwrap();
-    assert_eq!(n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 1);
+    assert_eq!(
+        n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        1
+    );
 
     // the builtins keep their names and their meaning
     let r = ctx.sql("SELECT id, body FROM t").await.unwrap().collect().await.unwrap();
@@ -725,7 +871,10 @@ async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
     // and the colliding attributes are still reachable, renamed rather than dropped
     let lens = Lens::new(&parts_of(&dir)).unwrap();
     let names: Vec<String> = lens.schema().fields().iter().map(|f| f.name().clone()).collect();
-    assert!(names.contains(&"body#str".to_string()), "the colliding attribute is renamed: {names:?}");
+    assert!(
+        names.contains(&"body#str".to_string()),
+        "the colliding attribute is renamed: {names:?}"
+    );
     assert!(names.contains(&"id#int".to_string()), "the colliding attribute is renamed: {names:?}");
     assert!(names.contains(&"fine".to_string()), "an uncontested key keeps its name");
     std::fs::remove_dir_all(&dir).ok();
@@ -736,10 +885,18 @@ async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
     // A key literally named `a#str` beside a multi-typed `a` produces the same collision one level up.
     let dir = tmp("collide2");
     let mut s = Store::open(&dir, cfg()).unwrap();
-    s.put("r1", &[Span::Lit(b"x")], vec![
-        ("a".into(), AttrValue::Str("as string".into())),
-        ("a#str".into(), AttrValue::Str("a literal key that looks like a disambiguation".into())),
-    ]).unwrap();
+    s.put(
+        "r1",
+        &[Span::Lit(b"x")],
+        vec![
+            ("a".into(), AttrValue::Str("as string".into())),
+            (
+                "a#str".into(),
+                AttrValue::Str("a literal key that looks like a disambiguation".into()),
+            ),
+        ],
+    )
+    .unwrap();
     s.put("r2", &[Span::Lit(b"y")], vec![("a".into(), AttrValue::Int(1))]).unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
@@ -748,7 +905,10 @@ async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
     let store = Store::open_read(&dir, cfg()).unwrap();
     let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
     let n = ctx.sql("SELECT count(*) AS n FROM t").await.unwrap().collect().await.unwrap();
-    assert_eq!(n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 2);
+    assert_eq!(
+        n[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0),
+        2
+    );
 
     let lens = Lens::new(&parts_of(&dir)).unwrap();
     let names: Vec<String> = lens.schema().fields().iter().map(|f| f.name().clone()).collect();
@@ -763,12 +923,18 @@ fn zone_maps_prune_a_part_without_decoding_it() {
     let dir = tmp("zoneprune");
     let mut s = Store::open(&dir, cfg()).unwrap();
     for i in 0..20i64 {
-        s.put(&format!("a{i:02}"), &[Span::Lit(b"x")], vec![("tokens".into(), AttrValue::Int(i))]).unwrap();
+        s.put(&format!("a{i:02}"), &[Span::Lit(b"x")], vec![("tokens".into(), AttrValue::Int(i))])
+            .unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
     for i in 0..20i64 {
-        s.put(&format!("b{i:02}"), &[Span::Lit(b"x")], vec![("tokens".into(), AttrValue::Int(10_000 + i))]).unwrap();
+        s.put(
+            &format!("b{i:02}"),
+            &[Span::Lit(b"x")],
+            vec![("tokens".into(), AttrValue::Int(10_000 + i))],
+        )
+        .unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
@@ -778,12 +944,8 @@ fn zone_maps_prune_a_part_without_decoding_it() {
     assert_eq!(parts.len(), 2);
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id"]).unwrap();
-    let tokens_field = lens
-        .schema()
-        .fields()
-        .iter()
-        .position(|f| f.name() == "tokens")
-        .expect("tokens in schema");
+    let tokens_field =
+        lens.schema().fields().iter().position(|f| f.name() == "tokens").expect("tokens in schema");
     let pred = Pred { field: tokens_field, op: Cmp::Gt, val: AttrValue::Int(5_000) };
 
     // Part 1 holds tokens [0, 19]: the zone DISPROVES the predicate, so the scan yields nothing

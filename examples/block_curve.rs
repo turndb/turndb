@@ -39,18 +39,38 @@ fn split_json_array(s: &[u8]) -> Option<Vec<(usize, usize)>> {
             }
         } else {
             match c {
-                b'"' => { in_str = true; if start.is_none() { start = Some(i); } }
-                b'[' | b'{' => { if start.is_none() { start = Some(i); } depth += 1; }
+                b'"' => {
+                    in_str = true;
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                }
+                b'[' | b'{' => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
                 b']' | b'}' => {
                     if depth == 0 && c == b']' {
-                        if let Some(st) = start.take() { out.push((st, i)); }
+                        if let Some(st) = start.take() {
+                            out.push((st, i));
+                        }
                         return Some(out);
                     }
                     depth -= 1;
                 }
-                b',' if depth == 0 => { if let Some(st) = start.take() { out.push((st, i)); } }
+                b',' if depth == 0 => {
+                    if let Some(st) = start.take() {
+                        out.push((st, i));
+                    }
+                }
                 w if (w as char).is_ascii_whitespace() => {}
-                _ => { if start.is_none() { start = Some(i); } }
+                _ => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                }
             }
         }
         i += 1;
@@ -106,7 +126,8 @@ impl BlockCache {
 const CACHE_BYTES: usize = 64 << 20;
 
 fn main() -> anyhow::Result<()> {
-    let corpus = PathBuf::from(std::env::args().nth(1).expect("usage: block_curve <corpus.jsonl> [field]"));
+    let corpus =
+        PathBuf::from(std::env::args().nth(1).expect("usage: block_curve <corpus.jsonl> [field]"));
     let field = std::env::args().nth(2).unwrap_or_else(|| "body".to_string());
 
     // distinct pieces in capture order + each record's piece list
@@ -121,10 +142,19 @@ fn main() -> anyhow::Result<()> {
     };
     for line in rdr.lines() {
         let line = line?;
-        let v: serde_json::Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
-        let body = match v.get(&field).and_then(|b| b.as_str()) { Some(b) => b.as_bytes().to_vec(), None => continue };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let body = match v.get(&field).and_then(|b| b.as_str()) {
+            Some(b) => b.as_bytes().to_vec(),
+            None => continue,
+        };
         logical += body.len() as u64;
-        let spans = match split_json_array(&body) { Some(e) if !e.is_empty() => e, _ => vec![(0, body.len())] };
+        let spans = match split_json_array(&body) {
+            Some(e) if !e.is_empty() => e,
+            _ => vec![(0, body.len())],
+        };
         let mut refs = Vec::with_capacity(spans.len());
         for (a, b) in spans {
             let span = &body[a..b];
@@ -139,21 +169,37 @@ fn main() -> anyhow::Result<()> {
     }
     let raw: u64 = pieces.iter().map(|p| p.len() as u64).sum();
     let avg_refs = records.iter().map(|r| r.len()).sum::<usize>() as f64 / records.len() as f64;
-    println!("logical {:.2} MiB | {} records | {} distinct pieces ({:.2} MiB) | {:.0} refs/record",
-        mib(logical), records.len(), pieces.len(), mib(raw), avg_refs);
+    println!(
+        "logical {:.2} MiB | {} records | {} distinct pieces ({:.2} MiB) | {:.0} refs/record",
+        mib(logical),
+        records.len(),
+        pieces.len(),
+        mib(raw),
+        avg_refs
+    );
 
     // sample of records to reconstruct, spread across the corpus
     let sample: Vec<usize> = (0..1000).map(|i| (i * 7919) % records.len()).collect();
 
     // ---- baseline: per-piece framing ----
-    println!("\n{:<16}{:>11}{:>10}{:>13}{:>15}{:>12}", "scheme", "size MiB", "overall", "1 piece us", "1 record us", "blk/record");
+    println!(
+        "\n{:<16}{:>11}{:>10}{:>13}{:>15}{:>12}",
+        "scheme", "size MiB", "overall", "1 piece us", "1 record us", "blk/record"
+    );
     for lvl in [3, 19] {
-        let comp: Vec<Vec<u8>> = pieces.iter().map(|p| zstd::bulk::compress(p, lvl).unwrap()).collect();
+        let comp: Vec<Vec<u8>> =
+            pieces.iter().map(|p| zstd::bulk::compress(p, lvl).unwrap()).collect();
         let size: u64 = comp.iter().map(|c| c.len() as u64).sum::<u64>() + 16 * pieces.len() as u64;
 
         let t = Instant::now();
         for &i in &sample {
-            std::hint::black_box(zstd::bulk::decompress(&comp[i % pieces.len()], pieces[i % pieces.len()].len().max(1)).unwrap());
+            std::hint::black_box(
+                zstd::bulk::decompress(
+                    &comp[i % pieces.len()],
+                    pieces[i % pieces.len()].len().max(1),
+                )
+                .unwrap(),
+            );
         }
         let one = t.elapsed().as_secs_f64() * 1e6 / sample.len() as f64;
 
@@ -162,32 +208,49 @@ fn main() -> anyhow::Result<()> {
             let mut out = Vec::new();
             for &pi in &records[r] {
                 let pi = pi as usize;
-                out.extend_from_slice(&zstd::bulk::decompress(&comp[pi], pieces[pi].len().max(1)).unwrap());
+                out.extend_from_slice(
+                    &zstd::bulk::decompress(&comp[pi], pieces[pi].len().max(1)).unwrap(),
+                );
             }
             std::hint::black_box(out);
         }
         let rec = t.elapsed().as_secs_f64() * 1e6 / sample.len() as f64;
-        println!("{:<16}{:>11.2}{:>9.1}x{:>13.1}{:>15.1}{:>12}",
-            format!("per-piece/z{lvl}"), mib(size), logical as f64 / size as f64, one, rec, "-");
+        println!(
+            "{:<16}{:>11.2}{:>9.1}x{:>13.1}{:>15.1}{:>12}",
+            format!("per-piece/z{lvl}"),
+            mib(size),
+            logical as f64 / size as f64,
+            one,
+            rec,
+            "-"
+        );
     }
 
     // ---- block framing across the curve ----
     // The sweep used to stop at 4 MiB, so 4 MiB was chosen as the largest size TESTED rather than as
     // a measured optimum. Extended, because the ratio was still climbing steeply there.
-    for block_bytes in [64 * 1024usize, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024] {
+    for block_bytes in
+        [64 * 1024usize, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024]
+    {
         // lay pieces into blocks in capture order
-        let (mut blocks, mut where_of) = (Vec::<Vec<u8>>::new(), Vec::<(usize, usize, usize)>::new());
+        let (mut blocks, mut where_of) =
+            (Vec::<Vec<u8>>::new(), Vec::<(usize, usize, usize)>::new());
         let mut buf: Vec<u8> = Vec::new();
         for p in &pieces {
             let off = buf.len();
             buf.extend_from_slice(p);
             where_of.push((blocks.len(), off, p.len()));
-            if buf.len() >= block_bytes { blocks.push(std::mem::take(&mut buf)); }
+            if buf.len() >= block_bytes {
+                blocks.push(std::mem::take(&mut buf));
+            }
         }
-        if !buf.is_empty() { blocks.push(buf); }
+        if !buf.is_empty() {
+            blocks.push(buf);
+        }
 
         for lvl in [19] {
-            let comp: Vec<Vec<u8>> = blocks.iter().map(|b| zstd::bulk::compress(b, lvl).unwrap()).collect();
+            let comp: Vec<Vec<u8>> =
+                blocks.iter().map(|b| zstd::bulk::compress(b, lvl).unwrap()).collect();
             let index_bytes = pieces.len() as u64 * 10 + blocks.len() as u64 * 8;
             let size: u64 = comp.iter().map(|c| c.len() as u64).sum::<u64>() + index_bytes;
 
@@ -214,8 +277,15 @@ fn main() -> anyhow::Result<()> {
             }
             let rec = t.elapsed().as_secs_f64() * 1e6 / sample.len() as f64;
             let bpr = cache.misses as f64 / sample.len() as f64;
-            println!("{:<16}{:>11.2}{:>9.1}x{:>13.1}{:>15.1}{:>12.2}",
-                format!("{}K/z{lvl}", block_bytes / 1024), mib(size), logical as f64 / size as f64, one, rec, bpr);
+            println!(
+                "{:<16}{:>11.2}{:>9.1}x{:>13.1}{:>15.1}{:>12.2}",
+                format!("{}K/z{lvl}", block_bytes / 1024),
+                mib(size),
+                logical as f64 / size as f64,
+                one,
+                rec,
+                bpr
+            );
         }
     }
     Ok(())

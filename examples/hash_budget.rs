@@ -54,7 +54,9 @@ fn main() -> anyhow::Result<()> {
     println!("{} parts, {records} records, {:.2} MiB of parts", paths.len(), mib(part_bytes));
     println!(
         "dictionary entries {} across parts, {} distinct pieces ({:.2}x carried more than once)\n",
-        all.len(), distinct.len(), all.len() as f64 / distinct.len().max(1) as f64
+        all.len(),
+        distinct.len(),
+        all.len() as f64 / distinct.len().max(1) as f64
     );
 
     // What the column costs today, and at narrower widths, MEASURED rather than assumed: compress each
@@ -70,13 +72,20 @@ fn main() -> anyhow::Result<()> {
         }
         println!(
             "{:<10}{:>12.3}{:>12.3}{:>10.2}x{:>15.3} MiB",
-            format!("{w} B"), mib(raw.len() as u64), mib(stored.len() as u64),
-            raw.len() as f64 / s, mib((base - s) as u64)
+            format!("{w} B"),
+            mib(raw.len() as u64),
+            mib(stored.len() as u64),
+            raw.len() as f64 / s,
+            mib((base - s) as u64)
         );
     }
 
-    println!("\nthe column is {:.1}% of all part bytes today ({:.3} of {:.3} MiB)",
-        hash_stored as f64 * 100.0 / part_bytes as f64, mib(hash_stored), mib(part_bytes));
+    println!(
+        "\nthe column is {:.1}% of all part bytes today ({:.3} of {:.3} MiB)",
+        hash_stored as f64 * 100.0 / part_bytes as f64,
+        mib(hash_stored),
+        mib(part_bytes)
+    );
 
     // Collision risk. This is the ONLY thing being traded away, so it gets stated exactly.
     println!("\n{:<12}{:>16}{:>16}{:>18}", "width", "1e6 pieces", "1e9 pieces", "1e12 pieces");
@@ -84,7 +93,11 @@ fn main() -> anyhow::Result<()> {
         let bits = (w * 8) as f64;
         let f = |n: f64| {
             let l = collision_log2(n, bits);
-            if l > -1.0 { "~certain".to_string() } else { format!("2^{:.0}", l) }
+            if l > -1.0 {
+                "~certain".to_string()
+            } else {
+                format!("2^{:.0}", l)
+            }
         };
         println!("{:<12}{:>16}{:>16}{:>18}", format!("{w} B"), f(1e6), f(1e9), f(1e12));
     }

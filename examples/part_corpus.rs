@@ -103,7 +103,6 @@ fn carve(body: &[u8]) -> Vec<(bool, std::ops::Range<usize>)> {
     }
 }
 
-
 fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
@@ -113,7 +112,10 @@ const PART_RECORDS: usize = 5000;
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let corpus = PathBuf::from(args.next().expect("usage: part_corpus <corpus.jsonl> [dir]"));
-    let dir = args.next().map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("turndb-part-corpus"));
+    let dir = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("turndb-part-corpus"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
@@ -129,11 +131,12 @@ fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
 
     let flush = |fold: &mut Fold,
-                     pending: &mut Vec<Record>,
-                     originals: &mut Vec<Vec<u8>>,
-                     parts: &mut Vec<PathBuf>,
-                     seq: &mut u64,
-                     verified: &mut u64| -> anyhow::Result<()> {
+                 pending: &mut Vec<Record>,
+                 originals: &mut Vec<Vec<u8>>,
+                 parts: &mut Vec<PathBuf>,
+                 seq: &mut u64,
+                 verified: &mut u64|
+     -> anyhow::Result<()> {
         if pending.is_empty() {
             return Ok(());
         }
@@ -163,8 +166,14 @@ fn main() -> anyhow::Result<()> {
 
     for line in rdr.lines() {
         let line = line?;
-        let v: serde_json::Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
-        let body = match v.get("body").and_then(|b| b.as_str()) { Some(b) => b.as_bytes().to_vec(), None => continue };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let body = match v.get("body").and_then(|b| b.as_str()) {
+            Some(b) => b.as_bytes().to_vec(),
+            None => continue,
+        };
         let id = format!(
             "{}:{}#{}",
             v.get("trace_id").and_then(|x| x.as_str()).unwrap_or("t"),
@@ -175,12 +184,18 @@ fn main() -> anyhow::Result<()> {
         let mut attrs = Vec::new();
         if let Some(obj) = v.as_object() {
             for (k, val) in obj {
-                if k == "body" { continue; }
+                if k == "body" {
+                    continue;
+                }
                 let av = match val {
                     serde_json::Value::String(s) => turndb::AttrValue::Str(s.clone()),
                     serde_json::Value::Bool(b) => turndb::AttrValue::Bool(*b),
-                    serde_json::Value::Number(n) if n.is_i64() => turndb::AttrValue::Int(n.as_i64().unwrap()),
-                    serde_json::Value::Number(n) => turndb::AttrValue::Float(n.as_f64().unwrap_or(0.0)),
+                    serde_json::Value::Number(n) if n.is_i64() => {
+                        turndb::AttrValue::Int(n.as_i64().unwrap())
+                    }
+                    serde_json::Value::Number(n) => {
+                        turndb::AttrValue::Float(n.as_f64().unwrap_or(0.0))
+                    }
                     _ => continue,
                 };
                 attrs.push((k.clone(), av));
@@ -195,7 +210,9 @@ fn main() -> anyhow::Result<()> {
             if foldable {
                 let p = fold.put(span)?;
                 refs += 1;
-                if p.deduped { dups += 1; }
+                if p.deduped {
+                    dups += 1;
+                }
                 prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
                 prog.push(BodyOp::Lit(span.to_vec()));
@@ -217,17 +234,38 @@ fn main() -> anyhow::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
 
     let fold_bytes = fold.disk_bytes();
-    let part_bytes: u64 = parts.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let part_bytes: u64 =
+        parts.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
     let total = fold_bytes + part_bytes;
 
     println!("\r{:<26}{}", "corpus", corpus.display());
     println!("{:<26}{nrec} records, {} parts", "ingested", parts.len());
     println!("{:<26}{:.2} MiB", "logical body bytes", mib(logical));
-    println!("{:<26}{refs} refs, {} distinct ({:.1}x collapsed)", "pieces", refs - dups, refs as f64 / (refs - dups) as f64);
+    println!(
+        "{:<26}{refs} refs, {} distinct ({:.1}x collapsed)",
+        "pieces",
+        refs - dups,
+        refs as f64 / (refs - dups) as f64
+    );
     println!();
-    println!("{:<26}{:>9.2} MiB   {:.1}%", "fold (content)", mib(fold_bytes), fold_bytes as f64 * 100.0 / total as f64);
-    println!("{:<26}{:>9.2} MiB   {:.1}%", "parts (metadata)", mib(part_bytes), part_bytes as f64 * 100.0 / total as f64);
-    println!("{:<26}{:>9.2} MiB   {:.1}x overall", "TOTAL", mib(total), logical as f64 / total as f64);
+    println!(
+        "{:<26}{:>9.2} MiB   {:.1}%",
+        "fold (content)",
+        mib(fold_bytes),
+        fold_bytes as f64 * 100.0 / total as f64
+    );
+    println!(
+        "{:<26}{:>9.2} MiB   {:.1}%",
+        "parts (metadata)",
+        mib(part_bytes),
+        part_bytes as f64 * 100.0 / total as f64
+    );
+    println!(
+        "{:<26}{:>9.2} MiB   {:.1}x overall",
+        "TOTAL",
+        mib(total),
+        logical as f64 / total as f64
+    );
     println!();
     println!("{:<26}{verified} records, ALL byte-exact through the part", "verified");
     println!("{:<26}{:.1}s ({:.0} rec/s)", "elapsed", secs, nrec as f64 / secs);

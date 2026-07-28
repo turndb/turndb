@@ -130,7 +130,10 @@ pub fn merge_opts(
         if w[0].meta().seq_hi >= w[1].meta().seq_lo {
             bail!(
                 "merge inputs overlap in sequence: [{},{}] and [{},{}]",
-                w[0].meta().seq_lo, w[0].meta().seq_hi, w[1].meta().seq_lo, w[1].meta().seq_hi
+                w[0].meta().seq_lo,
+                w[0].meta().seq_hi,
+                w[1].meta().seq_lo,
+                w[1].meta().seq_hi
             );
         }
     }
@@ -223,13 +226,20 @@ mod tests {
     use crate::types::{AttrValue, BodyOp, Record};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let n =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let d = std::env::temp_dir().join(format!("turndb-merge-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
-    fn part_of(dir: &std::path::Path, fold: &mut Fold, name: &str, seq: u64, recs: &[(&str, &str)]) -> Arc<Part> {
+    fn part_of(
+        dir: &std::path::Path,
+        fold: &mut Fold,
+        name: &str,
+        seq: u64,
+        recs: &[(&str, &str)],
+    ) -> Arc<Part> {
         let rs: Vec<Record> = recs
             .iter()
             .map(|(id, body)| {
@@ -304,7 +314,8 @@ mod tests {
         // a third part deleting k1 — a tombstone the merge must carry forward
         let tomb_rec = Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() };
         let cp = d.join("c.part");
-        super::super::build_full(&cp, &[tomb_rec], &[true], 3, 3, 3, |_| None, &HashMap::new()).unwrap();
+        super::super::build_full(&cp, &[tomb_rec], &[true], 3, 3, 3, |_| None, &HashMap::new())
+            .unwrap();
         let c = Arc::new(Part::open(&cp).unwrap());
         fold.sync().unwrap();
 
@@ -327,8 +338,14 @@ mod tests {
         ];
         let oracle = d.join("oracle.part");
         super::super::build_full(
-            &oracle, &recs, &[true, false, false], 1, 3, 3,
-            |h| locs.get(h).copied(), &locs,
+            &oracle,
+            &recs,
+            &[true, false, false],
+            1,
+            3,
+            3,
+            |h| locs.get(h).copied(),
+            &locs,
         )
         .unwrap();
 

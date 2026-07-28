@@ -254,7 +254,10 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
                 bytes += b.len() as u64;
             }
         }
-        println!("deep: {} records reconstruct byte-exact ({bytes} content bytes verified)", ids.len());
+        println!(
+            "deep: {} records reconstruct byte-exact ({bytes} content bytes verified)",
+            ids.len()
+        );
         // ... and the fold scrub covers what reconstruction cannot: blocks holding only retained
         // or unreferenced pieces.
         let fs = rs.fold().scrub().context("fold scrub failed")?;
@@ -264,7 +267,10 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
             fs.segments,
             fs.bytes,
             if fs.trailing_uncommitted > 0 {
-                format!("; {} uncommitted trailing bytes await the next writer open", fs.trailing_uncommitted)
+                format!(
+                    "; {} uncommitted trailing bytes await the next writer open",
+                    fs.trailing_uncommitted
+                )
             } else {
                 String::new()
             }
@@ -287,12 +293,12 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match *a {
-            "--id" => ids.push(
-                it.next().ok_or_else(|| anyhow::anyhow!("--id needs a value"))?.to_string(),
-            ),
+            "--id" => ids
+                .push(it.next().ok_or_else(|| anyhow::anyhow!("--id needs a value"))?.to_string()),
             "--attr" => {
                 let kv = it.next().ok_or_else(|| anyhow::anyhow!("--attr needs KEY=VALUE"))?;
-                let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--attr needs KEY=VALUE"))?;
+                let (k, v) =
+                    kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--attr needs KEY=VALUE"))?;
                 attr = Some((k.to_string(), v.to_string()));
             }
             "--include-ids" => include_ids = true,
@@ -315,7 +321,9 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
                     && match val {
                         turndb::AttrValue::Str(x) => x == v,
                         turndb::AttrValue::Int(x) => v.parse::<i64>() == Ok(*x),
-                        turndb::AttrValue::Float(x) => v.parse::<f64>().is_ok_and(|p| p.to_bits() == x.to_bits()),
+                        turndb::AttrValue::Float(x) => {
+                            v.parse::<f64>().is_ok_and(|p| p.to_bits() == x.to_bits())
+                        }
                         turndb::AttrValue::Bool(x) => v.parse::<bool>() == Ok(*x),
                     }
             });
@@ -361,7 +369,6 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-
 /// JSONL in, records out: `body` is the record body (carved by the default opinion), every other
 /// scalar field is an attribute, and `id` (or trace_id:span_id#kind, or a line counter) names it.
 /// Batched per 1000 lines — each batch replays all-or-nothing — and flushed at the end.
@@ -390,7 +397,10 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
             skipped += 1;
             continue;
         };
-        let id = match (v.get("id").and_then(|x| x.as_str()), v.get("trace_id").and_then(|x| x.as_str())) {
+        let id = match (
+            v.get("id").and_then(|x| x.as_str()),
+            v.get("trace_id").and_then(|x| x.as_str()),
+        ) {
             (Some(id), _) => id.to_string(),
             (None, Some(t)) => format!(
                 "{t}:{}#{}",
@@ -408,8 +418,12 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
                 let av = match val {
                     serde_json::Value::String(x) => turndb::AttrValue::Str(x.clone()),
                     serde_json::Value::Bool(x) => turndb::AttrValue::Bool(*x),
-                    serde_json::Value::Number(x) if x.is_i64() => turndb::AttrValue::Int(x.as_i64().unwrap()),
-                    serde_json::Value::Number(x) => turndb::AttrValue::Float(x.as_f64().unwrap_or(0.0)),
+                    serde_json::Value::Number(x) if x.is_i64() => {
+                        turndb::AttrValue::Int(x.as_i64().unwrap())
+                    }
+                    serde_json::Value::Number(x) => {
+                        turndb::AttrValue::Float(x.as_f64().unwrap_or(0.0))
+                    }
                     _ => continue,
                 };
                 attrs.push((k.clone(), av));
@@ -446,9 +460,8 @@ fn query(path: &Path, sql: Option<&str>) -> Result<()> {
     let rs = open_read(path)?;
     let (ctx, table) = turndb::query::table::TurndbTable::context(rs, "t")?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let batches = rt.block_on(async {
-        ctx.sql(sql).await?.collect().await.map_err(anyhow::Error::from)
-    })?;
+    let batches =
+        rt.block_on(async { ctx.sql(sql).await?.collect().await.map_err(anyhow::Error::from) })?;
     println!("{}", datafusion::arrow::util::pretty::pretty_format_batches(&batches)?);
     let st = table.stats();
     eprintln!("({} rows scanned, {} fold reads)", st.rows, st.fold_reads);

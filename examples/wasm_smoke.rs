@@ -26,8 +26,10 @@ fn main() -> Result<()> {
         s.put_body(
             &format!("member/{:013}/{i:04}#input", 1_700_000_000_000u64 + i as u64),
             &body(i),
-            vec![("model".into(), AttrValue::Str("claude-opus-5".into())),
-                 ("turn".into(), AttrValue::Int(i as i64))],
+            vec![
+                ("model".into(), AttrValue::Str("claude-opus-5".into())),
+                ("turn".into(), AttrValue::Int(i as i64)),
+            ],
         )?;
     }
     s.sync()?;

@@ -109,7 +109,8 @@ mod tests {
     fn never_gives_a_false_negative() {
         // The one property that matters: a stored piece must never be reported absent.
         let mut b = Bloom::with_capacity(5000);
-        let present: Vec<PieceHash> = (0..5000).map(|i| PieceHash::of(format!("p{i}").as_bytes())).collect();
+        let present: Vec<PieceHash> =
+            (0..5000).map(|i| PieceHash::of(format!("p{i}").as_bytes())).collect();
         for h in &present {
             b.insert(h);
         }
@@ -134,7 +135,8 @@ mod tests {
     #[test]
     fn roundtrips_through_its_section_bytes() {
         let mut b = Bloom::with_capacity(500);
-        let hs: Vec<PieceHash> = (0..500).map(|i| PieceHash::of(format!("r{i}").as_bytes())).collect();
+        let hs: Vec<PieceHash> =
+            (0..500).map(|i| PieceHash::of(format!("r{i}").as_bytes())).collect();
         for h in &hs {
             b.insert(h);
         }

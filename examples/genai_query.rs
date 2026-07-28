@@ -34,18 +34,18 @@ fn main() -> Result<()> {
             r["ts"].as_i64().unwrap_or(0),
             r["responseId"].as_str().unwrap_or(""),
         );
-        for (kind, key) in
-            [("system", "systemInstructions"), ("input", "inputMessages"), ("output", "outputMessages")]
-        {
+        for (kind, key) in [
+            ("system", "systemInstructions"),
+            ("input", "inputMessages"),
+            ("output", "outputMessages"),
+        ] {
             let body = &r[key];
             if body.is_null() || body.as_array().is_some_and(|a| a.is_empty()) {
                 continue;
             }
             let want = serde_json::to_vec(body)?;
             let id = format!("{member}/{ts:013}/{rid}#{kind}");
-            let got = rs
-                .reconstruct(&id)?
-                .with_context(|| format!("record {id} missing"))?;
+            let got = rs.reconstruct(&id)?.with_context(|| format!("record {id} missing"))?;
             anyhow::ensure!(got == want, "BYTE DRIFT for {id}");
             bytes += got.len() as u64;
             checked += 1;

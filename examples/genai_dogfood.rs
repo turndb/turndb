@@ -103,7 +103,11 @@ fn main() -> Result<()> {
         push_int(&mut base, "gen_ai.usage.input_tokens", &u["inputTokens"]);
         push_int(&mut base, "gen_ai.usage.output_tokens", &u["outputTokens"]);
         push_int(&mut base, "gen_ai.usage.cache_read_input_tokens", &u["cacheReadInputTokens"]);
-        push_int(&mut base, "gen_ai.usage.cache_creation_input_tokens", &u["cacheCreationInputTokens"]);
+        push_int(
+            &mut base,
+            "gen_ai.usage.cache_creation_input_tokens",
+            &u["cacheCreationInputTokens"],
+        );
         // CUSTOM FIELDS: whatever the deployment adds, typed and queryable
         if let Some(obj) = r["attributes"].as_object() {
             for (k, v) in obj {
@@ -113,9 +117,11 @@ fn main() -> Result<()> {
             }
         }
 
-        for (kind, body_key) in
-            [("system", "systemInstructions"), ("input", "inputMessages"), ("output", "outputMessages")]
-        {
+        for (kind, body_key) in [
+            ("system", "systemInstructions"),
+            ("input", "inputMessages"),
+            ("output", "outputMessages"),
+        ] {
             let body = &r[body_key];
             if body.is_null() || body.as_array().is_some_and(|a| a.is_empty()) {
                 continue;
@@ -171,7 +177,11 @@ fn dir_bytes(d: &std::path::Path) -> u64 {
             rd.flatten()
                 .map(|e| {
                     let p = e.path();
-                    if p.is_dir() { dir_bytes(&p) } else { e.metadata().map(|m| m.len()).unwrap_or(0) }
+                    if p.is_dir() {
+                        dir_bytes(&p)
+                    } else {
+                        e.metadata().map(|m| m.len()).unwrap_or(0)
+                    }
                 })
                 .sum()
         })
