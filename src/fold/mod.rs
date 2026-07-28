@@ -163,6 +163,18 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
+/// What [`Fold::scrub`] verified.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FoldScrub {
+    pub segments: u32,
+    pub blocks: usize,
+    /// Frame bytes whose checksums verified.
+    pub bytes: u64,
+    /// Bytes past the active segment's last valid frame — uncommitted residue a crash left, which
+    /// the next writer open truncates. Reported so "verified" never silently skips them.
+    pub trailing_uncommitted: u64,
+}
+
 /// One segment as a read source hands it to [`Fold::open_read_from`]: its number, its bytes, and
 /// its advisory sidecar if the source has one.
 pub struct SegmentInput {
@@ -812,6 +824,39 @@ impl Fold {
     /// tracks the flush interval rather than the store.
     pub fn seal_window(&mut self) {
         self.dedup.clear();
+    }
+
+    /// Verify every block frame in every segment — the fold's half of a scrub.
+    ///
+    /// This is the whole-file read that sidecars removed from OPEN, done deliberately where it
+    /// belongs: a scrub's cost is the point of a scrub. Covers what reconstruction-based deep
+    /// verification cannot — blocks holding only retained or unreferenced pieces — and works
+    /// identically over a directory or a pack, because it reads through [`ReadAt`].
+    ///
+    /// A frame that fails its checksum ends a segment's valid span; a sealed segment whose span
+    /// ends before its file does is corruption and errors. The ACTIVE segment is allowed a
+    /// trailing invalid region (uncommitted writes a crash abandoned), which is reported, not
+    /// condemned.
+    pub fn scrub(&self) -> Result<FoldScrub> {
+        let mut report = FoldScrub::default();
+        for (i, h) in self.headers.iter().enumerate() {
+            let len = self.readers[i].len()?;
+            let (end, entries) = segment::scan_tail(&self.readers[i], len, h.has_dict())?;
+            report.segments += 1;
+            report.blocks += entries.len();
+            report.bytes += end.saturating_sub(segment::SEG_HDR_LEN);
+            if end < len {
+                if h.seg == self.active {
+                    report.trailing_uncommitted = len - end;
+                } else {
+                    bail!(
+                        "sealed segment {} holds valid frames only to byte {end} of {len} — corruption",
+                        h.seg
+                    );
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn cache_stats(&self) -> CacheStats {
