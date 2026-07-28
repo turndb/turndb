@@ -551,7 +551,7 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
 fn zone_maps_bound_columns_and_refuse_to_lie() {
     let d = tmp("zones");
     std::fs::create_dir_all(&d).unwrap();
-    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
     let rec = |id: &str, n: i64, t: f64, nanf: f64| Record {
         id: id.into(),
         body: vec![BodyOp::Lit(b"x".to_vec())],

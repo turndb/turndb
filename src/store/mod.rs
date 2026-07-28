@@ -116,6 +116,12 @@ pub struct PartRef {
     pub seq_lo: u64,
     pub seq_hi: u64,
     pub records: u32,
+    /// BLAKE3 of the part file's bytes, hex — the manifest PINNING the part. Content is pinned
+    /// transitively from here: this digest covers `pdict.hash`, which carries per-piece BLAKE3,
+    /// so fold tampering is detectable without any segment-level digest. Absent in manifests
+    /// written before the chain existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b3: Option<String>,
 }
 
 /// How many committed manifests are RETAINED beside the live one, as `MANIFEST.<commit>`.
@@ -143,6 +149,13 @@ pub struct Manifest {
     /// written before the log existed, which serde reads as 0.
     #[serde(default)]
     pub commit: u64,
+    /// BLAKE3 of the PREVIOUS manifest's exact bytes, hex — the commit log as a hash chain, at
+    /// zero marginal cost. Absent on a store's first commit and in manifests written before the
+    /// chain existed. Honesty note: pruned manifests take their bytes with them, so the VERIFIABLE
+    /// chain spans the retained window plus whatever manifests an operator archived; the chain is
+    /// tamper-EVIDENCE for what is present, never a claim about what is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev: Option<String>,
 }
 
 impl Manifest {
@@ -227,6 +240,11 @@ impl Manifest {
     /// a retained manifest that outlives its window is swept space, never a correctness problem.
     fn commit(&mut self, dir: &Path) -> Result<()> {
         self.commit += 1;
+        // Chain onto whatever is being replaced. Hashed from disk rather than from memory,
+        // because the chain's claim is about the BYTES a verifier can read back.
+        self.prev = std::fs::read(dir.join("MANIFEST"))
+            .ok()
+            .map(|b| blake3::hash(&b).to_hex().to_string());
         let bytes = self.encode()?;
         {
             let p = retained_path(dir, self.commit);
@@ -390,6 +408,68 @@ fn sweep_unreachable(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What [`verify_chain`] checked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChainReport {
+    /// prev-links verified across the retained window (newest retained == live MANIFEST included).
+    pub links: usize,
+    /// part digests verified against their files, across every retained manifest.
+    pub part_digests: usize,
+    /// parts whose manifest entry predates digests — reported, because "verified" must never
+    /// silently include "had nothing to verify".
+    pub undigested: usize,
+}
+
+/// Verify the manifest hash chain and every part pin it carries, across the retained window.
+///
+/// The chain's honest span: pruned manifests take their bytes with them, so links are checkable
+/// for what is present (plus whatever an operator archived elsewhere). Failure is an error naming
+/// the broken link or drifted part — tamper-EVIDENCE, presented for a human to act on.
+pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
+    let mut report = ChainReport::default();
+    let commits = list_retained(dir);
+    let mut prev_bytes: Option<Vec<u8>> = None;
+    for &c in &commits {
+        let bytes = std::fs::read(retained_path(dir, c))?;
+        let m = Manifest::parse(&bytes)
+            .with_context(|| format!("retained manifest {c} is corrupt"))?;
+        if let (Some(want), Some(pb)) = (&m.prev, &prev_bytes) {
+            let got = blake3::hash(pb).to_hex().to_string();
+            if *want != got {
+                bail!("manifest chain broken: commit {c} names prev {want} but commit {} hashes to {got}", c - 1);
+            }
+            report.links += 1;
+        }
+        for p in &m.parts {
+            match &p.b3 {
+                Some(want) => {
+                    let got = blake3::hash(
+                        &std::fs::read(dir.join(&p.file))
+                            .with_context(|| format!("part {} named by commit {c}", p.file))?,
+                    )
+                    .to_hex()
+                    .to_string();
+                    if *want != got {
+                        bail!("part {} drifted from the digest commit {c} pinned", p.file);
+                    }
+                    report.part_digests += 1;
+                }
+                None => report.undigested += 1,
+            }
+        }
+        prev_bytes = Some(bytes);
+    }
+    // The live MANIFEST must be byte-identical to its retained copy — same commit, same bytes.
+    if let (Some(&newest), Some(pb)) = (commits.last(), &prev_bytes) {
+        let live = std::fs::read(dir.join("MANIFEST"))?;
+        if live != *pb {
+            bail!("MANIFEST diverges from its retained copy at commit {newest}");
+        }
+        report.links += 1;
+    }
+    Ok(report)
 }
 
 /// Promote the newest intact retained manifest over a damaged `MANIFEST`.
@@ -828,7 +908,13 @@ impl Store {
         )?;
 
         let mut m = self.manifest.clone();
-        m.parts.push(PartRef { file: file.clone(), seq_lo: seq, seq_hi: seq, records: meta.n_records });
+        m.parts.push(PartRef {
+            file: file.clone(),
+            seq_lo: seq,
+            seq_hi: seq,
+            records: meta.n_records,
+            b3: Some(blake3::hash(&std::fs::read(&path)?).to_hex().to_string()),
+        });
         m.fold_seg = tail.seg;
         m.fold_off = tail.off;
         m.next_seq = seq;
@@ -891,6 +977,7 @@ impl Store {
                 seq_lo: meta.seq_lo,
                 seq_hi: meta.seq_hi,
                 records: meta.n_records,
+                b3: Some(blake3::hash(&std::fs::read(&path)?).to_hex().to_string()),
             }],
         );
         m.commit(&self.dir)?;
@@ -1103,13 +1190,16 @@ impl Store {
         let mut m = self.manifest.clone();
         m.parts = built
             .iter()
-            .map(|(file, lo, hi, n)| PartRef {
-                file: file.clone(),
-                seq_lo: *lo,
-                seq_hi: *hi,
-                records: *n,
+            .map(|(file, lo, hi, n)| {
+                Ok(PartRef {
+                    file: file.clone(),
+                    seq_lo: *lo,
+                    seq_hi: *hi,
+                    records: *n,
+                    b3: Some(blake3::hash(&std::fs::read(self.dir.join(file))?).to_hex().to_string()),
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         m.fold_gen = new_gen;
         // The new fold starts empty of history, so the committed tail is its own.
         let new_dir = refold::fold_dir(&self.dir, new_gen);
@@ -1332,12 +1422,13 @@ mod tests {
         let d = std::env::temp_dir().join(format!("turndb-man-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let mut m = super::Manifest {
-            parts: vec![super::PartRef { file: "p.part".into(), seq_lo: 1, seq_hi: 1, records: 7 }],
+            parts: vec![super::PartRef { file: "p.part".into(), seq_lo: 1, seq_hi: 1, records: 7, b3: None }],
             fold_seg: 2,
             fold_off: 4096,
             next_seq: 9,
             fold_gen: 3,
             commit: 0,
+            prev: None,
         };
         m.commit(&d).unwrap();
         let got = super::Manifest::load(&d).unwrap();
