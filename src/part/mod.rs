@@ -630,6 +630,25 @@ impl Part {
         Ok(self.nums("ids.restart", 4)?.iter().map(|&x| x as u32).collect())
     }
 
+    /// Row ordinals whose ids fall in `[from, to)`, ascending — the part's half of a range scan.
+    ///
+    /// `from`/`to` are open-ended when `None`. Costs a binary search plus a walk of exactly the
+    /// matching run, rather than decoding the whole id column.
+    pub fn rows_in_range(&self, from: Option<&str>, to: Option<&str>) -> Result<std::ops::Range<usize>> {
+        let stream = self.sect("ids")?;
+        let restarts = self.restarts()?;
+        let c = IdCol::new(&stream, &restarts, self.len());
+        let lo = match from {
+            Some(f) => c.lower_bound(f.as_bytes())?,
+            None => 0,
+        };
+        let hi = match to {
+            Some(t) => c.lower_bound(t.as_bytes())?,
+            None => self.len(),
+        };
+        Ok(lo..hi.max(lo))
+    }
+
     /// Row index of `id`, or `None`.
     pub fn find(&self, id: &str) -> Result<Option<usize>> {
         let stream = self.sect("ids")?;

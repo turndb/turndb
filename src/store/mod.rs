@@ -1115,6 +1115,52 @@ impl Store {
         &self.parts
     }
 
+    /// [`ReadStore::scan_ids`], plus the uncommitted memtable — so a writer paging its own store
+    /// sees records it has not flushed yet, which is what makes a live backfill possible.
+    ///
+    /// The memtable is a `BTreeMap`, so its slice of the range is already in id order and merging
+    /// is a two-way walk. Staged deletions remove an id here exactly as a tombstone would.
+    pub fn scan_ids(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Committed candidates: ask for the whole page even though some may be shadowed by a
+        // staged deletion, then re-trim after the merge.
+        let committed = read::scan_ids(&self.parts, from, to, limit, reverse)?;
+        let staged: Vec<&String> = self
+            .mem
+            .range::<str, _>((
+                from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
+                to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+            ))
+            .filter(|(_, v)| v.is_some())
+            .map(|(k, _)| k)
+            .collect();
+        if staged.is_empty() {
+            // still must drop anything the memtable deleted
+            let mut out = committed;
+            out.retain(|id| !matches!(self.mem.get(id), Some(None)));
+            out.truncate(limit);
+            return Ok(out);
+        }
+        let mut all: Vec<String> = committed;
+        all.extend(staged.into_iter().cloned());
+        all.sort_unstable();
+        all.dedup();
+        all.retain(|id| !matches!(self.mem.get(id), Some(None)));
+        if reverse {
+            all.reverse();
+        }
+        all.truncate(limit);
+        Ok(all)
+    }
+
     /// Every live id: committed parts plus the uncommitted memtable.
     ///
     /// Includes staged records, unlike [`ReadStore::ids`], because a writer can see its own writes.
@@ -1387,6 +1433,21 @@ impl ReadStore {
     /// Distinct committed ids, sorted — the union across parts, newest-wins.
     pub fn ids(&self) -> Result<Vec<String>> {
         read::ids(&self.parts)
+    }
+
+    /// Live ids in `[from, to)`, at most `limit`, id-ordered or reversed — the paged read.
+    ///
+    /// Only ids inside the range are decoded, so the cost tracks the page rather than the store.
+    /// Ids sort lexicographically, so ids designed with the query in mind (a `member/timestamp/…`
+    /// prefix) give member-then-time paging with no secondary index.
+    pub fn scan_ids(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<String>> {
+        read::scan_ids(&self.parts, from, to, limit, reverse)
     }
 
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
