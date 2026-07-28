@@ -884,6 +884,15 @@ impl Fold {
         Ok(())
     }
 
+    /// Seal the open block so the next one starts fresh — what a SCOPE CHANGE requires.
+    ///
+    /// A block is the unit of encryption, so content from two scopes sharing a block would share
+    /// a key, and destroying either key would erase both. Sealing at the boundary is what makes
+    /// per-scope packing real; it costs a short block, which is the price of the guarantee.
+    pub fn seal_open(&mut self) -> Result<()> {
+        self.seal_block()
+    }
+
     /// Seal the open block, make everything durable, and return the tail. Data before pointers: no part
     /// may name a `Loc` at or beyond a tail this has not returned.
     ///

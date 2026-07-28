@@ -65,6 +65,20 @@ pub trait BlockCipher: Send + Sync {
     /// does not know or care what the grain means.
     fn current(&self) -> Result<KeyId>;
 
+    /// Seal subsequent blocks under `scope`, creating its key if absent.
+    ///
+    /// A **scope** is whatever the deployment erases as a unit — a person, a tenant, a session.
+    /// The core carries the word and never interprets it; only the implementation knows what a
+    /// scope names. This is on the trait rather than on one implementation because the STORE has
+    /// to be able to say "new content belongs to this scope now", and it must reach whatever
+    /// cipher it was handed.
+    fn select(&self, scope: &str) -> Result<KeyId>;
+
+    /// DESTROY a scope's key. Returns whether one existed. Every block sealed under it becomes
+    /// permanently unopenable — here, and in every copy anywhere, which is the only erasure
+    /// mechanism that reaches copies you cannot touch.
+    fn destroy_scope(&self, scope: &str) -> Result<bool>;
+
     /// Encrypt `plaintext`, authenticating `aad` alongside it. Returns `(nonce, ciphertext||tag)`.
     ///
     /// `aad` is the block's frame header. Binding it means ciphertext cannot be moved to another
