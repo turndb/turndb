@@ -3,10 +3,87 @@
 //! The encoder always falls back to [`CODEC_STORED`] when compression does not shrink the input. That
 //! single rule makes `stored <= raw` a structural guarantee rather than a usual case, which is what
 //! lets `Loc.stored` be a `u32` that can never overflow and makes a fold at most `input + 16 B/piece`.
+//!
+//! # Two backends, one format
+//!
+//! Native builds call the C zstd library. `wasm32` builds call a pure-Rust encoder, because
+//! requiring a C toolchain to build for WASM would defeat the point of shipping a single portable
+//! artifact. **This is a build-time choice with no format consequence**: both emit ordinary zstd
+//! frames, each reads the other's byte-exact (measured, including dictionary frames), and the codec
+//! tag in the block header says nothing about which produced it. A store written by a WASM build is
+//! an ordinary store.
+//!
+//! The split lives in [`z`] and nowhere else, so the fallback policy above is written once.
 
 use super::block::{CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::borrow::Cow;
+
+/// The zstd backend: C on native, pure Rust on wasm32. Same frames either way.
+mod z {
+    #[cfg(not(target_arch = "wasm32"))]
+    use anyhow::Context;
+    use anyhow::Result;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn compress(raw: &[u8], dict: Option<&[u8]>, level: i32) -> Result<Vec<u8>> {
+        match dict {
+            Some(d) => zstd::bulk::Compressor::with_dictionary(level, d)
+                .context("zstd compressor with dictionary")?
+                .compress(raw)
+                .context("zstd dictionary compress"),
+            None => zstd::bulk::compress(raw, level).context("zstd compress"),
+        }
+    }
+
+    /// Decode into a buffer sized by the block header. The caller-supplied length is the bound: a
+    /// frame claiming more than `out` holds fails here rather than allocating on a corrupt header.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn decompress_into(payload: &[u8], dict: Option<&[u8]>, out: &mut [u8]) -> Result<usize> {
+        let v = match dict {
+            Some(d) => zstd::bulk::Decompressor::with_dictionary(d)
+                .context("zstd decompressor with dictionary")?
+                .decompress(payload, out.len())
+                .context("zstd dictionary decompress")?,
+            None => zstd::bulk::decompress(payload, out.len()).context("zstd decompress")?,
+        };
+        if v.len() > out.len() {
+            anyhow::bail!("decoded {} exceeds declared {}", v.len(), out.len());
+        }
+        out[..v.len()].copy_from_slice(&v);
+        Ok(v.len())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn compress(raw: &[u8], dict: Option<&[u8]>, level: i32) -> Result<Vec<u8>> {
+        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+        match dict {
+            Some(d) => {
+                let mut c: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+                c.set_dictionary_from_bytes(d)
+                    .map_err(|e| anyhow::anyhow!("zstd compressor with dictionary: {e:?}"))?;
+                Ok(c.compress_independent_frame(raw))
+            }
+            None => Ok(structured_zstd::encoding::compress_slice_to_vec(
+                raw,
+                CompressionLevel::Level(level),
+            )),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn decompress_into(payload: &[u8], dict: Option<&[u8]>, out: &mut [u8]) -> Result<usize> {
+        let mut d = structured_zstd::decoding::FrameDecoder::new();
+        if let Some(dict) = dict {
+            d.add_dict_from_bytes(dict)
+                .map_err(|e| anyhow::anyhow!("zstd decompressor with dictionary: {e:?}"))?;
+        }
+        // `decode_all` writes into the caller's slice and refuses to overrun it, so the block
+        // header's `raw_len` bounds the output directly — no growable buffer to size from a
+        // possibly-corrupt frame.
+        d.decode_all(payload, out).map_err(|e| anyhow::anyhow!("zstd decompress: {e:?}"))
+    }
+}
 
 /// Default compression level. A WRITE-SIDE knob: the codec tag rides in the block header, so the
 /// reader is indifferent to it. Higher levels cost write throughput and buy size; decompression speed
@@ -18,14 +95,7 @@ pub const LEVEL_DEFAULT: i32 = 19;
 /// The tie-break is `>=`, not `>`: an equal-size compressed payload is rejected in favour of the
 /// stored form, because stored decodes without zstd at all.
 pub fn encode<'a>(raw: &'a [u8], dict: Option<&[u8]>, level: i32) -> Result<(u8, Cow<'a, [u8]>)> {
-    let compressed = match dict {
-        Some(d) => {
-            let mut c = zstd::bulk::Compressor::with_dictionary(level, d)
-                .context("zstd compressor with dictionary")?;
-            c.compress(raw).context("zstd dictionary compress")?
-        }
-        None => zstd::bulk::compress(raw, level).context("zstd compress")?,
-    };
+    let compressed = z::compress(raw, dict, level)?;
     if compressed.len() >= raw.len() {
         return Ok((CODEC_STORED, Cow::Borrowed(raw)));
     }
@@ -39,26 +109,32 @@ pub fn encode<'a>(raw: &'a [u8], dict: Option<&[u8]>, level: i32) -> Result<(u8,
 /// length is corruption and fails loud rather than returning short or over-long bytes.
 pub fn decode(codec: u8, payload: &[u8], raw_len: u32, dict: Option<&[u8]>) -> Result<Vec<u8>> {
     let n = raw_len as usize;
-    let out = match codec {
+    match codec {
         CODEC_STORED => {
             if payload.len() != n {
                 bail!("stored block payload {} != raw {}", payload.len(), n);
             }
-            payload.to_vec()
+            Ok(payload.to_vec())
         }
-        CODEC_ZSTD => zstd::bulk::decompress(payload, n).context("zstd decompress")?,
-        CODEC_ZSTD_DICT => {
-            let d = dict.ok_or_else(|| anyhow::anyhow!("dictionary block but no dictionary loaded"))?;
-            let mut z = zstd::bulk::Decompressor::with_dictionary(d)
-                .context("zstd decompressor with dictionary")?;
-            z.decompress(payload, n).context("zstd dictionary decompress")?
+        CODEC_ZSTD | CODEC_ZSTD_DICT => {
+            let d = if codec == CODEC_ZSTD_DICT {
+                Some(dict.ok_or_else(|| {
+                    anyhow::anyhow!("dictionary block but no dictionary loaded")
+                })?)
+            } else {
+                None
+            };
+            let mut out = vec![0u8; n];
+            let got = z::decompress_into(payload, d, &mut out)?;
+            // A frame that decodes SHORT is as much a corruption as one that overruns; without
+            // this the tail of the buffer would silently read back as zeros.
+            if got != n {
+                bail!("decoded length {got} != declared raw {n}");
+            }
+            Ok(out)
         }
         other => bail!("unknown block codec {other}"),
-    };
-    if out.len() != n {
-        bail!("decoded length {} != declared raw {}", out.len(), n);
     }
-    Ok(out)
 }
 
 #[cfg(test)]

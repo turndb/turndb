@@ -1014,7 +1014,16 @@ fn nthreads(cfg: usize) -> usize {
     if cfg > 0 {
         cfg
     } else {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        // wasm32 has no threads; the pool compresses inline there, so asking for more than one
+        // worker would be meaningless.
+        #[cfg(target_arch = "wasm32")]
+        {
+            1
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        }
     }
 }
 
@@ -1038,9 +1047,9 @@ fn acquire_writer_lock(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    use std::os::unix::io::AsRawFd;
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    if !crate::sys::lock_exclusive(&f)
+        .with_context(|| format!("locking {}", path.display()))?
+    {
         bail!("fold at {} is already open by another writer", dir.display());
     }
     Ok(f)

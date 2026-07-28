@@ -28,7 +28,7 @@ pub trait ReadAt: Send + Sync {
 
 impl ReadAt for File {
     fn read_exact_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
-        std::os::unix::fs::FileExt::read_exact_at(self, buf, off)
+        crate::sys::read_exact_at(self, buf, off)
     }
     fn len(&self) -> io::Result<u64> {
         Ok(self.metadata()?.len())

@@ -1,0 +1,171 @@
+//! The platform floor: the three OS facilities this engine needs, and what happens where one is
+//! missing.
+//!
+//! Everything else in the crate is portable Rust over `std::fs`. Exactly three operations are not,
+//! and each is isolated here rather than cfg-gated at its call sites, so "what does turndb need from
+//! an operating system" has one answer you can read in one place.
+//!
+//! | facility | Unix | WASI | why it is needed |
+//! |---|---|---|---|
+//! | positioned read/write | `std::os::unix::fs::FileExt` | `std::os::wasi::fs::FileExt` | every read is `n` bytes at offset `o`; seek-then-read is not thread-safe |
+//! | advisory whole-file lock | `flock` | **absent** — see [`lock_exclusive`] | the single-writer invariant, enforced by the OS rather than by convention |
+//! | hole punching | `fallocate(PUNCH_HOLE)`, Linux | **absent** | erase content in place without moving a single offset |
+//!
+//! # The honest position on WASI
+//!
+//! Positioned I/O is genuinely equivalent — WASI's `pread`/`pwrite` are the same primitive under a
+//! different module path, so that row costs nothing.
+//!
+//! The other two are real reductions, and this module makes each one *fail* rather than quietly
+//! degrade. Hole punching returns `Unsupported`, which the fold already handles: the caller falls
+//! back to a re-fold, which reclaims the same space by rewriting. Locking is the one that cannot be
+//! papered over, and [`lock_exclusive`] documents exactly what is lost.
+
+use std::fs::File;
+use std::io;
+
+// ── Positioned I/O ──────────────────────────────────────────────────────────
+//
+// The same `pread`/`pwrite` on both platforms. Unix reaches them through the stable `FileExt`;
+// WASI's equivalent trait is still unstable (`wasi_ext`), so we call the preview1 syscalls
+// directly, which is stable and is what that trait would do anyway.
+//
+// Both loop, because a short `pread`/`pwrite` is legal and means "call again", not "end of file".
+// Only a zero-length read at a non-empty request is EOF.
+
+/// Fill `buf` from `off`, exactly, or error.
+#[cfg(unix)]
+#[inline]
+pub(crate) fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, off)
+}
+
+/// Write all of `buf` at `off`, or error.
+#[cfg(unix)]
+#[inline]
+pub(crate) fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+}
+
+#[cfg(target_os = "wasi")]
+fn wasi_err(e: wasi::Errno) -> io::Error {
+    io::Error::from_raw_os_error(e.raw().into())
+}
+
+#[cfg(target_os = "wasi")]
+pub(crate) fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = f.as_raw_fd() as u32;
+    while !buf.is_empty() {
+        let iov = [wasi::Iovec { buf: buf.as_mut_ptr(), buf_len: buf.len() }];
+        let n = unsafe { wasi::fd_pread(fd, &iov, off) }.map_err(wasi_err)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "positioned read hit end of file before filling the buffer",
+            ));
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "wasi")]
+pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = f.as_raw_fd() as u32;
+    while !buf.is_empty() {
+        let iov = [wasi::Ciovec { buf: buf.as_ptr(), buf_len: buf.len() }];
+        let n = unsafe { wasi::fd_pwrite(fd, &iov, off) }.map_err(wasi_err)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "positioned write made no progress",
+            ));
+        }
+        buf = &buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
+// ── Whole-file advisory lock ────────────────────────────────────────────────
+
+/// Take an exclusive advisory lock on `f`, or report that another writer holds it.
+///
+/// `Ok(true)` means the lock is held for as long as `f` is open. `Ok(false)` means another writer
+/// has it. An `Err` is a real I/O failure, distinct from contention.
+///
+/// # Where this is weaker
+///
+/// On Unix this is `flock`, which the kernel releases when the file descriptor closes — including
+/// when the process is killed, and including when it crashes. That property is what makes it a
+/// *safe* single-writer gate: a stale lock cannot outlive its owner.
+///
+/// **WASI has no advisory locking**, so this returns `Ok(true)` unconditionally. The single-writer
+/// invariant is then the embedder's to keep, and it is not an academic concern: two writers on one
+/// store will interleave WAL frames and corrupt it. The intended deployment is one store per Node
+/// process, where the runtime provides the exclusion the OS otherwise would. A lockfile is *not* a
+/// substitute — an `O_EXCL` file survives a hard kill and would wedge the store closed with no safe
+/// way to tell a stale lock from a live one.
+///
+/// This is a documented reduction in a guarantee the format states, not an oversight; FORMAT.md
+/// says so too.
+#[inline]
+pub(crate) fn lock_exclusive(f: &File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        // EWOULDBLOCK is contention — another writer holds it. Anything else is a real failure and
+        // must not be reported as "someone else has it".
+        match e.raw_os_error() {
+            Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN => Ok(false),
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        Ok(true)
+    }
+}
+
+// ── Hole punching ───────────────────────────────────────────────────────────
+
+/// Deallocate `len` bytes at `off`, leaving the file's length untouched.
+///
+/// Linux only. Everywhere else this returns [`io::ErrorKind::Unsupported`], which callers already
+/// treat as "re-fold instead" — reclaiming the same space by rewriting rather than in place.
+#[inline]
+pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                off as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (f, off, len);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hole punching needs fallocate(FALLOC_FL_PUNCH_HOLE), which this platform lacks",
+        ))
+    }
+}

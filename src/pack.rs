@@ -36,7 +36,7 @@ impl Pack {
             bail!("pack of {len} bytes is too short to hold a footer");
         }
         let mut foot = [0u8; FOOTER_LEN as usize];
-        std::os::unix::fs::FileExt::read_exact_at(&f, &mut foot, len - FOOTER_LEN)?;
+        crate::sys::read_exact_at(&f, &mut foot, len - FOOTER_LEN)?;
         if &foot[0..8] != MAGIC {
             bail!("not a turndb pack (bad magic) — or the footer never landed");
         }
@@ -64,7 +64,7 @@ impl Pack {
             bail!("pack TOC runs past where the footer says the files end");
         }
         let mut tbuf = vec![0u8; toc_stored as usize];
-        std::os::unix::fs::FileExt::read_exact_at(&f, &mut tbuf, toc_off)?;
+        crate::sys::read_exact_at(&f, &mut tbuf, toc_off)?;
         if crc32fast::hash(&tbuf) != toc_xsum {
             bail!("pack TOC fails its checksum");
         }

@@ -151,17 +151,7 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// content — they carry the length that keeps the chain walkable, and the `block_id` that lets a
 /// scan report the erasure by name.
 pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let rc = unsafe {
-        libc::fallocate(
-            f.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            off as libc::off_t,
-            len as libc::off_t,
-        )
-    };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
+    if let Err(e) = crate::sys::punch_hole(f, off, len) {
         bail!("punching {len} bytes at {off} failed ({e}) — this filesystem may not support hole punching; re-fold instead");
     }
     f.sync_all()?;

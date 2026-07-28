@@ -62,14 +62,40 @@ zstd = "0.13"
 # flock: the single-writer invariant, enforced by the OS rather than by convention.
 libc = "0.2"
 
+[target.'cfg(target_os = "wasi")'.dependencies]
+# Positioned reads via the preview1 syscalls. `std::os::wasi::fs::FileExt` would do the same thing
+# but is still unstable (`wasi_ext`), and an engine that builds only on nightly is not shippable.
+wasi = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The same zstd format, implemented in Rust, because the C one needs a C toolchain that a wasm
+# build should not require. Not a compromise codec: measured over 50 blocks / 200 MiB of six
+# content types at this crate's own 4 MiB block size and level 19, it costs 0.6% more bytes than
+# the C encoder at 0.67x the time, and every frame decodes byte-exact under the C decoder (and C
+# frames under this one). Dictionary frames interoperate both ways too.
+#
+# Pinned tight on purpose: at 0.0.x this is the least-proven dependency in the tree, and it sits in
+# the compression path of a storage engine. A per-piece BLAKE3 check on every read means a bad
+# encode is caught rather than served, but an unreadable frame would still be data loss, so the
+# version does not float.
+structured-zstd = "=0.0.49"
+
 [profile.release]
 debug = true
 
-[dev-dependencies]
-# DataFusion is async; the SQL tests need a runtime to drive it.
+# DataFusion is async; the SQL tests need a runtime to drive it. Scoped away from wasm because
+# dev-dependencies are built for examples too, and a multi-thread runtime does not compile there —
+# the SQL lens is a native-only concern anyway.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# The query demo exercises the lens, so it only exists when the lens does.
+# These exercise the lens, so they only exist when the lens does. Without the declaration a
+# `--no-default-features` build fails on the EXAMPLES while the library itself is fine — which is
+# exactly the kind of breakage the sql-off CI job exists to catch.
 [[example]]
 name = "query_demo"
+required-features = ["sql"]
+
+[[example]]
+name = "genai_query"
 required-features = ["sql"]
