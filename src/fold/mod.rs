@@ -131,6 +131,13 @@ impl BlockCache {
             }
         }
     }
+    /// Drop an entry outright — for a block whose bytes no longer exist.
+    fn forget(&mut self, k: u32) {
+        if let Some((clock, v)) = self.map.remove(&k) {
+            self.bytes -= v.len();
+            self.order.remove(&clock);
+        }
+    }
     fn put(&mut self, k: u32, v: Arc<Vec<u8>>) {
         let add = v.len();
         // always admit one block, however large, then evict coldest until back inside the budget
@@ -703,6 +710,16 @@ impl Fold {
         let mut hb = [0u8; block::BLOCK_HDR_LEN];
         f.read_exact_at(&mut hb, off as u64)
             .with_context(|| format!("read block header at seg {seg} off {off}"))?;
+        // A punched block reads back as zeros, which parse_hdr would report as a bad tag —
+        // i.e. as corruption. Naming it is the difference between "your disk is failing" and
+        // "this content was erased on purpose", and only one of those is true.
+        if hb.iter().all(|&b| b == 0) {
+            bail!(
+                "block {} was ERASED (its bytes were punched out of the fold); \
+                 the manifest's punched list is authoritative for which",
+                loc.block_id
+            );
+        }
         let hdr = block::parse_hdr(&hb, has_dict)?;
         if hdr.block_id != loc.block_id {
             bail!("directory sent block {} to a frame carrying id {}", loc.block_id, hdr.block_id);
@@ -826,6 +843,55 @@ impl Fold {
         self.dedup.clear();
     }
 
+    /// Physically destroy the bytes of blocks whose every piece is dead, WITHOUT moving anything.
+    ///
+    /// `FALLOC_FL_PUNCH_HOLE` deallocates a file's extents and reads them back as zeros: the file
+    /// length, and therefore every offset in it, is unchanged — so no `Loc` above the fold is
+    /// invalidated and no part needs rebuilding. That is what makes this the sub-refold erasure
+    /// primitive: a refold rewrites the world to reclaim space, and this reclaims the same space
+    /// in place, at the cost of leaving the block's frame header punched too.
+    ///
+    /// `dead` names BLOCK IDS, and the caller owes the truth of that: a block is punchable only
+    /// when no live record references any piece in it. The store computes that from the parts and
+    /// records the result in the manifest before calling here — because a punched block read as
+    /// merely corrupt is an ops fire drill, and only an authoritative record prevents it.
+    ///
+    /// Returns the ids actually punched. A block already punched, or whose frame will not parse,
+    /// is skipped rather than errored — this is reclamation, and a block it cannot account for is
+    /// a block it leaves alone.
+    pub fn punch_blocks(&mut self, dead: &[u32]) -> Result<Vec<u32>> {
+        let mut done = Vec::new();
+        for &id in dead {
+            let Some(Some((seg, off))) = self.blockdir.get(id as usize).copied() else { continue };
+            let mut hb = [0u8; block::BLOCK_HDR_LEN];
+            if self.readers[seg as usize].read_exact_at(&mut hb, off as u64).is_err() {
+                continue;
+            }
+            let has_dict = self.headers[seg as usize].has_dict();
+            let Ok(hdr) = block::parse_hdr(&hb, has_dict) else { continue };
+            if hdr.block_id != id {
+                bail!("directory sent block {id} to a frame carrying id {}", hdr.block_id);
+            }
+            let f = segment::open_rw(&self.dir, seg)?;
+            // The PAYLOAD only — the header stays so the frame chain remains walkable. See
+            // `segment::punch`.
+            segment::punch(&f, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
+            // The block is gone as content: drop it from the directory so no Loc can resolve
+            // into erased bytes, exactly as a reopened store's scan would.
+            self.blockdir[id as usize] = None;
+            done.push(id);
+        }
+        // Punched blocks are no longer readable content: drop their cache entries so a warm
+        // reader cannot keep serving what the disk no longer holds.
+        {
+            let mut c = self.cache.lock().unwrap();
+            for id in &done {
+                c.forget(*id);
+            }
+        }
+        Ok(done)
+    }
+
     /// Verify every block frame in every segment — the fold's half of a scrub.
     ///
     /// This is the whole-file read that sidecars removed from OPEN, done deliberately where it
@@ -862,6 +928,15 @@ impl Fold {
     pub fn cache_stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
         CacheStats { hits: c.hits, misses: c.misses }
+    }
+
+    /// Every block id the directory knows — the universe a reachability sweep works against.
+    pub fn block_ids(&self) -> Vec<u32> {
+        self.blockdir
+            .iter()
+            .enumerate()
+            .filter_map(|(id, e)| e.map(|_| id as u32))
+            .collect()
     }
 
     pub fn segment_count(&self) -> u32 {

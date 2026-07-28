@@ -174,6 +174,37 @@ Recovery truncates to the committed tail and replays the log. A committed tail *
 block means the disk broke an fsync promise, and the fold refuses to open rather than serve content
 that silently lost durable bytes.
 
+### Punched blocks
+
+A block whose every piece is unreachable may have its **payload deallocated in place** — the
+extents are freed, the bytes read back as zeros, and the file's length is unchanged, so every
+offset and every `Loc` in every part still means exactly what it meant. This is erasure without
+rewriting: a re-fold reclaims the same space by rebuilding the world, and this reclaims it where
+it lies.
+
+Two rules make it safe, and both are load-bearing:
+
+* **Only the payload is punched, never the frame header.** The chain is walked by reading a
+  16-byte header and stepping over `stored` bytes; a punched header would end the chain and
+  silently orphan every block after it in the segment. The surviving header carries no content —
+  it carries the length that keeps the chain walkable and the `block_id` that names the erasure.
+* **The manifest's `punched` list is written BEFORE the bytes go**, as ascending disjoint
+  inclusive `[lo, hi]` block-id ranges. A crash between the two leaves blocks marked punched that
+  are still readable, which the next pass simply re-punches; the opposite order would leave zeros
+  that nothing accounts for — indistinguishable from corruption.
+
+A scan therefore recognises a frame whose header parses, whose checksum fails, and whose payload
+is entirely zero as **punched**: it steps over it and leaves the block OUT of the directory, so no
+`Loc` can resolve into erased bytes. Anything else that fails there is a torn write and ends the
+segment's valid span, exactly as before. Reading an erased block reports erasure by name rather
+than corruption — the difference between "this disk is failing" and "this content was destroyed
+on purpose", and only one of them is true.
+
+Hole punching is a filesystem feature (ext4, xfs, btrfs, tmpfs…) and frees whole filesystem
+blocks; where it is unavailable, a re-fold reclaims the same space by rewriting. Metadata residue
+— the erased pieces' lengths in `pdict.loc`, their hashes in `pdict.hash` — survives in the parts
+until a re-fold or re-seal rebuilds them, and any erasure record must say so.
+
 ### Fold generations
 
 The manifest names which generation is live. Generation 0 is the plain `fold/` directory; generation

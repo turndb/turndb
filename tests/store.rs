@@ -683,7 +683,7 @@ fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
     std::fs::remove_dir(&man).unwrap();
     std::fs::write(&man, serde_json::to_vec(&Manifest {
         parts: vec![PartRef { file: "part-00000001.part".into(), seq_lo: 1, seq_hi: 1, records: 20, b3: None }],
-        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0, commit: 1, prev: None,
+        fold_seg: 0, fold_off: 0, next_seq: 1, fold_gen: 0, commit: 1, prev: None, punched: Vec::new(),
     }).unwrap()).unwrap();
     let s = Store::open(&dir, cfg()).unwrap();
     assert_eq!(s.part_count(), 1);
@@ -1379,4 +1379,74 @@ fn the_manifest_chain_links_and_pins_and_notices_tampering() {
     std::fs::write(&part, &b).unwrap();
     assert!(turndb::store::verify_chain(&dir).is_err(), "a drifted part must break verification");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
+    let dir = tmp("punch");
+    let mut s = Store::open(&dir, FoldCfg { block_target: 256 * 1024, ..cfg() }).unwrap();
+    // INCOMPRESSIBLE bodies: hole punching frees whole filesystem blocks, so a fold that
+    // compresses into a single 4 KiB block has nothing observable to free.
+    let noise = |seed: u64, len: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut h = blake3::hash(&seed.to_le_bytes());
+        while out.len() < len {
+            out.extend_from_slice(h.as_bytes());
+            h = blake3::hash(h.as_bytes());
+        }
+        out.truncate(len);
+        out
+    };
+    let mut keep = Vec::new();
+    for f in 0..4u64 {
+        for i in 0..6u64 {
+            let id = format!("p{f}-{i}");
+            let want = put(&mut s, &id, &noise(f * 100 + i, 64 * 1024));
+            if f > 0 {
+                keep.push((id, want));
+            }
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    // delete and SETTLE the first flush's records, so their blocks become unreachable
+    for i in 0..6 {
+        s.delete(&format!("p0-{i}")).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.merge_range(0, s.part_count()).unwrap().unwrap();
+
+    let before = allocated_bytes(&dir.join("fold"));
+    let stats = s.punch_unreferenced().unwrap();
+    assert!(stats.blocks_punched > 0, "dead blocks must be punched: {stats:?}");
+    assert!(!s.manifest().punched.is_empty(), "the manifest must NAME what was punched");
+
+    // bytes actually left the disk, and the file LENGTHS did not change (offsets are stable)
+    let after = allocated_bytes(&dir.join("fold"));
+    assert!(after < before, "punching must deallocate: {before} -> {after}");
+
+    // everything still live reads byte-exact, through the same unmoved offsets
+    for (id, body) in &keep {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "{id} damaged by punching");
+    }
+    // and a reopened store agrees
+    drop(s);
+    let s = Store::open(&dir, cfg()).unwrap();
+    for (id, body) in &keep {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "{id} damaged across reopen");
+    }
+    assert!(!s.manifest().punched.is_empty(), "the punched list must survive reopen");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Blocks actually allocated on disk, in bytes — what punching changes (file LENGTH does not).
+fn allocated_bytes(d: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
+        .map(|e| e.metadata().unwrap().blocks() * 512)
+        .sum()
 }
