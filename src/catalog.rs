@@ -47,9 +47,23 @@ pub struct Member {
     /// sealed when policy says its window closed.
     #[serde(default)]
     pub sealed: bool,
+    /// LEGAL HOLDS on this member: reasons it must not be expired, each a free-form label
+    /// (a matter number, a ticket, a regulation). Retention refuses a held member outright —
+    /// **holds beat schedules, always**, because the failure modes are not symmetric: expiring
+    /// data under hold is spoliation and cannot be undone, while keeping data past its schedule
+    /// is a finding that can be corrected next sweep.
+    ///
+    /// A list rather than a flag because holds arrive from different matters and each must be
+    /// released by its own; a member is free only when every one is gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<String>,
 }
 
 impl Member {
+    pub fn on_hold(&self) -> bool {
+        !self.holds.is_empty()
+    }
+
     /// Is this member a pack file rather than a directory? Answered from the filesystem, not from
     /// the name, because the answer decides which reader opens it.
     pub fn is_pack(&self, root: &Path) -> bool {
@@ -140,6 +154,82 @@ impl Catalog {
             .collect()
     }
 
+    /// Place a legal hold. Idempotent: the same reason twice is one hold.
+    pub fn hold(&mut self, path: &str, reason: &str) -> Result<()> {
+        let m = self
+            .members
+            .iter_mut()
+            .find(|m| m.path == path)
+            .ok_or_else(|| anyhow::anyhow!("catalog holds no member {path}"))?;
+        if !m.holds.iter().any(|h| h == reason) {
+            m.holds.push(reason.to_string());
+        }
+        Ok(())
+    }
+
+    /// Release one hold. Returns whether it was there; a member is expirable only once EVERY
+    /// hold is gone.
+    pub fn release(&mut self, path: &str, reason: &str) -> Result<bool> {
+        let m = self
+            .members
+            .iter_mut()
+            .find(|m| m.path == path)
+            .ok_or_else(|| anyhow::anyhow!("catalog holds no member {path}"))?;
+        let n = m.holds.len();
+        m.holds.retain(|h| h != reason);
+        Ok(m.holds.len() != n)
+    }
+
+    /// Plan a retention sweep: which members a policy would expire, and which it refuses to.
+    ///
+    /// A PLAN, not an action, because the whole point of the two-step is that an operator sees
+    /// what is about to be destroyed before it is. `expired` is what the policy selects and no
+    /// hold protects; `held` is what the policy selected and a hold saved, reported by name and
+    /// reason so it appears in the record rather than silently not happening.
+    pub fn plan_retention(&self, expire_before: &str) -> RetentionPlan {
+        let mut expired = Vec::new();
+        let mut held = Vec::new();
+        for m in &self.members {
+            let Some(w) = m.window.as_deref() else { continue };
+            if w >= expire_before {
+                continue;
+            }
+            if m.on_hold() {
+                held.push((m.path.clone(), m.holds.clone()));
+            } else {
+                expired.push(m.path.clone());
+            }
+        }
+        RetentionPlan { expire_before: expire_before.to_string(), expired, held }
+    }
+
+    /// Apply a plan: drop the expired members from the catalog and commit.
+    ///
+    /// The BYTES are not touched — deleting them is a separate, deliberate step, and the returned
+    /// paths are what to delete once the operator is satisfied. Retention that destroys in the
+    /// same breath as it decides leaves no moment to notice a mistake.
+    pub fn apply_retention(&mut self, root: &Path, plan: &RetentionPlan) -> Result<Vec<String>> {
+        // Re-check holds at APPLY time: a hold placed between planning and applying must win, or
+        // the two-step becomes a race that loses to spoliation.
+        let mut removed = Vec::new();
+        for path in &plan.expired {
+            match self.members.iter().find(|m| m.path == *path) {
+                Some(m) if m.on_hold() => {
+                    bail!("member {path} came under legal hold after the plan was made — refusing")
+                }
+                Some(_) => {
+                    self.remove(path);
+                    removed.push(path.clone());
+                }
+                None => {} // already gone; not an error
+            }
+        }
+        if !removed.is_empty() {
+            self.commit(root)?;
+        }
+        Ok(removed)
+    }
+
     /// Rebuild by scanning `root` for stores and packs — the catalog is derived, and this is what
     /// makes losing it an inconvenience rather than a disaster.
     ///
@@ -164,10 +254,22 @@ impl Catalog {
         let mut c = Catalog::default();
         for (i, path) in names.into_iter().enumerate() {
             let sealed = root.join(&path).is_file();
-            c.members.push(Member { path, ordinal: i as u64, window: None, sealed });
+            c.members.push(Member { path, ordinal: i as u64, window: None, sealed , holds: Vec::new() });
         }
         Ok(c)
     }
+}
+
+/// What a retention sweep would do — the artifact an operator reviews, and the one a retention
+/// record is written from.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetentionPlan {
+    pub expire_before: String,
+    /// Members the policy selects and no hold protects.
+    pub expired: Vec<String>,
+    /// Members the policy selected and a hold SAVED, with the reasons. Reported rather than
+    /// silently skipped: "the schedule did not run here, and why" is exactly what an auditor asks.
+    pub held: Vec<(String, Vec<String>)>,
 }
 
 /// What a re-seal did.
@@ -286,7 +388,7 @@ pub fn reseal(
     for name in members {
         cat.remove(name);
     }
-    cat.add(Member { path: out_name.to_string(), ordinal: lowest, window: None, sealed: true })?;
+    cat.add(Member { path: out_name.to_string(), ordinal: lowest, window: None, sealed: true, holds: Vec::new() })?;
     cat.commit(root)?;
 
     Ok(ResealStats { members_collapsed: members.len(), records, bytes: stats.bytes })
