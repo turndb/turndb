@@ -157,6 +157,37 @@ impl<'a> IdCol<'a> {
         IdCursor { stream: self.stream, len: self.len, at: 0, done: 0, cur: Vec::new() }
     }
 
+    /// Index of the first id `>= needle` — the lower bound a range scan starts from.
+    ///
+    /// The same binary search over restart points that [`IdCol::find`] uses, but answering "where
+    /// would it go" rather than "is it here". That difference is what turns the id column into a
+    /// range index at no additional storage cost: ids are sorted, so a range is a contiguous run,
+    /// and finding its start is all a paged query needs.
+    pub fn lower_bound(&self, needle: &[u8]) -> Result<usize> {
+        if self.len == 0 {
+            return Ok(0);
+        }
+        // largest restart group whose first id is < needle
+        let (mut lo, mut hi) = (0usize, self.restarts.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.get(mid * RESTART)?.as_slice() < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // `lo` is the first group starting at or after `needle`; the answer is in the group before
+        // it (if any), because that group straddles the boundary.
+        let start = lo.saturating_sub(1) * RESTART;
+        for i in start..self.len {
+            if self.get(i)?.as_slice() >= needle {
+                return Ok(i);
+            }
+        }
+        Ok(self.len)
+    }
+
     /// Every id in order — the scan path.
     pub fn iter(&self) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::with_capacity(self.len);

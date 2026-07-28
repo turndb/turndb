@@ -1484,3 +1484,58 @@ fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
     assert_eq!(r.reconstruct("live").unwrap().unwrap(), staged, "flush publishes it");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
+    let dir = tmp("scanids");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    // ids shaped like the integration's: member/zero-padded-ts/rid — so lexicographic order IS
+    // member-then-time order, which is what makes a page one range scan.
+    for m in ["alice", "bob"] {
+        for t in 0..30u64 {
+            put(&mut s, &format!("{m}/{:013}/r{t}", 1785000000000u64 + t), b"x");
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+
+    // a member's page, newest first
+    let page = s.scan_ids(Some("alice/"), Some("alice0"), 10, true).unwrap();
+    assert_eq!(page.len(), 10);
+    assert!(page.iter().all(|id| id.starts_with("alice/")), "must not cross into bob: {page:?}");
+    assert_eq!(page[0], "alice/1785000000029/r29", "reverse must start at the newest");
+    assert!(page[0] > page[9], "reverse must descend");
+
+    // forward paging, and a time-bounded window
+    let first = s.scan_ids(Some("alice/"), Some("alice0"), 5, false).unwrap();
+    assert_eq!(first[0], "alice/1785000000000/r0");
+    let window = s
+        .scan_ids(Some("alice/1785000000010"), Some("alice/1785000000020"), 100, false)
+        .unwrap();
+    assert_eq!(window.len(), 10, "half-open range: 10..20");
+
+    // spans parts, and the whole store when unbounded
+    assert_eq!(s.scan_ids(None, None, 1000, false).unwrap().len(), 60);
+    assert_eq!(s.scan_ids(None, None, 3, false).unwrap().len(), 3, "limit is respected");
+
+    // UNCOMMITTED writes are visible to the writer — the live-backfill property
+    put(&mut s, "alice/1785000000099/live", b"unflushed");
+    s.sync().unwrap();
+    let page = s.scan_ids(Some("alice/"), Some("alice0"), 3, true).unwrap();
+    assert_eq!(page[0], "alice/1785000000099/live", "writer must page its own unflushed write");
+    // ... and not to a separate reader
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    let rpage = r.scan_ids(Some("alice/"), Some("alice0"), 3, true).unwrap();
+    assert_eq!(rpage[0], "alice/1785000000029/r29", "a reader sees committed state only");
+
+    // deletions drop out of the page, staged and settled alike
+    s.delete("alice/1785000000029/r29").unwrap();
+    s.sync().unwrap();
+    let page = s.scan_ids(Some("alice/"), Some("alice0"), 3, true).unwrap();
+    assert!(!page.contains(&"alice/1785000000029/r29".to_string()), "staged delete must vanish");
+    s.flush().unwrap();
+    s.merge_range(0, s.part_count()).unwrap();
+    let page = s.scan_ids(Some("alice/"), Some("alice0"), 3, true).unwrap();
+    assert!(!page.contains(&"alice/1785000000029/r29".to_string()), "settled delete must stay gone");
+    std::fs::remove_dir_all(&dir).ok();
+}
