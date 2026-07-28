@@ -1,7 +1,7 @@
 //! The pack gate: a store in one file answers exactly as the directory did, and both crossings
 //! are mechanical.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
 use turndb::store::{Span, Store};
 use turndb::AttrValue;
@@ -29,7 +29,7 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// A store with several flush intervals, a merge, a delete, and enough content to roll segments.
-fn build_store(dir: &PathBuf) -> Vec<(String, Vec<u8>)> {
+fn build_store(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut s = Store::open(dir, cfg()).unwrap();
     let mut want = Vec::new();
     for round in 0..3 {

@@ -298,7 +298,7 @@ impl ExecutionPlan for TurndbExec {
         // The fold is handed over only when `body` is in the projection, so an attribute-only query
         // cannot reach content even by mistake.
         let wants_body = self.schema.fields().iter().any(|f| f.name() == F_BODY);
-        let fold = wants_body.then(|| &self.fold);
+        let fold = wants_body.then_some(&self.fold);
 
         let scan = self
             .lens

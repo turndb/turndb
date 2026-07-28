@@ -19,6 +19,15 @@ use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::path::Path;
 
+/// A record together with the piece bytes that were NOVEL when it was written.
+///
+/// The pair the WAL must hold for replay to be exact: the record alone is not enough, because the
+/// pieces it references may not have reached the fold before the crash.
+pub type CarvedRecord = (Record, Vec<(PieceHash, Vec<u8>)>);
+
+/// A [`CarvedRecord`] plus whether it is a tombstone — the unit a batch frames.
+pub type FramedRecord = (Record, Vec<(PieceHash, Vec<u8>)>, bool);
+
 pub const FRAME_TAG: u8 = 0x57;
 /// A DELETION. Its payload is the id alone — a tombstone has no body, no attributes and no content, so
 /// it costs a frame and nothing else.
@@ -102,7 +111,7 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
 /// TORN-WRITE detector, not a validity proof — a buggy writer checksums its bugs perfectly. So
 /// every count is capped by the bytes that would have to carry it before it sizes an allocation,
 /// and every fixed-width read is bounds-checked: corrupt input is an error, never a panic.
-pub fn decode_record(b: &[u8]) -> Result<(Record, Vec<(PieceHash, Vec<u8>)>)> {
+pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
     fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
         if n > b.len() - *at {
             bail!("wal: field of {n} bytes runs past the frame");
@@ -255,11 +264,7 @@ impl Wal {
     /// the marker lands leaves members that no marker seals, and they are discarded.
     ///
     /// `items`: `(record, novel, is_tombstone)`; a tombstone's record carries only its id.
-    pub fn append_batch(
-        &mut self,
-        seq: u64,
-        items: &[(Record, Vec<(PieceHash, Vec<u8>)>, bool)],
-    ) -> Result<()> {
+    pub fn append_batch(&mut self, seq: u64, items: &[FramedRecord]) -> Result<()> {
         for (r, novel, tomb) in items {
             let mut scratch = std::mem::take(&mut self.scratch);
             scratch.clear();

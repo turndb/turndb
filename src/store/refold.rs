@@ -96,6 +96,10 @@ impl RefoldStats {
 ///
 /// `parts` must be the store's full live list — a re-fold is all-or-nothing by construction, because
 /// content it drops could otherwise still be referenced by a part it did not rebuild.
+/// A part the re-fold rebuilt: `(file name, seq_lo, seq_hi, record count)` — what the caller needs
+/// to write a new manifest entry for it.
+pub type RefoldedPart = (String, u64, u64, u32);
+
 pub fn refold(
     dir: &Path,
     parts: &[Arc<Part>],
@@ -103,7 +107,7 @@ pub fn refold(
     old_fold: &Fold,
     old_gen: u32,
     cfg: FoldCfg,
-) -> Result<(u32, Vec<(String, u64, u64, u32)>, RefoldStats)> {
+) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
     if parts.len() != seqs.len() {
         bail!("every part needs its committed sequence range");
     }

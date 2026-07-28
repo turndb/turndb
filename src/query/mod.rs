@@ -439,11 +439,14 @@ fn cmp_ok<T: PartialOrd>(op: Cmp, v: T, k: T) -> bool {
     }
 }
 
+/// The borrowed payload of a column comparison: `(tag, encoded values, operator, key)`.
+type ColTest<'a> = (&'a u8, &'a Arc<Vec<u8>>, &'a Cmp, &'a Key);
+
 impl Test {
     /// Mark rows in `lo..hi` that match. Rows with no value stay unmarked, which is correct: a
     /// comparison against NULL is NULL, and NULL does not pass a filter.
     fn mark(&self, lo: usize, hi: usize, out: &mut [bool]) {
-        let (rids, body): (&Arc<Vec<u32>>, Option<(&u8, &Arc<Vec<u8>>, &Cmp, &Key)>) = match self {
+        let (rids, body): (&Arc<Vec<u32>>, Option<ColTest<'_>>) = match self {
             Test::Never => return,
             Test::Present { rids } => (rids, None),
             Test::Col { tag, rids, val, op, key } => (rids, Some((tag, val, op, key))),
@@ -713,6 +716,9 @@ impl PartScan {
 /// Rows absent from `rid` become null. A row present more than once keeps its FIRST occurrence and
 /// counts the rest as shadowed — a flat column cannot represent a repeated key, and dropping them
 /// silently would be a lie about the data.
+// Same reasoning as `part::build_full`: eight independent inputs describing one scatter, not a
+// bag of options that wants a struct.
+#[allow(clippy::too_many_arguments)]
 fn scatter(
     tag: u8,
     rids: &[u32],

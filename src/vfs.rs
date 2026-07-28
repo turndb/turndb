@@ -113,7 +113,14 @@ pub(crate) fn create(path: &Path) -> Result<File> {
 #[inline]
 pub(crate) fn open_or_create(path: &Path) -> Result<(File, bool)> {
     let existed = path.exists();
-    let f = std::fs::OpenOptions::new().create(true).read(true).write(true).open(path)?;
+    // `truncate(false)` stated explicitly: this opens an EXISTING file to keep working on it, and
+    // silently truncating one here would discard a durable WAL or segment.
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
     #[cfg(feature = "dst")]
     if !existed {
         push(Op::Create { path: path.to_path_buf() });

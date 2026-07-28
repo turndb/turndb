@@ -189,7 +189,7 @@ impl StreamBuilder {
             );
         }
         let mut e = Vec::with_capacity(id.len() + 8);
-        let shared = if row as usize % RESTART == 0 {
+        let shared = if (row as usize).is_multiple_of(RESTART) {
             self.id_restarts.push(self.id_stream_len as u32);
             0
         } else {

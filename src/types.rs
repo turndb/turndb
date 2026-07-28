@@ -101,6 +101,12 @@ impl BodyOp {
             BodyOp::Piece { len, .. } => *len as u64,
         }
     }
+
+    /// Whether this op contributes no bytes. A zero-length piece is legal — an empty message part
+    /// carves to one — so this is a real question, not a lint appeasement.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A record as the store takes it in and as the WAL durably records it: fully carved, so replay is

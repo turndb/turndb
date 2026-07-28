@@ -135,7 +135,7 @@ fn main() -> Result<()> {
             records += 1;
         }
         calls += 1;
-        if calls as usize % flush_every == 0 {
+        if (calls as usize).is_multiple_of(flush_every) {
             s.apply(std::mem::take(&mut batch))?;
             s.sync()?;
             s.flush()?;

@@ -56,6 +56,9 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
 /// One step of the k-way walk: the winning `(part, row)` for the smallest id, plus how many other
 /// parts held a superseded version of it. Parts are id-sorted and hold one version per id, so a
 /// simple positional walk suffices; later parts win ties.
+/// One id's worth of a k-way merge step: `(id, winning stream, its row, streams that carried it)`.
+type MergeGroup = (Vec<u8>, usize, usize, usize);
+
 struct KWay<'a> {
     cursors: Vec<crate::part::idcol::IdCursor<'a>>,
     current: Vec<Option<Vec<u8>>>,
@@ -76,7 +79,7 @@ impl<'a> KWay<'a> {
         Ok(KWay { cursors, current, row: vec![0; streams.len()] })
     }
 
-    fn next_group(&mut self) -> Result<Option<(Vec<u8>, usize, usize, usize)>> {
+    fn next_group(&mut self) -> Result<Option<MergeGroup>> {
         let min = match self.current.iter().flatten().min() {
             Some(m) => m.clone(),
             None => return Ok(None),

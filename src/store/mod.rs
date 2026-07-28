@@ -822,7 +822,7 @@ impl Store {
         if batch.items.is_empty() {
             return Ok(());
         }
-        let mut framed: Vec<(Record, Vec<(PieceHash, Vec<u8>)>, bool)> =
+        let mut framed: Vec<crate::store::wal::FramedRecord> =
             Vec::with_capacity(batch.items.len());
         for item in &batch.items {
             match item {
