@@ -1,7 +1,29 @@
 [package]
 name = "turndb"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "A content-addressed columnar store for AI traces: byte-exact, embedded, single-writer."
+repository = "https://github.com/turndb/turndb"
+documentation = "https://docs.rs/turndb"
+readme = "README.md"
+keywords = ["storage", "content-addressed", "observability", "traces", "llm"]
+categories = ["database-implementations", "compression"]
+# `rust-version` is deliberately ABSENT until CI proves one. Claiming an MSRV we have never built
+# against is the kind of unverified assertion this project refuses everywhere else.
+#
+# The dev instruments under examples/ stay in the repo (CI builds them, which is what stops them
+# rotting, and their measurements are the project's evidence) but do not belong in the published
+# tarball: they need corpora no crates.io user has.
+exclude = [
+    "examples/block_curve.rs", "examples/block_experiment.rs", "examples/cache_footprint.rs",
+    "examples/carve_bench.rs", "examples/compact_bench.rs", "examples/dedup_math.rs",
+    "examples/dict_experiment.rs", "examples/dict_order.rs", "examples/fold_corpus.rs",
+    "examples/gen_fold.rs", "examples/hash_budget.rs", "examples/merge_bench.rs",
+    "examples/merge_driver.rs", "examples/open_bench.rs", "examples/part_anatomy.rs",
+    "examples/part_corpus.rs", "examples/swe_par.rs", "examples/swe_run.rs",
+    "target/*", ".scratch/*",
+]
 
 [features]
 # SQL is a LENS, not the substrate. A storage engine should not force a query engine on every

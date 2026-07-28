@@ -23,7 +23,15 @@ and columns, which on trace data is a small fraction of the bytes. That is what 
 behave like a database instead of a write-once archive.
 
 Measured on 40k records of real agent traffic (1.89 GiB of message bodies): 38.9× piece dedup,
-**308× total on-disk collapse**, every record byte-exact.
+**308× total on-disk collapse**, every record byte-exact. Against a production trace store's own
+SQLite path on 3,000 full-resend calls — same records, their schema and insert code — 320.24 MiB
+became 1.56 MiB.
+
+> **On these numbers.** They come from corpora that are not yet public, so you cannot reproduce
+> them today, and they are provisional pending a larger and more rigorous run. Treat them as our
+> measurements rather than as published results. What you *can* reproduce is the shape of the
+> claim: point turndb at your own traces and compare. The ratio depends entirely on how much your
+> traffic re-sends, which is the whole thesis.
 
 ## The cardinal invariant
 
@@ -99,4 +107,4 @@ and therefore pass*.
 
 ## License
 
-TBD.
+Apache-2.0. Copyright 2026 Efficacious, Inc. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
