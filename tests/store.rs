@@ -1450,3 +1450,37 @@ fn allocated_bytes(d: &std::path::Path) -> u64 {
         .map(|e| e.metadata().unwrap().blocks() * 512)
         .sum()
 }
+
+#[test]
+fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
+    // The visibility contract a live UI depends on. A single-process server that holds the writer
+    // can serve a record the instant it is written — no flush, no commit, no wait. A SEPARATE
+    // reader sees only committed state, which is what makes it safe to run beside the writer.
+    // Both halves matter: the first is what makes "live" possible, the second is why readers
+    // never see a half-written world.
+    let dir = tmp("livewrite");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let committed = put(&mut s, "before", b"flushed content");
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // written, ACKed, but NOT flushed — no part, no manifest commit
+    let staged = put(&mut s, "live", b"content that has not been flushed");
+    s.sync().unwrap();
+
+    // the writer serves it immediately, byte-exact
+    assert_eq!(s.reconstruct("live").unwrap().unwrap(), staged, "writer must see its own write");
+    assert!(s.ids().unwrap().contains(&"live".to_string()), "and list it");
+    assert_eq!(s.part_count(), 1, "still only the earlier part — nothing was committed");
+
+    // a concurrent reader sees the committed world only
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct("before").unwrap().unwrap(), committed);
+    assert!(r.reconstruct("live").unwrap().is_none(), "a reader must not see uncommitted records");
+
+    // ... until the flush, which is the visibility boundary
+    s.flush().unwrap();
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct("live").unwrap().unwrap(), staged, "flush publishes it");
+    std::fs::remove_dir_all(&dir).ok();
+}
