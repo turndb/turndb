@@ -28,6 +28,8 @@ usage: turndb <verb> [args]
   operating (a store directory, writer role taken):
     compact   <DIR>              merge every live part into one
     refold    <DIR>              rewrite the fold, dropping content no live record references
+    punch     <DIR>              deallocate unreachable fold blocks IN PLACE — the cheap half of
+                                 erasure; no offsets move, no parts are rebuilt
     recover   <DIR>              promote the newest intact retained manifest over a damaged one
     snapshots <DIR>              list retained commits available to time travel
     erase     <DIR> (--id ID ... | --attr KEY=VALUE) [--include-ids]
@@ -112,6 +114,17 @@ fn run(args: &[String]) -> Result<()> {
                     Ok(())
                 }
             }
+        }
+        "punch" => {
+            let mut s = Store::open(&arg(0, "DIR")?, FoldCfg::default())?;
+            s.flush()?;
+            let st = s.punch_unreferenced()?;
+            println!(
+                "punched {} of {} unreachable blocks (the manifest names them; metadata residue \
+                 remains in parts until a refold)",
+                st.blocks_punched, st.blocks_examined
+            );
+            Ok(())
         }
         "refold" => {
             let mut s = Store::open(&arg(0, "DIR")?, FoldCfg::default())?;

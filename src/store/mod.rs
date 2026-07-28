@@ -149,6 +149,14 @@ pub struct Manifest {
     /// written before the log existed, which serde reads as 0.
     #[serde(default)]
     pub commit: u64,
+    /// Block ids whose bytes were PUNCHED out of the fold, as inclusive `[lo, hi]` ranges (erasure
+    /// tends to hit runs of blocks, and ranges keep the manifest small). Authoritative, and that
+    /// is the point: a punched block reads back as zeros, which is indistinguishable from
+    /// corruption unless something says otherwise. This says otherwise.
+    ///
+    /// Ranges are ascending and disjoint. Absent in manifests written before punching existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub punched: Vec<(u32, u32)>,
     /// BLAKE3 of the PREVIOUS manifest's exact bytes, hex — the commit log as a hash chain, at
     /// zero marginal cost. Absent on a store's first commit and in manifests written before the
     /// chain existed. Honesty note: pruned manifests take their bytes with them, so the VERIFIABLE
@@ -1160,6 +1168,69 @@ impl Store {
         Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: Some(refold) })
     }
 
+    /// Reclaim erased space IN PLACE: punch every fold block no live record can reach.
+    ///
+    /// The cheap half of erasure, and the one a sealed store wants. A re-fold reclaims the same
+    /// bytes by rewriting the world — correct, thorough, and O(store); this walks the live
+    /// records' piece references, finds blocks nothing reaches, records them in the manifest, and
+    /// deallocates their extents. Offsets do not move, so no part is rebuilt and no reader is
+    /// disturbed.
+    ///
+    /// **Order matters and is the whole safety argument**: the manifest names the punched blocks
+    /// BEFORE the bytes go, so a crash between the two leaves blocks marked punched that are
+    /// still readable (harmless — the next call re-punches them), never punched blocks that
+    /// nothing accounts for (an ops fire drill: zeros that look exactly like corruption).
+    ///
+    /// Requires a flushed memtable, for the same reason a re-fold does: staged records reference
+    /// content this would otherwise consider unreachable.
+    pub fn punch_unreferenced(&mut self) -> Result<PunchStats> {
+        if !self.mem.is_empty() {
+            bail!("punching requires a flushed memtable; call sync() and flush() first");
+        }
+        // Every block a live record can still reach, via the piece dictionaries of live rows.
+        let visible = read::visibility(&self.parts)?;
+        let mut live_blocks: HashSet<u32> = HashSet::new();
+        for (pi, rows) in visible.rows.iter().enumerate() {
+            for &row in rows {
+                for op in self.parts[pi].body(row)? {
+                    let BodyOp::Piece { hash, .. } = op else { continue };
+                    if let Some(loc) = self.locate(&hash)? {
+                        live_blocks.insert(loc.block_id);
+                    }
+                }
+            }
+        }
+        // ... against every block the fold holds.
+        let mut dead: Vec<u32> = self
+            .fold
+            .block_ids()
+            .into_iter()
+            .filter(|b| !live_blocks.contains(b))
+            .collect();
+        dead.sort_unstable();
+        let already: HashSet<u32> = self
+            .manifest
+            .punched
+            .iter()
+            .flat_map(|&(lo, hi)| lo..=hi)
+            .collect();
+        dead.retain(|b| !already.contains(b));
+        if dead.is_empty() {
+            return Ok(PunchStats::default());
+        }
+
+        // Record first, punch second.
+        let mut m = self.manifest.clone();
+        let mut all: Vec<u32> = already.into_iter().chain(dead.iter().copied()).collect();
+        all.sort_unstable();
+        m.punched = to_ranges(&all);
+        m.commit(&self.dir)?;
+        self.manifest = m;
+
+        let punched = self.fold.punch_blocks(&dead)?;
+        Ok(PunchStats { blocks_punched: punched.len(), blocks_examined: dead.len() })
+    }
+
     /// Rewrite the fold, keeping only content that live records still reference.
     ///
     /// The ONLY operation that touches content. Everything else asserts it does not, which is why this
@@ -1257,6 +1328,27 @@ impl Store {
     pub fn wal_bytes(&self) -> u64 {
         self.wal.bytes()
     }
+}
+
+/// What [`Store::punch_unreferenced`] did.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PunchStats {
+    pub blocks_examined: usize,
+    /// Fewer than examined when blocks sit in the active segment, which is never punched.
+    pub blocks_punched: usize,
+}
+
+/// Collapse a sorted id list into inclusive ranges.
+fn to_ranges(ids: &[u32]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &id in ids {
+        match out.last_mut() {
+            Some(last) if last.1 + 1 == id => last.1 = id,
+            Some(last) if last.1 >= id => {}
+            _ => out.push((id, id)),
+        }
+    }
+    out
 }
 
 /// What an erasure did — the facts an erasure record is built from.
@@ -1433,6 +1525,7 @@ mod tests {
             fold_gen: 3,
             commit: 0,
             prev: None,
+            punched: Vec::new(),
         };
         m.commit(&d).unwrap();
         let got = super::Manifest::load(&d).unwrap();

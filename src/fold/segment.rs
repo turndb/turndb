@@ -113,6 +113,37 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
         .with_context(|| format!("open segment {}", path.display()))
 }
 
+/// Deallocate `len` bytes at `off` — the extents are freed and read back as zeros, and the file's
+/// length is untouched, so every offset in it still means what it meant.
+///
+/// This is the one operation that destroys committed fold bytes in place. It is a Linux
+/// filesystem feature (ext4, xfs, btrfs, tmpfs...); where the kernel or filesystem declines, the
+/// error surfaces and the caller falls back to a re-fold, which reclaims the same space by
+/// rewriting rather than by punching.
+///
+/// **Only a block's PAYLOAD is ever punched, never its header.** The frame chain is walked by
+/// reading a header and stepping over `stored` bytes, so a punched header would end the chain and
+/// silently orphan every block after it in the segment. Sixteen surviving header bytes carry no
+/// content — they carry the length that keeps the chain walkable, and the `block_id` that lets a
+/// scan report the erasure by name.
+pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe {
+        libc::fallocate(
+            f.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            off as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        bail!("punching {len} bytes at {off} failed ({e}) — this filesystem may not support hole punching; re-fold instead");
+    }
+    f.sync_all()?;
+    Ok(())
+}
+
 /// Walk the block chain to the last **complete, checksum-valid** block. Returns the offset just past
 /// it plus every `(block_id, offset)` seen, which is how the block directory is rebuilt at open.
 ///
@@ -151,6 +182,15 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
             break;
         }
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
+            // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
+            // it (that is what keeping the header buys) and the block is left OUT of the
+            // directory, so nothing can resolve a Loc into erased bytes. Anything else that fails
+            // here is a torn write, and ends the segment's valid span.
+            let body = &payload[BLOCK_HDR_LEN..span - BLOCK_XSUM_LEN];
+            if h.stored > 0 && body.iter().all(|&b| b == 0) {
+                off = end;
+                continue;
+            }
             break;
         }
         dir.push((h.block_id, off as u32));
