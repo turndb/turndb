@@ -125,6 +125,14 @@ impl<K: Keyring> BlockCipher for SubjectCipher<K> {
         }
     }
 
+    fn select(&self, scope: &str) -> Result<KeyId> {
+        self.set_subject(scope)
+    }
+
+    fn destroy_scope(&self, scope: &str) -> Result<bool> {
+        self.destroy_subject(scope)
+    }
+
     fn seal(&self, key: KeyId, plaintext: &[u8], aad: &[u8]) -> Result<([u8; NONCE_LEN], Vec<u8>)> {
         let material = self
             .material(key)?
