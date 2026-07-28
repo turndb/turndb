@@ -58,6 +58,10 @@ fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
     let src = PathBuf::from(a.next().context("usage: genai_dogfood <genai.jsonl> <store-dir>")?);
     let dir = PathBuf::from(a.next().context("usage: genai_dogfood <genai.jsonl> <store-dir>")?);
+    // Calls per flush. THE live-ness dial: a flush is when records become visible to a separate
+    // reader, and also when the open fold block seals — and blocks sealed short compress worse.
+    // The tradeoff is real and is measured rather than assumed; see the sweep in the session log.
+    let flush_every: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(512);
     let _ = std::fs::remove_dir_all(&dir);
 
     let mut s = Store::open(&dir, FoldCfg::default())?;
@@ -125,7 +129,7 @@ fn main() -> Result<()> {
             records += 1;
         }
         calls += 1;
-        if batch.len() >= 512 {
+        if calls as usize % flush_every == 0 {
             s.apply(std::mem::take(&mut batch))?;
             s.sync()?;
             s.flush()?;
@@ -146,7 +150,7 @@ fn main() -> Result<()> {
 
     let disk = dir_bytes(&dir);
     println!(
-        "{calls} calls -> {records} records\n\
+        "flush every {flush_every} calls | {calls} calls -> {records} records\n\
          logical  {:>8.1} MiB\n\
          turndb   {:>8.2} MiB   ({:.1}x)\n\
          ingest   {:>8.1} s     ({:.0} calls/s)\n\
