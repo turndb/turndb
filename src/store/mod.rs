@@ -538,80 +538,12 @@ pub struct Store {
     /// whole-part walk linear, so they cannot be removed — but unbounded they pinned 9.5x each part's
     /// on-disk size, which is a per-part cost that multiplies by part count.
     pcache: Arc<SectionCache>,
-    /// Present when content is encrypted. Held here as well as in the fold because scope
-    /// selection and scope erasure are store-level operations.
-    cipher: Option<Arc<dyn crate::cipher::BlockCipher>>,
-}
-
-/// What a scope erasure did.
-#[derive(Clone, Debug)]
-pub struct ScopeErasure {
-    pub scope: String,
-    /// False when the scope had no key — already erased, or never encrypted.
-    pub key_destroyed: bool,
-    pub records: ErasureStats,
 }
 
 impl Store {
     /// Part count at which [`Store::auto_compact`] runs a total merge. Chosen by measurement, not
     /// taste — see that method's numbers.
     pub const AUTO_COMPACT_K: usize = 8;
-
-    /// Open for writing with content ENCRYPTED under `cipher`.
-    ///
-    /// Existing plaintext content stays readable and stays plaintext: the fold rolls, and the new
-    /// segment carries the encrypted flag, so the two coexist and every reader learns per segment
-    /// which it is holding. Call [`Store::set_scope`] before writing, or the cipher has no key to
-    /// seal under and says so.
-    pub fn open_encrypted(
-        dir: &Path,
-        cfg: FoldCfg,
-        cipher: Arc<dyn crate::cipher::BlockCipher>,
-    ) -> Result<Store> {
-        let mut s = Store::open(dir, cfg)?;
-        let fold = std::mem::replace(&mut s.fold, Fold::open_read(&refold::fold_dir(dir, s.manifest.fold_gen), cfg)?);
-        s.fold = fold.with_cipher(cipher.clone())?;
-        s.cipher = Some(cipher);
-        Ok(s)
-    }
-
-    /// Seal subsequent content under `scope` — the erasure unit (a subject, a tenant, a session).
-    ///
-    /// Seals the open block first: a block is the unit of encryption, so two scopes sharing one
-    /// would share a key and destroying either would erase both.
-    pub fn set_scope(&mut self, scope: &str) -> Result<()> {
-        let cipher = self
-            .cipher
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("this store holds no cipher; open it with open_encrypted"))?;
-        self.fold.seal_open()?;
-        cipher.select(scope)?;
-        Ok(())
-    }
-
-    /// CRYPTO-ERASE a scope: destroy its key, then remove its records the ordinary way.
-    ///
-    /// Both halves matter and the order is deliberate. Destroying the key first is what reaches
-    /// copies this process cannot touch — replicas, backups, packs already shipped — and it takes
-    /// effect the instant it returns. Tombstoning, settling and re-folding then removes the local
-    /// bytes and the metadata the key never covered (ids, piece lengths, attribute values), which
-    /// is the residue documented in FORMAT.md.
-    ///
-    /// The re-fold is safe after key destruction precisely BECAUSE packing is per scope: a live
-    /// record never shares a block with an erased one, so nothing the re-fold must copy is
-    /// unreadable. Mixing scopes in a block would break that, which is why [`Store::set_scope`]
-    /// seals at the boundary.
-    ///
-    /// `ids` are the scope's records, resolved by the caller (an attribute predicate, usually).
-    pub fn erase_scope(&mut self, scope: &str, ids: &[String]) -> Result<ScopeErasure> {
-        let cipher = self
-            .cipher
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("this store holds no cipher; open it with open_encrypted"))?;
-        let key_destroyed = cipher.destroy_scope(scope)?;
-        let records = self.erase_ids(ids)?;
-        Ok(ScopeErasure { scope: scope.to_string(), key_destroyed, records })
-    }
 
     /// Open for writing. Takes the writer lock (through the fold) and recovers.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
@@ -688,7 +620,7 @@ impl Store {
         }
         let wal = Wal::open(&wal_path)?;
 
-        Ok(Store { dir: dir.to_path_buf(), fold, parts, manifest, mem, mem_bytes, wal, cfg, pcache, cipher: None })
+        Ok(Store { dir: dir.to_path_buf(), fold, parts, manifest, mem, mem_bytes, wal, cfg, pcache })
     }
 
     /// Open for reading only: no lock, no replay, no daemon.

@@ -544,35 +544,32 @@ fn scrub_verifies_every_frame_and_condemns_a_damaged_sealed_segment() {
 }
 
 #[test]
-fn an_encrypted_segment_opens_but_refuses_content_without_keys() {
-    // An encrypted segment is a KNOWN flag, so the fold opens: ids, attributes and every part-plane
-    // answer stay available, and only CONTENT needs keys. The refusal is therefore per block and
-    // it names the reason — "unknown flags" at open would both overreach and send an operator
-    // hunting corruption that is not there. An unknown future bit still refuses the whole open.
+fn a_segment_claiming_encryption_or_an_unknown_flag_refuses() {
+    // Reject-forward: the encryption bit is reserved and REFUSED, so if encryption is ever built
+    // every reader shipped before it declines rather than serving ciphertext as content. The
+    // refusal names encryption, because that sends an operator somewhere different from
+    // "unknown flags".
     let dir = tmp("encflag");
-    let loc = {
+    {
         let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
-        let p = f.put(b"content that a keyed build would have encrypted").unwrap();
+        f.put(b"content a future build might have encrypted").unwrap();
         f.sync().unwrap();
-        p
-    };
+    }
     let seg = dir.join("seg-00000000.fold");
-    let mut b = std::fs::read(&seg).unwrap();
+    let pristine = std::fs::read(&seg).unwrap();
+
+    let mut b = pristine.clone();
     b[12..16].copy_from_slice(&turndb::fold::segment::SEG_FLAG_ENCRYPTED.to_le_bytes());
     std::fs::write(&seg, &b).unwrap();
+    let err = match Fold::open_read(&dir, FoldCfg::default()) {
+        Err(e) => format!("{e:#}"),
+        Ok(_) => panic!("a segment claiming encryption must refuse"),
+    };
+    assert!(err.contains("ENCRYPTED"), "the refusal must name encryption: {err}");
 
-    // The flag is KNOWN, so the fold opens rather than refusing outright. (A flag-flipped
-    // plaintext segment holds no frame that satisfies the encrypted rules, so no block resolves —
-    // which is itself correct. The real no-keys and destroyed-key refusals are asserted against a
-    // genuinely encrypted fold in turndb-crypto's `erasure` test, where a cipher exists to make
-    // one.)
-    let f = Fold::open_read(&dir, FoldCfg::default()).expect("a known flag must not refuse the open");
-    assert!(f.read_verified(loc.loc, loc.hash).is_err(), "no block may resolve out of it");
-
-    // an unknown future bit still refuses the open outright
-    let mut b = std::fs::read(&seg).unwrap();
+    let mut b = pristine;
     b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
     std::fs::write(&seg, &b).unwrap();
-    assert!(Fold::open_read(&dir, FoldCfg::default()).is_err(), "unknown flags must still refuse");
+    assert!(Fold::open_read(&dir, FoldCfg::default()).is_err(), "unknown flags must refuse");
     std::fs::remove_dir_all(&dir).ok();
 }

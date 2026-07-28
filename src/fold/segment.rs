@@ -12,18 +12,14 @@ pub const SEG_HDR_LEN: u64 = 48;
 /// Identity assertion, not a version. A mismatch refuses — there is no negotiation anywhere.
 pub const MAGIC: &[u8; 8] = b"TURNFOLD";
 
-/// Segment flag: this segment's block payloads are ENCRYPTED, and reading them requires keys this
-/// build may not have.
+/// Segment flag: this segment's block payloads are ENCRYPTED.
 ///
-/// RESERVED, not yet written by anything — and reserved *early on purpose*. The whole value of a
-/// reject-forward lever is that shipped readers already refuse the thing before any writer can
-/// produce it; a bit reserved at the same moment it is first set protects nobody who is already
-/// running. This is the same discipline the part footer's reserved bytes follow, applied in
-/// advance of the work that will need it.
+/// RESERVED AND REFUSED. Nothing writes it and nothing reads it — the bit is claimed so that if
+/// encryption is ever built, every reader shipped before it already refuses rather than serving
+/// ciphertext as content. A reject-forward lever protects only the readers that already refuse,
+/// so claiming the bit early costs four bytes of documentation and buys that guarantee; the
+/// refusal names encryption so an operator is not sent hunting corruption that is not there.
 pub const SEG_FLAG_ENCRYPTED: u32 = 1 << 0;
-
-/// Every flag bit this build understands. Anything outside it refuses the open.
-pub const KNOWN_SEG_FLAGS: u32 = SEG_FLAG_ENCRYPTED;
 
 /// Default roll threshold. Bounded so a crash-time tail scan stays short and mmap granularity stays sane.
 pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
@@ -60,10 +56,6 @@ impl SegHeader {
         self.dict_id != [0u8; 32]
     }
 
-    pub fn is_encrypted(&self) -> bool {
-        self.flags & SEG_FLAG_ENCRYPTED != 0
-    }
-
     pub fn encode(&self) -> [u8; SEG_HDR_LEN as usize] {
         let mut b = [0u8; SEG_HDR_LEN as usize];
         b[0..8].copy_from_slice(MAGIC);
@@ -87,11 +79,16 @@ impl SegHeader {
             bail!("segment header says seg {seg} but the file is named for {expect_seg}");
         }
         let flags = u32::from_le_bytes(b[12..16].try_into().unwrap());
-        // The reject-forward lever. Bits this build knows are accepted and acted on; anything
-        // else stops the open, because unknown means stop, not adapt. An encrypted segment is
-        // openable — the fold reports ERASED per block when no key opens it, which is the honest
-        // answer — but a bit from a future format is not, and never becomes one by guessing.
-        if flags & !KNOWN_SEG_FLAGS != 0 {
+        // The reject-forward lever: unknown means stop, not adapt. The encryption bit is named
+        // in its own refusal because "this is encrypted and this build cannot read it" and
+        // "unknown flags" send an operator to very different places.
+        if flags & SEG_FLAG_ENCRYPTED != 0 {
+            bail!(
+                "segment {expect_seg} is ENCRYPTED and this build has no decryption path — \
+                 refusing rather than serving ciphertext as content"
+            );
+        }
+        if flags != 0 {
             bail!("segment flags {flags:#x} unknown — refusing (no compatibility negotiation)");
         }
         let mut dict_id = [0u8; 32];
@@ -178,11 +175,6 @@ pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
-    scan_tail_in(f, file_len, has_dict, false)
-}
-
-/// [`scan_tail`], told whether the segment is encrypted — the frame invariants differ.
-pub fn scan_tail_in(f: &dyn ReadAt, file_len: u64, has_dict: bool, encrypted: bool) -> Result<(u64, Vec<(u32, u32)>)> {
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
@@ -196,7 +188,7 @@ pub fn scan_tail_in(f: &dyn ReadAt, file_len: u64, has_dict: bool, encrypted: bo
         if f.read_exact_at(&mut hdr, off).is_err() {
             break;
         }
-        let h = match block::parse_hdr_in(&hdr, has_dict, encrypted) {
+        let h = match block::parse_hdr(&hdr, has_dict) {
             Ok(h) => h,
             Err(_) => break,
         };
@@ -213,7 +205,7 @@ pub fn scan_tail_in(f: &dyn ReadAt, file_len: u64, has_dict: bool, encrypted: bo
         if f.read_exact_at(&mut payload[..span], off).is_err() {
             break;
         }
-        if block::verify_frame_bytes_in(&payload[..span], has_dict, encrypted).is_err() {
+        if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
             // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
             // it (that is what keeping the header buys) and the block is left OUT of the
             // directory, so nothing can resolve a Loc into erased bytes. Anything else that fails
@@ -354,13 +346,10 @@ mod tests {
         bad[0] = b'X';
         assert!(SegHeader::decode(&bad, 5).is_err());
 
-        // A KNOWN flag is accepted and acted on — bit 0 means encrypted, which this build can
-        // hold (and reports per block when it has no key).
+        // Both the reserved encryption bit and any unknown bit refuse rather than negotiate.
         let mut flagged = b;
         flagged[12] = SEG_FLAG_ENCRYPTED as u8;
-        let h = SegHeader::decode(&flagged, 5).unwrap();
-        assert!(h.is_encrypted());
-        // An UNKNOWN bit still refuses rather than negotiates.
+        assert!(SegHeader::decode(&flagged, 5).is_err(), "the reserved encryption bit must refuse");
         let mut future = b;
         future[13] = 0x04;
         assert!(SegHeader::decode(&future, 5).is_err(), "unknown flags must refuse");
