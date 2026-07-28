@@ -132,3 +132,83 @@ fn retention_is_removal_and_the_catalog_rebuilds_from_the_members() {
     assert_eq!(r.reconstruct("new1").unwrap().unwrap(), keep[0].1, "rebuilt catalog still reads");
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn resealing_collapses_an_overlay_back_into_one_pack() {
+    let root = tmp("reseal");
+    let base = member(&root, "base", "base", &["k1", "k2", "k3"]);
+    turndb::pack::write(&root.join("base"), &root.join("base.turndb")).unwrap();
+    std::fs::remove_dir_all(root.join("base")).unwrap();
+
+    // an overlay correcting k1 and adding k4
+    let (corrected, added) = {
+        let mut s = Store::open(&root.join("ov"), cfg()).unwrap();
+        let c = b"{\"member\":\"ov\",\"id\":\"k1\",\"corrected\":true}".to_vec();
+        let a = b"{\"member\":\"ov\",\"id\":\"k4\",\"new\":true}".to_vec();
+        s.put("k1", &[Span::Piece(&c)], vec![]).unwrap();
+        s.put("k4", &[Span::Piece(&a)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        (c, a)
+    };
+
+    let mut cat = Catalog::default();
+    cat.add(Member { path: "base.turndb".into(), ordinal: 0, window: None, sealed: true }).unwrap();
+    cat.add(Member { path: "ov".into(), ordinal: 1, window: None, sealed: false }).unwrap();
+    cat.commit(&root).unwrap();
+
+    // what a reader saw BEFORE the re-seal is what it must see after
+    let before: Vec<(String, Option<Vec<u8>>)> = {
+        let r = CatalogReader::open(&root, cfg()).unwrap();
+        r.ids().unwrap().into_iter().map(|id| {
+            let b = r.reconstruct(&id).unwrap();
+            (id, b)
+        }).collect()
+    };
+
+    let st = turndb::catalog::reseal(
+        &root, &["base.turndb".into(), "ov".into()], "sealed.turndb", cfg(),
+    ).unwrap();
+    assert_eq!(st.members_collapsed, 2);
+    assert_eq!(st.records, 4, "k1..k4");
+
+    let cat = Catalog::load(&root).unwrap();
+    assert_eq!(cat.members.len(), 1, "the two members collapsed into one");
+    assert_eq!(cat.members[0].path, "sealed.turndb");
+    assert!(cat.members[0].sealed);
+
+    let r = CatalogReader::open(&root, cfg()).unwrap();
+    let after: Vec<(String, Option<Vec<u8>>)> = r.ids().unwrap().into_iter().map(|id| {
+        let b = r.reconstruct(&id).unwrap();
+        (id, b)
+    }).collect();
+    assert_eq!(before, after, "a re-seal must not change a single answer");
+    assert_eq!(r.reconstruct("k1").unwrap().unwrap(), corrected, "the overlay's correction survived");
+    assert_eq!(r.reconstruct("k4").unwrap().unwrap(), added);
+    assert_eq!(r.reconstruct("k2").unwrap().unwrap(), base[1].1);
+
+    // the inputs' bytes are still on disk — deliberately, so a mistake stays recoverable
+    assert!(root.join("base.turndb").exists());
+    assert!(root.join("ov").exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resealing_refuses_a_non_contiguous_run() {
+    let root = tmp("noncontig");
+    for (n, ids) in [("m0", &["a"][..]), ("m1", &["b"][..]), ("m2", &["c"][..])] {
+        member(&root, n, n, ids);
+    }
+    let mut cat = Catalog::default();
+    for (i, n) in ["m0", "m1", "m2"].iter().enumerate() {
+        cat.add(Member { path: (*n).into(), ordinal: i as u64, window: None, sealed: false }).unwrap();
+    }
+    cat.commit(&root).unwrap();
+    // m0 and m2 with m1 between them: collapsing those would silently change who wins for a
+    // shared id, exactly as a non-contiguous part merge would.
+    assert!(
+        turndb::catalog::reseal(&root, &["m0".into(), "m2".into()], "bad.turndb", cfg()).is_err(),
+        "a non-contiguous re-seal must refuse"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
