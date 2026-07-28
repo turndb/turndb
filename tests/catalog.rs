@@ -43,9 +43,9 @@ fn a_constellation_reads_as_one_store_across_directories_and_packs() {
     std::fs::remove_dir_all(root.join("w30")).unwrap();
 
     let mut c = Catalog::default();
-    c.add(Member { path: "w30.turndb".into(), ordinal: 0, window: Some("2026-W30".into()), sealed: true })
+    c.add(Member { path: "w30.turndb".into(), ordinal: 0, window: Some("2026-W30".into()), sealed: true, holds: Vec::new() })
         .unwrap();
-    c.add(Member { path: "w31".into(), ordinal: 1, window: Some("2026-W31".into()), sealed: false })
+    c.add(Member { path: "w31".into(), ordinal: 1, window: Some("2026-W31".into()), sealed: false, holds: Vec::new() })
         .unwrap();
     c.commit(&root).unwrap();
 
@@ -79,8 +79,8 @@ fn a_later_member_overrides_a_sealed_one_which_is_the_overlay_pattern() {
     };
 
     let mut c = Catalog::default();
-    c.add(Member { path: "base.turndb".into(), ordinal: 0, window: None, sealed: true }).unwrap();
-    c.add(Member { path: "overlay".into(), ordinal: 1, window: None, sealed: false }).unwrap();
+    c.add(Member { path: "base.turndb".into(), ordinal: 0, window: None, sealed: true, holds: Vec::new() }).unwrap();
+    c.add(Member { path: "overlay".into(), ordinal: 1, window: None, sealed: false, holds: Vec::new() }).unwrap();
     c.commit(&root).unwrap();
 
     let r = CatalogReader::open(&root, cfg()).unwrap();
@@ -99,8 +99,8 @@ fn retention_is_removal_and_the_catalog_rebuilds_from_the_members() {
     let keep = member(&root, "w30", "w30", &["new1"]);
 
     let mut c = Catalog::default();
-    c.add(Member { path: "w29".into(), ordinal: 0, window: Some("2026-W29".into()), sealed: true }).unwrap();
-    c.add(Member { path: "w30".into(), ordinal: 1, window: Some("2026-W30".into()), sealed: false }).unwrap();
+    c.add(Member { path: "w29".into(), ordinal: 0, window: Some("2026-W29".into()), sealed: true, holds: Vec::new() }).unwrap();
+    c.add(Member { path: "w30".into(), ordinal: 1, window: Some("2026-W30".into()), sealed: false, holds: Vec::new() }).unwrap();
     c.commit(&root).unwrap();
 
     // RETENTION: expire everything before W30 — the catalog drops it, then the bytes go. Two
@@ -153,8 +153,8 @@ fn resealing_collapses_an_overlay_back_into_one_pack() {
     };
 
     let mut cat = Catalog::default();
-    cat.add(Member { path: "base.turndb".into(), ordinal: 0, window: None, sealed: true }).unwrap();
-    cat.add(Member { path: "ov".into(), ordinal: 1, window: None, sealed: false }).unwrap();
+    cat.add(Member { path: "base.turndb".into(), ordinal: 0, window: None, sealed: true, holds: Vec::new() }).unwrap();
+    cat.add(Member { path: "ov".into(), ordinal: 1, window: None, sealed: false, holds: Vec::new() }).unwrap();
     cat.commit(&root).unwrap();
 
     // what a reader saw BEFORE the re-seal is what it must see after
@@ -201,7 +201,7 @@ fn resealing_refuses_a_non_contiguous_run() {
     }
     let mut cat = Catalog::default();
     for (i, n) in ["m0", "m1", "m2"].iter().enumerate() {
-        cat.add(Member { path: (*n).into(), ordinal: i as u64, window: None, sealed: false }).unwrap();
+        cat.add(Member { path: (*n).into(), ordinal: i as u64, window: None, sealed: false, holds: Vec::new() }).unwrap();
     }
     cat.commit(&root).unwrap();
     // m0 and m2 with m1 between them: collapsing those would silently change who wins for a
@@ -210,5 +210,76 @@ fn resealing_refuses_a_non_contiguous_run() {
         turndb::catalog::reseal(&root, &["m0".into(), "m2".into()], "bad.turndb", cfg()).is_err(),
         "a non-contiguous re-seal must refuse"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_legal_hold_beats_the_retention_schedule() {
+    let root = tmp("holds");
+    for (n, ids) in [("w26", &["a"][..]), ("w27", &["b"][..]), ("w28", &["c"][..])] {
+        member(&root, n, n, ids);
+    }
+    let mut cat = Catalog::default();
+    for (i, n) in ["w26", "w27", "w28"].iter().enumerate() {
+        cat.add(Member {
+            path: (*n).into(),
+            ordinal: i as u64,
+            window: Some(format!("2026-W{}", 26 + i)),
+            sealed: true,
+            holds: Vec::new(),
+        })
+        .unwrap();
+    }
+    // w27 is under two holds from different matters
+    cat.hold("w27", "matter:2026-cv-118").unwrap();
+    cat.hold("w27", "regulator-request:Q3").unwrap();
+    cat.hold("w27", "matter:2026-cv-118").unwrap(); // idempotent
+    cat.commit(&root).unwrap();
+
+    let plan = cat.plan_retention("2026-W28");
+    assert_eq!(plan.expired, vec!["w26".to_string()], "only the unheld member may expire");
+    assert_eq!(plan.held.len(), 1);
+    assert_eq!(plan.held[0].0, "w27");
+    assert_eq!(plan.held[0].1.len(), 2, "both matters must be reported, not just the fact of a hold");
+
+    let removed = cat.apply_retention(&root, &plan).unwrap();
+    assert_eq!(removed, vec!["w26".to_string()]);
+    let after = Catalog::load(&root).unwrap();
+    assert!(after.members.iter().any(|m| m.path == "w27"), "a held member must survive the sweep");
+    assert!(!after.members.iter().any(|m| m.path == "w26"));
+    // the BYTES are still there — retention decides, the operator destroys
+    assert!(root.join("w26").exists(), "apply must not delete bytes");
+
+    // Releasing one hold is not enough; releasing both frees it.
+    let mut cat = after;
+    assert!(cat.release("w27", "matter:2026-cv-118").unwrap());
+    assert!(!cat.release("w27", "matter:2026-cv-118").unwrap(), "releasing twice is not an error");
+    assert!(cat.plan_retention("2026-W28").expired.is_empty(), "one remaining hold still protects");
+    cat.release("w27", "regulator-request:Q3").unwrap();
+    assert_eq!(cat.plan_retention("2026-W28").expired, vec!["w27".to_string()]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_hold_placed_after_planning_still_wins() {
+    // The two-step exists so an operator can review before destroying — but a hold arriving in
+    // that window must not lose the race. Spoliation cannot be undone; a late sweep can.
+    let root = tmp("racehold");
+    member(&root, "old", "old", &["x"]);
+    let mut cat = Catalog::default();
+    cat.add(Member {
+        path: "old".into(), ordinal: 0, window: Some("2026-W20".into()), sealed: true, holds: Vec::new(),
+    })
+    .unwrap();
+    cat.commit(&root).unwrap();
+
+    let plan = cat.plan_retention("2026-W30");
+    assert_eq!(plan.expired, vec!["old".to_string()]);
+    cat.hold("old", "matter:late-arrival").unwrap(); // arrives after the plan
+    assert!(
+        cat.apply_retention(&root, &plan).is_err(),
+        "a hold placed after planning must refuse the apply"
+    );
+    assert!(Catalog::load(&root).unwrap().members.iter().any(|m| m.path == "old"));
     std::fs::remove_dir_all(&root).ok();
 }

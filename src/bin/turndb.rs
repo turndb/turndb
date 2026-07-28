@@ -46,6 +46,11 @@ usage: turndb <verb> [args]
     catalog   <ROOT> [rebuild]   list the members, or reconstruct the catalog by scanning
     cids      <ROOT>             every live id across the constellation
     cget      <ROOT> <ID>        reconstruct one record, later members winning
+    hold      <ROOT> <MEMBER> <REASON>     place a legal hold — retention will refuse this member
+    release   <ROOT> <MEMBER> <REASON>     release one hold (a member is free only when all are)
+    retention <ROOT> <BEFORE> [--apply]    plan (default) or apply expiry of windows before BEFORE;
+                                           apply drops members from the catalog and NEVER deletes
+                                           bytes — the paths it prints are yours to remove
     reseal    <ROOT> <OUT> <MEMBER>...
                                  collapse a contiguous run of members into one sealed pack and
                                  swap the catalog to it; inputs are left on disk for you to remove
@@ -203,6 +208,55 @@ fn run(args: &[String]) -> Result<()> {
                 }
                 None => bail!("no record {id:?} in this constellation"),
             }
+        }
+        "hold" | "release" => {
+            let root = arg(0, "ROOT")?;
+            let member = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing MEMBER\n\n{USAGE}"))?;
+            let reason = rest.get(2).ok_or_else(|| anyhow::anyhow!("missing REASON\n\n{USAGE}"))?;
+            let mut c = turndb::catalog::Catalog::load(&root)?;
+            if verb == "hold" {
+                c.hold(member, reason)?;
+                c.commit(&root)?;
+                println!("{member} is under legal hold: {reason}");
+            } else {
+                let had = c.release(member, reason)?;
+                c.commit(&root)?;
+                let left = c.members.iter().find(|m| m.path == *member).map(|m| m.holds.len()).unwrap_or(0);
+                println!(
+                    "{}{member}: {left} hold(s) remain",
+                    if had { "released; " } else { "no such hold; " }
+                );
+            }
+            Ok(())
+        }
+        "retention" => {
+            let root = arg(0, "ROOT")?;
+            let before = rest.get(1).ok_or_else(|| anyhow::anyhow!("missing BEFORE\n\n{USAGE}"))?;
+            let mut c = turndb::catalog::Catalog::load(&root)?;
+            let plan = c.plan_retention(before);
+            for (m, reasons) in &plan.held {
+                println!("HELD    {m}  ({})", reasons.join(", "));
+            }
+            for m in &plan.expired {
+                println!("EXPIRE  {m}");
+            }
+            if !rest.contains(&"--apply") {
+                println!(
+                    "plan only ({} to expire, {} held) — rerun with --apply",
+                    plan.expired.len(),
+                    plan.held.len()
+                );
+                return Ok(());
+            }
+            let removed = c.apply_retention(&root, &plan)?;
+            println!(
+                "removed {} member(s) from the catalog. THE BYTES REMAIN — delete when satisfied:",
+                removed.len()
+            );
+            for m in &removed {
+                println!("  {}", root.join(m).display());
+            }
+            Ok(())
         }
         "reseal" => {
             let root = arg(0, "ROOT")?;
