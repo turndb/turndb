@@ -1,0 +1,357 @@
+/**
+ * turndb — a content-addressed columnar store for AI traces.
+ *
+ * The engine is Rust compiled to `wasm32-wasip1`; this file is the thin layer that moves bytes
+ * across the boundary and turns status codes back into exceptions. There is no native addon, no
+ * prebuild matrix and no postinstall — one `.wasm` runs everywhere Node does.
+ *
+ * ## What this binding is for
+ *
+ * Writing traces and reading them back by id or id-range. It deliberately exposes NO SQL: the
+ * query engine would dominate the artifact, and the two things an application actually does — a
+ * point lookup and a page scan — are already served by the id order. Analytics run through the
+ * `turndb` CLI against the same directory, which needs no daemon and no second copy of the data.
+ *
+ * ## Durability, in one sentence
+ *
+ * `put` is not durable; `sync()` is the ACK point. `flush()` is a separate thing again — it seals
+ * writes into the columnar plane so OTHER readers can see them. This handle sees its own unflushed
+ * writes without either.
+ *
+ * ## Single writer
+ *
+ * One `Store` per directory, per process. On Unix the engine enforces this with `flock`; **under
+ * WASI there is no advisory locking, so it cannot**. Two writers on one store will interleave
+ * their write-ahead logs and corrupt it. If your process model can open the same directory twice,
+ * that exclusion is yours to provide.
+ */
+
+import { WASI } from 'node:wasi';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+
+const WASM_PATH = join(dirname(fileURLToPath(import.meta.url)), 'turndb.wasm');
+
+/** Where the store directory is mounted inside the sandbox. Callers never see this. */
+const GUEST_ROOT = '/store';
+
+/** Thrown for every engine-reported failure, carrying the engine's own message. */
+export class TurndbError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TurndbError';
+  }
+}
+
+/**
+ * Encode attributes into the ABI's tagged form: `[[key, tag, value], ...]`.
+ *
+ * turndb preserves attribute ORDER and DUPLICATE KEYS because byte-exact reconstruction depends on
+ * both, and a JS object can represent neither — so an object input is a convenience that quietly
+ * gives up those properties, while an array of `[key, value]` pairs keeps them. The tag is explicit
+ * because `1` and `1.0` are the same JS number but different stored values.
+ */
+function encodeAttrs(attrs) {
+  if (attrs == null) return '[]';
+  const pairs = Array.isArray(attrs) ? attrs : Object.entries(attrs);
+  const out = [];
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || pair.length < 2) {
+      throw new TypeError('each attribute must be a [key, value] pair');
+    }
+    const [k, v] = pair;
+    if (typeof k !== 'string') throw new TypeError(`attribute key must be a string, got ${typeof k}`);
+    if (typeof v === 'string') out.push([k, 's', v]);
+    else if (typeof v === 'boolean') out.push([k, 'b', v]);
+    else if (typeof v === 'bigint') out.push([k, 'i', Number(v)]);
+    else if (typeof v === 'number') {
+      // Integer-valued floats are stored as ints, which is almost always what a caller means.
+      // Pass a BigInt, or `{ f: n }`, when the distinction matters the other way.
+      out.push(Number.isInteger(v) ? [k, 'i', v] : [k, 'f', v]);
+    } else if (v && typeof v === 'object' && 'f' in v) out.push([k, 'f', Number(v.f)]);
+    else if (v && typeof v === 'object' && 'i' in v) out.push([k, 'i', Number(v.i)]);
+    else throw new TypeError(`attribute ${k} has unsupported type ${typeof v}`);
+  }
+  return JSON.stringify(out);
+}
+
+function decodeAttrs(tagged) {
+  return tagged.map(([k, tag, v]) => [k, tag === 'i' || tag === 'f' ? Number(v) : v]);
+}
+
+/** An open turndb store. Create with {@link open}. */
+export class Store {
+  #instance;
+  #exports;
+  #handle;
+  #enc = new TextEncoder();
+  #dec = new TextDecoder();
+
+  constructor(instance, handle) {
+    this.#instance = instance;
+    this.#exports = instance.exports;
+    this.#handle = handle;
+  }
+
+  get closed() {
+    return this.#handle < 0;
+  }
+
+  #mem() {
+    // Re-read every time: the buffer is DETACHED and replaced whenever linear memory grows, so a
+    // cached view silently becomes a view over nothing.
+    return new Uint8Array(this.#exports.memory.buffer);
+  }
+
+  /** Copy bytes into the instance and return `[ptr, len]`, both zero for empty. */
+  #put(bytes) {
+    if (!bytes || bytes.length === 0) return [0, 0];
+    const ptr = this.#exports.tdb_alloc(bytes.length);
+    if (ptr === 0) throw new TurndbError(`failed to allocate ${bytes.length} bytes in the instance`);
+    this.#mem().set(bytes, ptr);
+    return [ptr, bytes.length];
+  }
+
+  #putText(s) {
+    return this.#put(this.#enc.encode(s ?? ''));
+  }
+
+  #free(pairs) {
+    for (const [ptr, len] of pairs) if (ptr !== 0) this.#exports.tdb_free(ptr, len);
+  }
+
+  /** The engine's own error message — never flattened into something generic. */
+  #err() {
+    const ptr = this.#exports.tdb_err_ptr();
+    const len = this.#exports.tdb_err_len();
+    if (len === 0) return 'turndb reported a failure with no message';
+    return this.#dec.decode(this.#mem().subarray(ptr, ptr + len));
+  }
+
+  #check(code) {
+    if (code < 0) throw new TurndbError(this.#err());
+    return code;
+  }
+
+  /** A copy of the output buffer. Copied because the next call overwrites it. */
+  #out() {
+    const ptr = this.#exports.tdb_out_ptr();
+    const len = this.#exports.tdb_out_len();
+    return this.#mem().slice(ptr, ptr + len);
+  }
+
+  #outText() {
+    return this.#dec.decode(this.#out());
+  }
+
+  #alive() {
+    if (this.#handle < 0) throw new TurndbError('store is closed');
+  }
+
+  /**
+   * Write one record. NOT durable until {@link sync}.
+   *
+   * @param {string} id  Sort key as well as identity. Ids sort lexicographically, so an id designed
+   *   with the query in mind (`member/timestamp/...`) gives prefix-then-time paging out of
+   *   {@link scanIds} with no secondary index.
+   * @param {Uint8Array|Buffer|string} body
+   * @param {Record<string,unknown>|Array<[string,unknown]>} [attrs]
+   */
+  putBody(id, body, attrs) {
+    this.#alive();
+    const bytes = typeof body === 'string' ? this.#enc.encode(body) : body;
+    const a = [this.#putText(id), this.#put(bytes), this.#putText(encodeAttrs(attrs))];
+    try {
+      this.#check(this.#exports.tdb_put_body(this.#handle, ...a[0], ...a[1], ...a[2]));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * Apply many records atomically — the batch replays all-or-nothing, so a crash cannot leave a
+   * partial export committed. This is the shape an OTLP export should use: one call per export.
+   *
+   * @param {Array<{id: string, body?: Uint8Array|string, attrs?: object, delete?: boolean}>} records
+   * @returns {number} records applied
+   */
+  applyBatch(records) {
+    this.#alive();
+    const items = records.map((r) => {
+      if (r.delete) return ['del', r.id];
+      const bytes = typeof r.body === 'string' ? this.#enc.encode(r.body) : r.body;
+      return ['put', r.id, Buffer.from(bytes ?? new Uint8Array()).toString('base64'), JSON.parse(encodeAttrs(r.attrs))];
+    });
+    const a = [this.#putText(JSON.stringify(items))];
+    try {
+      return this.#check(this.#exports.tdb_apply(this.#handle, ...a[0]));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** Tombstone a record. Not durable until {@link sync}. */
+  delete(id) {
+    this.#alive();
+    const a = [this.#putText(id)];
+    try {
+      this.#check(this.#exports.tdb_delete(this.#handle, ...a[0]));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** Make everything written so far durable. **This is the ACK point.** */
+  sync() {
+    this.#alive();
+    this.#check(this.#exports.tdb_sync(this.#handle));
+  }
+
+  /**
+   * Seal the memtable into an immutable part.
+   *
+   * Separate from {@link sync} on purpose: this handle already sees its own unflushed writes, so
+   * flushing is about making them visible to OTHER readers and to the columnar plane. Flushing too
+   * often costs compression — blocks sealed short compress worse — so batch it.
+   */
+  flush() {
+    this.#alive();
+    this.#check(this.#exports.tdb_flush(this.#handle));
+  }
+
+  /** Merge parts if the threshold is reached. Returns whether a merge ran. */
+  autoCompact() {
+    this.#alive();
+    return this.#check(this.#exports.tdb_auto_compact(this.#handle)) === 1;
+  }
+
+  /**
+   * The record's body, byte-exact, or `null` if absent or deleted.
+   * @returns {Uint8Array|null}
+   */
+  get(id) {
+    this.#alive();
+    const a = [this.#putText(id)];
+    try {
+      return this.#check(this.#exports.tdb_reconstruct(this.#handle, ...a[0])) === 1 ? this.#out() : null;
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** The body decoded as UTF-8 text, or `null`. */
+  getText(id) {
+    const b = this.get(id);
+    return b === null ? null : this.#dec.decode(b);
+  }
+
+  /**
+   * The full record — body plus attributes, with order and duplicate keys intact.
+   * @returns {{id: string, body: Uint8Array, attrs: Array<[string, unknown]>}|null}
+   */
+  getRecord(id) {
+    this.#alive();
+    const a = [this.#putText(id)];
+    try {
+      if (this.#check(this.#exports.tdb_get_record(this.#handle, ...a[0])) !== 1) return null;
+      const v = JSON.parse(this.#outText());
+      return { id: v.id, body: Buffer.from(v.body, 'base64'), attrs: decodeAttrs(v.attrs) };
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * Live ids in `[from, to)`, in id order, at most `limit`.
+   *
+   * The paging primitive. Ids sort lexicographically, so a `prefix/` range is a contiguous run and
+   * costs a binary search plus a walk of exactly that run — not a scan of the store.
+   *
+   * @param {{from?: string, to?: string, prefix?: string, limit?: number, reverse?: boolean}} [opts]
+   * @returns {string[]}
+   */
+  scanIds(opts = {}) {
+    this.#alive();
+    let { from = '', to = '', prefix, limit = 100, reverse = false } = opts;
+    if (prefix != null) {
+      // The half-open range that contains exactly the ids starting with `prefix`: bump the last
+      // code unit to get the first id that cannot.
+      from = prefix;
+      to = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+    }
+    const a = [this.#putText(from), this.#putText(to)];
+    try {
+      this.#check(this.#exports.tdb_scan_ids(this.#handle, ...a[0], ...a[1], limit, reverse ? 1 : 0));
+      return JSON.parse(this.#outText());
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** @returns {{records: number, parts: number}} */
+  stats() {
+    this.#alive();
+    this.#check(this.#exports.tdb_stats(this.#handle));
+    return JSON.parse(this.#outText());
+  }
+
+  /**
+   * Close the store, releasing its writer lock.
+   *
+   * Does NOT sync — call {@link sync} first if the writes must survive. Deliberately explicit:
+   * a close that silently synced would hide a failing disk behind a method nobody checks.
+   */
+  close() {
+    if (this.#handle < 0) return;
+    const h = this.#handle;
+    this.#handle = -1;
+    this.#check(this.#exports.tdb_close(h));
+  }
+}
+
+let cachedModule = null;
+
+/**
+ * Open (or create) a store at `dir`.
+ *
+ * @param {string} dir  Host directory. Created if absent.
+ * @param {{blockTarget?: number, level?: number}} [opts]
+ *   `blockTarget` is the bytes gathered before a block seals (default 4 MiB) — bigger compresses
+ *   harder and costs more per read. `level` is the zstd level (default 19). Both are write-side
+ *   only: a reader never needs to know either.
+ * @returns {Promise<Store>}
+ */
+export async function open(dir, opts = {}) {
+  const hostDir = resolve(dir);
+  const wasi = new WASI({
+    version: 'preview1',
+    args: ['turndb'],
+    env: {},
+    // Only the store directory is reachable from inside. The engine cannot see the rest of the
+    // filesystem even if asked, which is a property of the target worth keeping.
+    preopens: { [GUEST_ROOT]: hostDir },
+    returnOnExit: true,
+  });
+  cachedModule ??= await WebAssembly.compile(await readFile(WASM_PATH));
+  const instance = await WebAssembly.instantiate(cachedModule, wasi.getImportObject());
+  // A reactor, not a command: initialize and keep it alive rather than running a main.
+  wasi.initialize(instance);
+
+  const enc = new TextEncoder();
+  const path = enc.encode(GUEST_ROOT);
+  const ptr = instance.exports.tdb_alloc(path.length);
+  new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
+  const handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 0);
+  instance.exports.tdb_free(ptr, path.length);
+
+  if (handle < 0) {
+    const ep = instance.exports.tdb_err_ptr();
+    const el = instance.exports.tdb_err_len();
+    const msg = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer).subarray(ep, ep + el));
+    throw new TurndbError(`opening ${hostDir}: ${msg}`);
+  }
+  return new Store(instance, handle);
+}
+
+export default { open, Store, TurndbError };
