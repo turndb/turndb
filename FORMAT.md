@@ -82,6 +82,17 @@ open the fold. It does not skip the segment, guess at the layout, or read what i
 means stop, not adapt. Any future change that a version-1 reader could misinterpret must set a flag
 bit, and that is what the field is reserved for.
 
+| bit | name | meaning |
+|---|---|---|
+| 0 | `ENCRYPTED` | this segment's block payloads are ciphertext; reading requires keys |
+| 1.. | — | unassigned; a reader must refuse any of them |
+
+Bit 0 is **reserved and refused, and no writer sets it yet**. That ordering is the point: a
+reject-forward lever only protects readers that already refuse before a writer can produce the
+thing, so the bit is claimed — and named in the refusal, so an operator meeting an encrypted fold
+hears "this is encrypted and you have no way in" rather than "unknown flags", which would send
+them hunting corruption that is not there — ahead of the encryption work rather than alongside it.
+
 `dict_id` names a dictionary file `zdict-<hex>.zd` beside the segments, whose contents must hash to
 the id naming it. No writer currently produces one; the field is honoured on read.
 

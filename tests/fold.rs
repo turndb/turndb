@@ -542,3 +542,33 @@ fn scrub_verifies_every_frame_and_condemns_a_damaged_sealed_segment() {
     assert!(f.scrub().is_err(), "a damaged sealed segment must fail the scrub");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn an_encrypted_segment_is_refused_by_name_not_as_unknown_flags() {
+    // The reject-forward lever, exercised before any writer can set it: a build with no
+    // decryption path must say WHY it cannot read, because "unknown flags" would send an operator
+    // hunting corruption that is not there.
+    let dir = tmp("encflag");
+    {
+        let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
+        f.put(b"content that a future build would have encrypted").unwrap();
+        f.sync().unwrap();
+    }
+    let seg = dir.join("seg-00000000.fold");
+    let mut b = std::fs::read(&seg).unwrap();
+    b[12..16].copy_from_slice(&turndb::fold::segment::SEG_FLAG_ENCRYPTED.to_le_bytes());
+    std::fs::write(&seg, &b).unwrap();
+
+    let err = match Fold::open_read(&dir, FoldCfg::default()) {
+        Err(e) => format!("{e:#}"),
+        Ok(_) => panic!("an encrypted segment must refuse a build with no keys"),
+    };
+    assert!(err.contains("ENCRYPTED"), "the refusal must name encryption: {err}");
+
+    // and an unknown future bit still refuses generically
+    let mut b = std::fs::read(&seg).unwrap();
+    b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
+    std::fs::write(&seg, &b).unwrap();
+    assert!(Fold::open_read(&dir, FoldCfg::default()).is_err(), "unknown flags must still refuse");
+    std::fs::remove_dir_all(&dir).ok();
+}
