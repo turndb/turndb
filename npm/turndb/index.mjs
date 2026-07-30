@@ -71,6 +71,28 @@ function assertEncodable(s, what) {
 }
 
 /**
+ * An id must be a string, and must be one UTF-8 can represent.
+ *
+ * Coercion is not a convenience here, it is an aliasing bug: `#putText` would have encoded `{}` as
+ * `"[object Object]"`, which collides with the literal string of the same name — measured, three
+ * writes producing two records with one body lost. That is the same silent-overwrite this module
+ * refuses unpaired surrogates for, arriving through a different door, and the colliding value is a
+ * string a real serialization bug has already produced in this codebase.
+ *
+ * `applyBatch` deliberately does NOT use this: the engine rejects a non-string id there with a
+ * message naming the offending item's index, which is more useful than anything thrown from here.
+ */
+function assertId(id, what = 'id') {
+  if (typeof id !== 'string') {
+    throw new TurndbError(
+      `${what} must be a string, got ${typeof id} — refusing rather than coercing, because ` +
+        `String(value) silently aliases distinct inputs onto one record`,
+    );
+  }
+  return assertEncodable(id, what);
+}
+
+/**
  * The first id that cannot start with `prefix` — the exclusive upper bound of its range — or
  * `null` when no such id exists and the range is therefore unbounded above.
  *
@@ -219,7 +241,7 @@ export class Store {
    */
   putBody(id, body, attrs) {
     this.#alive();
-    assertEncodable(id, 'id');
+    assertId(id);
     const bytes = typeof body === 'string' ? this.#enc.encode(body) : body;
     // Validate and encode the attributes BEFORE reserving anything in the instance. `encodeAttrs`
     // throws on a malformed attribute, and it used to be called inside the array literal that also
@@ -261,7 +283,7 @@ export class Store {
   /** Tombstone a record. Not durable until {@link sync}. */
   delete(id) {
     this.#alive();
-    assertEncodable(id, 'id');
+    assertId(id);
     const a = [this.#putText(id)];
     try {
       this.#check(this.#exports.tdb_delete(this.#handle, ...a[0]));
@@ -300,7 +322,7 @@ export class Store {
    */
   get(id) {
     this.#alive();
-    assertEncodable(id, 'id');
+    assertId(id);
     const a = [this.#putText(id)];
     try {
       return this.#check(this.#exports.tdb_reconstruct(this.#handle, ...a[0])) === 1 ? this.#out() : null;
@@ -321,7 +343,7 @@ export class Store {
    */
   getRecord(id) {
     this.#alive();
-    assertEncodable(id, 'id');
+    assertId(id);
     const a = [this.#putText(id)];
     try {
       if (this.#check(this.#exports.tdb_get_record(this.#handle, ...a[0])) !== 1) return null;
