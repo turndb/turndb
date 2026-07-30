@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import './_artifact.mjs';
 import { open, TurndbError, prefixUpperBound } from '../index.mjs';
 
 async function withStore(fn) {
@@ -107,6 +108,38 @@ test('the exported prefixUpperBound refuses malformed input rather than propagat
   // The mirror again: valid input, including the character malformed input would have become.
   assert.equal(prefixUpperBound('a\uFFFD'), 'a\uFFFE');
   assert.ok(prefixUpperBound('x\u{1F600}').isWellFormed(), 'a valid bound stays well-formed');
+});
+
+test('an inverted range refuses at the boundary and leaves the handle usable', async () => {
+  await withStore((s) => {
+    for (const id of ['a', 'b', 'c']) s.putBody(id, 'x');
+    s.sync();
+
+    // The engine refuses; the binding must surface that as a TurndbError carrying the engine's own
+    // message. Before the guard this PANICKED in Rust, crossed as `RuntimeError: unreachable`, and
+    // poisoned the handle — every later call failed with `RefCell already borrowed`.
+    assert.throws(
+      () => s.scanIds({ from: 'z', to: 'a' }),
+      (e) => {
+        assert.ok(e instanceof TurndbError, `expected TurndbError, got ${e?.constructor?.name}`);
+        assert.match(e.message, /inverted/, `must carry the engine's message, got: ${e.message}`);
+        return true;
+      },
+    );
+
+    // The half that was actually lost: the store still works afterwards.
+    assert.deepEqual(s.stats(), { parts: 0, records: 3 }, 'handle survives a refused range');
+    assert.deepEqual(s.scanIds({ limit: 10 }), ['a', 'b', 'c'], 'and still pages');
+
+    // Equal bounds are a legitimately empty half-open range, not an error.
+    assert.deepEqual(s.scanIds({ from: 'b', to: 'b', limit: 10 }), []);
+
+    // Astral vs BMP end to end: ordering is UTF-8 bytes all the way across the boundary. In JS
+    // comparison the astral bound sorts BELOW the BMP one, so a binding that pre-checked with `>`
+    // would accept this inverted pair and reject the valid one below it.
+    assert.throws(() => s.scanIds({ from: 'a\u{10000}', to: 'a￿' }), TurndbError);
+    assert.deepEqual(s.scanIds({ from: 'a￿', to: 'a\u{10000}', limit: 10 }), []);
+  });
 });
 
 test('an empty prefix scans everything rather than almost nothing', async () => {
