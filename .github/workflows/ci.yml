@@ -35,6 +35,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A private-repo runner is 2 cores and 7 GB, and this crate's test binaries each statically link
+  # datafusion. The first CI run died in `ld` with SIGBUS after ten minutes — linking a dozen of
+  # them in parallel exhausts the runner. Debug info is the bulk of what gets linked and nothing
+  # here reads a backtrace, so dropping it is the cheap half; capping build parallelism is the rest.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_BUILD_JOBS: '2'
 
 jobs:
   rust:
@@ -74,9 +81,17 @@ jobs:
         run: cargo test --release
 
   npm:
-    name: npm package
+    # `package.json` declares `engines: { node: ">=20" }`, so the matrix IS the claim. The first CI
+    # run pinned 22 and the suite died with SIGSEGV after its assertions passed — on a version the
+    # package says it supports, while passing locally on 24. Testing one version would have made
+    # that a property of whichever version someone picked.
+    name: npm package (node ${{ matrix.node }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,7 +102,7 @@ jobs:
           key: wasm
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
 
       # build.sh rebuilds turndb.wasm from the committed Rust and then runs the package suite, so
       # the tests cannot pass against an artifact nobody built. The .wasm is gitignored and
