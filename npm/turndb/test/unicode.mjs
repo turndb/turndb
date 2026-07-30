@@ -142,6 +142,37 @@ test('an inverted range refuses at the boundary and leaves the handle usable', a
   });
 });
 
+test('a non-string id is refused rather than coerced onto a colliding one', async () => {
+  await withStore((s) => {
+    // `#putText` used to encode `{}` as "[object Object]", colliding with the literal string of the
+    // same name: three writes produced two records and one body was lost. Same silent overwrite as
+    // the unpaired-surrogate case, through a different door — and that exact string is one a real
+    // serialization bug in this codebase has already produced.
+    assert.throws(() => s.putBody({}, 'x'), TurndbError, 'object id');
+    assert.throws(() => s.putBody(42, 'x'), TurndbError, 'number id');
+    assert.throws(() => s.get(null), TurndbError);
+    assert.throws(() => s.delete(undefined), TurndbError);
+    assert.throws(() => s.getRecord(['a']), TurndbError);
+
+    // The literal string is a perfectly ordinary id and must still work — the mirror again.
+    s.putBody('[object Object]', 'LITERAL');
+    s.sync();
+    assert.equal(s.getText('[object Object]'), 'LITERAL');
+    assert.deepEqual(s.scanIds({ limit: 10 }), ['[object Object]']);
+
+    // applyBatch keeps the ENGINE's error, which names the offending item's index — better than
+    // anything the binding could say, so the strict check is deliberately not applied there.
+    assert.throws(
+      () => s.applyBatch([{ id: 'ok', body: 'a' }, { id: 42, body: 'b' }]),
+      (e) => {
+        assert.ok(e instanceof TurndbError);
+        assert.match(e.message, /batch item 1/, `engine message expected, got: ${e.message}`);
+        return true;
+      },
+    );
+  });
+});
+
 test('an empty prefix scans everything rather than almost nothing', async () => {
   await withStore((s) => {
     for (const id of ['a', 'b', 'c']) s.putBody(id, 'x');

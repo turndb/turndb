@@ -68,6 +68,11 @@ export declare class TurndbError extends Error {
 }
 
 /**
+ * Ids must be strings, and are refused if they are not — `String(value)` would encode `{}` as
+ * `"[object Object]"`, silently aliasing it onto the literal string of that name. (`applyBatch` is
+ * the exception: the engine rejects a non-string id there with the offending item's index, which is
+ * a better message than the binding could give.)
+ *
  * Ids, range bounds and attribute strings are refused if they contain an unpaired surrogate.
  *
  * JS strings are UTF-16 and can hold them; UTF-8 cannot represent them, and `TextEncoder` maps them
