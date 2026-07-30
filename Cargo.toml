@@ -27,6 +27,7 @@ exclude = [
     "examples/gen_fold.rs", "examples/hash_budget.rs", "examples/merge_bench.rs",
     "examples/merge_driver.rs", "examples/open_bench.rs", "examples/part_anatomy.rs",
     "examples/part_corpus.rs", "examples/swe_par.rs", "examples/swe_run.rs",
+    "examples/readme_check.rs",
     "target/*", ".scratch/*",
 ]
 
