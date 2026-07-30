@@ -76,8 +76,17 @@ to a contract silently degrading. A paged read that excludes every deleted id ca
 short page. A serializer that emits the right keys can still render every value as `[object
 Object]`.
 
-Before committing a test, ask: **would this pass against a version that returns *some* of the right
-answer?** If yes, it is not yet testing the contract.
+Before committing a test, ask **both** of these. They are not the same question, and the second is
+the one people forget:
+
+- **Would this pass against a version that returns *some* of the right answer?** This catches a fix
+  that does too little — the short page, the half-rendered field, the truncated window.
+- **Would this pass against a version that refuses *more* than it should?** This catches a fix that
+  does too much. A suite full of "rejects bad input" assertions passes happily against an
+  implementation that also rejects good input. If you add a validity check, test the *nearest valid
+  thing* it must still accept.
+
+If either answer is yes, it is not yet testing the contract.
 
 ## Commit messages
 
