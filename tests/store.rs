@@ -1736,6 +1736,50 @@ fn scan_ids_fills_the_page_past_staged_deletions() {
     std::fs::remove_dir_all(&dir2).ok();
 }
 
+/// An inverted range must be REFUSED, not panic.
+///
+/// `BTreeMap::range` traps on `start > end`. Through the WASM binding that trap crossed as
+/// `RuntimeError: unreachable` and left the handle poisoned — every later call on that store failed
+/// with `RefCell already borrowed`. So one reversed argument pair, both strings perfectly
+/// well-formed, permanently killed the store. The corruption storm already holds every on-disk
+/// parser to "errors, never panics"; this is that same standard reaching API arguments, which it
+/// had not.
+#[test]
+fn an_inverted_scan_range_is_refused_rather_than_panicking() {
+    let dir = tmp("scanidsinverted");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        put(&mut s, id, b"x");
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    assert!(s.scan_ids(Some("z"), Some("a"), 10, false).is_err(), "writer path must refuse");
+    // ...and the store still works afterwards, which is the half that was actually lost.
+    assert_eq!(s.scan_ids(None, None, 10, false).unwrap(), vec!["a", "b", "c"]);
+
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert!(r.scan_ids(Some("z"), Some("a"), 10, false).is_err(), "reader path must refuse too");
+    assert_eq!(r.scan_ids(None, None, 10, false).unwrap().len(), 3);
+
+    // Equal bounds are a legitimately EMPTY half-open range, not an error.
+    assert_eq!(s.scan_ids(Some("b"), Some("b"), 10, false).unwrap(), Vec::<String>::new());
+
+    // An astral pair, because the guard must order by UTF-8 bytes like the store. Rust `str` Ord is
+    // byte order so this holds naturally — the test exists so a future rewrite in a language that
+    // compares UTF-16 code units cannot quietly invert it: the astral bound sorts ABOVE the BMP one
+    // in UTF-8 and BELOW it in UTF-16.
+    let astral = "a\u{10000}";
+    let bmp = "a\u{FFFF}";
+    assert!(
+        s.scan_ids(Some(astral), Some(bmp), 10, false).is_err(),
+        "astral-vs-BMP inversion must be refused under UTF-8 ordering"
+    );
+    assert!(s.scan_ids(Some(bmp), Some(astral), 10, false).is_ok(), "and its reverse is valid");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Seamus's adversarial fixture, kept because it is the case the author did not think of.
 ///
 /// Six interactions at once, where the tests above exercise them separately: a bounded range, two

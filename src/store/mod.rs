@@ -545,6 +545,24 @@ pub struct Store {
     pcache: Arc<SectionCache>,
 }
 
+/// Refuse an inverted scan range before it reaches `BTreeMap::range`, which PANICS on
+/// `start > end` rather than returning empty.
+///
+/// The corruption storm holds every on-disk parser to "errors, never panics". That discipline was
+/// applied rigorously to bytes on disk and not at all to API arguments — so a store that refuses to
+/// panic on a corrupt file would panic on a reversed range, which draws the trust boundary in the
+/// wrong place: disk bytes are hostile, but the embedder is merely capable of being mistaken, and
+/// only one of those can be fixed by refusing. Equal bounds are a legitimately empty half-open
+/// range and are allowed.
+fn check_range(from: Option<&str>, to: Option<&str>) -> Result<()> {
+    if let (Some(f), Some(t)) = (from, to) {
+        if f > t {
+            bail!("scan range is inverted: from {f:?} sorts after to {t:?}");
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     /// Part count at which [`Store::auto_compact`] runs a total merge. Chosen by measurement, not
     /// taste — see that method's numbers.
@@ -1167,6 +1185,7 @@ impl Store {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>> {
+        check_range(from, to)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1484,6 +1503,7 @@ impl ReadStore {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>> {
+        check_range(from, to)?;
         read::scan_ids(&self.parts, from, to, limit, reverse)
     }
 
