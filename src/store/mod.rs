@@ -6,8 +6,10 @@
 //! A store is a **directory**, and reading one requires nothing but the files. There is no daemon in
 //! this design; a server is a *role* a process takes when it holds the writer lock, not a thing the
 //! format depends on. (That lock is enforced by the OS on Unix and **not enforced on
-//! `wasm32-wasip1`**, where holding it is the embedder's obligation — see `src/sys.rs` and
-//! FORMAT.md.) [`Store::open_read`] takes no lock, replays nothing, and is safe to run
+//! `wasm32-wasip1`** — there the single-writer invariant is the embedder's to maintain, since
+//! there is no advisory lock to hold. See `src/sys.rs` and FORMAT.md.)
+//!
+//! [`Store::open_read`] takes no lock, replays nothing, and is safe to run
 //! concurrently with a writer — parts are immutable and the fold is append-only, so a reader pinned to
 //! a manifest sees a consistent store with no coordination at all.
 //!
