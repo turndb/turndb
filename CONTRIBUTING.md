@@ -20,13 +20,14 @@ model is worse than one, because they drift and then nobody knows which is true.
 
 ### Commit signing does not currently work
 
-`commit.gpgsign=true` is configured with an SSH key, and **signing fails in the development
-environment** — `ssh-keygen` can sign directly, but git's signing path goes through the
-gnome-keyring agent, which returns `communication with agent failed` whether git is pointed at the
-public key or the private key.
+`commit.gpgsign=true` is configured with an SSH key and **signing fails on the machines the core
+team develops on**, observed independently on two hosts, in two repositories, by three agents. The
+failure differs between attempts rather than between machines: sometimes git's signing path returns
+`communication with agent failed`, sometimes the commit hangs past a bounded timeout. In every
+observed case the commit does not complete.
 
-Every commit in this repository's history is unsigned; only merges performed through the GitHub web
-UI carry a signature. So unsigned commits are the status quo here rather than a deviation.
+This is environmental rather than one person's misconfiguration, and it says nothing about your
+machine. Commit with `-c commit.gpgsign=false`.
 
 **This matters if branch protection ever requires signed commits.** It would have to be solved
 before that requirement lands, not after — otherwise the first anyone learns of it is a rejected
