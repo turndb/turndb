@@ -610,6 +610,7 @@ impl Store {
         // is discarded, and the log regenerates it.
         let mut fold =
             Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
+        fold.declare_punched(&manifest.punched);
 
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -686,7 +687,13 @@ impl Store {
             let manifest = Manifest::load(dir)?;
             let fold_path = refold::fold_dir(dir, manifest.fold_gen);
             let fold = match Fold::open_read(&fold_path, cfg) {
-                Ok(fold) => fold,
+                Ok(mut fold) => {
+                    // A live record never references a punched block — `punch_unreferenced` walks
+                    // live visibility to decide. Declared anyway so that if a stale `Loc` ever does
+                    // reach one, it is named as erasure rather than as a failing disk.
+                    fold.declare_punched(&manifest.punched);
+                    fold
+                }
                 Err(e) => {
                     let gone = e
                         .downcast_ref::<std::io::Error>()
@@ -750,7 +757,21 @@ impl Store {
     /// reported as one.
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
         let manifest = load_retained(dir, commit)?;
-        let fold = Fold::open_read(&refold::fold_dir(dir, manifest.fold_gen), cfg)?;
+        let mut fold = Fold::open_read(&refold::fold_dir(dir, manifest.fold_gen), cfg)?;
+        // Erasure is declared by the LIVE manifest, not by this one. Punching commits a new manifest,
+        // so a retained copy predates every punch that followed it and declares nothing — which is
+        // exactly how a deliberate erasure came to be reported as a checksum failure. `punched` is
+        // cumulative, so the live copy is the whole truth about what is gone.
+        //
+        // Guarded on the generation because block ids are per generation: applying one generation's
+        // punched ranges to another would name live blocks. In practice a re-fold purges the retained
+        // log so this snapshot would not exist, but the guard is what makes that a fact about ids
+        // rather than a fact about the retention policy that happens to hold today.
+        if let Ok(live) = Manifest::load(dir) {
+            if live.fold_gen == manifest.fold_gen {
+                fold.declare_punched(&live.punched);
+            }
+        }
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
@@ -1339,6 +1360,9 @@ impl Store {
         m.punched = to_ranges(&all);
         m.commit(&self.dir)?;
         self.manifest = m;
+        // Declare before destroying, the same order the manifest write follows and for the same
+        // reason: at no point may a block's bytes be gone while this fold still calls it content.
+        self.fold.declare_punched(&self.manifest.punched);
 
         let punched = self.fold.punch_blocks(&dead)?;
         Ok(PunchStats { blocks_punched: punched.len(), blocks_examined: dead.len() })
@@ -1387,6 +1411,13 @@ impl Store {
             })
             .collect::<Result<_>>()?;
         m.fold_gen = new_gen;
+        // Block ids are PER GENERATION and the new fold's restart at 0, so a punched range carried
+        // over from the old generation names live blocks in the new one. Nothing reads `punched`
+        // today, which is the only reason this was survivable; the moment a reader consults it to
+        // tell erasure from corruption, a stale range reports live content as erased. Clearing it
+        // is not bookkeeping — the new fold was rewritten WITHOUT the erased content, so it has no
+        // holes to declare.
+        m.punched.clear();
         // The new fold starts empty of history, so the committed tail is its own.
         let new_dir = refold::fold_dir(&self.dir, new_gen);
         {
