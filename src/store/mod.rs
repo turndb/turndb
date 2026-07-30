@@ -5,7 +5,9 @@
 //!
 //! A store is a **directory**, and reading one requires nothing but the files. There is no daemon in
 //! this design; a server is a *role* a process takes when it holds the writer lock, not a thing the
-//! format depends on. [`Store::open_read`] takes no lock, replays nothing, and is safe to run
+//! format depends on. (That lock is enforced by the OS on Unix and **not enforced on
+//! `wasm32-wasip1`**, where holding it is the embedder's obligation — see `src/sys.rs` and
+//! FORMAT.md.) [`Store::open_read`] takes no lock, replays nothing, and is safe to run
 //! concurrently with a writer — parts are immutable and the fold is append-only, so a reader pinned to
 //! a manifest sees a consistent store with no coordination at all.
 //!
@@ -569,6 +571,11 @@ impl Store {
     pub const AUTO_COMPACT_K: usize = 8;
 
     /// Open for writing. Takes the writer lock (through the fold) and recovers.
+    ///
+    /// **On Unix** that lock is `flock` and the kernel enforces it. **On `wasm32-wasip1` it is not
+    /// enforced at all** — WASI has no advisory locking, so the lock file is created and gates
+    /// nothing, and the single-writer invariant becomes the embedder's: at most one open writer per
+    /// store directory, across every process and every instance. See `src/sys.rs` and FORMAT.md.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
         crate::vfs::mkdir_all(dir)?;
         let manifest = match Manifest::load(dir) {
