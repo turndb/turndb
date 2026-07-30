@@ -239,3 +239,44 @@ fn erase_ids_leaves_nothing_to_distinguish_it_from_absence() {
     drop(s);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A partially-erased record still refuses whole today, even when one of its pieces survives and is
+/// independently readable. This pins FORMAT.md's declared condition-2 gap until the public API can
+/// return surviving bytes together with exact erased ranges without weakening byte-exact
+/// `reconstruct`.
+#[test]
+fn a_partially_erased_record_refuses_even_though_its_shared_piece_survives() {
+    let dir = tmp("partial");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let shared = noise(900, 64 * 1024);
+    let unique = noise(901, 64 * 1024);
+
+    s.put("keeper", &[Span::Piece(&shared)], vec![]).unwrap();
+    s.put("victim", &[Span::Piece(&shared), Span::Piece(&unique)], vec![]).unwrap();
+    for i in 0..8 {
+        s.put(&format!("f{i}"), &[Span::Piece(&noise(920 + i, 64 * 1024))], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let c1 = s.manifest().commit;
+
+    s.put("victim", &[Span::Piece(&noise(950, 1024))], vec![]).unwrap();
+    for i in 0..24 {
+        s.put(&format!("m{i}"), &[Span::Piece(&noise(1000 + i, 64 * 1024))], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    assert!(s.punch_unreferenced().unwrap().blocks_punched > 0);
+    drop(s);
+
+    let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
+    assert_eq!(
+        old.reconstruct("keeper").unwrap().unwrap(),
+        shared,
+        "the shared piece survives and remains independently readable"
+    );
+    let err =
+        old.reconstruct("victim").expect_err("one erased piece still refuses the whole record");
+    assert!(err.to_string().contains("ERASED"), "{err:#}");
+    std::fs::remove_dir_all(&dir).ok();
+}
