@@ -1170,18 +1170,21 @@ impl Store {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // Committed candidates: ask for the whole page even though some may be shadowed by a
-        // staged deletion, then re-trim after the merge.
-        let committed = read::scan_ids(&self.parts, from, to, limit, reverse)?;
-        let staged: Vec<&String> = self
-            .mem
-            .range::<str, _>((
-                from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
-                to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-            ))
-            .filter(|(_, v)| v.is_some())
-            .map(|(k, _)| k)
-            .collect();
+        let range = (
+            from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
+            to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+        );
+        // A staged deletion SHADOWS a committed id: the id still occupies a slot in the committed
+        // scan and is dropped afterwards. Asking for exactly `limit` candidates therefore returns a
+        // short page while live ids sit just past the cut — silently, which is the worst way for a
+        // paged read to be wrong. At most one candidate can be shadowed per staged deletion in the
+        // range, so `limit + deletions` candidates cannot under-fill. Deletions that hit no
+        // committed id merely over-fetch, which the truncate below absorbs.
+        let staged_deletions = self.mem.range::<str, _>(range).filter(|(_, v)| v.is_none()).count();
+        let want = limit.saturating_add(staged_deletions);
+        let committed = read::scan_ids(&self.parts, from, to, want, reverse)?;
+        let staged: Vec<&String> =
+            self.mem.range::<str, _>(range).filter(|(_, v)| v.is_some()).map(|(k, _)| k).collect();
         if staged.is_empty() {
             // still must drop anything the memtable deleted
             let mut out = committed;

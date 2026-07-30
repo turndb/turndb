@@ -1660,6 +1660,82 @@ fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A page must be FULL whenever enough live ids exist — not merely free of deleted ones.
+///
+/// The committed scan is bounded by the page limit, so ids shadowed by a staged deletion used to
+/// leave a hole nothing backfilled: the page came back short while live rows sat just past the
+/// limit, and nothing reported that it was short. Asserting cardinality is the point of this test;
+/// the sibling test above deletes one id and asserts its absence, which this defect survived.
+#[test]
+fn scan_ids_fills_the_page_past_staged_deletions() {
+    let dir = tmp("scanidsfill");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c", "d", "e"] {
+        put(&mut s, id, b"x");
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // Staged, deliberately NOT flushed: the deletions live in the memtable, which is where they
+    // shadow committed ids without removing them from the committed scan's own count.
+    s.delete("a").unwrap();
+    s.delete("b").unwrap();
+    s.sync().unwrap();
+
+    assert_eq!(
+        s.scan_ids(None, None, 3, false).unwrap(),
+        vec!["c", "d", "e"],
+        "a full page of live ids exists past the deletions and must be returned"
+    );
+
+    // Deletions at the other end, against a reverse scan — a fix that over-fetches in only one
+    // direction passes the forward case and fails here.
+    let dir2 = tmp("scanidsfillrev");
+    let mut s2 = Store::open(&dir2, cfg()).unwrap();
+    for id in ["a", "b", "c", "d", "e"] {
+        put(&mut s2, id, b"x");
+    }
+    s2.sync().unwrap();
+    s2.flush().unwrap();
+    s2.delete("e").unwrap();
+    s2.delete("d").unwrap();
+    s2.sync().unwrap();
+    assert_eq!(
+        s2.scan_ids(None, None, 3, true).unwrap(),
+        vec!["c", "b", "a"],
+        "reverse pages must fill past deletions at the high end"
+    );
+
+    // Bounded range, deletions inside it, and a live id past the limit that must be pulled in.
+    assert_eq!(
+        s.scan_ids(Some("a"), Some("f"), 2, false).unwrap(),
+        vec!["c", "d"],
+        "a bounded range fills to its limit too"
+    );
+
+    // The page is short only when the store genuinely has fewer live ids than asked for.
+    assert_eq!(
+        s.scan_ids(None, None, 10, false).unwrap(),
+        vec!["c", "d", "e"],
+        "asking for more than exist returns what exists"
+    );
+
+    // A staged PUT sorting past the committed candidate window, under a reverse scan: the merge
+    // must reorder it into the page rather than let the committed slice decide the answer. Called
+    // out because over-fetching by the deletion count reasons about deletions only, and a staged
+    // put is the case that reasoning does not cover.
+    put(&mut s, "z", b"x");
+    s.sync().unwrap();
+    assert_eq!(
+        s.scan_ids(None, None, 3, true).unwrap(),
+        vec!["z", "e", "d"],
+        "an unflushed put beyond the committed window must still head a reverse page"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
 #[test]
 fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
     let dir = tmp("scanids");
