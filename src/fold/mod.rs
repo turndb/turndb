@@ -1066,8 +1066,11 @@ fn list_segments(dir: &Path) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-/// Exclusive writer lock held for the fold's whole lifetime — the single-writer invariant, enforced by
-/// the OS rather than by convention.
+/// Exclusive writer lock held for the fold's whole lifetime — the single-writer invariant.
+///
+/// Enforced by the OS *on Unix*. On `wasm32-wasip1` `sys::lock_exclusive` succeeds unconditionally,
+/// so this creates the file and gates nothing: there the invariant IS convention, and it is the
+/// embedder's to keep.
 fn acquire_writer_lock(dir: &Path) -> Result<File> {
     let path = dir.join("WRITER.lock");
     let f = std::fs::OpenOptions::new()

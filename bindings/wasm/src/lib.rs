@@ -242,8 +242,12 @@ pub unsafe extern "C" fn tdb_open(
     }
 }
 
-/// Close a store, dropping it (which releases its writer lock and flushes nothing — call
-/// [`tdb_sync`] first if the writes must survive).
+/// Close a store, dropping the handle. Flushes nothing — call [`tdb_sync`] first if the writes
+/// must survive.
+///
+/// Deliberately not "releases its writer lock": this binding is the WASI build, which holds no
+/// advisory lock to release. Closing hands exclusion back to nobody, because the engine never had
+/// it.
 #[no_mangle]
 pub extern "C" fn tdb_close(h: i32) -> i32 {
     clear_err();
