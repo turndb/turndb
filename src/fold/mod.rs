@@ -219,6 +219,16 @@ pub struct Fold {
     poisoned: bool,
     scratch: Vec<u8>,
     _lock: Option<File>,
+    /// Blocks the MANIFEST declares erased, as inclusive `[lo, hi]` ranges — the authority for
+    /// telling erasure from corruption.
+    ///
+    /// It has to be declared rather than detected. Punching zeroes a block's PAYLOAD and leaves its
+    /// header intact so the frame chain stays walkable, so an erased block presents as a valid
+    /// header over a checksum that will not verify — which is byte-for-byte what a torn write looks
+    /// like. Nothing in the bytes distinguishes them; only the manifest does.
+    ///
+    /// Empty for a fold nobody declared anything about, which reads exactly as it did before.
+    punched: Vec<(u32, u32)>,
 }
 
 impl Fold {
@@ -354,6 +364,7 @@ impl Fold {
                 inflight: HashMap::new(),
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
                 _lock: Some(lock),
+                punched: Vec::new(),
             });
         }
 
@@ -464,6 +475,7 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
             _lock: Some(lock),
+            punched: Vec::new(),
         })
     }
 
@@ -472,6 +484,20 @@ impl Fold {
     /// Takes no lock, truncates nothing, sweeps nothing — a reader must never mutate a store another
     /// process is writing. Safe concurrently with a live writer: segments are append-only and blocks
     /// are immutable once written, so a reader sees a prefix that only ever grows.
+    /// Tell this fold which blocks the manifest declares erased, as inclusive `[lo, hi]` ranges.
+    ///
+    /// The caller owes the right manifest, and for a RETAINED snapshot that is the LIVE one, not the
+    /// snapshot's own: punching commits a new manifest, so the retained copy predates the erasure
+    /// and declares nothing. `punched` is cumulative in the live manifest, which is what makes this
+    /// answerable at all.
+    pub fn declare_punched(&mut self, ranges: &[(u32, u32)]) {
+        self.punched = ranges.to_vec();
+    }
+
+    fn is_punched(&self, block_id: u32) -> bool {
+        self.punched.iter().any(|&(lo, hi)| block_id >= lo && block_id <= hi)
+    }
+
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
         let mut nums = list_segments(dir)?;
         if nums.is_empty() {
@@ -593,6 +619,7 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(1, cfg.level, None),
             _lock: None,
+            punched: Vec::new(),
         })
     }
 
@@ -732,9 +759,22 @@ impl Fold {
         let mut hb = [0u8; block::BLOCK_HDR_LEN];
         f.read_exact_at(&mut hb, off as u64)
             .with_context(|| format!("read block header at seg {seg} off {off}"))?;
-        // A punched block reads back as zeros, which parse_hdr would report as a bad tag —
-        // i.e. as corruption. Naming it is the difference between "your disk is failing" and
-        // "this content was erased on purpose", and only one of those is true.
+        // Naming an erasure is the difference between "your disk is failing" and "this content was
+        // erased on purpose", and only one of those is true.
+        //
+        // The DECLARATION is checked first because it is the only thing that can be right. Punching
+        // zeroes a block's payload and deliberately leaves its 16-byte header intact so the frame
+        // chain stays walkable, so an erased block presents as a valid header over a payload whose
+        // checksum will not verify — which is byte-for-byte indistinguishable from a torn write.
+        // The zero-header test below cannot see that case, which is every block turndb itself
+        // punches; it survives for a frame zeroed by something other than `punch_blocks`.
+        if self.is_punched(loc.block_id) {
+            bail!(
+                "block {} was ERASED (its bytes were punched out of the fold); \
+                 the manifest's punched list is authoritative for which",
+                loc.block_id
+            );
+        }
         if hb.iter().all(|&b| b == 0) {
             bail!(
                 "block {} was ERASED (its bytes were punched out of the fold); \
@@ -883,7 +923,7 @@ impl Fold {
     /// length, and therefore every offset in it, is unchanged — so no `Loc` above the fold is
     /// invalidated and no part needs rebuilding. That is what makes this the sub-refold erasure
     /// primitive: a refold rewrites the world to reclaim space, and this reclaims the same space
-    /// in place, at the cost of leaving the block's frame header punched too.
+    /// in place, at the cost of leaving the block's frame header behind unpunched.
     ///
     /// `dead` names BLOCK IDS, and the caller owes the truth of that: a block is punchable only
     /// when no live record references any piece in it. The store computes that from the parts and

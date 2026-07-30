@@ -337,10 +337,8 @@ repeated n_ops times:
 ```
 
 Concatenating the ops in order reproduces the record's body **byte for byte**. That is the format's
-central promise, and it has exactly one anticipated exception: content erased for privacy or retention
-reasons cannot be reproduced, by definition. A future revision that adds erasure must say what a
-reader gets instead, and must not make a partially-erased record unreadable — an audit record you are
-legally required to keep is not improved by refusing to serve the part of it that survives.
+central promise, and it has exactly one exception: content erased for privacy or retention reasons
+cannot be reproduced, by definition. See [Erasure](#erasure) for what a reader gets instead.
 
 `tagged == 0` is **RESERVED**. It would encode a zero-length literal, which contributes nothing; a
 writer must not emit one, and a reader must refuse it. A future revision may define it as an escape
@@ -539,6 +537,25 @@ without a version lever — **provided the new field has a documented default**,
 keep omitting it. `fold_gen` was added exactly that way and absent means 0, and `commit` likewise. A
 field without a default is a breaking change that JSON merely fails to announce.
 
+`punched` is a field of that kind, and it is **normative for erasure**: an array of inclusive
+`[lo, hi]` block-id ranges, ascending and disjoint, naming blocks whose payload bytes were
+deallocated by [erasure](#erasure). Absent — and it is omitted when empty — means nothing has been
+punched. It is written **before** the bytes go, so a crash between the two leaves blocks declared
+punched that are still readable, never punched blocks that nothing declares.
+
+**A reader must consult it to tell erasure from corruption, because the bytes cannot.** Punching
+zeroes a block's payload and deliberately leaves its 16-byte header intact so the frame chain stays
+walkable, so an erased block presents as a valid header over a payload whose checksum fails — which
+is byte-for-byte what a torn write looks like. This declaration is the only thing that distinguishes
+them.
+
+Two consequences worth stating because both have been got wrong here. The ranges are **per fold
+generation**: block ids restart at 0 in a new generation, so a re-fold — which rewrites the world
+without the erased content and therefore has no holes to declare — must reset the list rather than
+carry it forward, or it names live blocks as erased. And a **retained** manifest predates every punch
+that followed it, so a reader opening a retained snapshot must take `punched` from the **live**
+manifest, where it is cumulative, rather than from the snapshot's own.
+
 Committed with tmp + fsync + rename + fsync-dir, so a crash sees either the old manifest or the new
 one. **An unreadable manifest is an error, not an empty store** — conflating those with a sweep that
 unlinks unnamed files turns one bad byte into an empty directory.
@@ -607,6 +624,50 @@ flush  -> fold fsync, write part, commit manifest, truncate WAL
 Data before pointers, always: the fold is durable before a part names any of it, and the part is
 durable before the manifest names the part. A crash between any two steps leaves orphans, which are
 swept at writer open, and never a pointer to something that is not there.
+
+---
+
+## Erasure
+
+The one exception to byte-exact reconstruction. Two mechanisms, and they are **not** variants of each
+other — they differ in whether the record stays addressable, and that difference decides what a
+reader is owed.
+
+**Punching** deallocates the payload bytes of blocks no live record can reach, in place. Offsets do
+not move, so no part is rebuilt. The record's id, its columns and its piece lengths all survive; only
+the bytes are gone. The blocks are declared in [`punched`](#the-manifest) before they are destroyed.
+
+**Re-folding** rewrites the fold without the dropped content and rebuilds every part, so the id and
+the columnar metadata go too, and the retained commit log is purged — a snapshot that could still
+serve the erased record is not erasure.
+
+Two conditions bind any erasure, and they follow from the store's general rule that it must refuse
+rather than mislead:
+
+1. **A read of erased content reports erasure, not corruption.** Punching leaves the block header
+   intact so the frame chain stays walkable, so an erased block is byte-for-byte indistinguishable
+   from a torn write. The `punched` declaration is the only thing that separates them, and a reader
+   must consult it — from the **live** manifest, since a retained one predates the punch. Telling an
+   operator their disk is failing when the truth is that they erased something on purpose is a
+   fault, not a cosmetic issue.
+
+2. **A partially-erased record does not become wholly unreadable.** An audit record you are legally
+   required to keep is not improved by refusing to serve the part of it that survives.
+
+**Condition 2 is NOT met by the current implementation, and this is the honest state rather than a
+plan.** A record whose pieces span several blocks, only some of them punched, is refused whole.
+Serving the surviving part means returning a reconstruction that is *not* byte-exact, and the
+byte-exact promise is the one this format is built to keep — so the resolution is a new return shape
+that declares its gaps rather than a relaxation of `reconstruct`, and that is an open decision, not
+an implementation detail. Recorded here so a reader knows which way the gap runs.
+
+**Scope, stated because it is easy to overstate.** These conditions bite on *retained* reads after an
+erasure. Live reads are unaffected by construction: punching decides what is dead from live
+visibility, so no live record's blocks are punchable.
+
+**What erasure does not promise:** anything about copies outside this store — packs written earlier,
+replicas, backups, or any consumer that already read the data. It removes content from THIS store,
+and only that.
 
 ---
 
