@@ -87,6 +87,41 @@ fn a_read_of_erased_content_reports_erasure_not_corruption() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The live manifest is the ONLY authority for telling erasure from damage, so a retained read must
+/// refuse when it cannot be read — never fall back to "nothing was erased".
+///
+/// Tolerating the load error would rebuild the defect by another route: no declaration, so the
+/// punched payload is reported as checksum corruption again. `punched` being absent and `punched`
+/// being unknown are different facts, and only one of them is safe to act on.
+#[test]
+fn an_unreadable_live_manifest_refuses_rather_than_declaring_nothing_erased() {
+    let (dir, c1) = store_with_a_punched_retained_record("authority");
+
+    // Corrupt the LIVE manifest only. The retained one at c1 is untouched, so everything this
+    // snapshot names is still on disk and readable — the only thing missing is the erasure
+    // declaration, which is exactly the condition under test.
+    let live = dir.join("MANIFEST");
+    let mut bytes = std::fs::read(&live).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&live, &bytes).unwrap();
+    assert!(dir.join(format!("MANIFEST.{c1:08}")).exists(), "the retained manifest must survive");
+
+    match Store::open_read_at(&dir, cfg(), c1) {
+        Ok(_) => panic!(
+            "the live erasure declaration is authoritative and must be readable — opening a \
+             retained snapshot without it would report erased blocks as corruption"
+        ),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains("live manifest"),
+                "the refusal must name what could not be read; got {msg:?}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The distinction that makes the message worth anything: erased is not absent.
 #[test]
 fn erased_is_distinguishable_from_never_existed() {
