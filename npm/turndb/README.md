@@ -48,10 +48,14 @@ its unflushed writes without either — a live view can read back what it just w
 traffic, flushing every record gave 15×; every 50 gave 171×; every 512 gave 292×. Batch your
 writes.
 
-**One writer per directory, per process.** On Unix the engine enforces this with `flock`. **Under
-WASI there is no advisory locking, so it cannot.** Two writers on one store will interleave their
-write-ahead logs and corrupt it — if your process model can open the same directory twice, that
-exclusion is yours to provide.
+**Exclusion is yours to provide — this package cannot do it for you.** The native engine takes an
+advisory `flock`, but **this package is always the `wasm32-wasip1` build**, on every host including
+Linux and macOS, and WASI has no advisory locking. The lock file is created and gates nothing.
+
+So the obligation is: **at most one open writer per store directory, across every process *and*
+every instance or handle.** One process is not sufficient isolation — two `Store` handles in one
+process can open the same directory. Two writers will interleave their write-ahead logs and corrupt
+the store, and **detection is not guaranteed**: a clean read afterwards does not mean it is intact.
 
 ## Attributes keep order and duplicate keys
 

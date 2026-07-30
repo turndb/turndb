@@ -91,8 +91,8 @@ is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
 
 ## Platforms
 
-The Rust crate is **Unix only** — it needs positioned reads, `flock`, and (for `punch`) Linux hole
-punching.
+The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
+Linux hole punching.
 
 It also builds for **`wasm32-wasip1`**, which is what the [`turndb` npm package](npm/turndb)
 ships: one `.wasm`, no native addon, no prebuild matrix, no postinstall. A store written by either

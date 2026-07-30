@@ -116,9 +116,9 @@ cargo fmt --check
 Report **cargo's own exit codes.** A green that came from the wrong process — a status captured
 through a pipe, a suite that silently ran zero tests — is worse than no result at all.
 
-Unix only, matching the crate's stated scope. The WASM binding (`bindings/wasm`, published to npm)
-builds for `wasm32-wasip1`; `src/sys.rs` is the single answer to what turndb needs from an operating
-system, and what it does not get on that target.
+The native build is Unix only, matching the crate's stated scope. The WASM binding
+(`bindings/wasm`, published to npm) builds for `wasm32-wasip1`; `src/sys.rs` is the single answer
+to what turndb needs from an operating system, and what it does not get on that target.
 
 ## Changing the format
 

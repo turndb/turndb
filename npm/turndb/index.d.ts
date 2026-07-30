@@ -110,11 +110,22 @@ export declare class Store {
   /** Live ids in range, in id order. The paging primitive. */
   scanIds(opts?: ScanOptions): string[];
   stats(): Stats;
-  /** Release the writer lock. Does NOT sync — call {@link Store.sync} first. */
+  /**
+   * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
+   *
+   * Not "release the writer lock": this build holds no advisory lock. See {@link open}.
+   */
   close(): void;
 }
 
-/** Open (or create) a store at `dir`. One writer per directory, per process. */
+/**
+ * Open (or create) a store at `dir`.
+ *
+ * **At most one open writer per store directory, across every process and every instance or
+ * handle.** This package is always the `wasm32-wasip1` build and WASI has no advisory locking, so
+ * the engine cannot enforce this — the obligation is yours, and per-process is not sufficient.
+ * Two writers corrupt the store, and detection is not guaranteed.
+ */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
 
 /**
