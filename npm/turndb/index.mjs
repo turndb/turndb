@@ -84,6 +84,11 @@ function assertEncodable(s, what) {
  * Exported for tests: the boundary cases are the whole point and they deserve direct assertions.
  */
 export function prefixUpperBound(prefix) {
+  // Guarded here rather than only at the call site: this is exported and documented as contract, so
+  // a caller may use it to build `from`/`to` directly. Unguarded, a malformed prefix carried into a
+  // malformed bound — `'\uD800'` produced `'\uD801'`, which encodes to U+FFFD — reintroducing the
+  // wrong-boundary defect through the very helper added to remove it.
+  assertEncodable(prefix, 'prefix');
   const cps = Array.from(prefix);
   for (let i = cps.length - 1; i >= 0; i--) {
     const cp = cps[i].codePointAt(0);
@@ -216,7 +221,13 @@ export class Store {
     this.#alive();
     assertEncodable(id, 'id');
     const bytes = typeof body === 'string' ? this.#enc.encode(body) : body;
-    const a = [this.#putText(id), this.#put(bytes), this.#putText(encodeAttrs(attrs))];
+    // Validate and encode the attributes BEFORE reserving anything in the instance. `encodeAttrs`
+    // throws on a malformed attribute, and it used to be called inside the array literal that also
+    // performed the id and body allocations — so a throw escaped before `a` was bound, the
+    // `finally` never ran, and the id and body allocations leaked. Refusing an input must not cost
+    // the process memory it cannot get back: a rejected write has to stay recoverable.
+    const attrsText = encodeAttrs(attrs);
+    const a = [this.#putText(id), this.#put(bytes), this.#putText(attrsText)];
     try {
       this.#check(this.#exports.tdb_put_body(this.#handle, ...a[0], ...a[1], ...a[2]));
     } finally {

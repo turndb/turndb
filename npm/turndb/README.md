@@ -23,7 +23,8 @@ store.putBody('alice/1700000000000/req-1#input', JSON.stringify(messages), {
 store.sync();    // the ACK point — durable from here
 store.flush();   // seal into the columnar plane for other readers
 
-store.getText('alice/1700000000000/req-1#input');   // byte-exact
+store.get('alice/1700000000000/req-1#input');       // bytes, byte-exact
+store.getText('alice/1700000000000/req-1#input');   // UTF-8 convenience; lossy on invalid bytes
 store.scanIds({ prefix: 'alice/', limit: 50, reverse: true });
 ```
 
@@ -64,9 +65,15 @@ store.putBody(id, body, [['finishReason', 'end_turn'], ['finishReason', 'max_tok
 ## No SQL here, on purpose
 
 The query engine would dominate the artifact, and the two things an application does — a point
-lookup and a page scan — are already served by the id order. Ids sort lexicographically, so
-designing them with the query in mind (`member/timestamp/...`) gives prefix-then-time paging with
-no secondary index.
+lookup and a page scan — are already served by the id order. Ids sort lexicographically **by
+their UTF-8 bytes**, so designing them with the query in mind (`member/timestamp/...`) gives
+prefix-then-time paging with no secondary index.
+
+**Compare ids as bytes, not with JS `<`.** JS compares UTF-16 code units, and the two orders
+disagree above the BMP: `'a\u{10000}'` sorts *below* `'a\uFFFF'` in JS and *above* it in UTF-8. For
+ASCII ids they agree, so this only bites once an id carries an astral character — quietly, as a
+wrong page boundary rather than an error. Use `prefixUpperBound` to build a range, or compare
+`Buffer.from(id, 'utf8')`.
 
 For analytics, the `turndb` CLI runs SQL against the same directory. No daemon, no second copy.
 

@@ -94,6 +94,21 @@ test('prefixUpperBound carries by code point, not code unit', () => {
   assert.equal(prefixUpperBound('\u{10FFFF}\u{10FFFF}'), null);
 });
 
+test('the exported prefixUpperBound refuses malformed input rather than propagating it', () => {
+  // It is exported and documented as contract, so a caller may build `from`/`to` with it directly.
+  // Unguarded it carried a malformed prefix into a malformed bound — '\uD800' -> '\uD801', which
+  // encodes to U+FFFD — reintroducing the wrong-boundary defect through the helper added to fix it.
+  // scanIds guards too; that is defence in depth, not a substitute for guarding the entry point.
+  assert.throws(() => prefixUpperBound('\uD800'), TurndbError, 'lone high surrogate');
+  assert.throws(() => prefixUpperBound('\uDC00'), TurndbError, 'lone low surrogate');
+  assert.throws(() => prefixUpperBound('a\uD800'), TurndbError, 'trailing lone high surrogate');
+  assert.throws(() => prefixUpperBound('a\uDC00b'), TurndbError, 'interior lone low surrogate');
+
+  // The mirror again: valid input, including the character malformed input would have become.
+  assert.equal(prefixUpperBound('a\uFFFD'), 'a\uFFFE');
+  assert.ok(prefixUpperBound('x\u{1F600}').isWellFormed(), 'a valid bound stays well-formed');
+});
+
 test('an empty prefix scans everything rather than almost nothing', async () => {
   await withStore((s) => {
     for (const id of ['a', 'b', 'c']) s.putBody(id, 'x');
