@@ -1736,6 +1736,44 @@ fn scan_ids_fills_the_page_past_staged_deletions() {
     std::fs::remove_dir_all(&dir2).ok();
 }
 
+/// Seamus's adversarial fixture, kept because it is the case the author did not think of.
+///
+/// Six interactions at once, where the tests above exercise them separately: a bounded range, two
+/// deletions of committed ids inside it, a deletion of an id that is in range but was never
+/// committed, a deletion outside the range entirely (which must not be counted against the
+/// candidate budget), a staged put landing mid-range, and both scan directions. A candidate budget
+/// that miscounts any of those returns a short or wrong page here while passing every other test.
+#[test]
+fn scan_ids_mixed_overlay_fills_bounded_pages_in_both_directions() {
+    let dir = tmp("scanidsmixedoverlay");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        put(&mut s, id, b"x");
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    s.delete("c").unwrap(); // committed, in range
+    s.delete("f").unwrap(); // committed, in range
+    s.delete("cc").unwrap(); // in range, never committed — must not consume budget wrongly
+    s.delete("z").unwrap(); // outside the range — must not be counted at all
+    put(&mut s, "d0", b"x"); // staged put landing mid-range
+    s.sync().unwrap();
+
+    // Live in [b,h) is b, d, d0, e, g.
+    assert_eq!(
+        s.scan_ids(Some("b"), Some("h"), 4, false).unwrap(),
+        vec!["b", "d", "d0", "e"],
+        "forward page over a bounded range with mixed staged state"
+    );
+    assert_eq!(
+        s.scan_ids(Some("b"), Some("h"), 4, true).unwrap(),
+        vec!["g", "e", "d0", "d"],
+        "reverse page over the same state"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
     let dir = tmp("scanids");
