@@ -60,7 +60,7 @@ pub fn probe_encoded(sec: &[u8], h: &PieceHash) -> bool {
 impl Bloom {
     pub fn with_capacity(n: usize) -> Bloom {
         let m = ((n as u64).max(1) * BITS_PER).max(64);
-        Bloom { bits: vec![0u8; ((m + 7) / 8) as usize], m }
+        Bloom { bits: vec![0u8; m.div_ceil(8) as usize], m }
     }
 
     pub fn insert(&mut self, h: &PieceHash) {
@@ -90,7 +90,7 @@ impl Bloom {
             bail!("bloom section truncated");
         }
         let m = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        if m == 0 || b.len() - 8 < ((m + 7) / 8) as usize {
+        if m == 0 || b.len() - 8 < m.div_ceil(8) as usize {
             bail!("bloom bit array does not match its declared size");
         }
         Ok(Bloom { m, bits: b[8..].to_vec() })
@@ -109,7 +109,8 @@ mod tests {
     fn never_gives_a_false_negative() {
         // The one property that matters: a stored piece must never be reported absent.
         let mut b = Bloom::with_capacity(5000);
-        let present: Vec<PieceHash> = (0..5000).map(|i| PieceHash::of(format!("p{i}").as_bytes())).collect();
+        let present: Vec<PieceHash> =
+            (0..5000).map(|i| PieceHash::of(format!("p{i}").as_bytes())).collect();
         for h in &present {
             b.insert(h);
         }
@@ -134,7 +135,8 @@ mod tests {
     #[test]
     fn roundtrips_through_its_section_bytes() {
         let mut b = Bloom::with_capacity(500);
-        let hs: Vec<PieceHash> = (0..500).map(|i| PieceHash::of(format!("r{i}").as_bytes())).collect();
+        let hs: Vec<PieceHash> =
+            (0..500).map(|i| PieceHash::of(format!("r{i}").as_bytes())).collect();
         for h in &hs {
             b.insert(h);
         }

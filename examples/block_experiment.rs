@@ -83,8 +83,12 @@ fn mib(b: u64) -> f64 {
     b as f64 / (1024.0 * 1024.0)
 }
 
+/// Where a piece landed: `(block index, offset within it, length)`.
+type PiecePlacement = (usize, usize, usize);
+
 fn main() -> anyhow::Result<()> {
-    let corpus = PathBuf::from(std::env::args().nth(1).expect("usage: block_experiment <corpus.jsonl>"));
+    let corpus =
+        PathBuf::from(std::env::args().nth(1).expect("usage: block_experiment <corpus.jsonl>"));
 
     // Collect the DISTINCT pieces in fold insertion order — which is capture order, so temporally
     // adjacent pieces (same session, same task) land near each other. That ordering is what any
@@ -128,22 +132,29 @@ fn main() -> anyhow::Result<()> {
     let mut per_piece: Vec<(i32, u64)> = Vec::new();
     for lvl in [3, 19] {
         let t = Instant::now();
-        let total: u64 = pieces.iter().map(|p| zstd::bulk::compress(p, lvl).unwrap().len() as u64).sum();
+        let total: u64 =
+            pieces.iter().map(|p| zstd::bulk::compress(p, lvl).unwrap().len() as u64).sum();
         let secs = t.elapsed().as_secs_f64();
         // + 16 B framing per piece, as the fold actually writes it
         let on_disk = total + 16 * pieces.len() as u64;
         per_piece.push((lvl, on_disk));
         println!(
             "{:<12}{:>12.2}{:>9.1}x{:>11.1}x{:>13.1}s",
-            format!("zstd-{lvl}"), mib(on_disk), raw as f64 / on_disk as f64,
-            logical as f64 / on_disk as f64, secs
+            format!("zstd-{lvl}"),
+            mib(on_disk),
+            raw as f64 / on_disk as f64,
+            logical as f64 / on_disk as f64,
+            secs
         );
     }
 
     // ---- B. block framing ----
     println!();
     println!("-- block framing (read 1 piece = decompress its whole block) --");
-    println!("{:<12}{:>12}{:>10}{:>12}{:>10}{:>12}", "scheme", "size MiB", "ratio", "overall", "blocks", "compress");
+    println!(
+        "{:<12}{:>12}{:>10}{:>12}{:>10}{:>12}",
+        "scheme", "size MiB", "ratio", "overall", "blocks", "compress"
+    );
     let mut best: Option<(String, u64, usize)> = None;
     for block_bytes in [64 * 1024usize, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
         for lvl in [3, 19] {
@@ -169,10 +180,14 @@ fn main() -> anyhow::Result<()> {
             let name = format!("{}K/z{lvl}", block_bytes / 1024);
             println!(
                 "{:<12}{:>12.2}{:>9.1}x{:>11.1}x{:>10}{:>11.1}s",
-                name, mib(on_disk), raw as f64 / on_disk as f64,
-                logical as f64 / on_disk as f64, nblocks, secs
+                name,
+                mib(on_disk),
+                raw as f64 / on_disk as f64,
+                logical as f64 / on_disk as f64,
+                nblocks,
+                secs
             );
-            if best.as_ref().map_or(true, |(_, b, _)| on_disk < *b) {
+            if best.as_ref().is_none_or(|(_, b, _)| on_disk < *b) {
                 best = Some((name, on_disk, block_bytes));
             }
         }
@@ -194,7 +209,8 @@ fn main() -> anyhow::Result<()> {
 
     if let Some((_, _, bb)) = &best {
         // rebuild blocks at the winning size, record which block each piece landed in
-        let (mut blocks, mut where_of): (Vec<Vec<u8>>, Vec<(usize, usize, usize)>) = (Vec::new(), Vec::new());
+        let (mut blocks, mut where_of): (Vec<Vec<u8>>, Vec<PiecePlacement>) =
+            (Vec::new(), Vec::new());
         let mut buf: Vec<u8> = Vec::new();
         for p in &pieces {
             let off = buf.len();
@@ -208,7 +224,8 @@ fn main() -> anyhow::Result<()> {
             blocks.push(buf);
         }
         for lvl in [3, 19] {
-            let cblocks: Vec<Vec<u8>> = blocks.iter().map(|b| zstd::bulk::compress(b, lvl).unwrap()).collect();
+            let cblocks: Vec<Vec<u8>> =
+                blocks.iter().map(|b| zstd::bulk::compress(b, lvl).unwrap()).collect();
             let t = Instant::now();
             for &i in &sample {
                 let (bi, off, len) = where_of[i];
@@ -218,7 +235,8 @@ fn main() -> anyhow::Result<()> {
             let us = t.elapsed().as_secs_f64() * 1e6 / sample.len() as f64;
             println!(
                 "block {:>4}K zstd-{lvl:<2}      {us:>8.1} us/read   ({:.0}x the per-piece cost)",
-                bb / 1024, us / per_piece_us
+                bb / 1024,
+                us / per_piece_us
             );
         }
     }

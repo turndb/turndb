@@ -1,14 +1,45 @@
+[workspace]
+# The ABI lives in its own crate so the engine never carries one. `turndb` stays a Rust library
+# with a Rust API; `turndb-wasm` is the only place that speaks in pointers and status codes.
+members = [".", "bindings/wasm"]
+
 [package]
 name = "turndb"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "A content-addressed columnar store for AI traces: byte-exact, embedded, single-writer."
+repository = "https://github.com/turndb/turndb"
+documentation = "https://docs.rs/turndb"
+readme = "README.md"
+keywords = ["storage", "content-addressed", "observability", "traces", "llm"]
+categories = ["database-implementations", "compression"]
+# `rust-version` is deliberately ABSENT until CI proves one. Claiming an MSRV we have never built
+# against is the kind of unverified assertion this project refuses everywhere else.
+#
+# The dev instruments under examples/ stay in the repo (CI builds them, which is what stops them
+# rotting, and their measurements are the project's evidence) but do not belong in the published
+# tarball: they need corpora no crates.io user has.
+exclude = [
+    "examples/block_curve.rs", "examples/block_experiment.rs", "examples/cache_footprint.rs",
+    "examples/carve_bench.rs", "examples/compact_bench.rs", "examples/dedup_math.rs",
+    "examples/dict_experiment.rs", "examples/dict_order.rs", "examples/fold_corpus.rs",
+    "examples/gen_fold.rs", "examples/hash_budget.rs", "examples/merge_bench.rs",
+    "examples/merge_driver.rs", "examples/open_bench.rs", "examples/part_anatomy.rs",
+    "examples/part_corpus.rs", "examples/swe_par.rs", "examples/swe_run.rs",
+    "target/*", ".scratch/*",
+]
 
 [features]
 # SQL is a LENS, not the substrate. A storage engine should not force a query engine on every
 # embedder, so the whole plane is optional — but it is on by default, because a feature that is not
 # built by default is a feature that is not tested.
 default = ["sql"]
-sql = ["dep:datafusion", "dep:async-trait", "dep:futures"]
+sql = ["dep:datafusion", "dep:async-trait", "dep:futures", "dep:tokio"]
+# Deterministic-simulation testing: arms a recorder inside the write-path seam (src/vfs.rs) so the
+# DST harness can reconstruct every crash state. Off by default and adds nothing when off; the
+# harness runs as `cargo test --features dst --test dst`.
+dst = []
 
 [dependencies]
 # The query lens. Arrow comes in THROUGH datafusion's re-export rather than as its own dependency,
@@ -17,6 +48,9 @@ datafusion = { version = "54", optional = true }
 # TableProvider is an async trait; this is datafusion's own requirement, not an extra choice.
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
+# The runtime datafusion requires to drive a query — already in the tree through datafusion
+# itself; declaring it lets the CLI block_on a SQL statement. Adds nothing new to the build.
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # Content identity. The fold's whole addressing scheme rests on this.
 blake3 = "1"
 anyhow = "1"
@@ -30,18 +64,55 @@ serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
-memmap2 = "0.9"
 # flock: the single-writer invariant, enforced by the OS rather than by convention.
 libc = "0.2"
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+# Positioned reads via the preview1 syscalls. `std::os::wasi::fs::FileExt` would do the same thing
+# but is still unstable (`wasi_ext`), and an engine that builds only on nightly is not shippable.
+wasi = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The same zstd format, implemented in Rust, because the C one needs a C toolchain that a wasm
+# build should not require. Not a compromise codec: measured over 50 blocks / 200 MiB of six
+# content types at this crate's own 4 MiB block size and level 19, it costs 0.6% more bytes than
+# the C encoder at 0.67x the time, and every frame decodes byte-exact under the C decoder (and C
+# frames under this one). Dictionary frames interoperate both ways too.
+#
+# Pinned tight on purpose: at 0.0.x this is the least-proven dependency in the tree, and it sits in
+# the compression path of a storage engine. A per-piece BLAKE3 check on every read means a bad
+# encode is caught rather than served, but an unreadable frame would still be data loss, so the
+# version does not float.
+structured-zstd = "=0.0.49"
 
 [profile.release]
 debug = true
 
-[dev-dependencies]
-# DataFusion is async; the SQL tests need a runtime to drive it.
+# The shipped .wasm. A workspace root's profiles win over a member's, so this has to live here even
+# though only `turndb-wasm` uses it. Optimised for SIZE because the artifact is downloaded by every
+# npm install, and debug info in a binding nobody debugs at the Rust level is dead weight.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+panic = "abort"
+
+# DataFusion is async; the SQL tests need a runtime to drive it. Scoped away from wasm because
+# dev-dependencies are built for examples too, and a multi-thread runtime does not compile there —
+# the SQL lens is a native-only concern anyway.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# The query demo exercises the lens, so it only exists when the lens does.
+# These exercise the lens, so they only exist when the lens does. Without the declaration a
+# `--no-default-features` build fails on the EXAMPLES while the library itself is fine — which is
+# exactly the kind of breakage the sql-off CI job exists to catch.
 [[example]]
 name = "query_demo"
+required-features = ["sql"]
+
+[[example]]
+name = "genai_query"
 required-features = ["sql"]

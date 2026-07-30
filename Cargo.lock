@@ -1962,15 +1962,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memmap2"
-version = "0.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2545,6 +2536,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "structured-zstd"
+version = "0.0.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "392eea135985654a313cdfee001e93031bacd96a3693a5dc4b0d13793e40b27a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "turndb"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2735,11 +2735,20 @@ dependencies = [
  "datafusion",
  "futures",
  "libc",
- "memmap2",
  "serde",
  "serde_json",
+ "structured-zstd",
  "tokio",
+ "wasi",
  "zstd",
+]
+
+[[package]]
+name = "turndb-wasm"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "turndb",
 ]
 
 [[package]]

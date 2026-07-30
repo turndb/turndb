@@ -174,14 +174,14 @@ fn verify(s: &Store, m: &Model, ctx: &str) {
         eff.insert(k, v);
     }
     for (id, v) in &eff {
-        let got = s
-            .reconstruct(id)
-            .unwrap_or_else(|e| panic!("{ctx}: reconstruct({id}) errored: {e}"));
+        let got =
+            s.reconstruct(id).unwrap_or_else(|e| panic!("{ctx}: reconstruct({id}) errored: {e}"));
         match v {
             Some((body, attrs)) => {
                 let got = got.unwrap_or_else(|| panic!("{ctx}: {id} is missing"));
                 assert_eq!(&got, body, "{ctx}: {id} reconstructed to the wrong bytes");
-                let rec = s.get(id).unwrap().unwrap_or_else(|| panic!("{ctx}: get({id}) is missing"));
+                let rec =
+                    s.get(id).unwrap().unwrap_or_else(|| panic!("{ctx}: get({id}) is missing"));
                 assert_eq!(&rec.attrs, attrs, "{ctx}: {id} attributes diverged");
             }
             // A DELETED id must be absent from every read path — including after merges that may or
@@ -208,7 +208,9 @@ fn run_seed(seed: u64, steps: usize) -> usize {
         .map(|i| {
             let mut v = Vec::new();
             for j in 0..(8 + (i * 37) % 400) {
-                v.extend_from_slice(blake3::hash(&((i * 1000 + j) as u32).to_le_bytes()).as_bytes());
+                v.extend_from_slice(
+                    blake3::hash(&((i * 1000 + j) as u32).to_le_bytes()).as_bytes(),
+                );
             }
             v
         })
@@ -354,7 +356,13 @@ fn crash_never_resurrects_and_never_corrupts() {
     let mut m = Model::default();
     let mut s = Store::open(&dir, cfg()).unwrap();
     let pool: Vec<Vec<u8>> = (0..8)
-        .map(|i| (0..200).flat_map(|j| blake3::hash(&((i * 500 + j) as u32).to_le_bytes()).as_bytes()[..16].to_vec()).collect())
+        .map(|i| {
+            (0..200)
+                .flat_map(|j| {
+                    blake3::hash(&((i * 500 + j) as u32).to_le_bytes()).as_bytes()[..16].to_vec()
+                })
+                .collect()
+        })
         .collect();
 
     for round in 0..40 {
@@ -383,8 +391,11 @@ fn crash_never_resurrects_and_never_corrupts() {
                     body,
                     "round {round}: a SYNCED record did not survive the crash"
                 ),
-                None => assert_eq!(s.reconstruct(id).unwrap(), None,
-                    "round {round}: a SYNCED deletion did not survive the crash"),
+                None => assert_eq!(
+                    s.reconstruct(id).unwrap(),
+                    None,
+                    "round {round}: a SYNCED deletion did not survive the crash"
+                ),
             }
         }
         // nothing may exist that was never written

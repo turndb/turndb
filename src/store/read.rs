@@ -107,6 +107,65 @@ fn locate<'a>(parts: &'a [Arc<Part>], id: &str) -> Result<Option<(&'a Arc<Part>,
 ///
 /// Two filters, and both are needed: a part's own tombstoned rows are skipped, and an id an OLDER part
 /// still lists is dropped when a newer part deletes it.
+/// Live ids in `[from, to)`, in id order (or reversed), at most `limit`.
+///
+/// The paged read: ids are sorted, so a range is a contiguous run in every part, and each part
+/// contributes it with a binary search plus a walk of exactly that run. Only ids inside the range
+/// are ever decoded, which is what separates this from [`ids`] — that one materialises the whole
+/// store to answer anything.
+///
+/// Version resolution is the store's one rule, unchanged: an id is listed when the newest part
+/// holding it is not a tombstone. Resolution happens per candidate id rather than by walking every
+/// part's visibility, so the cost tracks the page, not the store.
+///
+/// Because ids sort lexicographically, a caller who designs ids with the query in mind — a
+/// `member/timestamp/...` prefix, say — gets member-then-time paging out of this with no secondary
+/// index at all. `reverse` walks the same run backwards, which is what a newest-first UI wants.
+pub fn scan_ids(
+    parts: &[Arc<Part>],
+    from: Option<&str>,
+    to: Option<&str>,
+    limit: usize,
+    reverse: bool,
+) -> Result<Vec<String>> {
+    if limit == 0 || parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Candidates from every part's matching run. A part contributes at most its own run, so this
+    // is bounded by the range rather than by the store.
+    let mut cand: Vec<String> = Vec::new();
+    for p in parts {
+        let rows = p.rows_in_range(from, to)?;
+        if rows.is_empty() {
+            continue;
+        }
+        let listed = p.ids()?;
+        for row in rows {
+            if let Some(id) = listed.get(row) {
+                cand.push(id.clone());
+            }
+        }
+    }
+    cand.sort_unstable();
+    cand.dedup();
+    if reverse {
+        cand.reverse();
+    }
+
+    // Resolve visibility per candidate, stopping as soon as the page is full — the reason this
+    // does not call `visibility`, which is O(store).
+    let mut out = Vec::with_capacity(limit.min(cand.len()));
+    for id in cand {
+        if locate(parts, &id)?.is_some() {
+            out.push(id);
+            if out.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn ids(parts: &[Arc<Part>]) -> Result<Vec<String>> {
     let visible = visibility(parts)?;
     let mut out = Vec::new();

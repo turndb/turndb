@@ -25,7 +25,7 @@
 
 use super::{Part, PartMeta};
 use crate::fold::Loc;
-use crate::types::{PieceHash, Record};
+use crate::types::PieceHash;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,6 +53,51 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
     merge_opts(out, inputs, level, false)
 }
 
+/// One step of the k-way walk: the winning `(part, row)` for the smallest id, plus how many other
+/// parts held a superseded version of it. Parts are id-sorted and hold one version per id, so a
+/// simple positional walk suffices; later parts win ties.
+/// One id's worth of a k-way merge step: `(id, winning stream, its row, streams that carried it)`.
+type MergeGroup = (Vec<u8>, usize, usize, usize);
+
+struct KWay<'a> {
+    cursors: Vec<crate::part::idcol::IdCursor<'a>>,
+    current: Vec<Option<Vec<u8>>>,
+    row: Vec<usize>,
+}
+
+impl<'a> KWay<'a> {
+    fn new(streams: &'a [Arc<Vec<u8>>], lens: &[usize]) -> Result<KWay<'a>> {
+        let mut cursors: Vec<_> = streams
+            .iter()
+            .zip(lens)
+            .map(|(s, &n)| crate::part::idcol::IdCursor::new(s, n))
+            .collect();
+        let mut current = Vec::with_capacity(cursors.len());
+        for c in &mut cursors {
+            current.push(c.next_id()?.map(|b| b.to_vec()));
+        }
+        Ok(KWay { cursors, current, row: vec![0; streams.len()] })
+    }
+
+    fn next_group(&mut self) -> Result<Option<MergeGroup>> {
+        let min = match self.current.iter().flatten().min() {
+            Some(m) => m.clone(),
+            None => return Ok(None),
+        };
+        let mut winner = (0usize, 0usize);
+        let mut holders = 0usize;
+        for i in 0..self.cursors.len() {
+            if self.current[i].as_deref() == Some(min.as_slice()) {
+                winner = (i, self.row[i]);
+                holders += 1;
+                self.row[i] += 1;
+                self.current[i] = self.cursors[i].next_id()?.map(|b| b.to_vec());
+            }
+        }
+        Ok(Some((min, winner.0, winner.1, holders - 1)))
+    }
+}
+
 /// [`merge`], with the option to DROP tombstones rather than carry them forward.
 ///
 /// A tombstone exists to shadow older versions of its id. It can only be discarded when there is
@@ -60,6 +105,16 @@ pub fn merge(out: &Path, inputs: &[Arc<Part>], level: i32) -> Result<(PartMeta, 
 /// it can still hold an older version of that id. Dropping one otherwise RESURRECTS deleted data,
 /// which is the worst outcome available here and the reason this is a caller's decision rather than an
 /// inference: only the store knows whether the run it passed is the whole live list.
+///
+/// # Two streaming passes, not one materialized one
+///
+/// Memory here is bounded by the piece dictionary and the column universe, never by the record
+/// count. Pass A walks the id columns to find each id's winner and gathers what the streaming
+/// builder must know up front — the exact `(key, type)` universe of surviving rows and each string
+/// column's distinct values. Pass B walks again and feeds rows straight into the builder, which
+/// spools its sections to disk. (One pass cannot work: `layout` references column ordinals and
+/// string values reference dictionary ordinals, and both orderings are only known once every
+/// surviving row has been seen.)
 pub fn merge_opts(
     out: &Path,
     inputs: &[Arc<Part>],
@@ -78,7 +133,10 @@ pub fn merge_opts(
         if w[0].meta().seq_hi >= w[1].meta().seq_lo {
             bail!(
                 "merge inputs overlap in sequence: [{},{}] and [{},{}]",
-                w[0].meta().seq_lo, w[0].meta().seq_hi, w[1].meta().seq_lo, w[1].meta().seq_hi
+                w[0].meta().seq_lo,
+                w[0].meta().seq_hi,
+                w[1].meta().seq_lo,
+                w[1].meta().seq_hi
             );
         }
     }
@@ -96,73 +154,66 @@ pub fn merge_opts(
         }
     }
 
-    // K-way merge over the id columns. Parts are id-sorted and hold one version per id, so a simple
-    // positional walk suffices; later parts win ties.
-    let ids: Vec<std::sync::Arc<Vec<String>>> = parts.iter().map(|p| p.ids()).collect::<Result<_>>()?;
-    let records_in: usize = ids.iter().map(|v| v.len()).sum();
-    let mut cursor = vec![0usize; parts.len()];
-    let mut out_recs: Vec<Record> = Vec::with_capacity(records_in);
-    let mut out_tombs: Vec<bool> = Vec::with_capacity(records_in);
+    let streams: Vec<Arc<Vec<u8>>> =
+        parts.iter().map(|p| p.section_bytes("ids")).collect::<Result<_>>()?;
+    let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+    let records_in: usize = lens.iter().sum();
+
+    // ---- pass A: winners, counts, and the exact column universe of SURVIVING rows ----
+    let mut columns: std::collections::BTreeMap<(String, u8), std::collections::BTreeSet<String>> =
+        Default::default();
+    let mut records_out = 0usize;
     let mut superseded = 0usize;
     let mut tombs_kept = 0usize;
     let mut tombs_dropped = 0usize;
-
-    loop {
-        // smallest id across all cursors
-        let mut best: Option<&str> = None;
-        for (i, c) in cursor.iter().enumerate() {
-            if let Some(id) = ids[i].get(*c) {
-                if best.map_or(true, |b| id.as_str() < b) {
-                    best = Some(id);
-                }
-            }
-        }
-        let Some(id) = best.map(|s| s.to_string()) else { break };
-
-        // every part holding it advances; the LAST (highest sequence) wins
-        let mut winner: Option<(usize, usize)> = None;
-        for (i, c) in cursor.iter_mut().enumerate() {
-            if ids[i].get(*c).map(|s| s.as_str()) == Some(id.as_str()) {
-                if winner.is_some() {
-                    superseded += 1;
-                }
-                winner = Some((i, *c));
-                *c += 1;
-            }
-        }
-        let (pi, row) = winner.expect("an id was found, so some part holds it");
+    let mut kway = KWay::new(&streams, &lens)?;
+    while let Some((_, pi, row, shadowed)) = kway.next_group()? {
+        superseded += shadowed;
         if parts[pi].is_tombstone(row)? {
             if drop_tombstones {
                 tombs_dropped += 1;
-                continue;
+            } else {
+                tombs_kept += 1;
+                records_out += 1;
             }
-            tombs_kept += 1;
-            out_recs.push(Record { id, body: Vec::new(), attrs: Vec::new() });
-            out_tombs.push(true);
-        } else {
-            out_recs.push(parts[pi].record(row)?);
-            out_tombs.push(false);
+            continue;
+        }
+        records_out += 1;
+        for (k, v) in parts[pi].attrs(row)? {
+            let e = columns.entry((k, v.type_tag())).or_default();
+            if let crate::types::AttrValue::Str(s) = v {
+                e.insert(s);
+            }
         }
     }
+    let string_dicts: Vec<Vec<String>> =
+        columns.values().map(|s| s.iter().cloned().collect()).collect();
+    let columns: Vec<(String, u8)> = columns.into_keys().collect();
 
-    // RETAIN the whole gathered union, not just what the surviving records reference. The fold never
-    // forgets, so every piece any input knew about is still stored and still worth deduping against —
-    // and a record staged but not yet flushed may have matched against an entry that is about to stop
-    // being referenced here.
-    let meta = super::build_full(
-        out,
-        &out_recs,
-        &out_tombs,
-        seq_lo,
-        seq_hi,
-        level,
-        |h| locs.get(h).copied(),
-        &locs,
-    )?;
+    // ---- pass B: stream every winning row into the builder ----
+    //
+    // The builder's dictionary RETAINS the whole gathered union, not just what the surviving
+    // records reference. The fold never forgets, so every piece any input knew about is still
+    // stored and still worth deduping against — and a record staged but not yet flushed may have
+    // matched against an entry that would otherwise stop being referenced here.
+    let dict: Vec<(Loc, PieceHash)> = locs.iter().map(|(h, l)| (*l, *h)).collect();
+    let mut b = crate::part::builder::StreamBuilder::new(out, level, dict, columns, string_dicts)?;
+    let mut kway = KWay::new(&streams, &lens)?;
+    while let Some((id, pi, row, _)) = kway.next_group()? {
+        if parts[pi].is_tombstone(row)? {
+            if !drop_tombstones {
+                b.push(&id, true, &[], &[])?;
+            }
+            continue;
+        }
+        b.push(&id, false, &parts[pi].body(row)?, &parts[pi].attrs(row)?)?;
+    }
+    let meta = b.finish(seq_lo, seq_hi)?;
+
     let stats = MergeStats {
         inputs: parts.len(),
         records_in,
-        records_out: out_recs.len(),
+        records_out,
         superseded,
         tombstones_kept: tombs_kept,
         tombstones_dropped: tombs_dropped,
@@ -175,16 +226,23 @@ pub fn merge_opts(
 mod tests {
     use super::*;
     use crate::fold::{Fold, FoldCfg};
-    use crate::types::{AttrValue, BodyOp};
+    use crate::types::{AttrValue, BodyOp, Record};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let n =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let d = std::env::temp_dir().join(format!("turndb-merge-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
-    fn part_of(dir: &std::path::Path, fold: &mut Fold, name: &str, seq: u64, recs: &[(&str, &str)]) -> Arc<Part> {
+    fn part_of(
+        dir: &std::path::Path,
+        fold: &mut Fold,
+        name: &str,
+        seq: u64,
+        recs: &[(&str, &str)],
+    ) -> Arc<Part> {
         let rs: Vec<Record> = recs
             .iter()
             .map(|(id, body)| {
@@ -244,6 +302,83 @@ mod tests {
             std::fs::read(&p2).unwrap(),
             "a merge must be a pure function of its input SET, not of argument order"
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The pre-streaming merge — gather every winning record, hand the lot to build_full with the
+    /// retained union — replayed inline as the ORACLE: the streaming two-pass merge must produce
+    /// the identical file, byte for byte, tombstones included.
+    #[test]
+    fn streaming_merge_matches_the_materialized_oracle_byte_for_byte() {
+        let d = tmpdir("oracle");
+        let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+        let a = part_of(&d, &mut fold, "a.part", 1, &[("k1", "one"), ("k2", "two")]);
+        let b = part_of(&d, &mut fold, "b.part", 2, &[("k2", "TWO-NEW"), ("k3", "three")]);
+        // a third part deleting k1 — a tombstone the merge must carry forward
+        let tomb_rec = Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() };
+        let cp = d.join("c.part");
+        super::super::build_full(&cp, &[tomb_rec], &[true], 3, 3, 3, |_| None, &HashMap::new())
+            .unwrap();
+        let c = Arc::new(Part::open(&cp).unwrap());
+        fold.sync().unwrap();
+
+        let streamed = d.join("streamed.part");
+        merge(&streamed, &[a.clone(), b.clone(), c.clone()], 3).unwrap();
+
+        // The oracle: winners are k1 (tombstone from c), k2 (from b), k3 (from b); the dictionary
+        // retains the whole union.
+        let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
+        for p in [&a, &b, &c] {
+            for i in 0..p.piece_count().unwrap() {
+                let (loc, hash) = p.piece(i).unwrap();
+                locs.entry(hash).or_insert(loc);
+            }
+        }
+        let recs = vec![
+            Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() },
+            b.record(b.find("k2").unwrap().unwrap()).unwrap(),
+            b.record(b.find("k3").unwrap().unwrap()).unwrap(),
+        ];
+        let oracle = d.join("oracle.part");
+        super::super::build_full(
+            &oracle,
+            &recs,
+            &[true, false, false],
+            1,
+            3,
+            3,
+            |h| locs.get(h).copied(),
+            &locs,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&streamed).unwrap(),
+            std::fs::read(&oracle).unwrap(),
+            "the streaming merge must be byte-identical to the materialized algorithm"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A total merge of a store whose every record was deleted: the tombstones drop, and the
+    /// output is a VALID EMPTY part — zero records, empty sections, correct footer — not an error
+    /// and not a refusal. Deleting everything you stored is an ordinary thing to have done.
+    #[test]
+    fn a_total_merge_of_only_tombstones_yields_a_valid_empty_part() {
+        let d = tmpdir("allgone");
+        let r = Record { id: "x".into(), body: Vec::new(), attrs: Vec::new() };
+        let p1 = d.join("a.part");
+        super::super::build_full(&p1, &[r], &[true], 1, 1, 3, |_| None, &HashMap::new()).unwrap();
+        let a = Arc::new(Part::open(&p1).unwrap());
+
+        let out = d.join("m.part");
+        let (meta, st) = merge_opts(&out, &[a], 3, true).unwrap();
+        assert_eq!(meta.n_records, 0);
+        assert_eq!(st.tombstones_dropped, 1);
+        let m = Part::open(&out).unwrap();
+        assert_eq!(m.len(), 0);
+        assert!(m.ids().unwrap().is_empty());
+        assert!(m.find("x").unwrap().is_none());
         std::fs::remove_dir_all(&d).ok();
     }
 

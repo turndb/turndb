@@ -37,7 +37,10 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
             id: "genai:aè#input".into(),
             body: vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }],
             // the SAME key at a different type — must become a separate column
-            attrs: vec![("mixed".into(), AttrValue::Str("7".into())), ("g".into(), AttrValue::Float(0.0))],
+            attrs: vec![
+                ("mixed".into(), AttrValue::Str("7".into())),
+                ("g".into(), AttrValue::Float(0.0)),
+            ],
         },
         Record {
             // interleaving that column storage alone cannot reproduce: a, b, a
@@ -55,7 +58,11 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
                 ("a".into(), AttrValue::Str("two".into())),
             ],
         },
-        Record { id: "rec:no-attrs".into(), body: vec![BodyOp::Lit(b"bare".to_vec())], attrs: Vec::new() },
+        Record {
+            id: "rec:no-attrs".into(),
+            body: vec![BodyOp::Lit(b"bare".to_vec())],
+            attrs: Vec::new(),
+        },
         Record {
             id: "rec:empty-body".into(),
             body: Vec::new(),
@@ -153,7 +160,12 @@ fn scales_to_many_records_with_shared_content() {
 
     // 2,000 records over a small shared piece pool — the dedup shape a real trace store has
     let pieces: Vec<_> = (0..40)
-        .map(|i| fold.put(format!("shared message body number {i}, with padding to give it size").as_bytes()).unwrap())
+        .map(|i| {
+            fold.put(
+                format!("shared message body number {i}, with padding to give it size").as_bytes(),
+            )
+            .unwrap()
+        })
         .collect();
     let recs: Vec<Record> = (0..2000)
         .map(|i| Record {
@@ -200,12 +212,16 @@ fn piece_dictionary_is_in_fold_order() {
     // this ordering, so it is asserted rather than assumed.
     let dir = tmp("dictorder");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut fold = Fold::open(&dir.join("fold"), FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+    let mut fold =
+        Fold::open(&dir.join("fold"), FoldCfg { block_target: 4096, ..Default::default() })
+            .unwrap();
     let recs: Vec<Record> = (0..200)
         .map(|i| Record {
             id: format!("r{i:04}"),
             body: vec![{
-                let p = fold.put(format!("piece {i} with enough bytes to matter for blocking").as_bytes()).unwrap();
+                let p = fold
+                    .put(format!("piece {i} with enough bytes to matter for blocking").as_bytes())
+                    .unwrap();
                 BodyOp::Piece { hash: p.hash, len: p.loc.raw }
             }],
             attrs: Vec::new(),
@@ -240,7 +256,10 @@ fn a_torn_part_is_refused() {
     let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(len - 8).unwrap();
     drop(f);
-    assert!(Part::open(&path).is_err(), "a part without its footer must be refused, never half-read");
+    assert!(
+        Part::open(&path).is_err(),
+        "a part without its footer must be refused, never half-read"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -339,8 +358,6 @@ fn a_toc_pointing_past_the_file_is_refused() {
     std::fs::remove_dir_all(&d).ok();
 }
 
-
-
 // ---------------------------------------------------------------------------------------------
 // Format levers. The fold could always refuse an unknown future; until now the part could not.
 // ---------------------------------------------------------------------------------------------
@@ -432,6 +449,154 @@ fn verification_is_opt_in_and_reads_do_not_pay_for_it() {
     // ...while an ordinary read does not run it. Whether this particular read errors or returns junk
     // depends on where the bit landed; what matters is that no checksum work happened.
     let _ = p.record(0);
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_part_reads_identically_out_of_an_embedded_extent() {
+    // The pack concept, proven at the part level: a part is footer-addressed, so it can live at an
+    // offset inside a bigger file and be read through a bounded extent with no code knowing the
+    // difference. Byte-identical answers, and no read may wander outside the extent.
+    let d = tmp("embedded");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let records = fixture(&mut fold);
+    let path = d.join("plain.part");
+    part::build(&path, &records, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
+    fold.sync().unwrap();
+    let part_bytes = std::fs::read(&path).unwrap();
+
+    // A "pack": garbage, the part, more garbage. Only the extent bounds say where the part is.
+    let packish = d.join("packish.bin");
+    let prefix = b"NOT-A-PART-PREFIX-0123456789".repeat(7);
+    let mut whole = prefix.clone();
+    whole.extend_from_slice(&part_bytes);
+    whole.extend_from_slice(&b"TRAILING-GARBAGE".repeat(11));
+    std::fs::write(&packish, &whole).unwrap();
+
+    let plain = Part::open(&path).unwrap();
+    let f = std::fs::File::open(&packish).unwrap();
+    let extent = turndb::readat::Slice::new(f, prefix.len() as u64, part_bytes.len() as u64);
+    let embedded =
+        Part::open_reader(Box::new(extent), turndb::part::cache::SectionCache::shared()).unwrap();
+
+    assert_eq!(plain.meta(), embedded.meta());
+    assert_eq!(plain.ids().unwrap(), embedded.ids().unwrap());
+    for r in 0..plain.len() {
+        assert_eq!(
+            plain.record(r).unwrap(),
+            embedded.record(r).unwrap(),
+            "row {r} must read identically out of the extent"
+        );
+        assert_eq!(
+            plain.reconstruct(r, &fold).unwrap(),
+            embedded.reconstruct(r, &fold).unwrap(),
+            "row {r} content must reconstruct identically out of the extent"
+        );
+    }
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn the_streaming_builder_is_byte_identical_to_build_full() {
+    // The in-memory builder is the streaming builder's ORACLE: same rows, same universes, and the
+    // two files must match byte for byte — encodings, section order, TOC, footer, everything.
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    let d = tmp("streambuild");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let mut records = fixture(&mut fold);
+    records.push(Record { id: "zzz:tomb".into(), body: vec![], attrs: vec![] });
+    let tombs: Vec<bool> = records.iter().map(|r| r.id == "zzz:tomb").collect();
+    fold.sync().unwrap();
+
+    let p1 = d.join("a.part");
+    part::build_full(&p1, &records, &tombs, 3, 9, 3, |h| fold.lookup(*h), &HashMap::new()).unwrap();
+
+    // The streaming side gets what a merge can cheaply know up front: the piece dictionary, the
+    // column universe with string dictionaries — then rows in id order.
+    let mut dict_map = HashMap::new();
+    for r in &records {
+        for op in &r.body {
+            if let BodyOp::Piece { hash, .. } = op {
+                dict_map.entry(*hash).or_insert_with(|| fold.lookup(*hash).unwrap());
+            }
+        }
+    }
+    let dict: Vec<_> = dict_map.into_iter().map(|(h, l)| (l, h)).collect();
+    let mut cols: BTreeMap<(String, u8), BTreeSet<String>> = BTreeMap::new();
+    for r in &records {
+        for (k, v) in &r.attrs {
+            let e = cols.entry((k.clone(), v.type_tag())).or_default();
+            if let AttrValue::Str(s) = v {
+                e.insert(s.clone());
+            }
+        }
+    }
+    let columns: Vec<(String, u8)> = cols.keys().cloned().collect();
+    let dicts: Vec<Vec<String>> = cols.values().map(|s| s.iter().cloned().collect()).collect();
+
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_by(|&a, &b| records[a].id.cmp(&records[b].id));
+    let p2 = d.join("b.part");
+    let mut b = turndb::part::builder::StreamBuilder::new(&p2, 3, dict, columns, dicts).unwrap();
+    for &i in &order {
+        let r = &records[i];
+        b.push(r.id.as_bytes(), tombs[i], &r.body, &r.attrs).unwrap();
+    }
+    b.finish(3, 9).unwrap();
+
+    assert_eq!(
+        std::fs::read(&p1).unwrap(),
+        std::fs::read(&p2).unwrap(),
+        "the streaming builder must be BYTE-IDENTICAL to build_full"
+    );
+    assert!(
+        !std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".s")),
+        "spools must be cleaned up"
+    );
+    drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn zone_maps_bound_columns_and_refuse_to_lie() {
+    let d = tmp("zones");
+    std::fs::create_dir_all(&d).unwrap();
+    let fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
+    let rec = |id: &str, n: i64, t: f64, nanf: f64| Record {
+        id: id.into(),
+        body: vec![BodyOp::Lit(b"x".to_vec())],
+        attrs: vec![
+            ("n".into(), AttrValue::Int(n)),
+            ("t".into(), AttrValue::Float(t)),
+            ("nanf".into(), AttrValue::Float(nanf)),
+            ("ok".into(), AttrValue::Bool(true)),
+            ("s".into(), AttrValue::Str(format!("v{n}"))),
+        ],
+    };
+    let records =
+        vec![rec("a", 5, 1.5, 0.0), rec("b", -3, 2.5, f64::NAN), rec("c", 42, -9.25, 1.0)];
+    let path = d.join("z.part");
+    part::build(&path, &records, 1, 1, 3, |h| fold.lookup(*h)).unwrap();
+    let p = Part::open(&path).unwrap();
+
+    // colmeta ordinals are sorted (key, tag): n=0, nanf=1, ok=2, s=3, t=4
+    assert_eq!(p.zone(0).unwrap(), Some((AttrValue::Int(-3), AttrValue::Int(42))));
+    assert_eq!(p.zone(1).unwrap(), None, "a NaN anywhere makes a float column unprunable");
+    assert_eq!(p.zone(2).unwrap(), Some((AttrValue::Bool(true), AttrValue::Bool(true))));
+    assert_eq!(
+        p.zone(3).unwrap(),
+        None,
+        "strings carry no zone — the dictionary already bounds them"
+    );
+    assert_eq!(p.zone(4).unwrap(), Some((AttrValue::Float(-9.25), AttrValue::Float(2.5))));
+    assert_eq!(p.zone(9).unwrap(), None, "an out-of-range ordinal is no pruning, not an error");
     drop(fold);
     std::fs::remove_dir_all(&d).ok();
 }

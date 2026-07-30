@@ -121,14 +121,21 @@ fn main() -> anyhow::Result<()> {
     let f = std::fs::File::open(&corpus)?;
     let rdr = BufReader::with_capacity(1 << 20, f);
 
-    let (mut records, mut logical, mut refs, mut dups, mut lit_bytes) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut records, mut logical, mut refs, mut dups, mut lit_bytes) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut verified = 0u64;
     // Decompose the ratio: dedup and compression are different wins and must be reported apart.
     // Compression is now per BLOCK, so a per-piece stored size no longer exists — the compressed
     // figure comes from the fold's durable bytes.
     let mut distinct_raw = 0u64;
-    const BUCKETS: [(&str, u32); 6] =
-        [("<256B", 256), ("256B-1K", 1024), ("1K-4K", 4096), ("4K-16K", 16384), ("16K-64K", 65536), (">=64K", u32::MAX)];
+    const BUCKETS: [(&str, u32); 6] = [
+        ("<256B", 256),
+        ("256B-1K", 1024),
+        ("1K-4K", 4096),
+        ("4K-16K", 16384),
+        ("16K-64K", 65536),
+        (">=64K", u32::MAX),
+    ];
     let mut hist = [(0u64, 0u64); 6]; // (count, raw)
     let t0 = Instant::now();
 
@@ -196,26 +203,49 @@ fn main() -> anyhow::Result<()> {
     let disk = fold.disk_bytes();
     let distinct = refs - dups;
 
-    println!("\r{:<28}{}  block={}K level={}", "corpus", corpus.display(), block_target / 1024, level);
+    println!(
+        "\r{:<28}{}  block={}K level={}",
+        "corpus",
+        corpus.display(),
+        block_target / 1024,
+        level
+    );
     println!("{:<28}{records}", "records");
     println!("{:<28}{:.2} MiB", "logical body bytes", mib(logical));
     println!();
     println!("{:<28}{refs}", "piece references");
-    println!("{:<28}{distinct}  ({:.1}% of refs)", "distinct pieces", distinct as f64 * 100.0 / refs as f64);
-    println!("{:<28}{dups}  ({:.1}x amplification collapsed)", "duplicate hits", refs as f64 / distinct as f64);
+    println!(
+        "{:<28}{distinct}  ({:.1}% of refs)",
+        "distinct pieces",
+        distinct as f64 * 100.0 / refs as f64
+    );
+    println!(
+        "{:<28}{dups}  ({:.1}x amplification collapsed)",
+        "duplicate hits",
+        refs as f64 / distinct as f64
+    );
     println!("{:<28}{:.2} MiB", "inline literal bytes", mib(lit_bytes));
     println!();
     println!("-- where the ratio comes from --");
     println!("{:<28}{:>10.2} MiB", "logical", mib(logical));
     println!(
         "{:<28}{:>10.2} MiB   {:.1}x  <- DEDUP (distinct pieces, uncompressed)",
-        "after dedup", mib(distinct_raw), logical as f64 / distinct_raw as f64
+        "after dedup",
+        mib(distinct_raw),
+        logical as f64 / distinct_raw as f64
     );
     println!(
         "{:<28}{:>10.2} MiB   {:.1}x  <- BLOCK COMPRESSION",
-        "fold on disk", mib(disk), distinct_raw as f64 / disk as f64
+        "fold on disk",
+        mib(disk),
+        distinct_raw as f64 / disk as f64
     );
-    println!("{:<28}{:>10.2} MiB   {:.1}x  <- overall", "", mib(disk), logical as f64 / disk as f64);
+    println!(
+        "{:<28}{:>10.2} MiB   {:.1}x  <- overall",
+        "",
+        mib(disk),
+        logical as f64 / disk as f64
+    );
     println!();
     println!("-- distinct piece sizes --");
     println!("{:<10}{:>9} {:>12}", "size", "pieces", "raw MiB");
@@ -232,10 +262,21 @@ fn main() -> anyhow::Result<()> {
         mib(small), mib(distinct_raw), small as f64 * 100.0 / distinct_raw as f64
     );
     let cs = fold.cache_stats();
-    println!("{:<28}{} hits / {} misses ({:.1}% hit)", "block cache", cs.hits, cs.misses,
-        cs.hits as f64 * 100.0 / (cs.hits + cs.misses).max(1) as f64);
+    println!(
+        "{:<28}{} hits / {} misses ({:.1}% hit)",
+        "block cache",
+        cs.hits,
+        cs.misses,
+        cs.hits as f64 * 100.0 / (cs.hits + cs.misses).max(1) as f64
+    );
     println!("{:<28}{verified} records, ALL byte-exact", "verified");
-    println!("{:<28}{:.1}s  ({:.0} rec/s, {:.1} MiB/s logical)", "elapsed", secs, records as f64 / secs, mib(logical) / secs);
+    println!(
+        "{:<28}{:.1}s  ({:.0} rec/s, {:.1} MiB/s logical)",
+        "elapsed",
+        secs,
+        records as f64 / secs,
+        mib(logical) / secs
+    );
     Ok(())
 }
 
