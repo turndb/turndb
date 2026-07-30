@@ -1,0 +1,113 @@
+# Every gate this repository enforces, in a place that runs without being asked.
+#
+# Before this existed, each check fired only at an ACTION — publish, `cargo doc`, `cargo test` — so
+# it was enforced for whoever ran the command and for nobody else. That is not hypothetical: a
+# clippy lint sat in `tests/dst.rs` because the person who ran clippy omitted `--all-features` and
+# the flags that would have caught it lived in a shell history rather than in a file. Two people ran
+# "clippy" and got different answers. The flags belong here.
+#
+# WHAT RUNS WHERE, stated because a workflow that quietly drops its expensive checks produces a
+# green tick that means less than it looks like:
+#
+#   every push and PR   fmt, clippy, rustdoc, `cargo test` x3 profiles, the example classifier,
+#                       and the npm package built from committed Rust
+#   nightly + on demand the DST harness, which reconstructs crash states and is the one suite too
+#                       slow to sit in front of every push
+#
+# The corruption suite is NOT scheduled: it is an ordinary `tests/corruption.rs` and already runs
+# inside the default `cargo test`. It was a candidate for deferral until someone checked.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  schedule:
+    # nightly, off the hour — the DST harness only
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+# A newer push supersedes an older run on the same ref. Actions minutes on a private repository are
+# billed against the org plan, so a superseded run is spend with no reader.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust gates
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --check
+
+      # --all-targets --all-features EXACTLY. Narrower flags miss the test bodies behind a feature,
+      # which is how a lint survived in this tree.
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # `#![deny(rustdoc::broken_intra_doc_links)]` in both crate roots makes this fail the build
+      # rather than wait for someone to sweep.
+      - name: rustdoc
+        run: cargo doc --no-deps
+
+      # Includes tests/package.rs, which fails if any example is neither excluded from the package
+      # nor declared user-facing, and tests/corruption.rs.
+      - name: test (default)
+        run: cargo test
+
+      # The SQL plane is optional and an embedder can turn it off, so it is built and tested off.
+      - name: test (no default features)
+        run: cargo test --no-default-features
+
+      - name: test (release)
+        run: cargo test --release
+
+  npm:
+    name: npm package
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # build.sh rebuilds turndb.wasm from the committed Rust and then runs the package suite, so
+      # the tests cannot pass against an artifact nobody built. The .wasm is gitignored and
+      # generated; on a fresh checkout there is nothing stale to inherit.
+      - name: build wasm from source and run the package suite
+        run: bash npm/build.sh
+
+  dst:
+    name: deterministic simulation (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dst
+
+      # Arms a recorder in the write-path seam and replays every crash state. Scheduled rather than
+      # per-push because of its runtime, and named here rather than omitted: a check nobody can see
+      # the absence of is the defect this file exists to remove.
+      - name: dst harness
+        run: cargo test --features dst --test dst -- --nocapture
