@@ -28,6 +28,10 @@ exclude = [
     "examples/merge_driver.rs", "examples/open_bench.rs", "examples/part_anatomy.rs",
     "examples/part_corpus.rs", "examples/swe_par.rs", "examples/swe_run.rs",
     "examples/readme_check.rs",
+    # Dev instruments added after the original list and never excluded — a benchmark and the two
+    # wasm interop proofs. `tests/package.rs` now fails if a new example is neither excluded nor
+    # declared user-facing, so this cannot drift again without someone deciding.
+    "examples/ingest_bench.rs", "examples/wasm_read.rs", "examples/wasm_smoke.rs",
     "target/*", ".scratch/*",
 ]
 
