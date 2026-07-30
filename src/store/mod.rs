@@ -787,7 +787,7 @@ impl Store {
         self.fold.put_hashed(b, hash)
     }
 
-    /// Fold the spans, log the record, and stage it. Durable only after [`sync`].
+    /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
         let mut body = Vec::with_capacity(spans.len());
         let mut novel = Vec::new();
@@ -896,7 +896,7 @@ impl Store {
         Ok(())
     }
 
-    /// Delete `id`. Durable only after [`sync`], exactly like a put.
+    /// Delete `id`. Durable only after [`Store::sync`], exactly like a put.
     ///
     /// Recorded as a TOMBSTONE rather than by removing anything: older parts are immutable and still
     /// hold the record, so a deletion has to be a newer version that says "absent". Space is not

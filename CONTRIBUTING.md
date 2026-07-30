@@ -133,3 +133,38 @@ assertions change in the same commit.
 
 crates.io, npm, and making a repository public are one-way doors. Each goes through the repository
 owner on its own review. **Landing on `main` does not approve publication.**
+
+### The publication gate
+
+These live here rather than in anyone's notes, because a gate item in one person's file is not a
+gate. Most are enforced by the toolchain and need no remembering; the ones that are not say so.
+
+**Enforced — you cannot skip these by accident:**
+
+- **The published `.wasm` is built from the source you are publishing.** `prepublishOnly` runs
+  `npm/build.sh`, which rebuilds from Rust and runs the package tests. A failing build aborts the
+  publish. *Residue:* `npm publish <a-tarball-you-built-earlier>` does not re-run it — that is a
+  deliberate act rather than an accident, and nothing in `package.json` can reach it.
+- **A broken doc link fails the build.** `#![deny(rustdoc::broken_intra_doc_links)]` in both crate
+  roots. *Reaches only `[`Item`]` link syntax* — 83 such lines against 302 carrying any backticked
+  identifier, so a stale plain-backtick reference still passes.
+- **Examples ship deliberately.** `tests/package.rs` fails if an example is neither excluded nor
+  declared user-facing. `exclude` is opt-out, so an unclassified example ships to crates.io
+  silently; this is what stops that.
+- **Tests refuse a stale `.wasm`.** `npm/turndb/test/_artifact.mjs` compares the artifact against
+  the newest engine source. Running `node --test` directly after changing Rust would otherwise
+  report the *old* engine's behaviour, which has already cost one wrong verification.
+
+**Not enforceable here — check these by hand at publish time:**
+
+- **The GitHub repository description**, once the repo is public. It is currently empty. It is a
+  standalone surface: whatever it says is the whole claim for anyone who does not click through, so
+  it must carry **no unqualified enforcement claim**. "Single-writer" belongs there only with the
+  WASI reduction attached, or not at all — the npm package description dropped it for exactly this
+  reason. The hazard is that someone fills it in from the README's first line, in a hurry, on the
+  day the repo goes public.
+- **The copyright holder in `LICENSE` and `NOTICE`** must name whoever holds the copyright at
+  publish time.
+- **Whether `crates.io` and `npm` metadata still describe what ships.** Registry `description`
+  fields render standalone, and `package.json` is not in its own `files` list — so no sweep over
+  the package payload reaches them.

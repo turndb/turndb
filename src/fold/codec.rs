@@ -13,7 +13,8 @@
 //! tag in the block header says nothing about which produced it. A store written by a WASM build is
 //! an ordinary store.
 //!
-//! The split lives in [`z`] and nowhere else, so the fallback policy above is written once.
+//! The split lives in the private `z` module and nowhere else, so the fallback policy above is
+//! written once. (Not a doc link: `z` is private, and a public page must not link into it.)
 
 use super::block::{CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 use anyhow::{bail, Result};

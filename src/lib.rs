@@ -35,6 +35,15 @@
 //! attribute order and duplicate keys. Every layer below is in service of it, and no change ships
 //! that breaks it.
 
+// A broken doc link is a documentation claim that no longer resolves, and this crate has
+// shipped three of them. Denying it makes the build refuse rather than leaving it for a
+// sweep — which matters because the one instance caught today was caught by comparing
+// `cargo doc` counts, not by anyone remembering the rule.
+//
+// Reaches only links written with `[`Item`]` syntax: 83 such lines against 302 carrying any
+// backticked identifier. The remainder is a separate problem and is not closed by this.
+#![deny(rustdoc::broken_intra_doc_links)]
+
 pub mod carve;
 pub mod fold;
 pub mod pack;
