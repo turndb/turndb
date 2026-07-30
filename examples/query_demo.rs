@@ -17,7 +17,8 @@ fn main() -> anyhow::Result<()> {
         .filter(|p| p.extension().map(|e| e == "part").unwrap_or(false))
         .collect();
     paths.sort();
-    let parts: Vec<Arc<Part>> = paths.iter().map(|p| Ok(Arc::new(Part::open(p)?))).collect::<anyhow::Result<_>>()?;
+    let parts: Vec<Arc<Part>> =
+        paths.iter().map(|p| Ok(Arc::new(Part::open(p)?))).collect::<anyhow::Result<_>>()?;
     let fold = std::sync::Arc::new(Fold::open_read(&dir.join("fold"), FoldCfg::default())?);
     let lens = Lens::new(&parts)?;
 
@@ -29,12 +30,23 @@ fn main() -> anyhow::Result<()> {
     // so batches are measured and dropped. Peak residency is one batch, whatever the projection.
     for (label, cols, need_fold) in [
         ("one attribute", vec!["gen_ai.request.model"], false),
-        ("four attributes", vec!["gen_ai.request.model", "gen_ai.response.model",
-                                 "turndb.source.repo", "turndb.call_index"], false),
+        (
+            "four attributes",
+            vec![
+                "gen_ai.request.model",
+                "gen_ai.response.model",
+                "turndb.source.repo",
+                "turndb.call_index",
+            ],
+            false,
+        ),
         ("ids only", vec!["id"], false),
         ("ids + BODY", vec!["id", "body"], true),
     ] {
-        let Ok(proj) = lens.project(&cols) else { println!("{label:<18} (columns absent)"); continue };
+        let Ok(proj) = lens.project(&cols) else {
+            println!("{label:<18} (columns absent)");
+            continue;
+        };
         let t = Instant::now();
         let mut st = ScanStats::default();
         let mut bytes = 0usize;

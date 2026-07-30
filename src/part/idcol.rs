@@ -99,15 +99,15 @@ impl<'a> IdCol<'a> {
             bail!("id index {i} out of range ({} ids)", self.len);
         }
         let group = i / RESTART;
-        let mut at = *self
-            .restarts
-            .get(group)
-            .ok_or_else(|| anyhow::anyhow!("missing restart {group}"))? as usize;
+        let mut at =
+            *self.restarts.get(group).ok_or_else(|| anyhow::anyhow!("missing restart {group}"))?
+                as usize;
         let mut cur: Vec<u8> = Vec::new();
         for _ in 0..=(i % RESTART) {
             let shared = get_varint(self.stream, &mut at)? as usize;
             let suffix_len = get_varint(self.stream, &mut at)? as usize;
-            if shared > cur.len() || at + suffix_len > self.stream.len() {
+            // `suffix_len > len - at` and not `at + suffix_len > len`: the sum can overflow.
+            if shared > cur.len() || suffix_len > self.stream.len() - at {
                 bail!("corrupt id column entry");
             }
             cur.truncate(shared);
@@ -150,6 +150,43 @@ impl<'a> IdCol<'a> {
         Ok(None)
     }
 
+    /// A streaming cursor over the ids, in order — one id resident at a time. `iter` materializes
+    /// the whole column; a merge over parts of millions of rows must not.
+    pub fn cursor(&self) -> IdCursor<'_> {
+        IdCursor { stream: self.stream, len: self.len, at: 0, done: 0, cur: Vec::new() }
+    }
+
+    /// Index of the first id `>= needle` — the lower bound a range scan starts from.
+    ///
+    /// The same binary search over restart points that [`IdCol::find`] uses, but answering "where
+    /// would it go" rather than "is it here". That difference is what turns the id column into a
+    /// range index at no additional storage cost: ids are sorted, so a range is a contiguous run,
+    /// and finding its start is all a paged query needs.
+    pub fn lower_bound(&self, needle: &[u8]) -> Result<usize> {
+        if self.len == 0 {
+            return Ok(0);
+        }
+        // largest restart group whose first id is < needle
+        let (mut lo, mut hi) = (0usize, self.restarts.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.get(mid * RESTART)?.as_slice() < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // `lo` is the first group starting at or after `needle`; the answer is in the group before
+        // it (if any), because that group straddles the boundary.
+        let start = lo.saturating_sub(1) * RESTART;
+        for i in start..self.len {
+            if self.get(i)?.as_slice() >= needle {
+                return Ok(i);
+            }
+        }
+        Ok(self.len)
+    }
+
     /// Every id in order — the scan path.
     pub fn iter(&self) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::with_capacity(self.len);
@@ -158,7 +195,7 @@ impl<'a> IdCol<'a> {
         for _ in 0..self.len {
             let shared = get_varint(self.stream, &mut at)? as usize;
             let suffix_len = get_varint(self.stream, &mut at)? as usize;
-            if shared > cur.len() || at + suffix_len > self.stream.len() {
+            if shared > cur.len() || suffix_len > self.stream.len() - at {
                 bail!("corrupt id column entry");
             }
             cur.truncate(shared);
@@ -167,6 +204,39 @@ impl<'a> IdCol<'a> {
             out.push(cur.clone());
         }
         Ok(out)
+    }
+}
+
+/// Sequential decoder holding one id of state. `next()` yields the next id or `None` at the end;
+/// a decode error surfaces as `Err`, never as a silent stop.
+pub struct IdCursor<'a> {
+    stream: &'a [u8],
+    len: usize,
+    at: usize,
+    done: usize,
+    cur: Vec<u8>,
+}
+
+impl<'a> IdCursor<'a> {
+    /// A cursor straight over a stream — for callers holding section bytes without an [`IdCol`].
+    pub fn new(stream: &'a [u8], len: usize) -> IdCursor<'a> {
+        IdCursor { stream, len, at: 0, done: 0, cur: Vec::new() }
+    }
+
+    pub fn next_id(&mut self) -> Result<Option<&[u8]>> {
+        if self.done >= self.len {
+            return Ok(None);
+        }
+        let shared = get_varint(self.stream, &mut self.at)? as usize;
+        let suffix_len = get_varint(self.stream, &mut self.at)? as usize;
+        if shared > self.cur.len() || suffix_len > self.stream.len() - self.at {
+            bail!("corrupt id column entry");
+        }
+        self.cur.truncate(shared);
+        self.cur.extend_from_slice(&self.stream[self.at..self.at + suffix_len]);
+        self.at += suffix_len;
+        self.done += 1;
+        Ok(Some(&self.cur))
     }
 }
 
@@ -201,6 +271,12 @@ mod tests {
         for (got, want) in all.iter().zip(&ids) {
             assert_eq!(got, want.as_bytes());
         }
+        // and the streaming cursor sees exactly the same sequence
+        let mut cur = c.cursor();
+        for want in &ids {
+            assert_eq!(cur.next_id().unwrap().unwrap(), want.as_bytes());
+        }
+        assert!(cur.next_id().unwrap().is_none(), "cursor must end exactly at len");
     }
 
     #[test]
@@ -221,7 +297,12 @@ mod tests {
         let ids = ids();
         let raw: usize = ids.iter().map(|s| s.len()).sum();
         let (stream, _) = build(&ids).unwrap();
-        assert!(stream.len() * 2 < raw, "front coding must roughly halve highly-shared ids: {} vs {}", stream.len(), raw);
+        assert!(
+            stream.len() * 2 < raw,
+            "front coding must roughly halve highly-shared ids: {} vs {}",
+            stream.len(),
+            raw
+        );
     }
 
     #[test]

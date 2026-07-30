@@ -37,7 +37,11 @@ fn corpus() -> Vec<Vec<u8>> {
     }
     // JSON-ish text that compresses well
     for i in 0..16 {
-        v.push(format!("{{\"gen_ai.request.model\":\"claude-{i}\",\"tokens\":{}}}", i * 31).repeat(20).into_bytes());
+        v.push(
+            format!("{{\"gen_ai.request.model\":\"claude-{i}\",\"tokens\":{}}}", i * 31)
+                .repeat(20)
+                .into_bytes(),
+        );
     }
     v
 }
@@ -122,7 +126,10 @@ fn appends_continue_correctly_after_reopen() {
     };
     let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
     let lb = f.put(&b).unwrap().loc;
-    assert!(lb.block_id > la.block_id, "the new piece must land in a later block than the recovered tail");
+    assert!(
+        lb.block_id > la.block_id,
+        "the new piece must land in a later block than the recovered tail"
+    );
     assert_eq!(f.read(la).unwrap(), a);
     assert_eq!(f.read(lb).unwrap(), b);
     std::fs::remove_dir_all(&dir).ok();
@@ -180,7 +187,8 @@ fn corrupted_frame_is_refused_not_served() {
     // flip a byte inside the payload
     {
         use std::os::unix::fs::FileExt;
-        let seg = OpenOptions::new().read(true).write(true).open(dir.join("seg-00000000.fold")).unwrap();
+        let seg =
+            OpenOptions::new().read(true).write(true).open(dir.join("seg-00000000.fold")).unwrap();
         // first block: segment header (48) + block header (16), then into the payload
         let _ = loc;
         let at = 48u64 + 16 + 4;
@@ -318,7 +326,11 @@ fn pieces_written_together_share_a_block() {
     let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
     let mut locs = Vec::new();
     for i in 0..40 {
-        locs.push(f.put(format!("{{\"role\":\"user\",\"content\":\"message {i}\"}}").as_bytes()).unwrap().loc);
+        locs.push(
+            f.put(format!("{{\"role\":\"user\",\"content\":\"message {i}\"}}").as_bytes())
+                .unwrap()
+                .loc,
+        );
     }
     let blocks: std::collections::HashSet<u32> = locs.iter().map(|l| l.block_id).collect();
     assert_eq!(blocks.len(), 1, "40 small pieces written together must share one block");
@@ -336,7 +348,11 @@ fn block_cache_serves_neighbours() {
     let mut f = Fold::open(&dir, cfg).unwrap();
     let mut locs = Vec::new();
     for i in 0..200 {
-        locs.push(f.put(format!("piece number {i} with some padding to give it size").as_bytes()).unwrap().loc);
+        locs.push(
+            f.put(format!("piece number {i} with some padding to give it size").as_bytes())
+                .unwrap()
+                .loc,
+        );
     }
     f.sync().unwrap();
     drop(f);
@@ -350,7 +366,8 @@ fn block_cache_serves_neighbours() {
     assert!(
         s.hits > s.misses * 10,
         "neighbours must come from cache: {} hits vs {} misses",
-        s.hits, s.misses
+        s.hits,
+        s.misses
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -362,15 +379,20 @@ fn a_configuration_that_would_overflow_is_refused_at_open() {
     // segment append point and Loc.in_off — both u32. Past 4 GiB they wrap, and in release that is a
     // block directory pointing at the wrong offset with no error anywhere.
     let huge = FoldCfg { block_target: 5 << 30, ..FoldCfg::default() };
-    assert!(Fold::open(&d.join("f1"), huge).is_err(), "an overflowing block_target must be refused");
+    assert!(
+        Fold::open(&d.join("f1"), huge).is_err(),
+        "an overflowing block_target must be refused"
+    );
 
     let zero = FoldCfg { block_target: 0, ..FoldCfg::default() };
     assert!(Fold::open(&d.join("f2"), zero).is_err(), "a zero block_target must be refused");
 
     for lvl in [0i32, -3, 23, 100] {
         let bad = FoldCfg { level: lvl, ..FoldCfg::default() };
-        assert!(Fold::open(&d.join(format!("f{lvl}")), bad).is_err(),
-            "zstd level {lvl} is out of range and must be refused at open, not at first write");
+        assert!(
+            Fold::open(&d.join(format!("f{lvl}")), bad).is_err(),
+            "zstd level {lvl} is out of range and must be refused at open, not at first write"
+        );
     }
 
     // and the defaults are, of course, accepted
@@ -398,7 +420,11 @@ fn recovery_rolls_back_across_segment_boundaries() {
             want.push((p.hash, p.loc, piece));
         }
         let tail = f.sync().unwrap();
-        assert!(tail.seg > 0, "the test must actually cross a segment boundary; got seg {}", tail.seg);
+        assert!(
+            tail.seg > 0,
+            "the test must actually cross a segment boundary; got seg {}",
+            tail.seg
+        );
 
         // more content AFTER the committed tail, spilling into further segments
         for i in 400..800u32 {
@@ -416,8 +442,11 @@ fn recovery_rolls_back_across_segment_boundaries() {
 
     // Recover to the committed tail: segments above it must go, and everything at or below must read.
     let f = Fold::open_at(&d, cfg, Some(committed)).unwrap();
-    assert_eq!(f.segment_count(), committed.seg + 1,
-        "segments above the committed tail must be removed");
+    assert_eq!(
+        f.segment_count(),
+        committed.seg + 1,
+        "segments above the committed tail must be removed"
+    );
     for (hash, loc, piece) in &want {
         let got = f.read_verified(*loc, *hash).unwrap();
         assert_eq!(&got, piece, "a committed piece did not survive a multi-segment rollback");
@@ -434,12 +463,160 @@ fn a_committed_tail_beyond_the_data_is_refused() {
     {
         let mut f = Fold::open(&d, cfg).unwrap();
         for i in 0..50u32 {
-            f.put(&blake3::hash(&i.to_le_bytes()).as_bytes().to_vec()).unwrap();
+            f.put(blake3::hash(&i.to_le_bytes()).as_bytes().as_ref()).unwrap();
         }
         f.sync().unwrap();
     }
     let beyond = FoldTail { seg: 99, off: 4096 };
-    assert!(Fold::open_at(&d, cfg, Some(beyond)).is_err(),
-        "a committed tail past the last good block must refuse, not truncate to it");
+    assert!(
+        Fold::open_at(&d, cfg, Some(beyond)).is_err(),
+        "a committed tail past the last good block must refuse, not truncate to it"
+    );
     std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn sealed_segments_carry_sidecars_and_survive_losing_them() {
+    // The directory sidecar is what makes open O(active segment) instead of O(store) — and it is
+    // ADVISORY: absent, torn, or stale, the segment is rescanned and the answer is identical.
+    let dir = tmp("sidecar");
+    let cfg = FoldCfg { seg_max: 256 * 1024, block_target: 32 * 1024, ..Default::default() };
+    let mut want = Vec::new();
+    {
+        let mut f = Fold::open(&dir, cfg).unwrap();
+        for b in corpus() {
+            let p = f.put(&b).unwrap();
+            want.push((p.loc, p.hash, b));
+        }
+        f.sync().unwrap();
+        assert!(f.segment_count() > 1, "the corpus must roll at least one segment");
+    }
+    let segs = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".fold"))
+        .count();
+    let sidecars = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".dir"))
+            .count()
+    };
+    assert_eq!(
+        sidecars(),
+        segs - 1,
+        "every SEALED segment rolls with a sidecar; the active has none"
+    );
+
+    // Reads through sidecar-built directories are byte-exact.
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(&f.read_verified(*loc, *hash).unwrap(), b, "sidecar-directed read drifted");
+        }
+    }
+
+    // Delete one sidecar and corrupt another: open falls back to the scan, answers identically,
+    // and the WRITER regenerates what was lost.
+    std::fs::remove_file(dir.join("seg-00000000.dir")).unwrap();
+    if segs > 2 {
+        let p = dir.join("seg-00000001.dir");
+        let mut b = std::fs::read(&p).unwrap();
+        let mid = b.len() / 2;
+        b[mid] ^= 0xFF;
+        std::fs::write(&p, &b).unwrap();
+    }
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(&f.read_verified(*loc, *hash).unwrap(), b, "fallback-scan read drifted");
+        }
+    }
+    assert_eq!(sidecars(), segs - 1, "the writer must regenerate missing or damaged sidecars");
+
+    // A stale sidecar — right checksum, wrong length for the file — is refused and rescanned.
+    let p = dir.join("seg-00000000.dir");
+    let good = std::fs::read(&p).unwrap();
+    {
+        // shrink the SEGMENT's sidecar claim by rebuilding one for a different length: simulate by
+        // truncating nothing and instead poking the tail field then re-checksumming
+        let mut b = good.clone();
+        let tail = u32::from_le_bytes(b[12..16].try_into().unwrap());
+        b[12..16].copy_from_slice(&(tail - 1).to_le_bytes());
+        let n = b.len();
+        let crc = crc32fast::hash(&b[..n - 4]);
+        b[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &b).unwrap();
+    }
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(
+                &f.read_verified(*loc, *hash).unwrap(),
+                b,
+                "stale sidecar must be refused, not trusted"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn scrub_verifies_every_frame_and_condemns_a_damaged_sealed_segment() {
+    let dir = tmp("scrub");
+    let cfg = FoldCfg { seg_max: 128 * 1024, block_target: 16 * 1024, ..Default::default() };
+    {
+        let mut f = Fold::open(&dir, cfg).unwrap();
+        for b in corpus() {
+            f.put(&b).unwrap();
+        }
+        f.sync().unwrap();
+        assert!(f.segment_count() > 1);
+        let report = f.scrub().unwrap();
+        assert!(report.blocks > 2, "a real fold scrubs real blocks: {report:?}");
+        assert_eq!(report.trailing_uncommitted, 0, "a synced fold has no residue");
+    }
+    // one flipped byte inside a SEALED segment's frame region must condemn it
+    let seg0 = dir.join("seg-00000000.fold");
+    let mut b = std::fs::read(&seg0).unwrap();
+    let mid = 48 + (b.len() - 48) / 2;
+    b[mid] ^= 0x01;
+    std::fs::write(&seg0, &b).unwrap();
+    let f = Fold::open_read(&dir, cfg).unwrap();
+    assert!(f.scrub().is_err(), "a damaged sealed segment must fail the scrub");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_segment_claiming_encryption_or_an_unknown_flag_refuses() {
+    // Reject-forward: the encryption bit is reserved and REFUSED, so if encryption is ever built
+    // every reader shipped before it declines rather than serving ciphertext as content. The
+    // refusal names encryption, because that sends an operator somewhere different from
+    // "unknown flags".
+    let dir = tmp("encflag");
+    {
+        let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
+        f.put(b"content a future build might have encrypted").unwrap();
+        f.sync().unwrap();
+    }
+    let seg = dir.join("seg-00000000.fold");
+    let pristine = std::fs::read(&seg).unwrap();
+
+    let mut b = pristine.clone();
+    b[12..16].copy_from_slice(&turndb::fold::segment::SEG_FLAG_ENCRYPTED.to_le_bytes());
+    std::fs::write(&seg, &b).unwrap();
+    let err = match Fold::open_read(&dir, FoldCfg::default()) {
+        Err(e) => format!("{e:#}"),
+        Ok(_) => panic!("a segment claiming encryption must refuse"),
+    };
+    assert!(err.contains("ENCRYPTED"), "the refusal must name encryption: {err}");
+
+    let mut b = pristine;
+    b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
+    std::fs::write(&seg, &b).unwrap();
+    assert!(Fold::open_read(&dir, FoldCfg::default()).is_err(), "unknown flags must refuse");
+    std::fs::remove_dir_all(&dir).ok();
 }

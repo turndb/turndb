@@ -11,8 +11,11 @@
 
 use super::block::{CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 use anyhow::Result;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
 
 /// A sealed block on its way to disk.
 pub struct Job {
@@ -28,6 +31,7 @@ pub struct Done {
     pub payload: Vec<u8>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Pool {
     tx: Option<SyncSender<Job>>,
     /// Behind a Mutex purely so `Pool` — and therefore `Fold` — is `Sync`. A `Receiver` is `Send` but
@@ -39,6 +43,7 @@ pub struct Pool {
     pub outstanding: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Pool {
     /// `dict` is the active segment's trained dictionary, if any. It is cloned into each worker
     /// because a dictionary belongs to a segment and outlives any single block.
@@ -62,14 +67,16 @@ impl Pool {
                         Err(_) => return,
                     }
                 };
-                let (codec, payload) = match super::codec::encode(&job.raw, dict.as_deref().map(|v| &v[..]), level) {
-                    Ok((c, p)) => (c, p.into_owned()),
-                    // A compression failure must not be silently dropped: fall back to stored, which
-                    // is always valid, and let the frame's own checks catch anything worse.
-                    Err(_) => (CODEC_STORED, job.raw.as_ref().clone()),
-                };
+                let (codec, payload) =
+                    match super::codec::encode(&job.raw, dict.as_deref().map(|v| &v[..]), level) {
+                        Ok((c, p)) => (c, p.into_owned()),
+                        // A compression failure must not be silently dropped: fall back to stored, which
+                        // is always valid, and let the frame's own checks catch anything worse.
+                        Err(_) => (CODEC_STORED, job.raw.as_ref().clone()),
+                    };
                 debug_assert!(matches!(codec, CODEC_STORED | CODEC_ZSTD | CODEC_ZSTD_DICT));
-                if dtx.send(Done { block_id: job.block_id, codec, raw: job.raw, payload }).is_err() {
+                if dtx.send(Done { block_id: job.block_id, codec, raw: job.raw, payload }).is_err()
+                {
                     return;
                 }
             }));
@@ -103,7 +110,12 @@ impl Pool {
     pub fn take_all(&mut self) -> Result<Vec<Done>> {
         let mut out = Vec::new();
         while self.outstanding > 0 {
-            let d = self.rx.lock().unwrap().recv().map_err(|_| anyhow::anyhow!("compression pool died with work outstanding"))?;
+            let d = self
+                .rx
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| anyhow::anyhow!("compression pool died with work outstanding"))?;
             self.outstanding -= 1;
             out.push(d);
         }
@@ -111,11 +123,61 @@ impl Pool {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Pool {
     fn drop(&mut self) {
         self.tx.take();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
+    }
+}
+
+// ── The single-threaded pool ────────────────────────────────────────────────
+
+/// `wasm32` has no threads, so the same API compresses inline on `submit`.
+///
+/// This is a scheduling change, not a behaviour change. `outstanding` still counts blocks handed
+/// over but not yet collected, `take_all` still returns every one of them, and the bytes produced
+/// are identical — the work simply happens on the caller's stack instead of a worker's. The writer
+/// loses the overlap the pool exists to buy, which is the honest cost of the target.
+#[cfg(target_arch = "wasm32")]
+pub struct Pool {
+    done: std::collections::VecDeque<Done>,
+    level: i32,
+    dict: Option<Arc<Vec<u8>>>,
+    pub outstanding: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Pool {
+    /// `threads` is accepted and ignored — callers should not have to know the target.
+    pub fn new(_threads: usize, level: i32, dict: Option<Arc<Vec<u8>>>) -> Pool {
+        Pool { done: std::collections::VecDeque::new(), level, dict, outstanding: 0 }
+    }
+
+    pub fn submit(&mut self, block_id: u32, raw: Arc<Vec<u8>>) -> Result<()> {
+        // Same fallback as a worker: a compression failure becomes a stored block rather than a
+        // lost one, and the frame's own checks catch anything worse.
+        let (codec, payload) =
+            match super::codec::encode(&raw, self.dict.as_deref().map(|v| &v[..]), self.level) {
+                Ok((c, p)) => (c, p.into_owned()),
+                Err(_) => (CODEC_STORED, raw.as_ref().clone()),
+            };
+        debug_assert!(matches!(codec, CODEC_STORED | CODEC_ZSTD | CODEC_ZSTD_DICT));
+        self.done.push_back(Done { block_id, codec, raw, payload });
+        self.outstanding += 1;
+        Ok(())
+    }
+
+    pub fn try_take(&mut self) -> Vec<Done> {
+        let out: Vec<Done> = self.done.drain(..).collect();
+        self.outstanding -= out.len();
+        out
+    }
+
+    /// Everything submitted is already finished, so this cannot block or fail.
+    pub fn take_all(&mut self) -> Result<Vec<Done>> {
+        Ok(self.try_take())
     }
 }

@@ -37,7 +37,6 @@
 //! referenced. Tombstones themselves go too: a re-fold covers every part, so nothing survives for them
 //! to shadow.
 
-
 use crate::fold::{Fold, FoldCfg, Loc};
 use crate::part::{self, Part};
 use crate::types::{BodyOp, PieceHash, Record};
@@ -55,15 +54,13 @@ pub fn fold_dir(dir: &Path, gen: u32) -> PathBuf {
     }
 }
 
-/// Is `name` a fold directory for some generation other than `live`?
-pub fn is_stale_fold(name: &str, live: u32) -> bool {
+/// The generation a fold directory name denotes: `fold` is 0, `fold-NNNN` is N. `None` for a name
+/// that is not a fold directory at all.
+pub fn parse_fold_gen(name: &str) -> Option<u32> {
     if name == "fold" {
-        return live != 0;
+        return Some(0);
     }
-    match name.strip_prefix("fold-").and_then(|g| g.parse::<u32>().ok()) {
-        Some(g) => g != live,
-        None => false,
-    }
+    name.strip_prefix("fold-").and_then(|g| g.parse::<u32>().ok())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -79,9 +76,17 @@ pub struct RefoldStats {
     pub pieces_dropped: usize,
     pub fold_bytes_before: u64,
     pub fold_bytes_after: u64,
+    /// The superseded fold generation could not be unlinked and is still on disk. The re-fold itself
+    /// committed and is correct; the space is simply not reclaimed yet, and a caller reading
+    /// [`RefoldStats::bytes_reclaimed`] needs to know that.
+    pub stale_generation_left: bool,
 }
 
 impl RefoldStats {
+    /// Bytes the re-fold removed — **provided [`stale_generation_left`] is false**. If the old
+    /// generation could not be unlinked, this is what WILL be reclaimed once it is, not what has been.
+    ///
+    /// [`stale_generation_left`]: RefoldStats::stale_generation_left
     pub fn bytes_reclaimed(&self) -> u64 {
         self.fold_bytes_before.saturating_sub(self.fold_bytes_after)
     }
@@ -91,6 +96,10 @@ impl RefoldStats {
 ///
 /// `parts` must be the store's full live list — a re-fold is all-or-nothing by construction, because
 /// content it drops could otherwise still be referenced by a part it did not rebuild.
+/// A part the re-fold rebuilt: `(file name, seq_lo, seq_hi, record count)` — what the caller needs
+/// to write a new manifest entry for it.
+pub type RefoldedPart = (String, u64, u64, u32);
+
 pub fn refold(
     dir: &Path,
     parts: &[Arc<Part>],
@@ -98,14 +107,14 @@ pub fn refold(
     old_fold: &Fold,
     old_gen: u32,
     cfg: FoldCfg,
-) -> Result<(u32, Vec<(String, u64, u64, u32)>, RefoldStats)> {
+) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
     if parts.len() != seqs.len() {
         bail!("every part needs its committed sequence range");
     }
     let new_gen = old_gen + 1;
     let new_dir = fold_dir(dir, new_gen);
     if new_dir.exists() {
-        std::fs::remove_dir_all(&new_dir)?;
+        crate::vfs::remove_tree(&new_dir)?;
     }
 
     let mut st = RefoldStats { parts_in: parts.len(), ..Default::default() };
@@ -126,9 +135,9 @@ pub fn refold(
                 if wanted.contains_key(&hash) {
                     continue;
                 }
-                let loc = parts[pi]
-                    .lookup_piece(&hash)?
-                    .ok_or_else(|| anyhow::anyhow!("live record references piece {hash}, which no part locates"))?;
+                let loc = parts[pi].lookup_piece(&hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("live record references piece {hash}, which no part locates")
+                })?;
                 wanted.insert(hash, loc);
             }
         }

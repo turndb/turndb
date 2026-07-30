@@ -6,3 +6,7 @@
 /scratch
 /.claude
 *.fold
+npm/turndb/turndb.wasm
+npm/turndb/LICENSE
+npm/turndb/NOTICE
+npm/turndb/*.tgz

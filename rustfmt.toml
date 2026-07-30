@@ -1,0 +1,9 @@
+# The codebase's existing style, codified rather than imposed.
+#
+# `use_small_heuristics = "Max"` is the load-bearing line: it lets a struct literal, a match arm, or
+# a block stay on ONE line whenever it fits inside `max_width`. Default rustfmt would explode ~800
+# of those across this crate — a diff that touches nearly every file, changes no behaviour, and
+# destroys layout that was chosen deliberately. Reformatting a codebase to match a tool's defaults
+# is not a style decision; this file is the style decision.
+max_width = 100
+use_small_heuristics = "Max"

@@ -85,7 +85,41 @@ fn arrow_type(tag: u8) -> DataType {
 
 /// A comparison a scan can evaluate for itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cmp { Eq, Ne, Lt, LtEq, Gt, GtEq }
+pub enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+/// Does the zone `(min, max)` PROVE that `<op> val` matches nothing in it? `false` on any doubt —
+/// a type mismatch, a NaN literal — because a zone may only ever widen a scan, never wrongly
+/// narrow one. `Ne` is disproven only when the column is constant at exactly `val`.
+fn zone_disproves(op: Cmp, val: &AttrValue, zone: &(AttrValue, AttrValue)) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    fn ord(a: &AttrValue, b: &AttrValue) -> Option<std::cmp::Ordering> {
+        match (a, b) {
+            (AttrValue::Int(x), AttrValue::Int(y)) => Some(x.cmp(y)),
+            (AttrValue::Float(x), AttrValue::Float(y)) => x.partial_cmp(y),
+            (AttrValue::Bool(x), AttrValue::Bool(y)) => Some(x.cmp(y)),
+            _ => None,
+        }
+    }
+    let (min, max) = zone;
+    let (Some(lo), Some(hi)) = (ord(val, min), ord(val, max)) else {
+        return false;
+    };
+    match op {
+        Cmp::Eq => lo == Less || hi == Greater,
+        Cmp::Ne => lo == Equal && hi == Equal,
+        Cmp::Lt => lo != Greater,   // every value >= min >= val
+        Cmp::LtEq => lo == Less,    // every value >= min > val
+        Cmp::Gt => hi != Less,      // every value <= max <= val
+        Cmp::GtEq => hi == Greater, // every value <= max < val
+    }
+}
 
 /// `field <op> value`, against a [`Lens`] schema field.
 ///
@@ -184,19 +218,37 @@ impl Lens {
             Field::new(F_BODY, DataType::Binary, true),
         ];
         let mut binding = vec![None, None];
+        // Field names must be UNIQUE, and nothing about the data guarantees it. An attribute literally
+        // named `id` or `body` collides with the synthesised columns; a key literally named `a#str`
+        // collides with the disambiguation of a multi-typed `a`. DataFusion rejects a duplicate at
+        // TABLE REGISTRATION, so either case made the whole store unqueryable — including
+        // `select count(*)` — rather than affecting only the offending column.
+        //
+        // Resolved by construction instead of by hoping: take the natural name if it is free, fall
+        // back to `key#type`, and only then to an ordinal. Renaming a column is a far smaller harm
+        // than refusing to answer any query at all.
+        let mut used: std::collections::HashSet<String> =
+            [F_ID, F_BODY].into_iter().map(String::from).collect();
         for (key, ts) in &tags {
             for &t in ts {
                 // A key with one type keeps its name. A key with several is never silently merged.
-                let name = if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                let mut name =
+                    if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                if used.contains(&name) {
+                    name = format!("{key}#{}", type_name(t));
+                }
+                let mut n = 2usize;
+                while used.contains(&name) {
+                    name = format!("{key}#{}#{n}", type_name(t));
+                    n += 1;
+                }
+                used.insert(name.clone());
                 fields.push(Field::new(&name, arrow_type(t), true));
                 binding.push(Some((key.clone(), t)));
             }
         }
-        let visible = parts
-            .iter()
-            .cloned()
-            .zip(visibility.rows.into_iter().map(Arc::new))
-            .collect();
+        let visible =
+            parts.iter().cloned().zip(visibility.rows.into_iter().map(Arc::new)).collect();
         Ok(Lens { schema: Arc::new(Schema::new(fields)), binding, visible })
     }
 
@@ -284,6 +336,16 @@ impl Lens {
                 tests.push(Test::Never);
                 continue;
             };
+            // Zone pruning: when the column's recorded [min, max] PROVES this predicate can match
+            // no row of the part, no section of the column is decoded at all — placed before the
+            // rid decode on purpose. Conservative twice over: the zone reader resolves every doubt
+            // to None, and the disproof compares only exactly-matching types.
+            if let Some(zone) = part.zone(c)? {
+                if zone_disproves(p_.op, &p_.val, &zone) {
+                    tests.push(Test::Never);
+                    continue;
+                }
+            }
             let (_, tag, occ, kind) = meta[c].clone();
             let rids = attrs::rids(part, c, occ, kind)?;
             let k = match (&p_.val, tag) {
@@ -307,7 +369,11 @@ impl Lens {
             tests.push(Test::Col { tag, rids, val: part.column_values(c)?, op: p_.op, key: k });
         }
 
-        let ids = if cols.iter().any(|c| matches!(c, Col::Id)) { part.ids()? } else { Arc::new(Vec::new()) };
+        let ids = if cols.iter().any(|c| matches!(c, Col::Id)) {
+            part.ids()?
+        } else {
+            Arc::new(Vec::new())
+        };
         let visible = self
             .visible
             .iter()
@@ -336,15 +402,26 @@ enum Test {
     /// No row in this part can match — the batch, and often the part, is skippable without reading.
     Never,
     /// Everything with a value matches; only nulls are excluded.
-    Present { rids: Arc<Vec<u32>> },
-    Col { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, op: Cmp, key: Key },
+    Present {
+        rids: Arc<Vec<u32>>,
+    },
+    Col {
+        tag: u8,
+        rids: Arc<Vec<u32>>,
+        val: Arc<Vec<u8>>,
+        op: Cmp,
+        key: Key,
+    },
 }
 
 #[derive(Clone, Copy)]
 enum Key {
     /// A dictionary ordinal. `exact` is false when the literal is absent and `k` is its insertion
     /// point — which still answers every ORDER comparison, because the dictionary is sorted.
-    Ord { k: u32, exact: bool },
+    Ord {
+        k: u32,
+        exact: bool,
+    },
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -362,11 +439,14 @@ fn cmp_ok<T: PartialOrd>(op: Cmp, v: T, k: T) -> bool {
     }
 }
 
+/// The borrowed payload of a column comparison: `(tag, encoded values, operator, key)`.
+type ColTest<'a> = (&'a u8, &'a Arc<Vec<u8>>, &'a Cmp, &'a Key);
+
 impl Test {
     /// Mark rows in `lo..hi` that match. Rows with no value stay unmarked, which is correct: a
     /// comparison against NULL is NULL, and NULL does not pass a filter.
     fn mark(&self, lo: usize, hi: usize, out: &mut [bool]) {
-        let (rids, body): (&Arc<Vec<u32>>, Option<(&u8, &Arc<Vec<u8>>, &Cmp, &Key)>) = match self {
+        let (rids, body): (&Arc<Vec<u32>>, Option<ColTest<'_>>) = match self {
             Test::Never => return,
             Test::Present { rids } => (rids, None),
             Test::Col { tag, rids, val, op, key } => (rids, Some((tag, val, op, key))),
@@ -398,12 +478,16 @@ impl Test {
                                     }
                                 }
                             }
-                            (1, Key::Int(kk)) => {
-                                cmp_ok(*op, i64::from_le_bytes(val[o..o + 8].try_into().unwrap()), *kk)
-                            }
+                            (1, Key::Int(kk)) => cmp_ok(
+                                *op,
+                                i64::from_le_bytes(val[o..o + 8].try_into().unwrap()),
+                                *kk,
+                            ),
                             (2, Key::Float(kk)) => cmp_ok(
                                 *op,
-                                f64::from_bits(u64::from_le_bytes(val[o..o + 8].try_into().unwrap())),
+                                f64::from_bits(u64::from_le_bytes(
+                                    val[o..o + 8].try_into().unwrap(),
+                                )),
                                 *kk,
                             ),
                             (3, Key::Bool(kk)) => cmp_ok(*op, val[o] != 0, *kk),
@@ -423,7 +507,12 @@ impl Test {
 enum Col {
     Id,
     Body,
-    Attr { tag: u8, rids: Arc<Vec<u32>>, val: Arc<Vec<u8>>, dict: Arc<Vec<String>> },
+    Attr {
+        tag: u8,
+        rids: Arc<Vec<u32>>,
+        val: Arc<Vec<u8>>,
+        dict: Arc<Vec<String>>,
+    },
     /// This part has no such column; the batch contributes nulls of the right type.
     Missing(DataType),
 }
@@ -595,9 +684,16 @@ impl PartScan {
                     Arc::new(b.finish()) as ArrayRef
                 }
                 Col::Missing(t) => datafusion::arrow::array::new_null_array(t, len),
-                Col::Attr { tag, rids, val, dict } => {
-                    scatter(*tag, rids, val, dict, lo, hi, &take, &mut self.stats.shadowed_occurrences)?
-                }
+                Col::Attr { tag, rids, val, dict } => scatter(
+                    *tag,
+                    rids,
+                    val,
+                    dict,
+                    lo,
+                    hi,
+                    &take,
+                    &mut self.stats.shadowed_occurrences,
+                )?,
             });
         }
 
@@ -620,6 +716,9 @@ impl PartScan {
 /// Rows absent from `rid` become null. A row present more than once keeps its FIRST occurrence and
 /// counts the rest as shadowed — a flat column cannot represent a repeated key, and dropping them
 /// silently would be a lie about the data.
+// Same reasoning as `part::build_full`: eight independent inputs describing one scatter, not a
+// bag of options that wants a struct.
+#[allow(clippy::too_many_arguments)]
 fn scatter(
     tag: u8,
     rids: &[u32],
@@ -695,7 +794,9 @@ fn scatter(
             for t in &taken {
                 match *t {
                     // from_bits, not from a float parse: -0.0 and NaN payloads round-trip exactly
-                    Some(k) => b.append_value(f64::from_bits(u64::from_le_bytes(at(k)?.try_into().unwrap()))),
+                    Some(k) => b.append_value(f64::from_bits(u64::from_le_bytes(
+                        at(k)?.try_into().unwrap(),
+                    ))),
                     None => b.append_null(),
                 }
             }

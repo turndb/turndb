@@ -1,0 +1,19 @@
+[package]
+name = "turndb-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "WASM ABI for turndb — the layer the npm package calls."
+publish = false
+
+[lib]
+# A reactor, not a command: `_initialize` rather than `_start`, so the host calls exported
+# functions instead of running a main and exiting.
+crate-type = ["cdylib"]
+
+[dependencies]
+turndb = { path = "../..", default-features = false }
+serde_json = "1"
+
+# Build with `--profile wasm-release`. Profiles are a workspace-root concern, so the settings live
+# in the root manifest; putting them here would be silently ignored.

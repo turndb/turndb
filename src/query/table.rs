@@ -17,10 +17,9 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::datasource::TableType;
-use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
-use datafusion::scalar::ScalarValue;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
@@ -28,8 +27,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::stream;
 use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
+use futures::stream;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -153,9 +153,9 @@ fn to_pred(e: &datafusion::prelude::Expr, lens: &Lens) -> Option<Pred> {
 fn scalar_to_attr(v: &ScalarValue) -> Option<AttrValue> {
     Some(match v {
         ScalarValue::Dictionary(_, inner) => return scalar_to_attr(inner),
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => {
-            AttrValue::Str(s.clone())
-        }
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => AttrValue::Str(s.clone()),
         ScalarValue::Int64(Some(i)) => AttrValue::Int(*i),
         ScalarValue::Int32(Some(i)) => AttrValue::Int(*i as i64),
         ScalarValue::Int16(Some(i)) => AttrValue::Int(*i as i64),
@@ -216,7 +216,17 @@ impl TurndbExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Ok(TurndbExec { parts, fold, lens, projection, preds, stats, schema, props: Arc::new(props), fetch: None })
+        Ok(TurndbExec {
+            parts,
+            fold,
+            lens,
+            projection,
+            preds,
+            stats,
+            schema,
+            props: Arc::new(props),
+            fetch: None,
+        })
     }
 }
 
@@ -270,18 +280,25 @@ impl ExecutionPlan for TurndbExec {
         }))
     }
 
-    fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DfResult<Arc<dyn ExecutionPlan>> {
+    fn with_new_children(
+        self: Arc<Self>,
+        _c: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
 
-    fn execute(&self, partition: usize, _ctx: Arc<TaskContext>) -> DfResult<SendableRecordBatchStream> {
+    fn execute(
+        &self,
+        partition: usize,
+        _ctx: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
         let Some(part) = self.parts.get(partition) else {
             return Ok(Box::pin(MemoryStream::try_new(vec![], self.schema.clone(), None)?));
         };
         // The fold is handed over only when `body` is in the projection, so an attribute-only query
         // cannot reach content even by mistake.
         let wants_body = self.schema.fields().iter().any(|f| f.name() == F_BODY);
-        let fold = wants_body.then(|| &self.fold);
+        let fold = wants_body.then_some(&self.fold);
 
         let scan = self
             .lens

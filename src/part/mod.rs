@@ -35,20 +35,20 @@
 
 pub mod attrs;
 pub mod bloom;
+pub mod builder;
 pub mod cache;
 pub mod idcol;
 pub mod merge;
 
 use crate::fold::{Fold, Loc};
+use crate::readat::ReadAt;
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
+use cache::{Held, Kind, SectionCache};
 use idcol::{get_varint, put_varint, IdCol};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
-use cache::{Held, Kind, SectionCache};
 use std::sync::Arc;
 
 pub const MAGIC: &[u8; 8] = b"TURNPART";
@@ -66,8 +66,22 @@ pub const FOOTER_LEN: u64 = 56;
 pub const PART_VERSION: u8 = 1;
 
 /// Body-program op tags, packed into the low bit of a varint.
-const OP_LIT: u64 = 0;
-const OP_PIECE: u64 = 1;
+pub(crate) const OP_LIT: u64 = 0;
+pub(crate) const OP_PIECE: u64 = 1;
+
+/// RESERVED: the escape codepoint for a future op space.
+///
+/// The op tag is one bit and both values are taken, so there is no room for a third op — and the
+/// obvious fix, widening the tag, re-encodes every op in every part and was measured to cost 2.6% of
+/// compressed `prog` forever.
+///
+/// `tagged == 0` is a zero-length literal: reachable, semantically vacuous, and never emitted (0
+/// occurrences across 623,106 body ops on three corpora). Reserving it now buys an UNBOUNDED future op
+/// space for zero bytes — a later revision may define it as an escape followed by a varint op number —
+/// but only if today's readers refuse it. A shipped reader that decoded it as an empty literal would
+/// silently parse a future escape's payload as ops, which is the exact failure the version lever
+/// exists to prevent.
+const OP_ESCAPE_RESERVED: u64 = 0;
 
 /// One section's location and encoding.
 #[derive(Clone, Debug)]
@@ -144,6 +158,11 @@ pub fn build_retaining(
 /// cannot shadow anything.
 ///
 /// `tombs` is parallel to `records` and may be empty, meaning none.
+// Eight arguments, all distinct and none derivable from the others: where to write, what to
+// write, which of it is a tombstone, the sequence range the part claims, the compression level,
+// how to resolve a piece to a location, and which locations to retain. Bundling them into a struct
+// would move the same eight names one level down for no gain in clarity.
+#[allow(clippy::too_many_arguments)]
 pub fn build_full(
     path: &Path,
     records: &[Record],
@@ -173,8 +192,9 @@ pub fn build_full(
         for op in &r.body {
             if let BodyOp::Piece { hash, .. } = op {
                 if !piece_of.contains_key(hash) {
-                    let loc = resolve(hash)
-                        .ok_or_else(|| anyhow::anyhow!("piece {hash} is referenced but not in the fold"))?;
+                    let loc = resolve(hash).ok_or_else(|| {
+                        anyhow::anyhow!("piece {hash} is referenced but not in the fold")
+                    })?;
                     piece_of.insert(*hash, loc);
                 }
             }
@@ -194,10 +214,18 @@ pub fn build_full(
     for &ri in &order {
         prog_off.push(prog.len() as u64);
         let r = &records[ri];
-        put_varint(&mut prog, r.body.len() as u64);
+        // An EMPTY literal would encode as tagged == 0, which is the reserved escape codepoint. It
+        // also contributes nothing to the body, so dropping it preserves byte-exactness exactly — but
+        // the op COUNT is written before the ops, so it must be the count of what is actually emitted.
+        let emitted =
+            r.body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
+        put_varint(&mut prog, emitted as u64);
         for op in &r.body {
             match op {
                 BodyOp::Lit(b) => {
+                    if b.is_empty() {
+                        continue;
+                    }
                     put_varint(&mut prog, ((b.len() as u64) << 1) | OP_LIT);
                     prog.extend_from_slice(b);
                 }
@@ -262,6 +290,7 @@ pub fn build_full(
     w.section("layout", &built.layout)?;
     w.section("layout.off", &u64s(&built.layout_off))?;
     w.section("colmeta", &built.meta)?;
+    w.section("zone", &built.zones)?;
     for (i, c) in built.cols.iter().enumerate() {
         w.section(&format!("col.val.{i}"), &c.val)?;
         if !c.rid.is_empty() {
@@ -286,20 +315,22 @@ fn u64s(v: &[u64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-struct Writer {
+pub(crate) struct Writer {
     f: File,
+    path: std::path::PathBuf,
     off: u64,
     toc: Vec<(String, Section)>,
     level: i32,
 }
 
 impl Writer {
-    fn new(path: &Path, level: i32) -> Result<Writer> {
-        let f = File::create(path).with_context(|| format!("create part {}", path.display()))?;
-        Ok(Writer { f, off: 0, toc: Vec::new(), level })
+    pub(crate) fn new(path: &Path, level: i32) -> Result<Writer> {
+        let f =
+            crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
+        Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level })
     }
 
-    fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
+    pub(crate) fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
         // A section's `stored` and `raw` are u32 in the TOC. Truncating here would write a part that
         // reads back as a shorter section with no error anywhere — silent corruption. Refuse instead:
         // a part that cannot be written is recoverable, a part that lies is not.
@@ -307,7 +338,7 @@ impl Writer {
             bail!("section {name} is {} bytes; the format caps a section at 4 GiB", raw.len());
         }
         let (codec, payload) = crate::fold::codec::encode(raw, None, self.level)?;
-        self.f.write_all(&payload)?;
+        crate::vfs::write_all_at(&self.f, &self.path, &payload, self.off)?;
         self.toc.push((
             name.to_string(),
             Section {
@@ -322,7 +353,7 @@ impl Writer {
         Ok(())
     }
 
-    fn finish(mut self, meta: PartMeta) -> Result<()> {
+    pub(crate) fn finish(self, meta: PartMeta) -> Result<()> {
         let mut toc = Vec::new();
         put_varint(&mut toc, self.toc.len() as u64);
         for (name, s) in &self.toc {
@@ -344,7 +375,7 @@ impl Writer {
         }
         let (toc_codec, toc_payload) = crate::fold::codec::encode(&toc, None, self.level)?;
         let toc_off = self.off;
-        self.f.write_all(&toc_payload)?;
+        crate::vfs::write_all_at(&self.f, &self.path, &toc_payload, toc_off)?;
 
         let mut foot = Vec::with_capacity(FOOTER_LEN as usize);
         foot.extend_from_slice(MAGIC);
@@ -368,8 +399,8 @@ impl Writer {
         foot.extend_from_slice(&x.as_bytes()[0..4]);
         debug_assert_eq!(foot.len(), FOOTER_LEN as usize);
         // The footer lands LAST and is the completeness marker.
-        self.f.write_all(&foot)?;
-        self.f.sync_all()?;
+        crate::vfs::write_all_at(&self.f, &self.path, &foot, toc_off + toc_payload.len() as u64)?;
+        crate::vfs::sync_file(&self.f, &self.path)?;
         Ok(())
     }
 }
@@ -378,8 +409,11 @@ impl Writer {
 // Read
 // ---------------------------------------------------------------------------------------------
 
+/// One section's on-disk anatomy: `(name, stored, raw, codec)`.
+pub type SectionInfo = (String, u32, u32, u8);
+
 pub struct Part {
-    f: File,
+    f: Box<dyn ReadAt>,
     toc: HashMap<String, Section>,
     meta: PartMeta,
     /// Identity within the shared cache.
@@ -417,9 +451,15 @@ impl Part {
     /// Open sharing `cache` with other parts.
     pub fn open_in(path: &Path, cache: Arc<SectionCache>) -> Result<Part> {
         let f = File::open(path).with_context(|| format!("open part {}", path.display()))?;
-        let len = f.metadata()?.len();
+        Part::open_reader(Box::new(f), cache)
+    }
+
+    /// Open from any [`ReadAt`] — a plain file, an extent of a pack, a remote range. The format is
+    /// footer-addressed precisely so that THIS is the only entry a backend needs.
+    pub fn open_reader(f: Box<dyn ReadAt>, cache: Arc<SectionCache>) -> Result<Part> {
+        let len = f.len()?;
         if len < FOOTER_LEN {
-            bail!("part {} is too short to hold a footer", path.display());
+            bail!("part of {len} bytes is too short to hold a footer");
         }
         let mut foot = [0u8; FOOTER_LEN as usize];
         f.read_exact_at(&mut foot, len - FOOTER_LEN)?;
@@ -447,6 +487,13 @@ impl Part {
             );
         }
 
+        // Reserved bytes must be ZERO, and a reader must refuse otherwise — the same rule the fold
+        // applies to segment `flags` ("unknown means stop, not adapt"). Reserving bytes in a document
+        // while the reader ignores them reserves nothing: a future writer could use them and this
+        // build would accept the part and misread it. Enforcement is what makes a reservation real.
+        if foot[50..52] != [0u8; 2] {
+            bail!("part footer reserved bytes are non-zero — refusing rather than guessing at a layout this build does not know");
+        }
         let toc_xsum = u32::from_le_bytes(foot[46..50].try_into().unwrap());
         if toc_off.saturating_add(toc_stored as u64) > len - FOOTER_LEN {
             bail!("part TOC runs past where the footer says the sections end");
@@ -454,16 +501,22 @@ impl Part {
         let mut tbuf = vec![0u8; toc_stored as usize];
         f.read_exact_at(&mut tbuf, toc_off)?;
         if version >= 1 && crc32fast::hash(&tbuf) != toc_xsum {
-            bail!("part TOC fails its checksum — every section checksum it carries is untrustworthy");
+            bail!(
+                "part TOC fails its checksum — every section checksum it carries is untrustworthy"
+            );
         }
         let toc_bytes = crate::fold::codec::decode(toc_codec, &tbuf, toc_raw, None)?;
 
         let mut at = 0usize;
         let n = get_varint(&toc_bytes, &mut at)? as usize;
-        let mut toc = HashMap::with_capacity(n);
+        // An entry costs several bytes, so the byte count bounds the entry count — checked before
+        // the count sizes an allocation, because `n` is exactly as trustworthy as the TOC carrying
+        // it, and on a version-0 part the TOC has no checksum at all.
+        let mut toc = HashMap::with_capacity(n.min(toc_bytes.len()));
         for _ in 0..n {
             let nl = get_varint(&toc_bytes, &mut at)? as usize;
-            if at + nl > toc_bytes.len() {
+            // `nl > len - at`, never `at + nl > len`: the sum overflows on a hostile length.
+            if nl > toc_bytes.len() - at {
                 bail!("part TOC entry name runs past the end of the TOC");
             }
             let name = String::from_utf8(toc_bytes[at..at + nl].to_vec())?;
@@ -498,6 +551,21 @@ impl Part {
         }
         if at != toc_bytes.len() {
             bail!("part TOC has {} trailing bytes after its last entry", toc_bytes.len() - at);
+        }
+        // The footer's n_records is load-bearing everywhere — row bounds, dense-column synthesis —
+        // and it is a bare integer a flipped bit can inflate to anything. `prog.off` is REQUIRED
+        // and its RAW size is (n_records + 1) u64s, so the two must agree; after this check the
+        // count is as trustworthy as the section sizes, which are range-checked above.
+        match toc.get("prog.off") {
+            Some(s) => {
+                if s.raw as u64 != (n_records as u64 + 1) * 8 {
+                    bail!(
+                        "footer claims {n_records} records but prog.off holds {} offsets",
+                        s.raw / 8
+                    );
+                }
+            }
+            None => bail!("part is missing its required prog.off section"),
         }
         Ok(Part {
             f,
@@ -575,6 +643,29 @@ impl Part {
         Ok(self.nums("ids.restart", 4)?.iter().map(|&x| x as u32).collect())
     }
 
+    /// Row ordinals whose ids fall in `[from, to)`, ascending — the part's half of a range scan.
+    ///
+    /// `from`/`to` are open-ended when `None`. Costs a binary search plus a walk of exactly the
+    /// matching run, rather than decoding the whole id column.
+    pub fn rows_in_range(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<std::ops::Range<usize>> {
+        let stream = self.sect("ids")?;
+        let restarts = self.restarts()?;
+        let c = IdCol::new(&stream, &restarts, self.len());
+        let lo = match from {
+            Some(f) => c.lower_bound(f.as_bytes())?,
+            None => 0,
+        };
+        let hi = match to {
+            Some(t) => c.lower_bound(t.as_bytes())?,
+            None => self.len(),
+        };
+        Ok(lo..hi.max(lo))
+    }
+
     /// Row index of `id`, or `None`.
     pub fn find(&self, id: &str) -> Result<Option<usize>> {
         let stream = self.sect("ids")?;
@@ -586,7 +677,9 @@ impl Part {
     pub fn piece(&self, i: usize) -> Result<(Loc, PieceHash)> {
         let l = self.sect("pdict.loc")?;
         let h = self.sect("pdict.hash")?;
-        if (i + 1) * Loc::WIDTH > l.len() || (i + 1) * 32 > h.len() {
+        // Compared by division, not `(i + 1) * WIDTH`: `i` arrives from a body-program varint and a
+        // hostile value overflows the multiplication.
+        if i >= l.len() / Loc::WIDTH || i >= h.len() / 32 {
             bail!("piece dictionary index {i} out of range");
         }
         let loc = Loc::decode(&l[i * Loc::WIDTH..])?;
@@ -631,7 +724,7 @@ impl Part {
         let b = self.sect("tomb")?;
         let mut at = 0usize;
         let n = get_varint(&b, &mut at)? as usize;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(b.len()));
         let mut cur = 0u64;
         for _ in 0..n {
             cur += get_varint(&b, &mut at)?;
@@ -708,13 +801,19 @@ impl Part {
             bail!("row {r} out of range");
         }
         let (mut at, end) = (offs[r] as usize, offs[r + 1] as usize);
+        if end > prog.len() || at > end {
+            bail!("prog.off names a program outside the prog section");
+        }
         let n = get_varint(&prog, &mut at)? as usize;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(end.saturating_sub(at)));
         for _ in 0..n {
             let tagged = get_varint(&prog, &mut at)?;
+            if tagged == OP_ESCAPE_RESERVED {
+                bail!("body program uses the reserved op escape — this part needs a newer build");
+            }
             if tagged & 1 == OP_LIT {
                 let len = (tagged >> 1) as usize;
-                if at + len > end {
+                if at > end || len > end - at {
                     bail!("literal runs past the program");
                 }
                 out.push(BodyOp::Lit(prog[at..at + len].to_vec()));
@@ -732,6 +831,14 @@ impl Part {
     /// Row `r`'s attributes, in their exact original order, duplicates included.
     pub fn attrs(&self, r: usize) -> Result<Vec<(String, AttrValue)>> {
         attrs::read_row(self, r)
+    }
+
+    /// Column `c`'s zone map: `(min, max)` over every value the column holds, or `None` when no
+    /// pruning is possible — an older part, a string column (its sorted dictionary already bounds
+    /// it), a float column that saw NaN, or a damaged section. Advisory by construction: `None`
+    /// only ever costs a scan, never an answer.
+    pub fn zone(&self, c: usize) -> Result<Option<(AttrValue, AttrValue)>> {
+        attrs::read_zone(self, c)
     }
 
     /// The whole record at row `r`.
@@ -753,13 +860,19 @@ impl Part {
             bail!("row {r} out of range");
         }
         let (mut at, end) = (offs[r] as usize, offs[r + 1] as usize);
+        if end > prog.len() || at > end {
+            bail!("prog.off names a program outside the prog section");
+        }
         let n = get_varint(&prog, &mut at)? as usize;
         let mut out = Vec::new();
         for _ in 0..n {
             let tagged = get_varint(&prog, &mut at)?;
+            if tagged == OP_ESCAPE_RESERVED {
+                bail!("body program uses the reserved op escape — this part needs a newer build");
+            }
             if tagged & 1 == OP_LIT {
                 let len = (tagged >> 1) as usize;
-                if at + len > end {
+                if at > end || len > end - at {
                     bail!("literal runs past the program");
                 }
                 out.extend_from_slice(&prog[at..at + len]);
@@ -768,11 +881,10 @@ impl Part {
                 let idx = (tagged >> 1) as usize;
                 let len = get_varint(&prog, &mut at)? as u32;
                 let (loc, hash) = self.piece(idx)?;
-                let bytes = fold.read_verified(loc, hash)?;
-                if bytes.len() as u32 != len {
-                    bail!("piece {hash} is {} bytes but the program says {len}", bytes.len());
+                if loc.raw != len {
+                    bail!("piece {hash} is {} bytes but the program says {len}", loc.raw);
                 }
-                out.extend_from_slice(&bytes);
+                fold.read_verified_into(loc, hash, &mut out)?;
             }
         }
         Ok(out)
@@ -786,11 +898,11 @@ impl Part {
         }
     }
 
-    /// Every section: `(name, stored, raw, codec)` — the on-disk anatomy of this part.
-    pub fn sections(&self) -> Vec<(String, u32, u32, u8)> {
-        let mut v: Vec<(String, u32, u32, u8)> =
+    /// Every section — the on-disk anatomy of this part.
+    pub fn sections(&self) -> Vec<SectionInfo> {
+        let mut v: Vec<SectionInfo> =
             self.toc.iter().map(|(n, s)| (n.clone(), s.stored, s.raw, s.codec)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|s| std::cmp::Reverse(s.1));
         v
     }
 
@@ -817,7 +929,10 @@ impl Part {
         }
         let b = self.sect(name)?;
         let v: Vec<u64> = match width {
-            4 => b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect(),
+            4 => b
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64)
+                .collect(),
             8 => b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(),
             w => bail!("unsupported array width {w}"),
         };
@@ -854,4 +969,3 @@ impl Part {
         self.has(name)
     }
 }
-

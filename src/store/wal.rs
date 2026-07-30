@@ -16,15 +16,32 @@
 use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, BodyOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::os::unix::fs::FileExt;
+use std::fs::File;
 use std::path::Path;
+
+/// A record together with the piece bytes that were NOVEL when it was written.
+///
+/// The pair the WAL must hold for replay to be exact: the record alone is not enough, because the
+/// pieces it references may not have reached the fold before the crash.
+pub type CarvedRecord = (Record, Vec<(PieceHash, Vec<u8>)>);
+
+/// A [`CarvedRecord`] plus whether it is a tombstone — the unit a batch frames.
+pub type FramedRecord = (Record, Vec<(PieceHash, Vec<u8>)>, bool);
 
 pub const FRAME_TAG: u8 = 0x57;
 /// A DELETION. Its payload is the id alone — a tombstone has no body, no attributes and no content, so
 /// it costs a frame and nothing else.
 pub const TOMB_TAG: u8 = 0x58;
+/// A BATCH COMMIT. Everything since the previous commit point that carries an in-batch tag is
+/// applied by this frame, and is applied not at all without it. Its payload is the member count,
+/// as a varint — redundant with what replay observed, and checked against it, because a marker
+/// sealing a different number of frames than the writer put down means the log is not what was
+/// written.
+pub const BATCH_COMMIT_TAG: u8 = 0x59;
+/// [`FRAME_TAG`], inside a batch: applied only when a [`BATCH_COMMIT_TAG`] seals it.
+pub const BATCH_FRAME_TAG: u8 = 0x5A;
+/// [`TOMB_TAG`], inside a batch.
+pub const BATCH_TOMB_TAG: u8 = 0x5B;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
@@ -45,7 +62,9 @@ fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 
 fn get_bytes<'a>(b: &'a [u8], at: &mut usize) -> Result<&'a [u8]> {
     let n = get_varint(b, at)? as usize;
-    if *at + n > b.len() {
+    // `n > len - at`, never `at + n > len`: the left side cannot overflow (at <= len always), the
+    // right side can — a huge declared length wrapped the sum and PASSED the check.
+    if n > b.len() - *at {
         bail!("wal: byte string runs past the frame");
     }
     let s = &b[*at..*at + n];
@@ -88,23 +107,31 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
     }
 }
 
-pub fn decode_record(b: &[u8]) -> Result<(Record, Vec<(PieceHash, Vec<u8>)>)> {
+/// Decode a record payload. Replay hands this only frames whose crc verified, but the crc is a
+/// TORN-WRITE detector, not a validity proof — a buggy writer checksums its bugs perfectly. So
+/// every count is capped by the bytes that would have to carry it before it sizes an allocation,
+/// and every fixed-width read is bounds-checked: corrupt input is an error, never a panic.
+pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
+    fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
+        if n > b.len() - *at {
+            bail!("wal: field of {n} bytes runs past the frame");
+        }
+        let s = &b[*at..*at + n];
+        *at += n;
+        Ok(s)
+    }
     let mut at = 0usize;
     let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
     let n_ops = get_varint(b, &mut at)? as usize;
-    let mut body = Vec::with_capacity(n_ops);
+    let mut body = Vec::with_capacity(n_ops.min(b.len()));
     for _ in 0..n_ops {
         let tag = *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: truncated op"))?;
         at += 1;
         match tag {
             0 => body.push(BodyOp::Lit(get_bytes(b, &mut at)?.to_vec())),
             1 => {
-                if at + 32 > b.len() {
-                    bail!("wal: truncated piece hash");
-                }
                 let mut h = [0u8; 32];
-                h.copy_from_slice(&b[at..at + 32]);
-                at += 32;
+                h.copy_from_slice(take(b, &mut at, 32)?);
                 let len = get_varint(b, &mut at)? as u32;
                 body.push(BodyOp::Piece { hash: PieceHash(h), len });
             }
@@ -112,136 +139,179 @@ pub fn decode_record(b: &[u8]) -> Result<(Record, Vec<(PieceHash, Vec<u8>)>)> {
         }
     }
     let n_attrs = get_varint(b, &mut at)? as usize;
-    let mut attrs = Vec::with_capacity(n_attrs);
+    let mut attrs = Vec::with_capacity(n_attrs.min(b.len()));
     for _ in 0..n_attrs {
         let key = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
         let tag = *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: truncated attr"))?;
         at += 1;
         let v = match tag {
             0 => AttrValue::Str(String::from_utf8(get_bytes(b, &mut at)?.to_vec())?),
-            1 => {
-                let x = i64::from_le_bytes(b[at..at + 8].try_into()?);
-                at += 8;
-                AttrValue::Int(x)
-            }
-            2 => {
-                let x = f64::from_bits(u64::from_le_bytes(b[at..at + 8].try_into()?));
-                at += 8;
-                AttrValue::Float(x)
-            }
-            3 => {
-                let x = b[at] != 0;
-                at += 1;
-                AttrValue::Bool(x)
-            }
+            1 => AttrValue::Int(i64::from_le_bytes(take(b, &mut at, 8)?.try_into().unwrap())),
+            2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
+                take(b, &mut at, 8)?.try_into().unwrap(),
+            ))),
+            3 => AttrValue::Bool(take(b, &mut at, 1)?[0] != 0),
             t => bail!("wal: unknown attr type tag {t}"),
         };
         attrs.push((key, v));
     }
     let n_novel = get_varint(b, &mut at)? as usize;
-    let mut novel = Vec::with_capacity(n_novel);
+    let mut novel = Vec::with_capacity(n_novel.min(b.len() / 33 + 1));
     for _ in 0..n_novel {
-        if at + 32 > b.len() {
-            bail!("wal: truncated novel hash");
-        }
         let mut h = [0u8; 32];
-        h.copy_from_slice(&b[at..at + 32]);
-        at += 32;
+        h.copy_from_slice(take(b, &mut at, 32)?);
         novel.push((PieceHash(h), get_bytes(b, &mut at)?.to_vec()));
     }
     Ok((Record { id, body, attrs }, novel))
 }
 
+/// Buffered writes are EXPLICIT here — an owned buffer flushed through the [`crate::vfs`] seam —
+/// rather than a `BufWriter`, whose internal flushes would write to the file behind the seam and
+/// leave the DST recorder blind to the very bytes whose crash behavior the log exists to test.
+///
+/// The file is deliberately NOT opened with `O_APPEND`: writes are positioned, and on Linux
+/// `O_APPEND` makes `pwrite` ignore its offset and append anyway — a portability trap that would
+/// turn a truncate-then-rewrite into interleaved garbage.
 pub struct Wal {
-    w: BufWriter<File>,
+    f: File,
     path: std::path::PathBuf,
-    len: u64,
+    /// Bytes durably ordered in the FILE (not necessarily fsynced).
+    file_len: u64,
+    /// Frames appended but not yet written to the file.
+    buf: Vec<u8>,
     scratch: Vec<u8>,
 }
 
+/// Flush the buffer once it holds this much — the same batching a BufWriter provided.
+const BUF_FLUSH: usize = 1 << 20;
+
 impl Wal {
     pub fn open(path: &Path) -> Result<Wal> {
-        let f = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
+        let (f, created) = crate::vfs::open_or_create(path)
             .with_context(|| format!("open wal {}", path.display()))?;
-        let len = f.metadata()?.len();
-        Ok(Wal { w: BufWriter::with_capacity(1 << 20, f), path: path.to_path_buf(), len, scratch: Vec::new() })
+        if created {
+            // A created file's NAME is volatile until its parent directory syncs — fsyncing the
+            // file alone leaves a dirent a power loss can drop, and an ACK backed by a WAL that
+            // can vanish is no ACK at all. Found by the DST harness under the strict-POSIX model:
+            // sync() had fsynced the file, the dirent evaporated, and acked records were lost.
+            if let Some(parent) = path.parent() {
+                crate::vfs::sync_dir(parent).with_context(|| {
+                    format!("fsync {} after creating the wal", parent.display())
+                })?;
+            }
+        }
+        let file_len = f.metadata()?.len();
+        Ok(Wal { f, path: path.to_path_buf(), file_len, buf: Vec::new(), scratch: Vec::new() })
+    }
+
+    fn flush_buf(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        crate::vfs::write_all_at(&self.f, &self.path, &self.buf, self.file_len)?;
+        self.file_len += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Frame `payload` under `tag` and append it. The CRC covers the HEADER as well as the payload —
+    /// replay checks both, so omitting the header would make every frame read back as a torn write.
+    fn append_frame(&mut self, tag: u8, seq: u64, payload: &[u8]) -> Result<()> {
+        // The frame length is a u32 on disk. Truncating here would write a frame whose header
+        // disagrees with its payload, which replay would read as a torn tail — silently losing every
+        // record after it.
+        if payload.len() as u64 > u32::MAX as u64 {
+            bail!("wal frame payload of {} bytes exceeds the u32 length field", payload.len());
+        }
+        let mut hdr = Vec::with_capacity(HDR);
+        hdr.push(tag);
+        hdr.extend_from_slice(&seq.to_le_bytes());
+        hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&hdr);
+        crc.update(payload);
+        let c = crc.finalize();
+        self.buf.extend_from_slice(&hdr);
+        self.buf.extend_from_slice(payload);
+        self.buf.extend_from_slice(&c.to_le_bytes());
+        if self.buf.len() >= BUF_FLUSH {
+            self.flush_buf()?;
+        }
+        Ok(())
     }
 
     /// Log a deletion. Durable on the next [`Wal::sync`], exactly like a put.
     pub fn append_tomb(&mut self, seq: u64, id: &str) -> Result<()> {
-        self.scratch.clear();
-        self.scratch.extend_from_slice(id.as_bytes());
-        if self.scratch.len() as u64 > u32::MAX as u64 {
-            bail!("wal tombstone id of {} bytes exceeds the u32 length field", self.scratch.len());
-        }
-        let mut hdr = Vec::with_capacity(13);
-        hdr.push(TOMB_TAG);
-        hdr.extend_from_slice(&seq.to_le_bytes());
-        hdr.extend_from_slice(&(self.scratch.len() as u32).to_le_bytes());
-        // The CRC covers the HEADER as well as the payload — replay checks both, so omitting the
-        // header here would make every tombstone frame read back as a torn write.
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&hdr);
-        crc.update(&self.scratch);
-        let c = crc.finalize();
-        self.w.write_all(&hdr)?;
-        self.w.write_all(&self.scratch)?;
-        self.w.write_all(&c.to_le_bytes())?;
-        self.len += (HDR + self.scratch.len() + CRC) as u64;
-        Ok(())
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.extend_from_slice(id.as_bytes());
+        let r = self.append_frame(TOMB_TAG, seq, &scratch);
+        self.scratch = scratch;
+        r
     }
 
     pub fn append(&mut self, seq: u64, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
-        self.scratch.clear();
-        encode_record(&mut self.scratch, r, novel);
-        // The frame length is a u32 on disk. Truncating here would write a frame whose header
-        // disagrees with its payload, which replay would read as a torn tail — silently losing every
-        // record after it.
-        if self.scratch.len() as u64 > u32::MAX as u64 {
-            bail!("wal frame payload of {} bytes exceeds the u32 length field", self.scratch.len());
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        encode_record(&mut scratch, r, novel);
+        let res = self.append_frame(FRAME_TAG, seq, &scratch);
+        self.scratch = scratch;
+        res
+    }
+
+    /// Append records and tombstones as ONE atomic unit: the members under in-batch tags, then the
+    /// commit marker that seals them. Replay applies all of them or none — a crash anywhere before
+    /// the marker lands leaves members that no marker seals, and they are discarded.
+    ///
+    /// `items`: `(record, novel, is_tombstone)`; a tombstone's record carries only its id.
+    pub fn append_batch(&mut self, seq: u64, items: &[FramedRecord]) -> Result<()> {
+        for (r, novel, tomb) in items {
+            let mut scratch = std::mem::take(&mut self.scratch);
+            scratch.clear();
+            let tag = if *tomb {
+                scratch.extend_from_slice(r.id.as_bytes());
+                BATCH_TOMB_TAG
+            } else {
+                encode_record(&mut scratch, r, novel);
+                BATCH_FRAME_TAG
+            };
+            let res = self.append_frame(tag, seq, &scratch);
+            self.scratch = scratch;
+            res?;
         }
-        let mut hdr = Vec::with_capacity(HDR);
-        hdr.push(FRAME_TAG);
-        hdr.extend_from_slice(&seq.to_le_bytes());
-        hdr.extend_from_slice(&(self.scratch.len() as u32).to_le_bytes());
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&hdr);
-        crc.update(&self.scratch);
-        self.w.write_all(&hdr)?;
-        self.w.write_all(&self.scratch)?;
-        self.w.write_all(&crc.finalize().to_le_bytes())?;
-        self.len += (HDR + self.scratch.len() + CRC) as u64;
-        Ok(())
+        let mut count = Vec::with_capacity(4);
+        put_varint(&mut count, items.len() as u64);
+        self.append_frame(BATCH_COMMIT_TAG, seq, &count)
     }
 
     /// The ACK point. Nothing may be reported durable before this returns.
     pub fn sync(&mut self) -> Result<()> {
-        self.w.flush()?;
-        self.w.get_ref().sync_all().context("fsync wal")?;
+        self.flush_buf()?;
+        crate::vfs::sync_file(&self.f, &self.path).context("fsync wal")?;
         Ok(())
     }
 
     /// Drop every frame — called once the records they cover are committed in a part.
     pub fn truncate(&mut self) -> Result<()> {
-        self.w.flush()?;
-        let f = OpenOptions::new().write(true).open(&self.path)?;
-        f.set_len(0)?;
-        f.sync_all()?;
-        self.w = BufWriter::with_capacity(1 << 20, OpenOptions::new().append(true).open(&self.path)?);
-        self.len = 0;
+        self.buf.clear();
+        crate::vfs::set_len(&self.f, &self.path, 0)?;
+        crate::vfs::sync_file(&self.f, &self.path)?;
+        self.file_len = 0;
         Ok(())
     }
 
     pub fn bytes(&self) -> u64 {
-        self.len
+        self.file_len + self.buf.len() as u64
     }
 
-    /// Every intact frame, in order. Stops at the first torn or corrupt one — a partial tail is the
-    /// end of the log, not an error, because a crash mid-append leaves exactly that.
+    /// Every intact, COMMITTED frame, in order. Stops at the first torn or corrupt one — a partial
+    /// tail is the end of the log, not an error, because a crash mid-append leaves exactly that.
+    ///
+    /// Batch members ride in a holding pen until their commit marker seals them. The marker seals
+    /// exactly the `count` members immediately before it; members before those belong to a batch
+    /// whose marker never landed — an append that errored partway — and are discarded, exactly as
+    /// an unsealed run at the end of the log is. A standalone frame arriving over a non-empty pen
+    /// discards the pen the same way: whatever batch those members belonged to never committed.
     pub fn replay(path: &Path) -> Result<Vec<Frame>> {
         let f = match File::open(path) {
             Ok(f) => f,
@@ -249,15 +319,27 @@ impl Wal {
         };
         let len = f.metadata()?.len();
         let mut out = Vec::new();
+        let mut pending: Vec<Frame> = Vec::new();
         let mut off = 0u64;
         let mut hdr = [0u8; HDR];
         loop {
-            if off + HDR as u64 + CRC as u64 > len || f.read_exact_at(&mut hdr, off).is_err() {
+            if off + HDR as u64 + CRC as u64 > len
+                || crate::sys::read_exact_at(&f, &mut hdr, off).is_err()
+            {
                 break;
             }
-            if hdr[0] != FRAME_TAG && hdr[0] != TOMB_TAG {
-                break;
-            }
+            // An unknown tag is AMBIGUOUS and the two readings are opposite: a crash mid-append
+            // leaves garbage here (stop, the log ends), but a newer writer's frame type also lands
+            // here (refuse, or silently discard committed records). Treating both as "end of log" —
+            // which is what a bare `break` does — means a future frame type silently truncates the
+            // log and loses every record after it.
+            //
+            // The crc disambiguates: a torn tail does not checksum, a well-formed future frame does.
+            // So defer the decision until after the crc, below.
+            let known = matches!(
+                hdr[0],
+                FRAME_TAG | TOMB_TAG | BATCH_COMMIT_TAG | BATCH_FRAME_TAG | BATCH_TOMB_TAG
+            );
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
             let end = off + HDR as u64 + plen as u64 + CRC as u64;
@@ -265,35 +347,82 @@ impl Wal {
                 break;
             }
             let mut payload = vec![0u8; plen];
-            if f.read_exact_at(&mut payload, off + HDR as u64).is_err() {
+            if crate::sys::read_exact_at(&f, &mut payload, off + HDR as u64).is_err() {
                 break;
             }
             let mut cb = [0u8; CRC];
-            if f.read_exact_at(&mut cb, off + HDR as u64 + plen as u64).is_err() {
+            if crate::sys::read_exact_at(&f, &mut cb, off + HDR as u64 + plen as u64).is_err() {
                 break;
             }
             let mut crc = crc32fast::Hasher::new();
             crc.update(&hdr);
             crc.update(&payload);
             if crc.finalize() != u32::from_le_bytes(cb) {
-                break; // torn write
+                break; // torn write: the log genuinely ends here
             }
-            if hdr[0] == TOMB_TAG {
-                let Ok(id) = String::from_utf8(payload) else { break };
-                out.push(Frame {
-                    seq,
-                    tomb: true,
-                    record: Record { id, body: Vec::new(), attrs: Vec::new() },
-                    novel: Vec::new(),
-                });
-            } else {
-                match decode_record(&payload) {
-                    Ok((record, novel)) => out.push(Frame { seq, tomb: false, record, novel }),
-                    Err(_) => break,
+            if !known {
+                // Checksums correctly, so it was written deliberately — by a build that knows a frame
+                // type this one does not. Refusing is the only safe reading; skipping it would apply a
+                // suffix of the log without its prefix.
+                bail!(
+                    "wal frame tag {:#04x} is not a type this build knows, and it checksums — \
+                     refusing rather than discarding committed records",
+                    hdr[0]
+                );
+            }
+            match hdr[0] {
+                BATCH_COMMIT_TAG => {
+                    let mut at = 0usize;
+                    let Ok(n) = get_varint(&payload, &mut at) else { break };
+                    if at != payload.len() {
+                        break; // a malformed marker cannot say what it seals
+                    }
+                    let n = n as usize;
+                    if n > pending.len() {
+                        // The frame chain is unbroken back to the last commit point, so a marker
+                        // sealing more members than preceded it means the log is not what a writer
+                        // put down. That is corruption that CHECKSUMS, and it must not quietly
+                        // shrink a batch.
+                        bail!(
+                            "wal batch commit seals {n} frames but only {} precede it",
+                            pending.len()
+                        );
+                    }
+                    let start = pending.len() - n;
+                    // Members before the sealed run belong to a batch whose marker never landed.
+                    out.extend(pending.drain(..).skip(start));
                 }
+                TOMB_TAG | BATCH_TOMB_TAG => {
+                    let Ok(id) = String::from_utf8(payload) else { break };
+                    let fr = Frame {
+                        seq,
+                        tomb: true,
+                        record: Record { id, body: Vec::new(), attrs: Vec::new() },
+                        novel: Vec::new(),
+                    };
+                    if hdr[0] == BATCH_TOMB_TAG {
+                        pending.push(fr);
+                    } else {
+                        pending.clear();
+                        out.push(fr);
+                    }
+                }
+                _ => match decode_record(&payload) {
+                    Ok((record, novel)) => {
+                        let fr = Frame { seq, tomb: false, record, novel };
+                        if hdr[0] == BATCH_FRAME_TAG {
+                            pending.push(fr);
+                        } else {
+                            pending.clear();
+                            out.push(fr);
+                        }
+                    }
+                    Err(_) => break,
+                },
             }
             off = end;
         }
+        // An unsealed run at the end of the log is a batch that never committed.
         Ok(out)
     }
 }
@@ -301,6 +430,8 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     fn rec() -> (Record, Vec<(PieceHash, Vec<u8>)>) {
         let bytes = b"a novel piece".to_vec();
@@ -308,7 +439,10 @@ mod tests {
         (
             Record {
                 id: "genai:aé#in".into(),
-                body: vec![BodyOp::Lit(b"[".to_vec()), BodyOp::Piece { hash: h, len: bytes.len() as u32 }],
+                body: vec![
+                    BodyOp::Lit(b"[".to_vec()),
+                    BodyOp::Piece { hash: h, len: bytes.len() as u32 },
+                ],
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
                     ("k".into(), AttrValue::Int(-5)),
@@ -362,6 +496,73 @@ mod tests {
         let frames = Wal::replay(&p).unwrap();
         assert_eq!(frames.len(), 5, "a torn tail is the end of the log, not an error");
         assert_eq!(frames[4].seq, 5);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_batch_replays_all_or_nothing() {
+        let d = std::env::temp_dir().join(format!("turndb-walbatch-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("wal");
+        let mk = |id: &str| {
+            let (mut r, n) = rec();
+            r.id = id.into();
+            (r, n)
+        };
+        let (a, na) = mk("a");
+        let (b, nb) = mk("b");
+        {
+            let mut w = Wal::open(&p).unwrap();
+            w.append(1, &a, &na).unwrap();
+            let tomb = Record { id: "z".into(), body: Vec::new(), attrs: Vec::new() };
+            w.append_batch(
+                2,
+                &[
+                    (a.clone(), na.clone(), false),
+                    (tomb, Vec::new(), true),
+                    (b.clone(), nb.clone(), false),
+                ],
+            )
+            .unwrap();
+            w.sync().unwrap();
+        }
+        let f = Wal::replay(&p).unwrap();
+        assert_eq!(f.len(), 4, "standalone + three sealed members");
+        assert!(f[2].tomb && f[2].record.id == "z");
+        assert_eq!(f[3].record.id, "b");
+
+        // Tear the marker off: the members are unsealed and contribute NOTHING.
+        let flen = std::fs::metadata(&p).unwrap().len();
+        let fh = OpenOptions::new().write(true).open(&p).unwrap();
+        fh.set_len(flen - (HDR as u64 + 1 + CRC as u64)).unwrap();
+        let f = Wal::replay(&p).unwrap();
+        assert_eq!(f.len(), 1, "an unsealed batch must not replay a prefix of itself");
+
+        // A sealed batch after the abandoned run: its marker seals ITS members, not the strays.
+        {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_batch(3, &[(b.clone(), nb.clone(), false)]).unwrap();
+            w.sync().unwrap();
+        }
+        let f = Wal::replay(&p).unwrap();
+        assert_eq!(
+            f.len(),
+            2,
+            "abandoned members stay discarded: {:?}",
+            f.iter().map(|x| &x.record.id).collect::<Vec<_>>()
+        );
+        assert_eq!(f[1].record.id, "b");
+
+        // A marker claiming more members than precede it is corruption that checksums: refuse.
+        let p2 = d.join("wal2");
+        {
+            let mut w = Wal::open(&p2).unwrap();
+            let mut count = Vec::new();
+            put_varint(&mut count, 5);
+            w.append_frame(BATCH_COMMIT_TAG, 1, &count).unwrap();
+            w.sync().unwrap();
+        }
+        assert!(Wal::replay(&p2).is_err(), "a marker sealing absent frames must refuse the log");
         std::fs::remove_dir_all(&d).ok();
     }
 
