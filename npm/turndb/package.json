@@ -13,6 +13,6 @@
   "repository": { "type": "git", "url": "git+https://github.com/turndb/turndb.git" },
   "scripts": {
     "test": "node --test test/*.mjs",
-    "prepublishOnly": "bash ../build.sh"
+    "prepublishOnly": "bash ../prepublish-check.sh && bash ../build.sh"
   }
 }
