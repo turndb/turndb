@@ -15,8 +15,9 @@ first job is to find out which.
 
 ## The shape of a store
 
-A store is a directory. Reading one requires nothing but the files — no daemon, no lock, no recovery.
-A server is a role a process takes when it holds the writer lock, not something the format depends on.
+A store is a directory. **Reading** one requires nothing but the files — no daemon, no lock, no
+recovery. **Writing** one requires the writer lock described [below](#the-writer-lock). A server is a
+role a process takes when it holds that lock, not something the format depends on.
 
 ```
 mystore/
@@ -26,18 +27,59 @@ mystore/
   MANIFEST.00000042
   WAL                       uncommitted records
   fold/                     content, generation 0
+    WRITER.lock             the single-writer gate; empty, and never read
     seg-00000000.fold       segments, numbered densely from 0
     seg-00000001.fold
+    seg-00000000.dir        advisory sidecar beside a SEALED segment
+    zdict-<hex>.zd          a trained dictionary, named by its own hash
   fold-0001/                content, generation 1 (after a re-fold)
   part-00000003.part                 written by a flush, named by its sequence
   part-00000001-00000003.part        written by a merge, named by its sequence RANGE
   part-r0001-00000001-00000003.part  written by a re-fold into generation 1
 ```
 
-Part filenames are informative only — the manifests name what is reachable, and any file that no
-manifest (live or retained — see [The manifest](#the-manifest)) names is unreachable and swept. The
-three part-name forms exist so a merge output can never collide with an input it is about to
+Part filenames are informative only: the manifests name what is reachable. **The sweep is narrower
+than "everything unnamed", and deliberately so.** It removes exactly two classes — a `part-*.part`
+that no manifest (live or retained — see [The manifest](#the-manifest)) names, and a whole
+fold-generation directory whose generation no manifest names. Everything else in the directory is
+named by no manifest and is *supposed* to survive: the WAL holds records that are not committed yet
+and so cannot be named; the retained `MANIFEST.NNNNNNNN` files *are* the naming authority; sidecars
+and dictionaries belong to a fold generation rather than to a commit; and `WRITER.lock` belongs to
+the process, not to any snapshot. A sweep that took "unnamed is unreachable" literally would delete
+acknowledged data that has not yet been flushed.
+
+The three part-name forms exist so a merge output can never collide with an input it is about to
 replace.
+
+### The writer lock
+
+`<fold-generation>/WRITER.lock` is an empty file held under an exclusive advisory lock for as long
+as a writer holds the fold open. It carries no content and is never read — the lock is the file's
+whole purpose, and a second writer is refused at open rather than allowed to interleave.
+
+It is **not** part of a snapshot. A pack excludes it, because a pack has no writer, ever; packing
+works from an allowlist of what belongs in a snapshot rather than a denylist of what does not, so it
+cannot be swept into one by accident.
+
+**Where the invariant is enforced, and where it is not.** On Unix this is `flock`, which the kernel
+releases when the descriptor closes — including on a crash. That is what makes it a *safe* gate
+rather than a convention: a stale lock cannot outlive its owner, so there is never a lock nobody can
+distinguish from a live one.
+
+**On `wasm32-wasip1` there is no advisory locking, and this document must not imply otherwise.**
+WASI provides no equivalent, so the lock call succeeds unconditionally and the file is created but
+gates nothing. On that build the single-writer invariant is **the embedder's to keep**, and the
+obligation is precise: **at most one open writer per store directory, across all processes and all
+WASM instances.** One process is not sufficient isolation — a single process can open the same
+directory through two instances or two handles, and the file will not stop it.
+
+Two writers on one store will interleave WAL frames and corrupt it. Some of that damage may later
+trip a WAL or frame check, but **detection is not guaranteed, and the absence of an error does not
+establish that the store is intact.**
+
+A lockfile is deliberately not used as a substitute. An `O_EXCL` file survives a hard kill, and a
+store wedged closed by a stale lock nobody can tell from a live one is a worse failure than the one
+it prevents.
 
 Two planes, and the split is the whole design:
 
