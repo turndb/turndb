@@ -20,10 +20,14 @@
  *
  * ## Single writer
  *
- * One `Store` per directory, per process. On Unix the engine enforces this with `flock`; **under
- * WASI there is no advisory locking, so it cannot**. Two writers on one store will interleave
- * their write-ahead logs and corrupt it. If your process model can open the same directory twice,
- * that exclusion is yours to provide.
+ * **This package is always the `wasm32-wasip1` build** — the host OS does not switch it onto the
+ * native engine — and WASI has no advisory locking, so the engine **cannot** enforce exclusion.
+ * The native build's `flock` is not in play here, on any host.
+ *
+ * The obligation is the embedder's: **at most one open writer per store directory, across every
+ * process and every instance or handle.** Per-process is not enough — two `Store` handles in one
+ * process can open the same directory. Two writers interleave their write-ahead logs and corrupt
+ * the store, and detection is not guaranteed.
  */
 
 import { WASI } from 'node:wasi';
@@ -393,7 +397,11 @@ export class Store {
   }
 
   /**
-   * Close the store, releasing its writer lock.
+   * Close the store and release its handle.
+   *
+   * Deliberately not "releases the writer lock": this build holds no advisory lock to release (see
+   * the note on single-writer above). Closing frees the handle; it does not hand exclusion back to
+   * anyone, because the engine never had it.
    *
    * Does NOT sync — call {@link sync} first if the writes must survive. Deliberately explicit:
    * a close that silently synced would hide a failing disk behind a method nobody checks.
