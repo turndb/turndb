@@ -763,15 +763,33 @@ impl Store {
         // exactly how a deliberate erasure came to be reported as a checksum failure. `punched` is
         // cumulative, so the live copy is the whole truth about what is gone.
         //
+        // The load is PROPAGATED, not tolerated. Treating an unreadable live manifest as "nothing
+        // was erased" is the same false fallback this whole fix exists to remove: the reader would
+        // proceed with no declaration and report a punched payload as checksum corruption, which is
+        // the misattribution, arrived at by a different route. An unreadable manifest is an error
+        // and not an empty one — the store's existing rule, and it applies with more force here,
+        // because this manifest is the ONLY authority for telling erasure from damage.
+        let live = Manifest::load(dir).with_context(|| {
+            format!(
+                "retained snapshot at commit {commit} needs the live manifest in {} to tell erased \
+                 blocks from damaged ones, and it could not be read",
+                dir.display()
+            )
+        })?;
         // Guarded on the generation because block ids are per generation: applying one generation's
-        // punched ranges to another would name live blocks. In practice a re-fold purges the retained
-        // log so this snapshot would not exist, but the guard is what makes that a fact about ids
-        // rather than a fact about the retention policy that happens to hold today.
-        if let Ok(live) = Manifest::load(dir) {
-            if live.fold_gen == manifest.fold_gen {
-                fold.declare_punched(&live.punched);
-            }
+        // punched ranges to another would name live blocks. A re-fold purges the retained log, so a
+        // mismatch should be unreachable — and if it happens anyway, there is no surviving authority
+        // for the old generation's erasures (a re-fold clears `punched`, having rewritten the world
+        // without the erased content). No authority means refuse, for the same reason as above.
+        if live.fold_gen != manifest.fold_gen {
+            bail!(
+                "retained snapshot at commit {commit} is fold generation {} but the live manifest is \
+                 {}, so no erasure declaration covers it",
+                manifest.fold_gen,
+                live.fold_gen
+            );
         }
+        fold.declare_punched(&live.punched);
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
