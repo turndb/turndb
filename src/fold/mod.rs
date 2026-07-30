@@ -756,8 +756,10 @@ impl Fold {
         let dict = self.dicts.get(&self.headers[seg as usize].dict_id).cloned();
         let payload = &buf[block::BLOCK_HDR_LEN..block::BLOCK_HDR_LEN + hdr.stored as usize];
         let raw = codec::decode(hdr.codec, payload, hdr.raw, dict.as_deref().map(|v| &v[..]))?;
-        // r16 is zero in an encrypted fold (it would be a plaintext oracle); the AEAD tag has
-        // already authenticated these bytes, which is a strictly stronger check.
+        // A free check that a decode produced the bytes this block was written for. It filters; it
+        // never concludes identity. Unconditional — every block in this build carries r16. (The
+        // ENCRYPTED segment flag is reserved and refused at open, so nothing reaching here was
+        // ever ciphertext.)
         if blake3::hash(&raw).as_bytes()[0..2] != hdr.r16 {
             bail!("decoded block does not match its content prefix (block {})", loc.block_id);
         }
