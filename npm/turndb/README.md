@@ -48,14 +48,23 @@ its unflushed writes without either — a live view can read back what it just w
 traffic, flushing every record gave 15×; every 50 gave 171×; every 512 gave 292×. Batch your
 writes.
 
-**Exclusion is yours to provide — this package cannot do it for you.** The native engine takes an
-advisory `flock`, but **this package is always the `wasm32-wasip1` build**, on every host including
-Linux and macOS, and WASI has no advisory locking. The lock file is created and gates nothing.
+**Cross-process exclusion is yours to provide.** The native engine takes an advisory `flock`, but
+**this package is always the `wasm32-wasip1` build**, on every host including Linux and macOS, and
+WASI has no advisory locking. The lock file is created and gates nothing.
 
-So the obligation is: **at most one open writer per store directory, across every process *and*
-every instance or handle.** One process is not sufficient isolation — two `Store` handles in one
-process can open the same directory. Two writers will interleave their write-ahead logs and corrupt
+The host layer permits one live `Store` per process. That is not enough isolation: another process
+can still open the same directory. The obligation is therefore **at most one open writer per store
+directory across every process.** Two writers will interleave their write-ahead logs and corrupt
 the store, and **detection is not guaranteed**: a clean read afterwards does not mean it is intact.
+
+Sequential opens, including different directories, reuse one WASI instance. This removes
+per-construction external-memory pressure while keeping the sandbox narrow: only the current store
+directory is mounted. A consumer that must hold multiple stores open concurrently needs separate
+processes.
+
+Call `close()` explicitly. A dropped handle is reclaimed when JavaScript eventually collects it, so
+forgetting `close()` does not wedge the process forever, but collection has no timing guarantee and
+the next `open()` refuses while the old handle is still live.
 
 ## Attributes keep order and duplicate keys
 
