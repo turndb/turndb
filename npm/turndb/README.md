@@ -81,20 +81,27 @@ Your stall budget is a **rate**, not a total: one seal per `blockTarget` of uniq
 
     seals per hour  =  unique bytes ingested per hour  /  blockTarget
 
-and the cost of each seal is set by `level`. Measured on 4 MiB blocks (wasm build, Node 22):
-**~80ms per seal at level 3 — this package's default — versus ~1.7s at level 19** (the engine's
-default, tuned for the native build where compression runs on a thread pool), for about 9% more
-disk — measured on one real LLM-trace corpus via a zstd CLI proxy at the same levels; synthetic
-test content through the package itself shows as little as 4%. Check your own ratio if disk is
-tight; the stall numbers, not the disk delta, are the ones measured through this build. A trace workload writing 1.8 GB/day of unique content seals ~430
-times a day: ~34 seconds of total stall at level 3, ~12 minutes — in 1.7-second ambushes — at
-level 19. Pass `level: 19` only if that trade is one you have measured your event loop against.
+and the cost of each seal is set by `level`. Measured on 4 MiB blocks of synthetic unique-content
+bodies through this package's wasm build, in a Node 22 container on one Linux x86-64 workstation
+(a single workstation, Intel Core Ultra 7 155H): **~80ms per seal at level 3 — this package's default —
+versus ~1.7s at level 19** (the engine's default, tuned for the native build where compression
+runs on a thread pool).
+
+Level 3 also costs more disk, and this README does not publish a figure: measurements through the
+package on one real trace corpus varied materially with workload ordering and sample
+configuration, and nothing in the default depends on the number — the default is set by the stall. If
+disk matters, measure your own workload: write a sample at both levels and compare the
+directories. A trace workload writing 1.8 GB/day of unique content seals ~430 times a day: ~34
+seconds of total stall at level 3, ~12 minutes — in 1.7-second ambushes — at level 19. Pass
+`level: 19` only if that trade is one you have measured your event loop against.
 
 **Compaction.** Merges never rewrite content — that is the format's load-bearing claim and the
 engine asserts it — but they rebuild the reference plane (piece dictionary and columns), whose
 size tracks content volume. `autoCompact()` is a **total** merge: linear in the store's on-disk
-bytes (~5s/GB measured at level 19), only ever run when you call it, and the only merge that
-settles deletes. `maybeCompact()` is the bounded alternative: it merges the oldest few parts, so
+bytes (~5s/GB at level 19 — four points on synthetic stores from 0.7 MB to 1.9 GB through this
+build, Node 22, a single workstation; the level 3 merge cost is unmeasured), only ever run when you call
+it, and the only merge that settles deletes. `maybeCompact()` is the bounded alternative: it
+merges the oldest few parts, so
 the stall is capped by the run you allow rather than the store you've accumulated. A long-lived
 single-threaded embedder should call `maybeCompact()` on its idle path and reserve `autoCompact()`
 for moments when a multi-second pause is acceptable.
