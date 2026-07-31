@@ -113,6 +113,10 @@ export declare class Store {
   /**
    * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
    *
+   * A later `open` reuses this handle's WASI instance. Closing is therefore required before opening
+   * any other store in this process. An abandoned handle is reclaimed when JavaScript collects it,
+   * but collection has no timing guarantee and is not a substitute for `close`.
+   *
    * Not "release the writer lock": this build holds no advisory lock. See {@link open}.
    */
   close(): void;
@@ -121,10 +125,14 @@ export declare class Store {
 /**
  * Open (or create) a store at `dir`.
  *
- * **At most one open writer per store directory, across every process and every instance or
- * handle.** This package is always the `wasm32-wasip1` build and WASI has no advisory locking, so
- * the engine cannot enforce this — the obligation is yours, and per-process is not sufficient.
- * Two writers corrupt the store, and detection is not guaranteed.
+ * **At most one open writer per store directory across every process.** This package is always the
+ * `wasm32-wasip1` build and WASI has no advisory locking, so the engine cannot enforce
+ * cross-process exclusion. Two writers corrupt the store, and detection is not guaranteed.
+ *
+ * Within one process, sequential opens — including opens of different directories — reuse one WASI
+ * instance. The directory capability is switched between handles without widening the sandbox to a
+ * common ancestor. Consequently only one `Store` may be open in a process at a time; use separate
+ * processes when multiple stores must be held open concurrently.
  */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
 

@@ -24,10 +24,10 @@
  * native engine — and WASI has no advisory locking, so the engine **cannot** enforce exclusion.
  * The native build's `flock` is not in play here, on any host.
  *
- * The obligation is the embedder's: **at most one open writer per store directory, across every
- * process and every instance or handle.** Per-process is not enough — two `Store` handles in one
- * process can open the same directory. Two writers interleave their write-ahead logs and corrupt
- * the store, and detection is not guaranteed.
+ * The host layer permits only one live `Store` in a process, but that is not cross-process
+ * exclusion. The obligation is still the embedder's: **at most one open writer per store directory
+ * across every process.** Two processes can interleave their write-ahead logs and corrupt the
+ * store, and detection is not guaranteed.
  */
 
 import { WASI } from 'node:wasi';
@@ -39,6 +39,8 @@ const WASM_PATH = join(dirname(fileURLToPath(import.meta.url)), 'turndb.wasm');
 
 /** Where the store directory is mounted inside the sandbox. Callers never see this. */
 const GUEST_ROOT = '/store';
+/** Preview1 reserves 0..2 for stdio, so our only preopen is descriptor 3. */
+const GUEST_ROOT_FD = 3;
 
 /** Thrown for every engine-reported failure, carrying the engine's own message. */
 export class TurndbError extends Error {
@@ -165,18 +167,31 @@ function decodeAttrs(tagged) {
   return tagged.map(([k, tag, v]) => [k, tag === 'i' || tag === 'f' ? Number(v) : v]);
 }
 
+const storeFinalizer = new FinalizationRegistry(({ runtime, handle }) => {
+  // A forgotten close must not wedge this process forever. Finalization is only a fallback: it
+  // cannot report either error and gives no timing guarantee, so callers still close explicitly.
+  try {
+    runtime.instance.exports.tdb_close(handle);
+  } finally {
+    try {
+      releaseRuntime(runtime);
+    } catch {}
+  }
+});
+
 /** An open turndb store. Create with {@link open}. */
 export class Store {
-  #instance;
+  #runtime;
   #exports;
   #handle;
   #enc = new TextEncoder();
   #dec = new TextDecoder();
 
-  constructor(instance, handle) {
-    this.#instance = instance;
-    this.#exports = instance.exports;
+  constructor(runtime, handle) {
+    this.#runtime = runtime;
+    this.#exports = runtime.instance.exports;
     this.#handle = handle;
+    storeFinalizer.register(this, { runtime, handle }, this);
   }
 
   get closed() {
@@ -410,11 +425,110 @@ export class Store {
     if (this.#handle < 0) return;
     const h = this.#handle;
     this.#handle = -1;
-    this.#check(this.#exports.tdb_close(h));
+    storeFinalizer.unregister(this);
+    let failure;
+    try {
+      this.#check(this.#exports.tdb_close(h));
+    } catch (e) {
+      failure = e;
+    }
+    try {
+      releaseRuntime(this.#runtime);
+    } catch (e) {
+      failure ??= e;
+    }
+    if (failure) throw failure;
   }
 }
 
 let cachedModule = null;
+let runtimePromise = null;
+let acquireTail = Promise.resolve();
+
+function wasiFor(hostDir) {
+  return new WASI({
+    version: 'preview1',
+    args: ['turndb'],
+    env: {},
+    // Only the current store directory is reachable from inside. The engine cannot see the rest of
+    // the filesystem even if asked, which is a property of the target worth keeping.
+    preopens: { [GUEST_ROOT]: hostDir },
+    returnOnExit: true,
+  });
+}
+
+async function createRuntime(hostDir) {
+  const wasi = wasiFor(hostDir);
+  const state = { imports: wasi.getImportObject() };
+  // WebAssembly imports are fixed at instantiation, while a WASI preopen is fixed when its WASI
+  // object is created. Route every syscall through a replaceable table so later handles can mount
+  // a different directory without constructing a second engine or exposing a common ancestor.
+  const routedImports = Object.fromEntries(
+    Object.entries(state.imports).map(([namespace, functions]) => [
+      namespace,
+      Object.fromEntries(
+        Object.keys(functions).map((name) => [
+          name,
+          (...args) => state.imports[namespace][name](...args),
+        ]),
+      ),
+    ]),
+  );
+  cachedModule ??= await WebAssembly.compile(await readFile(WASM_PATH));
+  const instance = await WebAssembly.instantiate(cachedModule, routedImports);
+  wasi.initialize(instance);
+  return { instance, state, active: false, needsWasi: false, hostDir };
+}
+
+function releaseRuntime(runtime) {
+  const errno = runtime.state.imports.wasi_snapshot_preview1.fd_close(GUEST_ROOT_FD);
+  runtime.active = false;
+  runtime.needsWasi = true;
+  if (errno !== 0) {
+    throw new TurndbError(`closing the WASI store-directory capability failed with errno ${errno}`);
+  }
+}
+
+async function acquireRuntime(hostDir) {
+  const previous = acquireTail;
+  let release;
+  acquireTail = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    if (runtimePromise == null) {
+      runtimePromise = createRuntime(hostDir);
+      runtimePromise.catch(() => {
+        runtimePromise = null;
+      });
+    }
+    const runtime = await runtimePromise;
+    if (runtime.active) {
+      throw new TurndbError(
+        `opening ${hostDir}: this process already has a store open — close its handle before opening another`,
+      );
+    }
+    if (runtime.needsWasi || runtime.hostDir !== hostDir) {
+      const wasi = wasiFor(hostDir);
+      runtime.state.imports = wasi.getImportObject();
+      // Give the new WASI capability object this instance's memory before any engine call reaches
+      // it. Each WASI object is initialized once; the engine instance and its linear memory stay.
+      try {
+        wasi.initialize(runtime.instance);
+      } catch (e) {
+        runtime.state.imports.wasi_snapshot_preview1.fd_close(GUEST_ROOT_FD);
+        throw e;
+      }
+      runtime.hostDir = hostDir;
+      runtime.needsWasi = false;
+    }
+    runtime.active = true;
+    return runtime;
+  } finally {
+    release();
+  }
+}
 
 /**
  * Open (or create) a store at `dir`.
@@ -428,34 +542,36 @@ let cachedModule = null;
  */
 export async function open(dir, opts = {}) {
   const hostDir = resolve(dir);
-  const wasi = new WASI({
-    version: 'preview1',
-    args: ['turndb'],
-    env: {},
-    // Only the store directory is reachable from inside. The engine cannot see the rest of the
-    // filesystem even if asked, which is a property of the target worth keeping.
-    preopens: { [GUEST_ROOT]: hostDir },
-    returnOnExit: true,
-  });
-  cachedModule ??= await WebAssembly.compile(await readFile(WASM_PATH));
-  const instance = await WebAssembly.instantiate(cachedModule, wasi.getImportObject());
-  // A reactor, not a command: initialize and keep it alive rather than running a main.
-  wasi.initialize(instance);
+  const runtime = await acquireRuntime(hostDir);
+  const { instance } = runtime;
 
   const enc = new TextEncoder();
   const path = enc.encode(GUEST_ROOT);
-  const ptr = instance.exports.tdb_alloc(path.length);
-  new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
-  const handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 0);
-  instance.exports.tdb_free(ptr, path.length);
+  let handle;
+  try {
+    const ptr = instance.exports.tdb_alloc(path.length);
+    new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
+    try {
+      handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 0);
+    } finally {
+      instance.exports.tdb_free(ptr, path.length);
+    }
 
-  if (handle < 0) {
-    const ep = instance.exports.tdb_err_ptr();
-    const el = instance.exports.tdb_err_len();
-    const msg = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer).subarray(ep, ep + el));
-    throw new TurndbError(`opening ${hostDir}: ${msg}`);
+    if (handle < 0) {
+      const ep = instance.exports.tdb_err_ptr();
+      const el = instance.exports.tdb_err_len();
+      const msg = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer).subarray(ep, ep + el));
+      throw new TurndbError(`opening ${hostDir}: ${msg}`);
+    }
+  } catch (e) {
+    try {
+      releaseRuntime(runtime);
+    } catch (closeError) {
+      e.cause ??= closeError;
+    }
+    throw e;
   }
-  return new Store(instance, handle);
+  return new Store(runtime, handle);
 }
 
 export default { open, Store, TurndbError };
