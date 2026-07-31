@@ -1,7 +1,7 @@
 {
   "name": "turndb",
   "version": "0.1.0",
-  "description": "A content-addressed columnar store for AI traces: byte-exact, embedded, single-writer.",
+  "description": "A content-addressed columnar store for AI traces: byte-exact, embedded, and readable by the CLI and the Rust crate over the same directory.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./index.mjs",
@@ -11,5 +11,8 @@
   "engines": { "node": ">=20" },
   "keywords": ["storage", "content-addressed", "traces", "llm", "observability", "wasm"],
   "repository": { "type": "git", "url": "git+https://github.com/turndb/turndb.git" },
-  "scripts": { "test": "node --test test/*.mjs" }
+  "scripts": {
+    "test": "node --test test/*.mjs",
+    "prepublishOnly": "bash ../prepublish-check.sh && bash ../build.sh"
+  }
 }

@@ -20,10 +20,14 @@
  *
  * ## Single writer
  *
- * One `Store` per directory, per process. On Unix the engine enforces this with `flock`; **under
- * WASI there is no advisory locking, so it cannot**. Two writers on one store will interleave
- * their write-ahead logs and corrupt it. If your process model can open the same directory twice,
- * that exclusion is yours to provide.
+ * **This package is always the `wasm32-wasip1` build** — the host OS does not switch it onto the
+ * native engine — and WASI has no advisory locking, so the engine **cannot** enforce exclusion.
+ * The native build's `flock` is not in play here, on any host.
+ *
+ * The obligation is the embedder's: **at most one open writer per store directory, across every
+ * process and every instance or handle.** Per-process is not enough — two `Store` handles in one
+ * process can open the same directory. Two writers interleave their write-ahead logs and corrupt
+ * the store, and detection is not guaranteed.
  */
 
 import { WASI } from 'node:wasi';
@@ -45,6 +49,86 @@ export class TurndbError extends Error {
 }
 
 /**
+ * Refuse a string JS can hold but UTF-8 cannot represent.
+ *
+ * JS strings are UTF-16 and may contain unpaired surrogates; `TextEncoder` maps those to U+FFFD
+ * *silently*. So `putBody('a\uD800', …)` and `putBody('a\uDC00', …)` both land on `a�` and the
+ * second overwrites the first — two records the caller believes are distinct become one, with no
+ * error, in a store whose cardinal invariant is byte-exact reconstruction. Refusing is the engine's
+ * own discipline: a store that cannot be written is recoverable, one that lies is not.
+ */
+function assertEncodable(s, what) {
+  // Deliberately silent on non-strings: existing paths already reject or coerce them, and the
+  // engine's batch error names the offending item index, which is better than anything thrown here.
+  if (typeof s !== 'string') return s;
+  const ok =
+    typeof s.isWellFormed === 'function'
+      ? s.isWellFormed()
+      : !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s);
+  if (!ok) {
+    throw new TurndbError(
+      `${what} contains an unpaired surrogate, which UTF-8 cannot represent — refusing rather ` +
+        `than substituting U+FFFD, which would silently alias it onto a different id`,
+    );
+  }
+  return s;
+}
+
+/**
+ * An id must be a string, and must be one UTF-8 can represent.
+ *
+ * Coercion is not a convenience here, it is an aliasing bug: `#putText` would have encoded `{}` as
+ * `"[object Object]"`, which collides with the literal string of the same name — measured, three
+ * writes producing two records with one body lost. That is the same silent-overwrite this module
+ * refuses unpaired surrogates for, arriving through a different door, and the colliding value is a
+ * string a real serialization bug has already produced in this codebase.
+ *
+ * `applyBatch` deliberately does NOT use this: the engine rejects a non-string id there with a
+ * message naming the offending item's index, which is more useful than anything thrown from here.
+ */
+function assertId(id, what = 'id') {
+  if (typeof id !== 'string') {
+    throw new TurndbError(
+      `${what} must be a string, got ${typeof id} — refusing rather than coercing, because ` +
+        `String(value) silently aliases distinct inputs onto one record`,
+    );
+  }
+  return assertEncodable(id, what);
+}
+
+/**
+ * The first id that cannot start with `prefix` — the exclusive upper bound of its range — or
+ * `null` when no such id exists and the range is therefore unbounded above.
+ *
+ * Computed over CODE POINTS, carrying left across trailing U+10FFFF. The obvious version bumps the
+ * last UTF-16 code *unit*, which is wrong three ways: it breaks surrogate pairs into unpaired ones,
+ * it wraps at U+FFFF to produce a bound BELOW the prefix (an inverted, silently-empty range), and
+ * it has no answer for a prefix of all-maximal scalars. Carrying handles the first two; the third
+ * genuinely has no upper bound, because no valid Unicode string sorts above that prefix family —
+ * and `null` says so rather than inventing a boundary.
+ *
+ * Exported for tests: the boundary cases are the whole point and they deserve direct assertions.
+ */
+export function prefixUpperBound(prefix) {
+  // Guarded here rather than only at the call site: this is exported and documented as contract, so
+  // a caller may use it to build `from`/`to` directly. Unguarded, a malformed prefix carried into a
+  // malformed bound — `'\uD800'` produced `'\uD801'`, which encodes to U+FFFD — reintroducing the
+  // wrong-boundary defect through the very helper added to remove it.
+  assertEncodable(prefix, 'prefix');
+  const cps = Array.from(prefix);
+  for (let i = cps.length - 1; i >= 0; i--) {
+    const cp = cps[i].codePointAt(0);
+    if (cp < 0x10ffff) {
+      // D800..DFFF are surrogate code points, not scalars — step over the hole.
+      const next = cp + 1 === 0xd800 ? 0xe000 : cp + 1;
+      return cps.slice(0, i).join('') + String.fromCodePoint(next);
+    }
+    // A trailing U+10FFFF cannot be incremented; drop it and carry into the scalar to its left.
+  }
+  return null;
+}
+
+/**
  * Encode attributes into the ABI's tagged form: `[[key, tag, value], ...]`.
  *
  * turndb preserves attribute ORDER and DUPLICATE KEYS because byte-exact reconstruction depends on
@@ -62,7 +146,8 @@ function encodeAttrs(attrs) {
     }
     const [k, v] = pair;
     if (typeof k !== 'string') throw new TypeError(`attribute key must be a string, got ${typeof k}`);
-    if (typeof v === 'string') out.push([k, 's', v]);
+    assertEncodable(k, 'attribute key');
+    if (typeof v === 'string') out.push([k, 's', assertEncodable(v, `attribute ${k}`)]);
     else if (typeof v === 'boolean') out.push([k, 'b', v]);
     else if (typeof v === 'bigint') out.push([k, 'i', Number(v)]);
     else if (typeof v === 'number') {
@@ -160,8 +245,15 @@ export class Store {
    */
   putBody(id, body, attrs) {
     this.#alive();
+    assertId(id);
     const bytes = typeof body === 'string' ? this.#enc.encode(body) : body;
-    const a = [this.#putText(id), this.#put(bytes), this.#putText(encodeAttrs(attrs))];
+    // Validate and encode the attributes BEFORE reserving anything in the instance. `encodeAttrs`
+    // throws on a malformed attribute, and it used to be called inside the array literal that also
+    // performed the id and body allocations — so a throw escaped before `a` was bound, the
+    // `finally` never ran, and the id and body allocations leaked. Refusing an input must not cost
+    // the process memory it cannot get back: a rejected write has to stay recoverable.
+    const attrsText = encodeAttrs(attrs);
+    const a = [this.#putText(id), this.#put(bytes), this.#putText(attrsText)];
     try {
       this.#check(this.#exports.tdb_put_body(this.#handle, ...a[0], ...a[1], ...a[2]));
     } finally {
@@ -179,6 +271,7 @@ export class Store {
   applyBatch(records) {
     this.#alive();
     const items = records.map((r) => {
+      assertEncodable(r.id, 'id');
       if (r.delete) return ['del', r.id];
       const bytes = typeof r.body === 'string' ? this.#enc.encode(r.body) : r.body;
       return ['put', r.id, Buffer.from(bytes ?? new Uint8Array()).toString('base64'), JSON.parse(encodeAttrs(r.attrs))];
@@ -194,6 +287,7 @@ export class Store {
   /** Tombstone a record. Not durable until {@link sync}. */
   delete(id) {
     this.#alive();
+    assertId(id);
     const a = [this.#putText(id)];
     try {
       this.#check(this.#exports.tdb_delete(this.#handle, ...a[0]));
@@ -232,6 +326,7 @@ export class Store {
    */
   get(id) {
     this.#alive();
+    assertId(id);
     const a = [this.#putText(id)];
     try {
       return this.#check(this.#exports.tdb_reconstruct(this.#handle, ...a[0])) === 1 ? this.#out() : null;
@@ -252,6 +347,7 @@ export class Store {
    */
   getRecord(id) {
     this.#alive();
+    assertId(id);
     const a = [this.#putText(id)];
     try {
       if (this.#check(this.#exports.tdb_get_record(this.#handle, ...a[0])) !== 1) return null;
@@ -275,11 +371,15 @@ export class Store {
     this.#alive();
     let { from = '', to = '', prefix, limit = 100, reverse = false } = opts;
     if (prefix != null) {
-      // The half-open range that contains exactly the ids starting with `prefix`: bump the last
-      // code unit to get the first id that cannot.
+      // The half-open range holding exactly the ids that start with `prefix`. An empty prefix, and
+      // one made entirely of U+10FFFF, both have no upper bound — which is the unbounded scan, not
+      // an empty one. `''` is how the ABI spells unbounded on either end.
+      assertEncodable(prefix, 'prefix');
       from = prefix;
-      to = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+      to = prefixUpperBound(prefix) ?? '';
     }
+    assertEncodable(from, 'from');
+    assertEncodable(to, 'to');
     const a = [this.#putText(from), this.#putText(to)];
     try {
       this.#check(this.#exports.tdb_scan_ids(this.#handle, ...a[0], ...a[1], limit, reverse ? 1 : 0));
@@ -297,7 +397,11 @@ export class Store {
   }
 
   /**
-   * Close the store, releasing its writer lock.
+   * Close the store and release its handle.
+   *
+   * Deliberately not "releases the writer lock": this build holds no advisory lock to release (see
+   * the note on single-writer above). Closing frees the handle; it does not hand exclusion back to
+   * anyone, because the engine never had it.
    *
    * Does NOT sync — call {@link sync} first if the writes must survive. Deliberately explicit:
    * a close that silently synced would hide a failing disk behind a method nobody checks.

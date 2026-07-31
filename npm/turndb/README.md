@@ -23,7 +23,8 @@ store.putBody('alice/1700000000000/req-1#input', JSON.stringify(messages), {
 store.sync();    // the ACK point — durable from here
 store.flush();   // seal into the columnar plane for other readers
 
-store.getText('alice/1700000000000/req-1#input');   // byte-exact
+store.get('alice/1700000000000/req-1#input');       // bytes, byte-exact
+store.getText('alice/1700000000000/req-1#input');   // UTF-8 convenience; lossy on invalid bytes
 store.scanIds({ prefix: 'alice/', limit: 50, reverse: true });
 ```
 
@@ -47,10 +48,14 @@ its unflushed writes without either — a live view can read back what it just w
 traffic, flushing every record gave 15×; every 50 gave 171×; every 512 gave 292×. Batch your
 writes.
 
-**One writer per directory, per process.** On Unix the engine enforces this with `flock`. **Under
-WASI there is no advisory locking, so it cannot.** Two writers on one store will interleave their
-write-ahead logs and corrupt it — if your process model can open the same directory twice, that
-exclusion is yours to provide.
+**Exclusion is yours to provide — this package cannot do it for you.** The native engine takes an
+advisory `flock`, but **this package is always the `wasm32-wasip1` build**, on every host including
+Linux and macOS, and WASI has no advisory locking. The lock file is created and gates nothing.
+
+So the obligation is: **at most one open writer per store directory, across every process *and*
+every instance or handle.** One process is not sufficient isolation — two `Store` handles in one
+process can open the same directory. Two writers will interleave their write-ahead logs and corrupt
+the store, and **detection is not guaranteed**: a clean read afterwards does not mean it is intact.
 
 ## Attributes keep order and duplicate keys
 
@@ -64,9 +69,15 @@ store.putBody(id, body, [['finishReason', 'end_turn'], ['finishReason', 'max_tok
 ## No SQL here, on purpose
 
 The query engine would dominate the artifact, and the two things an application does — a point
-lookup and a page scan — are already served by the id order. Ids sort lexicographically, so
-designing them with the query in mind (`member/timestamp/...`) gives prefix-then-time paging with
-no secondary index.
+lookup and a page scan — are already served by the id order. Ids sort lexicographically **by
+their UTF-8 bytes**, so designing them with the query in mind (`member/timestamp/...`) gives
+prefix-then-time paging with no secondary index.
+
+**Compare ids as bytes, not with JS `<`.** JS compares UTF-16 code units, and the two orders
+disagree above the BMP: `'a\u{10000}'` sorts *below* `'a\uFFFF'` in JS and *above* it in UTF-8. For
+ASCII ids they agree, so this only bites once an id carries an astral character — quietly, as a
+wrong page boundary rather than an error. Use `prefixUpperBound` to build a range, or compare
+`Buffer.from(id, 'utf8')`.
 
 For analytics, the `turndb` CLI runs SQL against the same directory. No daemon, no second copy.
 

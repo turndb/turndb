@@ -1660,6 +1660,164 @@ fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A page must be FULL whenever enough live ids exist — not merely free of deleted ones.
+///
+/// The committed scan is bounded by the page limit, so ids shadowed by a staged deletion used to
+/// leave a hole nothing backfilled: the page came back short while live rows sat just past the
+/// limit, and nothing reported that it was short. Asserting cardinality is the point of this test;
+/// the sibling test above deletes one id and asserts its absence, which this defect survived.
+#[test]
+fn scan_ids_fills_the_page_past_staged_deletions() {
+    let dir = tmp("scanidsfill");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c", "d", "e"] {
+        put(&mut s, id, b"x");
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // Staged, deliberately NOT flushed: the deletions live in the memtable, which is where they
+    // shadow committed ids without removing them from the committed scan's own count.
+    s.delete("a").unwrap();
+    s.delete("b").unwrap();
+    s.sync().unwrap();
+
+    assert_eq!(
+        s.scan_ids(None, None, 3, false).unwrap(),
+        vec!["c", "d", "e"],
+        "a full page of live ids exists past the deletions and must be returned"
+    );
+
+    // Deletions at the other end, against a reverse scan — a fix that over-fetches in only one
+    // direction passes the forward case and fails here.
+    let dir2 = tmp("scanidsfillrev");
+    let mut s2 = Store::open(&dir2, cfg()).unwrap();
+    for id in ["a", "b", "c", "d", "e"] {
+        put(&mut s2, id, b"x");
+    }
+    s2.sync().unwrap();
+    s2.flush().unwrap();
+    s2.delete("e").unwrap();
+    s2.delete("d").unwrap();
+    s2.sync().unwrap();
+    assert_eq!(
+        s2.scan_ids(None, None, 3, true).unwrap(),
+        vec!["c", "b", "a"],
+        "reverse pages must fill past deletions at the high end"
+    );
+
+    // Bounded range, deletions inside it, and a live id past the limit that must be pulled in.
+    assert_eq!(
+        s.scan_ids(Some("a"), Some("f"), 2, false).unwrap(),
+        vec!["c", "d"],
+        "a bounded range fills to its limit too"
+    );
+
+    // The page is short only when the store genuinely has fewer live ids than asked for.
+    assert_eq!(
+        s.scan_ids(None, None, 10, false).unwrap(),
+        vec!["c", "d", "e"],
+        "asking for more than exist returns what exists"
+    );
+
+    // A staged PUT sorting past the committed candidate window, under a reverse scan: the merge
+    // must reorder it into the page rather than let the committed slice decide the answer. Called
+    // out because over-fetching by the deletion count reasons about deletions only, and a staged
+    // put is the case that reasoning does not cover.
+    put(&mut s, "z", b"x");
+    s.sync().unwrap();
+    assert_eq!(
+        s.scan_ids(None, None, 3, true).unwrap(),
+        vec!["z", "e", "d"],
+        "an unflushed put beyond the committed window must still head a reverse page"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+/// An inverted range must be REFUSED, not panic.
+///
+/// `BTreeMap::range` traps on `start > end`. Through the WASM binding that trap crossed as
+/// `RuntimeError: unreachable` and left the handle poisoned — every later call on that store failed
+/// with `RefCell already borrowed`. So one reversed argument pair, both strings perfectly
+/// well-formed, permanently killed the store. The corruption storm already holds every on-disk
+/// parser to "errors, never panics"; this is that same standard reaching API arguments, which it
+/// had not.
+#[test]
+fn an_inverted_scan_range_is_refused_rather_than_panicking() {
+    let dir = tmp("scanidsinverted");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        put(&mut s, id, b"x");
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    assert!(s.scan_ids(Some("z"), Some("a"), 10, false).is_err(), "writer path must refuse");
+    // ...and the store still works afterwards, which is the half that was actually lost.
+    assert_eq!(s.scan_ids(None, None, 10, false).unwrap(), vec!["a", "b", "c"]);
+
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert!(r.scan_ids(Some("z"), Some("a"), 10, false).is_err(), "reader path must refuse too");
+    assert_eq!(r.scan_ids(None, None, 10, false).unwrap().len(), 3);
+
+    // Equal bounds are a legitimately EMPTY half-open range, not an error.
+    assert_eq!(s.scan_ids(Some("b"), Some("b"), 10, false).unwrap(), Vec::<String>::new());
+
+    // An astral pair, because the guard must order by UTF-8 bytes like the store. Rust `str` Ord is
+    // byte order so this holds naturally — the test exists so a future rewrite in a language that
+    // compares UTF-16 code units cannot quietly invert it: the astral bound sorts ABOVE the BMP one
+    // in UTF-8 and BELOW it in UTF-16.
+    let astral = "a\u{10000}";
+    let bmp = "a\u{FFFF}";
+    assert!(
+        s.scan_ids(Some(astral), Some(bmp), 10, false).is_err(),
+        "astral-vs-BMP inversion must be refused under UTF-8 ordering"
+    );
+    assert!(s.scan_ids(Some(bmp), Some(astral), 10, false).is_ok(), "and its reverse is valid");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Seamus's adversarial fixture, kept because it is the case the author did not think of.
+///
+/// Six interactions at once, where the tests above exercise them separately: a bounded range, two
+/// deletions of committed ids inside it, a deletion of an id that is in range but was never
+/// committed, a deletion outside the range entirely (which must not be counted against the
+/// candidate budget), a staged put landing mid-range, and both scan directions. A candidate budget
+/// that miscounts any of those returns a short or wrong page here while passing every other test.
+#[test]
+fn scan_ids_mixed_overlay_fills_bounded_pages_in_both_directions() {
+    let dir = tmp("scanidsmixedoverlay");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        put(&mut s, id, b"x");
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    s.delete("c").unwrap(); // committed, in range
+    s.delete("f").unwrap(); // committed, in range
+    s.delete("cc").unwrap(); // in range, never committed — must not consume budget wrongly
+    s.delete("z").unwrap(); // outside the range — must not be counted at all
+    put(&mut s, "d0", b"x"); // staged put landing mid-range
+    s.sync().unwrap();
+
+    // Live in [b,h) is b, d, d0, e, g.
+    assert_eq!(
+        s.scan_ids(Some("b"), Some("h"), 4, false).unwrap(),
+        vec!["b", "d", "d0", "e"],
+        "forward page over a bounded range with mixed staged state"
+    );
+    assert_eq!(
+        s.scan_ids(Some("b"), Some("h"), 4, true).unwrap(),
+        vec!["g", "e", "d0", "d"],
+        "reverse page over the same state"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
     let dir = tmp("scanids");
