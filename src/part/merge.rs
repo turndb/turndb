@@ -7,7 +7,7 @@
 //! # Contiguity is a correctness gate, not a nicety
 //!
 //! Version resolution across parts compares sequence numbers. If parts with sequences 1 and 3 were
-//! merged while 2 was left out, the output would claim the range [1,3] while missing whatever 2 said
+//! merged while 2 was left out, the output would claim the range 1..=3 while missing whatever 2 said
 //! about a shared id — silently resurrecting a superseded record. The input set must therefore be a
 //! **contiguous slice** of the sequence-ordered live list, and that is checked, not assumed.
 //!

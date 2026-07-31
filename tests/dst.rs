@@ -339,7 +339,7 @@ fn run_workload(dir: &Path) -> (Vec<Op>, Vec<Issued>, Vec<Ack>) {
     {
         // Reopen mid-workload: RECOVERY ITSELF is part of the recorded op stream, so crash points
         // inside recovery-after-a-crash get tested too.
-        let mut s = Store::open(&dir.to_path_buf(), cfg).unwrap();
+        let mut s = Store::open(dir, cfg).unwrap();
         s.delete("r2:5").unwrap();
         group += 1;
         issued.push((group, "r2:5".into(), None));

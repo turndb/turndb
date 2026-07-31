@@ -77,11 +77,29 @@ s.flush()?;                                   // seal into an immutable part
 
 ## What it does not do
 
-No daemon, no network, no cluster, no consensus. One writer per store, enforced by `flock`;
-readers need no lock and see a consistent committed snapshot. Scale-out is more stores, not a
-bigger one. No encryption (the format reserves a flag bit and refuses it — see FORMAT.md). No
-parity/erasure coding: corruption is detected at every level and repair is the storage layer's
-job. Unix only.
+No daemon, no network, no cluster, no consensus. Scale-out is more stores, not a bigger one. No
+encryption (the format reserves a flag bit and refuses it — see FORMAT.md). No parity/erasure
+coding: corruption is detected at every level and repair is the storage layer's job.
+
+**One writer per store.** Readers need no lock and see a consistent committed snapshot. On Unix
+the engine enforces this with `flock`, which the kernel releases when the process dies — so a
+stale lock cannot outlive its owner. **Under WASI there is no advisory locking and the engine
+cannot enforce it**: the lock file is created and gates nothing, so the obligation is the
+embedder's — at most one open writer per store directory, across every process and every WASM
+instance. Two writers will interleave their write-ahead logs and corrupt the store, and detection
+is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
+
+## Platforms
+
+The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
+Linux hole punching.
+
+It also builds for **`wasm32-wasip1`**, which is what the [`turndb` npm package](npm/turndb)
+ships: one `.wasm`, no native addon, no prebuild matrix, no postinstall. A store written by either
+build is readable by the other, byte for byte. That target gives up three things, and the first is
+the one that matters: **no advisory locking** (see above), no `punch` (`refold` reclaims the same
+space by rewriting), and no threads, so compression runs inline. `src/sys.rs` is the single place
+that states what turndb needs from an operating system and what happens where it isn't there.
 
 ## Testing
 

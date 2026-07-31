@@ -29,7 +29,12 @@ export interface ScanOptions {
   from?: string;
   /** Exclusive upper bound. */
   to?: string;
-  /** Shorthand for the half-open range covering exactly this prefix. Overrides `from`/`to`. */
+  /**
+   * Shorthand for the half-open range covering exactly this prefix. Overrides `from`/`to`.
+   *
+   * `''` means every id — the range is unbounded, not empty. A prefix of all-U+10FFFF is likewise
+   * unbounded above, because no valid string sorts past it.
+   */
   prefix?: string;
   /** Default 100. */
   limit?: number;
@@ -62,6 +67,19 @@ export declare class TurndbError extends Error {
   readonly name: 'TurndbError';
 }
 
+/**
+ * Ids must be strings, and are refused if they are not — `String(value)` would encode `{}` as
+ * `"[object Object]"`, silently aliasing it onto the literal string of that name. (`applyBatch` is
+ * the exception: the engine rejects a non-string id there with the offending item's index, which is
+ * a better message than the binding could give.)
+ *
+ * Ids, range bounds and attribute strings are refused if they contain an unpaired surrogate.
+ *
+ * JS strings are UTF-16 and can hold them; UTF-8 cannot represent them, and `TextEncoder` maps them
+ * to U+FFFD silently — so two ids the caller believes are distinct would land on one record and the
+ * second would overwrite the first. A `TurndbError` is thrown instead. U+FFFD itself is a valid
+ * character and is accepted normally.
+ */
 export declare class Store {
   /** True once {@link Store.close} has run. */
   readonly closed: boolean;
@@ -79,19 +97,46 @@ export declare class Store {
   autoCompact(): boolean;
   /** The body, byte-exact, or `null` if absent or deleted. */
   get(id: string): Uint8Array | null;
-  /** The body decoded as UTF-8, or `null`. */
+  /**
+   * The body decoded as UTF-8, or `null`.
+   *
+   * **Lossy on bodies that are not valid UTF-8**: invalid sequences decode to U+FFFD, so this is a
+   * convenience for text bodies and not a round-trip. `get` returns the bytes exactly and is the
+   * one to use when the body may be binary — re-encoding this string would not reproduce them.
+   */
   getText(id: string): string | null;
   /** Body plus attributes, or `null`. */
   getRecord(id: string): StoreRecord | null;
   /** Live ids in range, in id order. The paging primitive. */
   scanIds(opts?: ScanOptions): string[];
   stats(): Stats;
-  /** Release the writer lock. Does NOT sync — call {@link Store.sync} first. */
+  /**
+   * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
+   *
+   * Not "release the writer lock": this build holds no advisory lock. See {@link open}.
+   */
   close(): void;
 }
 
-/** Open (or create) a store at `dir`. One writer per directory, per process. */
+/**
+ * Open (or create) a store at `dir`.
+ *
+ * **At most one open writer per store directory, across every process and every instance or
+ * handle.** This package is always the `wasm32-wasip1` build and WASI has no advisory locking, so
+ * the engine cannot enforce this — the obligation is yours, and per-process is not sufficient.
+ * Two writers corrupt the store, and detection is not guaranteed.
+ */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
+
+/**
+ * The first id that cannot start with `prefix`, or `null` when the range is unbounded above.
+ *
+ * Exported because its boundary behaviour is part of the contract: it carries by code POINT, so a
+ * prefix ending at U+FFFF or inside an astral pair yields a valid bound rather than an inverted
+ * range or an unpaired surrogate. Compare bounds as UTF-8 bytes — ids sort by bytes, and JS `<`
+ * compares UTF-16 code units, which disagree for astral characters.
+ */
+export declare function prefixUpperBound(prefix: string): string | null;
 
 declare const _default: { open: typeof open; Store: typeof Store; TurndbError: typeof TurndbError };
 export default _default;

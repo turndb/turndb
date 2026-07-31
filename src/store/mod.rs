@@ -5,7 +5,11 @@
 //!
 //! A store is a **directory**, and reading one requires nothing but the files. There is no daemon in
 //! this design; a server is a *role* a process takes when it holds the writer lock, not a thing the
-//! format depends on. [`Store::open_read`] takes no lock, replays nothing, and is safe to run
+//! format depends on. (That lock is enforced by the OS on Unix and **not enforced on
+//! `wasm32-wasip1`** — there the single-writer invariant is the embedder's to maintain, since
+//! there is no advisory lock to hold. See `src/sys.rs` and FORMAT.md.)
+//!
+//! [`Store::open_read`] takes no lock, replays nothing, and is safe to run
 //! concurrently with a writer — parts are immutable and the fold is append-only, so a reader pinned to
 //! a manifest sees a consistent store with no coordination at all.
 //!
@@ -545,12 +549,35 @@ pub struct Store {
     pcache: Arc<SectionCache>,
 }
 
+/// Refuse an inverted scan range before it reaches `BTreeMap::range`, which PANICS on
+/// `start > end` rather than returning empty.
+///
+/// The corruption storm holds every on-disk parser to "errors, never panics". That discipline was
+/// applied rigorously to bytes on disk and not at all to API arguments — so a store that refuses to
+/// panic on a corrupt file would panic on a reversed range, which draws the trust boundary in the
+/// wrong place: disk bytes are hostile, but the embedder is merely capable of being mistaken, and
+/// only one of those can be fixed by refusing. Equal bounds are a legitimately empty half-open
+/// range and are allowed.
+fn check_range(from: Option<&str>, to: Option<&str>) -> Result<()> {
+    if let (Some(f), Some(t)) = (from, to) {
+        if f > t {
+            bail!("scan range is inverted: from {f:?} sorts after to {t:?}");
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     /// Part count at which [`Store::auto_compact`] runs a total merge. Chosen by measurement, not
     /// taste — see that method's numbers.
     pub const AUTO_COMPACT_K: usize = 8;
 
     /// Open for writing. Takes the writer lock (through the fold) and recovers.
+    ///
+    /// **On Unix** that lock is `flock` and the kernel enforces it. **On `wasm32-wasip1` it is not
+    /// enforced at all** — WASI has no advisory locking, so the lock file is created and gates
+    /// nothing, and the single-writer invariant becomes the embedder's: at most one open writer per
+    /// store directory, across every process and every instance. See `src/sys.rs` and FORMAT.md.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
         crate::vfs::mkdir_all(dir)?;
         let manifest = match Manifest::load(dir) {
@@ -583,6 +610,7 @@ impl Store {
         // is discarded, and the log regenerates it.
         let mut fold =
             Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
+        fold.declare_punched(&manifest.punched);
 
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -659,7 +687,13 @@ impl Store {
             let manifest = Manifest::load(dir)?;
             let fold_path = refold::fold_dir(dir, manifest.fold_gen);
             let fold = match Fold::open_read(&fold_path, cfg) {
-                Ok(fold) => fold,
+                Ok(mut fold) => {
+                    // A live record never references a punched block — `punch_unreferenced` walks
+                    // live visibility to decide. Declared anyway so that if a stale `Loc` ever does
+                    // reach one, it is named as erasure rather than as a failing disk.
+                    fold.declare_punched(&manifest.punched);
+                    fold
+                }
                 Err(e) => {
                     let gone = e
                         .downcast_ref::<std::io::Error>()
@@ -723,7 +757,39 @@ impl Store {
     /// reported as one.
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
         let manifest = load_retained(dir, commit)?;
-        let fold = Fold::open_read(&refold::fold_dir(dir, manifest.fold_gen), cfg)?;
+        let mut fold = Fold::open_read(&refold::fold_dir(dir, manifest.fold_gen), cfg)?;
+        // Erasure is declared by the LIVE manifest, not by this one. Punching commits a new manifest,
+        // so a retained copy predates every punch that followed it and declares nothing — which is
+        // exactly how a deliberate erasure came to be reported as a checksum failure. `punched` is
+        // cumulative, so the live copy is the whole truth about what is gone.
+        //
+        // The load is PROPAGATED, not tolerated. Treating an unreadable live manifest as "nothing
+        // was erased" is the same false fallback this whole fix exists to remove: the reader would
+        // proceed with no declaration and report a punched payload as checksum corruption, which is
+        // the misattribution, arrived at by a different route. An unreadable manifest is an error
+        // and not an empty one — the store's existing rule, and it applies with more force here,
+        // because this manifest is the ONLY authority for telling erasure from damage.
+        let live = Manifest::load(dir).with_context(|| {
+            format!(
+                "retained snapshot at commit {commit} needs the live manifest in {} to tell erased \
+                 blocks from damaged ones, and it could not be read",
+                dir.display()
+            )
+        })?;
+        // Guarded on the generation because block ids are per generation: applying one generation's
+        // punched ranges to another would name live blocks. A re-fold purges the retained log, so a
+        // mismatch should be unreachable — and if it happens anyway, there is no surviving authority
+        // for the old generation's erasures (a re-fold clears `punched`, having rewritten the world
+        // without the erased content). No authority means refuse, for the same reason as above.
+        if live.fold_gen != manifest.fold_gen {
+            bail!(
+                "retained snapshot at commit {commit} is fold generation {} but the live manifest is \
+                 {}, so no erasure declaration covers it",
+                manifest.fold_gen,
+                live.fold_gen
+            );
+        }
+        fold.declare_punched(&live.punched);
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
@@ -760,7 +826,7 @@ impl Store {
         self.fold.put_hashed(b, hash)
     }
 
-    /// Fold the spans, log the record, and stage it. Durable only after [`sync`].
+    /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
         let mut body = Vec::with_capacity(spans.len());
         let mut novel = Vec::new();
@@ -869,7 +935,7 @@ impl Store {
         Ok(())
     }
 
-    /// Delete `id`. Durable only after [`sync`], exactly like a put.
+    /// Delete `id`. Durable only after [`Store::sync`], exactly like a put.
     ///
     /// Recorded as a TOMBSTONE rather than by removing anything: older parts are immutable and still
     /// hold the record, so a deletion has to be a newer version that says "absent". Space is not
@@ -1167,21 +1233,25 @@ impl Store {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>> {
+        check_range(from, to)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // Committed candidates: ask for the whole page even though some may be shadowed by a
-        // staged deletion, then re-trim after the merge.
-        let committed = read::scan_ids(&self.parts, from, to, limit, reverse)?;
-        let staged: Vec<&String> = self
-            .mem
-            .range::<str, _>((
-                from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
-                to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-            ))
-            .filter(|(_, v)| v.is_some())
-            .map(|(k, _)| k)
-            .collect();
+        let range = (
+            from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
+            to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+        );
+        // A staged deletion SHADOWS a committed id: the id still occupies a slot in the committed
+        // scan and is dropped afterwards. Asking for exactly `limit` candidates therefore returns a
+        // short page while live ids sit just past the cut — silently, which is the worst way for a
+        // paged read to be wrong. At most one candidate can be shadowed per staged deletion in the
+        // range, so `limit + deletions` candidates cannot under-fill. Deletions that hit no
+        // committed id merely over-fetch, which the truncate below absorbs.
+        let staged_deletions = self.mem.range::<str, _>(range).filter(|(_, v)| v.is_none()).count();
+        let want = limit.saturating_add(staged_deletions);
+        let committed = read::scan_ids(&self.parts, from, to, want, reverse)?;
+        let staged: Vec<&String> =
+            self.mem.range::<str, _>(range).filter(|(_, v)| v.is_some()).map(|(k, _)| k).collect();
         if staged.is_empty() {
             // still must drop anything the memtable deleted
             let mut out = committed;
@@ -1308,6 +1378,9 @@ impl Store {
         m.punched = to_ranges(&all);
         m.commit(&self.dir)?;
         self.manifest = m;
+        // Declare before destroying, the same order the manifest write follows and for the same
+        // reason: at no point may a block's bytes be gone while this fold still calls it content.
+        self.fold.declare_punched(&self.manifest.punched);
 
         let punched = self.fold.punch_blocks(&dead)?;
         Ok(PunchStats { blocks_punched: punched.len(), blocks_examined: dead.len() })
@@ -1356,6 +1429,13 @@ impl Store {
             })
             .collect::<Result<_>>()?;
         m.fold_gen = new_gen;
+        // Block ids are PER GENERATION and the new fold's restart at 0, so a punched range carried
+        // over from the old generation names live blocks in the new one. Nothing reads `punched`
+        // today, which is the only reason this was survivable; the moment a reader consults it to
+        // tell erasure from corruption, a stale range reports live content as erased. Clearing it
+        // is not bookkeeping — the new fold was rewritten WITHOUT the erased content, so it has no
+        // holes to declare.
+        m.punched.clear();
         // The new fold starts empty of history, so the committed tail is its own.
         let new_dir = refold::fold_dir(&self.dir, new_gen);
         {
@@ -1481,6 +1561,7 @@ impl ReadStore {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>> {
+        check_range(from, to)?;
         read::scan_ids(&self.parts, from, to, limit, reverse)
     }
 
