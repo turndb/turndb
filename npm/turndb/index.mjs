@@ -576,9 +576,9 @@ async function acquireRuntime(hostDir) {
  *   not the engine's 19**, because this build is single-threaded: the block seal compresses on the
  *   calling thread inside whichever `putBody` crosses the boundary, and 4 MiB at level 19 is a
  *   ~1.7s event-loop stall where level 3 is ~80ms (measured through this build on synthetic
- *   bodies, Node 22, host `przym`). Level 3 costs more disk; the delta is content- and
- *   size-dependent, so measure your own workload rather than trusting a figure (see README
- *   "When a write stalls"). Pass `level: 19` to choose ratio over latency knowingly; pass `0` for the
+ *   bodies, Node 22, host `przym`). Level 3 costs more disk; the delta varies materially with
+ *   workload ordering and configuration, so measure your own workload rather than trusting a
+ *   figure (see README "When a write stalls"). Pass `level: 19` to choose ratio over latency knowingly; pass `0` for the
  *   engine default (currently 19). Both options are write-side only: a reader never needs to know
  *   either, so this choice is per-open and never a format commitment.
  * @returns {Promise<Store>}

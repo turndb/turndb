@@ -27,8 +27,8 @@ export interface OpenOptions {
    * the calling thread inside whichever `putBody` crosses the `blockTarget` boundary. Measured on
    * 4 MiB blocks (wasm, Node 22, host `przym`, synthetic bodies): ~1.7s per seal at level 19,
    * ~80ms at level 3.
-   * Level 3 costs more disk; the delta is content- and size-dependent, so measure your own
-   * workload rather than trusting a figure.
+   * Level 3 costs more disk; the delta varies materially with workload ordering and
+   * configuration, so measure your own workload rather than trusting a figure.
    * An explicit `level: 19` buys that ratio back at that per-seal price — stated here and in the
    * README; nothing warns at runtime. `0` selects the engine default (currently 19). Write-side
    * only — a reader never needs to know it, so the choice is per-open, never a format commitment.
