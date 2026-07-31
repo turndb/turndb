@@ -329,10 +329,45 @@ export class Store {
     this.#check(this.#exports.tdb_flush(this.#handle));
   }
 
-  /** Merge parts if the threshold is reached. Returns whether a merge ran. */
+  /**
+   * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
+   *
+   * The stall is the caller's: this build runs the merge on the calling thread, and a total
+   * merge's wall time is linear in the store's on-disk content (~5s/GB measured at level 19,
+   * wasm). It never fires on its own — nothing compacts inside `putBody`/`sync`/`flush` — so
+   * schedule it when a multi-second pause is acceptable, or use {@link Store.maybeCompact} to
+   * bound the pause instead. Total merges are also the only ones that settle deletes: a tombstone
+   * can only be dropped when the merge covers every live part.
+   */
   autoCompact() {
     this.#alive();
     return this.#check(this.#exports.tdb_auto_compact(this.#handle)) === 1;
+  }
+
+  /**
+   * Bounded compaction: if at least `trigger` parts are live, merge the oldest `run` of them.
+   * Returns whether a merge ran.
+   *
+   * The dial for callers with a latency budget: the merge's input — and therefore the stall — is
+   * capped at the oldest `run` parts instead of the whole store. Call it after flushes; repeated
+   * calls amortize what {@link Store.autoCompact} would do in one linear-in-the-store pause.
+   * The trade: bounded merges never settle deletes (tombstones are carried, not dropped), so run a
+   * total merge occasionally if the store sees deletions.
+   *
+   * @param {{trigger?: number, run?: number}} [opts]  Defaults `trigger: 8` (the engine's own
+   *   total-merge threshold) and `run: 4`.
+   * @returns {boolean}
+   */
+  maybeCompact(opts = {}) {
+    this.#alive();
+    const trigger = opts.trigger ?? 8;
+    const run = opts.run ?? 4;
+    if (!Number.isInteger(trigger) || trigger < 2 || !Number.isInteger(run) || run < 2) {
+      throw new TurndbError(
+        `maybeCompact: trigger and run must be integers >= 2 (got trigger=${trigger}, run=${run})`,
+      );
+    }
+    return this.#check(this.#exports.tdb_maybe_compact(this.#handle, trigger, run)) === 1;
   }
 
   /**
@@ -536,8 +571,13 @@ async function acquireRuntime(hostDir) {
  * @param {string} dir  Host directory. Created if absent.
  * @param {{blockTarget?: number, level?: number}} [opts]
  *   `blockTarget` is the bytes gathered before a block seals (default 4 MiB) — bigger compresses
- *   harder and costs more per read. `level` is the zstd level (default 19). Both are write-side
- *   only: a reader never needs to know either.
+ *   harder and costs more per read. `level` is the zstd level — **this package defaults it to 3,
+ *   not the engine's 19**, because this build is single-threaded: the block seal compresses on the
+ *   calling thread inside whichever `putBody` crosses the boundary, and 4 MiB at level 19 is a
+ *   ~1.7s event-loop stall where level 3 is ~80ms for ~9% more disk on real trace content
+ *   (measured; see README "When a write stalls"). Pass `level: 19` to choose ratio over latency knowingly; pass `0` for the
+ *   engine default (currently 19). Both options are write-side only: a reader never needs to know
+ *   either, so this choice is per-open and never a format commitment.
  * @returns {Promise<Store>}
  */
 export async function open(dir, opts = {}) {
@@ -552,7 +592,7 @@ export async function open(dir, opts = {}) {
     const ptr = instance.exports.tdb_alloc(path.length);
     new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
     try {
-      handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 0);
+      handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 3);
     } finally {
       instance.exports.tdb_free(ptr, path.length);
     }

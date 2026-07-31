@@ -66,6 +66,39 @@ Call `close()` explicitly. A dropped handle is reclaimed when JavaScript eventua
 forgetting `close()` does not wedge the process forever, but collection has no timing guarantee and
 the next `open()` refuses while the old handle is still live.
 
+## When a write stalls, and by how much
+
+This build is single-threaded, so two operations run on **your** thread and nothing else's. Both
+are predictable enough to budget for — this section is the arithmetic.
+
+**Block seals.** The fold gathers *unique* content until it reaches `blockTarget` (default 4 MiB),
+then seals the block: one zstd compression, executed inside whichever `putBody` crossed the
+boundary. Every other put is fast (hundreds of MB/s across the boundary); the crossing one pays the
+whole seal. Content the store has seen before — same bytes, same BLAKE3 — dedups and never
+accumulates toward a seal.
+
+Your stall budget is a **rate**, not a total: one seal per `blockTarget` of unique content, so
+
+    seals per hour  =  unique bytes ingested per hour  /  blockTarget
+
+and the cost of each seal is set by `level`. Measured on 4 MiB blocks (wasm build, Node 22):
+**~80ms per seal at level 3 — this package's default — versus ~1.7s at level 19** (the engine's
+default, tuned for the native build where compression runs on a thread pool), for about 9% more
+disk — measured on one real LLM-trace corpus via a zstd CLI proxy at the same levels; synthetic
+test content through the package itself shows as little as 4%. Check your own ratio if disk is
+tight; the stall numbers, not the disk delta, are the ones measured through this build. A trace workload writing 1.8 GB/day of unique content seals ~430
+times a day: ~34 seconds of total stall at level 3, ~12 minutes — in 1.7-second ambushes — at
+level 19. Pass `level: 19` only if that trade is one you have measured your event loop against.
+
+**Compaction.** Merges never rewrite content — that is the format's load-bearing claim and the
+engine asserts it — but they rebuild the reference plane (piece dictionary and columns), whose
+size tracks content volume. `autoCompact()` is a **total** merge: linear in the store's on-disk
+bytes (~5s/GB measured at level 19), only ever run when you call it, and the only merge that
+settles deletes. `maybeCompact()` is the bounded alternative: it merges the oldest few parts, so
+the stall is capped by the run you allow rather than the store you've accumulated. A long-lived
+single-threaded embedder should call `maybeCompact()` on its idle path and reserve `autoCompact()`
+for moments when a multi-second pause is acceptable.
+
 ## Attributes keep order and duplicate keys
 
 Byte-exact reconstruction depends on both, and a JS object can represent neither. Pass an object
