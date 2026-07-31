@@ -20,7 +20,17 @@ export type Attrs = Record<string, AttrValue> | Array<[string, AttrValue]>;
 export interface OpenOptions {
   /** Bytes gathered before a block seals. Default 4 MiB. Bigger compresses harder, costs more per read. */
   blockTarget?: number;
-  /** zstd level. Default 19. Write-side only — a reader never needs to know it. */
+  /**
+   * zstd level. **This package defaults to 3; the engine's own default is 19.**
+   *
+   * The divergence is deliberate: this build is single-threaded, so the block seal compresses on
+   * the calling thread inside whichever `putBody` crosses the `blockTarget` boundary. Measured on
+   * 4 MiB blocks (wasm, Node 22): ~1.7s per seal at level 19, ~80ms at level 3, for ~9% more disk
+   * (measured on a real LLM-trace corpus; synthetic content shows less).
+   * An explicit `level: 19` buys that ratio back at that per-seal price — stated here and in the
+   * README; nothing warns at runtime. `0` selects the engine default (currently 19). Write-side
+   * only — a reader never needs to know it, so the choice is per-open, never a format commitment.
+   */
   level?: number;
 }
 
@@ -93,8 +103,24 @@ export declare class Store {
   sync(): void;
   /** Seal the memtable into an immutable part, making writes visible to other readers. */
   flush(): void;
-  /** Merge parts if the threshold is reached. Returns whether a merge ran. */
+  /**
+   * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
+   *
+   * The stall is the caller's: wall time is linear in the store's on-disk content (~5s/GB measured
+   * at level 19, wasm), on the calling thread. Never fires on its own — schedule it when a
+   * multi-second pause is acceptable, or bound the pause with {@link Store.maybeCompact}. Only
+   * total merges settle deletes.
+   */
   autoCompact(): boolean;
+  /**
+   * Bounded compaction: if at least `trigger` parts are live (default 8), merge the oldest `run`
+   * of them (default 4). Returns whether a merge ran.
+   *
+   * The latency-budget dial: the stall is capped by the merged run instead of the whole store.
+   * Bounded merges never settle deletes — run {@link Store.autoCompact} occasionally if the store
+   * sees deletions.
+   */
+  maybeCompact(opts?: { trigger?: number; run?: number }): boolean;
   /** The body, byte-exact, or `null` if absent or deleted. */
   get(id: string): Uint8Array | null;
   /**

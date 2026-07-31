@@ -408,6 +408,20 @@ pub extern "C" fn tdb_auto_compact(h: i32) -> i32 {
     with_store(h, |s| s.auto_compact().map_err(fail)).map_or(-1, |m| i32::from(m.is_some()))
 }
 
+/// Bounded compaction: if at least `trigger` parts are live, merge the oldest `run` of them.
+/// Returns 1 if a merge ran, 0 if not.
+///
+/// This exists for single-threaded embedders. `tdb_auto_compact` runs a TOTAL merge whose wall
+/// time is linear in the whole store; on this build that work happens on the caller's thread, so
+/// an embedder with a latency budget needs a merge whose input — and therefore stall — it can
+/// bound. `Store::maybe_compact` is the engine's own dial for exactly that; this only reaches it.
+#[no_mangle]
+pub extern "C" fn tdb_maybe_compact(h: i32, trigger: u32, run: u32) -> i32 {
+    clear_err();
+    with_store(h, |s| s.maybe_compact(trigger as usize, run as usize).map_err(fail))
+        .map_or(-1, |m| i32::from(m.is_some()))
+}
+
 // ── Reads ───────────────────────────────────────────────────────────────────
 
 /// Reconstruct a record's body byte-exact into the output buffer.
