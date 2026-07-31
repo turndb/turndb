@@ -6,17 +6,32 @@ bug, and finding out which is the first job.
 
 ## Branching
 
-`main` is protected. Nobody merges to it directly.
+This repository is trunk-based. `main` is the only long-lived branch.
 
 | branch | what it is |
 |---|---|
-| `main` | Protected. Pull requests only, approved by the repository owner. |
-| `develop` | The integration trunk. **Branch your work from here, and merge it back here.** |
-| `review/<yyyy-mm-dd>` | Cut from `develop` when a batch is ready. The PR to `main` comes from this branch and is **frozen** during review, so the diff cannot shift under the reviewer while they are reading it. `develop` keeps moving the whole time. |
+| `main` | The trunk. **Branch your work from here.** Changes land through a pull request, verified by someone who did not write them, and merge with a merge commit — never a squash or rebase — so every commit that was reviewed is the commit that lands. |
+| `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
-The same model applies in CommandSuite, and is written down there in its own `CONTRIBUTING.md`.
-It is stated once per repository and pointed at from everywhere else — three copies of a branch
-model is worse than one, because they drift and then nobody knows which is true.
+Nobody pushes to `main` directly — **by convention, not by machinery.** The repository is currently
+private on a plan that offers no branch protection, so nothing server-side refuses a direct push.
+That is a gap between what this document asks and what the repo can enforce; when the repository
+goes public, branch protection on `main` should be turned on the same day, and this paragraph
+updated to say "protected" and mean it.
+
+**`develop` is retired.** Until 2026-07-31 this repository used a `develop` integration branch with
+frozen `review/<date>` PR branches; every commit from that model is in `main`'s history. Deleting
+the remote branch did not delete anyone's local ref, and a stale local `develop` checks out without
+a word of complaint — so if your clone predates the migration, run `git fetch --prune` and
+`git branch -D develop` before branching anything. Because `develop` was merged (not squashed) into
+`main`, a branch accidentally cut from the stale ref is merely behind `main` rather than carrying
+phantom commits — but base your work on `main` all the same. Nothing server-side currently refuses
+a push that recreates `develop` (see the protection gap above); a CI guard that fails such a push
+is written and waiting on a workflow-scoped token to land.
+
+CommandSuite made the same migration to trunk-based development (its #55); each repository states
+its own model in its own `CONTRIBUTING.md` — three copies of a branch model is worse than one,
+because they drift and then nobody knows which is true.
 
 ### Commit signing does not currently work
 
@@ -39,7 +54,7 @@ Every change is verified by someone who did not write it, and **whoever did not 
 whether it is done.** That is not a rubber stamp and not a style review. A verifier is expected to
 disagree; agreement arrived at by deference is worth nothing.
 
-Merge to `develop` once your partner has verified. Where you differ, say so rather than smoothing it
+Merge to `main` once your partner has verified. Where you differ, say so rather than smoothing it
 into consensus.
 
 ## Standards
