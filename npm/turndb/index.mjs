@@ -333,8 +333,9 @@ export class Store {
    * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
    *
    * The stall is the caller's: this build runs the merge on the calling thread, and a total
-   * merge's wall time is linear in the store's on-disk content (~5s/GB measured at level 19,
-   * wasm). It never fires on its own — nothing compacts inside `putBody`/`sync`/`flush` — so
+   * merge's wall time is linear in the store's on-disk content (~5s/GB at level 19, wasm —
+   * measured on synthetic stores up to 1.9 GB, a single workstation; level 3 unmeasured). It never fires
+   * on its own — nothing compacts inside `putBody`/`sync`/`flush` — so
    * schedule it when a multi-second pause is acceptable, or use {@link Store.maybeCompact} to
    * bound the pause instead. Total merges are also the only ones that settle deletes: a tombstone
    * can only be dropped when the merge covers every live part.
@@ -574,8 +575,10 @@ async function acquireRuntime(hostDir) {
  *   harder and costs more per read. `level` is the zstd level — **this package defaults it to 3,
  *   not the engine's 19**, because this build is single-threaded: the block seal compresses on the
  *   calling thread inside whichever `putBody` crosses the boundary, and 4 MiB at level 19 is a
- *   ~1.7s event-loop stall where level 3 is ~80ms for ~9% more disk on real trace content
- *   (measured; see README "When a write stalls"). Pass `level: 19` to choose ratio over latency knowingly; pass `0` for the
+ *   ~1.7s event-loop stall where level 3 is ~80ms (measured through this build on synthetic
+ *   bodies, Node 22, a single workstation). Level 3 costs more disk; the delta is content- and
+ *   size-dependent, so measure your own workload rather than trusting a figure (see README
+ *   "When a write stalls"). Pass `level: 19` to choose ratio over latency knowingly; pass `0` for the
  *   engine default (currently 19). Both options are write-side only: a reader never needs to know
  *   either, so this choice is per-open and never a format commitment.
  * @returns {Promise<Store>}

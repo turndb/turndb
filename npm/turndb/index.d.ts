@@ -25,8 +25,10 @@ export interface OpenOptions {
    *
    * The divergence is deliberate: this build is single-threaded, so the block seal compresses on
    * the calling thread inside whichever `putBody` crosses the `blockTarget` boundary. Measured on
-   * 4 MiB blocks (wasm, Node 22): ~1.7s per seal at level 19, ~80ms at level 3, for ~9% more disk
-   * (measured on a real LLM-trace corpus; synthetic content shows less).
+   * 4 MiB blocks (wasm, Node 22, a single workstation, synthetic bodies): ~1.7s per seal at level 19,
+   * ~80ms at level 3.
+   * Level 3 costs more disk; the delta is content- and size-dependent, so measure your own
+   * workload rather than trusting a figure.
    * An explicit `level: 19` buys that ratio back at that per-seal price — stated here and in the
    * README; nothing warns at runtime. `0` selects the engine default (currently 19). Write-side
    * only — a reader never needs to know it, so the choice is per-open, never a format commitment.
@@ -106,8 +108,9 @@ export declare class Store {
   /**
    * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
    *
-   * The stall is the caller's: wall time is linear in the store's on-disk content (~5s/GB measured
-   * at level 19, wasm), on the calling thread. Never fires on its own — schedule it when a
+   * The stall is the caller's: wall time is linear in the store's on-disk content (~5s/GB at
+   * level 19, wasm — synthetic stores up to 1.9 GB, a single workstation; level 3 unmeasured), on the
+   * calling thread. Never fires on its own — schedule it when a
    * multi-second pause is acceptable, or bound the pause with {@link Store.maybeCompact}. Only
    * total merges settle deletes.
    */
