@@ -88,8 +88,8 @@ versus ~1.7s at level 19** (the engine's default, tuned for the native build whe
 runs on a thread pool).
 
 Level 3 also costs more disk, and this README does not publish a figure: measurements through the
-package on one real trace corpus varied with sampling method and store size in ways not yet
-explained, and nothing in the default depends on the number — the default is set by the stall. If
+package on one real trace corpus varied materially with workload ordering and sample
+configuration, and nothing in the default depends on the number — the default is set by the stall. If
 disk matters, measure your own workload: write a sample at both levels and compare the
 directories. A trace workload writing 1.8 GB/day of unique content seals ~430 times a day: ~34
 seconds of total stall at level 3, ~12 minutes — in 1.7-second ambushes — at level 19. Pass
