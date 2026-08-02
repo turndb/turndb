@@ -77,8 +77,18 @@ pub fn get(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
 
 /// Byte-exact content for `id`, or `None` if it is absent or deleted.
 pub fn reconstruct(parts: &[Arc<Part>], fold: &Fold, id: &str) -> Result<Option<Vec<u8>>> {
+    reconstruct_content(parts, fold, id, crate::types::BODY_CONTENT)
+}
+
+/// Byte-exact named content for `id`, or `None` when either the record or value is absent.
+pub fn reconstruct_content(
+    parts: &[Arc<Part>],
+    fold: &Fold,
+    id: &str,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
     match locate(parts, id)? {
-        Some((p, row)) => Ok(Some(p.reconstruct(row, fold)?)),
+        Some((p, row)) => p.reconstruct_content(row, name, fold),
         None => Ok(None),
     }
 }

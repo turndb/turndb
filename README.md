@@ -3,7 +3,7 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
-**Status: pre-1.0, format version 1, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
+**Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
 ## What problem it solves
@@ -16,7 +16,8 @@ queryable.
 turndb splits the two planes:
 
 * the **fold** holds content, addressed by BLAKE3 of its bytes, written once and never rewritten;
-* **parts** hold record ids, body programs, and typed attribute columns — references, not bytes.
+* **parts** hold record ids, named content programs, and typed attribute columns — references, not
+  bytes.
 
 Because a part holds no content, **compaction never touches content**: merging rewrites references
 and columns, which on trace data is a small fraction of the bytes. That is what lets a trace store
@@ -35,8 +36,9 @@ became 1.56 MiB.
 
 ## The cardinal invariant
 
-**Byte-exact reconstruction.** Reading a record reproduces the original bytes exactly — attribute
-order, duplicate keys, NaN payloads, `-0.0`. Everything else is in service of it.
+**Byte-exact reconstruction.** Reading a record reproduces every named content value and attribute
+exactly — including content boundaries, attribute order, duplicate keys, NaN payloads, and `-0.0`.
+Everything else is in service of it.
 
 ## Try it
 
@@ -69,7 +71,7 @@ s.flush()?;                                   // seal into an immutable part
 | | |
 |---|---|
 | **Durability** | WAL with an explicit ACK point; batches replay all-or-nothing; one commit point (the manifest) with a checksummed commit log, snapshots, and explicit recovery |
-| **Query** | DataFusion lens over the columnar plane — `body` is a projectable column, so attribute queries open zero fold blocks (measured, not asserted) |
+| **Query** | DataFusion lens over the columnar plane — `body` and `content.<name>` are independently projectable, so attribute queries open zero fold blocks (measured, not asserted) |
 | **Compaction** | Total merge at eight parts, chosen by benchmark; merges provably touch zero content bytes |
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
-use turndb::store::{Manifest, PartRef, Span, Store};
+use turndb::store::{ContentSpans, Manifest, PartRef, Span, Store};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -72,6 +72,97 @@ fn put_flush_get_is_byte_exact() {
         let r = s.get(id).unwrap().unwrap();
         assert_eq!(r.attrs[0].1, AttrValue::Str("claude".into()));
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn named_content_is_independent_sparse_and_content_addressed() {
+    let dir = tmp("named-content");
+    let shared = b"the same large content appears under request and response";
+    let mut s = Store::open(&dir, cfg()).unwrap();
+
+    // Deliberately submit names out of order. The semantic record is a map and reads canonically.
+    let contents = vec![
+        ContentSpans::new("response", vec![Span::Piece(shared), Span::Lit(b"!")]),
+        ContentSpans::new("empty", vec![]),
+        ContentSpans::new("request", vec![Span::Piece(shared)]),
+    ];
+    s.put_record("mixed:1", &contents, vec![("kind".into(), AttrValue::Str("example".into()))])
+        .unwrap();
+
+    assert_eq!(s.dedup_window_len(), 1, "one shared piece is stored once across content names");
+    assert_eq!(s.reconstruct_content("mixed:1", "request").unwrap().unwrap(), shared);
+    assert_eq!(
+        s.reconstruct_content("mixed:1", "response").unwrap().unwrap(),
+        [shared.as_slice(), b"!"].concat()
+    );
+    assert_eq!(s.reconstruct_content("mixed:1", "empty").unwrap(), Some(Vec::new()));
+    assert_eq!(s.reconstruct_content("mixed:1", "absent").unwrap(), None);
+    assert_eq!(s.reconstruct("mixed:1").unwrap(), None, "body is conventional, not privileged");
+    assert_eq!(
+        s.get("mixed:1")
+            .unwrap()
+            .unwrap()
+            .contents
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["empty", "request", "response"]
+    );
+
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let second = [ContentSpans::new("raw", vec![Span::Piece(shared)])];
+    s.put_record("mixed:2", &second, vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.merge_range(0, 2).unwrap().unwrap();
+    assert_eq!(s.part_count(), 1);
+    assert_eq!(s.reconstruct_content("mixed:1", "request").unwrap().unwrap(), shared);
+    assert_eq!(s.reconstruct_content("mixed:2", "raw").unwrap().unwrap(), shared);
+
+    s.refold().unwrap();
+    drop(s);
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct_content("mixed:1", "empty").unwrap(), Some(Vec::new()));
+    assert_eq!(r.reconstruct_content("mixed:1", "absent").unwrap(), None);
+    assert_eq!(r.reconstruct_content("mixed:2", "raw").unwrap().unwrap(), shared);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_invalid_content_map_has_no_storage_side_effects() {
+    let dir = tmp("invalid-content-map");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let duplicate = [
+        ContentSpans::new("same", vec![Span::Piece(b"first")]),
+        ContentSpans::new("same", vec![Span::Piece(b"second")]),
+    ];
+    assert!(s.put_record("bad", &duplicate, vec![]).is_err());
+    assert_eq!(s.memtable_len(), 0);
+    assert_eq!(s.dedup_window_len(), 0);
+    assert_eq!(s.wal_bytes(), 0);
+
+    let empty_name = [ContentSpans::new("", vec![Span::Piece(b"bytes")])];
+    assert!(s.put_record("bad", &empty_name, vec![]).is_err());
+    assert_eq!(s.memtable_len(), 0);
+    assert_eq!(s.dedup_window_len(), 0);
+    assert_eq!(s.wal_bytes(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_invalid_late_batch_member_has_no_storage_side_effects() {
+    let dir = tmp("invalid-batch-record");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut batch = turndb::store::Batch::new();
+    batch.put("good", &[Span::Piece(b"must not reach the fold")], vec![]);
+    // The compatibility staging API cannot return an error, so apply preflights the entire batch.
+    batch.put("", &[Span::Piece(b"also must not reach the fold")], vec![]);
+    assert!(s.apply(batch).is_err());
+    assert_eq!(s.memtable_len(), 0);
+    assert_eq!(s.dedup_window_len(), 0);
+    assert_eq!(s.wal_bytes(), 0);
     std::fs::remove_dir_all(&dir).ok();
 }
 

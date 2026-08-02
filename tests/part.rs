@@ -5,7 +5,11 @@
 use std::path::PathBuf;
 use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
-use turndb::{AttrValue, BodyOp, Record};
+use turndb::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
+
+fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
+    vec![Content::new(BODY_CONTENT, ops)]
+}
 
 fn tmp(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -23,7 +27,7 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         Record {
             // duplicate keys, mixed types on one key, NaN, -0.0, and a non-ASCII id
             id: "genai:aé#input".into(),
-            body: vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }],
+            contents: body_content(vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }]),
             attrs: vec![
                 ("z.last".into(), AttrValue::Str("v".into())),
                 ("dup".into(), AttrValue::Int(1)),
@@ -35,7 +39,7 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         },
         Record {
             id: "genai:aè#input".into(),
-            body: vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }],
+            contents: body_content(vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }]),
             // the SAME key at a different type — must become a separate column
             attrs: vec![
                 ("mixed".into(), AttrValue::Str("7".into())),
@@ -45,13 +49,13 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         Record {
             // interleaving that column storage alone cannot reproduce: a, b, a
             id: "rec:interleaved".into(),
-            body: vec![
+            contents: body_content(vec![
                 BodyOp::Lit(b"[".to_vec()),
                 BodyOp::Piece { hash: p2.hash, len: p2.loc.raw },
                 BodyOp::Lit(b",".to_vec()),
                 BodyOp::Piece { hash: p3.hash, len: p3.loc.raw },
                 BodyOp::Lit(b"]".to_vec()),
-            ],
+            ]),
             attrs: vec![
                 ("a".into(), AttrValue::Str("one".into())),
                 ("b".into(), AttrValue::Bool(true)),
@@ -60,12 +64,12 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         },
         Record {
             id: "rec:no-attrs".into(),
-            body: vec![BodyOp::Lit(b"bare".to_vec())],
+            contents: body_content(vec![BodyOp::Lit(b"bare".to_vec())]),
             attrs: Vec::new(),
         },
         Record {
             id: "rec:empty-body".into(),
-            body: Vec::new(),
+            contents: body_content(Vec::new()),
             attrs: vec![("only".into(), AttrValue::Bool(false))],
         },
     ]
@@ -95,12 +99,12 @@ fn records_round_trip_byte_exact() {
         let row = p.find(&r.id).unwrap().expect("every id must be findable");
         let got = p.record(row).unwrap();
         assert_eq!(got.id, r.id);
-        assert_eq!(got.body, r.body, "body program drifted for {}", r.id);
+        assert_eq!(got.contents, r.contents, "content programs drifted for {}", r.id);
         assert_eq!(got.attrs, r.attrs, "ATTR DRIFT (order/dupes/types) for {}", r.id);
 
         // and the content itself reconstructs byte-exact out of the fold
         let mut expect = Vec::new();
-        for op in &r.body {
+        for op in r.body().unwrap() {
             match op {
                 BodyOp::Lit(b) => expect.extend_from_slice(b),
                 BodyOp::Piece { hash, .. } => {
@@ -131,7 +135,7 @@ fn float_bit_patterns_survive() {
         .enumerate()
         .map(|(i, f)| Record {
             id: format!("f{i:03}"),
-            body: Vec::new(),
+            contents: body_content(Vec::new()),
             attrs: vec![("v".into(), AttrValue::Float(*f))],
         })
         .collect();
@@ -170,12 +174,14 @@ fn scales_to_many_records_with_shared_content() {
     let recs: Vec<Record> = (0..2000)
         .map(|i| Record {
             id: format!("genai:trace{:05}:span{:03}#input", i / 7, i % 7),
-            body: (0..(i % 9 + 1))
-                .map(|k| {
-                    let p = &pieces[(i + k) % pieces.len()];
-                    BodyOp::Piece { hash: p.hash, len: p.loc.raw }
-                })
-                .collect(),
+            contents: body_content(
+                (0..(i % 9 + 1))
+                    .map(|k| {
+                        let p = &pieces[(i + k) % pieces.len()];
+                        BodyOp::Piece { hash: p.hash, len: p.loc.raw }
+                    })
+                    .collect(),
+            ),
             attrs: vec![
                 ("model".into(), AttrValue::Str(format!("claude-{}", i % 3))),
                 ("tokens".into(), AttrValue::Int((i * 13 % 997) as i64)),
@@ -195,7 +201,7 @@ fn scales_to_many_records_with_shared_content() {
         let row = p.find(&r.id).unwrap().expect("id findable");
         let got = p.record(row).unwrap();
         assert_eq!(got.attrs, r.attrs, "attrs drifted for {}", r.id);
-        assert_eq!(got.body, r.body, "body drifted for {}", r.id);
+        assert_eq!(got.contents, r.contents, "content drifted for {}", r.id);
         p.reconstruct(row, &fold).unwrap();
     }
 
@@ -218,12 +224,12 @@ fn piece_dictionary_is_in_fold_order() {
     let recs: Vec<Record> = (0..200)
         .map(|i| Record {
             id: format!("r{i:04}"),
-            body: vec![{
+            contents: body_content(vec![{
                 let p = fold
                     .put(format!("piece {i} with enough bytes to matter for blocking").as_bytes())
                     .unwrap();
                 BodyOp::Piece { hash: p.hash, len: p.loc.raw }
-            }],
+            }]),
             attrs: Vec::new(),
         })
         .collect();
@@ -269,8 +275,8 @@ fn duplicate_ids_in_one_part_are_refused() {
     std::fs::create_dir_all(&dir).unwrap();
     let fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
     let recs = vec![
-        Record { id: "same".into(), body: Vec::new(), attrs: Vec::new() },
-        Record { id: "same".into(), body: Vec::new(), attrs: Vec::new() },
+        Record { id: "same".into(), contents: body_content(Vec::new()), attrs: Vec::new() },
+        Record { id: "same".into(), contents: body_content(Vec::new()), attrs: Vec::new() },
     ];
     let path = dir.join("p.part");
     // A part is one version per id; cross-part resolution is by sequence range. Two versions inside
@@ -317,7 +323,7 @@ fn a_toc_pointing_past_the_file_is_refused() {
             let p = fold.put(&body).unwrap();
             Record {
                 id: format!("k{i:03}"),
-                body: vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                contents: body_content(vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }]),
                 attrs: vec![("v".into(), AttrValue::Int(i))],
             }
         })
@@ -370,7 +376,7 @@ fn a_part(d: &std::path::Path) -> (std::path::PathBuf, Fold) {
             let p = fold.put(&body).unwrap();
             Record {
                 id: format!("k{i:03}"),
-                body: vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                contents: body_content(vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }]),
                 attrs: vec![("v".into(), AttrValue::Str(format!("value {i}")))],
             }
         })
@@ -508,7 +514,7 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
     std::fs::create_dir_all(&d).unwrap();
     let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
     let mut records = fixture(&mut fold);
-    records.push(Record { id: "zzz:tomb".into(), body: vec![], attrs: vec![] });
+    records.push(Record { id: "zzz:tomb".into(), contents: vec![], attrs: vec![] });
     let tombs: Vec<bool> = records.iter().map(|r| r.id == "zzz:tomb").collect();
     fold.sync().unwrap();
 
@@ -519,9 +525,11 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
     // column universe with string dictionaries — then rows in id order.
     let mut dict_map = HashMap::new();
     for r in &records {
-        for op in &r.body {
-            if let BodyOp::Piece { hash, .. } = op {
-                dict_map.entry(*hash).or_insert_with(|| fold.lookup(*hash).unwrap());
+        for content in &r.contents {
+            for op in &content.ops {
+                if let BodyOp::Piece { hash, .. } = op {
+                    dict_map.entry(*hash).or_insert_with(|| fold.lookup(*hash).unwrap());
+                }
             }
         }
     }
@@ -537,14 +545,24 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
     }
     let columns: Vec<(String, u8)> = cols.keys().cloned().collect();
     let dicts: Vec<Vec<String>> = cols.values().map(|s| s.iter().cloned().collect()).collect();
+    let content_names: BTreeSet<String> =
+        records.iter().flat_map(|r| r.contents.iter().map(|c| c.name.clone())).collect();
 
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by(|&a, &b| records[a].id.cmp(&records[b].id));
     let p2 = d.join("b.part");
-    let mut b = turndb::part::builder::StreamBuilder::new(&p2, 3, dict, columns, dicts).unwrap();
+    let mut b = turndb::part::builder::StreamBuilder::new(
+        &p2,
+        3,
+        dict,
+        content_names.into_iter().collect(),
+        columns,
+        dicts,
+    )
+    .unwrap();
     for &i in &order {
         let r = &records[i];
-        b.push(r.id.as_bytes(), tombs[i], &r.body, &r.attrs).unwrap();
+        b.push(r.id.as_bytes(), tombs[i], &r.contents, &r.attrs).unwrap();
     }
     b.finish(3, 9).unwrap();
 
@@ -571,7 +589,7 @@ fn zone_maps_bound_columns_and_refuse_to_lie() {
     let fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
     let rec = |id: &str, n: i64, t: f64, nanf: f64| Record {
         id: id.into(),
-        body: vec![BodyOp::Lit(b"x".to_vec())],
+        contents: body_content(vec![BodyOp::Lit(b"x".to_vec())]),
         attrs: vec![
             ("n".into(), AttrValue::Int(n)),
             ("t".into(), AttrValue::Float(t)),

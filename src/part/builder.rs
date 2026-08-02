@@ -11,12 +11,12 @@
 //! **The output is byte-identical to `build_full` given the same rows** — asserted by test, not
 //! assumed — which is what makes the old builder the streaming builder's oracle.
 
-use super::{PartMeta, Writer, OP_LIT, OP_PIECE};
+use super::{PartMeta, Writer};
 use crate::fold::Loc;
 use crate::part::attrs::{encode_zones, ZoneAcc, RID_DELTA, RID_DENSE};
 use crate::part::bloom;
 use crate::part::idcol::{put_varint, RESTART};
-use crate::types::{AttrValue, BodyOp, PieceHash};
+use crate::types::{AttrValue, Content, PieceHash};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -73,21 +73,31 @@ struct Col {
     rid: Spool,
 }
 
+struct ContentCol {
+    name: String,
+    occurrences: u64,
+    dense: bool,
+    prev_rid: u64,
+    prog: Spool,
+    off: Spool,
+    rid: Spool,
+    prog_len: u64,
+}
+
 pub struct StreamBuilder {
     w: Writer,
     dict: Vec<(Loc, PieceHash)>,
     dict_index: HashMap<PieceHash, u32>,
     cols: Vec<Col>,
     col_of: HashMap<(String, u8), usize>,
+    content_cols: Vec<ContentCol>,
+    content_of: HashMap<String, usize>,
 
     ids: Spool,
     id_restarts: Vec<u32>,
     id_stream_len: u64,
     prev_id: Vec<u8>,
 
-    prog: Spool,
-    prog_off: Spool,
-    prog_len: u64,
     layout: Spool,
     layout_off: Spool,
     layout_len: u64,
@@ -108,6 +118,7 @@ impl StreamBuilder {
         path: &Path,
         level: i32,
         mut dict: Vec<(Loc, PieceHash)>,
+        mut content_names: Vec<String>,
         columns: Vec<(String, u8)>,
         string_dicts: Vec<Vec<String>>,
     ) -> Result<StreamBuilder> {
@@ -146,19 +157,41 @@ impl StreamBuilder {
             });
         }
 
+        content_names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        if content_names.iter().any(String::is_empty) {
+            bail!("content column names must not be empty");
+        }
+        if content_names.windows(2).any(|w| w[0] == w[1]) {
+            bail!("content column names must be unique");
+        }
+        let mut content_cols = Vec::with_capacity(content_names.len());
+        let mut content_of = HashMap::with_capacity(content_names.len());
+        for name in content_names {
+            content_of.insert(name.clone(), content_cols.len());
+            content_cols.push(ContentCol {
+                name,
+                occurrences: 0,
+                dense: true,
+                prev_rid: 0,
+                prog: spool(path)?,
+                off: spool(path)?,
+                rid: spool(path)?,
+                prog_len: 0,
+            });
+        }
+
         Ok(StreamBuilder {
             w: Writer::new(path, level)?,
             dict,
             dict_index,
             cols,
             col_of,
+            content_cols,
+            content_of,
             ids: spool(path)?,
             id_restarts: Vec::new(),
             id_stream_len: 0,
             prev_id: Vec::new(),
-            prog: spool(path)?,
-            prog_off: spool(path)?,
-            prog_len: 0,
             layout: spool(path)?,
             layout_off: spool(path)?,
             layout_len: 0,
@@ -175,7 +208,7 @@ impl StreamBuilder {
         &mut self,
         id: &[u8],
         tomb: bool,
-        body: &[BodyOp],
+        contents: &[Content],
         attrs: &[(String, AttrValue)],
     ) -> Result<()> {
         let row = self.rows;
@@ -208,32 +241,28 @@ impl StreamBuilder {
         self.prev_id.clear();
         self.prev_id.extend_from_slice(id);
 
-        // ---- body program ----
-        self.prog_off.append(&self.prog_len.to_le_bytes())?;
-        let mut p = Vec::new();
-        let emitted =
-            body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
-        put_varint(&mut p, emitted as u64);
-        for op in body {
-            match op {
-                BodyOp::Lit(b) => {
-                    if b.is_empty() {
-                        continue;
-                    }
-                    put_varint(&mut p, ((b.len() as u64) << 1) | OP_LIT);
-                    p.extend_from_slice(b);
-                }
-                BodyOp::Piece { hash, len } => {
-                    let idx = *self.dict_index.get(hash).ok_or_else(|| {
-                        anyhow::anyhow!("piece {hash} is not in the builder's dictionary")
-                    })?;
-                    put_varint(&mut p, ((idx as u64) << 1) | OP_PIECE);
-                    put_varint(&mut p, *len as u64);
-                }
-            }
+        // ---- named content columns ----
+        crate::types::validate_contents(contents)?;
+        for content in contents {
+            let &c = self.content_of.get(&content.name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "content {:?} is outside the declared column universe",
+                    content.name
+                )
+            })?;
+            let col = &mut self.content_cols[c];
+            col.dense = col.dense && col.occurrences == row;
+            let mut d = Vec::new();
+            put_varint(&mut d, row - col.prev_rid);
+            col.rid.append(&d)?;
+            col.prev_rid = row;
+            col.off.append(&col.prog_len.to_le_bytes())?;
+            let mut p = Vec::new();
+            super::content::encode_program(&mut p, &content.ops, &self.dict_index)?;
+            col.prog.append(&p)?;
+            col.prog_len += p.len() as u64;
+            col.occurrences += 1;
         }
-        self.prog.append(&p)?;
-        self.prog_len += p.len() as u64;
 
         // ---- layout + columns ----
         self.layout_off.append(&self.layout_len.to_le_bytes())?;
@@ -285,14 +314,33 @@ impl StreamBuilder {
             bail!("{} records exceeds the u32 record count a part footer can name", self.rows);
         }
         let n = self.rows;
-        self.prog_off.append(&self.prog_len.to_le_bytes())?;
         self.layout_off.append(&self.layout_len.to_le_bytes())?;
 
         self.w.section("ids", &self.ids.take()?)?;
         let restarts: Vec<u8> = self.id_restarts.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.w.section("ids.restart", &restarts)?;
-        self.w.section("prog", &self.prog.take()?)?;
-        self.w.section("prog.off", &self.prog_off.take()?)?;
+        let mut cmeta = Vec::new();
+        put_varint(&mut cmeta, self.content_cols.len() as u64);
+        for c in &self.content_cols {
+            put_varint(&mut cmeta, c.name.len() as u64);
+            cmeta.extend_from_slice(c.name.as_bytes());
+            put_varint(&mut cmeta, c.occurrences);
+            cmeta.push(if c.dense && c.occurrences == n {
+                super::content::RID_DENSE
+            } else {
+                super::content::RID_DELTA
+            });
+        }
+        self.w.section("cmeta", &cmeta)?;
+        for (i, mut c) in self.content_cols.into_iter().enumerate() {
+            c.off.append(&c.prog_len.to_le_bytes())?;
+            self.w.section(&format!("con.prog.{i}"), &c.prog.take()?)?;
+            self.w.section(&format!("con.off.{i}"), &c.off.take()?)?;
+            let rid = c.rid.take()?;
+            if !(c.dense && c.occurrences == n) {
+                self.w.section(&format!("con.rid.{i}"), &rid)?;
+            }
+        }
         self.w.section(
             "pdict.loc",
             &self.dict.iter().flat_map(|(l, _)| l.encode()).collect::<Vec<u8>>(),

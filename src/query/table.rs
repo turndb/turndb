@@ -7,7 +7,7 @@
 //! One partition per part, so parts scan in parallel and a merged part simply becomes one bigger
 //! partition.
 
-use super::{Cmp, Lens, Pred, ScanStats, F_BODY};
+use super::{Cmp, Lens, Pred, ScanStats};
 use crate::fold::Fold;
 use crate::part::Part;
 use crate::store::ReadStore;
@@ -295,10 +295,10 @@ impl ExecutionPlan for TurndbExec {
         let Some(part) = self.parts.get(partition) else {
             return Ok(Box::pin(MemoryStream::try_new(vec![], self.schema.clone(), None)?));
         };
-        // The fold is handed over only when `body` is in the projection, so an attribute-only query
-        // cannot reach content even by mistake.
-        let wants_body = self.schema.fields().iter().any(|f| f.name() == F_BODY);
-        let fold = wants_body.then_some(&self.fold);
+        // The fold is handed over only when named content is in the projection, so an attribute-only
+        // query cannot reach content even by mistake.
+        let wants_content = self.lens.projection_reads_content(&self.projection);
+        let fold = wants_content.then_some(&self.fold);
 
         let scan = self
             .lens

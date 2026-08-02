@@ -13,7 +13,11 @@ use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
 use turndb::store::wal::Wal;
 use turndb::store::{Span, Store};
-use turndb::types::{AttrValue, BodyOp, Record};
+use turndb::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
+
+fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
+    vec![Content::new(BODY_CONTENT, ops)]
+}
 
 fn tmp(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -105,11 +109,11 @@ fn build_part(dir: &Path) -> (Vec<u8>, Fold) {
         let p = fold.put(body.as_bytes()).unwrap();
         records.push(Record {
             id: format!("rec:{i:03}"),
-            body: vec![
+            contents: body_content(vec![
                 BodyOp::Lit(b"[".to_vec()),
                 BodyOp::Piece { hash: p.hash, len: p.loc.raw },
                 BodyOp::Lit(b"]".to_vec()),
-            ],
+            ]),
             attrs: vec![
                 ("model".into(), AttrValue::Str(format!("m{}", i % 3))),
                 ("n".into(), AttrValue::Int(i as i64)),
@@ -169,7 +173,7 @@ fn wal_replay_never_panics_on_damage() {
             let h = turndb::PieceHash::of(&bytes);
             let r = Record {
                 id: format!("w:{i}"),
-                body: vec![BodyOp::Piece { hash: h, len: bytes.len() as u32 }],
+                contents: body_content(vec![BodyOp::Piece { hash: h, len: bytes.len() as u32 }]),
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
                     ("f".into(), AttrValue::Float(-0.0)),
@@ -178,8 +182,11 @@ fn wal_replay_never_panics_on_damage() {
             w.append(i, &r, &[(h, bytes)]).unwrap();
         }
         w.append_tomb(10, "w:3").unwrap();
-        let extra =
-            Record { id: "b:1".into(), body: vec![BodyOp::Lit(b"lit".to_vec())], attrs: vec![] };
+        let extra = Record {
+            id: "b:1".into(),
+            contents: body_content(vec![BodyOp::Lit(b"lit".to_vec())]),
+            attrs: vec![],
+        };
         w.append_batch(11, &[(extra, Vec::new(), false)]).unwrap();
         w.sync().unwrap();
     }
@@ -200,10 +207,10 @@ fn wal_record_decode_never_panics_on_damage() {
     let h = turndb::PieceHash::of(&body_bytes);
     let r = Record {
         id: "d:1".into(),
-        body: vec![
+        contents: body_content(vec![
             BodyOp::Lit(b"[".to_vec()),
             BodyOp::Piece { hash: h, len: body_bytes.len() as u32 },
-        ],
+        ]),
         attrs: vec![
             ("s".into(), AttrValue::Str("v".into())),
             ("i".into(), AttrValue::Int(-9)),
@@ -212,7 +219,7 @@ fn wal_record_decode_never_panics_on_damage() {
         ],
     };
     let mut pristine = Vec::new();
-    turndb::store::wal::encode_record(&mut pristine, &r, &[(h, body_bytes)]);
+    turndb::store::wal::encode_record(&mut pristine, &r, &[(h, body_bytes)]).unwrap();
 
     let mut rng = Rng(0xC0DEC);
     for round in 0..15000 {
