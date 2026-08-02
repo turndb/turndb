@@ -1,9 +1,9 @@
 //! A **part**: an immutable, self-contained, id-sorted columnar slice of the store.
 //!
-//! A part holds record identity, the flat body programs that reconstruct content out of the fold, the
-//! piece dictionary those programs reference, and the typed attribute columns. It holds no content —
-//! content lives in the fold and is shared by every part. That is what makes merging parts cheap:
-//! a merge rewrites references and columns, never bytes.
+//! A part holds record identity, sparse named programs that reconstruct content out of the fold, the
+//! piece dictionary those programs reference, and typed attribute columns. It holds literal runs but
+//! no carved piece bytes — those live in the fold and are shared by every part. That is what makes
+//! merging parts cheap: a merge rewrites references and columns, never carved bytes.
 //!
 //! ```text
 //!   [ sections … ]  [ TOC ]  [ FOOTER (56B, at EOF) ]
@@ -37,12 +37,13 @@ pub mod attrs;
 pub mod bloom;
 pub mod builder;
 pub mod cache;
+pub mod content;
 pub mod idcol;
 pub mod merge;
 
 use crate::fold::{Fold, Loc};
 use crate::readat::ReadAt;
-use crate::types::{AttrValue, BodyOp, PieceHash, Record};
+use crate::types::{AttrValue, BodyOp, Content, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use cache::{Held, Kind, SectionCache};
 use idcol::{get_varint, put_varint, IdCol};
@@ -63,9 +64,9 @@ pub const FOOTER_LEN: u64 = 56;
 ///
 /// This claims one of the footer's padding bytes, which cost nothing because they were already
 /// zero-filled: a part written before this existed reads as version 0, which is exactly what it is.
-pub const PART_VERSION: u8 = 1;
+pub const PART_VERSION: u8 = 2;
 
-/// Body-program op tags, packed into the low bit of a varint.
+/// Content-program op tags, packed into the low bit of a varint.
 pub(crate) const OP_LIT: u64 = 0;
 pub(crate) const OP_PIECE: u64 = 1;
 
@@ -104,6 +105,14 @@ pub struct PartMeta {
     /// include.
     pub seq_lo: u64,
     pub seq_hi: u64,
+}
+
+/// One named content column declared by a revision-2 part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentMeta {
+    pub name: String,
+    pub occurrences: usize,
+    pub dense: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -189,13 +198,16 @@ pub fn build_full(
     // ---- piece dictionary: distinct locs, sorted in FOLD order ----
     let mut piece_of: HashMap<PieceHash, Loc> = HashMap::new();
     for r in records {
-        for op in &r.body {
-            if let BodyOp::Piece { hash, .. } = op {
-                if !piece_of.contains_key(hash) {
-                    let loc = resolve(hash).ok_or_else(|| {
-                        anyhow::anyhow!("piece {hash} is referenced but not in the fold")
-                    })?;
-                    piece_of.insert(*hash, loc);
+        crate::types::validate_contents(&r.contents)?;
+        for content in &r.contents {
+            for op in &content.ops {
+                if let BodyOp::Piece { hash, .. } = op {
+                    if !piece_of.contains_key(hash) {
+                        let loc = resolve(hash).ok_or_else(|| {
+                            anyhow::anyhow!("piece {hash} is referenced but not in the fold")
+                        })?;
+                        piece_of.insert(*hash, loc);
+                    }
                 }
             }
         }
@@ -208,39 +220,9 @@ pub fn build_full(
     let dict_index: HashMap<PieceHash, u32> =
         dict.iter().enumerate().map(|(i, (_, h))| (*h, i as u32)).collect();
 
-    // ---- body programs ----
-    let mut prog = Vec::new();
-    let mut prog_off: Vec<u64> = Vec::with_capacity(ids.len() + 1);
-    for &ri in &order {
-        prog_off.push(prog.len() as u64);
-        let r = &records[ri];
-        // An EMPTY literal would encode as tagged == 0, which is the reserved escape codepoint. It
-        // also contributes nothing to the body, so dropping it preserves byte-exactness exactly — but
-        // the op COUNT is written before the ops, so it must be the count of what is actually emitted.
-        let emitted =
-            r.body.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
-        put_varint(&mut prog, emitted as u64);
-        for op in &r.body {
-            match op {
-                BodyOp::Lit(b) => {
-                    if b.is_empty() {
-                        continue;
-                    }
-                    put_varint(&mut prog, ((b.len() as u64) << 1) | OP_LIT);
-                    prog.extend_from_slice(b);
-                }
-                BodyOp::Piece { hash, len } => {
-                    let idx = dict_index[hash];
-                    put_varint(&mut prog, ((idx as u64) << 1) | OP_PIECE);
-                    put_varint(&mut prog, *len as u64);
-                }
-            }
-        }
-    }
-    prog_off.push(prog.len() as u64);
-
-    // ---- attribute columns ----
+    // ---- named content and attribute columns ----
     let ordered: Vec<&Record> = order.iter().map(|&i| &records[i]).collect();
+    let content = content::build(&ordered, &dict_index)?;
     let built = attrs::build(&ordered)?;
 
     // ---- id column ----
@@ -250,8 +232,14 @@ pub fn build_full(
     let mut w = Writer::new(path, level)?;
     w.section("ids", &id_stream)?;
     w.section("ids.restart", &u32s(&id_restarts))?;
-    w.section("prog", &prog)?;
-    w.section("prog.off", &u64s(&prog_off))?;
+    w.section("cmeta", &content.meta)?;
+    for (i, c) in content.cols.iter().enumerate() {
+        w.section(&format!("con.prog.{i}"), &c.prog)?;
+        w.section(&format!("con.off.{i}"), &u64s(&c.offsets))?;
+        if !c.dense {
+            w.section(&format!("con.rid.{i}"), &c.rid)?;
+        }
+    }
     w.section("pdict.loc", &dict.iter().flat_map(|(l, _)| l.encode()).collect::<Vec<u8>>())?;
     w.section("pdict.hash", &dict.iter().flat_map(|(_, h)| h.0).collect::<Vec<u8>>())?;
     // The dictionary is sorted in FOLD order, which is what makes merge a gather and keeps decode
@@ -354,6 +342,13 @@ impl Writer {
     }
 
     pub(crate) fn finish(self, meta: PartMeta) -> Result<()> {
+        self.finish_version(meta, PART_VERSION)
+    }
+
+    fn finish_version(self, meta: PartMeta, version: u8) -> Result<()> {
+        if version > PART_VERSION {
+            bail!("cannot write unsupported part version {version}");
+        }
         let mut toc = Vec::new();
         put_varint(&mut toc, self.toc.len() as u64);
         for (name, s) in &self.toc {
@@ -386,7 +381,7 @@ impl Writer {
         foot.extend_from_slice(&meta.seq_lo.to_le_bytes());
         foot.extend_from_slice(&meta.seq_hi.to_le_bytes());
         foot.push(toc_codec);
-        foot.push(PART_VERSION);
+        foot.push(version);
         // The TOC is where every section's checksum lives, so leaving the TOC itself unchecked made
         // those checksums only as trustworthy as the bytes carrying them. This covers the STORED TOC
         // payload, and the footer's own checksum covers this — so the chain is closed: footer verifies
@@ -552,20 +547,22 @@ impl Part {
         if at != toc_bytes.len() {
             bail!("part TOC has {} trailing bytes after its last entry", toc_bytes.len() - at);
         }
-        // The footer's n_records is load-bearing everywhere — row bounds, dense-column synthesis —
-        // and it is a bare integer a flipped bit can inflate to anything. `prog.off` is REQUIRED
-        // and its RAW size is (n_records + 1) u64s, so the two must agree; after this check the
-        // count is as trustworthy as the section sizes, which are range-checked above.
-        match toc.get("prog.off") {
-            Some(s) => {
-                if s.raw as u64 != (n_records as u64 + 1) * 8 {
-                    bail!(
-                        "footer claims {n_records} records but prog.off holds {} offsets",
-                        s.raw / 8
-                    );
+        if version <= 1 {
+            // In the singular-content layouts, the body offset count corroborates the footer's row
+            // count and is required even for an empty part.
+            match toc.get("prog.off") {
+                Some(s) => {
+                    if s.raw as u64 != (n_records as u64 + 1) * 8 {
+                        bail!(
+                            "footer claims {n_records} records but prog.off holds {} offsets",
+                            s.raw / 8
+                        );
+                    }
                 }
+                None => bail!("part is missing its required prog.off section"),
             }
-            None => bail!("part is missing its required prog.off section"),
+        } else if !toc.contains_key("cmeta") {
+            bail!("revision-2 part is missing its required cmeta section");
         }
         Ok(Part {
             f,
@@ -677,7 +674,7 @@ impl Part {
     pub fn piece(&self, i: usize) -> Result<(Loc, PieceHash)> {
         let l = self.sect("pdict.loc")?;
         let h = self.sect("pdict.hash")?;
-        // Compared by division, not `(i + 1) * WIDTH`: `i` arrives from a body-program varint and a
+        // Compared by division, not `(i + 1) * WIDTH`: `i` arrives from a content-program varint and a
         // hostile value overflows the multiplication.
         if i >= l.len() / Loc::WIDTH || i >= h.len() / 32 {
             bail!("piece dictionary index {i} out of range");
@@ -793,39 +790,218 @@ impl Part {
         Ok(None) // filter false positive
     }
 
-    /// The body program of row `r`, with piece references resolved to content identity.
-    pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
-        let prog = self.sect("prog")?;
-        let offs = self.nums("prog.off", 8)?;
-        if r + 1 >= offs.len() {
-            bail!("row {r} out of range");
+    /// The named content columns this part declares, in canonical UTF-8 byte order.
+    pub fn content_meta(&self) -> Result<Arc<Vec<ContentMeta>>> {
+        if let Some(Held::ContentMeta(v)) = self.cache.get(self.id, &Kind::ContentMeta) {
+            return Ok(v);
         }
-        let (mut at, end) = (offs[r] as usize, offs[r + 1] as usize);
-        if end > prog.len() || at > end {
-            bail!("prog.off names a program outside the prog section");
+        if self.version <= 1 {
+            let out = Arc::new(vec![ContentMeta {
+                name: BODY_CONTENT.to_string(),
+                occurrences: self.len(),
+                dense: true,
+            }]);
+            self.cache.put(self.id, Kind::ContentMeta, Held::ContentMeta(out.clone()));
+            return Ok(out);
         }
-        let n = get_varint(&prog, &mut at)? as usize;
-        let mut out = Vec::with_capacity(n.min(end.saturating_sub(at)));
+        let meta = self.sect("cmeta")?;
+        let mut at = 0usize;
+        let n = usize::try_from(get_varint(&meta, &mut at)?)
+            .context("content-column count exceeds this platform's address space")?;
+        let mut out = Vec::with_capacity(n.min(meta.len()));
+        let mut previous: Option<Vec<u8>> = None;
+        for i in 0..n {
+            let name_len = usize::try_from(get_varint(&meta, &mut at)?)
+                .context("content name length exceeds this platform's address space")?;
+            if name_len == 0 {
+                bail!("content column {i} has an empty name");
+            }
+            if name_len > meta.len() - at {
+                bail!("content column {i}'s name runs past cmeta");
+            }
+            let name_bytes = meta[at..at + name_len].to_vec();
+            at += name_len;
+            if previous.as_deref().is_some_and(|p| p >= name_bytes.as_slice()) {
+                bail!("content column names are duplicated or out of canonical order");
+            }
+            previous = Some(name_bytes.clone());
+            let name = String::from_utf8(name_bytes)?;
+            let occurrences = usize::try_from(get_varint(&meta, &mut at)?)
+                .context("content occurrence count exceeds this platform's address space")?;
+            if occurrences > self.len() {
+                bail!(
+                    "content {name:?} has {occurrences} occurrences across only {} rows",
+                    self.len()
+                );
+            }
+            let rid_kind = *meta
+                .get(at)
+                .ok_or_else(|| anyhow::anyhow!("content {name:?} is missing its row-id kind"))?;
+            at += 1;
+            let dense = match rid_kind {
+                content::RID_DENSE => {
+                    if occurrences != self.len() {
+                        bail!(
+                            "dense content {name:?} has {occurrences} occurrences for {} rows",
+                            self.len()
+                        );
+                    }
+                    true
+                }
+                content::RID_DELTA => false,
+                k => bail!("content {name:?} has unknown row-id kind {k}"),
+            };
+            let prog = format!("con.prog.{i}");
+            let off = format!("con.off.{i}");
+            let rid = format!("con.rid.{i}");
+            if !self.has(&prog) || !self.has(&off) {
+                bail!("content {name:?} is missing its program or offset section");
+            }
+            if self.toc[&off].raw as u64 != (occurrences as u64 + 1) * 8 {
+                bail!("content {name:?} has an offset count inconsistent with cmeta");
+            }
+            if dense && self.has(&rid) {
+                bail!("dense content {name:?} must elide its row-id section");
+            }
+            if !dense && !self.has(&rid) {
+                bail!("sparse content {name:?} is missing its row-id section");
+            }
+            out.push(ContentMeta { name, occurrences, dense });
+        }
+        if at != meta.len() {
+            bail!("cmeta has {} trailing bytes", meta.len() - at);
+        }
+        let out = Arc::new(out);
+        self.cache.put(self.id, Kind::ContentMeta, Held::ContentMeta(out.clone()));
+        Ok(out)
+    }
+
+    fn content_rids(&self, col: usize, meta: &ContentMeta) -> Result<Arc<Vec<u32>>> {
+        let key = Kind::ContentRids(col);
+        if let Some(Held::Rids(v)) = self.cache.get(self.id, &key) {
+            return Ok(v);
+        }
+        let encoded = self.sect(&format!("con.rid.{col}"))?;
+        let mut at = 0usize;
+        let mut current = 0usize;
+        let mut rows = Vec::with_capacity(meta.occurrences);
+        for occurrence in 0..meta.occurrences {
+            let delta = usize::try_from(get_varint(&encoded, &mut at)?)
+                .context("content row delta exceeds this platform's address space")?;
+            if occurrence > 0 && delta == 0 {
+                bail!("content {:?} repeats row {current}", meta.name);
+            }
+            current = current
+                .checked_add(delta)
+                .ok_or_else(|| anyhow::anyhow!("content {:?} row id overflows", meta.name))?;
+            if current >= self.len() {
+                bail!("content {:?} names row {current} outside the part", meta.name);
+            }
+            rows.push(u32::try_from(current).context("content row id exceeds u32")?);
+        }
+        if at != encoded.len() {
+            bail!("content {:?} row ids have {} trailing bytes", meta.name, encoded.len() - at);
+        }
+        let rows = Arc::new(rows);
+        self.cache.put(self.id, key, Held::Rids(rows.clone()));
+        Ok(rows)
+    }
+
+    fn content_occurrence(
+        &self,
+        col: usize,
+        meta: &ContentMeta,
+        row: usize,
+    ) -> Result<Option<usize>> {
+        if row >= self.len() {
+            bail!("row {row} out of range");
+        }
+        if meta.dense {
+            return Ok(Some(row));
+        }
+        let rows = self.content_rids(col, meta)?;
+        let row = u32::try_from(row).context("content row id exceeds u32")?;
+        Ok(rows.binary_search(&row).ok())
+    }
+
+    fn program(&self, prog_name: &str, off_name: &str, occurrence: usize) -> Result<Vec<BodyOp>> {
+        let prog = self.sect(prog_name)?;
+        let offs = self.nums(off_name, 8)?;
+        if occurrence + 1 >= offs.len() {
+            bail!("content occurrence {occurrence} is outside {off_name}");
+        }
+        let (start, end) = (offs[occurrence] as usize, offs[occurrence + 1] as usize);
+        if end > prog.len() || start > end {
+            bail!("{off_name} names a program outside {prog_name}");
+        }
+        let program = &prog[start..end];
+        let mut at = 0usize;
+        let n = usize::try_from(get_varint(program, &mut at)?)
+            .context("content-op count exceeds this platform's address space")?;
+        let mut out = Vec::with_capacity(n.min(program.len().saturating_sub(at)));
         for _ in 0..n {
-            let tagged = get_varint(&prog, &mut at)?;
+            let tagged = get_varint(program, &mut at)?;
             if tagged == OP_ESCAPE_RESERVED {
-                bail!("body program uses the reserved op escape — this part needs a newer build");
+                bail!(
+                    "content program uses the reserved op escape — this part needs a newer build"
+                );
             }
             if tagged & 1 == OP_LIT {
-                let len = (tagged >> 1) as usize;
-                if at > end || len > end - at {
+                let len = usize::try_from(tagged >> 1)
+                    .context("literal length exceeds this platform's address space")?;
+                if len > program.len() - at {
                     bail!("literal runs past the program");
                 }
-                out.push(BodyOp::Lit(prog[at..at + len].to_vec()));
+                out.push(BodyOp::Lit(program[at..at + len].to_vec()));
                 at += len;
             } else {
-                let idx = (tagged >> 1) as usize;
-                let len = get_varint(&prog, &mut at)? as u32;
+                let idx = usize::try_from(tagged >> 1)
+                    .context("piece index exceeds this platform's address space")?;
+                let len = u32::try_from(get_varint(program, &mut at)?)
+                    .context("piece length exceeds the format's u32 limit")?;
                 let (_, hash) = self.piece(idx)?;
                 out.push(BodyOp::Piece { hash, len });
             }
         }
+        if at != program.len() {
+            bail!("content program has {} trailing bytes", program.len() - at);
+        }
         Ok(out)
+    }
+
+    /// One named content program at row `r`, if present.
+    pub fn content(&self, r: usize, name: &str) -> Result<Option<Vec<BodyOp>>> {
+        if self.version <= 1 {
+            return if name == BODY_CONTENT {
+                Ok(Some(self.program("prog", "prog.off", r)?))
+            } else {
+                Ok(None)
+            };
+        }
+        let columns = self.content_meta()?;
+        let Ok(col) = columns.binary_search_by(|c| c.name.as_bytes().cmp(name.as_bytes())) else {
+            return Ok(None);
+        };
+        let Some(occurrence) = self.content_occurrence(col, &columns[col], r)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.program(&format!("con.prog.{col}"), &format!("con.off.{col}"), occurrence)?))
+    }
+
+    /// Every named content value at row `r`, in canonical name order.
+    pub fn contents(&self, r: usize) -> Result<Vec<Content>> {
+        let mut out = Vec::new();
+        for meta in self.content_meta()?.iter() {
+            if let Some(ops) = self.content(r, &meta.name)? {
+                out.push(Content::new(&meta.name, ops));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compatibility body program. An absent `body` value reads as empty through this legacy API.
+    pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
+        Ok(self.content(r, BODY_CONTENT)?.unwrap_or_default())
     }
 
     /// Row `r`'s attributes, in their exact original order, duplicates included.
@@ -846,7 +1022,7 @@ impl Part {
         let ids = self.sect("ids")?;
         let restarts: Vec<u32> = self.nums("ids.restart", 4)?.iter().map(|&x| x as u32).collect();
         let id = String::from_utf8(IdCol::new(&ids, &restarts, self.len()).get(r)?)?;
-        Ok(Record { id, body: self.body(r)?, attrs: self.attrs(r)? })
+        Ok(Record { id, contents: self.contents(r)?, attrs: self.attrs(r)? })
     }
 
     /// Reconstruct row `r`'s content byte-exactly, resolving pieces through `fold`.
@@ -854,40 +1030,46 @@ impl Part {
     /// Piece references go through the part's own dictionary, so the fold is addressed by location and
     /// never searched. The dictionary is in fold order, so a scan walks the fold forward.
     pub fn reconstruct(&self, r: usize, fold: &Fold) -> Result<Vec<u8>> {
-        let prog = self.sect("prog")?;
-        let offs = self.nums("prog.off", 8)?;
-        if r + 1 >= offs.len() {
-            bail!("row {r} out of range");
-        }
-        let (mut at, end) = (offs[r] as usize, offs[r + 1] as usize);
-        if end > prog.len() || at > end {
-            bail!("prog.off names a program outside the prog section");
-        }
-        let n = get_varint(&prog, &mut at)? as usize;
+        self.reconstruct_content(r, BODY_CONTENT, fold).map(|v| v.unwrap_or_default())
+    }
+
+    /// Reconstruct one named content value without touching any other content column.
+    pub fn reconstruct_content(
+        &self,
+        r: usize,
+        name: &str,
+        fold: &Fold,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(ops) = self.content(r, name)? else {
+            return Ok(None);
+        };
         let mut out = Vec::new();
-        for _ in 0..n {
-            let tagged = get_varint(&prog, &mut at)?;
-            if tagged == OP_ESCAPE_RESERVED {
-                bail!("body program uses the reserved op escape — this part needs a newer build");
-            }
-            if tagged & 1 == OP_LIT {
-                let len = (tagged >> 1) as usize;
-                if at > end || len > end - at {
-                    bail!("literal runs past the program");
+        for op in ops {
+            match op {
+                BodyOp::Lit(bytes) => out.extend_from_slice(&bytes),
+                BodyOp::Piece { hash, len } => {
+                    let mut loc = self.lookup_piece(&hash)?;
+                    if loc.is_none() {
+                        // Revision-0 parts may predate the optional hash-sorted dictionary index.
+                        for i in 0..self.piece_count()? {
+                            let (candidate_loc, candidate_hash) = self.piece(i)?;
+                            if candidate_hash == hash {
+                                loc = Some(candidate_loc);
+                                break;
+                            }
+                        }
+                    }
+                    let loc = loc.ok_or_else(|| {
+                        anyhow::anyhow!("piece {hash} is not in the part dictionary")
+                    })?;
+                    if loc.raw != len {
+                        bail!("piece {hash} is {} bytes but the program says {len}", loc.raw);
+                    }
+                    fold.read_verified_into(loc, hash, &mut out)?;
                 }
-                out.extend_from_slice(&prog[at..at + len]);
-                at += len;
-            } else {
-                let idx = (tagged >> 1) as usize;
-                let len = get_varint(&prog, &mut at)? as u32;
-                let (loc, hash) = self.piece(idx)?;
-                if loc.raw != len {
-                    bail!("piece {hash} is {} bytes but the program says {len}", loc.raw);
-                }
-                fold.read_verified_into(loc, hash, &mut out)?;
             }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Reconstruct by id.
@@ -967,5 +1149,53 @@ impl Part {
 
     pub(crate) fn section_present(&self, name: &str) -> bool {
         self.has(name)
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::fold::FoldCfg;
+
+    #[test]
+    fn a_revision_one_body_reads_as_named_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "turndb-part-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.part");
+        let (ids, restarts) = idcol::build(&["legacy".to_string()]).unwrap();
+        let mut prog = Vec::new();
+        put_varint(&mut prog, 1);
+        put_varint(&mut prog, (6u64 << 1) | OP_LIT);
+        prog.extend_from_slice(b"legacy");
+
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("ids", &ids).unwrap();
+        writer.section("ids.restart", &u32s(&restarts)).unwrap();
+        writer.section("prog", &prog).unwrap();
+        writer.section("prog.off", &u64s(&[0, prog.len() as u64])).unwrap();
+        writer.section("pdict.loc", &[]).unwrap();
+        writer.section("pdict.hash", &[]).unwrap();
+        writer.finish_version(PartMeta { n_records: 1, seq_lo: 1, seq_hi: 1 }, 1).unwrap();
+
+        let part = Part::open(&path).unwrap();
+        assert_eq!(
+            part.content_meta().unwrap().as_ref(),
+            &[ContentMeta { name: BODY_CONTENT.into(), occurrences: 1, dense: true }]
+        );
+        let record = part.record(0).unwrap();
+        assert_eq!(
+            record.contents,
+            vec![Content::new(BODY_CONTENT, vec![BodyOp::Lit(b"legacy".to_vec())])]
+        );
+        let fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
+        assert_eq!(
+            part.reconstruct_content(0, BODY_CONTENT, &fold).unwrap(),
+            Some(b"legacy".to_vec())
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

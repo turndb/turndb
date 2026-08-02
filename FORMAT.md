@@ -1,6 +1,6 @@
 # turndb on-disk format
 
-**Status: format version 1. Not frozen.** See [Compatibility](#compatibility) for what is
+**Status: format version 2. Not frozen.** See [Compatibility](#compatibility) for what is
 promised and what is not.
 
 This is the one document in this repository, and the only place mechanics are written down twice. It
@@ -228,8 +228,7 @@ Absence is meaningful, but it does **not** mean "anything may be missing". Three
 |---|---|
 | `ids` | front-coded id column, strictly increasing |
 | `ids.restart` | u32 stream offsets, one every `RESTART` = 16 ids |
-| `prog` | body programs, one per row |
-| `prog.off` | u64 offsets into `prog`, `n_records + 1` of them |
+| `cmeta` | named content-column metadata; required even when it declares zero columns (version 2) |
 | `pdict.loc` | piece dictionary `Loc`s, 12 bytes each, sorted in FOLD order |
 | `pdict.hash` | piece hashes, 32 bytes each, parallel to `pdict.loc` |
 
@@ -240,6 +239,8 @@ dictionary's size.
 
 | name | required when |
 |---|---|
+| `con.prog.N`, `con.off.N` | content column *N* exists in `cmeta` |
+| `con.rid.N` | content column *N* is sparse; absent and **elided** when dense |
 | `layout`, `layout.off`, `colmeta` | any record carries an attribute |
 | `col.val.N` | column *N* exists in `colmeta` |
 | `col.rid.N` | column *N*'s `rid_kind` is 1 (delta); absent and **elided** when dense |
@@ -257,6 +258,10 @@ strict. A writer at this version always emits all of them except `tomb`.
 
 Unknown section names must be ignored, not rejected: that is what lets a later version add one without
 moving `version`.
+
+Version-0 and version-1 parts predate named content. They require `prog` and `prog.off`, holding one
+body program per row, instead of `cmeta` and `con.*`; a version-2 reader presents that physical body as
+a dense content column named `body`. Version 2 never writes the legacy sections.
 
 **The piece dictionary is sorted in fold order, not hash order**, and `pdict.hsort` carries hash order
 separately. Two orders over one dictionary rather than two dictionaries: fold order keeps `pdict.loc`
@@ -324,9 +329,27 @@ repeated n_attrs times:
 
 Reconstruction walks this sequence and draws the next unconsumed value from each named column.
 
-#### Body programs
+#### Named content columns
 
-Per row, in `prog` at `prog.off[row]`:
+Content names are unique within a record and sorted by their UTF-8 bytes into physical column
+ordinals. `cmeta` is:
+
+```
+varint  n_content_columns
+repeated n_content_columns times:
+  varint  name_len
+  bytes   utf8_name
+  varint  occurrences
+  u8      rid_kind       0 dense, 1 ascending delta row ids
+```
+
+Each column *N* has `con.prog.N`, containing programs in occurrence order, and `con.off.N`, containing
+`occurrences + 1` little-endian u64 offsets. A sparse column also has `con.rid.N`, an ascending
+delta-varint sequence of row ids; a dense column occurs exactly once on every row and elides that
+section. Content names must be non-empty, unique, and strictly sorted. Row ids must be unique and in
+range. Any disagreement among `cmeta`, offsets, row ids, and section presence is corruption.
+
+An occurrence's program is:
 
 ```
 varint  n_ops
@@ -336,9 +359,11 @@ repeated n_ops times:
   op 1 (piece):    payload is a dictionary ordinal, followed by a varint length
 ```
 
-Concatenating the ops in order reproduces the record's body **byte for byte**. That is the format's
-central promise, and it has exactly one exception: content erased for privacy or retention reasons
-cannot be reproduced, by definition. See [Erasure](#erasure) for what a reader gets instead.
+Concatenating the ops in order reproduces that named content value **byte for byte**. An empty program
+is a present empty value; a missing row id is absence. Every content column uses the same part-wide
+piece dictionary, so identical bytes deduplicate across content names and records. The byte-exact
+promise has one exception: content erased for privacy or retention reasons cannot be reproduced, by
+definition. See [Erasure](#erasure) for what a reader gets instead.
 
 `tagged == 0` is **RESERVED**. It would encode a zero-length literal, which contributes nothing; a
 writer must not emit one, and a reader must refuse it. A future revision may define it as an escape
@@ -437,11 +462,13 @@ a reader to act on.
 
 | tag | meaning | payload |
 |---|---|---|
-| 0x57 | record | see below |
+| 0x57 | legacy version-1 body record | legacy payload below |
 | 0x58 | tombstone | the id alone, UTF-8, no framing |
-| 0x5A | record, **inside a batch** | as 0x57 |
+| 0x5A | legacy version-1 body record, **inside a batch** | as 0x57 |
 | 0x5B | tombstone, inside a batch | as 0x58 |
 | 0x59 | **batch commit** | varint member count |
+| 0x5C | version-2 record with named content | current payload below |
+| 0x5D | version-2 record, **inside a batch** | as 0x5C |
 
 A batch is a group of writes that replays **all or none** — the unit an ingest source actually
 sent, kept whole across a crash. Its members are ordinary record and tombstone payloads under the
@@ -454,19 +481,24 @@ the frame chain is unbroken back to the last commit point, so the log is not wha
 down — and the reader must refuse. The marker's count is one byte of redundancy that keeps a batch
 from being quietly shrunk.
 
-A build predating batches refuses these tags by the unknown-tag rule below, which is the safe
-direction; a log without them replays exactly as before.
+A build predating named content refuses 0x5C and 0x5D by the unknown-tag rule below, which is the safe
+direction. A version-2 reader accepts the old record tags and presents their one body program as
+content named `body`.
 
-A record payload is:
+A current record payload is:
 
 ```
 varint   id_len
 bytes    id
-varint   n_ops
-repeated n_ops times:
-  u8      op               0 literal, 1 piece
-  op 0:   varint len, then len bytes
-  op 1:   32 bytes piece hash, then varint len
+varint   n_contents
+repeated n_contents times, in UTF-8 name order:
+  varint  name_len
+  bytes   utf8_name
+  varint  n_ops
+  repeated n_ops times:
+    u8      op               0 literal, 1 piece
+    op 0:   varint len, then len bytes
+    op 1:   32 bytes piece hash, then varint len
 varint   n_attrs
 repeated n_attrs times:
   varint  key_len
@@ -480,7 +512,10 @@ repeated n_novel times:
   bytes    piece content
 ```
 
-Two differences from a part's `prog`, both deliberate and neither incidental:
+The legacy 0x57/0x5A payload places one `n_ops` program directly after the id, followed by the same
+attribute and novel-piece encodings. It has no content count or name.
+
+Two differences from a part's `con.prog.N`, both deliberate and neither incidental:
 
 * the op tag is a **plain u8**, not the `(payload << 1) | op` varint packing a part uses — the packing
   buys density in a section read millions of times, and the log is written once and discarded;
@@ -801,7 +836,7 @@ may sit at fold generation 40 while never having changed format revision at all.
 
 What that requires of a change:
 
-* a change a version-1 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
+* a change a version-2 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
 * note what these levers do **not** cover: they guard against misparsing, not against a conformant
   writer violating a privacy or retention invariant. A part that parses perfectly can still carry

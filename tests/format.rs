@@ -238,8 +238,9 @@ fn a_part_declares_the_sections_the_document_lists() {
     for required in [
         "ids",
         "ids.restart",
-        "prog",
-        "prog.off",
+        "cmeta",
+        "con.prog.0",
+        "con.off.0",
         "pdict.loc",
         "pdict.hash",
         "pdict.hsort",
@@ -280,7 +281,7 @@ fn wal_frame_matches_the_document() {
     s.sync().unwrap();
     let b = std::fs::read(dir.join("WAL")).unwrap();
 
-    assert_eq!(b[0], 0x57, "tag at 0 is 0x57 for a record");
+    assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a named-content record");
     assert_eq!(le64(&b, 1), 0, "seq at 1");
     let len = le32(&b, 9) as usize;
     assert_eq!(13 + len + 4, b.len(), "header 13 + payload + crc 4 is the whole frame");

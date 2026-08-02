@@ -7,12 +7,13 @@
 #![cfg(feature = "sql")]
 
 use datafusion::arrow::array::{Array, AsArray};
+use datafusion::catalog::TableProvider;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turndb::fold::FoldCfg;
 use turndb::part::Part;
 use turndb::query::{collect, table::TurndbTable, Lens};
-use turndb::store::{Span, Store};
+use turndb::store::{ContentSpans, Span, Store};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -401,6 +402,70 @@ async fn sql_can_still_reach_content_when_it_asks_for_it() {
     let expect = &want.iter().find(|(i, _)| i == "t00-0007").unwrap().1;
     assert_eq!(body, expect.as_slice(), "SQL must return content byte-exactly");
     assert!(table.stats().fold_reads > 0, "this query genuinely did read the fold");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn named_content_columns_are_sparse_independent_and_lazy() {
+    let dir = tmp("named-content");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put_record(
+        "a",
+        &[ContentSpans::new("request", vec![Span::Piece(b"request-a")])],
+        vec![("kind".into(), AttrValue::Str("one".into()))],
+    )
+    .unwrap();
+    s.put_record(
+        "b",
+        &[ContentSpans::new("response", vec![Span::Piece(b"response-b")])],
+        vec![("kind".into(), AttrValue::Str("two".into()))],
+    )
+    .unwrap();
+    s.put_record(
+        "c",
+        &[
+            ContentSpans::new("request", vec![Span::Piece(b"request-c")]),
+            ContentSpans::new("response", vec![Span::Piece(b"response-c")]),
+        ],
+        vec![("kind".into(), AttrValue::Str("three".into()))],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    let schema = table.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(names.contains(&"content.request"));
+    assert!(names.contains(&"content.response"));
+    assert!(!names.contains(&"body"), "body exists only when a record actually names it");
+
+    table.reset_stats();
+    let batches = ctx
+        .sql("SELECT id, \"content.request\" FROM t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let ids = batch.column(0).as_string::<i32>();
+    let requests = batch.column(1).as_binary::<i32>();
+    assert_eq!(ids.value(0), "a");
+    assert_eq!(requests.value(0), b"request-a");
+    assert!(requests.is_null(1), "a sparse content miss is NULL, not empty bytes");
+    assert_eq!(requests.value(2), b"request-c");
+    assert_eq!(
+        table.stats().fold_reads,
+        2,
+        "projecting request reconstructs its two values and no response values"
+    );
+
+    table.reset_stats();
+    ctx.sql("SELECT kind FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(table.stats().fold_reads, 0, "metadata projection cannot reach any content column");
     std::fs::remove_dir_all(&dir).ok();
 }
 

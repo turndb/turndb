@@ -130,15 +130,19 @@ pub fn refold(
     let mut wanted: HashMap<PieceHash, Loc> = HashMap::new();
     for (pi, rows) in live.iter().enumerate() {
         for &row in rows {
-            for op in parts[pi].body(row)? {
-                let BodyOp::Piece { hash, .. } = op else { continue };
-                if wanted.contains_key(&hash) {
-                    continue;
+            for content in parts[pi].record(row)?.contents {
+                for op in content.ops {
+                    let BodyOp::Piece { hash, .. } = op else { continue };
+                    if wanted.contains_key(&hash) {
+                        continue;
+                    }
+                    let loc = parts[pi].lookup_piece(&hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "live record references piece {hash}, which no part locates"
+                        )
+                    })?;
+                    wanted.insert(hash, loc);
                 }
-                let loc = parts[pi].lookup_piece(&hash)?.ok_or_else(|| {
-                    anyhow::anyhow!("live record references piece {hash}, which no part locates")
-                })?;
-                wanted.insert(hash, loc);
             }
         }
     }

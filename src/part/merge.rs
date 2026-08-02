@@ -162,6 +162,7 @@ pub fn merge_opts(
     // ---- pass A: winners, counts, and the exact column universe of SURVIVING rows ----
     let mut columns: std::collections::BTreeMap<(String, u8), std::collections::BTreeSet<String>> =
         Default::default();
+    let mut content_names = std::collections::BTreeSet::new();
     let mut records_out = 0usize;
     let mut superseded = 0usize;
     let mut tombs_kept = 0usize;
@@ -179,6 +180,9 @@ pub fn merge_opts(
             continue;
         }
         records_out += 1;
+        for content in parts[pi].contents(row)? {
+            content_names.insert(content.name);
+        }
         for (k, v) in parts[pi].attrs(row)? {
             let e = columns.entry((k, v.type_tag())).or_default();
             if let crate::types::AttrValue::Str(s) = v {
@@ -197,7 +201,14 @@ pub fn merge_opts(
     // stored and still worth deduping against — and a record staged but not yet flushed may have
     // matched against an entry that would otherwise stop being referenced here.
     let dict: Vec<(Loc, PieceHash)> = locs.iter().map(|(h, l)| (*l, *h)).collect();
-    let mut b = crate::part::builder::StreamBuilder::new(out, level, dict, columns, string_dicts)?;
+    let mut b = crate::part::builder::StreamBuilder::new(
+        out,
+        level,
+        dict,
+        content_names.into_iter().collect(),
+        columns,
+        string_dicts,
+    )?;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((id, pi, row, _)) = kway.next_group()? {
         if parts[pi].is_tombstone(row)? {
@@ -206,7 +217,7 @@ pub fn merge_opts(
             }
             continue;
         }
-        b.push(&id, false, &parts[pi].body(row)?, &parts[pi].attrs(row)?)?;
+        b.push(&id, false, &parts[pi].contents(row)?, &parts[pi].attrs(row)?)?;
     }
     let meta = b.finish(seq_lo, seq_hi)?;
 
@@ -226,7 +237,7 @@ pub fn merge_opts(
 mod tests {
     use super::*;
     use crate::fold::{Fold, FoldCfg};
-    use crate::types::{AttrValue, BodyOp, Record};
+    use crate::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let n =
@@ -249,7 +260,10 @@ mod tests {
                 let p = fold.put(body.as_bytes()).unwrap();
                 Record {
                     id: (*id).to_string(),
-                    body: vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                    contents: vec![Content::new(
+                        BODY_CONTENT,
+                        vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                    )],
                     attrs: vec![("v".into(), AttrValue::Str((*body).to_string()))],
                 }
             })
@@ -315,7 +329,7 @@ mod tests {
         let a = part_of(&d, &mut fold, "a.part", 1, &[("k1", "one"), ("k2", "two")]);
         let b = part_of(&d, &mut fold, "b.part", 2, &[("k2", "TWO-NEW"), ("k3", "three")]);
         // a third part deleting k1 — a tombstone the merge must carry forward
-        let tomb_rec = Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() };
+        let tomb_rec = Record { id: "k1".into(), contents: Vec::new(), attrs: Vec::new() };
         let cp = d.join("c.part");
         super::super::build_full(&cp, &[tomb_rec], &[true], 3, 3, 3, |_| None, &HashMap::new())
             .unwrap();
@@ -335,7 +349,7 @@ mod tests {
             }
         }
         let recs = vec![
-            Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() },
+            Record { id: "k1".into(), contents: Vec::new(), attrs: Vec::new() },
             b.record(b.find("k2").unwrap().unwrap()).unwrap(),
             b.record(b.find("k3").unwrap().unwrap()).unwrap(),
         ];
@@ -366,7 +380,7 @@ mod tests {
     #[test]
     fn a_total_merge_of_only_tombstones_yields_a_valid_empty_part() {
         let d = tmpdir("allgone");
-        let r = Record { id: "x".into(), body: Vec::new(), attrs: Vec::new() };
+        let r = Record { id: "x".into(), contents: Vec::new(), attrs: Vec::new() };
         let p1 = d.join("a.part");
         super::super::build_full(&p1, &[r], &[true], 1, 1, 3, |_| None, &HashMap::new()).unwrap();
         let a = Arc::new(Part::open(&p1).unwrap());

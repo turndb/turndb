@@ -38,7 +38,7 @@ pub mod wal;
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
-use crate::types::{AttrValue, BodyOp, PieceHash, Record};
+use crate::types::{AttrValue, BodyOp, Content, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,6 +55,25 @@ pub enum Span<'a> {
     Piece(&'a [u8]),
 }
 
+/// One named content value handed to [`Store::put_record`] or [`Batch::put_record`].
+///
+/// The spans are already carved, preserving the existing escape hatch: a consumer can accept the
+/// engine's default opinion, choose a [`crate::carve::Carve`] per value, or supply its own boundaries.
+pub struct ContentSpans<'a> {
+    pub name: &'a str,
+    pub spans: Vec<Span<'a>>,
+}
+
+impl<'a> ContentSpans<'a> {
+    pub fn new(name: &'a str, spans: Vec<Span<'a>>) -> ContentSpans<'a> {
+        ContentSpans { name, spans }
+    }
+
+    pub fn carve(name: &'a str, bytes: &'a [u8], carve: &crate::carve::Carve) -> ContentSpans<'a> {
+        ContentSpans { name, spans: carve.carve(bytes) }
+    }
+}
+
 /// A group of writes that commits ATOMICALLY: after a crash, either every member replays or none
 /// does. A lone `put` is durable per record, which means a crash can land between the records of
 /// one logical ingest — half an export survived is an anomaly the source then has to reconcile.
@@ -69,8 +88,13 @@ pub struct Batch {
 }
 
 enum BatchItem {
-    Put { id: String, spans: Vec<OwnedSpan>, attrs: Vec<(String, AttrValue)> },
+    Put { id: String, contents: Vec<OwnedContent>, attrs: Vec<(String, AttrValue)> },
     Delete { id: String },
+}
+
+struct OwnedContent {
+    name: String,
+    spans: Vec<OwnedSpan>,
 }
 
 enum OwnedSpan {
@@ -85,14 +109,31 @@ impl Batch {
 
     /// Stage a put. Same shape as [`Store::put`]; nothing happens until [`Store::apply`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) {
-        let spans = spans
+        let spans = own_spans(spans);
+        self.items.push(BatchItem::Put {
+            id: id.to_string(),
+            contents: vec![OwnedContent { name: BODY_CONTENT.to_string(), spans }],
+            attrs,
+        });
+    }
+
+    /// Stage a general record. Invalid ids or content maps are refused before the batch owns bytes.
+    pub fn put_record(
+        &mut self,
+        id: &str,
+        contents: &[ContentSpans<'_>],
+        attrs: Vec<(String, AttrValue)>,
+    ) -> Result<()> {
+        validate_content_inputs(id, contents)?;
+        let contents = contents
             .iter()
-            .map(|s| match s {
-                Span::Lit(b) => OwnedSpan::Lit(b.to_vec()),
-                Span::Piece(b) => OwnedSpan::Piece(b.to_vec()),
+            .map(|content| OwnedContent {
+                name: content.name.to_string(),
+                spans: own_spans(&content.spans),
             })
             .collect();
-        self.items.push(BatchItem::Put { id: id.to_string(), spans, attrs });
+        self.items.push(BatchItem::Put { id: id.to_string(), contents, attrs });
+        Ok(())
     }
 
     /// Stage a put carved by the engine's default opinion. See [`crate::carve`].
@@ -112,6 +153,65 @@ impl Batch {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+}
+
+fn own_spans(spans: &[Span<'_>]) -> Vec<OwnedSpan> {
+    spans
+        .iter()
+        .map(|s| match s {
+            Span::Lit(b) => OwnedSpan::Lit(b.to_vec()),
+            Span::Piece(b) => OwnedSpan::Piece(b.to_vec()),
+        })
+        .collect()
+}
+
+fn validate_content_inputs(id: &str, contents: &[ContentSpans<'_>]) -> Result<()> {
+    if id.is_empty() {
+        bail!("record id must not be empty");
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for content in contents {
+        if content.name.is_empty() {
+            bail!("content name must not be empty");
+        }
+        if !names.insert(content.name) {
+            bail!("duplicate content name {:?}", content.name);
+        }
+        validate_spans(&content.spans)?;
+    }
+    Ok(())
+}
+
+fn validate_spans(spans: &[Span<'_>]) -> Result<()> {
+    for span in spans {
+        if let Span::Piece(bytes) = span {
+            u32::try_from(bytes.len())
+                .context("one folded piece exceeds the format's u32 length")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_owned_contents(id: &str, contents: &[OwnedContent]) -> Result<()> {
+    if id.is_empty() {
+        bail!("record id must not be empty");
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for content in contents {
+        if content.name.is_empty() {
+            bail!("content name must not be empty");
+        }
+        if !names.insert(content.name.as_str()) {
+            bail!("duplicate content name {:?}", content.name);
+        }
+        for span in &content.spans {
+            if let OwnedSpan::Piece(bytes) = span {
+                u32::try_from(bytes.len())
+                    .context("one folded piece exceeds the format's u32 length")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -828,11 +928,44 @@ impl Store {
 
     /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
-        let mut body = Vec::with_capacity(spans.len());
+        if id.is_empty() {
+            bail!("record id must not be empty");
+        }
+        validate_spans(spans)?;
         let mut novel = Vec::new();
+        let body = self.fold_spans(BODY_CONTENT, spans, &mut novel)?;
+        let rec = Record::new(id, vec![body], attrs)?;
+        self.stage_record(rec, novel)
+    }
+
+    /// Fold, log, and stage a general record with independently named content values.
+    pub fn put_record(
+        &mut self,
+        id: &str,
+        contents: &[ContentSpans<'_>],
+        attrs: Vec<(String, AttrValue)>,
+    ) -> Result<()> {
+        // Validate the whole map before `fold_spans` can append anything to the fold.
+        validate_content_inputs(id, contents)?;
+        let mut novel = Vec::new();
+        let mut carved = Vec::with_capacity(contents.len());
+        for content in contents {
+            carved.push(self.fold_spans(content.name, &content.spans, &mut novel)?);
+        }
+        let rec = Record::new(id, carved, attrs)?;
+        self.stage_record(rec, novel)
+    }
+
+    fn fold_spans(
+        &mut self,
+        name: &str,
+        spans: &[Span<'_>],
+        novel: &mut Vec<(PieceHash, Vec<u8>)>,
+    ) -> Result<Content> {
+        let mut ops = Vec::with_capacity(spans.len());
         for s in spans {
             match s {
-                Span::Lit(b) => body.push(BodyOp::Lit(b.to_vec())),
+                Span::Lit(b) => ops.push(BodyOp::Lit(b.to_vec())),
                 Span::Piece(b) => {
                     let put = self.fold_piece(b)?;
                     if !put.deduped {
@@ -840,11 +973,14 @@ impl Store {
                         // anything the fold wrote past the committed tail
                         novel.push((put.hash, b.to_vec()));
                     }
-                    body.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
+                    ops.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
                 }
             }
         }
-        let rec = Record { id: id.to_string(), body, attrs };
+        Ok(Content::new(name, ops))
+    }
+
+    fn stage_record(&mut self, rec: Record, novel: Vec<(PieceHash, Vec<u8>)>) -> Result<()> {
         self.wal.append(self.manifest.next_seq, &rec, &novel)?;
         self.mem_bytes += approx_bytes(&rec);
         self.mem.insert(rec.id.clone(), Some(rec));
@@ -888,34 +1024,43 @@ impl Store {
         if batch.items.is_empty() {
             return Ok(());
         }
+        // Refuse the complete batch before folding any member. Otherwise an invalid later item could
+        // leave novel bytes and dedup-window state behind even though no atomic batch was logged.
+        for item in &batch.items {
+            match item {
+                BatchItem::Put { id, contents, .. } => validate_owned_contents(id, contents)?,
+                BatchItem::Delete { id } if id.is_empty() => bail!("record id must not be empty"),
+                BatchItem::Delete { .. } => {}
+            }
+        }
         let mut framed: Vec<crate::store::wal::FramedRecord> =
             Vec::with_capacity(batch.items.len());
         for item in &batch.items {
             match item {
-                BatchItem::Put { id, spans, attrs } => {
-                    let mut body = Vec::with_capacity(spans.len());
+                BatchItem::Put { id, contents, attrs } => {
                     let mut novel = Vec::new();
-                    for s in spans {
-                        match s {
-                            OwnedSpan::Lit(b) => body.push(BodyOp::Lit(b.clone())),
-                            OwnedSpan::Piece(b) => {
-                                let put = self.fold_piece(b)?;
-                                if !put.deduped {
-                                    novel.push((put.hash, b.clone()));
+                    let mut carved = Vec::with_capacity(contents.len());
+                    for content in contents {
+                        let mut ops = Vec::with_capacity(content.spans.len());
+                        for s in &content.spans {
+                            match s {
+                                OwnedSpan::Lit(b) => ops.push(BodyOp::Lit(b.clone())),
+                                OwnedSpan::Piece(b) => {
+                                    let put = self.fold_piece(b)?;
+                                    if !put.deduped {
+                                        novel.push((put.hash, b.clone()));
+                                    }
+                                    ops.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
                                 }
-                                body.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
                             }
                         }
+                        carved.push(Content::new(&content.name, ops));
                     }
-                    framed.push((
-                        Record { id: id.clone(), body, attrs: attrs.clone() },
-                        novel,
-                        false,
-                    ));
+                    framed.push((Record::new(id, carved, attrs.clone())?, novel, false));
                 }
                 BatchItem::Delete { id } => {
                     framed.push((
-                        Record { id: id.clone(), body: Vec::new(), attrs: Vec::new() },
+                        Record { id: id.clone(), contents: Vec::new(), attrs: Vec::new() },
                         Vec::new(),
                         true,
                     ));
@@ -943,6 +1088,9 @@ impl Store {
     /// separate, deliberate operation, because the fold is shared and the same bytes may be referenced
     /// by records that are still live.
     pub fn delete(&mut self, id: &str) -> Result<()> {
+        if id.is_empty() {
+            bail!("record id must not be empty");
+        }
         self.wal.append_tomb(self.manifest.next_seq, id)?;
         self.mem_bytes += id.len() + 32;
         self.mem.insert(id.to_string(), None);
@@ -976,7 +1124,7 @@ impl Store {
                 }
                 // A tombstone still needs a row, so it gets an empty one carrying only its id.
                 None => {
-                    recs.push(Record { id: id.clone(), body: Vec::new(), attrs: Vec::new() });
+                    recs.push(Record { id: id.clone(), contents: Vec::new(), attrs: Vec::new() });
                     tombs.push(true);
                 }
             }
@@ -994,17 +1142,19 @@ impl Store {
         // first flush.
         let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
         for r in &recs {
-            for op in &r.body {
-                let BodyOp::Piece { hash, .. } = op else { continue };
-                if locs.contains_key(hash) {
-                    continue;
+            for content in &r.contents {
+                for op in &content.ops {
+                    let BodyOp::Piece { hash, .. } = op else { continue };
+                    if locs.contains_key(hash) {
+                        continue;
+                    }
+                    let loc = self.locate(hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "staged piece {hash} is in neither the fold window nor any live part"
+                        )
+                    })?;
+                    locs.insert(*hash, loc);
                 }
-                let loc = self.locate(hash)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "staged piece {hash} is in neither the fold window nor any live part"
-                    )
-                })?;
-                locs.insert(*hash, loc);
             }
         }
         let meta = part::build_full(
@@ -1154,15 +1304,20 @@ impl Store {
 
     /// Byte-exact content for `id`.
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        self.reconstruct_content(id, BODY_CONTENT)
+    }
+
+    /// Byte-exact named content for `id`, without reconstructing any sibling content value.
+    pub fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
         // The memtable is newer than every part, so it is consulted first — and it is the ONLY thing
         // this adds over the committed read core.
         if let Some(v) = self.mem.get(id) {
             return match v {
-                Some(r) => Ok(Some(self.rebuild(r)?)),
+                Some(r) => self.rebuild_content(r, name),
                 None => Ok(None), // staged deletion
             };
         }
-        read::reconstruct(&self.parts, &self.fold, id)
+        read::reconstruct_content(&self.parts, &self.fold, id, name)
     }
 
     /// Where content lives, through BOTH dedup tiers.
@@ -1184,9 +1339,12 @@ impl Store {
         Ok(None)
     }
 
-    fn rebuild(&self, r: &Record) -> Result<Vec<u8>> {
+    fn rebuild_content(&self, r: &Record, name: &str) -> Result<Option<Vec<u8>>> {
         let mut out = Vec::new();
-        for op in &r.body {
+        let Some(content) = r.content(name) else {
+            return Ok(None);
+        };
+        for op in &content.ops {
             match op {
                 BodyOp::Lit(b) => out.extend_from_slice(b),
                 BodyOp::Piece { hash, .. } => {
@@ -1197,7 +1355,7 @@ impl Store {
                 }
             }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     pub fn memtable_len(&self) -> usize {
@@ -1352,10 +1510,12 @@ impl Store {
         let mut live_blocks: HashSet<u32> = HashSet::new();
         for (pi, rows) in visible.rows.iter().enumerate() {
             for &row in rows {
-                for op in self.parts[pi].body(row)? {
-                    let BodyOp::Piece { hash, .. } = op else { continue };
-                    if let Some(loc) = self.locate(&hash)? {
-                        live_blocks.insert(loc.block_id);
+                for content in self.parts[pi].record(row)?.contents {
+                    for op in content.ops {
+                        let BodyOp::Piece { hash, .. } = op else { continue };
+                        if let Some(loc) = self.locate(&hash)? {
+                            live_blocks.insert(loc.block_id);
+                        }
                     }
                 }
             }
@@ -1544,6 +1704,11 @@ impl ReadStore {
         read::reconstruct(&self.parts, &self.fold, id)
     }
 
+    /// Byte-exact named content, if both the record and value are present.
+    pub fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        read::reconstruct_content(&self.parts, &self.fold, id, name)
+    }
+
     /// Distinct committed ids, sorted — the union across parts, newest-wins.
     pub fn ids(&self) -> Result<Vec<String>> {
         read::ids(&self.parts)
@@ -1589,11 +1754,18 @@ impl ReadStore {
 
 fn approx_bytes(r: &Record) -> usize {
     r.id.len()
-        + r.body
+        + r.contents
             .iter()
-            .map(|o| match o {
-                BodyOp::Lit(b) => b.len() + 8,
-                BodyOp::Piece { .. } => 40,
+            .map(|content| {
+                content.name.len()
+                    + content
+                        .ops
+                        .iter()
+                        .map(|o| match o {
+                            BodyOp::Lit(b) => b.len() + 8,
+                            BodyOp::Piece { .. } => 40,
+                        })
+                        .sum::<usize>()
             })
             .sum::<usize>()
         + r.attrs.iter().map(|(k, _)| k.len() + 24).sum::<usize>()

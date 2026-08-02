@@ -1,8 +1,8 @@
 //! The write-ahead log — the ACK point, and the only thing standing between a crash and lost data.
 //!
-//! A frame holds the **carved result**: the record's id, its body program, and its attributes. Never
-//! the raw input, because replaying raw input would re-run the carve and make recovery depend on
-//! whichever carve logic happened to be compiled in. Carved frames replay exactly, forever.
+//! A frame holds the **carved result**: the record's id, named content programs, and attributes. Never
+//! raw input, because replaying raw input would re-run the carve and make recovery depend on whichever
+//! carve logic happened to be compiled in. Carved frames replay exactly, forever.
 //!
 //! Piece bytes ride along **only for dedup misses** — content that was new when it was written. A
 //! hit's content was already durable (it is either below the last committed fold tail, or it is
@@ -14,7 +14,7 @@
 //! ```
 
 use crate::part::idcol::{get_varint, put_varint};
-use crate::types::{AttrValue, BodyOp, PieceHash, Record};
+use crate::types::{AttrValue, BodyOp, Content, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::path::Path;
@@ -42,12 +42,16 @@ pub const BATCH_COMMIT_TAG: u8 = 0x59;
 pub const BATCH_FRAME_TAG: u8 = 0x5A;
 /// [`TOMB_TAG`], inside a batch.
 pub const BATCH_TOMB_TAG: u8 = 0x5B;
+/// A general record carrying zero or more named content programs.
+pub const RECORD_V2_TAG: u8 = 0x5C;
+/// [`RECORD_V2_TAG`], inside a batch.
+pub const BATCH_RECORD_V2_TAG: u8 = 0x5D;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
 /// A record plus the bytes of any piece that was new when it was written.
 pub struct Frame {
-    /// True when this frame deletes `record.id`. The record's body and attributes are empty.
+    /// True when this frame deletes `record.id`. The record's content and attributes are empty.
     pub tomb: bool,
     pub seq: u64,
     pub record: Record,
@@ -61,7 +65,8 @@ fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 }
 
 fn get_bytes<'a>(b: &'a [u8], at: &mut usize) -> Result<&'a [u8]> {
-    let n = get_varint(b, at)? as usize;
+    let n = usize::try_from(get_varint(b, at)?)
+        .context("wal: byte-string length exceeds this platform's address space")?;
     // `n > len - at`, never `at + n > len`: the left side cannot overflow (at <= len always), the
     // right side can — a huge declared length wrapped the sum and PASSED the check.
     if n > b.len() - *at {
@@ -72,10 +77,18 @@ fn get_bytes<'a>(b: &'a [u8], at: &mut usize) -> Result<&'a [u8]> {
     Ok(s)
 }
 
-pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) {
-    put_bytes(out, r.id.as_bytes());
-    put_varint(out, r.body.len() as u64);
-    for op in &r.body {
+fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
+    if n > b.len() - *at {
+        bail!("wal: field of {n} bytes runs past the frame");
+    }
+    let s = &b[*at..*at + n];
+    *at += n;
+    Ok(s)
+}
+
+fn put_ops(out: &mut Vec<u8>, ops: &[BodyOp]) {
+    put_varint(out, ops.len() as u64);
+    for op in ops {
         match op {
             BodyOp::Lit(b) => {
                 out.push(0);
@@ -88,8 +101,33 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
             }
         }
     }
-    put_varint(out, r.attrs.len() as u64);
-    for (k, v) in &r.attrs {
+}
+
+fn get_ops(b: &[u8], at: &mut usize) -> Result<Vec<BodyOp>> {
+    let n_ops = usize::try_from(get_varint(b, at)?)
+        .context("wal: content-op count exceeds this platform's address space")?;
+    let mut ops = Vec::with_capacity(n_ops.min(b.len()));
+    for _ in 0..n_ops {
+        let tag = *b.get(*at).ok_or_else(|| anyhow::anyhow!("wal: truncated content op"))?;
+        *at += 1;
+        match tag {
+            0 => ops.push(BodyOp::Lit(get_bytes(b, at)?.to_vec())),
+            1 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(take(b, at, 32)?);
+                let len = u32::try_from(get_varint(b, at)?)
+                    .context("wal: piece length exceeds the format's u32 limit")?;
+                ops.push(BodyOp::Piece { hash: PieceHash(h), len });
+            }
+            t => bail!("wal: unknown content op tag {t}"),
+        }
+    }
+    Ok(ops)
+}
+
+fn put_attrs(out: &mut Vec<u8>, attrs: &[(String, AttrValue)]) {
+    put_varint(out, attrs.len() as u64);
+    for (k, v) in attrs {
         put_bytes(out, k.as_bytes());
         out.push(v.type_tag());
         match v {
@@ -100,6 +138,31 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
             AttrValue::Bool(b) => out.push(u8::from(*b)),
         }
     }
+}
+
+fn get_attrs(b: &[u8], at: &mut usize) -> Result<Vec<(String, AttrValue)>> {
+    let n_attrs = usize::try_from(get_varint(b, at)?)
+        .context("wal: attribute count exceeds this platform's address space")?;
+    let mut attrs = Vec::with_capacity(n_attrs.min(b.len()));
+    for _ in 0..n_attrs {
+        let key = String::from_utf8(get_bytes(b, at)?.to_vec())?;
+        let tag = *b.get(*at).ok_or_else(|| anyhow::anyhow!("wal: truncated attr"))?;
+        *at += 1;
+        let v = match tag {
+            0 => AttrValue::Str(String::from_utf8(get_bytes(b, at)?.to_vec())?),
+            1 => AttrValue::Int(i64::from_le_bytes(take(b, at, 8)?.try_into().unwrap())),
+            2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
+                take(b, at, 8)?.try_into().unwrap(),
+            ))),
+            3 => AttrValue::Bool(take(b, at, 1)?[0] != 0),
+            t => bail!("wal: unknown attr type tag {t}"),
+        };
+        attrs.push((key, v));
+    }
+    Ok(attrs)
+}
+
+fn put_novel(out: &mut Vec<u8>, novel: &[(PieceHash, Vec<u8>)]) {
     put_varint(out, novel.len() as u64);
     for (h, bytes) in novel {
         out.extend_from_slice(&h.0);
@@ -107,62 +170,77 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
     }
 }
 
+fn get_novel(b: &[u8], at: &mut usize) -> Result<Vec<(PieceHash, Vec<u8>)>> {
+    let n_novel = usize::try_from(get_varint(b, at)?)
+        .context("wal: novel-piece count exceeds this platform's address space")?;
+    let mut novel = Vec::with_capacity(n_novel.min(b.len() / 33 + 1));
+    for _ in 0..n_novel {
+        let mut h = [0u8; 32];
+        h.copy_from_slice(take(b, at, 32)?);
+        novel.push((PieceHash(h), get_bytes(b, at)?.to_vec()));
+    }
+    Ok(novel)
+}
+
+/// Encode the general record payload written by revision 2.
+pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
+    crate::types::validate_contents(&r.contents)?;
+    if r.id.is_empty() {
+        bail!("record id must not be empty");
+    }
+    put_bytes(out, r.id.as_bytes());
+    put_varint(out, r.contents.len() as u64);
+    let mut contents: Vec<&Content> = r.contents.iter().collect();
+    contents.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    for content in contents {
+        put_bytes(out, content.name.as_bytes());
+        put_ops(out, &content.ops);
+    }
+    put_attrs(out, &r.attrs);
+    put_novel(out, novel);
+    Ok(())
+}
+
+#[cfg(test)]
+fn encode_record_v1(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) {
+    put_bytes(out, r.id.as_bytes());
+    put_ops(out, r.body().unwrap_or(&[]));
+    put_attrs(out, &r.attrs);
+    put_novel(out, novel);
+}
+
 /// Decode a record payload. Replay hands this only frames whose crc verified, but the crc is a
 /// TORN-WRITE detector, not a validity proof — a buggy writer checksums its bugs perfectly. So
 /// every count is capped by the bytes that would have to carry it before it sizes an allocation,
 /// and every fixed-width read is bounds-checked: corrupt input is an error, never a panic.
 pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
-    fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
-        if n > b.len() - *at {
-            bail!("wal: field of {n} bytes runs past the frame");
-        }
-        let s = &b[*at..*at + n];
-        *at += n;
-        Ok(s)
-    }
     let mut at = 0usize;
     let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
-    let n_ops = get_varint(b, &mut at)? as usize;
-    let mut body = Vec::with_capacity(n_ops.min(b.len()));
-    for _ in 0..n_ops {
-        let tag = *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: truncated op"))?;
-        at += 1;
-        match tag {
-            0 => body.push(BodyOp::Lit(get_bytes(b, &mut at)?.to_vec())),
-            1 => {
-                let mut h = [0u8; 32];
-                h.copy_from_slice(take(b, &mut at, 32)?);
-                let len = get_varint(b, &mut at)? as u32;
-                body.push(BodyOp::Piece { hash: PieceHash(h), len });
-            }
-            t => bail!("wal: unknown body op tag {t}"),
-        }
+    let n_contents = usize::try_from(get_varint(b, &mut at)?)
+        .context("wal: content count exceeds this platform's address space")?;
+    let mut contents = Vec::with_capacity(n_contents.min(b.len()));
+    for _ in 0..n_contents {
+        let name = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
+        contents.push(Content::new(name, get_ops(b, &mut at)?));
     }
-    let n_attrs = get_varint(b, &mut at)? as usize;
-    let mut attrs = Vec::with_capacity(n_attrs.min(b.len()));
-    for _ in 0..n_attrs {
-        let key = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
-        let tag = *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: truncated attr"))?;
-        at += 1;
-        let v = match tag {
-            0 => AttrValue::Str(String::from_utf8(get_bytes(b, &mut at)?.to_vec())?),
-            1 => AttrValue::Int(i64::from_le_bytes(take(b, &mut at, 8)?.try_into().unwrap())),
-            2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
-                take(b, &mut at, 8)?.try_into().unwrap(),
-            ))),
-            3 => AttrValue::Bool(take(b, &mut at, 1)?[0] != 0),
-            t => bail!("wal: unknown attr type tag {t}"),
-        };
-        attrs.push((key, v));
+    let attrs = get_attrs(b, &mut at)?;
+    let novel = get_novel(b, &mut at)?;
+    if at != b.len() {
+        bail!("wal: record has {} trailing bytes", b.len() - at);
     }
-    let n_novel = get_varint(b, &mut at)? as usize;
-    let mut novel = Vec::with_capacity(n_novel.min(b.len() / 33 + 1));
-    for _ in 0..n_novel {
-        let mut h = [0u8; 32];
-        h.copy_from_slice(take(b, &mut at, 32)?);
-        novel.push((PieceHash(h), get_bytes(b, &mut at)?.to_vec()));
+    Ok((Record::new(id, contents, attrs)?, novel))
+}
+
+fn decode_record_v1(b: &[u8]) -> Result<CarvedRecord> {
+    let mut at = 0usize;
+    let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
+    let body = get_ops(b, &mut at)?;
+    let attrs = get_attrs(b, &mut at)?;
+    let novel = get_novel(b, &mut at)?;
+    if at != b.len() {
+        bail!("wal: legacy record has {} trailing bytes", b.len() - at);
     }
-    Ok((Record { id, body, attrs }, novel))
+    Ok((Record::new(id, vec![Content::new(BODY_CONTENT, body)], attrs)?, novel))
 }
 
 /// Buffered writes are EXPLICIT here — an owned buffer flushed through the [`crate::vfs`] seam —
@@ -253,8 +331,8 @@ impl Wal {
     pub fn append(&mut self, seq: u64, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        encode_record(&mut scratch, r, novel);
-        let res = self.append_frame(FRAME_TAG, seq, &scratch);
+        let encoded = encode_record(&mut scratch, r, novel);
+        let res = encoded.and_then(|()| self.append_frame(RECORD_V2_TAG, seq, &scratch));
         self.scratch = scratch;
         res
     }
@@ -272,8 +350,8 @@ impl Wal {
                 scratch.extend_from_slice(r.id.as_bytes());
                 BATCH_TOMB_TAG
             } else {
-                encode_record(&mut scratch, r, novel);
-                BATCH_FRAME_TAG
+                encode_record(&mut scratch, r, novel)?;
+                BATCH_RECORD_V2_TAG
             };
             let res = self.append_frame(tag, seq, &scratch);
             self.scratch = scratch;
@@ -338,7 +416,13 @@ impl Wal {
             // So defer the decision until after the crc, below.
             let known = matches!(
                 hdr[0],
-                FRAME_TAG | TOMB_TAG | BATCH_COMMIT_TAG | BATCH_FRAME_TAG | BATCH_TOMB_TAG
+                FRAME_TAG
+                    | TOMB_TAG
+                    | BATCH_COMMIT_TAG
+                    | BATCH_FRAME_TAG
+                    | BATCH_TOMB_TAG
+                    | RECORD_V2_TAG
+                    | BATCH_RECORD_V2_TAG
             );
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
@@ -397,7 +481,7 @@ impl Wal {
                     let fr = Frame {
                         seq,
                         tomb: true,
-                        record: Record { id, body: Vec::new(), attrs: Vec::new() },
+                        record: Record { id, contents: Vec::new(), attrs: Vec::new() },
                         novel: Vec::new(),
                     };
                     if hdr[0] == BATCH_TOMB_TAG {
@@ -407,18 +491,26 @@ impl Wal {
                         out.push(fr);
                     }
                 }
-                _ => match decode_record(&payload) {
-                    Ok((record, novel)) => {
-                        let fr = Frame { seq, tomb: false, record, novel };
-                        if hdr[0] == BATCH_FRAME_TAG {
-                            pending.push(fr);
-                        } else {
-                            pending.clear();
-                            out.push(fr);
+                FRAME_TAG | BATCH_FRAME_TAG | RECORD_V2_TAG | BATCH_RECORD_V2_TAG => {
+                    let decoded = if matches!(hdr[0], FRAME_TAG | BATCH_FRAME_TAG) {
+                        decode_record_v1(&payload)
+                    } else {
+                        decode_record(&payload)
+                    };
+                    match decoded {
+                        Ok((record, novel)) => {
+                            let fr = Frame { seq, tomb: false, record, novel };
+                            if matches!(hdr[0], BATCH_FRAME_TAG | BATCH_RECORD_V2_TAG) {
+                                pending.push(fr);
+                            } else {
+                                pending.clear();
+                                out.push(fr);
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
-                },
+                }
+                _ => unreachable!("known WAL tag was not handled"),
             }
             off = end;
         }
@@ -439,10 +531,13 @@ mod tests {
         (
             Record {
                 id: "genai:aé#in".into(),
-                body: vec![
-                    BodyOp::Lit(b"[".to_vec()),
-                    BodyOp::Piece { hash: h, len: bytes.len() as u32 },
-                ],
+                contents: vec![Content::new(
+                    BODY_CONTENT,
+                    vec![
+                        BodyOp::Lit(b"[".to_vec()),
+                        BodyOp::Piece { hash: h, len: bytes.len() as u32 },
+                    ],
+                )],
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
                     ("k".into(), AttrValue::Int(-5)),
@@ -459,7 +554,7 @@ mod tests {
     fn record_wire_roundtrips_exactly() {
         let (r, novel) = rec();
         let mut b = Vec::new();
-        encode_record(&mut b, &r, &novel);
+        encode_record(&mut b, &r, &novel).unwrap();
         let (got, gn) = decode_record(&b).unwrap();
         assert_eq!(got, r, "record must replay exactly, attr order and dupes included");
         assert_eq!(gn.len(), 1);
@@ -469,6 +564,37 @@ mod tests {
             (AttrValue::Float(a), AttrValue::Float(b)) => assert_eq!(a.to_bits(), b.to_bits()),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn legacy_and_named_content_frames_replay_together() {
+        let d = std::env::temp_dir().join(format!("turndb-wal-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("wal");
+        let (legacy, novel) = rec();
+        let named = Record::new(
+            "new",
+            vec![
+                Content::new("request", vec![BodyOp::Lit(b"in".to_vec())]),
+                Content::new("response", vec![BodyOp::Lit(b"out".to_vec())]),
+            ],
+            vec![],
+        )
+        .unwrap();
+        {
+            let mut w = Wal::open(&p).unwrap();
+            let mut old_payload = Vec::new();
+            encode_record_v1(&mut old_payload, &legacy, &novel);
+            w.append_frame(FRAME_TAG, 1, &old_payload).unwrap();
+            w.append(1, &named, &[]).unwrap();
+            w.sync().unwrap();
+        }
+        let replay = Wal::replay(&p).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].record.contents, legacy.contents);
+        assert_eq!(replay[0].record.contents[0].name, BODY_CONTENT);
+        assert_eq!(replay[1].record, named);
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -514,7 +640,7 @@ mod tests {
         {
             let mut w = Wal::open(&p).unwrap();
             w.append(1, &a, &na).unwrap();
-            let tomb = Record { id: "z".into(), body: Vec::new(), attrs: Vec::new() };
+            let tomb = Record { id: "z".into(), contents: Vec::new(), attrs: Vec::new() };
             w.append_batch(
                 2,
                 &[
