@@ -31,6 +31,7 @@ test('reports the native capability profile without a portable fallback', () => 
     immutableSnapshots: true,
     lifecycleOperations: true,
     healthSnapshots: true,
+    schemaDiscovery: true,
   });
 });
 
@@ -306,4 +307,59 @@ test('reports cheap health across staging and publication', async (t) => {
   assert.equal(published.retainedCommits, 1n);
   assert.equal(typeof published.foldCacheHits, 'bigint');
   assert.equal(typeof published.partCacheBudget, 'bigint');
+});
+
+test('discovers typed field and content namespaces without reading values', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write([{
+    kind: 'put',
+    id: 'schema/1',
+    contents: [{ name: 'request', bytes: Buffer.from('request body') }],
+    attrs: [{ name: 'mixed', kind: 'string', stringValue: 'one' }],
+  }]);
+  assert.deepEqual(await store.schema(), {
+    attributes: [{ name: 'mixed', types: ['string'] }],
+    contents: ['request'],
+    mayIncludeShadowedFields: false,
+  });
+  await store.flush();
+
+  await store.write([{
+    kind: 'put',
+    id: 'schema/2',
+    contents: [{ name: 'response', bytes: Buffer.from('response body') }],
+    attrs: [
+      { name: 'a', kind: 'bool', boolValue: true },
+      { name: 'mixed', kind: 'int', intValue: 2n },
+      { name: 'mixed', kind: 'float', floatValue: 3.5 },
+    ],
+  }]);
+
+  const healthBefore = await store.health();
+  assert.deepEqual(await store.schema(), {
+    attributes: [
+      { name: 'a', types: ['bool'] },
+      { name: 'mixed', types: ['string', 'int', 'float'] },
+    ],
+    contents: ['request', 'response'],
+    mayIncludeShadowedFields: true,
+  });
+  const healthAfter = await store.health();
+  assert.equal(healthAfter.foldCacheHits, healthBefore.foldCacheHits);
+  assert.equal(healthAfter.foldCacheMisses, healthBefore.foldCacheMisses);
+
+  const published = await NativeSnapshot.open(dir);
+  t.after(async () => {
+    try { await published.close(); } catch {}
+  });
+  assert.deepEqual(await published.schema(), {
+    attributes: [{ name: 'mixed', types: ['string'] }],
+    contents: ['request'],
+    mayIncludeShadowedFields: true,
+  });
 });

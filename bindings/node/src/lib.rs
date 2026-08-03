@@ -138,6 +138,7 @@ pub struct NativeCapabilities {
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub health_snapshots: bool,
+    pub schema_discovery: bool,
 }
 
 #[napi]
@@ -167,6 +168,7 @@ pub fn capabilities() -> NativeCapabilities {
         immutable_snapshots: true,
         lifecycle_operations: true,
         health_snapshots: true,
+        schema_discovery: true,
     }
 }
 
@@ -249,6 +251,19 @@ pub struct NativeHealth {
     pub dedup_window_entries: BigInt,
     pub retained_commits: BigInt,
     pub punched_blocks: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeAttributeSchema {
+    pub name: String,
+    pub types: Vec<String>,
+}
+
+#[napi(object)]
+pub struct NativeSchema {
+    pub attributes: Vec<NativeAttributeSchema>,
+    pub contents: Vec<String>,
+    pub may_include_shadowed_fields: bool,
 }
 
 struct SnapshotState {
@@ -351,6 +366,17 @@ impl NativeSnapshot {
             .map_err(|error| failure("join TurnDB snapshot content read", error))?
             .map(|bytes| bytes.map(Buffer::from))
             .map_err(|error| failure("read TurnDB snapshot content", error))
+    }
+
+    /// Discover field names and scalar types from metadata without decoding values or content.
+    #[napi]
+    pub async fn schema(&self) -> Result<NativeSchema> {
+        let store = self.state.get()?;
+        napi::tokio::task::spawn_blocking(move || store.schema())
+            .await
+            .map_err(|error| failure("join TurnDB snapshot schema discovery", error))?
+            .map(encode_schema)
+            .map_err(|error| failure("discover TurnDB snapshot schema", error))
     }
 
     #[napi]
@@ -511,6 +537,16 @@ impl NativeStore {
             .await
             .map(encode_health)
             .map_err(|error| failure("read TurnDB health", error))
+    }
+
+    /// Discover the part field universe plus accepted writer-memtable fields.
+    #[napi]
+    pub async fn schema(&self) -> Result<NativeSchema> {
+        self.actor
+            .schema()
+            .await
+            .map(encode_schema)
+            .map_err(|error| failure("discover TurnDB schema", error))
     }
 
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
@@ -837,5 +873,32 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
         retained_commits: BigInt::from(health.retained_commits as u64),
         punched_blocks: BigInt::from(health.punched_blocks),
+    }
+}
+
+fn encode_schema(schema: turndb::schema::Schema) -> NativeSchema {
+    NativeSchema {
+        attributes: schema
+            .attributes
+            .into_iter()
+            .map(|attribute| NativeAttributeSchema {
+                name: attribute.name,
+                types: attribute
+                    .types
+                    .into_iter()
+                    .map(|kind| {
+                        match kind {
+                            turndb::schema::AttrType::String => "string",
+                            turndb::schema::AttrType::Int => "int",
+                            turndb::schema::AttrType::Float => "float",
+                            turndb::schema::AttrType::Bool => "bool",
+                        }
+                        .to_string()
+                    })
+                    .collect(),
+            })
+            .collect(),
+        contents: schema.contents,
+        may_include_shadowed_fields: schema.may_include_shadowed_fields,
     }
 }

@@ -53,6 +53,7 @@ pub mod part;
 pub mod query;
 pub mod readat;
 pub mod scan;
+pub mod schema;
 pub mod store;
 mod sys;
 pub mod types;

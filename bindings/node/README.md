@@ -48,6 +48,11 @@ silently.
   endpoint: commit and fold generation, part pressure, staged entries and bytes, WAL/fold bytes,
   cache counters and budgets, dedup-window size, retained commits, and punched blocks. It decodes no
   records or content and therefore does not claim an exact live-row count.
+- `schema()` discovers the attribute names and scalar types and the independently named content
+  fields present in the store. It reads part metadata, not values or content, and the writer view also
+  includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to
+  the result because metadata-only discovery can conservatively include a field that exists only in
+  a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
 The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, backup/restore and
 recovery controls, configurable queue depth, or the complete engine error taxonomy. Those remain
