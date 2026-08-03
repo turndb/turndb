@@ -175,20 +175,22 @@ page stopped. The first matching row is always admitted whole even when it excee
 single large record cannot deadlock pagination. Node exposes the same contract as
 `maxReconstructedBytes: bigint` and `reconstructionBudgetExhausted`.
 
-The structured pager now point-locates each committed candidate and decodes only attribute/content
-columns named by projections or predicates. Visibility resolution precedes that projection and the
-writer's memtable remains an in-memory newest overlay. Shared layout/metadata sections are necessary,
-but sibling value/dictionary/program sections stay unopened. See
-`docs/projected-structured-scan.md`.
+The structured pager now retains each committed candidate's authoritative part and row from its
+bounded k-way range merge, then decodes only attribute/content columns named by projections or
+predicates. It does not point-locate the id again during projection or reconstruction, and byte
+projection reuses the already decoded content program and identity. Visibility resolution precedes
+projection and the writer's memtable remains an in-memory newest overlay. Shared layout/metadata
+sections are necessary, but sibling value/dictionary/program sections stay unopened. See
+`docs/projected-structured-scan.md` and `docs/resolved-row-paging.md`.
 
 Each successful page now carries exact operation-local `stats.io` evidence: distinct raw part
 sections and fold blocks touched, cache hit/miss access counts, backing-reader stored bytes, and raw
 bytes decoded. The collector is scoped below shared caches, so concurrent snapshots cannot
 contaminate one another through global counter deltas. See `docs/structured-scan-io.md`.
 
-**Current gap:** committed candidates are still point-located rather than consumed by a batched
-physical column range walk. The `max_examined` budget counts live records evaluated against
-predicates, not superseded physical rows encountered while resolving them.
+**Current gap:** resolved candidates still invoke selected-column decoders per row rather than being
+grouped by part for vectorized physical gathers. The `max_examined` budget counts live records
+evaluated against predicates, not superseded physical rows encountered while resolving them.
 
 ## 5. Platform capabilities
 

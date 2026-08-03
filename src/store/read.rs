@@ -45,6 +45,18 @@ pub(crate) struct Visibility {
     pub tombstones: usize,
 }
 
+/// A live committed row resolved by the range merge.
+///
+/// The part index is stable for the lifetime of the `Store`/`ReadStore` borrow that produced it.
+/// Carrying it into projection avoids repeating a newest-first point lookup for every candidate and
+/// again for every reconstructed content value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RowRef {
+    pub id: String,
+    pub part: usize,
+    pub row: usize,
+}
+
 pub(crate) fn visibility(parts: &[Arc<Part>]) -> Result<Visibility> {
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
     let mut seen: HashSet<String> = HashSet::new();
@@ -75,22 +87,29 @@ pub fn get(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
     }
 }
 
-/// The newest committed version of `id`, decoding only selected attribute and content columns.
-/// Visibility is resolved before projection, so a predicate can never fall through to an older row.
-pub(crate) fn project(
+/// Column-selective projection from an already resolved live row.
+pub(crate) fn project_row(
     parts: &[Arc<Part>],
-    id: &str,
+    resolved: &RowRef,
     attrs: &HashSet<&str>,
     contents: &HashSet<&str>,
-) -> Result<Option<Record>> {
-    match locate(parts, id)? {
-        Some((part, row)) => Ok(Some(Record {
-            id: id.to_string(),
-            contents: part.contents_selected(row, contents)?,
-            attrs: part.attrs_selected(row, attrs)?,
-        })),
-        None => Ok(None),
+) -> Result<Record> {
+    let part = parts.get(resolved.part).ok_or_else(|| {
+        anyhow::anyhow!("resolved part {} is outside the immutable snapshot", resolved.part)
+    })?;
+    if resolved.row >= part.len() {
+        anyhow::bail!(
+            "resolved row {} is outside part {} with {} rows",
+            resolved.row,
+            resolved.part,
+            part.len()
+        );
     }
+    Ok(Record {
+        id: resolved.id.clone(),
+        contents: part.contents_selected(resolved.row, contents)?,
+        attrs: part.attrs_selected(resolved.row, attrs)?,
+    })
 }
 
 /// Byte-exact content for `id`, or `None` if it is absent or deleted.
@@ -109,6 +128,27 @@ pub fn reconstruct_content(
         Some((p, row)) => p.reconstruct_content(row, name, fold),
         None => Ok(None),
     }
+}
+
+/// Byte-exact content whose program was projected from an already resolved live row.
+pub(crate) fn reconstruct_projected_content(
+    parts: &[Arc<Part>],
+    fold: &Fold,
+    resolved: &RowRef,
+    content: &crate::types::Content,
+) -> Result<Vec<u8>> {
+    let part = parts.get(resolved.part).ok_or_else(|| {
+        anyhow::anyhow!("resolved part {} is outside the immutable snapshot", resolved.part)
+    })?;
+    if resolved.row >= part.len() {
+        anyhow::bail!(
+            "resolved row {} is outside part {} with {} rows",
+            resolved.row,
+            resolved.part,
+            part.len()
+        );
+    }
+    part.reconstruct_projected_content(content, fold)
 }
 
 /// Whether `id` exists in the committed state — cheaper than [`get`], since no record is decoded.
@@ -149,13 +189,13 @@ fn locate<'a>(parts: &'a [Arc<Part>], id: &str) -> Result<Option<(&'a Arc<Part>,
 /// Because ids sort lexicographically, a caller who designs ids with the query in mind — a
 /// `member/timestamp/...` prefix, say — gets member-then-time paging out of this with no secondary
 /// index at all. `reverse` walks the same run backwards, which is what a newest-first UI wants.
-pub fn scan_ids(
+pub(crate) fn scan_rows(
     parts: &[Arc<Part>],
     from: Option<&str>,
     to: Option<&str>,
     limit: usize,
     reverse: bool,
-) -> Result<Vec<String>> {
+) -> Result<Vec<RowRef>> {
     if limit == 0 || parts.is_empty() {
         return Ok(Vec::new());
     }
@@ -191,7 +231,7 @@ pub fn scan_ids(
             .collect();
         let newest = *matching.last().expect("the selected id has at least one source part");
         if !parts[newest].is_tombstone(walks[newest].row)? {
-            out.push(best);
+            out.push(RowRef { id: best, part: newest, row: walks[newest].row });
         }
         for pi in matching {
             let walk = &mut walks[pi];
@@ -213,6 +253,17 @@ pub fn scan_ids(
         }
     }
     Ok(out)
+}
+
+/// Id-only projection of the same resolved-row range merge used by structured scans.
+pub fn scan_ids(
+    parts: &[Arc<Part>],
+    from: Option<&str>,
+    to: Option<&str>,
+    limit: usize,
+    reverse: bool,
+) -> Result<Vec<String>> {
+    Ok(scan_rows(parts, from, to, limit, reverse)?.into_iter().map(|row| row.id).collect())
 }
 
 pub fn ids(parts: &[Arc<Part>]) -> Result<Vec<String>> {

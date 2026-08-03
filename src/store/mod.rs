@@ -2077,32 +2077,57 @@ impl Store {
         read::get(&self.parts, id)
     }
 
-    /// Scan projection over newest-wins state. The memtable is already materialized; committed rows
-    /// delegate to the column-selective read core.
-    pub(crate) fn project(
+    /// Project a row whose newest-wins origin was already settled by the range merge.
+    pub(crate) fn project_candidate(
         &self,
-        id: &str,
+        candidate: &crate::scan::ScanCandidate,
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Option<Record>> {
-        if let Some(value) = self.mem.get(id) {
-            return Ok(value.as_ref().map(|record| Record {
-                id: record.id.clone(),
-                contents: record
-                    .contents
-                    .iter()
-                    .filter(|content| contents.contains(content.name.as_str()))
-                    .cloned()
-                    .collect(),
-                attrs: record
-                    .attrs
-                    .iter()
-                    .filter(|(name, _)| attrs.contains(name.as_str()))
-                    .cloned()
-                    .collect(),
-            }));
+    ) -> Result<Record> {
+        match candidate {
+            crate::scan::ScanCandidate::Committed(row) => {
+                read::project_row(&self.parts, row, attrs, contents)
+            }
+            crate::scan::ScanCandidate::Memtable(id) => {
+                let record = self.mem.get(id).and_then(Option::as_ref).ok_or_else(|| {
+                    anyhow::anyhow!("resolved memtable row {id:?} is no longer live")
+                })?;
+                Ok(Record {
+                    id: record.id.clone(),
+                    contents: record
+                        .contents
+                        .iter()
+                        .filter(|content| contents.contains(content.name.as_str()))
+                        .cloned()
+                        .collect(),
+                    attrs: record
+                        .attrs
+                        .iter()
+                        .filter(|(name, _)| attrs.contains(name.as_str()))
+                        .cloned()
+                        .collect(),
+                })
+            }
         }
-        read::project(&self.parts, id, attrs, contents)
+    }
+
+    /// Reconstruct selected content without re-locating an already resolved scan row.
+    pub(crate) fn reconstruct_candidate_content(
+        &self,
+        candidate: &crate::scan::ScanCandidate,
+        content: &Content,
+    ) -> Result<Vec<u8>> {
+        match candidate {
+            crate::scan::ScanCandidate::Committed(row) => {
+                read::reconstruct_projected_content(&self.parts, &self.fold, row, content)
+            }
+            crate::scan::ScanCandidate::Memtable(id) => {
+                self.mem.get(id).and_then(Option::as_ref).ok_or_else(|| {
+                    anyhow::anyhow!("resolved memtable row {id:?} is no longer live")
+                })?;
+                self.rebuild_projected_content(content)
+            }
+        }
     }
 
     /// Byte-exact content for `id`.
@@ -2143,10 +2168,14 @@ impl Store {
     }
 
     fn rebuild_content(&self, r: &Record, name: &str) -> Result<Option<Vec<u8>>> {
-        let mut out = Vec::new();
         let Some(content) = r.content(name) else {
             return Ok(None);
         };
+        Ok(Some(self.rebuild_projected_content(content)?))
+    }
+
+    fn rebuild_projected_content(&self, content: &Content) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
         for op in &content.ops {
             match op {
                 BodyOp::Lit(b) => out.extend_from_slice(b),
@@ -2161,10 +2190,13 @@ impl Store {
         if let Some(expected) = content.identity {
             let got = ContentHash::of(&out);
             if got != expected {
-                bail!("content {name:?} reconstructed as {got} but its identity is {expected}");
+                bail!(
+                    "content {:?} reconstructed as {got} but its identity is {expected}",
+                    content.name
+                );
             }
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     pub fn memtable_len(&self) -> usize {
@@ -2191,8 +2223,8 @@ impl Store {
     /// [`ReadStore::scan_ids`], plus the uncommitted memtable — so a writer paging its own store
     /// sees records it has not flushed yet, which is what makes a live backfill possible.
     ///
-    /// The memtable is a `BTreeMap`, so its slice of the range is already in id order and merging
-    /// is a two-way walk. Staged deletions remove an id here exactly as a tombstone would.
+    /// The memtable is a `BTreeMap`, so its slice of the range overlays resolved committed rows in
+    /// id order. Staged deletions remove an id here exactly as a tombstone would.
     pub fn scan_ids(
         &self,
         from: Option<&str>,
@@ -2200,6 +2232,21 @@ impl Store {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .scan_candidates(from, to, limit, reverse)?
+            .into_iter()
+            .map(crate::scan::ScanCandidate::into_id)
+            .collect())
+    }
+
+    /// Resolve a bounded id range once and retain each live row's storage origin for projection.
+    pub(crate) fn scan_candidates(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<crate::scan::ScanCandidate>> {
         check_range(from, to)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -2216,21 +2263,19 @@ impl Store {
         // committed id merely over-fetch, which the truncate below absorbs.
         let staged_deletions = self.mem.range::<str, _>(range).filter(|(_, v)| v.is_none()).count();
         let want = limit.saturating_add(staged_deletions);
-        let committed = read::scan_ids(&self.parts, from, to, want, reverse)?;
-        let staged: Vec<&String> =
-            self.mem.range::<str, _>(range).filter(|(_, v)| v.is_some()).map(|(k, _)| k).collect();
-        if staged.is_empty() {
-            // still must drop anything the memtable deleted
-            let mut out = committed;
-            out.retain(|id| !matches!(self.mem.get(id), Some(None)));
-            out.truncate(limit);
-            return Ok(out);
+        let committed = read::scan_rows(&self.parts, from, to, want, reverse)?;
+        let mut resolved = BTreeMap::new();
+        for row in committed {
+            resolved.insert(row.id.clone(), crate::scan::ScanCandidate::Committed(row));
         }
-        let mut all: Vec<String> = committed;
-        all.extend(staged.into_iter().cloned());
-        all.sort_unstable();
-        all.dedup();
-        all.retain(|id| !matches!(self.mem.get(id), Some(None)));
+        for (id, value) in self.mem.range::<str, _>(range) {
+            if value.is_some() {
+                resolved.insert(id.clone(), crate::scan::ScanCandidate::Memtable(id.clone()));
+            } else {
+                resolved.remove(id);
+            }
+        }
+        let mut all: Vec<_> = resolved.into_values().collect();
         if reverse {
             all.reverse();
         }
@@ -2713,13 +2758,35 @@ impl ReadStore {
         read::get(&self.parts, id)
     }
 
-    pub(crate) fn project(
+    pub(crate) fn project_candidate(
         &self,
-        id: &str,
+        candidate: &crate::scan::ScanCandidate,
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Option<Record>> {
-        read::project(&self.parts, id, attrs, contents)
+    ) -> Result<Record> {
+        match candidate {
+            crate::scan::ScanCandidate::Committed(row) => {
+                read::project_row(&self.parts, row, attrs, contents)
+            }
+            crate::scan::ScanCandidate::Memtable(id) => {
+                bail!("immutable snapshot received memtable row {id:?}")
+            }
+        }
+    }
+
+    pub(crate) fn reconstruct_candidate_content(
+        &self,
+        candidate: &crate::scan::ScanCandidate,
+        content: &Content,
+    ) -> Result<Vec<u8>> {
+        match candidate {
+            crate::scan::ScanCandidate::Committed(row) => {
+                read::reconstruct_projected_content(&self.parts, &self.fold, row, content)
+            }
+            crate::scan::ScanCandidate::Memtable(id) => {
+                bail!("immutable snapshot received memtable row {id:?}")
+            }
+        }
     }
 
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
@@ -2753,8 +2820,25 @@ impl ReadStore {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .scan_candidates(from, to, limit, reverse)?
+            .into_iter()
+            .map(crate::scan::ScanCandidate::into_id)
+            .collect())
+    }
+
+    pub(crate) fn scan_candidates(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<crate::scan::ScanCandidate>> {
         check_range(from, to)?;
-        read::scan_ids(&self.parts, from, to, limit, reverse)
+        Ok(read::scan_rows(&self.parts, from, to, limit, reverse)?
+            .into_iter()
+            .map(crate::scan::ScanCandidate::Committed)
+            .collect())
     }
 
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership

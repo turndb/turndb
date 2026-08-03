@@ -220,6 +220,10 @@ fn page_io_stats_are_operation_local_and_distinguish_cold_from_cached_reads() {
     assert_eq!(cold.rows[0].contents[0].bytes.as_deref(), Some(payload.as_slice()));
     assert!(cold.stats.io.part_sections_touched > 0);
     assert!(cold.stats.io.part_section_cache_misses > 0);
+    assert!(
+        cold.stats.io.part_section_cache_hits <= 3,
+        "resolved rows and projected content programs must not be point-located or decoded again"
+    );
     assert!(cold.stats.io.part_stored_bytes_read > 0);
     assert!(cold.stats.io.part_raw_bytes_decoded >= cold.stats.io.part_stored_bytes_read);
     assert_eq!(cold.stats.io.fold_blocks_touched, 1);
@@ -586,4 +590,42 @@ fn bounded_part_walk_matches_the_materialized_visibility_oracle() {
         }
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resolved_candidates_project_and_reconstruct_the_authoritative_part_rows() {
+    let dir = tmp("resolved-rows");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        store.put_body("a", b"a0", vec![("generation".into(), AttrValue::Int(0))]).unwrap();
+        store.put_body("b", b"b0", vec![("generation".into(), AttrValue::Int(0))]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+
+        store.delete("a").unwrap();
+        store.put_body("b", b"b1", vec![("generation".into(), AttrValue::Int(1))]).unwrap();
+        store.put_body("c", b"c1", vec![("generation".into(), AttrValue::Int(1))]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+
+        store.put_body("a", b"a2", vec![("generation".into(), AttrValue::Int(2))]).unwrap();
+        store.delete("c").unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let page = reader
+        .scan(&ScanRequest {
+            attrs: vec!["generation".into()],
+            contents: vec![ContentSelect { name: "body".into(), mode: ContentMode::Bytes }],
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(page.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(page.rows[0].attrs, [("generation".into(), AttrValue::Int(2))]);
+    assert_eq!(page.rows[0].contents[0].bytes.as_deref(), Some(b"a2".as_slice()));
+    assert_eq!(page.rows[1].attrs, [("generation".into(), AttrValue::Int(1))]);
+    assert_eq!(page.rows[1].contents[0].bytes.as_deref(), Some(b"b1".as_slice()));
+    std::fs::remove_dir_all(dir).ok();
 }
