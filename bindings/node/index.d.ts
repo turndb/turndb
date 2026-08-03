@@ -275,6 +275,8 @@ export interface StoreMetrics {
   flush: OperationMetrics;
   compaction: OperationMetrics;
   backup: OperationMetrics;
+  verification: OperationMetrics;
+  verificationCorruptionFailures: bigint;
   punch: OperationMetrics;
   refold: OperationMetrics;
   formatMigration: OperationMetrics;

@@ -865,6 +865,11 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.equal(refolded.recordsKept, 2n);
   assert.equal(typeof refolded.bytesReclaimed, 'bigint');
   assert.equal((await store.verify()).parts, 1n);
+  const metrics = await store.metrics();
+  assert.equal(metrics.verification.attempts, 2n);
+  assert.equal(metrics.verification.succeeded, 2n);
+  assert.equal(metrics.verification.failed, 0n);
+  assert.equal(metrics.verificationCorruptionFailures, 0n);
 });
 
 test('compacts one exact bounded work unit and classifies budgets for schedulers', async (t) => {

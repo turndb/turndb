@@ -138,7 +138,8 @@ silently.
   records or content and therefore does not claim an exact live-row count.
 - `metrics()` returns monotonic `bigint` outcomes and nanosecond totals for recovery and writer
   lifecycle work. It is handle-local and pull-based; actor queue wait is deliberately separate from
-  core execution time. Folded-content counters expose exact piece hits/logical/novel bytes, and
+  core execution time. Verification reports a dedicated corruption-failure subset without conflating
+  cancellation or I/O. Folded-content counters expose exact piece hits/logical/novel bytes, and
   `partDistribution(options)` reports live immutable-part byte/row order statistics. See
   [pull-based operation metrics](../../docs/operation-metrics.md).
 - `contentLiveness(options)` walks visible record programs and fold headers to separate unique live
