@@ -260,6 +260,14 @@ pub struct NativeScanIoStats {
 }
 
 #[napi(object)]
+pub struct NativeScanResolutionStats {
+    pub physical_rows: BigInt,
+    pub superseded_rows: BigInt,
+    pub tombstones: BigInt,
+    pub memtable_entries: BigInt,
+}
+
+#[napi(object)]
 pub struct NativeScanStats {
     pub examined: u32,
     pub returned: u32,
@@ -268,6 +276,7 @@ pub struct NativeScanStats {
     pub reconstructed_bytes: BigInt,
     pub reconstruction_budget_exhausted: bool,
     pub io: NativeScanIoStats,
+    pub resolution: NativeScanResolutionStats,
 }
 
 #[napi(object)]
@@ -1865,6 +1874,12 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
                 fold_block_cache_misses: BigInt::from(page.stats.io.fold_block_cache_misses),
                 fold_stored_bytes_read: BigInt::from(page.stats.io.fold_stored_bytes_read),
                 fold_raw_bytes_decoded: BigInt::from(page.stats.io.fold_raw_bytes_decoded),
+            },
+            resolution: NativeScanResolutionStats {
+                physical_rows: BigInt::from(page.stats.resolution.physical_rows as u64),
+                superseded_rows: BigInt::from(page.stats.resolution.superseded_rows as u64),
+                tombstones: BigInt::from(page.stats.resolution.tombstones as u64),
+                memtable_entries: BigInt::from(page.stats.resolution.memtable_entries as u64),
             },
         },
     }

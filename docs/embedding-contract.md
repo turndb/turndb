@@ -188,9 +188,14 @@ sections and fold blocks touched, cache hit/miss access counts, backing-reader s
 bytes decoded. The collector is scoped below shared caches, so concurrent snapshots cannot
 contaminate one another through global counter deltas. See `docs/structured-scan-io.md`.
 
+`stats.resolution` separately reports immutable physical row occurrences, superseded occurrences,
+deciding tombstones, and live-writer memtable entries consumed before predicate evaluation. This
+keeps `examined`'s live-candidate meaning intact while exposing version-resolution amplification.
+
 **Current gap:** resolved candidates still invoke selected-column decoders per row rather than being
 grouped by part for vectorized physical gathers. The `max_examined` budget counts live records
-evaluated against predicates, not superseded physical rows encountered while resolving them.
+evaluated against predicates, not superseded physical rows encountered while resolving them; a hard
+resolution-work budget and tombstone-only continuation are not yet implemented.
 
 ## 5. Platform capabilities
 

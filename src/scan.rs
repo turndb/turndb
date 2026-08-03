@@ -168,6 +168,18 @@ pub struct ScanIoStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanResolutionStats {
+    /// Immutable part-row occurrences consumed while resolving newest-wins candidates.
+    pub physical_rows: usize,
+    /// Older immutable occurrences hidden by the deciding occurrence for the same id.
+    pub superseded_rows: usize,
+    /// Newest immutable occurrences that were tombstones and yielded no candidate.
+    pub tombstones: usize,
+    /// Ordered live-writer memtable entries inspected while overlaying committed candidates.
+    pub memtable_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
     pub examined: usize,
     pub returned: usize,
@@ -179,6 +191,8 @@ pub struct ScanStats {
     pub reconstruction_budget_exhausted: bool,
     /// Exact operation-local storage reads. Shared cache activity from other scans is excluded.
     pub io: ScanIoStats,
+    /// Exact work performed before predicate evaluation to establish live candidate rows.
+    pub resolution: ScanResolutionStats,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -193,6 +207,12 @@ pub struct ScanPage {
 pub(crate) enum ScanCandidate {
     Committed(crate::store::read::RowRef),
     Memtable(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CandidateBatch {
+    pub candidates: Vec<ScanCandidate>,
+    pub resolution: ScanResolutionStats,
 }
 
 impl ScanCandidate {
@@ -218,7 +238,7 @@ trait Source {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<ScanCandidate>>;
+    ) -> Result<CandidateBatch>;
     fn project(
         &self,
         candidate: &ScanCandidate,
@@ -235,7 +255,7 @@ impl Source for Store {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<ScanCandidate>> {
+    ) -> Result<CandidateBatch> {
         Store::scan_candidates(self, from, to, limit, reverse)
     }
 
@@ -260,7 +280,7 @@ impl Source for ReadStore {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<ScanCandidate>> {
+    ) -> Result<CandidateBatch> {
         ReadStore::scan_candidates(self, from, to, limit, reverse)
     }
 
@@ -347,20 +367,40 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         check_interruption(request)?;
         let remaining = request.max_examined - stats.examined;
         let ask = remaining.min((request.limit - rows.len()).max(64));
-        let candidates = source.scan_candidates(
+        let batch = source.scan_candidates(
             from.as_deref(),
             to.as_deref(),
             ask,
             request.direction == Direction::Reverse,
         )?;
         check_interruption(request)?;
-        if candidates.is_empty() {
+        stats.resolution.physical_rows = stats
+            .resolution
+            .physical_rows
+            .checked_add(batch.resolution.physical_rows)
+            .context("structured scan physical-row counter overflow")?;
+        stats.resolution.superseded_rows = stats
+            .resolution
+            .superseded_rows
+            .checked_add(batch.resolution.superseded_rows)
+            .context("structured scan superseded-row counter overflow")?;
+        stats.resolution.tombstones = stats
+            .resolution
+            .tombstones
+            .checked_add(batch.resolution.tombstones)
+            .context("structured scan tombstone counter overflow")?;
+        stats.resolution.memtable_entries = stats
+            .resolution
+            .memtable_entries
+            .checked_add(batch.resolution.memtable_entries)
+            .context("structured scan memtable-entry counter overflow")?;
+        if batch.candidates.is_empty() {
             has_more = false;
             break;
         }
-        let fetched = candidates.len();
+        let fetched = batch.candidates.len();
         let mut processed = 0usize;
-        for candidate in candidates {
+        for candidate in batch.candidates {
             check_interruption(request)?;
             processed += 1;
             stats.examined += 1;
@@ -787,8 +827,14 @@ mod tests {
             _to: Option<&str>,
             _limit: usize,
             _reverse: bool,
-        ) -> Result<Vec<ScanCandidate>> {
-            Ok(vec![ScanCandidate::Memtable("a".into()), ScanCandidate::Memtable("b".into())])
+        ) -> Result<CandidateBatch> {
+            Ok(CandidateBatch {
+                candidates: vec![
+                    ScanCandidate::Memtable("a".into()),
+                    ScanCandidate::Memtable("b".into()),
+                ],
+                resolution: ScanResolutionStats { memtable_entries: 2, ..Default::default() },
+            })
         }
 
         fn project(

@@ -2234,6 +2234,7 @@ impl Store {
     ) -> Result<Vec<String>> {
         Ok(self
             .scan_candidates(from, to, limit, reverse)?
+            .candidates
             .into_iter()
             .map(crate::scan::ScanCandidate::into_id)
             .collect())
@@ -2246,10 +2247,10 @@ impl Store {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<crate::scan::ScanCandidate>> {
+    ) -> Result<crate::scan::CandidateBatch> {
         check_range(from, to)?;
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(crate::scan::CandidateBatch::default());
         }
         let range = (
             from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
@@ -2261,18 +2262,19 @@ impl Store {
         // paged read to be wrong. At most one candidate can be shadowed per staged deletion in the
         // range, so `limit + deletions` candidates cannot under-fill. Deletions that hit no
         // committed id merely over-fetch, which the truncate below absorbs.
-        let staged_deletions = self.mem.range::<str, _>(range).filter(|(_, v)| v.is_none()).count();
+        let staged: Vec<_> = self.mem.range::<str, _>(range).collect();
+        let staged_deletions = staged.iter().filter(|(_, value)| value.is_none()).count();
         let want = limit.saturating_add(staged_deletions);
         let committed = read::scan_rows(&self.parts, from, to, want, reverse)?;
         let mut resolved = BTreeMap::new();
-        for row in committed {
+        for row in committed.rows {
             resolved.insert(row.id.clone(), crate::scan::ScanCandidate::Committed(row));
         }
-        for (id, value) in self.mem.range::<str, _>(range) {
+        for (id, value) in &staged {
             if value.is_some() {
-                resolved.insert(id.clone(), crate::scan::ScanCandidate::Memtable(id.clone()));
+                resolved.insert((*id).clone(), crate::scan::ScanCandidate::Memtable((*id).clone()));
             } else {
-                resolved.remove(id);
+                resolved.remove(*id);
             }
         }
         let mut all: Vec<_> = resolved.into_values().collect();
@@ -2280,7 +2282,15 @@ impl Store {
             all.reverse();
         }
         all.truncate(limit);
-        Ok(all)
+        Ok(crate::scan::CandidateBatch {
+            candidates: all,
+            resolution: crate::scan::ScanResolutionStats {
+                physical_rows: committed.physical_rows,
+                superseded_rows: committed.superseded_rows,
+                tombstones: committed.tombstones,
+                memtable_entries: staged.len(),
+            },
+        })
     }
 
     /// Every live id: committed parts plus the uncommitted memtable.
@@ -2822,6 +2832,7 @@ impl ReadStore {
     ) -> Result<Vec<String>> {
         Ok(self
             .scan_candidates(from, to, limit, reverse)?
+            .candidates
             .into_iter()
             .map(crate::scan::ScanCandidate::into_id)
             .collect())
@@ -2833,12 +2844,22 @@ impl ReadStore {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<crate::scan::ScanCandidate>> {
+    ) -> Result<crate::scan::CandidateBatch> {
         check_range(from, to)?;
-        Ok(read::scan_rows(&self.parts, from, to, limit, reverse)?
-            .into_iter()
-            .map(crate::scan::ScanCandidate::Committed)
-            .collect())
+        let resolved = read::scan_rows(&self.parts, from, to, limit, reverse)?;
+        Ok(crate::scan::CandidateBatch {
+            candidates: resolved
+                .rows
+                .into_iter()
+                .map(crate::scan::ScanCandidate::Committed)
+                .collect(),
+            resolution: crate::scan::ScanResolutionStats {
+                physical_rows: resolved.physical_rows,
+                superseded_rows: resolved.superseded_rows,
+                tombstones: resolved.tombstones,
+                memtable_entries: 0,
+            },
+        })
     }
 
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
