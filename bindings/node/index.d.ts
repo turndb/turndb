@@ -68,9 +68,20 @@ export interface Capabilities {
   nativeNode: true;
   napiVersion: 6;
   commandQueueCapacity: number;
+  immutableSnapshots: true;
 }
 
 export declare function capabilities(): Capabilities;
+export declare function retainedCommits(path: string): Promise<bigint[]>;
+
+export declare class NativeSnapshot {
+  static open(path: string): Promise<NativeSnapshot>;
+  static openAt(path: string, commit: bigint): Promise<NativeSnapshot>;
+  readonly commit: bigint;
+  scan(request?: ScanRequest): Promise<ScanPage>;
+  readContent(id: string, name: string): Promise<Buffer | null>;
+  close(): Promise<void>;
+}
 
 export declare class NativeStore {
   static open(path: string): Promise<NativeStore>;
@@ -79,5 +90,6 @@ export declare class NativeStore {
   flush(): Promise<boolean>;
   scan(request?: ScanRequest): Promise<ScanPage>;
   readContent(id: string, name: string): Promise<Buffer | null>;
+  snapshot(): Promise<NativeSnapshot>;
   close(durable?: boolean): Promise<void>;
 }

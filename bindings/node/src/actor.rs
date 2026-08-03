@@ -13,7 +13,7 @@ use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
 use turndb::fold::FoldCfg;
 use turndb::scan::{ScanPage, ScanRequest};
-use turndb::store::{Batch, ContentSpans, Store};
+use turndb::store::{Batch, ContentSpans, ReadStore, Store};
 use turndb::types::AttrValue;
 
 const QUEUE_CAPACITY: usize = 64;
@@ -38,6 +38,7 @@ enum Command {
     Flush { reply: oneshot::Sender<Result<bool>> },
     Scan { request: ScanRequest, reply: oneshot::Sender<Result<ScanPage>> },
     ReadContent { id: String, name: String, reply: oneshot::Sender<Result<Option<Vec<u8>>>> },
+    Snapshot { reply: oneshot::Sender<Result<ReadStore>> },
     Close { durable: bool, reply: oneshot::Sender<Result<()>> },
 }
 
@@ -61,7 +62,7 @@ impl Actor {
             .spawn(move || match Store::open(&path, FoldCfg::default()) {
                 Ok(store) => {
                     let _ = ready_tx.send(Ok(()));
-                    run(store, rx);
+                    run(store, &path, rx);
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
@@ -115,6 +116,10 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::ReadContent { id, name, reply })?).await
     }
 
+    pub async fn snapshot(&self) -> Result<ReadStore> {
+        Self::receive(self.submit(|reply| Command::Snapshot { reply })?).await
+    }
+
     pub async fn close(&self, durable: bool) -> Result<()> {
         if self
             .inner
@@ -140,7 +145,7 @@ impl Actor {
     }
 }
 
-fn run(mut store: Store, rx: mpsc::Receiver<Command>) {
+fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
     while let Ok(command) = rx.recv() {
         match command {
             Command::Write { ops, durable, reply } => {
@@ -158,6 +163,16 @@ fn run(mut store: Store, rx: mpsc::Receiver<Command>) {
             }
             Command::ReadContent { id, name, reply } => {
                 let _ = reply.send(store.reconstruct_content(&id, &name));
+            }
+            Command::Snapshot { reply } => {
+                // A reader never replays the writer's WAL. Flush is therefore the only honest way
+                // to include every earlier accepted write in an immutable view, and actor
+                // serialization makes this an exact cut rather than a race around `open_read`.
+                let result = store
+                    .flush()
+                    .and_then(|_| Store::open_read(path, FoldCfg::default()))
+                    .context("publish immutable reader snapshot");
+                let _ = reply.send(result);
             }
             Command::Close { durable, reply } => {
                 let result = if durable { store.sync() } else { Ok(()) };

@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { capabilities, NativeStore } = require('..');
+const { capabilities, NativeSnapshot, NativeStore, retainedCommits } = require('..');
 
 function temporaryStore(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-'));
@@ -28,6 +28,7 @@ test('reports the native capability profile without a portable fallback', () => 
     nativeNode: true,
     napiVersion: 6,
     commandQueueCapacity: 64,
+    immutableSnapshots: true,
   });
 });
 
@@ -137,6 +138,43 @@ test('pages and filters in Rust and refuses cursor misuse', async (t) => {
     store.scan({ ...request, from: 'r2', cursor: first.next }),
     /cursor belongs to different bounds or predicates/
   );
+});
+
+test('publishes exact immutable cuts and reopens retained commits', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write([{ kind: 'put', id: 'r1' }]);
+  const first = await store.snapshot();
+  t.after(async () => {
+    try { await first.close(); } catch {}
+  });
+  assert(first.commit > 0n);
+  assert.deepEqual((await first.scan()).rows.map(({ id }) => id), ['r1']);
+
+  await store.write([{ kind: 'put', id: 'r2' }]);
+  assert.deepEqual((await first.scan()).rows.map(({ id }) => id), ['r1']);
+  // A separately opened reader sees only the manifest published by the first snapshot, not r2 in
+  // the writer's WAL/memtable.
+  const published = await NativeSnapshot.open(dir);
+  assert.deepEqual((await published.scan()).rows.map(({ id }) => id), ['r1']);
+  await published.close();
+
+  const second = await store.snapshot();
+  assert.deepEqual((await second.scan()).rows.map(({ id }) => id), ['r1', 'r2']);
+  const commits = await retainedCommits(dir);
+  assert(commits.includes(first.commit));
+  assert(commits.includes(second.commit));
+
+  const retained = await NativeSnapshot.openAt(dir, first.commit);
+  assert.equal(retained.commit, first.commit);
+  assert.deepEqual((await retained.scan()).rows.map(({ id }) => id), ['r1']);
+  await retained.close();
+  await assert.rejects(retained.scan(), /closed/);
+  await second.close();
 });
 
 test('validates exact values and lifecycle at the boundary', async (t) => {

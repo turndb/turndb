@@ -26,10 +26,13 @@ silently.
   Integers enter and leave as JavaScript `bigint`; binary content uses `Buffer`.
 - `scan()` is the Rust structured pager. Rust owns visibility, filtering, ordering, work bounds, and
   opaque cursor validation. The writer view includes accepted unflushed writes.
+- `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
+  actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
+  writer lock; `openAt()` reopens a commit still inside the bounded retention window.
 - `close()` syncs by default. Passing `false` is an explicit no-sync close.
 - Calls made after close refuse. When 64 operations are already queued, ordinary operations refuse
   with an overload error rather than creating an unbounded backlog.
 
-The current slice does not yet expose read-only snapshots, cancellation/deadlines, Arrow IPC, SQL,
-lifecycle maintenance, configurable queue depth, or structured error codes. Those remain explicit
-Phase 3/4 work rather than being simulated in JavaScript.
+The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, lifecycle maintenance,
+configurable queue depth, or structured error codes. Those remain explicit Phase 3/4 work rather than
+being simulated in JavaScript.

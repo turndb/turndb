@@ -194,10 +194,16 @@ batch and optionally syncs it before resolving. `close` syncs by default, while 
 explicit no-sync close. Dropping the final handle disconnects the queue and releases the writer rather
 than keeping an orphan actor alive.
 
+`NativeStore::snapshot` flushes all operations ordered before it on the actor, then opens an immutable
+`ReadStore` at that exact published cut. The snapshot's scans can execute concurrently on the blocking
+pool and remain stable across later writer activity. A read-only process can open the current published
+manifest directly or request a commit still present in the bounded retained-manifest window; neither
+path takes the writer lock or replays an unflushed WAL.
+
 **Current gaps:** queue depth is fixed; overload and other failures retain full contextual messages
-but not stable machine-readable codes; AbortSignal/deadline cancellation, read-only snapshots, Arrow
-IPC, SQL, lifecycle maintenance, and prebuilt artifact selection are not exposed yet. The package is
-a tested source prototype and must not be described as a production distribution.
+but not stable machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, lifecycle
+maintenance, and prebuilt artifact selection are not exposed yet. The package is a tested source
+prototype and must not be described as a production distribution.
 
 ## 7. Compatibility policy
 
