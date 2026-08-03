@@ -502,7 +502,11 @@ that evidence is sent.
   preparer with `explainScan`; SQL reports successful planning/stream-start and cumulative active
   pull/IPC time separately, while read-only `EXPLAIN` returns DataFusion logical/physical plans.
   Consumers choose slow thresholds and retain statements/correlation outside the core.
-- Configurable resource budgets and overload behavior.
+- Configurable resource budgets and overload behavior. **Implemented across enforcement seams:**
+  native queue admission, record/batch admission, scan examination/resolution/reconstruction, SQL
+  per-query and aggregate memory, bounded compaction, fold/part caches, and compression/block/segment
+  policy expose typed refusal or explicit progress evidence. Rust `StoreOptions` and native Node open
+  share the storage configuration instead of duplicating it in JS.
 - A health snapshot API suitable for an embedding application's health endpoint.
 - Hooks through which a consumer can export OpenTelemetry without introducing OTel into the storage
   core. **Implemented for metrics:** Rust and Node expose a pull snapshot with stable integer fields;

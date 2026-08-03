@@ -361,6 +361,9 @@ journal with independent sequence cursors and explicit loss accounting; see
 Structured scan pages expose successful execution nanoseconds beside exact work/I/O counters and a
 shared-plan explanation API. SQL separates planning/stream-start time from cumulative active pull
 and IPC time and supports read-only `EXPLAIN`; consumers decide what is slow.
+Rust `StoreOptions` and native Node open options carry storage cache/compression policy through the
+same seam. Queue, write, scan, SQL, compaction, and cache overload behavior is explicit and typed;
+see `docs/resource-budgets.md`.
 
 ## 7. Compatibility policy
 

@@ -16,7 +16,7 @@ use turndb::fold::FoldCfg;
 use turndb::scan::{ScanExplanation, ScanPage, ScanRequest};
 use turndb::store::{
     Batch, BoundedCompaction, CompactionBudget, ContentSpans, ErasureStats, PunchStats, ReadStore,
-    Store, WriteLimits,
+    Store, StoreOptions,
 };
 use turndb::types::AttrValue;
 
@@ -230,13 +230,13 @@ pub(crate) struct Actor {
 impl Actor {
     #[cfg(test)]
     pub fn open_with_capacity(path: &Path, capacity: usize) -> Result<Actor> {
-        Self::open_with_capacity_and_limits(path, capacity, WriteLimits::default())
+        Self::open_with_capacity_and_options(path, capacity, StoreOptions::default())
     }
 
-    pub fn open_with_capacity_and_limits(
+    pub fn open_with_capacity_and_options(
         path: &Path,
         capacity: usize,
-        write_limits: WriteLimits,
+        options: StoreOptions,
     ) -> Result<Actor> {
         if !(1..=MAX_QUEUE_CAPACITY).contains(&capacity) {
             return Err(anyhow!(
@@ -248,7 +248,7 @@ impl Actor {
         let path = path.to_path_buf();
         std::thread::Builder::new()
             .name("turndb-store".into())
-            .spawn(move || match Store::open_with_limits(&path, FoldCfg::default(), write_limits) {
+            .spawn(move || match Store::open_with_options(&path, options) {
                 Ok(store) => {
                     let _ = ready_tx.send(Ok(()));
                     run(store, &path, rx);

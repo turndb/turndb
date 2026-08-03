@@ -43,6 +43,7 @@ test('reports the native capability profile without a portable fallback', () => 
     lifecycleEventCapacity: 256,
     queryTimings: true,
     sqlExplain: true,
+    storageRuntimeOptions: true,
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -88,6 +89,38 @@ test('configures a bounded per-store command backlog without breaking the defaul
     NativeStore.open(temporaryStore(t), { commandQueueCapacity: 65537 }),
     (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
   );
+});
+
+test('passes storage and cache policy through the native open seam', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t), {
+    blockTargetBytes: 8192n,
+    foldCacheBytes: 2n << 20n,
+    partCacheBytes: 4n << 20n,
+    segmentMaxBytes: 1n << 20n,
+    compressionLevel: 3,
+    compressionThreads: 1,
+  });
+  const health = await store.health();
+  assert.equal(health.foldBlockTargetBytes, 8192n);
+  assert.equal(health.foldCacheBudget, 2n << 20n);
+  assert.equal(health.partCacheBudget, 4n << 20n);
+  assert.equal(health.foldSegmentMaxBytes, 1n << 20n);
+  assert.equal(health.foldCompressionLevel, 3);
+  assert.equal(health.foldCompressionThreads, 1n);
+  await store.close();
+
+  for (const options of [
+    { blockTargetBytes: 0n },
+    { foldCacheBytes: 0n },
+    { partCacheBytes: (1n << 20n) - 1n },
+    { segmentMaxBytes: 1n << 32n },
+    { compressionLevel: 0 },
+  ]) {
+    await assert.rejects(
+      NativeStore.open(temporaryStore(t), options),
+      (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+    );
+  }
 });
 
 test('enforces configurable write admission with stable error classes', async (t) => {
@@ -1070,6 +1103,11 @@ test('reports cheap health across staging and publication', async (t) => {
   assert(published.foldDiskBytes > 0n);
   assert.equal(published.retainedCommits, 1n);
   assert.equal(typeof published.foldCacheHits, 'bigint');
+  assert.equal(published.foldCacheBudget, 64n << 20n);
+  assert.equal(published.partCacheBudget, 512n << 20n);
+  assert.equal(published.foldBlockTargetBytes, 4n << 20n);
+  assert.equal(published.foldSegmentMaxBytes, 1n << 30n);
+  assert.equal(published.foldCompressionLevel, 19);
   assert.equal(typeof published.partCacheBudget, 'bigint');
 
   const migration = await store.formatMigrationStatus();

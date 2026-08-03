@@ -83,6 +83,25 @@ impl Default for WriteLimits {
     }
 }
 
+/// Runtime writer configuration. None of these values are persisted format commitments.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreOptions {
+    pub fold: FoldCfg,
+    pub write_limits: WriteLimits,
+    /// One decompressed-section cache budget shared by every immutable part in this handle.
+    pub part_cache_bytes: usize,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        StoreOptions {
+            fold: FoldCfg::default(),
+            write_limits: WriteLimits::default(),
+            part_cache_bytes: crate::part::cache::BUDGET_DEFAULT,
+        }
+    }
+}
+
 impl WriteLimits {
     /// Return this policy when every ceiling is usable, or a typed invalid-policy error.
     pub fn validate(self) -> std::result::Result<Self, WriteAdmissionError> {
@@ -1290,6 +1309,12 @@ pub struct StoreHealth {
     pub fold_segments: u32,
     pub fold_cache_hits: u64,
     pub fold_cache_misses: u64,
+    pub fold_cache_bytes: usize,
+    pub fold_cache_budget: usize,
+    pub fold_block_target_bytes: usize,
+    pub fold_segment_max_bytes: u32,
+    pub fold_compression_level: i32,
+    pub fold_compression_threads: usize,
     pub part_cache_bytes: usize,
     pub part_cache_budget: usize,
     pub dedup_window_entries: usize,
@@ -1417,13 +1442,25 @@ impl Store {
     /// nothing, and the single-writer invariant becomes the embedder's: at most one open writer per
     /// store directory, across every process and every instance. See `src/sys.rs` and FORMAT.md.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
-        Self::open_with_limits(dir, cfg, WriteLimits::default())
+        Self::open_with_options(dir, StoreOptions { fold: cfg, ..StoreOptions::default() })
     }
 
     /// Open a writer with explicit runtime admission policy.
     pub fn open_with_limits(dir: &Path, cfg: FoldCfg, write_limits: WriteLimits) -> Result<Store> {
+        Self::open_with_options(
+            dir,
+            StoreOptions { fold: cfg, write_limits, ..StoreOptions::default() },
+        )
+    }
+
+    /// Open a writer with explicit storage, cache, and admission configuration.
+    pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
         let recovery_started = std::time::Instant::now();
+        let StoreOptions { fold: cfg, write_limits, part_cache_bytes } = options;
         let write_limits = write_limits.validate()?;
+        if part_cache_bytes < crate::part::cache::BUDGET_MIN {
+            bail!("part_cache_bytes must be at least {}", crate::part::cache::BUDGET_MIN);
+        }
         crate::vfs::mkdir_all(dir)?;
         let manifest = match Manifest::load(dir) {
             Ok(m) => m,
@@ -1457,7 +1494,7 @@ impl Store {
             Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
         fold.declare_punched(&manifest.punched);
 
-        let pcache = SectionCache::shared();
+        let pcache = Arc::new(SectionCache::new(part_cache_bytes));
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
             parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
@@ -3570,7 +3607,8 @@ impl Store {
                 let _ = crate::vfs::unlink(&retained_path(&self.dir, c));
             }
         }
-        self.pcache = SectionCache::shared();
+        let part_cache_budget = self.pcache.budget();
+        self.pcache = Arc::new(SectionCache::new(part_cache_budget));
         self.parts.clear();
         for p in &self.manifest.parts {
             self.parts.push(Arc::new(Part::open_in(&self.dir.join(&p.file), self.pcache.clone())?));
@@ -3623,6 +3661,12 @@ impl Store {
             fold_segments: self.fold.segment_count(),
             fold_cache_hits: fold_cache.hits,
             fold_cache_misses: fold_cache.misses,
+            fold_cache_bytes: fold_cache.bytes,
+            fold_cache_budget: fold_cache.budget,
+            fold_block_target_bytes: self.cfg.block_target,
+            fold_segment_max_bytes: self.cfg.seg_max,
+            fold_compression_level: self.cfg.level,
+            fold_compression_threads: self.cfg.compress_threads,
             part_cache_bytes,
             part_cache_budget,
             dedup_window_entries: self.fold.window_len(),

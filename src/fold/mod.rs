@@ -43,6 +43,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub const SEGMENT_MAX_DEFAULT: u32 = SEG_MAX_DEFAULT;
+pub const SEGMENT_MAX_LIMIT: u64 = SEG_MAX_LIMIT;
+pub const BLOCK_TARGET_MAX: u64 = (u32::MAX as u64) / 2;
+
 /// Another writer currently owns this fold's OS lock.
 ///
 /// This is a typed operational condition rather than prose so bindings can expose stable contention
@@ -186,6 +190,8 @@ impl BlockCache {
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
+    pub bytes: usize,
+    pub budget: usize,
 }
 
 /// What [`Fold::scrub`] verified.
@@ -276,7 +282,7 @@ impl Fold {
         if cfg.block_target == 0 {
             bail!("block_target must be non-zero");
         }
-        if cfg.block_target as u64 > (u32::MAX as u64) / 2 {
+        if cfg.block_target as u64 > BLOCK_TARGET_MAX {
             bail!(
                 "block_target {} is too large; the segment append point and Loc.in_off are u32, so a \
                  block must stay well under 4 GiB",
@@ -1088,7 +1094,7 @@ impl Fold {
 
     pub fn cache_stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
-        CacheStats { hits: c.hits, misses: c.misses }
+        CacheStats { hits: c.hits, misses: c.misses, bytes: c.bytes, budget: c.budget }
     }
 
     /// Every block id the directory knows — the universe a reachability sweep works against.

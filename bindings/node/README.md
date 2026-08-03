@@ -154,6 +154,9 @@ silently.
   `planningDurationNs` and cumulative active `executionDurationNs`. Read-only SQL `EXPLAIN` streams
   DataFusion's plan as ordinary Arrow IPC. TurnDB supplies evidence and leaves slow thresholds to the
   consumer.
+- Native `open()` also accepts fold/part cache budgets and the write-side block target, segment,
+  compression level, and compression-worker policy. `health()` reports their effective values; see
+  [resource budgets and overload](../../docs/resource-budgets.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to
