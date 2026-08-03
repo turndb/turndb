@@ -108,7 +108,7 @@ for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSql
     'querySql', 'next', 'stats', 'compact', 'compactBounded', 'estimateCompactionSpace',
     'verify', 'erase', 'punch', 'refold', 'estimateRefoldSpace',
     'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
-    'backup', 'health', 'metrics', 'partDistribution', 'contentLiveness', 'spaceUsage',
+    'backup', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
     'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {

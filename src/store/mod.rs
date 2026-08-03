@@ -1269,6 +1269,7 @@ pub struct Store {
     /// on-disk size, which is a per-part cost that multiplies by part count.
     pcache: Arc<SectionCache>,
     metrics: crate::observability::StoreMetrics,
+    events: crate::observability::EventJournal,
 }
 
 /// Cheap operational state for an embedder's health and metrics endpoint.
@@ -1503,7 +1504,15 @@ impl Store {
             recovered_wal_frames,
             ..crate::observability::StoreMetrics::default()
         };
-        metrics.open_recovery.observe_success(recovery_started.elapsed());
+        let recovery_duration = recovery_started.elapsed();
+        metrics.open_recovery.observe_success(recovery_duration);
+        let mut events = crate::observability::EventJournal::default();
+        let recovery_result: Result<()> = Ok(());
+        events.observe(
+            crate::observability::LifecycleOperation::OpenRecovery,
+            recovery_duration,
+            &recovery_result,
+        );
         Ok(Store {
             dir: dir.to_path_buf(),
             fold,
@@ -1516,6 +1525,7 @@ impl Store {
             write_limits,
             pcache,
             metrics,
+            events,
         })
     }
 
@@ -1527,6 +1537,43 @@ impl Store {
     /// Monotonic, process-lifetime operation metrics for this writer handle.
     pub fn metrics(&self) -> crate::observability::StoreMetrics {
         self.metrics
+    }
+
+    /// Read retained lifecycle outcomes after an independent consumer cursor.
+    ///
+    /// Reads are non-destructive. `gap` reports that the requested next sequence aged out of the
+    /// bounded journal; `dropped_events` is cumulative for this handle.
+    pub fn lifecycle_events_after(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> crate::observability::LifecycleEventBatch {
+        self.events.read_after(after_sequence, limit)
+    }
+
+    fn observe_lifecycle<T>(
+        &mut self,
+        operation: crate::observability::LifecycleOperation,
+        duration: std::time::Duration,
+        result: &Result<T>,
+    ) {
+        use crate::observability::LifecycleOperation;
+        match operation {
+            LifecycleOperation::OpenRecovery => {
+                self.metrics.open_recovery.observe(duration, result)
+            }
+            LifecycleOperation::Sync => self.metrics.sync.observe(duration, result),
+            LifecycleOperation::Flush => self.metrics.flush.observe(duration, result),
+            LifecycleOperation::Compaction => self.metrics.compaction.observe(duration, result),
+            LifecycleOperation::Backup => self.metrics.backup.observe(duration, result),
+            LifecycleOperation::Verification => self.metrics.verification.observe(duration, result),
+            LifecycleOperation::Punch => self.metrics.punch.observe(duration, result),
+            LifecycleOperation::Refold => self.metrics.refold.observe(duration, result),
+            LifecycleOperation::FormatMigration => {
+                self.metrics.format_migration.observe(duration, result)
+            }
+        }
+        self.events.observe(operation, duration, result);
     }
 
     /// Verify the retained manifest chain, all live immutable-part sections, and every fold frame.
@@ -1545,7 +1592,11 @@ impl Store {
     ) -> Result<StoreVerification> {
         let started = std::time::Instant::now();
         let result = self.verify_inner_with_control(control);
-        self.metrics.verification.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Verification,
+            started.elapsed(),
+            &result,
+        );
         if result.as_ref().err().is_some_and(|error| {
             crate::error::classify(error) == crate::error::ErrorClass::Corruption
         }) {
@@ -2100,7 +2151,11 @@ impl Store {
             control.check("store sync")?;
             self.wal.sync()
         })();
-        self.metrics.sync.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Sync,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 
@@ -2124,7 +2179,11 @@ impl Store {
     ) -> Result<crate::pack::BackupStats> {
         let started = std::time::Instant::now();
         let result = self.backup_inner_with_control(out, control);
-        self.metrics.backup.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Backup,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 
@@ -2165,7 +2224,11 @@ impl Store {
     ) -> Result<Option<PartRef>> {
         let started = std::time::Instant::now();
         let result = self.flush_inner_with_control(control);
-        self.metrics.flush.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Flush,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 
@@ -2311,7 +2374,11 @@ impl Store {
     ) -> Result<Option<crate::part::merge::MergeStats>> {
         let started = std::time::Instant::now();
         let result = self.merge_range_inner_with_control(lo, len, control);
-        self.metrics.compaction.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Compaction,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 
@@ -2767,7 +2834,11 @@ impl Store {
     ) -> Result<Option<FormatMigrationStep>> {
         let started = std::time::Instant::now();
         let result = self.migrate_format_step_inner_with_control(control);
-        self.metrics.format_migration.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::FormatMigration,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 
@@ -3270,7 +3341,11 @@ impl Store {
     ) -> Result<PunchStats> {
         let started = std::time::Instant::now();
         let result = self.punch_unreferenced_inner_with_control(control);
-        self.metrics.punch.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Punch,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 
@@ -3410,7 +3485,11 @@ impl Store {
     ) -> Result<refold::RefoldStats> {
         let started = std::time::Instant::now();
         let result = self.refold_inner_with_control(control);
-        self.metrics.refold.observe(started.elapsed(), &result);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Refold,
+            started.elapsed(),
+            &result,
+        );
         result
     }
 

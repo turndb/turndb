@@ -109,6 +109,8 @@ export interface Capabilities {
   operation_metrics: true;
   part_distribution: true;
   content_liveness: true;
+  lifecycle_event_journal: true;
+  lifecycle_event_capacity: number;
   max_record_bytes_default: number;
   max_batch_bytes_default: number;
   max_batch_records_default: number;
