@@ -554,8 +554,10 @@ demonstrated rather than asserted.
 linked application/AI telemetry and a deliberately non-telemetry build pipeline through the same
 self-described envelope. The suite currently proves mixed families, arbitrary typed correlations,
 shared named content identity, metadata-only timelines, selective reconstruction, live keyset paging,
-late arrival, atomic durable acknowledgement, restart, and process-exit WAL recovery. Sustained
-retention/compaction, erasure, backup/restore, and old-format upgrade remain before this phase's gate.
+late arrival, atomic durable acknowledgement, restart, and process-exit WAL recovery.
+**Maintenance qualification is also implemented:** repeated retained cuts, full metadata-only
+compaction, verification, backup/restore to a writable store, and erasure/refold with retained-history
+purging run as one consumer workflow. A measured sustained soak and old-format upgrade remain.
 
 ### Maturity gate
 

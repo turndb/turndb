@@ -24,7 +24,12 @@ the cursor can appear while later-arriving keys before it do not replay. `snapsh
 mechanism. Another case exits a child process without closing its writer after a durable atomic batch
 and verifies complete WAL recovery through the public Node API.
 
-This is the first qualification slice, not a claim that Phase 6 is complete. The executable suite
-still needs sustained retention/compaction, physical erasure, backup/restore, and old-format upgrade
-scenarios. Those should extend the same external harness; adding consumer concepts to `src/` is not an
-acceptable way to make a fixture pass.
+The maintenance workflow creates repeated durable/immutable cuts, verifies the bounded retained
+commit window, fully compacts without reading folded content, verifies the result, publishes and
+restores a writable backup, then physically erases one record. It asserts that refold purges retained
+history and leaves no dead or reclaimable content. It also asserts the deliberately narrower erasure
+scope: the backup created beforehand is an external copy and still contains the record.
+
+This is not yet a claim that Phase 6 is complete. The executable suite still needs a measured
+sustained retention/compaction soak and an old-format upgrade scenario. Those should extend the same
+external harness; adding consumer concepts to `src/` is not an acceptable way to make a fixture pass.
