@@ -45,6 +45,21 @@ Memtable byte projection similarly reconstructs from the already projected `Cont
 writer's two-tier piece locator. Exact byte reconstruction, content hashing, duplicate attributes,
 tombstones, cursor behavior, and reconstruction budgets are unchanged.
 
+## Resolution statistics
+
+Every successful page reports exact pre-predicate work in `stats.resolution`:
+
+- `physical_rows`: immutable part-row occurrences consumed by id groups during k-way resolution;
+- `superseded_rows`: older occurrences hidden by the deciding occurrence for the same id;
+- `tombstones`: deciding immutable tombstones that yielded no live candidate;
+- `memtable_entries`: ordered writer-overlay entries inspected in the requested range.
+
+These are operation-local counters, not estimates derived from part metadata. They include resolver
+over-fetch even when the scan later stops on a result limit or predicate budget, because that work
+actually occurred. `stats.examined` remains the number of resolved live candidates evaluated against
+predicates; it deliberately does not pretend to measure physical version-resolution work. Native Node
+uses `bigint` for all four counters.
+
 ## What remains
 
 This is a bounded resolved-row batch, not yet vectorized column execution. Rows retain global id
@@ -56,3 +71,8 @@ Range setup still visits every live part, and the writer overlay currently count
 the requested range before choosing committed over-fetch. Secondary indexes, alternate sort orders,
 logical query plans, and SQL execution are separate roadmap work. This slice changes no on-disk
 format and adds no consumer-specific semantics.
+
+The resolver reports amplification but does not yet impose a hard physical-row or memtable-entry
+ceiling. A future budget needs a continuation for a completely consumed id group—even when that group
+produces no live row—so stopping among tombstone-heavy history cannot rescan forever or skip a newer
+version. That cursor rule should be implemented before advertising a hard resolution bound.

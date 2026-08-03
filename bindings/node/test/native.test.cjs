@@ -237,6 +237,7 @@ test('round-trips exact typed fields and independently named content', async (t)
   assert.equal(page.rows[0].contents[3].identity, undefined);
   assert.equal(page.rows[0].contents[3].bytes, undefined);
   assert(Object.values(page.stats.io).every((value) => typeof value === 'bigint'));
+  assert(Object.values(page.stats.resolution).every((value) => typeof value === 'bigint'));
   assert(page.stats.io.foldBlocksTouched >= 1n);
   assert.equal((await store.readContent('trace/1', 'request')).toString(), 'shared');
   assert.equal(await store.readContent('trace/1', 'absent'), null);

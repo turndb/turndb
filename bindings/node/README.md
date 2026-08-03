@@ -44,7 +44,9 @@ silently.
   Committed rows decode only attribute/content columns used by the projection or predicates; sibling
   value, dictionary, and content-program sections remain unopened. Every successful page's `stats.io`
   reports exact operation-local part sections and fold blocks touched, cache access counts, and
-  stored/raw bytes as `bigint`; concurrent snapshots cannot contaminate those numbers. See
+  stored/raw bytes as `bigint`; concurrent snapshots cannot contaminate those numbers.
+  `stats.resolution` reports physical immutable rows, superseded rows, deciding tombstones, and
+  writer-memtable entries consumed before predicates, also as `bigint`. See
   [projected structured scans](../../docs/projected-structured-scan.md) and
   [structured scan I/O statistics](../../docs/structured-scan-io.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact

@@ -627,5 +627,9 @@ fn resolved_candidates_project_and_reconstruct_the_authoritative_part_rows() {
     assert_eq!(page.rows[0].contents[0].bytes.as_deref(), Some(b"a2".as_slice()));
     assert_eq!(page.rows[1].attrs, [("generation".into(), AttrValue::Int(1))]);
     assert_eq!(page.rows[1].contents[0].bytes.as_deref(), Some(b"b1".as_slice()));
+    assert_eq!(page.stats.resolution.physical_rows, 7);
+    assert_eq!(page.stats.resolution.superseded_rows, 4);
+    assert_eq!(page.stats.resolution.tombstones, 1);
+    assert_eq!(page.stats.resolution.memtable_entries, 0);
     std::fs::remove_dir_all(dir).ok();
 }

@@ -77,6 +77,13 @@ export interface ScanPage {
       foldStoredBytesRead: bigint;
       foldRawBytesDecoded: bigint;
     };
+    /** Work used to establish newest-wins candidates before predicates are evaluated. */
+    resolution: {
+      physicalRows: bigint;
+      supersededRows: bigint;
+      tombstones: bigint;
+      memtableEntries: bigint;
+    };
   };
 }
 

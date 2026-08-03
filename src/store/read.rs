@@ -57,6 +57,18 @@ pub(crate) struct RowRef {
     pub row: usize,
 }
 
+/// Work performed by one committed range-resolution call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RowBatch {
+    pub rows: Vec<RowRef>,
+    /// Immutable row occurrences participating in resolved id groups.
+    pub physical_rows: usize,
+    /// Older occurrences hidden by the deciding occurrence in their id group.
+    pub superseded_rows: usize,
+    /// Deciding occurrences that were tombstones and produced no live candidate.
+    pub tombstones: usize,
+}
+
 pub(crate) fn visibility(parts: &[Arc<Part>]) -> Result<Visibility> {
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
     let mut seen: HashSet<String> = HashSet::new();
@@ -183,8 +195,9 @@ fn locate<'a>(parts: &'a [Arc<Part>], id: &str) -> Result<Option<(&'a Arc<Part>,
 /// store to answer anything.
 ///
 /// Version resolution is the store's one rule, unchanged: an id is listed when the newest part
-/// holding it is not a tombstone. Resolution happens per candidate id rather than by walking every
-/// part's visibility, so the cost tracks the page, not the store.
+/// holding it is not a tombstone. Resolution happens per candidate id rather than by materializing
+/// every part's visibility. The result is live-row bounded; tombstones and repeated versions may
+/// require more physical rows, which [`RowBatch`] reports exactly.
 ///
 /// Because ids sort lexicographically, a caller who designs ids with the query in mind — a
 /// `member/timestamp/...` prefix, say — gets member-then-time paging out of this with no secondary
@@ -195,9 +208,9 @@ pub(crate) fn scan_rows(
     to: Option<&str>,
     limit: usize,
     reverse: bool,
-) -> Result<Vec<RowRef>> {
+) -> Result<RowBatch> {
     if limit == 0 || parts.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RowBatch::default());
     }
     struct Walk {
         range: std::ops::Range<usize>,
@@ -216,8 +229,8 @@ pub(crate) fn scan_rows(
     // K-way walk over the already-sorted ranges. Equal ids are resolved as one group; the newest
     // part in that group decides, including when it is a tombstone. Crucially, the walk stops once
     // `limit` live ids are found instead of materialising every candidate in the requested range.
-    let mut out = Vec::with_capacity(limit);
-    while out.len() < limit {
+    let mut batch = RowBatch { rows: Vec::with_capacity(limit), ..RowBatch::default() };
+    while batch.rows.len() < limit {
         let best = walks
             .iter()
             .filter_map(|walk| walk.current.as_ref())
@@ -229,9 +242,22 @@ pub(crate) fn scan_rows(
             .enumerate()
             .filter_map(|(pi, walk)| (walk.current.as_deref() == Some(best.as_str())).then_some(pi))
             .collect();
+        batch.physical_rows = batch
+            .physical_rows
+            .checked_add(matching.len())
+            .ok_or_else(|| anyhow::anyhow!("physical row-resolution counter overflow"))?;
+        batch.superseded_rows = batch
+            .superseded_rows
+            .checked_add(matching.len().saturating_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("superseded row-resolution counter overflow"))?;
         let newest = *matching.last().expect("the selected id has at least one source part");
         if !parts[newest].is_tombstone(walks[newest].row)? {
-            out.push(RowRef { id: best, part: newest, row: walks[newest].row });
+            batch.rows.push(RowRef { id: best, part: newest, row: walks[newest].row });
+        } else {
+            batch.tombstones = batch
+                .tombstones
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("tombstone row-resolution counter overflow"))?;
         }
         for pi in matching {
             let walk = &mut walks[pi];
@@ -252,7 +278,7 @@ pub(crate) fn scan_rows(
             }
         }
     }
-    Ok(out)
+    Ok(batch)
 }
 
 /// Id-only projection of the same resolved-row range merge used by structured scans.
@@ -263,7 +289,7 @@ pub fn scan_ids(
     limit: usize,
     reverse: bool,
 ) -> Result<Vec<String>> {
-    Ok(scan_rows(parts, from, to, limit, reverse)?.into_iter().map(|row| row.id).collect())
+    Ok(scan_rows(parts, from, to, limit, reverse)?.rows.into_iter().map(|row| row.id).collect())
 }
 
 pub fn ids(parts: &[Arc<Part>]) -> Result<Vec<String>> {

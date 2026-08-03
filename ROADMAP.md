@@ -98,7 +98,10 @@ content model right before compatibility turns today's choices into permanent pr
   range merge now carries each live committed candidate's authoritative part/row into projection and
   reconstruction; neither phase point-searches the id again, and byte projection reuses its decoded
   content program and identity. Writer memtable origins use the same candidate pipeline. Per-row
-  selected-column decoding remains to be replaced by grouped physical gathers.
+  selected-column decoding remains to be replaced by grouped physical gathers. Structured-page
+  resolution statistics now distinguish immutable physical occurrences, superseded occurrences,
+  deciding tombstones, and inspected memtable entries from live candidates examined by predicates;
+  this exposes amplification without mislabeling it as a hard bound.
 
 ## Product boundary
 
