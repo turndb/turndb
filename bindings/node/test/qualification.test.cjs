@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { NativeStore } = require('..');
+const { NativeStore, retainedCommits, restoreBackup } = require('..');
 const { putRecord } = require('../qualification/record-adapter.cjs');
 const { buildPipeline, linkedTelemetry } = require('../qualification/workloads.cjs');
 
@@ -192,4 +192,98 @@ test('recovers an atomically acknowledged consumer batch after process exit', as
     page.rows.map(({ contents }) => contents[0].bytes.toString()),
     ['first durable value', 'second durable value'],
   );
+});
+
+test('qualifies retention, compaction, backup, restore, and physical erasure as one workflow', async (t) => {
+  const root = temporaryRoot(t, 'turndb-qualification-maintenance-');
+  const dir = path.join(root, 'store');
+  const artifact = path.join(root, 'before-erasure.turndb');
+  const restoredDir = path.join(root, 'restored');
+  const shared = Buffer.from('shared immutable source context');
+  const erasedPayload = Buffer.alloc(64 << 10, 0xa5);
+  const store = await NativeStore.open(dir, {
+    blockTargetBytes: 8n << 10n,
+    compressionLevel: 3,
+  });
+  let restoredStore;
+  t.after(async () => {
+    try { await restoredStore?.close(); } catch {}
+    try { await store.close(); } catch {}
+  });
+
+  const expectedIds = [];
+  for (let cycle = 0; cycle < 8; cycle++) {
+    const id = `retention/${cycle.toString().padStart(4, '0')}`;
+    expectedIds.push(id);
+    await store.write([putRecord({
+      id,
+      fields: [
+        { name: 'retention.group', type: 'string', value: 'group-a' },
+        { name: 'retention.cycle', type: 'uint', value: BigInt(cycle) },
+      ],
+      contents: [
+        { name: 'shared', bytes: shared },
+        { name: 'payload', bytes: cycle === 3 ? erasedPayload : Buffer.from(`payload-${cycle}`) },
+      ],
+    })], true);
+    assert.equal(await store.flush(), true);
+  }
+
+  assert.equal((await store.health()).parts, 8n);
+  const retainedBeforeCompaction = await retainedCommits(dir);
+  assert.equal(retainedBeforeCompaction.length, 4);
+  assert(retainedBeforeCompaction.every((commit, index, commits) => (
+    index === 0 || commits[index - 1] < commit
+  )));
+
+  const compacted = await store.compact(true);
+  assert.equal(compacted.partsBefore, 8n);
+  assert.equal(compacted.partsAfter, 1n);
+  assert.equal(compacted.merge.inputs, 8n);
+  assert.equal(compacted.merge.recordsOut, 8n);
+  assert.equal(compacted.merge.foldBytesTouched, 0n);
+  const distribution = await store.partDistribution();
+  assert.equal(distribution.parts, 1n);
+  assert.equal(distribution.totalRows, 8n);
+  assert.equal((await store.verify()).parts, 1n);
+
+  const backup = await store.backup(artifact);
+  assert.equal(backup.bytes, BigInt(fs.statSync(artifact).size));
+  assert.equal(backup.commit, (await store.health()).commit);
+  assert.deepEqual((await store.scan()).rows.map(({ id }) => id), expectedIds);
+
+  const restored = await restoreBackup(artifact, restoredDir);
+  assert.deepEqual(restored, backup);
+  restoredStore = await NativeStore.open(restoredDir);
+  assert.deepEqual((await restoredStore.scan()).rows.map(({ id }) => id), expectedIds);
+  assert.deepEqual(await restoredStore.readContent('retention/0003', 'payload'), erasedPayload);
+  await restoredStore.write([putRecord({
+    id: 'retention/restored-only',
+    fields: [{ name: 'retention.group', type: 'string', value: 'group-b' }],
+  })], true);
+  assert.deepEqual(
+    (await restoredStore.scan()).rows.map(({ id }) => id),
+    [...expectedIds, 'retention/restored-only'],
+  );
+
+  const erased = await store.erase(['retention/0003']);
+  assert.equal(erased.requested, 1n);
+  assert.equal(erased.tombstoned, 1n);
+  assert.equal(erased.absent, 0n);
+  assert(erased.refold);
+  assert.equal(erased.refold.recordsKept, 7n);
+  assert.equal(await store.readContent('retention/0003', 'payload'), null);
+  assert.deepEqual(
+    (await store.scan()).rows.map(({ id }) => id),
+    expectedIds.filter((id) => id !== 'retention/0003'),
+  );
+  const liveCommit = (await store.health()).commit;
+  assert.deepEqual(await retainedCommits(dir), [liveCommit]);
+  const liveness = await store.contentLiveness();
+  assert.equal(liveness.deadLogicalBytes, 0n);
+  assert.equal(liveness.reclaimableBlocks.rawBytes, 0n);
+  assert.equal((await store.verify()).parts, 1n);
+
+  // Erasure is scoped to this store. A backup made before it is an external copy by definition.
+  assert.deepEqual(await restoredStore.readContent('retention/0003', 'payload'), erasedPayload);
 });
