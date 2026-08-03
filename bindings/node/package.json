@@ -1,0 +1,23 @@
+{
+  "name": "@turndb/native",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native N-API embedding interface for TurnDB",
+  "main": "index.cjs",
+  "types": "index.d.ts",
+  "files": [
+    "index.cjs",
+    "index.d.ts",
+    "README.md",
+    "*.node"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test:dev": "node scripts/test-dev.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0"
+  }
+}

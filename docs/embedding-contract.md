@@ -167,9 +167,9 @@ writer. Portable use must be an explicit package or entry point chosen by the ca
 
 ## 6. Binding seam
 
-The supported native Node path will use N-API, preferably `napi-rs`, for stable Node ABI compatibility.
-It may carry several additional megabytes when those bytes replace bespoke scheduling, buffer,
-cancellation, and error machinery that TurnDB would otherwise have to build and maintain.
+The native Node source prototype uses `napi-rs` at N-API 6 for stable Node ABI compatibility. It may
+carry several additional megabytes when those bytes replace bespoke scheduling, buffer, cancellation,
+and error machinery that TurnDB would otherwise have to build and maintain.
 
 The Rust/native seam is:
 
@@ -186,6 +186,18 @@ thread, encode binary content as base64 for the native path, or round i64 throug
 
 The WASM package remains synchronous internally and single-threaded. Its current object API is a
 lightweight compatibility profile, not the template for native concurrency.
+
+The current native prototype implements one dedicated store thread and a bounded 64-command queue.
+Open and every store operation return Promises; content crosses as `Buffer`, i64 crosses as `bigint`,
+and `scan` calls the Rust structured pager directly. `write(ops, durable)` applies one ordered atomic
+batch and optionally syncs it before resolving. `close` syncs by default, while `close(false)` is an
+explicit no-sync close. Dropping the final handle disconnects the queue and releases the writer rather
+than keeping an orphan actor alive.
+
+**Current gaps:** queue depth is fixed; overload and other failures retain full contextual messages
+but not stable machine-readable codes; AbortSignal/deadline cancellation, read-only snapshots, Arrow
+IPC, SQL, lifecycle maintenance, and prebuilt artifact selection are not exposed yet. The package is
+a tested source prototype and must not be described as a production distribution.
 
 ## 7. Compatibility policy
 

@@ -105,6 +105,12 @@ is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
 The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
 Linux hole punching.
 
+`bindings/node` is the in-progress native server-side interface. Its `napi-rs` addon gives each open
+writer a dedicated Rust actor and bounded queue, exposes Promise-based batch/durability/scan/content
+operations with `Buffer` and exact `bigint`, and refuses to fall back to WASM when a native artifact
+is unavailable. It is currently a source prototype; its README states the supported slice and the
+remaining production gaps.
+
 It also builds for **`wasm32-wasip1`**, which is what the [`turndb` npm package](npm/turndb)
 ships: one `.wasm`, no native addon, no prebuild matrix, no postinstall. A store written by either
 build is readable by the other, byte for byte. That target gives up three things, and the first is

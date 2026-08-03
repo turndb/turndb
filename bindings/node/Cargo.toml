@@ -1,0 +1,27 @@
+[package]
+name = "turndb-node"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native Node.js N-API binding for TurnDB."
+publish = false
+
+[features]
+default = []
+columnar = ["turndb/columnar"]
+sql = ["columnar", "turndb/sql"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The native binding needs the structured store API, not Arrow or SQL. Keeping those out makes the
+# Rust/Node seam visible: richer planning can be added as a separate adapter without infecting the
+# embedded write and paging path.
+turndb = { path = "../..", default-features = false }
+anyhow = "1"
+napi = { version = "3.12.0", default-features = false, features = ["napi6", "tokio_rt", "dyn-symbols"] }
+napi-derive = "3.6.2"
+
+[build-dependencies]
+napi-build = "2.4.0"
