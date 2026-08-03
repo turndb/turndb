@@ -4373,6 +4373,66 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    #[test]
+    fn revision_three_reference_pack_matches_the_checked_in_node_fixture() {
+        let root = std::env::temp_dir().join(format!(
+            "turndb-v3-reference-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let d = root.join("store");
+        let artifact = root.join("revision-three.turndb");
+        std::fs::create_dir_all(&d).unwrap();
+        let mut fold =
+            crate::fold::Fold::open(&d.join("fold"), crate::fold::FoldCfg::default()).unwrap();
+        fold.sync().unwrap();
+        let tail = fold.tail();
+        drop(fold);
+        let mut part_refs = Vec::new();
+        for (seq, id, payload) in [
+            (1, "legacy/0001", b"revision three request".as_slice()),
+            (2, "legacy/0002", b"revision three response".as_slice()),
+        ] {
+            let file = format!("legacy-{seq}.part");
+            let meta = crate::part::build_revision_three_fixture(&d.join(&file), seq, id, payload)
+                .unwrap();
+            part_refs.push(super::PartRef {
+                file,
+                seq_lo: meta.seq_lo,
+                seq_hi: meta.seq_hi,
+                records: meta.n_records,
+                b3: None,
+            });
+        }
+        let mut manifest = super::Manifest {
+            parts: part_refs,
+            fold_seg: tail.seg,
+            fold_off: tail.off,
+            next_seq: 2,
+            ..super::Manifest::default()
+        };
+        manifest.commit(&d).unwrap();
+        let mut store = super::Store::open(&d, crate::fold::FoldCfg::default()).unwrap();
+        store.backup(&artifact).unwrap();
+        drop(store);
+        let bytes = std::fs::read(&artifact).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let actual = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        if std::env::var_os("TURNDB_PRINT_REFERENCE_FIXTURE").is_some() {
+            println!("{actual}");
+            return;
+        }
+        let expected =
+            include_str!("../../bindings/node/qualification/fixtures/revision-three.turndb.hex")
+                .split_ascii_whitespace()
+                .collect::<String>();
+        assert_eq!(
+            actual, expected,
+            "regenerate only when the legacy fixture intentionally changes"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn punching_retries_blocks_already_declared_before_a_crash() {

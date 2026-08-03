@@ -1445,6 +1445,42 @@ pub(crate) fn build_revision_two_fixture(path: &Path, seq: u64, id: &str) -> Res
 }
 
 #[cfg(test)]
+pub(crate) fn build_revision_three_fixture(
+    path: &Path,
+    seq: u64,
+    id: &str,
+    payload: &[u8],
+) -> Result<PartMeta> {
+    let (ids, restarts) = idcol::build(&[id.to_string()])?;
+    let mut cmeta = Vec::new();
+    put_varint(&mut cmeta, 1);
+    put_varint(&mut cmeta, 7);
+    cmeta.extend_from_slice(b"payload");
+    put_varint(&mut cmeta, 1);
+    cmeta.push(content::RID_DENSE);
+    let mut prog = Vec::new();
+    put_varint(&mut prog, 1);
+    put_varint(&mut prog, ((payload.len() as u64) << 1) | OP_LIT);
+    prog.extend_from_slice(payload);
+    let mut identity = Vec::with_capacity(33);
+    identity.push(1);
+    identity.extend_from_slice(blake3::hash(payload).as_bytes());
+
+    let meta = PartMeta { n_records: 1, seq_lo: seq, seq_hi: seq };
+    let mut writer = Writer::new(path, 3)?;
+    writer.section("ids", &ids)?;
+    writer.section("ids.restart", &u32s(&restarts))?;
+    writer.section("cmeta", &cmeta)?;
+    writer.section("con.prog.0", &prog)?;
+    writer.section("con.off.0", &u64s(&[0, prog.len() as u64]))?;
+    writer.section("con.id.0", &identity)?;
+    writer.section("pdict.loc", &[])?;
+    writer.section("pdict.hash", &[])?;
+    writer.finish_version(meta, 3)?;
+    Ok(meta)
+}
+
+#[cfg(test)]
 mod compatibility_tests {
     use super::*;
     use crate::fold::FoldCfg;

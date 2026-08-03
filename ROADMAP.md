@@ -557,7 +557,9 @@ shared named content identity, metadata-only timelines, selective reconstruction
 late arrival, atomic durable acknowledgement, restart, and process-exit WAL recovery.
 **Maintenance qualification is also implemented:** repeated retained cuts, full metadata-only
 compaction, verification, backup/restore to a writable store, and erasure/refold with retained-history
-purging run as one consumer workflow. A measured sustained soak and old-format upgrade remain.
+purging run as one consumer workflow. **Upgrade qualification is implemented against real old bytes:**
+a Rust-reproducible revision-3 pack is restored, preflighted, migrated one part across a restart, and
+verified byte/identity-exact through public Node methods. A measured sustained soak remains.
 
 ### Maturity gate
 

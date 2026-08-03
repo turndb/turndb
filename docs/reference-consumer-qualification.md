@@ -30,6 +30,13 @@ restores a writable backup, then physically erases one record. It asserts that r
 history and leaves no dead or reclaimable content. It also asserts the deliberately narrower erasure
 scope: the backup created beforehand is an external copy and still contains the record.
 
+A checked revision-3 pack supplies real old bytes for upgrade qualification. A private Rust test
+reconstructs the pack and compares it byte-for-byte with the checked-in hexadecimal fixture, while
+the external harness can only restore it and use public Node methods. The workflow preflights and
+migrates one part, closes and reopens, resumes the second part, and verifies that record bytes and
+whole-content identities remain exact. Old parts pinned by retained snapshots stay reported
+separately from the current-format live parts.
+
 This is not yet a claim that Phase 6 is complete. The executable suite still needs a measured
-sustained retention/compaction soak and an old-format upgrade scenario. Those should extend the same
-external harness; adding consumer concepts to `src/` is not an acceptable way to make a fixture pass.
+sustained retention/compaction soak. It should extend the same external harness; adding consumer
+concepts to `src/` is not an acceptable way to make a fixture pass.
