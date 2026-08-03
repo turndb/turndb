@@ -41,6 +41,9 @@ silently.
   `maxReconstructedBytes` overrides the ceiling as a lossless `bigint`. TurnDB never splits a row,
   admits one oversized row so paging can progress, and sets `reconstructionBudgetExhausted` when the
   continuation resumes at a row deferred by the ceiling. Metadata-only projections spend zero bytes.
+  Committed rows decode only attribute/content columns used by the projection or predicates; sibling
+  value, dictionary, and content-program sections remain unopened. See
+  [projected structured scans](../../docs/projected-structured-scan.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.

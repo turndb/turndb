@@ -17,6 +17,7 @@ use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, Record};
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 /// Bytes per value, by type tag. Fixed width keeps `val` directly indexable; zstd removes the slack.
 pub fn width(tag: u8) -> usize {
@@ -545,6 +546,28 @@ fn value_at(
 
 /// Row `r`'s attributes in their exact original order, duplicates included.
 pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
+    read_row_filtered(part, r, None)
+}
+
+/// Selected attributes at row `r`, preserving their relative order and duplicate occurrences.
+/// Layout and column metadata are shared structural sections; value/rid/dictionary sections are
+/// opened only for columns whose name appears in `names`.
+pub fn read_row_selected(
+    part: &Part,
+    r: usize,
+    names: &HashSet<&str>,
+) -> Result<Vec<(String, AttrValue)>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    read_row_filtered(part, r, Some(names))
+}
+
+fn read_row_filtered(
+    part: &Part,
+    r: usize,
+    names: Option<&HashSet<&str>>,
+) -> Result<Vec<(String, AttrValue)>> {
     if !part.section_present("colmeta") {
         return Ok(Vec::new());
     }
@@ -569,6 +592,9 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
         let (key, tag, occ, kind) = meta
             .get(c)
             .ok_or_else(|| anyhow::anyhow!("layout names column {c} which does not exist"))?;
+        if names.is_some_and(|names| !names.contains(key.as_str())) {
+            continue;
+        }
         let entry = match cursor.get(&c) {
             Some(e) => *e,
             None => {

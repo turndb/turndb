@@ -21,6 +21,13 @@ Binary attributes are intended for compact queryable identifiers, hashes, and pr
 Large opaque values still belong in named content, where content addressing, deduplication, lazy
 reconstruction, and physical erasure apply.
 
+Lists, maps, and other nested documents are deliberately not scalar attributes in revision 4. They
+belong in named content under a consumer-chosen explicit encoding (for example canonical JSON, CBOR,
+or protobuf), with ordinary scalar fields carrying any encoding/version metadata the consumer needs
+to query. TurnDB never guesses that arbitrary bytes are JSON or normalizes a document during ingest.
+A future native nested column type would require its own versioned tag and exact ordering/null rules;
+it cannot silently reinterpret content written under this contract.
+
 A timestamp has exactly one interpretation: its i64 is nanoseconds since `1970-01-01T00:00:00Z`.
 TurnDB stores no local timezone and performs no implicit unit conversion. Consumers that receive
 milliseconds or timezone-less civil time must normalize deliberately before writing.

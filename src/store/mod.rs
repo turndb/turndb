@@ -2077,6 +2077,34 @@ impl Store {
         read::get(&self.parts, id)
     }
 
+    /// Scan projection over newest-wins state. The memtable is already materialized; committed rows
+    /// delegate to the column-selective read core.
+    pub(crate) fn project(
+        &self,
+        id: &str,
+        attrs: &HashSet<&str>,
+        contents: &HashSet<&str>,
+    ) -> Result<Option<Record>> {
+        if let Some(value) = self.mem.get(id) {
+            return Ok(value.as_ref().map(|record| Record {
+                id: record.id.clone(),
+                contents: record
+                    .contents
+                    .iter()
+                    .filter(|content| contents.contains(content.name.as_str()))
+                    .cloned()
+                    .collect(),
+                attrs: record
+                    .attrs
+                    .iter()
+                    .filter(|(name, _)| attrs.contains(name.as_str()))
+                    .cloned()
+                    .collect(),
+            }));
+        }
+        read::project(&self.parts, id, attrs, contents)
+    }
+
     /// Byte-exact content for `id`.
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
         self.reconstruct_content(id, BODY_CONTENT)
@@ -2683,6 +2711,15 @@ pub struct ReadStore {
 impl ReadStore {
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
         read::get(&self.parts, id)
+    }
+
+    pub(crate) fn project(
+        &self,
+        id: &str,
+        attrs: &HashSet<&str>,
+        contents: &HashSet<&str>,
+    ) -> Result<Option<Record>> {
+        read::project(&self.parts, id, attrs, contents)
     }
 
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
