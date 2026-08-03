@@ -30,6 +30,9 @@ export interface ScanRequest {
   cursor?: string;
   limit?: number;
   maxExamined?: number;
+  /** Milliseconds from submission, including actor-queue wait; zero cancels before scan work. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
   attrs?: string[];
   contents?: Array<{ name: string; mode: 'metadata' | 'bytes' }>;
   predicates?: Predicate[];
@@ -75,6 +78,7 @@ export interface Capabilities {
   lifecycleOperations: true;
   healthSnapshots: true;
   schemaDiscovery: true;
+  scanCancellation: true;
 }
 
 export interface OpenOptions {
@@ -118,6 +122,7 @@ export type TurnDbErrorCode =
   | 'INVALID_ARGUMENT'
   | 'BUSY'
   | 'CLOSED'
+  | 'CANCELLED'
   | 'CONTENTION'
   | 'NOT_FOUND'
   | 'CORRUPTION'

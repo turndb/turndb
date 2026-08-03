@@ -56,8 +56,11 @@ function normalizeError(error) {
   return new TurnDbError(code, reason.replace(/\[TURNDB_CODE:[A-Z_]+\]\s*/g, ''), error);
 }
 
-function guarded(fn) {
+function guarded(fn, operation) {
   return function guardedNativeCall(...args) {
+    if (operation === 'scan' && args[0]?.signal?.aborted) {
+      return Promise.reject(new TurnDbError('CANCELLED', 'scan was cancelled before submission'));
+    }
     try {
       return Promise.resolve(fn.apply(this, args)).catch((error) => {
         throw normalizeError(error);
@@ -74,7 +77,7 @@ for (const Class of [native.NativeStore, native.NativeSnapshot]) {
     'compact', 'verify', 'erase', 'punch', 'refold', 'health', 'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
-      Class.prototype[name] = guarded(Class.prototype[name]);
+      Class.prototype[name] = guarded(Class.prototype[name], name);
     }
   }
 }

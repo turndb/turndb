@@ -148,11 +148,17 @@ because a name may occur only in a row shadowed by a newer version or tombstone.
 `may_include_shadowed_fields`/`mayIncludeShadowedFields` result flag prevents consumers from confusing
 that inexpensive descriptive inventory with a required or exact live-row schema.
 
+The structured pager accepts an absolute deadline and a shareable cooperative cancellation token.
+Checks occur before range work, between candidate records and selected content values, and after
+potentially blocking reads. Interruption returns a typed `ScanInterrupted` error and never a partial
+page. The Node binding maps `timeoutMs` to a deadline before actor submission (therefore including
+queue time) and maps `AbortSignal` to the same Rust token; both reject with `CANCELLED`.
+
 **Current gaps:** the structured pager point-decodes each eligible record rather than pushing selected
-fields into the columnar lens; arbitrary field ordering, explicit null values, cancellation, and
-deadlines are absent; scan statistics do not yet report section bytes or distinct fold blocks. The
-`max_examined` budget counts live records evaluated against predicates, not superseded physical rows
-encountered while resolving them.
+fields into the columnar lens; arbitrary field ordering and explicit null values are absent; scan
+statistics do not yet report section bytes or distinct fold blocks. The `max_examined` budget counts
+live records evaluated against predicates, not superseded physical rows encountered while resolving
+them.
 
 ## 5. Platform capabilities
 
@@ -211,14 +217,15 @@ pool and remain stable across later writer activity. A read-only process can ope
 manifest directly or request a commit still present in the bounded retained-manifest window; neither
 path takes the writer lock or replays an unflushed WAL.
 
-**Current gaps:** only the binding-owned failure classes and writer contention have stable
-machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, backup/restore
-and recovery controls, and prebuilt artifact selection are not exposed yet. The package is a tested
-source prototype and must not be described as a production distribution.
+**Current gaps:** only the binding-owned failure classes, scan interruption, and writer contention
+have stable machine-readable codes; Arrow IPC, SQL, backup/restore and recovery controls, and prebuilt
+artifact selection are not exposed yet. The package is a tested source prototype and must not be
+described as a production distribution.
 
 The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
-overload, closed handles, and writer contention. Contention is a typed `WriterLocked` condition in the
-Rust core; consumers do not match its message. Unknown core failures deliberately remain `INTERNAL`
+overload, closed handles, typed scan interruption, and writer contention. Contention is a typed
+`WriterLocked` condition in the Rust core; consumers do not match its message. Unknown core failures
+deliberately remain `INTERNAL`
 until their engine error variants exist. `NOT_FOUND`, `CORRUPTION`, and `IO` are reserved in the Node
 union but must not be assigned through message heuristics.
 
@@ -260,11 +267,12 @@ and raw sizes are u32, and Arrow binary values are limited by i32 offsets. Encod
 overflow. Query batches currently target 8,192 rows or 32 MiB of reconstructed content, while always
 admitting one oversized value so progress remains possible.
 
-Before production binding maturity, the API must add query memory, deadline, and cancellation budgets;
-the native command backlog is already bounded and configurable. Reaching a budget returns a structured
-error or partial page with a cursor
-only where the operation contract explicitly allows it. It never truncates a record, invents a weaker
-durability acknowledgement, or silently widens a scan.
+Before production binding maturity, the API must add query-memory budgets and interruption for
+long-running lifecycle operations; structured scans already have deadlines and cooperative
+cancellation, and the native command backlog is bounded and configurable. Reaching a budget returns a
+structured error or partial page with a cursor only where the operation contract explicitly allows
+it. It never truncates a record, invents a weaker durability acknowledgement, or silently widens a
+scan.
 
 Ambiguous recovery is an error. Corruption, deliberate erasure, unsupported capability, contention,
 cancellation, invalid input, and resource exhaustion remain distinguishable machine-readable classes

@@ -9,6 +9,9 @@ use crate::types::{AttrValue, Content, ContentHash, Record};
 use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::time::Instant;
 
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_FINGERPRINT: usize = 16;
@@ -16,6 +19,47 @@ const CURSOR_CHECKSUM: usize = 8;
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_EXAMINED: usize = 1_000_000;
+
+/// A cheap cooperative cancellation target shared by a scan and its caller.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn new() -> CancellationToken {
+        CancellationToken::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanInterruptionReason {
+    Cancelled,
+    DeadlineExceeded,
+}
+
+/// A scan stopped by its cooperative token or absolute deadline. No partial page is returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanInterrupted {
+    pub reason: ScanInterruptionReason,
+}
+
+impl std::fmt::Display for ScanInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            ScanInterruptionReason::Cancelled => f.write_str("scan was cancelled"),
+            ScanInterruptionReason::DeadlineExceeded => f.write_str("scan deadline exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for ScanInterrupted {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Direction {
@@ -67,6 +111,10 @@ pub struct ScanRequest {
     pub limit: usize,
     /// Hard bound on candidate records examined during this call. A partial page carries a cursor.
     pub max_examined: usize,
+    /// Absolute deadline. It may be created before queue submission so queue time is included.
+    pub deadline: Option<Instant>,
+    /// Cooperative cancellation checked before and during record/content evaluation.
+    pub cancellation: Option<CancellationToken>,
     /// Attribute keys to return. Matching occurrences preserve their original order and duplicates.
     pub attrs: Vec<String>,
     /// Named content values to describe or reconstruct.
@@ -83,6 +131,8 @@ impl Default for ScanRequest {
             cursor: None,
             limit: DEFAULT_LIMIT,
             max_examined: 10_000,
+            deadline: None,
+            cancellation: None,
             attrs: Vec::new(),
             contents: Vec::new(),
             predicates: Vec::new(),
@@ -188,6 +238,7 @@ pub(crate) fn scan_read_store(store: &ReadStore, request: &ScanRequest) -> Resul
 
 fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     validate(request)?;
+    check_interruption(request)?;
     let fingerprint = fingerprint(request);
     let cursor = request
         .cursor
@@ -227,6 +278,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     let mut has_more = false;
 
     while rows.len() < request.limit && stats.examined < request.max_examined {
+        check_interruption(request)?;
         let remaining = request.max_examined - stats.examined;
         let ask = remaining.min((request.limit - rows.len()).max(64));
         let ids = source.scan_ids(
@@ -235,6 +287,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             ask,
             request.direction == Direction::Reverse,
         )?;
+        check_interruption(request)?;
         if ids.is_empty() {
             has_more = false;
             break;
@@ -242,6 +295,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         let fetched = ids.len();
         let mut processed = 0usize;
         for id in ids {
+            check_interruption(request)?;
             processed += 1;
             stats.examined += 1;
             last_examined = Some(id.clone());
@@ -268,6 +322,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             }
             let mut contents = Vec::with_capacity(request.contents.len());
             for selected in &request.contents {
+                check_interruption(request)?;
                 let content = record.as_ref().and_then(|r| r.content(&selected.name));
                 let bytes = if content.is_some() && selected.mode == ContentMode::Bytes {
                     let value =
@@ -277,6 +332,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
                                 selected.name
                             )
                         })?;
+                    check_interruption(request)?;
                     stats.content_values_reconstructed += 1;
                     stats.reconstructed_bytes =
                         stats.reconstructed_bytes.saturating_add(value.len() as u64);
@@ -311,6 +367,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         has_more = true;
     }
 
+    check_interruption(request)?;
     stats.returned = rows.len();
     let next = if has_more {
         last_examined
@@ -320,6 +377,16 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         None
     };
     Ok(ScanPage { rows, next, stats })
+}
+
+fn check_interruption(request: &ScanRequest) -> Result<()> {
+    if request.cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        return Err(ScanInterrupted { reason: ScanInterruptionReason::Cancelled }.into());
+    }
+    if request.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ScanInterrupted { reason: ScanInterruptionReason::DeadlineExceeded }.into());
+    }
+    Ok(())
 }
 
 fn validate(request: &ScanRequest) -> Result<()> {
@@ -588,6 +655,52 @@ fn unhex(value: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CancelsAfterFirstRead {
+        cancellation: CancellationToken,
+    }
+
+    impl Source for CancelsAfterFirstRead {
+        fn scan_ids(
+            &self,
+            _from: Option<&str>,
+            _to: Option<&str>,
+            _limit: usize,
+            _reverse: bool,
+        ) -> Result<Vec<String>> {
+            Ok(vec!["a".into(), "b".into()])
+        }
+
+        fn get(&self, id: &str) -> Result<Option<Record>> {
+            if id == "a" {
+                self.cancellation.cancel();
+            }
+            Ok(Some(Record::new(id, vec![], vec![("selected".into(), AttrValue::Bool(true))])?))
+        }
+
+        fn reconstruct_content(&self, _id: &str, _name: &str) -> Result<Option<Vec<u8>>> {
+            unreachable!("the interruption test projects no content")
+        }
+    }
+
+    #[test]
+    fn cancellation_discards_rows_already_built_inside_the_call() {
+        let cancellation = CancellationToken::new();
+        let source = CancelsAfterFirstRead { cancellation: cancellation.clone() };
+        let error = scan_source(
+            &source,
+            &ScanRequest {
+                attrs: vec!["selected".into()],
+                cancellation: Some(cancellation),
+                ..ScanRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ScanInterrupted>().unwrap().reason,
+            ScanInterruptionReason::Cancelled
+        );
+    }
 
     #[test]
     fn cursor_roundtrips_arbitrary_valid_ids() {

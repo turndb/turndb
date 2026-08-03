@@ -11,15 +11,16 @@ use actor::{
     Actor, CompactResult, OwnedContent, VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY,
     MAX_QUEUE_CAPACITY,
 };
-use napi::bindgen_prelude::{BigInt, Buffer};
-use napi::{Error, Result, Status};
+use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
+use napi::{Env, Error, Result, Status};
 use napi_derive::napi;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use turndb::fold::FoldCfg;
 use turndb::scan::{
-    Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent, ScanPage,
-    ScanRequest, ScanRow,
+    CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
+    ScanInterrupted, ScanPage, ScanRequest, ScanRow,
 };
 use turndb::store::{ReadStore, Store};
 use turndb::types::AttrValue;
@@ -30,6 +31,14 @@ fn failure(context: &str, error: impl std::fmt::Display) -> Error {
 
 fn coded_failure(code: &str, reason: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, format!("[TURNDB_CODE:{code}] {reason}"))
+}
+
+fn scan_failure(context: &str, error: anyhow::Error) -> Error {
+    if error.chain().any(|cause| cause.downcast_ref::<ScanInterrupted>().is_some()) {
+        coded_failure("CANCELLED", format!("{context}: {error:#}"))
+    } else {
+        failure(context, error)
+    }
 }
 
 #[napi(object)]
@@ -78,7 +87,7 @@ pub struct NativePredicate {
     pub present: Option<bool>,
 }
 
-#[napi(object)]
+#[napi(object, object_to_js = false)]
 pub struct NativeScanRequest {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -87,6 +96,9 @@ pub struct NativeScanRequest {
     pub cursor: Option<String>,
     pub limit: Option<u32>,
     pub max_examined: Option<u32>,
+    /// Milliseconds from submission; zero is an immediate, deterministic deadline.
+    pub timeout_ms: Option<u32>,
+    pub signal: Option<AbortSignal>,
     pub attrs: Option<Vec<String>>,
     pub contents: Option<Vec<NativeContentSelect>>,
     pub predicates: Option<Vec<NativePredicate>>,
@@ -144,6 +156,7 @@ pub struct NativeCapabilities {
     pub lifecycle_operations: bool,
     pub health_snapshots: bool,
     pub schema_discovery: bool,
+    pub scan_cancellation: bool,
 }
 
 #[napi]
@@ -175,6 +188,7 @@ pub fn capabilities() -> NativeCapabilities {
         lifecycle_operations: true,
         health_snapshots: true,
         schema_discovery: true,
+        scan_cancellation: true,
     }
 }
 
@@ -360,14 +374,22 @@ impl NativeSnapshot {
     }
 
     #[napi]
-    pub async fn scan(&self, request: Option<NativeScanRequest>) -> Result<NativeScanPage> {
-        let request = request.map(decode_scan).transpose()?.unwrap_or_default();
-        let store = self.state.get()?;
-        napi::tokio::task::spawn_blocking(move || store.scan(&request))
-            .await
-            .map_err(|error| failure("join TurnDB snapshot scan", error))?
-            .map(encode_page)
-            .map_err(|error| failure("scan TurnDB snapshot", error))
+    pub fn scan<'env>(
+        &self,
+        env: &'env Env,
+        request: Option<NativeScanRequest>,
+    ) -> Result<PromiseRaw<'env, NativeScanPage>> {
+        let request = request.map(decode_scan).transpose();
+        let store = self.state.get();
+        env.spawn_future(async move {
+            let request = request?.unwrap_or_default();
+            let store = store?;
+            napi::tokio::task::spawn_blocking(move || store.scan(&request))
+                .await
+                .map_err(|error| failure("join TurnDB snapshot scan", error))?
+                .map(encode_page)
+                .map_err(|error| scan_failure("scan TurnDB snapshot", error))
+        })
     }
 
     #[napi]
@@ -473,13 +495,20 @@ impl NativeStore {
 
     /// Page the writer's read-your-writes view using an opaque, checked cursor.
     #[napi]
-    pub async fn scan(&self, request: Option<NativeScanRequest>) -> Result<NativeScanPage> {
-        let request = request.map(decode_scan).transpose()?.unwrap_or_default();
-        self.actor
-            .scan(request)
-            .await
-            .map(encode_page)
-            .map_err(|error| failure("scan TurnDB store", error))
+    pub fn scan<'env>(
+        &self,
+        env: &'env Env,
+        request: Option<NativeScanRequest>,
+    ) -> Result<PromiseRaw<'env, NativeScanPage>> {
+        let request = request.map(decode_scan).transpose();
+        let actor = self.actor.clone();
+        env.spawn_future(async move {
+            actor
+                .scan(request?.unwrap_or_default())
+                .await
+                .map(encode_page)
+                .map_err(|error| scan_failure("scan TurnDB store", error))
+        })
     }
 
     /// Reconstruct one named content value without reading its siblings.
@@ -664,6 +693,14 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
 }
 
 fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
+    let cancellation = input.signal.map(|signal| {
+        let token = CancellationToken::new();
+        let cancelled = token.clone();
+        signal.on_abort(move || cancelled.cancel());
+        token
+    });
+    let deadline =
+        input.timeout_ms.map(|millis| Instant::now() + Duration::from_millis(u64::from(millis)));
     let mut request = ScanRequest {
         from: input.from,
         to: input.to,
@@ -678,6 +715,8 @@ fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
             }
         },
         cursor: input.cursor,
+        deadline,
+        cancellation,
         attrs: input.attrs.unwrap_or_default(),
         contents: input
             .contents

@@ -27,7 +27,10 @@ silently.
 - `scan()` is the Rust structured pager. Rust owns visibility, filtering, ordering, work bounds, and
   opaque cursor validation. The writer view includes accepted unflushed writes. Content metadata
   includes `identity`, the lowercase BLAKE3 hex digest of the complete reconstructed value, when its
-  record format carried one; obtaining it does not read the content.
+  record format carried one; obtaining it does not read the content. `timeoutMs` establishes an
+  absolute deadline before submission, so actor-queue time counts, and `signal` accepts an
+  `AbortSignal`. Both stop cooperatively in Rust and reject with `CANCELLED`; no partial page is
+  presented as success.
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
@@ -36,11 +39,11 @@ silently.
   backlog from 1 through 65,536; the default remains 64 and the handle reports its actual value.
   Once that many operations are queued, ordinary operations refuse with an overload error rather
   than creating an unbounded backlog. `close()` remains admissible when the queue is full.
-- Rejections use `TurnDbError` with a stable `code`. The initial binding-owned classes distinguish
-  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, and `INTERNAL`; the original native error is
-  retained as `cause` and the full contextual message remains available. The declared code union
-  reserves `NOT_FOUND`, `CORRUPTION`, and `IO` while typed engine errors are added—unclassified core
-  failures report `INTERNAL` rather than being guessed from prose.
+- Rejections use `TurnDbError` with a stable `code`. The initial classes distinguish
+  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, `CANCELLED`, and `INTERNAL`; the original native
+  error is retained as `cause` and the full contextual message remains available. The declared code
+  union reserves `NOT_FOUND`, `CORRUPTION`, and `IO` while typed engine errors are added—unclassified
+  core failures report `INTERNAL` rather than being guessed from prose.
 - `compact()`, `verify()`, `punch()`, and `refold()` run on the same serialized writer actor. They
   sync and flush earlier writes before operating, so their reports cover an exact cut and their
   filesystem work stays off the event loop. `compact(true)` requests a full merge; the default uses
@@ -58,6 +61,6 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, backup/restore and
-recovery controls, or the complete engine error taxonomy. Those remain
-explicit Phase 3/4 work rather than being simulated in JavaScript.
+The current slice does not yet expose Arrow IPC, SQL, backup/restore and recovery controls,
+cancellation for long-running lifecycle operations, or the complete engine error taxonomy. Those
+remain explicit Phase 3/4 work rather than being simulated in JavaScript.

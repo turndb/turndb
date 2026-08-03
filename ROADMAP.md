@@ -44,7 +44,9 @@ content model right before compatibility turns today's choices into permanent pr
   or program hashes with byte identity. The Node package remains a source prototype, not yet a
   production prebuild matrix. Its accepted command backlog is now a validated per-store open option
   with an explicit default and maximum, deterministic overload behavior, and an actual-capacity
-  handle property.
+  handle property. Structured scans now have a shareable Rust cancellation token and absolute
+  deadline; Node maps `AbortSignal` and queue-inclusive `timeoutMs` onto them and classifies both as
+  `CANCELLED` without returning partial success.
 
 ## Product boundary
 
@@ -317,9 +319,9 @@ not include npm metadata or per-platform duplication. It does show that keeping 
 profile is useful while the additional query-engine dependency is affordable when its capabilities
 are actually exposed.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts, Arrow IPC and SQL, cancellation/deadlines,
-a complete typed engine error taxonomy, backup/restore and recovery controls, and measured
-event-loop/query overhead under a representative mixed workload.
+Remaining Phase-3 gaps are prebuilt platform artifacts, Arrow IPC and SQL, cancellation/deadlines for
+long-running lifecycle operations, a complete typed engine error taxonomy, backup/restore and recovery
+controls, and measured event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 
