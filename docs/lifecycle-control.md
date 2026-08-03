@@ -15,6 +15,9 @@ Controlled operations currently include:
 - In-place punching through `punch_unreferenced_with_control`.
 - Generational content rewriting through `refold_with_control`.
 - The read-only planning phase of strong record erasure through `erase_ids_with_control`.
+- Backup packing/verification through `Store::backup_with_control` and
+  `pack::write_with_control`.
+- Validated extraction/publication through `pack::restore_with_control`.
 
 Checkpoints occur between records, dictionary entries, sections, fold frames, copied pieces, rebuilt
 parts, and independently punchable blocks. An individual unit is not split, so cancellation latency
@@ -41,6 +44,11 @@ Each operation deliberately interprets interruption according to its publication
   atomic tombstone batch is applied, cancellation is deferred until total merge and refold complete.
   Returning `cancelled` after logical deletion but before physical removal would make a retry mistake
   those ids for previously absent records and falsely report success.
+- **Backup** copies and verifies into a private sibling file. Cancellation removes unpublished
+  staging and leaves the requested artifact absent. The hard link is the final checkpoint; once it
+  exists, TurnDB reports the publication outcome rather than cancellation.
+- **Restore** validates and extracts into a private sibling directory. Cancellation removes staging
+  and leaves the destination absent. The atomic no-replace rename is its final checkpoint.
 
 An actor operation may have settled earlier accepted writes before a later checkpoint stops its main
 work. That publication is ordered prerequisite work, not a partially published compaction or refold.
@@ -48,7 +56,7 @@ An already-expired deadline is checked before settling and therefore has no life
 
 ## Node API
 
-The native writer methods accept a `LifecycleOptions` object:
+The native lifecycle methods and restore function accept a `LifecycleOptions` object:
 
 ```ts
 const abort = new AbortController();
@@ -61,15 +69,18 @@ await store.verify({ timeoutMs: 30_000 });
 await store.punch({ signal: abort.signal });
 await store.refold({ timeoutMs: 120_000 });
 await store.erase(ids, { signal: abort.signal });
+await store.backup('snapshot.turndb', { signal: abort.signal });
+await restoreBackup('snapshot.turndb', 'restored', { timeoutMs: 120_000 });
 ```
 
-`timeoutMs` is converted to an absolute deadline before actor submission, so queue time counts. Zero
-is a deterministic pre-mutation refusal. A signal aborted before submission is rejected at the
-JavaScript boundary; later aborts set the Rust token directly. Both conditions reject with
+`timeoutMs` is converted to an absolute deadline before submission, so writer-actor queue time and
+restore worker-scheduling time count. Zero is a deterministic pre-mutation refusal. A signal aborted
+before submission is rejected at the JavaScript boundary; later aborts set the Rust token directly.
+Both conditions reject with
 `TurnDbError.code === "CANCELLED"`; the message distinguishes cancellation from deadline expiry.
 Dropping or ignoring the Promise does not cancel the operation—pass a signal when cancellation is
 required.
 
-The native capability profile reports `lifecycleCancellation: true`. This does not cover backup,
-offline recovery, restore, SQL planning, sync, or flush. Those operations retain their existing
+The native capability profile reports `lifecycleCancellation: true`. This does not cover offline
+recovery, SQL planning, sync, or flush. Those operations retain their existing
 contracts, and their omission is explicit rather than represented as cancellable work.

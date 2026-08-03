@@ -119,10 +119,10 @@ batch, batch member count, and UTF-8 identifier/name bytes. Defaults are 64 MiB,
 charged before the first fold mutation, and charging is independent of dedup history. See
 [write admission limits](docs/write-admission.md).
 
-Long-running compaction, verification, punching, and refold operations accept reusable Rust
-cancellation tokens and absolute deadlines through their controlled variants. The native Node methods
-map these to queue-inclusive `timeoutMs` and `AbortSignal` options while preserving each operation's
-publication and restart invariants; see
+Long-running compaction, verification, punching, refold, backup, and restore operations accept
+reusable Rust cancellation tokens and absolute deadlines through their controlled variants. The
+native Node methods map these to submission-inclusive `timeoutMs` and `AbortSignal` options while
+preserving each operation's publication and restart invariants; see
 [lifecycle cancellation and deadlines](docs/lifecycle-control.md).
 Incremental compaction accepts simultaneous exact physical input-part, row, and file-byte limits,
 reports the executed plan and output bytes, and refuses rather than exceeding an insufficient budget;

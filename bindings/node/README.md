@@ -68,7 +68,8 @@ silently.
   verifies every member, extracts with bounded memory, validates the staged store, and atomically
   publishes a new writable directory without overlaying any filesystem object. Safe restore reports
   `UNSUPPORTED` on a platform without an OS no-replace directory rename; the capability is exposed
-  as `backupRestore`.
+  as `backupRestore`. Both accept `timeoutMs`/`AbortSignal`; cancellation before the final atomic
+  link/rename removes unpublished staging and never publishes the requested destination.
 - `recoverManifest(path, { maxRollbackCommits })` is an offline, exclusive recovery control. It
   refuses a healthy store or live writer, validates the exact fold prefix, every part/section and
   every visible content value before publication, and defaults to permitting no rollback past the
@@ -96,7 +97,7 @@ silently.
   and the full contextual message remains available. The declared code union reserves `NOT_FOUND`,
   `CORRUPTION`, and broader `IO` use while typed engine errors are added—unclassified core failures
   report `INTERNAL` rather than being guessed from prose.
-- `compact()`, `verify()`, `punch()`, and `refold()` run on the same serialized writer actor. They
+- `compact()`, `verify()`, `punch()`, `refold()`, and `backup()` run on the same serialized writer actor. They
   sync and flush earlier writes before operating, so their reports cover an exact cut and their
   filesystem work stays off the event loop. `compact(true)` requests a full merge; the default uses
   the engine's measured automatic policy. Each accepts queue-inclusive `timeoutMs` and
@@ -123,6 +124,6 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose cancellation for backup, restore, offline recovery, SQL
-planning, sync, or flush, or the complete engine error taxonomy. Those remain explicit Phase 3/4
-work rather than being simulated in JavaScript.
+The current slice does not yet expose cancellation for offline recovery, SQL planning, sync, or
+flush. Low-level untyped invariant failures also retain the conservative `INTERNAL` class. Those
+remain explicit Phase 3/4 work rather than being simulated in JavaScript.

@@ -125,6 +125,7 @@ enum Command {
     },
     Backup {
         path: std::path::PathBuf,
+        control: OperationControl,
         reply: oneshot::Sender<Result<turndb::pack::BackupStats>>,
     },
     Erase {
@@ -279,8 +280,12 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
 
-    pub async fn backup(&self, path: std::path::PathBuf) -> Result<turndb::pack::BackupStats> {
-        Self::receive(self.submit(|reply| Command::Backup { path, reply })?).await
+    pub async fn backup(
+        &self,
+        path: std::path::PathBuf,
+        control: OperationControl,
+    ) -> Result<turndb::pack::BackupStats> {
+        Self::receive(self.submit(|reply| Command::Backup { path, control, reply })?).await
     }
 
     pub async fn erase(&self, ids: Vec<String>, control: OperationControl) -> Result<ErasureStats> {
@@ -375,10 +380,10 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = verify(&mut store, path, &control);
                 let _ = reply.send(result);
             }
-            Command::Backup { path, reply } => {
+            Command::Backup { path, control, reply } => {
                 // Actor order fixes the backup cut: earlier writes are settled by `Store::backup`,
                 // while later commands wait until the verified artifact has been published.
-                let _ = reply.send(store.backup(&path));
+                let _ = reply.send(store.backup_with_control(&path, &control));
             }
             Command::Erase { ids, control, reply } => {
                 let _ = reply.send(store.erase_ids_with_control(&ids, &control));
@@ -675,6 +680,43 @@ mod tests {
         assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some_and(
             |error| { error.reason == turndb::control::InterruptionReason::DeadlineExceeded }
         ));
+        runtime.block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_backup_deadline_includes_actor_queue_time_and_publishes_nothing() {
+        let dir = temp();
+        let artifact = dir.with_extension("cancelled-backup");
+        let actor = Actor::open_with_capacity(&dir, DEFAULT_QUEUE_CAPACITY).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
+        entered_rx.recv().unwrap();
+
+        let runtime = napi::tokio::runtime::Runtime::new().unwrap();
+        let backup_actor = actor.clone();
+        let output = artifact.clone();
+        let pending = runtime.spawn(async move {
+            backup_actor
+                .backup(
+                    output,
+                    OperationControl {
+                        deadline: Some(
+                            std::time::Instant::now() + std::time::Duration::from_millis(10),
+                        ),
+                        cancellation: None,
+                    },
+                )
+                .await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        let error = runtime.block_on(pending).unwrap().unwrap_err();
+        assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some_and(
+            |error| { error.reason == turndb::control::InterruptionReason::DeadlineExceeded }
+        ));
+        assert!(!artifact.exists());
         runtime.block_on(actor.close(false)).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

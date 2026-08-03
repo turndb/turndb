@@ -13,6 +13,10 @@ The Rust writer API is:
 let stats = store.backup(Path::new("snapshot.turndb"))?;
 ```
 
+`Store::backup_with_control` accepts the same absolute deadline/shared cancellation token used by
+other lifecycle work. Directory-level callers can use `pack::write_with_control`; pack validation
+and explicit scrubs have `Pack::open_with_control` and `Pack::verify_with_control`.
+
 `Store::backup` syncs and flushes every earlier accepted operation while holding the sole writer
 role. It then copies the exact committed files while the mutable store is borrowed and no later
 operation can advance the manifest. The Node equivalent, `await store.backup(path)`, is serialized
@@ -25,10 +29,17 @@ contention if another process is currently writing the store. This avoids an ext
 compaction, re-fold, or unreachable-file cleanup.
 
 A backup is written to a uniquely named sibling staging file, synced, reopened, and fully verified.
-Only then is it hard-linked under the requested output name. Hard-link publication is atomic and
+Copy and verification check interruption between files and bounded 1 MiB chunks. Only then is it
+hard-linked under the requested output name. Hard-link publication is atomic and
 refuses an existing file, directory, or symlink; TurnDB never replaces a backup destination. The
 parent directory is synced before success is returned. A process or machine crash can leave a hidden
 staging file, but never a partial artifact under the requested name.
+
+Cancellation has one final checkpoint immediately before the hard link. Before that point the staging
+guard removes the private file best-effort and the destination remains absent. Once the link exists,
+TurnDB completes cleanup/directory sync and reports that publication outcome instead of returning a
+false cancellation after making an artifact visible. Writer backup may already have synced/flushed
+the same logical source cut before a later cancellation; it never rolls durable source state back.
 
 `BackupStats` reports the number of packed files, artifact bytes, and manifest commit. The legacy
 `pack::write` return omits the commit but has the same safety behavior.
@@ -42,7 +53,7 @@ let stats = turndb::pack::restore(Path::new("snapshot.turndb"), Path::new("resto
 ```
 
 ```js
-const stats = await restoreBackup('snapshot.turndb', 'restored');
+const stats = await restoreBackup('snapshot.turndb', 'restored', { timeoutMs: 30_000 });
 ```
 
 Restore follows a deliberately conservative sequence:
@@ -53,6 +64,11 @@ Restore follows a deliberately conservative sequence:
    file and directory.
 4. Open the staged directory through the ordinary read path to validate that it is a usable store.
 5. Atomically rename it into place with an OS no-replace primitive and sync the parent directory.
+
+`pack::restore_with_control` checks interruption while validating and between bounded extraction
+chunks. Cancellation before the final no-replace rename removes the private staging directory
+best-effort and leaves the destination absent. The rename is the last cancellation point: after it,
+the operation completes publication bookkeeping and reports success or a real filesystem failure.
 
 The final rename uses Linux `renameat2(RENAME_NOREPLACE)` or Apple `renamex_np(RENAME_EXCL)`. On a
 platform without an equivalent primitive, safe restore reports `UNSUPPORTED`; it does not weaken the
@@ -69,9 +85,9 @@ native target.
 
 - Backups are external copies. Record erasure or re-folding in the source store cannot erase an
   already-created pack; consumers must apply their retention and deletion policy to backup media.
-- Backup and restore currently have no cancellation/deadline option. A Node writer backup occupies
-  its actor until copying and verification finish, so queue latency should be monitored for large
-  stores.
+- Native Node `store.backup(path, options)` and `restoreBackup(pack, dir, options)` accept
+  `timeoutMs`/`AbortSignal`. Writer queue time and restore worker-scheduling time are included because
+  the absolute deadline is created before submission. Dropping a Promise does not cancel work.
 - The format is a full snapshot, not an incremental or remote-object protocol. Incremental backup,
   object-store transfer, encryption, scheduling, and retention policy remain higher-layer concerns.
 - Callers choose and secure filesystem paths. TurnDB guarantees integrity and publication behavior,

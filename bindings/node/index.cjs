@@ -71,11 +71,13 @@ function guarded(fn, operation) {
         throw new TurnDbError('CANCELLED', 'next was cancelled before submission');
       });
     }
-    const lifecycleOptions = ['compact', 'compactBounded', 'erase'].includes(operation)
+    const lifecycleOptions = ['compact', 'compactBounded', 'erase', 'backup'].includes(operation)
       ? args[1]
-      : ['verify', 'punch', 'refold'].includes(operation)
-        ? args[0]
-        : undefined;
+      : operation === 'restoreBackup'
+        ? args[2]
+        : ['verify', 'punch', 'refold'].includes(operation)
+          ? args[0]
+          : undefined;
     if (lifecycleOptions?.signal?.aborted) {
       return Promise.reject(new TurnDbError(
         'CANCELLED',
@@ -123,7 +125,7 @@ module.exports = {
   NativeSnapshot: guardFactories(native.NativeSnapshot),
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
-  restoreBackup: guarded(native.restoreBackup),
+  restoreBackup: guarded(native.restoreBackup, 'restoreBackup'),
   recoverManifest: guarded(native.recoverManifest),
   TurnDbError,
 };
