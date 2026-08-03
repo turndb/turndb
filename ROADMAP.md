@@ -475,7 +475,9 @@ that evidence is sent.
 ### Deliverables
 
 - Metrics and snapshots covering:
-  - Commit, sync, flush, and recovery latency.
+  - Commit, sync, flush, and recovery latency. **Partially implemented:** successful open/recovery,
+    sync, flush, compaction, backup, punch, refold, and migration now expose monotonic typed outcomes
+    and nanosecond totals/maxima; manifest-only commit timing and histograms remain.
   - WAL and in-memory write-state size.
   - Part count and part-size distribution.
   - Query rows examined and returned.
@@ -490,7 +492,8 @@ that evidence is sent.
 - Configurable resource budgets and overload behavior.
 - A health snapshot API suitable for an embedding application's health endpoint.
 - Hooks through which a consumer can export OpenTelemetry without introducing OTel into the storage
-  core.
+  core. **Implemented for metrics:** Rust and Node expose a pull snapshot with stable integer fields;
+  consumers export deltas without callbacks or an SDK on the writer thread. Structured events remain.
 
 ### Maturity gate
 

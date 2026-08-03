@@ -2481,3 +2481,56 @@ fn space_usage_separates_live_retained_and_unclassified_files_without_double_cou
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
+    let dir = tmp("lifecycle-metrics");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        put(&mut store, "replay", b"recover this frame");
+        store.sync().unwrap();
+        // The next handle's recovery counter starts at that handle rather than pretending metrics
+        // are persisted across opens.
+    }
+
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let opened = store.metrics();
+    assert_eq!(opened.open_recovery.attempts, 1);
+    assert_eq!(opened.open_recovery.succeeded, 1);
+    assert_eq!(opened.recovered_wal_frames, 1);
+    assert_eq!(opened.sync.attempts, 0);
+
+    store.sync().unwrap();
+    store.flush().unwrap();
+    put(&mut store, "second", b"second metric part");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.merge_range(0, 2).unwrap().unwrap();
+
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    store
+        .sync_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+
+    let metrics = store.metrics();
+    assert_eq!(metrics.sync.attempts, 3);
+    assert_eq!(metrics.sync.succeeded, 2);
+    assert_eq!(metrics.sync.cancelled, 1);
+    assert_eq!(metrics.sync.failed, 0);
+    assert_eq!(metrics.flush.attempts, 2);
+    assert_eq!(metrics.flush.succeeded, 2);
+    assert_eq!(metrics.compaction.attempts, 1);
+    assert_eq!(metrics.compaction.succeeded, 1);
+    for operation in [metrics.open_recovery, metrics.sync, metrics.flush, metrics.compaction] {
+        assert_eq!(
+            operation.attempts,
+            operation.succeeded + operation.failed + operation.cancelled
+        );
+        assert!(operation.total_duration_ns >= operation.max_duration_ns);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

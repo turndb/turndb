@@ -188,6 +188,9 @@ enum Command {
     Health {
         reply: oneshot::Sender<Result<turndb::store::StoreHealth>>,
     },
+    Metrics {
+        reply: oneshot::Sender<Result<turndb::observability::StoreMetrics>>,
+    },
     SpaceUsage {
         control: OperationControl,
         reply: oneshot::Sender<Result<turndb::store::StoreSpaceUsage>>,
@@ -399,6 +402,10 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Health { reply })?).await
     }
 
+    pub async fn metrics(&self) -> Result<turndb::observability::StoreMetrics> {
+        Self::receive(self.submit(|reply| Command::Metrics { reply })?).await
+    }
+
     pub async fn space_usage(
         &self,
         control: OperationControl,
@@ -524,6 +531,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Health { reply } => {
                 let _ = reply.send(Ok(store.health()));
+            }
+            Command::Metrics { reply } => {
+                let _ = reply.send(Ok(store.metrics()));
             }
             Command::SpaceUsage { control, reply } => {
                 let _ = reply.send(store.space_usage_with_control(&control));

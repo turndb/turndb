@@ -171,6 +171,7 @@ export interface Capabilities {
   storeSpaceUsage: true;
   allocatedSpaceUsage: boolean;
   formatMigration: true;
+  operationMetrics: true;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -253,6 +254,28 @@ export interface StoreSpaceUsage {
   total: SpaceAmount;
   /** Bytes available to the current user on the containing filesystem, when supported. */
   filesystemAvailableBytes?: bigint;
+}
+
+export interface OperationMetrics {
+  attempts: bigint;
+  succeeded: bigint;
+  failed: bigint;
+  cancelled: bigint;
+  totalDurationNs: bigint;
+  lastDurationNs: bigint;
+  maxDurationNs: bigint;
+}
+
+export interface StoreMetrics {
+  openRecovery: OperationMetrics;
+  recoveredWalFrames: bigint;
+  sync: OperationMetrics;
+  flush: OperationMetrics;
+  compaction: OperationMetrics;
+  backup: OperationMetrics;
+  punch: OperationMetrics;
+  refold: OperationMetrics;
+  formatMigration: OperationMetrics;
 }
 
 export interface MergeStats {
@@ -514,5 +537,6 @@ export declare class NativeStore {
     retainedCommits: bigint;
     punchedBlocks: bigint;
   }>;
+  metrics(): Promise<StoreMetrics>;
   close(durable?: boolean): Promise<void>;
 }

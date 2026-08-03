@@ -133,6 +133,8 @@ compaction and refold expose exact source facts plus explicitly advisory staging
 Live immutable parts can be upgraded one atomic, restartable unit at a time, with retained-snapshot
 dependencies and advisory stage space reported separately; see
 [resumable format migration](docs/format-migration.md).
+Writer handles expose process-local, monotonic lifecycle outcomes and nanosecond totals through a
+telemetry-neutral polling surface; see [pull-based operation metrics](docs/operation-metrics.md).
 
 With `sql` enabled, `query::sql::SqlQuery` runs positional-parameter SQL against the generic
 `records` table under a configurable DataFusion execution-memory ceiling. DDL, DML, and session
