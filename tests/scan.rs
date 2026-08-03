@@ -161,6 +161,118 @@ fn an_examination_budget_returns_a_continuation_even_with_no_matches() {
 }
 
 #[test]
+fn reconstruction_budget_pages_whole_rows_without_gaps() {
+    let dir = tmp("content-budget");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        store.put_body(id, b"123456", vec![]).unwrap();
+    }
+
+    let mut request = ScanRequest {
+        contents: vec![ContentSelect { name: "body".into(), mode: ContentMode::Bytes }],
+        max_reconstructed_bytes: 10,
+        ..ScanRequest::default()
+    };
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = store.scan(&request).unwrap();
+        pages += 1;
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.stats.reconstructed_bytes, 6);
+        ids.push(page.rows[0].id.clone());
+        let Some(next) = page.next else {
+            assert!(!page.stats.reconstruction_budget_exhausted);
+            break;
+        };
+        assert!(page.stats.reconstruction_budget_exhausted);
+        assert_eq!(page.stats.examined, 2, "the deferred row was inspected but not consumed");
+        request.cursor = Some(next);
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(ids, ["a", "b", "c"]);
+
+    request.cursor = None;
+    request.direction = Direction::Reverse;
+    let mut reverse_ids = Vec::new();
+    loop {
+        let page = store.scan(&request).unwrap();
+        reverse_ids.extend(page.rows.into_iter().map(|row| row.id));
+        let Some(next) = page.next else { break };
+        request.cursor = Some(next);
+    }
+    assert_eq!(reverse_ids, ["c", "b", "a"]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reconstruction_budget_admits_one_oversized_row_and_counts_all_selected_content() {
+    let dir = tmp("oversized-content-budget");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b"] {
+        store
+            .put_record(
+                id,
+                &[
+                    ContentSpans::new("request", vec![Span::Piece(b"123456")]),
+                    ContentSpans::new("response", vec![Span::Piece(b"abcdef")]),
+                ],
+                vec![],
+            )
+            .unwrap();
+    }
+    let mut request = ScanRequest {
+        contents: vec![
+            ContentSelect { name: "request".into(), mode: ContentMode::Bytes },
+            ContentSelect { name: "response".into(), mode: ContentMode::Bytes },
+        ],
+        max_reconstructed_bytes: 5,
+        ..ScanRequest::default()
+    };
+
+    let first = store.scan(&request).unwrap();
+    assert_eq!(first.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert_eq!(first.stats.content_values_reconstructed, 2);
+    assert_eq!(first.stats.reconstructed_bytes, 12);
+    assert!(first.stats.reconstruction_budget_exhausted);
+
+    request.cursor = first.next;
+    let second = store.scan(&request).unwrap();
+    assert_eq!(second.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["b"]);
+    assert_eq!(second.stats.reconstructed_bytes, 12);
+    assert!(!second.stats.reconstruction_budget_exhausted);
+    assert!(second.next.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn metadata_only_projection_does_not_spend_the_reconstruction_budget() {
+    let dir = tmp("metadata-budget");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        store.put_body(id, b"far larger than one byte", vec![]).unwrap();
+    }
+    let page = store
+        .scan(&ScanRequest {
+            contents: vec![ContentSelect { name: "body".into(), mode: ContentMode::Metadata }],
+            max_reconstructed_bytes: 1,
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(page.rows.len(), 3);
+    assert_eq!(page.stats.content_values_reconstructed, 0);
+    assert_eq!(page.stats.reconstructed_bytes, 0);
+    assert!(!page.stats.reconstruction_budget_exhausted);
+    assert!(page.next.is_none());
+    assert!(store
+        .scan(&ScanRequest { max_reconstructed_bytes: 0, ..ScanRequest::default() })
+        .unwrap_err()
+        .to_string()
+        .contains("must be greater than zero"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn cursor_tampering_or_request_reuse_is_refused() {
     let dir = tmp("cursor");
     let mut store = Store::open(&dir, cfg()).unwrap();

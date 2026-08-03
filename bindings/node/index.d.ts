@@ -30,6 +30,8 @@ export interface ScanRequest {
   cursor?: string;
   limit?: number;
   maxExamined?: number;
+  /** Whole-page content byte ceiling; one oversized row is admitted to guarantee progress. */
+  maxReconstructedBytes?: bigint;
   /** Milliseconds from submission, including actor-queue wait; zero cancels before scan work. */
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -57,6 +59,7 @@ export interface ScanPage {
     shadowedAttrOccurrences: number;
     contentValuesReconstructed: number;
     reconstructedBytes: bigint;
+    reconstructionBudgetExhausted: boolean;
   };
 }
 
@@ -79,6 +82,8 @@ export interface Capabilities {
   healthSnapshots: true;
   schemaDiscovery: true;
   scanCancellation: true;
+  scanReconstructionBudget: true;
+  scanReconstructedBytesDefault: bigint;
 }
 
 export interface OpenOptions {

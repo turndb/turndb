@@ -46,7 +46,9 @@ content model right before compatibility turns today's choices into permanent pr
   with an explicit default and maximum, deterministic overload behavior, and an actual-capacity
   handle property. Structured scans now have a shareable Rust cancellation token and absolute
   deadline; Node maps `AbortSignal` and queue-inclusive `timeoutMs` onto them and classifies both as
-  `CANCELLED` without returning partial success.
+  `CANCELLED` without returning partial success. Structured pages now also enforce a configurable
+  whole-row reconstruction ceiling (32 MiB by default), expose when it caused a partial page, admit
+  one oversized row for progress, and resume before rather than after a deferred row.
 
 ## Product boundary
 
