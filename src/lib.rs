@@ -48,6 +48,7 @@ pub mod capabilities;
 pub mod carve;
 pub mod control;
 pub mod fold;
+mod io_trace;
 pub mod pack;
 pub mod part;
 #[cfg(feature = "columnar")]

@@ -51,13 +51,14 @@ Projection does not change:
 - examination and reconstructed-content byte budgets;
 - cooperative cancellation/deadline behavior.
 
-The existing structured scan request and native Node result shapes therefore need no compatibility
-adapter. The optimization lives behind the Rust query contract rather than in a binding.
+The existing structured scan request needs no compatibility adapter. The optimization lives behind
+the Rust query contract rather than in a binding.
 
 ## Remaining cost gap
 
 The pager still obtains bounded candidate ids and point-locates each committed id across live parts.
 It no longer decodes whole records, but it is not yet a batched physical column range scan. Query
-statistics also do not yet report exact distinct sections, stored/raw section bytes, or fold blocks
-touched. Those are the next Phase-2 opportunities; this slice establishes the selective read primitive
-they can share without creating a second index or changing the format.
+statistics now report exact operation-local distinct sections and fold blocks, cache access counts,
+and stored/raw bytes. See [structured scan I/O statistics](structured-scan-io.md). Batched physical
+range execution remains the next Phase-2 opportunity; the selective read primitive can support it
+without creating a second index or changing the format.

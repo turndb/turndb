@@ -589,20 +589,22 @@ impl Part {
 
     /// A section's decompressed bytes, cached after first touch.
     fn sect(&self, name: &str) -> Result<Arc<Vec<u8>>> {
-        let k = Kind::Section(name.to_string());
-        if let Some(Held::Bytes(v)) = self.cache.get(self.id, &k) {
-            return Ok(v);
-        }
         let s = self
             .toc
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("part has no section {name}"))?
             .clone();
+        let k = Kind::Section(name.to_string());
+        if let Some(Held::Bytes(v)) = self.cache.get(self.id, &k) {
+            crate::io_trace::part_section(self.id, name, true, s.stored, s.raw);
+            return Ok(v);
+        }
         let mut buf = vec![0u8; s.stored as usize];
         self.f.read_exact_at(&mut buf, s.off)?;
         let raw = crate::fold::codec::decode(s.codec, &buf, s.raw, None)?;
         let arc = Arc::new(raw);
         self.cache.put(self.id, k, Held::Bytes(arc.clone()));
+        crate::io_trace::part_section(self.id, name, false, s.stored, s.raw);
         Ok(arc)
     }
 

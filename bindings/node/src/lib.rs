@@ -246,6 +246,20 @@ pub struct NativeScanRow {
 }
 
 #[napi(object)]
+pub struct NativeScanIoStats {
+    pub part_sections_touched: BigInt,
+    pub part_section_cache_hits: BigInt,
+    pub part_section_cache_misses: BigInt,
+    pub part_stored_bytes_read: BigInt,
+    pub part_raw_bytes_decoded: BigInt,
+    pub fold_blocks_touched: BigInt,
+    pub fold_block_cache_hits: BigInt,
+    pub fold_block_cache_misses: BigInt,
+    pub fold_stored_bytes_read: BigInt,
+    pub fold_raw_bytes_decoded: BigInt,
+}
+
+#[napi(object)]
 pub struct NativeScanStats {
     pub examined: u32,
     pub returned: u32,
@@ -253,6 +267,7 @@ pub struct NativeScanStats {
     pub content_values_reconstructed: u32,
     pub reconstructed_bytes: BigInt,
     pub reconstruction_budget_exhausted: bool,
+    pub io: NativeScanIoStats,
 }
 
 #[napi(object)]
@@ -1839,6 +1854,18 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
             content_values_reconstructed: page.stats.content_values_reconstructed as u32,
             reconstructed_bytes: BigInt::from(page.stats.reconstructed_bytes),
             reconstruction_budget_exhausted: page.stats.reconstruction_budget_exhausted,
+            io: NativeScanIoStats {
+                part_sections_touched: BigInt::from(page.stats.io.part_sections_touched as u64),
+                part_section_cache_hits: BigInt::from(page.stats.io.part_section_cache_hits),
+                part_section_cache_misses: BigInt::from(page.stats.io.part_section_cache_misses),
+                part_stored_bytes_read: BigInt::from(page.stats.io.part_stored_bytes_read),
+                part_raw_bytes_decoded: BigInt::from(page.stats.io.part_raw_bytes_decoded),
+                fold_blocks_touched: BigInt::from(page.stats.io.fold_blocks_touched as u64),
+                fold_block_cache_hits: BigInt::from(page.stats.io.fold_block_cache_hits),
+                fold_block_cache_misses: BigInt::from(page.stats.io.fold_block_cache_misses),
+                fold_stored_bytes_read: BigInt::from(page.stats.io.fold_stored_bytes_read),
+                fold_raw_bytes_decoded: BigInt::from(page.stats.io.fold_raw_bytes_decoded),
+            },
         },
     }
 }

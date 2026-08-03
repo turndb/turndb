@@ -42,8 +42,11 @@ silently.
   admits one oversized row so paging can progress, and sets `reconstructionBudgetExhausted` when the
   continuation resumes at a row deferred by the ceiling. Metadata-only projections spend zero bytes.
   Committed rows decode only attribute/content columns used by the projection or predicates; sibling
-  value, dictionary, and content-program sections remain unopened. See
-  [projected structured scans](../../docs/projected-structured-scan.md).
+  value, dictionary, and content-program sections remain unopened. Every successful page's `stats.io`
+  reports exact operation-local part sections and fold blocks touched, cache access counts, and
+  stored/raw bytes as `bigint`; concurrent snapshots cannot contaminate those numbers. See
+  [projected structured scans](../../docs/projected-structured-scan.md) and
+  [structured scan I/O statistics](../../docs/structured-scan-io.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.

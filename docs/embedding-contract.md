@@ -181,11 +181,14 @@ writer's memtable remains an in-memory newest overlay. Shared layout/metadata se
 but sibling value/dictionary/program sections stay unopened. See
 `docs/projected-structured-scan.md`.
 
-**Current gaps:** committed candidates are still point-located rather than consumed by a batched
-physical column range walk; scan statistics do not yet report section bytes or distinct fold blocks.
-The `max_examined` budget counts
-live records evaluated against predicates, not superseded physical rows encountered while resolving
-them.
+Each successful page now carries exact operation-local `stats.io` evidence: distinct raw part
+sections and fold blocks touched, cache hit/miss access counts, backing-reader stored bytes, and raw
+bytes decoded. The collector is scoped below shared caches, so concurrent snapshots cannot
+contaminate one another through global counter deltas. See `docs/structured-scan-io.md`.
+
+**Current gap:** committed candidates are still point-located rather than consumed by a batched
+physical column range walk. The `max_examined` budget counts live records evaluated against
+predicates, not superseded physical rows encountered while resolving them.
 
 ## 5. Platform capabilities
 
@@ -298,8 +301,9 @@ ceilings bound input work, not elapsed time or temporary disk usage. See
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
 memtable entries and bytes, WAL and fold disk bytes, fold and part cache counters/budgets, Tier-0 dedup
 window entries, retained commits, and punched blocks. No record or content is decoded. Latency
-histograms, slow-query events, query section/block I/O, dedup ratios, reclaimable-byte estimation, and
-export hooks remain Phase-5 work; consumers may poll this generic value into their telemetry system.
+histograms, slow-query events, dedup ratios, reclaimable-byte estimation, and export hooks remain
+Phase-5 work; consumers may poll this generic value into their telemetry system. Structured pages
+separately expose exact section/block I/O attributable to that operation.
 
 ## 7. Compatibility policy
 

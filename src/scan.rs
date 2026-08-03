@@ -144,6 +144,30 @@ pub struct ScanRow {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanIoStats {
+    /// Distinct `(part, section)` pairs opened through the raw-section cache during this page.
+    pub part_sections_touched: usize,
+    /// Raw-section cache accesses served without part-file I/O.
+    pub part_section_cache_hits: u64,
+    /// Raw-section cache accesses that read and decoded a part-file section.
+    pub part_section_cache_misses: u64,
+    /// Compressed part section bytes physically read on this page's cache misses.
+    pub part_stored_bytes_read: u64,
+    /// Uncompressed part section bytes produced on this page's cache misses.
+    pub part_raw_bytes_decoded: u64,
+    /// Distinct fold block ids containing pieces consulted during content reconstruction.
+    pub fold_blocks_touched: usize,
+    /// Stored fold block accesses served from the decompressed block cache.
+    pub fold_block_cache_hits: u64,
+    /// Stored fold block accesses that read and decoded a frame.
+    pub fold_block_cache_misses: u64,
+    /// Complete fold frame bytes physically read on this page's cache misses.
+    pub fold_stored_bytes_read: u64,
+    /// Uncompressed fold block bytes produced on this page's cache misses.
+    pub fold_raw_bytes_decoded: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
     pub examined: usize,
     pub returned: usize,
@@ -153,6 +177,8 @@ pub struct ScanStats {
     /// A matching row was deliberately left for the next page because adding all of its selected
     /// content bytes would have crossed the request's reconstruction ceiling.
     pub reconstruction_budget_exhausted: bool,
+    /// Exact operation-local storage reads. Shared cache activity from other scans is excluded.
+    pub io: ScanIoStats,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -240,6 +266,7 @@ pub(crate) fn scan_read_store(store: &ReadStore, request: &ScanRequest) -> Resul
 fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     validate(request)?;
     check_interruption(request)?;
+    let read_trace = crate::io_trace::ReadTraceScope::start();
     let fingerprint = fingerprint(request);
     let cursor = request
         .cursor
@@ -403,6 +430,19 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
 
     check_interruption(request)?;
     stats.returned = rows.len();
+    let trace = read_trace.finish();
+    stats.io = ScanIoStats {
+        part_sections_touched: trace.part_sections_touched(),
+        part_section_cache_hits: trace.part_section_cache_hits,
+        part_section_cache_misses: trace.part_section_cache_misses,
+        part_stored_bytes_read: trace.part_stored_bytes_read,
+        part_raw_bytes_decoded: trace.part_raw_bytes_decoded,
+        fold_blocks_touched: trace.fold_blocks_touched(),
+        fold_block_cache_hits: trace.fold_block_cache_hits,
+        fold_block_cache_misses: trace.fold_block_cache_misses,
+        fold_stored_bytes_read: trace.fold_stored_bytes_read,
+        fold_raw_bytes_decoded: trace.fold_raw_bytes_decoded,
+    };
     let next = if has_more {
         last_consumed
             .map(|last| encode_cursor(request.direction, fingerprint, &last))
