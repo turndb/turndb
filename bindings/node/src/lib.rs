@@ -302,6 +302,7 @@ pub struct NativeCapabilities {
     pub format_migration: bool,
     pub operation_metrics: bool,
     pub part_distribution: bool,
+    pub content_liveness: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -358,6 +359,7 @@ pub fn capabilities() -> NativeCapabilities {
         format_migration: c.format_migration,
         operation_metrics: c.operation_metrics,
         part_distribution: c.part_distribution,
+        content_liveness: c.content_liveness,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -685,6 +687,23 @@ pub struct NativePartDistribution {
     pub p50_rows: BigInt,
     pub p95_rows: BigInt,
     pub max_rows: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeFoldBlockSpace {
+    pub blocks: BigInt,
+    pub raw_bytes: BigInt,
+    pub stored_bytes: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeContentLiveness {
+    pub live_pieces: BigInt,
+    pub live_logical_bytes: BigInt,
+    pub dead_logical_bytes: BigInt,
+    pub stranded_dead_logical_bytes: BigInt,
+    pub live_blocks: NativeFoldBlockSpace,
+    pub reclaimable_blocks: NativeFoldBlockSpace,
 }
 
 #[napi(object)]
@@ -1636,6 +1655,24 @@ impl NativeStore {
                 .await
                 .map(encode_part_distribution)
                 .map_err(|error| engine_failure("measure TurnDB part distribution", error))
+        })
+    }
+
+    /// Inspect exact live, dead, and block-reclaimable folded content.
+    #[napi]
+    pub fn content_liveness<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeContentLiveness>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .content_liveness(control)
+                .await
+                .map(encode_content_liveness)
+                .map_err(|error| engine_failure("inspect TurnDB content liveness", error))
         })
     }
 
@@ -2618,6 +2655,24 @@ fn encode_part_distribution(
         p50_rows: BigInt::from(distribution.p50_rows),
         p95_rows: BigInt::from(distribution.p95_rows),
         max_rows: BigInt::from(distribution.max_rows),
+    }
+}
+
+fn encode_content_liveness(
+    liveness: turndb::observability::ContentLiveness,
+) -> NativeContentLiveness {
+    let encode_space = |space: turndb::observability::FoldBlockSpace| NativeFoldBlockSpace {
+        blocks: BigInt::from(space.blocks),
+        raw_bytes: BigInt::from(space.raw_bytes),
+        stored_bytes: BigInt::from(space.stored_bytes),
+    };
+    NativeContentLiveness {
+        live_pieces: BigInt::from(liveness.live_pieces),
+        live_logical_bytes: BigInt::from(liveness.live_logical_bytes),
+        dead_logical_bytes: BigInt::from(liveness.dead_logical_bytes),
+        stranded_dead_logical_bytes: BigInt::from(liveness.stranded_dead_logical_bytes),
+        live_blocks: encode_space(liveness.live_blocks),
+        reclaimable_blocks: encode_space(liveness.reclaimable_blocks),
     }
 }
 

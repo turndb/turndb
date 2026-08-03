@@ -27,6 +27,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.format_migration, true);
   assert.equal(c.operation_metrics, true);
   assert.equal(c.part_distribution, true);
+  assert.equal(c.content_liveness, true);
   assert.equal(c.max_record_bytes_default, 64 << 20);
   assert.equal(c.max_batch_bytes_default, 256 << 20);
   assert.equal(c.max_batch_records_default, 4096);

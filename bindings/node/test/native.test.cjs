@@ -38,6 +38,7 @@ test('reports the native capability profile without a portable fallback', () => 
     formatMigration: true,
     operationMetrics: true,
     partDistribution: true,
+    contentLiveness: true,
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -1086,6 +1087,13 @@ test('reports cheap health across staging and publication', async (t) => {
   assert(distribution.totalBytes > 0n);
   assert.equal(distribution.minBytes, distribution.maxBytes);
   assert.equal(distribution.p50Rows, 1n);
+  const liveness = await store.contentLiveness();
+  assert.equal(liveness.livePieces, 1n);
+  assert(liveness.liveLogicalBytes > 0n);
+  assert.equal(liveness.deadLogicalBytes, 0n);
+  assert.equal(liveness.strandedDeadLogicalBytes, 0n);
+  assert.equal(liveness.liveBlocks.blocks, 1n);
+  assert.equal(liveness.reclaimableBlocks.blocks, 0n);
 
   fs.writeFileSync(path.join(dir, 'operator-note'), 'not owned by TurnDB');
   const space = await store.spaceUsage();
@@ -1114,6 +1122,10 @@ test('reports cheap health across staging and publication', async (t) => {
   cancelled.abort();
   await assert.rejects(
     store.spaceUsage({ signal: cancelled.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  await assert.rejects(
+    store.contentLiveness({ signal: cancelled.signal }),
     (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
   );
 });

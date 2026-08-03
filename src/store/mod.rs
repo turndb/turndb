@@ -1569,6 +1569,78 @@ impl Store {
         })
     }
 
+    /// Inspect exact live, dead, and block-reclaimable folded content for a settled snapshot.
+    ///
+    /// This walks visible record programs and reads each fold block header, but never decompresses
+    /// content. A flushed memtable is required so unpublished references cannot make dead content
+    /// appear safe to reclaim.
+    pub fn content_liveness(&self) -> Result<crate::observability::ContentLiveness> {
+        self.content_liveness_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::content_liveness`] with cooperative record and block checkpoints.
+    pub fn content_liveness_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<crate::observability::ContentLiveness> {
+        control.check("content liveness")?;
+        if !self.mem.is_empty() {
+            bail!("content liveness requires a flushed memtable; call sync() and flush() first");
+        }
+        let live_pieces = self.live_fold_pieces_with_control(control)?;
+        let live_block_ids: HashSet<u32> =
+            live_pieces.values().map(|location| location.block_id).collect();
+        let mut report = crate::observability::ContentLiveness {
+            live_pieces: u64::try_from(live_pieces.len())
+                .map_err(|_| anyhow::anyhow!("live piece count exceeds u64"))?,
+            ..crate::observability::ContentLiveness::default()
+        };
+        for location in live_pieces.values() {
+            report.live_logical_bytes = report
+                .live_logical_bytes
+                .checked_add(u64::from(location.raw))
+                .ok_or_else(|| anyhow::anyhow!("live content byte count overflow"))?;
+        }
+
+        let inventory = self.fold.block_inventory_with_control(control)?;
+        let punched = |block_id: u32| {
+            self.manifest.punched.iter().any(|&(lo, hi)| (lo..=hi).contains(&block_id))
+        };
+        let mut observed_live_blocks = HashSet::new();
+        for block in inventory {
+            control.check("content liveness")?;
+            if punched(block.block_id) {
+                continue;
+            }
+            if live_block_ids.contains(&block.block_id) {
+                report
+                    .live_blocks
+                    .checked_observe(block.raw_bytes, block.stored_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("live block space count overflow"))?;
+                observed_live_blocks.insert(block.block_id);
+            } else {
+                report
+                    .reclaimable_blocks
+                    .checked_observe(block.raw_bytes, block.stored_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("reclaimable block space count overflow"))?;
+            }
+        }
+        if observed_live_blocks != live_block_ids {
+            let missing = live_block_ids.difference(&observed_live_blocks).next().copied().unwrap();
+            bail!("live content references block {missing}, which is absent or declared punched");
+        }
+        report.stranded_dead_logical_bytes =
+            report.live_blocks.raw_bytes.checked_sub(report.live_logical_bytes).ok_or_else(
+                || anyhow::anyhow!("live piece bytes exceed their containing block bytes"),
+            )?;
+        report.dead_logical_bytes = report
+            .reclaimable_blocks
+            .raw_bytes
+            .checked_add(report.stranded_dead_logical_bytes)
+            .ok_or_else(|| anyhow::anyhow!("dead content byte count overflow"))?;
+        Ok(report)
+    }
+
     /// Open for reading only: no lock, no replay, no daemon.
     ///
     /// Sees exactly the committed manifest — uncommitted records in some writer's memtable are
@@ -3060,6 +3132,44 @@ impl Store {
         Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: Some(refold) })
     }
 
+    fn live_fold_pieces_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<HashMap<PieceHash, Loc>> {
+        let visible = read::visibility(&self.parts)?;
+        let mut pieces: HashMap<PieceHash, Loc> = HashMap::new();
+        for (part_index, rows) in visible.rows.iter().enumerate() {
+            for &row in rows {
+                control.check("content reachability")?;
+                for content in self.parts[part_index].record(row)?.contents {
+                    for operation in content.ops {
+                        let BodyOp::Piece { hash, len } = operation else { continue };
+                        if let Some(existing) = pieces.get(&hash) {
+                            if existing.raw != len {
+                                bail!(
+                                    "live piece {hash} has inconsistent lengths {} and {len}",
+                                    existing.raw
+                                );
+                            }
+                            continue;
+                        }
+                        let location = self.locate(&hash)?.ok_or_else(|| {
+                            anyhow::anyhow!("live record references absent piece {hash}")
+                        })?;
+                        if location.raw != len {
+                            bail!(
+                                "live piece {hash} is {} bytes but its record says {len}",
+                                location.raw
+                            );
+                        }
+                        pieces.insert(hash, location);
+                    }
+                }
+            }
+        }
+        Ok(pieces)
+    }
+
     /// Reclaim erased space IN PLACE: punch every fold block no live record can reach.
     ///
     /// The cheap half of erasure, and the one a sealed store wants. A re-fold reclaims the same
@@ -3103,21 +3213,11 @@ impl Store {
             bail!("punching requires a flushed memtable; call sync() and flush() first");
         }
         // Every block a live record can still reach, via the piece dictionaries of live rows.
-        let visible = read::visibility(&self.parts)?;
-        let mut live_blocks: HashSet<u32> = HashSet::new();
-        for (pi, rows) in visible.rows.iter().enumerate() {
-            for &row in rows {
-                control.check("content punching")?;
-                for content in self.parts[pi].record(row)?.contents {
-                    for op in content.ops {
-                        let BodyOp::Piece { hash, .. } = op else { continue };
-                        if let Some(loc) = self.locate(&hash)? {
-                            live_blocks.insert(loc.block_id);
-                        }
-                    }
-                }
-            }
-        }
+        let live_blocks: HashSet<u32> = self
+            .live_fold_pieces_with_control(control)?
+            .values()
+            .map(|location| location.block_id)
+            .collect();
         // ... against every block the fold holds.
         let mut dead: Vec<u32> =
             self.fold.block_ids().into_iter().filter(|b| !live_blocks.contains(b)).collect();

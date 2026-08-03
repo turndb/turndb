@@ -1096,6 +1096,41 @@ impl Fold {
         self.blockdir.iter().enumerate().filter_map(|(id, e)| e.map(|_| id as u32)).collect()
     }
 
+    /// Read the framing facts for every block the current directory can address.
+    ///
+    /// This deliberately reads headers only: callers can classify compressed storage without
+    /// decompressing content or warming the block cache. Blocks declared punched may still appear
+    /// here after reopen because sealed-segment sidecars preserve their framing locations; the
+    /// store layer owns that manifest-level classification.
+    pub(crate) fn block_inventory_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Vec<BlockStorage>> {
+        let mut inventory = Vec::new();
+        for (id, entry) in self.blockdir.iter().enumerate() {
+            control.check("fold block inventory")?;
+            let Some((seg, off)) = *entry else { continue };
+            let id = u32::try_from(id).map_err(|_| anyhow::anyhow!("block id exceeds u32"))?;
+            let reader = self.readers.get(seg as usize).ok_or_else(|| {
+                anyhow::anyhow!("block {id} names segment {seg} which does not exist")
+            })?;
+            let mut bytes = [0u8; block::BLOCK_HDR_LEN];
+            reader
+                .read_exact_at(&mut bytes, u64::from(off))
+                .with_context(|| format!("read block {id} header at seg {seg} off {off}"))?;
+            let header = block::parse_hdr(&bytes, self.headers[seg as usize].has_dict())?;
+            if header.block_id != id {
+                bail!("directory sent block {id} to a frame carrying id {}", header.block_id);
+            }
+            inventory.push(BlockStorage {
+                block_id: id,
+                raw_bytes: header.raw,
+                stored_bytes: header.stored,
+            });
+        }
+        Ok(inventory)
+    }
+
     pub fn segment_count(&self) -> u32 {
         self.headers.len() as u32
     }
@@ -1163,6 +1198,13 @@ impl Fold {
         self.cur_off = SEG_HDR_LEN as u32;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockStorage {
+    pub block_id: u32,
+    pub raw_bytes: u32,
+    pub stored_bytes: u32,
 }
 
 /// Compression threads: 0 means one per core.

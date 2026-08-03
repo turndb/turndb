@@ -195,6 +195,10 @@ enum Command {
         control: OperationControl,
         reply: oneshot::Sender<Result<turndb::observability::PartDistribution>>,
     },
+    ContentLiveness {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<turndb::observability::ContentLiveness>>,
+    },
     SpaceUsage {
         control: OperationControl,
         reply: oneshot::Sender<Result<turndb::store::StoreSpaceUsage>>,
@@ -417,6 +421,13 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::PartDistribution { control, reply })?).await
     }
 
+    pub async fn content_liveness(
+        &self,
+        control: OperationControl,
+    ) -> Result<turndb::observability::ContentLiveness> {
+        Self::receive(self.submit(|reply| Command::ContentLiveness { control, reply })?).await
+    }
+
     pub async fn space_usage(
         &self,
         control: OperationControl,
@@ -548,6 +559,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::PartDistribution { control, reply } => {
                 let _ = reply.send(store.part_distribution_with_control(&control));
+            }
+            Command::ContentLiveness { control, reply } => {
+                let _ = reply.send(store.content_liveness_with_control(&control));
             }
             Command::SpaceUsage { control, reply } => {
                 let _ = reply.send(store.space_usage_with_control(&control));

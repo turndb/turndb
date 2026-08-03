@@ -141,6 +141,10 @@ silently.
   core execution time. Folded-content counters expose exact piece hits/logical/novel bytes, and
   `partDistribution(options)` reports live immutable-part byte/row order statistics. See
   [pull-based operation metrics](../../docs/operation-metrics.md).
+- `contentLiveness(options)` walks visible record programs and fold headers to separate unique live
+  piece bytes, dead bytes stranded inside mixed compressed blocks, and wholly unreferenced block
+  payload eligible for punch/refold. It requires a flushed memtable and accepts cancellation; see
+  [content liveness and reclamation](../../docs/content-liveness.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to

@@ -97,3 +97,38 @@ pub struct PartDistribution {
     pub p95_rows: u64,
     pub max_rows: u64,
 }
+
+/// Compressed-block storage occupied by one content-liveness class.
+///
+/// `raw_bytes` is decompressed fold content and `stored_bytes` is compressed payload length. Frame
+/// headers/checksums and filesystem allocation granularity are intentionally excluded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FoldBlockSpace {
+    pub blocks: u64,
+    pub raw_bytes: u64,
+    pub stored_bytes: u64,
+}
+
+impl FoldBlockSpace {
+    pub(crate) fn checked_observe(&mut self, raw_bytes: u32, stored_bytes: u32) -> Option<()> {
+        self.blocks = self.blocks.checked_add(1)?;
+        self.raw_bytes = self.raw_bytes.checked_add(u64::from(raw_bytes))?;
+        self.stored_bytes = self.stored_bytes.checked_add(u64::from(stored_bytes))?;
+        Some(())
+    }
+}
+
+/// Exact content reachability for a settled store snapshot.
+///
+/// A live block contains at least one piece referenced by a currently visible record. Reclaimable
+/// blocks contain no live pieces and can be removed by punching or refold. Dead bytes inside a live
+/// block are stranded until refold because block compression makes the block the reclamation unit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentLiveness {
+    pub live_pieces: u64,
+    pub live_logical_bytes: u64,
+    pub dead_logical_bytes: u64,
+    pub stranded_dead_logical_bytes: u64,
+    pub live_blocks: FoldBlockSpace,
+    pub reclaimable_blocks: FoldBlockSpace,
+}

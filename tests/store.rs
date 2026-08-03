@@ -2483,6 +2483,67 @@ fn space_usage_separates_live_retained_and_unclassified_files_without_double_cou
 }
 
 #[test]
+fn content_liveness_separates_stranded_dead_bytes_from_whole_reclaimable_blocks() {
+    let dir = tmp("content-liveness");
+    let mut store =
+        Store::open(&dir, FoldCfg { block_target: 8, compress_threads: 1, ..Default::default() })
+            .unwrap();
+    let a = b"aaaa";
+    let b = b"bbbb";
+    let c = b"cccc";
+    let d = b"dddd";
+    store.put("mixed", &[Span::Piece(a), Span::Piece(b)], Vec::new()).unwrap();
+    store.put("gone", &[Span::Piece(c), Span::Piece(d)], Vec::new()).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    // Keep one piece from the first block and remove the second block's only visible record.
+    store.put("mixed", &[Span::Piece(a)], Vec::new()).unwrap();
+    store.delete("gone").unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.merge_range(0, store.part_count()).unwrap().unwrap();
+
+    let liveness = store.content_liveness().unwrap();
+    assert_eq!(liveness.live_pieces, 1);
+    assert_eq!(liveness.live_logical_bytes, 4);
+    assert_eq!(liveness.live_blocks.blocks, 1);
+    assert_eq!(liveness.live_blocks.raw_bytes, 8);
+    assert!(liveness.live_blocks.stored_bytes > 0);
+    assert_eq!(liveness.stranded_dead_logical_bytes, 4);
+    assert_eq!(liveness.reclaimable_blocks.blocks, 1);
+    assert_eq!(liveness.reclaimable_blocks.raw_bytes, 8);
+    assert!(liveness.reclaimable_blocks.stored_bytes > 0);
+    assert_eq!(liveness.dead_logical_bytes, 12);
+
+    store.refold().unwrap();
+    let rewritten = store.content_liveness().unwrap();
+    assert_eq!(rewritten.live_pieces, 1);
+    assert_eq!(rewritten.live_logical_bytes, 4);
+    assert_eq!(rewritten.live_blocks.raw_bytes, 4);
+    assert_eq!(rewritten.dead_logical_bytes, 0);
+    assert_eq!(rewritten.stranded_dead_logical_bytes, 0);
+    assert_eq!(rewritten.reclaimable_blocks.blocks, 0);
+
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .content_liveness_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<turndb::control::OperationInterrupted>().is_some(),
+        "content inventory cancellation must remain typed: {error:#}"
+    );
+
+    store.put("unsettled", &[Span::Piece(b"eeee")], Vec::new()).unwrap();
+    assert!(store.content_liveness().unwrap_err().to_string().contains("flushed memtable"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     let dir = tmp("lifecycle-metrics");
     {

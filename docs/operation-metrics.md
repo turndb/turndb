@@ -33,6 +33,10 @@ because they read every live part's file metadata. They report exact total/min/p
 and physical rows using nearest-rank order statistics. All values are zero for an empty store, with
 `parts` disambiguating emptiness. The call accepts cancellation/deadlines and does not decode rows.
 
+Exact content reachability is likewise a separate, potentially expensive snapshot. See
+`content-liveness.md` for the distinction between dead logical bytes, dead bytes stranded inside a
+live compressed block, and whole-block payload that punch/refold can reclaim.
+
 Durations cover core execution on the writer thread. They deliberately exclude time waiting in the
 Node actor queue; lifecycle deadlines remain submission-inclusive and therefore separately express
 queue pressure. Query and structured-scan work keeps its operation-local row, resolution, section,

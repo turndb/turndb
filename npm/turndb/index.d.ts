@@ -108,6 +108,7 @@ export interface Capabilities {
   format_migration: true;
   operation_metrics: true;
   part_distribution: true;
+  content_liveness: true;
   max_record_bytes_default: number;
   max_batch_bytes_default: number;
   max_batch_records_default: number;

@@ -44,6 +44,7 @@ pub struct Capabilities {
     pub format_migration: bool,
     pub operation_metrics: bool,
     pub part_distribution: bool,
+    pub content_liveness: bool,
     pub max_record_bytes_default: u64,
     pub max_batch_bytes_default: u64,
     pub max_batch_records_default: usize,
@@ -76,6 +77,7 @@ pub const fn capabilities() -> Capabilities {
         format_migration: true,
         operation_metrics: true,
         part_distribution: true,
+        content_liveness: true,
         max_record_bytes_default: crate::store::DEFAULT_MAX_RECORD_BYTES,
         max_batch_bytes_default: crate::store::DEFAULT_MAX_BATCH_BYTES,
         max_batch_records_default: crate::store::DEFAULT_MAX_BATCH_RECORDS,
@@ -98,5 +100,6 @@ mod tests {
         assert!(c.format_migration);
         assert!(c.operation_metrics);
         assert!(c.part_distribution);
+        assert!(c.content_liveness);
     }
 }
