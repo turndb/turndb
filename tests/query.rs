@@ -507,7 +507,24 @@ async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
     assert_eq!(ids, ["c"]);
     assert!(query.is_finished());
     assert!(query.next().await.unwrap().is_none(), "end of stream is stable");
-    assert!(query.stats().rows > 0);
+    let timing = query.stats();
+    assert!(timing.rows > 0);
+    assert!(timing.planning_duration_ns > 0);
+    assert!(timing.execution_duration_ns > 0);
+
+    let mut explanation = SqlQuery::open(
+        reader.clone(),
+        "EXPLAIN SELECT id FROM records WHERE tokens > 1",
+        vec![],
+        SqlOptions::default(),
+    )
+    .await
+    .unwrap();
+    let mut explanation_rows = 0;
+    while let Some(batch) = explanation.next().await.unwrap() {
+        explanation_rows += batch.rows;
+    }
+    assert!(explanation_rows > 0, "read-only SQL EXPLAIN must return DataFusion's plans");
 
     let mut starved = SqlQuery::open(
         reader.clone(),

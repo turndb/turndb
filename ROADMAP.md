@@ -497,7 +497,11 @@ that evidence is sent.
   sequence-numbered, non-destructive journal exposes operation, outcome, stable error class, and
   duration with explicit cursor-gap/eviction accounting. Threshold-derived health events remain a
   consumer policy; additional engine state transitions can extend the same generic journal.
-- Slow-query reporting and query plans suitable for diagnosis.
+- Slow-query reporting and query plans suitable for diagnosis. **Implemented as policy-neutral
+  evidence:** structured pages report complete execution nanoseconds and share their request
+  preparer with `explainScan`; SQL reports successful planning/stream-start and cumulative active
+  pull/IPC time separately, while read-only `EXPLAIN` returns DataFusion logical/physical plans.
+  Consumers choose slow thresholds and retain statements/correlation outside the core.
 - Configurable resource budgets and overload behavior.
 - A health snapshot API suitable for an embedding application's health endpoint.
 - Hooks through which a consumer can export OpenTelemetry without introducing OTel into the storage

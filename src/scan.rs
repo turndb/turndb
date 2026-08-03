@@ -261,6 +261,8 @@ pub struct ScanResolutionStats {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
+    /// Complete successful page execution, including validation and cursor preparation.
+    pub duration_ns: u64,
     pub examined: usize,
     pub returned: usize,
     pub shadowed_attr_occurrences: usize,
@@ -583,6 +585,7 @@ fn explain_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanExpl
 }
 
 fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
+    let started = std::time::Instant::now();
     let prepared = prepare(request)?;
     let read_trace = crate::io_trace::ReadTraceScope::start();
     let PreparedScan {
@@ -595,7 +598,11 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         content_needed,
     } = prepared;
     if matches!((&from, &to), (Some(a), Some(b)) if a >= b) {
-        return Ok(ScanPage { rows: Vec::new(), next: None, stats: ScanStats::default() });
+        let stats = ScanStats {
+            duration_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            ..ScanStats::default()
+        };
+        return Ok(ScanPage { rows: Vec::new(), next: None, stats });
     }
     let needs_record = !attr_needed.is_empty() || !content_needed.is_empty();
     let mut rows = Vec::with_capacity(request.limit);
@@ -789,6 +796,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     } else {
         None
     };
+    stats.duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     Ok(ScanPage { rows, next, stats })
 }
 

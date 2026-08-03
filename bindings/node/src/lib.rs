@@ -173,6 +173,7 @@ pub struct NativeScanResolutionStats {
 
 #[napi(object)]
 pub struct NativeScanStats {
+    pub duration_ns: BigInt,
     pub examined: u32,
     pub returned: u32,
     pub shadowed_attr_occurrences: u32,
@@ -262,6 +263,8 @@ pub struct NativeSqlNextOptions {
 #[cfg(feature = "sql")]
 #[napi(object)]
 pub struct NativeSqlStats {
+    pub planning_duration_ns: BigInt,
+    pub execution_duration_ns: BigInt,
     pub rows: BigInt,
     pub batches: BigInt,
     pub columns_decoded: BigInt,
@@ -305,6 +308,8 @@ pub struct NativeCapabilities {
     pub content_liveness: bool,
     pub lifecycle_event_journal: bool,
     pub lifecycle_event_capacity: u32,
+    pub query_timings: bool,
+    pub sql_explain: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -364,6 +369,8 @@ pub fn capabilities() -> NativeCapabilities {
         content_liveness: c.content_liveness,
         lifecycle_event_journal: c.lifecycle_event_journal,
         lifecycle_event_capacity: c.lifecycle_event_capacity as u32,
+        query_timings: c.query_timings,
+        sql_explain: c.sql_explain,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -2359,6 +2366,7 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
         rows: page.rows.into_iter().map(encode_row).collect(),
         next: page.next,
         stats: NativeScanStats {
+            duration_ns: BigInt::from(page.stats.duration_ns),
             examined: page.stats.examined as u32,
             returned: page.stats.returned as u32,
             shadowed_attr_occurrences: page.stats.shadowed_attr_occurrences as u32,
@@ -2444,6 +2452,8 @@ fn encode_scan_explanation(explanation: ScanExplanation) -> NativeScanExplanatio
 #[cfg(feature = "sql")]
 fn encode_sql_stats(stats: turndb::query::ScanStats) -> NativeSqlStats {
     NativeSqlStats {
+        planning_duration_ns: BigInt::from(stats.planning_duration_ns),
+        execution_duration_ns: BigInt::from(stats.execution_duration_ns),
         rows: BigInt::from(stats.rows as u64),
         batches: BigInt::from(stats.batches as u64),
         columns_decoded: BigInt::from(stats.columns_decoded as u64),

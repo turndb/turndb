@@ -56,7 +56,8 @@ Rust exposes `ScanIoStats` under `ScanStats::io`. The native Node binding expose
 in camel case and uses `bigint` for every value. Counts are represented as `bigint` too, avoiding a
 future precision split between counters and byte totals.
 
-These metrics describe the storage-native structured pager. They do not instrument SQL execution,
-report elapsed time, measure OS-level I/O, or replace the constant-work whole-store health snapshot.
+These metrics describe the storage-native structured pager. `durationNs` separately reports complete
+successful page execution, including validation and cursor preparation but excluding native actor
+queue wait. They do not instrument SQL execution, measure OS-level I/O, or replace the constant-work whole-store health snapshot.
 `explain_scan` separately describes logical requirements and pre-resolution physical scope; its own
 id-structure reads are not returned as page I/O statistics and may warm caches before a later page.

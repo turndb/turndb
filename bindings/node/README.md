@@ -150,6 +150,10 @@ silently.
   operation/outcome/error-class/duration facts. Sequence gaps and cumulative eviction are explicit,
   so independent exporters can detect loss; see
   [bounded lifecycle events](../../docs/lifecycle-events.md).
+- Structured scan stats include `durationNs`; SQL stats separately expose
+  `planningDurationNs` and cumulative active `executionDurationNs`. Read-only SQL `EXPLAIN` streams
+  DataFusion's plan as ordinary Arrow IPC. TurnDB supplies evidence and leaves slow thresholds to the
+  consumer.
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to

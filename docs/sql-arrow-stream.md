@@ -61,4 +61,11 @@ facts without claiming to measure total process RSS.
 Query statistics accompany each batch and remain available from `stats()`: storage rows and batches,
 attribute columns decoded, fold reads, rows rejected or hidden, batches skipped, and duplicate
 attribute occurrences shadowed by the flat columnar view. They describe the TurnDB table scan rather
-than pretending to be complete DataFusion operator metrics.
+than pretending to be complete DataFusion operator metrics. `planningDurationNs` measures successful
+planning plus stream startup. `executionDurationNs` accumulates only time actively awaiting and IPC
+encoding pulls, excluding consumer idle time between calls; a consumer chooses its own slow threshold.
+
+Read-only `EXPLAIN SELECT ...` uses the same parameterized SQL boundary and returns DataFusion's plan
+rows through ordinary Arrow IPC. `EXPLAIN ANALYZE` executes the underlying read and should be used
+only when the caller deliberately wants runtime operator evidence. TurnDB does not log SQL text,
+attach trace correlation, or choose a slow-query threshold in core.
