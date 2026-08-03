@@ -29,6 +29,7 @@ test('reports the native capability profile without a portable fallback', () => 
     napiVersion: 6,
     commandQueueCapacity: 64,
     immutableSnapshots: true,
+    lifecycleOperations: true,
   });
 });
 
@@ -224,4 +225,50 @@ test('classifies writer contention without parsing prose in the consumer', async
     return true;
   });
   await store.close();
+});
+
+test('runs compaction verification and physical erasure through the actor', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  for (let part = 0; part < 3; part++) {
+    await store.write([{
+      kind: 'put',
+      id: `r${part}`,
+      contents: [{ name: 'payload', bytes: Buffer.from(`payload-${part}`) }],
+    }]);
+    assert.equal(await store.flush(), true);
+  }
+
+  const compact = await store.compact(true);
+  assert.equal(compact.partsBefore, 3n);
+  assert.equal(compact.partsAfter, 1n);
+  assert.equal(compact.merge.inputs, 3n);
+  assert.equal(compact.merge.recordsOut, 3n);
+  assert.equal(compact.merge.foldBytesTouched, 0n);
+
+  const verified = await store.verify();
+  assert.equal(verified.parts, 1n);
+  assert(verified.partSections > 0n);
+  assert(verified.partDigests > 0n);
+  assert(verified.foldBlocks > 0n);
+  assert.equal(verified.trailingUncommittedBytes, 0n);
+
+  const erased = await store.erase(['r1', 'never-existed']);
+  assert.equal(erased.requested, 2n);
+  assert.equal(erased.tombstoned, 1n);
+  assert.equal(erased.absent, 1n);
+  assert(erased.refold);
+  assert.equal(erased.refold.recordsKept, 2n);
+  assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['r0', 'r2']);
+  assert.equal(await store.readContent('r1', 'payload'), null);
+
+  const punched = await store.punch();
+  assert.equal(typeof punched.blocksExamined, 'bigint');
+  assert.equal(typeof punched.blocksPunched, 'bigint');
+  const refolded = await store.refold();
+  assert.equal(refolded.recordsKept, 2n);
+  assert.equal(typeof refolded.bytesReclaimed, 'bigint');
+  assert.equal((await store.verify()).parts, 1n);
 });

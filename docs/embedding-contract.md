@@ -201,15 +201,23 @@ manifest directly or request a commit still present in the bounded retained-mani
 path takes the writer lock or replays an unflushed WAL.
 
 **Current gaps:** queue depth is fixed; only the binding-owned failure classes and writer contention
-have stable machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, lifecycle
-maintenance, and prebuilt artifact selection are not exposed yet. The package is a tested source
-prototype and must not be described as a production distribution.
+have stable machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, backup/restore
+and recovery controls, and prebuilt artifact selection are not exposed yet. The package is a tested
+source prototype and must not be described as a production distribution.
 
 The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
 overload, closed handles, and writer contention. Contention is a typed `WriterLocked` condition in the
 Rust core; consumers do not match its message. Unknown core failures deliberately remain `INTERNAL`
 until their engine error variants exist. `NOT_FOUND`, `CORRUPTION`, and `IO` are reserved in the Node
 union but must not be assigned through message heuristics.
+
+Writer lifecycle commands are serialized with ingest. `compact`, `verify`, `punch`, and `refold`
+first sync and flush earlier writes, then operate on the resulting published cut. Verification covers
+the retained manifest hash chain and part pins, every live part section, and every fold frame; it is
+not a backup. `erase(ids)` invokes the engine's strong erasure composition and purges retained history.
+Its boundary remains this store: previously written packs, backups, replicas, and consumer exports are
+not affected. Backup/restore, manifest recovery, preflight space estimates, resumable maintenance, and
+cancellation remain current gaps.
 
 ## 7. Compatibility policy
 

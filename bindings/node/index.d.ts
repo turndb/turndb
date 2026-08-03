@@ -69,6 +69,31 @@ export interface Capabilities {
   napiVersion: 6;
   commandQueueCapacity: number;
   immutableSnapshots: true;
+  lifecycleOperations: true;
+}
+
+export interface MergeStats {
+  inputs: bigint;
+  recordsIn: bigint;
+  recordsOut: bigint;
+  superseded: bigint;
+  tombstonesKept: bigint;
+  tombstonesDropped: bigint;
+  foldBytesTouched: bigint;
+}
+
+export interface RefoldResult {
+  partsIn: bigint;
+  partsOut: bigint;
+  recordsKept: bigint;
+  recordsDropped: bigint;
+  tombstonesDropped: bigint;
+  piecesKept: bigint;
+  piecesDropped: bigint;
+  foldBytesBefore: bigint;
+  foldBytesAfter: bigint;
+  bytesReclaimed: bigint;
+  staleGenerationLeft: boolean;
 }
 
 export type TurnDbErrorCode =
@@ -106,5 +131,30 @@ export declare class NativeStore {
   scan(request?: ScanRequest): Promise<ScanPage>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   snapshot(): Promise<NativeSnapshot>;
+  compact(full?: boolean): Promise<{
+    flushed: boolean;
+    partsBefore: bigint;
+    partsAfter: bigint;
+    merge?: MergeStats;
+  }>;
+  verify(): Promise<{
+    manifestLinks: bigint;
+    partDigests: bigint;
+    undigestedParts: bigint;
+    parts: bigint;
+    partSections: bigint;
+    foldSegments: number;
+    foldBlocks: bigint;
+    foldBytes: bigint;
+    trailingUncommittedBytes: bigint;
+  }>;
+  erase(ids: string[]): Promise<{
+    requested: bigint;
+    tombstoned: bigint;
+    absent: bigint;
+    refold?: RefoldResult;
+  }>;
+  punch(): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
+  refold(): Promise<RefoldResult>;
   close(durable?: boolean): Promise<void>;
 }
