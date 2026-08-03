@@ -13,6 +13,17 @@ in parallel, but passing a later gate depends on passing the earlier ones.
 TurnDB is currently pre-1.0 and its format is not frozen. That is an opportunity to make the record and
 content model right before compatibility turns today's choices into permanent promises.
 
+## Progress on `codex/turn-maturity`
+
+- `553c59f` implements the first Phase-1 format slice: general named content in semantic records,
+  revision-2 WAL and sparse part columns, mixed-version reads, lifecycle propagation, and lazy
+  `content.<name>` query projection.
+- `docs/embedding-contract.md` records the Phase-0 architectural, consistency, compatibility,
+  capability, limit, and Rust-versus-binding decisions, including current gaps rather than presenting
+  them as completed guarantees.
+- The columnar lens is separated from DataFusion as the first Phase-2 seam. Writer memtable visibility
+  and the storage-native structured scan/cursor contract remain the next critical path.
+
 ## Product boundary
 
 TurnDB should own:

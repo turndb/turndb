@@ -77,6 +77,10 @@ s.flush()?;                                   // seal into an immutable part
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
 | **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
 
+The query layers are independently selectable: `--features columnar --no-default-features` provides
+the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same
+lens. Storage, visibility, and content semantics remain in TurnDB either way.
+
 ## What it does not do
 
 No daemon, no network, no cluster, no consensus. Scale-out is more stores, not a bigger one. No

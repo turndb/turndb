@@ -40,15 +40,21 @@ exclude = [
 # embedder, so the whole plane is optional — but it is on by default, because a feature that is not
 # built by default is a feature that is not tested.
 default = ["sql"]
-sql = ["dep:datafusion", "dep:async-trait", "dep:futures", "dep:tokio"]
+# The storage-native Arrow lens without a planner. Embedders and bindings can project and stream
+# columns without carrying DataFusion's SQL, optimizer, and datasource graph.
+columnar = ["dep:arrow"]
+# DataFusion is an adapter over the same lens, not the feature that defines it.
+sql = ["columnar", "dep:datafusion", "dep:async-trait", "dep:futures", "dep:tokio"]
 # Deterministic-simulation testing: arms a recorder inside the write-path seam (src/vfs.rs) so the
 # DST harness can reconstruct every crash state. Off by default and adds nothing when off; the
 # harness runs as `cargo test --features dst --test dst`.
 dst = []
 
 [dependencies]
-# The query lens. Arrow comes in THROUGH datafusion's re-export rather than as its own dependency,
-# so an arrow version mismatch between the two is structurally impossible.
+# The storage-native query lens. Kept at DataFusion 54's exact Arrow line so enabling SQL unifies one
+# Arrow graph rather than compiling two incompatible ABIs.
+arrow = { version = "58.4.0", default-features = false, optional = true }
+# Optional SQL planner/executor over the lens.
 datafusion = { version = "54", optional = true }
 # TableProvider is an async trait; this is datafusion's own requirement, not an extra choice.
 async-trait = { version = "0.1", optional = true }

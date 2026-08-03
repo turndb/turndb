@@ -4,13 +4,26 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import './_artifact.mjs';
-import { open, TurndbError } from '../index.mjs';
+import { open, capabilities, TurndbError } from '../index.mjs';
 
 async function withStore(fn, opts) {
   const dir = await mkdtemp(join(tmpdir(), 'turndb-test-'));
   const s = await open(dir, opts);
   try { return await fn(s, dir); } finally { try { s.close(); } catch {} await rm(dir, { recursive: true, force: true }); }
 }
+
+test('capabilities describe the WASI guest rather than its host', async () => {
+  const c = await capabilities();
+  assert.equal(c.portable_wasm, true);
+  assert.equal(c.writer_exclusion, 'embedder_enforced');
+  assert.equal(c.physical_erasure, 'refold_only');
+  assert.equal(c.threads, false);
+  assert.equal(c.columnar, false);
+  assert.equal(c.sql, false);
+  assert.equal(c.part_format_write, 2);
+
+  await withStore((s) => assert.deepEqual(s.capabilities(), c));
+});
 
 test('a record round-trips byte-exact, including non-UTF8 bytes', async () => {
   await withStore((s) => {
@@ -44,10 +57,33 @@ test('attributes keep order and duplicate keys', async () => {
     assert.deepEqual(got.attrs.map(([k]) => k), ['k', 'n', 'k', 'f', 'ok']);
     assert.deepEqual(got.attrs[0], ['k', 'first']);
     assert.deepEqual(got.attrs[2], ['k', 'second']);
-    assert.equal(got.attrs[1][1], 42);
+    assert.equal(got.attrs[1][1], 42n);
     assert.equal(got.attrs[3][1], 1.5);
     assert.equal(got.attrs[4][1], true);
     assert.equal(Buffer.from(got.body).toString(), 'body');
+  });
+});
+
+test('i64 attributes never round through a JavaScript Number', async () => {
+  await withStore((s) => {
+    const min = -9223372036854775808n;
+    const max = 9223372036854775807n;
+    s.putBody('ints', 'body', [['min', min], ['max', max]]);
+    assert.deepEqual(s.getRecord('ints').attrs, [['min', min], ['max', max]]);
+    assert.throws(
+      () => s.putBody('unsafe', 'body', { n: Number.MAX_SAFE_INTEGER + 1 }),
+      /pass a BigInt/,
+    );
+  });
+});
+
+test('non-finite floats cross the JSON-only portable ABI deliberately', async () => {
+  await withStore((s) => {
+    s.putBody('floats', 'body', [['nan', { f: NaN }], ['pos', { f: Infinity }], ['neg', { f: -Infinity }]]);
+    const attrs = Object.fromEntries(s.getRecord('floats').attrs);
+    assert.equal(Number.isNaN(attrs.nan), true);
+    assert.equal(attrs.pos, Infinity);
+    assert.equal(attrs.neg, -Infinity);
   });
 });
 

@@ -44,11 +44,12 @@
 // backticked identifier. The remainder is a separate problem and is not closed by this.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod capabilities;
 pub mod carve;
 pub mod fold;
 pub mod pack;
 pub mod part;
-#[cfg(feature = "sql")]
+#[cfg(feature = "columnar")]
 pub mod query;
 pub mod readat;
 pub mod store;

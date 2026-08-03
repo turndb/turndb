@@ -13,7 +13,7 @@ use crate::part::Part;
 use crate::store::ReadStore;
 use crate::types::AttrValue;
 use anyhow::Result;
-use datafusion::arrow::datatypes::SchemaRef;
+use arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::datasource::TableType;
@@ -209,7 +209,7 @@ impl TurndbExec {
     ) -> DfResult<TurndbExec> {
         let full = lens.schema();
         let fields: Vec<_> = projection.iter().map(|&i| full.field(i).clone()).collect();
-        let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(fields));
         let props = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(parts.len().max(1)),

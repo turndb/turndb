@@ -32,18 +32,19 @@
 //! and a newest tombstone makes the id absent. In particular, a predicate that rejects the newest
 //! version can never fall through and reveal an older version that happens to match.
 
+#[cfg(feature = "sql")]
 pub mod table;
 
 use crate::fold::Fold;
 use crate::part::{attrs, Part};
 use crate::types::AttrValue;
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{
+use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Array, Int64Builder, StringArray,
     StringBuilder,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -720,7 +721,7 @@ impl PartScan {
                     }
                     Arc::new(b.finish()) as ArrayRef
                 }
-                Col::Missing(t) => datafusion::arrow::array::new_null_array(t, len),
+                Col::Missing(t) => arrow::array::new_null_array(t, len),
                 Col::Attr { tag, rids, val, dict } => scatter(
                     *tag,
                     rids,
@@ -811,7 +812,7 @@ fn scatter(
                 })
                 .collect();
             let values = StringArray::from(dict.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-            Arc::new(datafusion::arrow::array::DictionaryArray::try_new(
+            Arc::new(arrow::array::DictionaryArray::try_new(
                 Int32Array::from(keys),
                 Arc::new(values),
             )?) as ArrayRef
@@ -886,10 +887,10 @@ pub fn collect_where(
 
 /// A `StringBuilder`-based flat view of a dictionary column, for callers that want plain strings.
 pub fn flatten_strings(a: &ArrayRef) -> Result<ArrayRef> {
-    use datafusion::arrow::array::{Array, AsArray};
+    use arrow::array::{Array, AsArray};
     let d = a
         .as_any()
-        .downcast_ref::<datafusion::arrow::array::DictionaryArray<datafusion::arrow::datatypes::Int32Type>>()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
         .ok_or_else(|| anyhow::anyhow!("not a dictionary column"))?;
     let values = d.values().as_string::<i32>();
     let mut b = StringBuilder::new();

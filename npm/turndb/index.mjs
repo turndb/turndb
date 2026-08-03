@@ -130,6 +130,40 @@ export function prefixUpperBound(prefix) {
   return null;
 }
 
+function readCapabilities(runtime) {
+  const e = runtime.instance.exports;
+  const code = e.tdb_capabilities();
+  const mem = new Uint8Array(e.memory.buffer);
+  if (code < 0) {
+    const message = new TextDecoder().decode(
+      mem.subarray(e.tdb_err_ptr(), e.tdb_err_ptr() + e.tdb_err_len()),
+    );
+    throw new TurndbError(message);
+  }
+  const json = new TextDecoder().decode(
+    mem.subarray(e.tdb_out_ptr(), e.tdb_out_ptr() + e.tdb_out_len()),
+  );
+  return JSON.parse(json);
+}
+
+/**
+ * Guarantees of the compiled portable core. They describe the WASI guest, not the host OS.
+ */
+export async function capabilities() {
+  // An existing store already owns the one runtime. Reading the immutable build profile does not
+  // need another directory capability and must remain available while that store is open.
+  if (runtimePromise != null) {
+    const runtime = await runtimePromise;
+    if (runtime.active) return readCapabilities(runtime);
+  }
+  const runtime = await acquireRuntime(process.cwd());
+  try {
+    return readCapabilities(runtime);
+  } finally {
+    releaseRuntime(runtime);
+  }
+}
+
 /**
  * Encode attributes into the ABI's tagged form: `[[key, tag, value], ...]`.
  *
@@ -151,20 +185,47 @@ function encodeAttrs(attrs) {
     assertEncodable(k, 'attribute key');
     if (typeof v === 'string') out.push([k, 's', assertEncodable(v, `attribute ${k}`)]);
     else if (typeof v === 'boolean') out.push([k, 'b', v]);
-    else if (typeof v === 'bigint') out.push([k, 'i', Number(v)]);
+    else if (typeof v === 'bigint') out.push([k, 'i', v.toString()]);
     else if (typeof v === 'number') {
       // Integer-valued floats are stored as ints, which is almost always what a caller means.
       // Pass a BigInt, or `{ f: n }`, when the distinction matters the other way.
-      out.push(Number.isInteger(v) ? [k, 'i', v] : [k, 'f', v]);
-    } else if (v && typeof v === 'object' && 'f' in v) out.push([k, 'f', Number(v.f)]);
-    else if (v && typeof v === 'object' && 'i' in v) out.push([k, 'i', Number(v.i)]);
+      if (Number.isInteger(v)) {
+        if (!Number.isSafeInteger(v)) {
+          throw new TypeError(
+            `integer attribute ${k} is outside JavaScript's exact Number range; pass a BigInt`,
+          );
+        }
+        out.push([k, 'i', v.toString()]);
+      } else out.push([k, 'f', encodeFloat(v)]);
+    } else if (v && typeof v === 'object' && 'f' in v) {
+      out.push([k, 'f', encodeFloat(Number(v.f))]);
+    }
+    else if (v && typeof v === 'object' && 'i' in v) {
+      const i = v.i;
+      if (typeof i === 'bigint') out.push([k, 'i', i.toString()]);
+      else if (typeof i === 'number' && Number.isSafeInteger(i)) out.push([k, 'i', i.toString()]);
+      else throw new TypeError(`integer attribute ${k} must be a safe integer or BigInt`);
+    }
     else throw new TypeError(`attribute ${k} has unsupported type ${typeof v}`);
   }
   return JSON.stringify(out);
 }
 
+function encodeFloat(v) {
+  if (Number.isNaN(v)) return 'NaN';
+  if (v === Infinity) return 'inf';
+  if (v === -Infinity) return '-inf';
+  return v;
+}
+
 function decodeAttrs(tagged) {
-  return tagged.map(([k, tag, v]) => [k, tag === 'i' || tag === 'f' ? Number(v) : v]);
+  return tagged.map(([k, tag, v]) => [k, tag === 'i' ? BigInt(v) : tag === 'f' ? decodeFloat(v) : v]);
+}
+
+function decodeFloat(v) {
+  if (v === 'inf') return Infinity;
+  if (v === '-inf') return -Infinity;
+  return Number(v);
 }
 
 const storeFinalizer = new FinalizationRegistry(({ runtime, handle }) => {
@@ -196,6 +257,12 @@ export class Store {
 
   get closed() {
     return this.#handle < 0;
+  }
+
+  /** Guarantees of the compiled portable core. */
+  capabilities() {
+    this.#alive();
+    return readCapabilities(this.#runtime);
   }
 
   #mem() {
@@ -617,4 +684,4 @@ export async function open(dir, opts = {}) {
   return new Store(runtime, handle);
 }
 
-export default { open, Store, TurndbError };
+export default { open, capabilities, Store, TurndbError };
