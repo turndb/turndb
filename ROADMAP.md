@@ -559,7 +559,11 @@ late arrival, atomic durable acknowledgement, restart, and process-exit WAL reco
 compaction, verification, backup/restore to a writable store, and erasure/refold with retained-history
 purging run as one consumer workflow. **Upgrade qualification is implemented against real old bytes:**
 a Rust-reproducible revision-3 pack is restored, preflighted, migrated one part across a restart, and
-verified byte/identity-exact through public Node methods. A measured sustained soak remains.
+verified byte/identity-exact through public Node methods. **Sustained qualification is implemented:**
+the bounded CI profile runs 64 cycles, while a measured 512-cycle profile acknowledged 5,630 ops,
+crossed 31 restarts, held 4,106 exact live records, drained compaction through 127 eight-input-or-less
+units, held live part pressure to 9, refolded measured dead content, and verified the result. A
+one-unit-per-interval policy reached 71 parts and was rejected rather than documented as sustainable.
 
 ### Maturity gate
 
@@ -570,6 +574,10 @@ A consumer can replace its trace-specific persistence machinery with TurnDB with
 - Inventing its own compaction, verification, or erasure system.
 - Depending on undocumented file-format behavior.
 - Adding consumer-specific concepts to TurnDB core.
+
+**Gate exercised:** the dual-domain qualification suite and its maintenance, crash, upgrade, and
+sustained profiles cover every workload property above through public Rust/Node storage concepts. This
+is evidence for the abstraction boundary, not an API/format freeze or a release-readiness claim.
 
 ## Phase 7: stabilize the format, APIs, and releases
 

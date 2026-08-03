@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { NativeStore, retainedCommits, restoreBackup } = require('..');
 const { putRecord } = require('../qualification/record-adapter.cjs');
+const { runSoak } = require('../qualification/soak.cjs');
 const { buildPipeline, linkedTelemetry } = require('../qualification/workloads.cjs');
 
 function temporaryRoot(t, prefix = 'turndb-qualification-') {
@@ -372,4 +373,26 @@ test('upgrades a checked revision-three consumer artifact one restartable part a
   const verified = await store.verify();
   assert.equal(verified.parts, 2n);
   assert.equal(verified.trailingUncommittedBytes, 0n);
+});
+
+test('runs the bounded sustained-ingestion qualification profile', async (t) => {
+  const dir = path.join(temporaryRoot(t, 'turndb-qualification-soak-'), 'store');
+  const report = await runSoak({
+    dir,
+    cycles: 64,
+    recordsPerCycle: 8,
+    payloadBytes: 2048,
+    compactEvery: 8,
+    restartEvery: 16,
+  });
+  assert.equal(report.cycles, 64);
+  assert.equal(report.acceptedOps, 702);
+  assert.equal(report.liveRecords, 522);
+  assert.equal(report.boundedCompactions, 15);
+  assert.equal(report.restarts, 3);
+  assert(BigInt(report.partHighWater) <= 9n);
+  assert(BigInt(report.deadBytesBeforeRefold) > 0n);
+  assert(BigInt(report.foldBytesAfterRefold) < BigInt(report.foldBytesBeforeRefold));
+  assert(Number.isFinite(report.durationMs));
+  assert(report.durationMs > 0);
 });
