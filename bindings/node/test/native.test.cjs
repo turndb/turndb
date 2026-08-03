@@ -34,6 +34,7 @@ test('reports the native capability profile without a portable fallback', () => 
     commandQueueCapacityMax: 65536,
     writeAdmissionLimits: true,
     readAdmissionLimits: true,
+    objectCountAdmission: true,
     storeSpaceUsage: true,
     allocatedSpaceUsage: process.platform !== 'win32',
     formatMigration: true,
@@ -51,6 +52,9 @@ test('reports the native capability profile without a portable fallback', () => 
     maxIdentifierBytesDefault: 4096,
     maxStoredFrameBytesDefault: 512n << 20n,
     maxDecodedFrameBytesDefault: 512n << 20n,
+    maxDirectoryEntriesDefault: 100000n,
+    maxWalFramesDefault: 100000n,
+    maxFoldBlocksDefault: 1000000n,
     immutableSnapshots: true,
     lifecycleOperations: true,
     backupRestore: true,
@@ -101,6 +105,9 @@ test('passes storage and cache policy through the native open seam', async (t) =
     partCacheBytes: 4n << 20n,
     maxStoredFrameBytes: 2n << 20n,
     maxDecodedFrameBytes: 3n << 20n,
+    maxDirectoryEntries: 2000n,
+    maxWalFrames: 3000n,
+    maxFoldBlocks: 4000n,
     segmentMaxBytes: 1n << 20n,
     compressionLevel: 3,
     compressionThreads: 1,
@@ -111,12 +118,18 @@ test('passes storage and cache policy through the native open seam', async (t) =
   assert.equal(health.partCacheBudget, 4n << 20n);
   assert.equal(health.maxStoredFrameBytes, 2n << 20n);
   assert.equal(health.maxDecodedFrameBytes, 3n << 20n);
+  assert.equal(health.maxDirectoryEntries, 2000n);
+  assert.equal(health.maxWalFrames, 3000n);
+  assert.equal(health.maxFoldBlocks, 4000n);
   assert.equal(health.foldSegmentMaxBytes, 1n << 20n);
   assert.equal(health.foldCompressionLevel, 3);
   assert.equal(health.foldCompressionThreads, 1n);
   const inherited = await store.snapshot();
   assert.equal(inherited.maxStoredFrameBytes, 2n << 20n);
   assert.equal(inherited.maxDecodedFrameBytes, 3n << 20n);
+  assert.equal(inherited.maxDirectoryEntries, 2000n);
+  assert.equal(inherited.maxWalFrames, 3000n);
+  assert.equal(inherited.maxFoldBlocks, 4000n);
   await inherited.close();
   await store.close();
 
@@ -128,6 +141,9 @@ test('passes storage and cache policy through the native open seam', async (t) =
     { compressionLevel: 0 },
     { maxStoredFrameBytes: 0n },
     { maxDecodedFrameBytes: 0n },
+    { maxDirectoryEntries: 0n },
+    { maxWalFrames: 0n },
+    { maxFoldBlocks: 0n },
   ]) {
     await assert.rejects(
       NativeStore.open(temporaryStore(t), options),
@@ -160,12 +176,29 @@ test('classifies atomic frame admission at the native storage boundary', async (
   });
   assert.equal(snapshot.maxStoredFrameBytes, 96n);
   assert.equal(snapshot.maxDecodedFrameBytes, 128n);
+  assert.equal(snapshot.maxDirectoryEntries, 100000n);
+  assert.equal(snapshot.maxWalFrames, 100000n);
+  assert.equal(snapshot.maxFoldBlocks, 1000000n);
   await snapshot.close();
 
   await assert.rejects(
     NativeSnapshot.open(temporaryStore(t), { maxDecodedFrameBytes: 0n }),
     (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
   );
+});
+
+test('bounds physical WAL frames through the native actor before mutation', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t), { maxWalFrames: 2n });
+  await store.write([{ kind: 'put', id: 'one' }]);
+  assert.equal((await store.health()).walFrames, 2n);
+  await assert.rejects(
+    store.write([{ kind: 'put', id: 'two' }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /WAL frames/.test(error.message),
+  );
+  assert.equal((await store.health()).walFrames, 2n);
+  await store.close(false);
 });
 
 test('enforces configurable write admission with stable error classes', async (t) => {

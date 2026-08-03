@@ -302,6 +302,7 @@ pub struct NativeCapabilities {
     pub command_queue_capacity_max: u32,
     pub write_admission_limits: bool,
     pub read_admission_limits: bool,
+    pub object_count_admission: bool,
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
     pub format_migration: bool,
@@ -319,6 +320,9 @@ pub struct NativeCapabilities {
     pub max_identifier_bytes_default: u32,
     pub max_stored_frame_bytes_default: BigInt,
     pub max_decoded_frame_bytes_default: BigInt,
+    pub max_directory_entries_default: BigInt,
+    pub max_wal_frames_default: BigInt,
+    pub max_fold_blocks_default: BigInt,
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub backup_restore: bool,
@@ -367,6 +371,7 @@ pub fn capabilities() -> NativeCapabilities {
         command_queue_capacity_max: MAX_QUEUE_CAPACITY as u32,
         write_admission_limits: c.write_admission_limits,
         read_admission_limits: c.read_admission_limits,
+        object_count_admission: c.object_count_admission,
         store_space_usage: c.store_space_usage,
         allocated_space_usage: c.allocated_space_usage,
         format_migration: c.format_migration,
@@ -384,6 +389,9 @@ pub fn capabilities() -> NativeCapabilities {
         max_identifier_bytes_default: c.max_identifier_bytes_default as u32,
         max_stored_frame_bytes_default: BigInt::from(c.max_stored_frame_bytes_default),
         max_decoded_frame_bytes_default: BigInt::from(c.max_decoded_frame_bytes_default),
+        max_directory_entries_default: BigInt::from(c.max_directory_entries_default),
+        max_wal_frames_default: BigInt::from(c.max_wal_frames_default),
+        max_fold_blocks_default: BigInt::from(c.max_fold_blocks_default),
         immutable_snapshots: true,
         lifecycle_operations: true,
         backup_restore: turndb::pack::ATOMIC_RESTORE,
@@ -438,6 +446,12 @@ pub struct NativeOpenOptions {
     pub max_stored_frame_bytes: Option<BigInt>,
     /// Decoded bytes admitted for one TOC/section/fold frame. Defaults to 512 MiB.
     pub max_decoded_frame_bytes: Option<BigInt>,
+    /// Entries admitted in one filesystem directory enumeration. Defaults to 100,000.
+    pub max_directory_entries: Option<BigInt>,
+    /// Physical frames admitted in one unflushed WAL. Defaults to 100,000.
+    pub max_wal_frames: Option<BigInt>,
+    /// Content blocks admitted in one fold generation. Defaults to 1,000,000.
+    pub max_fold_blocks: Option<BigInt>,
     /// Raw bytes gathered per compressed fold block. Defaults to 4 MiB.
     pub block_target_bytes: Option<BigInt>,
     /// Decompressed fold-block cache budget. Defaults to 64 MiB.
@@ -457,6 +471,9 @@ pub struct NativeSnapshotOpenOptions {
     pub max_concurrent_sql_memory_bytes: Option<BigInt>,
     pub max_stored_frame_bytes: Option<BigInt>,
     pub max_decoded_frame_bytes: Option<BigInt>,
+    pub max_directory_entries: Option<BigInt>,
+    pub max_wal_frames: Option<BigInt>,
+    pub max_fold_blocks: Option<BigInt>,
 }
 
 #[napi(object)]
@@ -614,6 +631,9 @@ pub struct NativeRecoveryOptions {
     pub max_rollback_commits: Option<BigInt>,
     pub max_stored_frame_bytes: Option<BigInt>,
     pub max_decoded_frame_bytes: Option<BigInt>,
+    pub max_directory_entries: Option<BigInt>,
+    pub max_wal_frames: Option<BigInt>,
+    pub max_fold_blocks: Option<BigInt>,
     /// Milliseconds from submission; worker-scheduling time is included.
     pub timeout_ms: Option<u32>,
     pub signal: Option<AbortSignal>,
@@ -623,6 +643,9 @@ pub struct NativeRecoveryOptions {
 pub struct NativeRestoreOptions {
     pub max_stored_frame_bytes: Option<BigInt>,
     pub max_decoded_frame_bytes: Option<BigInt>,
+    pub max_directory_entries: Option<BigInt>,
+    pub max_wal_frames: Option<BigInt>,
+    pub max_fold_blocks: Option<BigInt>,
     pub timeout_ms: Option<u32>,
     pub signal: Option<AbortSignal>,
 }
@@ -678,6 +701,7 @@ pub struct NativeHealth {
     pub memtable_entries: BigInt,
     pub memtable_bytes: BigInt,
     pub wal_bytes: BigInt,
+    pub wal_frames: BigInt,
     pub fold_disk_bytes: BigInt,
     pub fold_segments: u32,
     pub fold_cache_hits: BigInt,
@@ -692,6 +716,9 @@ pub struct NativeHealth {
     pub part_cache_budget: BigInt,
     pub max_stored_frame_bytes: BigInt,
     pub max_decoded_frame_bytes: BigInt,
+    pub max_directory_entries: BigInt,
+    pub max_wal_frames: BigInt,
+    pub max_fold_blocks: BigInt,
     pub dedup_window_entries: BigInt,
     pub retained_commits: BigInt,
     pub punched_blocks: BigInt,
@@ -1088,6 +1115,9 @@ impl NativeSnapshot {
         let read_limits = decode_read_limits(
             options.as_ref().and_then(|value| value.max_stored_frame_bytes.clone()),
             options.as_ref().and_then(|value| value.max_decoded_frame_bytes.clone()),
+            options.as_ref().and_then(|value| value.max_directory_entries.clone()),
+            options.as_ref().and_then(|value| value.max_wal_frames.clone()),
+            options.as_ref().and_then(|value| value.max_fold_blocks.clone()),
         )?;
         #[cfg(feature = "sql")]
         let budget = decode_sql_budget(
@@ -1124,6 +1154,9 @@ impl NativeSnapshot {
         let read_limits = decode_read_limits(
             options.as_ref().and_then(|value| value.max_stored_frame_bytes.clone()),
             options.as_ref().and_then(|value| value.max_decoded_frame_bytes.clone()),
+            options.as_ref().and_then(|value| value.max_directory_entries.clone()),
+            options.as_ref().and_then(|value| value.max_wal_frames.clone()),
+            options.as_ref().and_then(|value| value.max_fold_blocks.clone()),
         )?;
         #[cfg(feature = "sql")]
         let budget = decode_sql_budget(
@@ -1164,6 +1197,21 @@ impl NativeSnapshot {
     #[napi(getter)]
     pub fn max_decoded_frame_bytes(&self) -> Result<BigInt> {
         Ok(BigInt::from(self.state.get()?.read_limits().max_decoded_frame_bytes))
+    }
+
+    #[napi(getter)]
+    pub fn max_directory_entries(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.state.get()?.read_limits().max_directory_entries))
+    }
+
+    #[napi(getter)]
+    pub fn max_wal_frames(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.state.get()?.read_limits().max_wal_frames))
+    }
+
+    #[napi(getter)]
+    pub fn max_fold_blocks(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.state.get()?.read_limits().max_fold_blocks))
     }
 
     #[napi]
@@ -1238,10 +1286,13 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
     if path.is_empty() {
         return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
     }
-    napi::tokio::task::spawn_blocking(move || turndb::store::retained_commits(&PathBuf::from(path)))
-        .await
-        .map(|commits| commits.into_iter().map(BigInt::from).collect())
-        .map_err(|error| failure("join retained TurnDB commit listing", error))
+    let commits = napi::tokio::task::spawn_blocking(move || {
+        turndb::store::retained_commits(&PathBuf::from(path))
+    })
+    .await
+    .map_err(|error| failure("join retained TurnDB commit listing", error))?
+    .map_err(|error| engine_failure("list retained TurnDB commits", error))?;
+    Ok(commits.into_iter().map(BigInt::from).collect())
 }
 
 /// Validate and restore one immutable backup into a destination that must not exist.
@@ -1260,7 +1311,13 @@ pub fn restore_backup<'env>(
     }
     let (read_limits, control) = match options {
         Some(options) => (
-            decode_read_limits(options.max_stored_frame_bytes, options.max_decoded_frame_bytes)?,
+            decode_read_limits(
+                options.max_stored_frame_bytes,
+                options.max_decoded_frame_bytes,
+                options.max_directory_entries,
+                options.max_wal_frames,
+                options.max_fold_blocks,
+            )?,
             decode_lifecycle(Some(NativeLifecycleOptions {
                 timeout_ms: options.timeout_ms,
                 signal: options.signal,
@@ -1305,7 +1362,13 @@ pub fn recover_manifest<'env>(
                 .map(|value| decode_u64(value, "maxRollbackCommits"))
                 .transpose()?
                 .unwrap_or(0),
-            decode_read_limits(options.max_stored_frame_bytes, options.max_decoded_frame_bytes)?,
+            decode_read_limits(
+                options.max_stored_frame_bytes,
+                options.max_decoded_frame_bytes,
+                options.max_directory_entries,
+                options.max_wal_frames,
+                options.max_fold_blocks,
+            )?,
             decode_lifecycle(Some(NativeLifecycleOptions {
                 timeout_ms: options.timeout_ms,
                 signal: options.signal,
@@ -2339,6 +2402,9 @@ fn decode_write_limits(options: Option<&NativeOpenOptions>) -> Result<WriteLimit
 fn decode_read_limits(
     max_stored_frame_bytes: Option<BigInt>,
     max_decoded_frame_bytes: Option<BigInt>,
+    max_directory_entries: Option<BigInt>,
+    max_wal_frames: Option<BigInt>,
+    max_fold_blocks: Option<BigInt>,
 ) -> Result<ReadLimits> {
     let defaults = ReadLimits::default();
     let limits = ReadLimits {
@@ -2349,6 +2415,18 @@ fn decode_read_limits(
         max_decoded_frame_bytes: match max_decoded_frame_bytes {
             Some(value) => decode_u64(value, "maxDecodedFrameBytes")?,
             None => defaults.max_decoded_frame_bytes,
+        },
+        max_directory_entries: match max_directory_entries {
+            Some(value) => decode_u64(value, "maxDirectoryEntries")?,
+            None => defaults.max_directory_entries,
+        },
+        max_wal_frames: match max_wal_frames {
+            Some(value) => decode_u64(value, "maxWalFrames")?,
+            None => defaults.max_wal_frames,
+        },
+        max_fold_blocks: match max_fold_blocks {
+            Some(value) => decode_u64(value, "maxFoldBlocks")?,
+            None => defaults.max_fold_blocks,
         },
     };
     limits.validate().map_err(|error| Error::new(Status::InvalidArg, error.to_string()))
@@ -2425,6 +2503,9 @@ fn decode_store_options(options: Option<&NativeOpenOptions>) -> Result<StoreOpti
         read_limits: decode_read_limits(
             options.and_then(|value| value.max_stored_frame_bytes.clone()),
             options.and_then(|value| value.max_decoded_frame_bytes.clone()),
+            options.and_then(|value| value.max_directory_entries.clone()),
+            options.and_then(|value| value.max_wal_frames.clone()),
+            options.and_then(|value| value.max_fold_blocks.clone()),
         )?,
         part_cache_bytes,
     })
@@ -2822,6 +2903,7 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         memtable_entries: BigInt::from(health.memtable_entries as u64),
         memtable_bytes: BigInt::from(health.memtable_bytes as u64),
         wal_bytes: BigInt::from(health.wal_bytes),
+        wal_frames: BigInt::from(health.wal_frames),
         fold_disk_bytes: BigInt::from(health.fold_disk_bytes),
         fold_segments: health.fold_segments,
         fold_cache_hits: BigInt::from(health.fold_cache_hits),
@@ -2836,6 +2918,9 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         part_cache_budget: BigInt::from(health.part_cache_budget as u64),
         max_stored_frame_bytes: BigInt::from(health.max_stored_frame_bytes),
         max_decoded_frame_bytes: BigInt::from(health.max_decoded_frame_bytes),
+        max_directory_entries: BigInt::from(health.max_directory_entries),
+        max_wal_frames: BigInt::from(health.max_wal_frames),
+        max_fold_blocks: BigInt::from(health.max_fold_blocks),
         dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
         retained_commits: BigInt::from(health.retained_commits as u64),
         punched_blocks: BigInt::from(health.punched_blocks),

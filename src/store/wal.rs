@@ -341,6 +341,14 @@ pub struct Wal {
     /// Frames appended but not yet written to the file.
     buf: Vec<u8>,
     scratch: Vec<u8>,
+    read_limits: crate::read_limits::ReadLimits,
+    frame_count: u64,
+}
+
+pub(crate) struct ReplayState {
+    pub frames: Vec<Frame>,
+    pub physical_frames: u64,
+    pub valid_bytes: u64,
 }
 
 /// Flush the buffer once it holds this much — the same batching a BufWriter provided.
@@ -348,6 +356,19 @@ const BUF_FLUSH: usize = 1 << 20;
 
 impl Wal {
     pub fn open(path: &Path) -> Result<Wal> {
+        let read_limits = crate::read_limits::ReadLimits::default();
+        let replay = Self::replay_state_with_limits(path, read_limits)?;
+        Self::open_recovered(path, read_limits, replay.physical_frames, replay.valid_bytes)
+    }
+
+    pub(crate) fn open_recovered(
+        path: &Path,
+        read_limits: crate::read_limits::ReadLimits,
+        frame_count: u64,
+        valid_bytes: u64,
+    ) -> Result<Wal> {
+        let read_limits = read_limits.validate()?;
+        read_limits.admit_wal_frames(frame_count)?;
         let (f, created) = crate::vfs::open_or_create(path)
             .with_context(|| format!("open wal {}", path.display()))?;
         if created {
@@ -362,7 +383,35 @@ impl Wal {
             }
         }
         let file_len = f.metadata()?.len();
-        Ok(Wal { f, path: path.to_path_buf(), file_len, buf: Vec::new(), scratch: Vec::new() })
+        if valid_bytes > file_len {
+            bail!("WAL recovery boundary {valid_bytes} runs past the file's {file_len} bytes");
+        }
+        if valid_bytes < file_len {
+            crate::vfs::set_len(&f, path, valid_bytes)?;
+            crate::vfs::sync_file(&f, path)?;
+        }
+        Ok(Wal {
+            f,
+            path: path.to_path_buf(),
+            file_len: valid_bytes,
+            buf: Vec::new(),
+            scratch: Vec::new(),
+            read_limits,
+            frame_count,
+        })
+    }
+
+    pub(crate) fn admit_additional_frames(&self, additional: u64) -> Result<()> {
+        let proposed = self
+            .frame_count
+            .checked_add(additional)
+            .ok_or_else(|| anyhow::anyhow!("WAL frame count overflow"))?;
+        self.read_limits.admit_wal_frames(proposed)?;
+        Ok(())
+    }
+
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
     }
 
     fn flush_buf(&mut self) -> Result<()> {
@@ -384,6 +433,7 @@ impl Wal {
         if payload.len() as u64 > u32::MAX as u64 {
             bail!("wal frame payload of {} bytes exceeds the u32 length field", payload.len());
         }
+        self.admit_additional_frames(1)?;
         let mut hdr = Vec::with_capacity(HDR);
         hdr.push(tag);
         hdr.extend_from_slice(&seq.to_le_bytes());
@@ -398,6 +448,7 @@ impl Wal {
         if self.buf.len() >= BUF_FLUSH {
             self.flush_buf()?;
         }
+        self.frame_count += 1;
         Ok(())
     }
 
@@ -426,6 +477,7 @@ impl Wal {
     ///
     /// `items`: `(record, novel, is_tombstone)`; a tombstone's record carries only its id.
     pub fn append_batch(&mut self, seq: u64, items: &[FramedRecord]) -> Result<()> {
+        self.admit_additional_frames(items.len() as u64 + 1)?;
         for (r, novel, tomb) in items {
             let mut scratch = std::mem::take(&mut self.scratch);
             scratch.clear();
@@ -458,6 +510,7 @@ impl Wal {
         crate::vfs::set_len(&self.f, &self.path, 0)?;
         crate::vfs::sync_file(&self.f, &self.path)?;
         self.file_len = 0;
+        self.frame_count = 0;
         Ok(())
     }
 
@@ -477,19 +530,31 @@ impl Wal {
         Self::replay_with_limits(path, crate::read_limits::ReadLimits::default())
     }
 
-    /// Replay with explicit atomic-frame admission before payload allocation.
+    /// Replay with explicit frame-byte and physical-frame-count admission before allocation.
     pub fn replay_with_limits(
         path: &Path,
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Vec<Frame>> {
+        Ok(Self::replay_state_with_limits(path, read_limits)?.frames)
+    }
+
+    pub(crate) fn replay_state_with_limits(
+        path: &Path,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<ReplayState> {
         let read_limits = read_limits.validate()?;
         let f = match File::open(path) {
             Ok(f) => f,
-            Err(_) => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ReplayState { frames: Vec::new(), physical_frames: 0, valid_bytes: 0 });
+            }
+            Err(error) => return Err(error.into()),
         };
         let len = f.metadata()?.len();
         let mut out = Vec::new();
         let mut pending: Vec<Frame> = Vec::new();
+        let mut pending_start: Option<(u64, u64)> = None;
+        let mut physical_frames = 0u64;
         let mut off = 0u64;
         let mut hdr = [0u8; HDR];
         loop {
@@ -526,6 +591,7 @@ impl Wal {
             if end > len {
                 break;
             }
+            read_limits.admit_wal_frames(physical_frames.saturating_add(1))?;
             read_limits.admit("WAL frame", plen as u64, plen as u64)?;
             let mut payload = vec![0u8; plen];
             if crate::sys::read_exact_at(&f, &mut payload, off + HDR as u64).is_err() {
@@ -572,6 +638,7 @@ impl Wal {
                     let start = pending.len() - n;
                     // Members before the sealed run belong to a batch whose marker never landed.
                     out.extend(pending.drain(..).skip(start));
+                    pending_start = None;
                 }
                 TOMB_TAG | BATCH_TOMB_TAG => {
                     let Ok(id) = String::from_utf8(payload) else { break };
@@ -582,9 +649,13 @@ impl Wal {
                         novel: Vec::new(),
                     };
                     if hdr[0] == BATCH_TOMB_TAG {
+                        if pending.is_empty() {
+                            pending_start = Some((off, physical_frames));
+                        }
                         pending.push(fr);
                     } else {
                         pending.clear();
+                        pending_start = None;
                         out.push(fr);
                     }
                 }
@@ -609,9 +680,13 @@ impl Wal {
                                     | BATCH_RECORD_V3_TAG
                                     | BATCH_RECORD_V4_TAG
                             ) {
+                                if pending.is_empty() {
+                                    pending_start = Some((off, physical_frames));
+                                }
                                 pending.push(fr);
                             } else {
                                 pending.clear();
+                                pending_start = None;
                                 out.push(fr);
                             }
                         }
@@ -620,10 +695,12 @@ impl Wal {
                 }
                 _ => unreachable!("known WAL tag was not handled"),
             }
+            physical_frames += 1;
             off = end;
         }
         // An unsealed run at the end of the log is a batch that never committed.
-        Ok(out)
+        let (valid_bytes, physical_frames) = pending_start.unwrap_or((off, physical_frames));
+        Ok(ReplayState { frames: out, physical_frames, valid_bytes })
     }
 }
 
@@ -679,6 +756,7 @@ mod tests {
             crate::read_limits::ReadLimits {
                 max_stored_frame_bytes: 64,
                 max_decoded_frame_bytes: 64,
+                ..crate::read_limits::ReadLimits::default()
             },
         ) {
             Ok(_) => panic!("strict replay must refuse the complete larger frame"),

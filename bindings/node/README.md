@@ -158,11 +158,13 @@ silently.
   `planningDurationNs` and cumulative active `executionDurationNs`. Read-only SQL `EXPLAIN` streams
   DataFusion's plan as ordinary Arrow IPC. TurnDB supplies evidence and leaves slow thresholds to the
   consumer.
-- Native `open()` also accepts fold/part cache budgets, stored/decoded atomic-frame admission, and
-  the write-side block target, segment, compression level, and compression-worker policy. Independently
-  opened snapshots accept the same read ceilings; writer-created snapshots inherit them. `health()`
-  reports effective writer values; see
-  [resource budgets and overload](../../docs/resource-budgets.md).
+- Native `open()` also accepts fold/part cache budgets, stored/decoded atomic-frame admission,
+  persistent directory-entry/WAL-frame/fold-block count admission, and the write-side block target,
+  segment, compression level, and compression-worker policy. Independently opened snapshots accept
+  the same read ceilings; writer-created snapshots inherit them. `health()` reports the effective
+  writer values, including current physical WAL frames; see
+  [resource budgets and overload](../../docs/resource-budgets.md) and
+  [persistent object-count admission](../../docs/object-admission.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to

@@ -103,6 +103,33 @@ Evidence: `part_toc_and_selected_sections_are_admitted_before_decode`,
 `restore_preserves_frame_budget_refusal_instead_of_calling_the_backup_invalid`, plus
 native/portable binding tests.
 
+### SR-05: persistent object counts could drive unbounded collection growth — fixed
+
+Byte ceilings did not bound the number of tiny filesystem entries or checksum-valid WAL frames a
+reader could encounter. Fold reconstruction could also resize its block directory from a sparse,
+checksummed block id. `ReadLimits` now independently bounds entries visited by a directory
+enumeration, physical frames in one unflushed WAL, and blocks (including the largest id plus one) in
+one fold generation. Defaults are 100,000 directory entries, 100,000 WAL frames, and 1,000,000 fold
+blocks. The policy is configurable per Rust, native Node, and portable WASI open; valid refusals are
+typed `RESOURCE_EXHAUSTED`.
+
+Readers check counts before retaining entries or growing vectors, irrelevant directory names count,
+iterator errors propagate, fold block ids must be dense enough for the configured ceiling, and
+duplicate ids are corruption rather than last-writer-wins metadata. Writers reserve directory names,
+WAL member frames plus batch commit markers, and the next fold block before their first associated
+mutation. WAL recovery preserves the exact committed append boundary: it truncates a torn or
+unsealed suffix before appending, but never truncates a complete WAL merely refused by policy.
+Writer health caches retained-manifest count, so observing health does not hide an unbounded scan.
+
+Evidence: `store_directory_enumeration_refuses_before_collecting_unbounded_junk`,
+`manifest_recovery_reserves_its_staging_name_before_publication`,
+`wal_frame_limit_is_enforced_before_writer_and_replay_growth`,
+`batch_frame_count_is_preflighted_before_fold_mutation`,
+`fold_block_limit_preserves_progress_and_refuses_the_next_block_before_mutation`,
+`sparse_persisted_block_id_is_refused_before_block_directory_resize`, and
+`writer_truncates_a_torn_wal_suffix_before_appending_new_frames`, plus native and portable binding
+tests.
+
 ## Existing controls reviewed
 
 File formats reject unknown future versions/flags rather than guessing. Footer-to-TOC-to-section
@@ -133,21 +160,16 @@ enforce the single-writer lock, which is a capability reduction rather than a pa
 
 ## Residual risks and required follow-up
 
-1. **Object-count admission is incomplete for directory stores.** Pack metadata is bounded and a
-   manifest byte ceiling indirectly limits parts, but directory enumeration of segments,
-   dictionaries, and retained files has no explicit count budget. Fold directory reconstruction can
-   also resize its block-id index from a checksummed but adversarially sparse id. Add per-open
-   filesystem-object, WAL-frame, and fold-directory-entry ceilings with typed resource refusal.
-2. **Concurrent hostile filesystem mutation is not contained.** Canonical backup checks protect an
+1. **Concurrent hostile filesystem mutation is not contained.** Canonical backup checks protect an
    offline supplied store but are not an `openat2(RESOLVE_BENEATH)` sandbox. Applications must not
    grant untrusted writers access to an actively opened store directory. A future hardened Linux
    profile may use directory descriptors and no-follow/beneath resolution throughout.
-3. **Dependency and supply-chain review remains external.** Rust/Node lockfiles pin the resolved
+2. **Dependency and supply-chain review remains external.** Rust/Node lockfiles pin the resolved
    graph and CI builds all feature profiles, but this review did not independently audit DataFusion,
    Arrow, zstd, napi-rs, or the npm publication chain. Release automation should add vulnerability,
    license, provenance, and reproducible-artifact gates rather than treating source review as a
    substitute.
-4. **CPU budgets are cooperative, not preemptive.** Cancellation checkpoints surround bounded work,
+3. **CPU budgets are cooperative, not preemptive.** Cancellation checkpoints surround bounded work,
    but one zstd frame decode/encode and one part encoding unit are intentionally uninterruptible.
    Admission limits and worker isolation remain the protection against a single expensive atomic
    codec operation.

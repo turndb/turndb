@@ -343,6 +343,7 @@ pub fn write_with_control(
 pub(crate) fn write_committed_with_control(
     dir: &Path,
     out: &Path,
+    read_limits: crate::read_limits::ReadLimits,
     control: &crate::control::OperationControl,
 ) -> Result<PackStats> {
     control.check("backup")?;
@@ -376,11 +377,14 @@ pub(crate) fn write_committed_with_control(
     };
     let fold_dir = dir.join(&fold_rel);
     let mut fold_files: Vec<String> = Vec::new();
+    let mut visited = 0u64;
     for e in std::fs::read_dir(&fold_dir)
         .with_context(|| format!("read fold dir {}", fold_dir.display()))?
-        .flatten()
     {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("backup fold directory", visited)?;
         control.check("backup packing")?;
+        let e = e?;
         let n = e.file_name().to_string_lossy().to_string();
         let keep = n.ends_with(".fold")
             || n.ends_with(".dir")
@@ -494,7 +498,8 @@ pub fn restore_with_control(
     )
 }
 
-/// [`restore_with_control`] with explicit atomic-frame admission while validating the staged store.
+/// [`restore_with_control`] with explicit frame and object-count admission while validating the
+/// staged store.
 pub fn restore_with_limits_and_control(
     pack_path: &Path,
     out_dir: &Path,

@@ -125,6 +125,11 @@ handle, classify refusal as `RESOURCE_EXHAUSTED`, and are distinct from cache re
 fold blocks early under strict profiles and refuse oversized part outputs before publication; see
 [atomic frame read admission](docs/read-admission.md).
 
+Persistent collection growth is bounded separately within that same per-open profile: 100,000
+directory entries, 100,000 physical WAL frames, and 1,000,000 fold blocks by default. Checks precede
+directory/vector growth and future writer output, including atomic-batch member frames and sparse
+fold ids; see [persistent object-count admission](docs/object-admission.md).
+
 Long-running compaction, verification, punching, refold, backup, and restore operations accept
 reusable Rust cancellation tokens and absolute deadlines through their controlled variants. The
 native Node methods map these to submission-inclusive `timeoutMs` and `AbortSignal` options while

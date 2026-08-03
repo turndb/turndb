@@ -23,6 +23,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.part_format_write, 4);
   assert.equal(c.write_admission_limits, true);
   assert.equal(c.read_admission_limits, true);
+  assert.equal(c.object_count_admission, true);
   assert.equal(c.store_space_usage, true);
   assert.equal(c.allocated_space_usage, false);
   assert.equal(c.format_migration, true);
@@ -39,6 +40,9 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.max_identifier_bytes_default, 4096);
   assert.equal(c.max_stored_frame_bytes_default, 512 << 20);
   assert.equal(c.max_decoded_frame_bytes_default, 512 << 20);
+  assert.equal(c.max_directory_entries_default, 100000);
+  assert.equal(c.max_wal_frames_default, 100000);
+  assert.equal(c.max_fold_blocks_default, 1000000);
 
   await withStore((s) => assert.deepEqual(s.capabilities(), c));
 });
@@ -61,12 +65,32 @@ test('portable open applies and reports atomic frame admission', async () => {
     assert.deepEqual(s.readLimits(), {
       maxStoredFrameBytes: 64,
       maxDecodedFrameBytes: 64,
+      maxDirectoryEntries: 17,
+      maxWalFrames: 19,
+      maxFoldBlocks: 23,
     });
     assert.throws(
       () => s.putBody('large-piece', new Uint8Array(256).fill(0x5a)),
       /new fold block/,
     );
-  }, { maxStoredFrameBytes: 64, maxDecodedFrameBytes: 64 });
+  }, {
+    maxStoredFrameBytes: 64,
+    maxDecodedFrameBytes: 64,
+    maxDirectoryEntries: 17,
+    maxWalFrames: 19,
+    maxFoldBlocks: 23,
+  });
+});
+
+test('portable writer bounds physical WAL frame accumulation', async () => {
+  await withStore((s) => {
+    s.putBody('one', '1');
+    s.putBody('two', '2');
+    assert.throws(() => s.putBody('three', '3'), /WAL frames/);
+    assert.equal(s.getText('one'), '1');
+    assert.equal(s.getText('two'), '2');
+    assert.equal(s.get('three'), null);
+  }, { maxWalFrames: 2 });
 });
 
 test('the writer sees its own unflushed writes', async () => {

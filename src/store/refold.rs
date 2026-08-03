@@ -141,7 +141,7 @@ pub fn refold_with_control(
     )
 }
 
-/// [`refold_with_control`] with atomic-frame admission on the replacement generation.
+/// [`refold_with_control`] with frame and object-count admission on the replacement generation.
 #[allow(clippy::too_many_arguments)]
 pub fn refold_with_control_and_limits(
     dir: &Path,
@@ -165,7 +165,7 @@ pub fn refold_with_control_and_limits(
     let mut cleanup = StagedRefold::new(dir, new_gen, seqs);
 
     let mut st = RefoldStats { parts_in: parts.len(), ..Default::default() };
-    st.fold_bytes_before = dir_bytes(&fold_dir(dir, old_gen));
+    st.fold_bytes_before = dir_bytes(&fold_dir(dir, old_gen), read_limits)?;
 
     let visible = super::read::visibility(parts)?;
     let live = visible.rows;
@@ -226,7 +226,7 @@ pub fn refold_with_control_and_limits(
         control.check("content refold")?;
         nf.sync()?;
     }
-    st.fold_bytes_after = dir_bytes(&new_dir);
+    st.fold_bytes_after = dir_bytes(&new_dir, read_limits)?;
 
     // Rebuild each part against the new fold, keeping only live rows and no tombstones. `retain` is
     // deliberately EMPTY: carrying dictionary entries forward is right for an ordinary merge, where the
@@ -298,16 +298,18 @@ impl Drop for StagedRefold {
     }
 }
 
-fn dir_bytes(d: &Path) -> u64 {
-    std::fs::read_dir(d)
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| e.metadata().ok())
-                .filter(|m| m.is_file())
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
+fn dir_bytes(d: &Path, read_limits: crate::read_limits::ReadLimits) -> Result<u64> {
+    let mut bytes = 0u64;
+    let mut visited = 0u64;
+    for entry in std::fs::read_dir(d)? {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("refold directory", visited)?;
+        let metadata = entry?.metadata()?;
+        if metadata.is_file() {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

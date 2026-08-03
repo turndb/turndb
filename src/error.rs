@@ -86,7 +86,8 @@ pub fn classify(error: &anyhow::Error) -> ErrorClass {
         return match admission {
             crate::read_limits::ReadAdmissionError::InvalidLimits(_) => ErrorClass::InvalidArgument,
             crate::read_limits::ReadAdmissionError::StoredFrameTooLarge { .. }
-            | crate::read_limits::ReadAdmissionError::DecodedFrameTooLarge { .. } => {
+            | crate::read_limits::ReadAdmissionError::DecodedFrameTooLarge { .. }
+            | crate::read_limits::ReadAdmissionError::ObjectCountTooLarge { .. } => {
                 ErrorClass::ResourceExhausted
             }
         };

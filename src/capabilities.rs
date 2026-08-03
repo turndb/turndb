@@ -40,6 +40,7 @@ pub struct Capabilities {
     pub portable_wasm: bool,
     pub write_admission_limits: bool,
     pub read_admission_limits: bool,
+    pub object_count_admission: bool,
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
     pub format_migration: bool,
@@ -56,6 +57,9 @@ pub struct Capabilities {
     pub max_identifier_bytes_default: usize,
     pub max_stored_frame_bytes_default: u64,
     pub max_decoded_frame_bytes_default: u64,
+    pub max_directory_entries_default: u64,
+    pub max_wal_frames_default: u64,
+    pub max_fold_blocks_default: u64,
 }
 
 /// Report what this build can actually guarantee.
@@ -80,6 +84,7 @@ pub const fn capabilities() -> Capabilities {
         portable_wasm: cfg!(target_arch = "wasm32"),
         write_admission_limits: true,
         read_admission_limits: true,
+        object_count_admission: true,
         store_space_usage: true,
         allocated_space_usage: cfg!(unix),
         format_migration: true,
@@ -96,6 +101,9 @@ pub const fn capabilities() -> Capabilities {
         max_identifier_bytes_default: crate::store::DEFAULT_MAX_IDENTIFIER_BYTES,
         max_stored_frame_bytes_default: crate::read_limits::DEFAULT_MAX_STORED_FRAME_BYTES,
         max_decoded_frame_bytes_default: crate::read_limits::DEFAULT_MAX_DECODED_FRAME_BYTES,
+        max_directory_entries_default: crate::read_limits::DEFAULT_MAX_DIRECTORY_ENTRIES,
+        max_wal_frames_default: crate::read_limits::DEFAULT_MAX_WAL_FRAMES,
+        max_fold_blocks_default: crate::read_limits::DEFAULT_MAX_FOLD_BLOCKS,
     }
 }
 
@@ -111,6 +119,7 @@ mod tests {
         assert_eq!(c.portable_wasm, cfg!(target_arch = "wasm32"));
         assert!(c.store_space_usage);
         assert!(c.read_admission_limits);
+        assert!(c.object_count_admission);
         assert_eq!(
             c.max_stored_frame_bytes_default,
             crate::read_limits::DEFAULT_MAX_STORED_FRAME_BYTES

@@ -28,6 +28,12 @@ pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
 /// Format bound. `Loc.block_off` is a `u32`, so a block start must fit in one.
 pub const SEG_MAX_LIMIT: u64 = 1 << 32;
 
+/// Block id and byte offset entries reconstructed for one segment.
+pub type BlockDirectory = Vec<(u32, u32)>;
+
+/// A sidecar's committed segment tail and its block directory.
+pub type DirectorySidecar = (u32, BlockDirectory);
+
 pub fn seg_name(n: u32) -> String {
     format!("seg-{n:08}.fold")
 }
@@ -204,7 +210,7 @@ pub fn scan_tail_controlled(
     )
 }
 
-/// Controlled tail scan with explicit atomic-frame admission.
+/// Controlled tail scan with explicit frame-byte and block-count admission.
 pub fn scan_tail_controlled_with_limits(
     f: &dyn ReadAt,
     file_len: u64,
@@ -264,12 +270,16 @@ pub fn scan_tail_controlled_with_limits(
             // committed prefix predates the sidecar written after this segment was sealed.
             let body = &payload[BLOCK_HDR_LEN..span - BLOCK_XSUM_LEN];
             if h.stored > 0 && body.iter().all(|&b| b == 0) {
+                read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
+                read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
                 dir.push((h.block_id, off as u32));
                 off = end;
                 continue;
             }
             break;
         }
+        read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
+        read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
         dir.push((h.block_id, off as u32));
         off = end;
     }
@@ -332,8 +342,23 @@ pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) 
 /// segment back into being the active one, and its leftover sidecar then describes blocks past
 /// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
 /// means the sidecar and the segment parted ways.
-pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
-    parse_dir_sidecar(&read_dir_sidecar_bytes(dir, n, file_len)?, n, file_len)
+pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<DirectorySidecar> {
+    read_dir_sidecar_with_limits(dir, n, file_len, crate::read_limits::ReadLimits::default())
+        .ok()
+        .flatten()
+}
+
+/// Read and parse advisory directory metadata with explicit byte and object admission.
+pub fn read_dir_sidecar_with_limits(
+    dir: &Path,
+    n: u32,
+    file_len: u64,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Option<DirectorySidecar>> {
+    let Some(bytes) = read_dir_sidecar_bytes_with_limits(dir, n, file_len, read_limits)? else {
+        return Ok(None);
+    };
+    parse_dir_sidecar_with_limits(&bytes, n, file_len, read_limits)
 }
 
 /// Largest structurally possible sidecar for a segment extent. Every indexed block consumes at
@@ -346,35 +371,73 @@ pub fn max_dir_sidecar_bytes(file_len: u64) -> u64 {
 /// Read advisory bytes only after their filesystem length fits what the segment could describe.
 /// `None` is intentionally the only failure: callers rescan the authoritative segment.
 pub fn read_dir_sidecar_bytes(dir: &Path, n: u32, file_len: u64) -> Option<Vec<u8>> {
-    let file = File::open(dir_path(dir, n)).ok()?;
+    read_dir_sidecar_bytes_with_limits(dir, n, file_len, crate::read_limits::ReadLimits::default())
+        .ok()
+        .flatten()
+}
+
+/// Read advisory sidecar bytes after both structural and runtime byte admission.
+pub fn read_dir_sidecar_bytes_with_limits(
+    dir: &Path,
+    n: u32,
+    file_len: u64,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Option<Vec<u8>>> {
+    let file = match File::open(dir_path(dir, n)) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
     let max = max_dir_sidecar_bytes(file_len);
-    let len = file.metadata().ok()?.len();
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Ok(None),
+    };
     if len > max {
-        return None;
+        return Ok(None);
     }
-    let capacity = usize::try_from(len).ok()?;
+    read_limits.admit_stored(format!("fold segment {n} directory sidecar"), len)?;
+    let capacity = match usize::try_from(len) {
+        Ok(capacity) => capacity,
+        Err(_) => return Ok(None),
+    };
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(capacity).ok()?;
-    file.take(max.saturating_add(1)).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= max).then_some(bytes)
+    if bytes.try_reserve_exact(capacity).is_err()
+        || file.take(max.saturating_add(1)).read_to_end(&mut bytes).is_err()
+    {
+        return Ok(None);
+    }
+    Ok((bytes.len() as u64 <= max).then_some(bytes))
 }
 
 /// [`read_dir_sidecar`]'s validation core, over bytes from ANY source — a directory or a pack.
-pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
+pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<DirectorySidecar> {
+    parse_dir_sidecar_with_limits(b, n, file_len, crate::read_limits::ReadLimits::default())
+        .ok()
+        .flatten()
+}
+
+/// Parse advisory directory bytes with object admission before allocating the entry vector.
+pub fn parse_dir_sidecar_with_limits(
+    b: &[u8],
+    n: u32,
+    file_len: u64,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Option<DirectorySidecar>> {
     if b.len() < 24 || &b[0..8] != DIR_MAGIC {
-        return None;
+        return Ok(None);
     }
     let crc = u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap());
     if crc32fast::hash(&b[..b.len() - 4]) != crc {
-        return None;
+        return Ok(None);
     }
     let seg = u32::from_le_bytes(b[8..12].try_into().unwrap());
     let tail = u32::from_le_bytes(b[12..16].try_into().unwrap());
     let n_entries = u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize;
     let expected_len = n_entries.checked_mul(8).and_then(|bytes| 24usize.checked_add(bytes));
     if seg != n || tail as u64 != file_len || expected_len != Some(b.len()) {
-        return None;
+        return Ok(None);
     }
+    read_limits.admit_fold_blocks(n_entries as u64)?;
     let mut entries = Vec::with_capacity(n_entries);
     for i in 0..n_entries {
         let at = 20 + i * 8;
@@ -383,7 +446,7 @@ pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<(u32, Vec<(u
             u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()),
         ));
     }
-    Some((tail, entries))
+    Ok(Some((tail, entries)))
 }
 
 /// The full path of a segment, for callers that need it (tests, introspection).
