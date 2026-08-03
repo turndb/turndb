@@ -82,7 +82,7 @@ jobs:
         run: cargo test --release
 
   npm:
-    # `package.json` declares `engines: { node: ">=20" }`, so the matrix IS the claim. The first CI
+    # `package.json` declares `engines: { node: ">=22 <27" }`, so the matrix IS the claim. The first CI
     # run pinned 22 and the suite died with SIGSEGV after its assertions passed — on a version the
     # package says it supports, while passing locally on 24. Testing one version would have made
     # that a property of whichever version someone picked.
@@ -92,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22', '24']
+        node: ['22', '24', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -121,7 +121,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['18', '20', '22', '24']
+        node: ['22', '24', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

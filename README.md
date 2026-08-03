@@ -159,6 +159,10 @@ is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
 
 ## Platforms
 
+The exact tested targets, Node majors, capability rules, semantic-version policy, and current
+prototype/publication status are defined in the
+[support and compatibility policy](docs/support-and-compatibility.md).
+
 The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
 Linux hole punching.
 

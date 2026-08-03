@@ -367,6 +367,10 @@ see `docs/resource-budgets.md`.
 
 ## 7. Compatibility policy
 
+Package/runtime support, semantic-version rules, deprecation, capability evolution, and on-disk
+versioning are separated in the [support and compatibility policy](support-and-compatibility.md); the
+rules below summarize the format half of that contract.
+
 TurnDB is pre-1.0 and the format is not frozen, but every accepted revision follows these rules:
 
 - A reader refuses a part version above its maximum before parsing version-specific sections.

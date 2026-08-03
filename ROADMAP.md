@@ -586,10 +586,16 @@ This phase turns demonstrated behavior into promises that downstream projects ca
 ### Deliverables
 
 - A complete public format specification.
-- A supported-platform and capability policy.
-- Semantic-versioning policies for the Rust and Node APIs.
-- Format-version compatibility fixtures retained across releases.
-- Upgrade fixtures containing stores written by older versions.
+- A supported-platform and capability policy. **Implemented for the 0.x line:** evidence tiers name
+  Linux/WASI/native-Node coverage and refuse claims for untested targets; closed Node engine ranges
+  and CI majors are machine-checked together.
+- Semantic-versioning policies for the Rust and Node APIs. **Implemented for 0.x and the 1.0
+  transition:** patch/minor breaking rules, exhaustive Rust shapes, extensible Node results,
+  error-code stability, features, deprecation, and publication status are explicit.
+- Format-version compatibility fixtures retained across releases. **Initial retained fixture
+  implemented:** a deterministic revision-3 pack is checked against private Rust construction.
+- Upgrade fixtures containing stores written by older versions. **Implemented for revision 3:** the
+  public Node seam restores and migrates the retained pack byte/identity-exact across restart.
 - Property, fuzz, corruption, and deterministic crash testing for the generalized record model.
 - Differential tests between point reads, structured scans, and DataFusion queries.
 - Cross-runtime tests proving native and WASM implementations read the same stores byte-exactly where
