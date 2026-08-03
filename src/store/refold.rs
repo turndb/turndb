@@ -108,6 +108,28 @@ pub fn refold(
     old_gen: u32,
     cfg: FoldCfg,
 ) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
+    refold_with_control(
+        dir,
+        parts,
+        seqs,
+        old_fold,
+        old_gen,
+        cfg,
+        &crate::control::OperationControl::default(),
+    )
+}
+
+/// [`refold`] with cooperative checkpoints throughout its unpublished generation build.
+pub fn refold_with_control(
+    dir: &Path,
+    parts: &[Arc<Part>],
+    seqs: &[(u64, u64)],
+    old_fold: &Fold,
+    old_gen: u32,
+    cfg: FoldCfg,
+    control: &crate::control::OperationControl,
+) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
+    control.check("content refold")?;
     if parts.len() != seqs.len() {
         bail!("every part needs its committed sequence range");
     }
@@ -116,6 +138,7 @@ pub fn refold(
     if new_dir.exists() {
         crate::vfs::remove_tree(&new_dir)?;
     }
+    let mut cleanup = StagedRefold::new(dir, new_gen, seqs);
 
     let mut st = RefoldStats { parts_in: parts.len(), ..Default::default() };
     st.fold_bytes_before = dir_bytes(&fold_dir(dir, old_gen));
@@ -130,6 +153,7 @@ pub fn refold(
     let mut wanted: HashMap<PieceHash, Loc> = HashMap::new();
     for (pi, rows) in live.iter().enumerate() {
         for &row in rows {
+            control.check("content refold")?;
             for content in parts[pi].record(row)?.contents {
                 for op in content.ops {
                     let BodyOp::Piece { hash, .. } = op else { continue };
@@ -150,6 +174,7 @@ pub fn refold(
         let mut all = HashSet::new();
         for p in parts {
             for i in 0..p.piece_count()? {
+                control.check("content refold")?;
                 all.insert(p.piece(i)?.1);
             }
         }
@@ -167,12 +192,14 @@ pub fn refold(
     {
         let mut nf = Fold::open(&new_dir, cfg)?;
         for (loc, hash) in &order {
+            control.check("content refold")?;
             // read_verified, not read: a re-fold is exactly when to re-check that content still hashes
             // to the identity claiming it, since everything downstream is about to trust the copy.
             let bytes = old_fold.read_verified(*loc, *hash)?;
             let put = nf.put_hashed(&bytes, *hash)?;
             remap.insert(*hash, put.loc);
         }
+        control.check("content refold")?;
         nf.sync()?;
     }
     st.fold_bytes_after = dir_bytes(&new_dir);
@@ -182,6 +209,7 @@ pub fn refold(
     // content still exists, and wrong here, where it has just been dropped.
     let mut out = Vec::new();
     for (pi, rows) in live.iter().enumerate() {
+        control.check("content refold")?;
         if rows.is_empty() {
             continue; // every record in this part was deleted or superseded
         }
@@ -200,8 +228,49 @@ pub fn refold(
         )?;
         out.push((file, lo, hi, meta.n_records));
     }
+    control.check("content refold")?;
     st.parts_out = out.len();
+    cleanup.disarm();
     Ok((new_gen, out, st))
+}
+
+struct StagedRefold {
+    fold: PathBuf,
+    parts: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl StagedRefold {
+    fn new(dir: &Path, generation: u32, seqs: &[(u64, u64)]) -> StagedRefold {
+        StagedRefold {
+            fold: fold_dir(dir, generation),
+            parts: seqs
+                .iter()
+                .map(|&(lo, hi)| dir.join(format!("part-r{generation:04}-{lo:08}-{hi:08}.part")))
+                .collect(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedRefold {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.fold.exists() {
+            let _ = crate::vfs::remove_tree(&self.fold);
+        }
+        for part in &self.parts {
+            if part.exists() {
+                let _ = crate::vfs::unlink(part);
+            }
+        }
+    }
 }
 
 fn dir_bytes(d: &Path) -> u64 {
@@ -214,4 +283,30 @@ fn dir_bytes(d: &Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_stage_guard_removes_every_unpublished_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "turndb-refold-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let seqs = [(1, 2), (3, 4)];
+        let stage = StagedRefold::new(&root, 7, &seqs);
+        std::fs::create_dir_all(fold_dir(&root, 7)).unwrap();
+        std::fs::write(fold_dir(&root, 7).join("partial"), b"partial").unwrap();
+        for path in &stage.parts {
+            std::fs::write(path, b"partial").unwrap();
+        }
+        drop(stage);
+        assert!(!fold_dir(&root, 7).exists());
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
 }

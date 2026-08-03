@@ -115,6 +115,7 @@ export interface Capabilities {
   healthSnapshots: true;
   schemaDiscovery: true;
   scanCancellation: true;
+  lifecycleCancellation: true;
   scanReconstructionBudget: true;
   scanReconstructedBytesDefault: bigint;
   arrowIpc: boolean;
@@ -132,6 +133,12 @@ export interface OpenOptions {
 
 export interface SnapshotOpenOptions {
   maxConcurrentSqlMemoryBytes?: bigint;
+}
+
+export interface LifecycleOptions {
+  /** Queue-inclusive relative deadline. Zero refuses before lifecycle mutation. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export type AttributeType = 'string' | 'int' | 'float' | 'bool';
@@ -240,13 +247,13 @@ export declare class NativeStore {
   readContent(id: string, name: string): Promise<Buffer | null>;
   snapshot(): Promise<NativeSnapshot>;
   schema(): Promise<StoreSchema>;
-  compact(full?: boolean): Promise<{
+  compact(full?: boolean, options?: LifecycleOptions): Promise<{
     flushed: boolean;
     partsBefore: bigint;
     partsAfter: bigint;
     merge?: MergeStats;
   }>;
-  verify(): Promise<{
+  verify(options?: LifecycleOptions): Promise<{
     manifestLinks: bigint;
     partDigests: bigint;
     undigestedParts: bigint;
@@ -259,14 +266,14 @@ export declare class NativeStore {
   }>;
   /** Settles prior writes; refuses to replace an existing destination. */
   backup(path: string): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
-  erase(ids: string[]): Promise<{
+  erase(ids: string[], options?: LifecycleOptions): Promise<{
     requested: bigint;
     tombstoned: bigint;
     absent: bigint;
     refold?: RefoldResult;
   }>;
-  punch(): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
-  refold(): Promise<RefoldResult>;
+  punch(options?: LifecycleOptions): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
+  refold(options?: LifecycleOptions): Promise<RefoldResult>;
   health(): Promise<{
     commit: bigint;
     foldGeneration: number;

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use turndb::control::{OperationControl, OperationInterrupted};
 use turndb::fold::FoldCfg;
 #[cfg(feature = "sql")]
 use turndb::query::sql::{
@@ -42,6 +43,14 @@ fn coded_failure(code: &str, reason: impl std::fmt::Display) -> Error {
 
 fn scan_failure(context: &str, error: anyhow::Error) -> Error {
     if error.chain().any(|cause| cause.downcast_ref::<ScanInterrupted>().is_some()) {
+        coded_failure("CANCELLED", format!("{context}: {error:#}"))
+    } else {
+        failure(context, error)
+    }
+}
+
+fn lifecycle_failure(context: &str, error: anyhow::Error) -> Error {
+    if error.chain().any(|cause| cause.downcast_ref::<OperationInterrupted>().is_some()) {
         coded_failure("CANCELLED", format!("{context}: {error:#}"))
     } else {
         failure(context, error)
@@ -171,6 +180,13 @@ pub struct NativeScanRequest {
     pub predicates: Option<Vec<NativePredicate>>,
 }
 
+#[napi(object, object_to_js = false)]
+pub struct NativeLifecycleOptions {
+    /// Milliseconds from submission; actor-queue time is included.
+    pub timeout_ms: Option<u32>,
+    pub signal: Option<AbortSignal>,
+}
+
 #[napi(object)]
 pub struct NativeProjectedContent {
     pub name: String,
@@ -275,6 +291,7 @@ pub struct NativeCapabilities {
     pub health_snapshots: bool,
     pub schema_discovery: bool,
     pub scan_cancellation: bool,
+    pub lifecycle_cancellation: bool,
     pub scan_reconstruction_budget: bool,
     pub scan_reconstructed_bytes_default: BigInt,
     pub arrow_ipc: bool,
@@ -315,6 +332,7 @@ pub fn capabilities() -> NativeCapabilities {
         health_snapshots: true,
         schema_discovery: true,
         scan_cancellation: true,
+        lifecycle_cancellation: true,
         scan_reconstruction_budget: true,
         scan_reconstructed_bytes_default: BigInt::from(DEFAULT_MAX_RECONSTRUCTED_BYTES),
         arrow_ipc: cfg!(feature = "sql"),
@@ -1008,22 +1026,39 @@ impl NativeStore {
 
     /// Settle earlier writes and compact. `full=true` merges every live part; false uses policy.
     #[napi]
-    pub async fn compact(&self, full: Option<bool>) -> Result<NativeCompactResult> {
-        self.actor
-            .compact(full.unwrap_or(false))
-            .await
-            .map(encode_compact)
-            .map_err(|error| failure("compact TurnDB store", error))
+    pub fn compact<'env>(
+        &self,
+        env: &'env Env,
+        full: Option<bool>,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeCompactResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .compact(full.unwrap_or(false), control)
+                .await
+                .map(encode_compact)
+                .map_err(|error| lifecycle_failure("compact TurnDB store", error))
+        })
     }
 
     /// Settle earlier writes, then verify manifest pins, every part section, and every fold frame.
     #[napi]
-    pub async fn verify(&self) -> Result<NativeVerifyResult> {
-        self.actor
-            .verify()
-            .await
-            .map(encode_verify)
-            .map_err(|error| failure("verify TurnDB store", error))
+    pub fn verify<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeVerifyResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .verify(control)
+                .await
+                .map(encode_verify)
+                .map_err(|error| lifecycle_failure("verify TurnDB store", error))
+        })
     }
 
     /// Settle earlier writes and publish a verified backup without replacing an existing path.
@@ -1045,40 +1080,65 @@ impl NativeStore {
 
     /// Physically erase ids from this store, including retained history. External copies are out of scope.
     #[napi]
-    pub async fn erase(&self, ids: Vec<String>) -> Result<NativeEraseResult> {
-        self.actor
-            .erase(ids)
-            .await
-            .map(|stats| NativeEraseResult {
-                requested: BigInt::from(stats.requested as u64),
-                tombstoned: BigInt::from(stats.tombstoned as u64),
-                absent: BigInt::from(stats.absent as u64),
-                refold: stats.refold.map(encode_refold),
-            })
-            .map_err(|error| failure("erase TurnDB records", error))
+    pub fn erase<'env>(
+        &self,
+        env: &'env Env,
+        ids: Vec<String>,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeEraseResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .erase(ids, control)
+                .await
+                .map(|stats| NativeEraseResult {
+                    requested: BigInt::from(stats.requested as u64),
+                    tombstoned: BigInt::from(stats.tombstoned as u64),
+                    absent: BigInt::from(stats.absent as u64),
+                    refold: stats.refold.map(encode_refold),
+                })
+                .map_err(|error| lifecycle_failure("erase TurnDB records", error))
+        })
     }
 
     /// Reclaim unreachable fold blocks in place where the platform supports punching.
     #[napi]
-    pub async fn punch(&self) -> Result<NativePunchResult> {
-        self.actor
-            .punch()
-            .await
-            .map(|stats| NativePunchResult {
-                blocks_examined: BigInt::from(stats.blocks_examined as u64),
-                blocks_punched: BigInt::from(stats.blocks_punched as u64),
-            })
-            .map_err(|error| failure("punch unreferenced TurnDB content", error))
+    pub fn punch<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativePunchResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .punch(control)
+                .await
+                .map(|stats| NativePunchResult {
+                    blocks_examined: BigInt::from(stats.blocks_examined as u64),
+                    blocks_punched: BigInt::from(stats.blocks_punched as u64),
+                })
+                .map_err(|error| lifecycle_failure("punch unreferenced TurnDB content", error))
+        })
     }
 
     /// Rewrite all live content into a new fold generation and purge retained history.
     #[napi]
-    pub async fn refold(&self) -> Result<NativeRefoldResult> {
-        self.actor
-            .refold()
-            .await
-            .map(encode_refold)
-            .map_err(|error| failure("refold TurnDB store", error))
+    pub fn refold<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeRefoldResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .refold(control)
+                .await
+                .map(encode_refold)
+                .map_err(|error| lifecycle_failure("refold TurnDB store", error))
+        })
     }
 
     /// Return cheap operational counters without decoding records or content.
@@ -1246,6 +1306,21 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
         }
     };
     Ok((name, value))
+}
+
+fn decode_lifecycle(options: Option<NativeLifecycleOptions>) -> OperationControl {
+    let Some(options) = options else {
+        return OperationControl::default();
+    };
+    let cancellation = options.signal.map(|signal| {
+        let token = CancellationToken::new();
+        let cancelled = token.clone();
+        signal.on_abort(move || cancelled.cancel());
+        token
+    });
+    let deadline =
+        options.timeout_ms.map(|millis| Instant::now() + Duration::from_millis(u64::from(millis)));
+    OperationControl { deadline, cancellation }
 }
 
 fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {

@@ -73,10 +73,15 @@ silently.
 - `compact()`, `verify()`, `punch()`, and `refold()` run on the same serialized writer actor. They
   sync and flush earlier writes before operating, so their reports cover an exact cut and their
   filesystem work stays off the event loop. `compact(true)` requests a full merge; the default uses
-  the engine's measured automatic policy.
+  the engine's measured automatic policy. Each accepts queue-inclusive `timeoutMs` and
+  `AbortSignal` options backed by Rust cooperative checkpoints. Cancelled compaction/refold staging
+  is removed; punching retains safe resumable progress. See
+  [lifecycle cancellation and deadlines](../../docs/lifecycle-control.md).
 - `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
   content, and purges retained manifests so this store has no snapshot path back to the erased rows.
-  It cannot erase packs, backups, replicas, or any other external copy.
+  It accepts cancellation during read-only planning, then deliberately defers it once tombstones are
+  applied until physical erasure completes. It cannot erase packs, backups, replicas, or any other
+  external copy.
 - `health()` is a cheap engine snapshot suitable for an embedding application's health/metrics
   endpoint: commit and fold generation, part pressure, staged entries and bytes, WAL/fold bytes,
   cache counters and budgets, dedup-window size, retained commits, and punched blocks. It decodes no
@@ -87,6 +92,6 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose cancellation for long-running lifecycle operations, recovery,
-or SQL planning, or the complete engine error taxonomy. Those remain explicit Phase 3/4 work rather
-than being simulated in JavaScript.
+The current slice does not yet expose cancellation for backup, restore, offline recovery, SQL
+planning, sync, or flush, or the complete engine error taxonomy. Those remain explicit Phase 3/4
+work rather than being simulated in JavaScript.

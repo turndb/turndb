@@ -165,6 +165,23 @@ pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_controlled(
+        f,
+        file_len,
+        has_dict,
+        &crate::control::OperationControl::default(),
+        "fold scan",
+    )
+}
+
+/// [`scan_tail`] with cooperative checks between complete frames.
+pub fn scan_tail_controlled(
+    f: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+) -> Result<(u64, Vec<(u32, u32)>)> {
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
@@ -172,6 +189,7 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
     // rebuilt from the ids the frames carry.
     let mut dir: Vec<(u32, u32)> = Vec::new();
     loop {
+        control.check(operation)?;
         if off + (block::BLOCK_OVERHEAD as u64) > file_len {
             break; // cannot hold even an empty block
         }
@@ -196,6 +214,7 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
         if f.read_exact_at(&mut payload[..span], off).is_err() {
             break;
         }
+        control.check(operation)?;
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
             // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
             // it (that is what keeping the header buys) and retains its location. The manifest's

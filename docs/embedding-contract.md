@@ -258,8 +258,14 @@ not a backup. `erase(ids)` invokes the engine's strong erasure composition and p
 Its boundary remains this store: previously written packs, backups, replicas, and consumer exports are
 not affected. Online backup, validated no-overlay restore, and exclusive fully validated manifest
 recovery are exposed in Rust and Node. Recovery defaults to zero rollback, requires explicit authority
-to abandon newer retained commits, and reports its validation evidence. Preflight space estimates,
-resumable maintenance, and lifecycle-operation cancellation remain current gaps.
+to abandon newer retained commits, and reports its validation evidence. Compaction, verification,
+punching, and refold now accept shared Rust cancellation/deadline controls, exposed as queue-inclusive
+Node `timeoutMs` and `AbortSignal` options. Unpublished compaction/refold staging is removed on
+interruption; punching is durably resumable after cancellation or crash. Strong erasure accepts
+interruption only before its atomic tombstone phase, then drives physical removal to completion so it
+cannot return an ambiguous partial-erasure result. Preflight space estimates and resumable format
+migration remain current gaps. Backup, restore, offline recovery, SQL planning, sync, and flush remain
+non-cancellable.
 
 `Store::health` and the Node `health()` method are constant-work operational snapshots. They report
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
@@ -298,8 +304,9 @@ scans have byte ceilings, deadlines, and cooperative cancellation and the native
 bounded and configurable. The SQL pool is not represented as a total-process RSS guarantee:
 DataFusion documents allocations outside its pool, Arrow IPC output is returned to the caller, and
 TurnDB's bounded caches are accounted independently. Concurrent queries reserve their per-query
-ceilings against a shared aggregate governor; long-running lifecycle operations still need
-interruption.
+ceilings against a shared aggregate governor. Lifecycle deadlines are cooperative rather than hard
+real-time limits: latency is bounded by the current record, section, fold frame, piece, rebuilt part,
+or independently punched block.
 Reaching a budget returns a structured error or partial page with a cursor only where the operation
 contract explicitly allows it. It never truncates a record, invents a weaker durability
 acknowledgement, or silently widens a scan.

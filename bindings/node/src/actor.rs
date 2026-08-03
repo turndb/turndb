@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
+use turndb::control::OperationControl;
 use turndb::fold::FoldCfg;
 use turndb::scan::{ScanPage, ScanRequest};
 use turndb::store::{Batch, ChainReport, ContentSpans, ErasureStats, PunchStats, ReadStore, Store};
@@ -97,9 +98,11 @@ enum Command {
     },
     Compact {
         full: bool,
+        control: OperationControl,
         reply: oneshot::Sender<Result<CompactResult>>,
     },
     Verify {
+        control: OperationControl,
         reply: oneshot::Sender<Result<VerifyResult>>,
     },
     Backup {
@@ -108,12 +111,15 @@ enum Command {
     },
     Erase {
         ids: Vec<String>,
+        control: OperationControl,
         reply: oneshot::Sender<Result<ErasureStats>>,
     },
     Punch {
+        control: OperationControl,
         reply: oneshot::Sender<Result<PunchStats>>,
     },
     Refold {
+        control: OperationControl,
         reply: oneshot::Sender<Result<turndb::store::refold::RefoldStats>>,
     },
     Health {
@@ -233,28 +239,31 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Snapshot { reply })?).await
     }
 
-    pub async fn compact(&self, full: bool) -> Result<CompactResult> {
-        Self::receive(self.submit(|reply| Command::Compact { full, reply })?).await
+    pub async fn compact(&self, full: bool, control: OperationControl) -> Result<CompactResult> {
+        Self::receive(self.submit(|reply| Command::Compact { full, control, reply })?).await
     }
 
-    pub async fn verify(&self) -> Result<VerifyResult> {
-        Self::receive(self.submit(|reply| Command::Verify { reply })?).await
+    pub async fn verify(&self, control: OperationControl) -> Result<VerifyResult> {
+        Self::receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
 
     pub async fn backup(&self, path: std::path::PathBuf) -> Result<turndb::pack::BackupStats> {
         Self::receive(self.submit(|reply| Command::Backup { path, reply })?).await
     }
 
-    pub async fn erase(&self, ids: Vec<String>) -> Result<ErasureStats> {
-        Self::receive(self.submit(|reply| Command::Erase { ids, reply })?).await
+    pub async fn erase(&self, ids: Vec<String>, control: OperationControl) -> Result<ErasureStats> {
+        Self::receive(self.submit(|reply| Command::Erase { ids, control, reply })?).await
     }
 
-    pub async fn punch(&self) -> Result<PunchStats> {
-        Self::receive(self.submit(|reply| Command::Punch { reply })?).await
+    pub async fn punch(&self, control: OperationControl) -> Result<PunchStats> {
+        Self::receive(self.submit(|reply| Command::Punch { control, reply })?).await
     }
 
-    pub async fn refold(&self) -> Result<turndb::store::refold::RefoldStats> {
-        Self::receive(self.submit(|reply| Command::Refold { reply })?).await
+    pub async fn refold(
+        &self,
+        control: OperationControl,
+    ) -> Result<turndb::store::refold::RefoldStats> {
+        Self::receive(self.submit(|reply| Command::Refold { control, reply })?).await
     }
 
     pub async fn health(&self) -> Result<turndb::store::StoreHealth> {
@@ -319,12 +328,12 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                     .context("publish immutable reader snapshot");
                 let _ = reply.send(result);
             }
-            Command::Compact { full, reply } => {
-                let result = compact(&mut store, full);
+            Command::Compact { full, control, reply } => {
+                let result = compact(&mut store, full, &control);
                 let _ = reply.send(result);
             }
-            Command::Verify { reply } => {
-                let result = verify(&mut store, path);
+            Command::Verify { control, reply } => {
+                let result = verify(&mut store, path, &control);
                 let _ = reply.send(result);
             }
             Command::Backup { path, reply } => {
@@ -332,15 +341,23 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 // while later commands wait until the verified artifact has been published.
                 let _ = reply.send(store.backup(&path));
             }
-            Command::Erase { ids, reply } => {
-                let _ = reply.send(store.erase_ids(&ids));
+            Command::Erase { ids, control, reply } => {
+                let _ = reply.send(store.erase_ids_with_control(&ids, &control));
             }
-            Command::Punch { reply } => {
-                let result = settle(&mut store).and_then(|_| store.punch_unreferenced());
+            Command::Punch { control, reply } => {
+                let result = control
+                    .check("content punching")
+                    .map_err(anyhow::Error::from)
+                    .and_then(|_| settle(&mut store))
+                    .and_then(|_| store.punch_unreferenced_with_control(&control));
                 let _ = reply.send(result);
             }
-            Command::Refold { reply } => {
-                let result = settle(&mut store).and_then(|_| store.refold());
+            Command::Refold { control, reply } => {
+                let result = control
+                    .check("content refold")
+                    .map_err(anyhow::Error::from)
+                    .and_then(|_| settle(&mut store))
+                    .and_then(|_| store.refold_with_control(&control));
                 let _ = reply.send(result);
             }
             Command::Health { reply } => {
@@ -393,22 +410,31 @@ fn settle(store: &mut Store) -> Result<bool> {
     Ok(store.flush()?.is_some())
 }
 
-fn compact(store: &mut Store, full: bool) -> Result<CompactResult> {
+fn compact(store: &mut Store, full: bool, control: &OperationControl) -> Result<CompactResult> {
+    control.check("part compaction")?;
     let flushed = settle(store)?;
+    control.check("part compaction")?;
     let parts_before = store.part_count();
-    let merge = if full { store.merge_range(0, parts_before)? } else { store.auto_compact()? };
+    let merge = if full {
+        store.merge_range_with_control(0, parts_before, control)?
+    } else {
+        store.auto_compact_with_control(control)?
+    };
     Ok(CompactResult { flushed, parts_before, parts_after: store.part_count(), merge })
 }
 
-fn verify(store: &mut Store, path: &Path) -> Result<VerifyResult> {
+fn verify(store: &mut Store, path: &Path, control: &OperationControl) -> Result<VerifyResult> {
     // Settling makes the report cover every operation accepted before this command, and actor
     // serialization prevents a new manifest from racing the chain walk.
+    control.check("store verification")?;
     settle(store)?;
-    let chain = turndb::store::verify_chain(path)?;
-    let fold = store.fold().scrub()?;
+    control.check("store verification")?;
+    let chain = turndb::store::verify_chain_with_control(path, control)?;
+    let fold = store.fold().scrub_with_control(control)?;
     let mut part_sections = 0usize;
     for part in store.parts() {
-        part_sections += part.verify_sections()?;
+        control.check("store verification")?;
+        part_sections += part.verify_sections_with_control(control)?;
     }
     Ok(VerifyResult { chain, fold, parts: store.part_count(), part_sections })
 }
@@ -547,6 +573,40 @@ mod tests {
         assert!(error.downcast_ref::<turndb::scan::ScanInterrupted>().is_some_and(|error| {
             error.reason == turndb::scan::ScanInterruptionReason::DeadlineExceeded
         }));
+        runtime.block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_lifecycle_deadline_includes_time_waiting_in_the_actor_queue() {
+        let dir = temp();
+        let actor = Actor::open_with_capacity(&dir, DEFAULT_QUEUE_CAPACITY).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
+        entered_rx.recv().unwrap();
+
+        let runtime = napi::tokio::runtime::Runtime::new().unwrap();
+        let verify_actor = actor.clone();
+        let pending = runtime.spawn(async move {
+            verify_actor
+                .verify(OperationControl {
+                    deadline: Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(10),
+                    ),
+                    cancellation: None,
+                })
+                .await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        let error = match runtime.block_on(pending).unwrap() {
+            Ok(_) => panic!("expired lifecycle work must refuse before settling the store"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some_and(
+            |error| { error.reason == turndb::control::InterruptionReason::DeadlineExceeded }
+        ));
         runtime.block_on(actor.close(false)).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

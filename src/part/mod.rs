@@ -706,11 +706,20 @@ impl Part {
     /// what a query touches. Offering it as a deliberate call keeps that a caller's choice — a
     /// consistency check, a repair tool, an ingest gate — instead of a tax every scan pays.
     pub fn verify_sections(&self) -> Result<usize> {
+        self.verify_sections_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Part::verify_sections`] with a cooperative checkpoint before each section read.
+    pub fn verify_sections_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<usize> {
         let mut checked = 0usize;
         if self.version < 1 {
             return Ok(0); // predates per-section checksums; nothing to check, and that is not an error
         }
         for (name, s) in &self.toc {
+            control.check("part verification")?;
             let mut buf = vec![0u8; s.stored as usize];
             self.f.read_exact_at(&mut buf, s.off)?;
             let got = crc32fast::hash(&buf);
