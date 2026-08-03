@@ -111,6 +111,12 @@ jobs:
       - name: build wasm from source and run the package suite
         run: bash npm/build.sh
 
+      # Format/codec interoperability is independent of Node major. Run it once: WASI writes and
+      # native reads, then native writes and WASI reads, each against an independent expected corpus.
+      - name: cross-runtime store compatibility
+        if: matrix.node == '24'
+        run: bash npm/interop.sh
+
   native-node:
     # This matrix is the native package's `engines.node` claim. N-API 6 is meant to decouple the
     # addon from a single Node/V8 release; only loading and exercising the same Rust surface across

@@ -599,7 +599,9 @@ This phase turns demonstrated behavior into promises that downstream projects ca
 - Property, fuzz, corruption, and deterministic crash testing for the generalized record model.
 - Differential tests between point reads, structured scans, and DataFusion queries.
 - Cross-runtime tests proving native and WASM implementations read the same stores byte-exactly where
-  their capability sets overlap.
+  their capability sets overlap. **Implemented in both directions:** CI has portable-WASI write/native
+  read and native write/portable-WASI read compare exact ids, content, and every scalar/duplicate-key
+  attribute against independent deterministic expectations while exercising both zstd encoders.
 - Performance baselines for ingestion, durable commit, metadata scans, content reconstruction,
   compaction, verification, recovery, and open time.
 - Published artifact sizes and measured costs for lightweight and full-featured packages.
