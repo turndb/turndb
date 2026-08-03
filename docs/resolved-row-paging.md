@@ -84,14 +84,14 @@ The writer memtable participates as the newest ordered source in the same k-way 
 or delete costs one resolution entry, is decided atomically with every immutable occurrence of that
 id, and no longer requires materializing the complete requested memtable range before paging.
 
-## What remains
+## Projection handoff and remaining work
 
-This is a bounded resolved-row batch, not yet vectorized column execution. Rows retain global id
-order across parts and each row currently invokes the selected-column decoders separately. Those
-decoders share section and decoded-column caches, but a future physical batch primitive can group
-resolved ordinals by part, decode/gather selected columns once, and restore global result order.
+The bounded resolved-row batch now feeds the [grouped column gather](grouped-column-gather.md).
+Immutable rows are grouped by part, selected physical decoders are shared within a bounded chunk, and
+records are restored to global id order before predicate evaluation. Writer memtable candidates keep
+their direct in-memory projection path.
 
-Range setup still visits every live part to find its `[from, to)` bounds, and globally ordered
-candidates still invoke selected-column decoders per row. Secondary indexes, alternate sort orders,
+Range setup still visits every live part to find its `[from, to)` bounds. Predicates remain
+row-oriented rather than vectorized over encoded columns. Secondary indexes, alternate sort orders,
 logical query plans, and SQL execution are separate roadmap work. This slice changes no on-disk
 format and adds no consumer-specific semantics.

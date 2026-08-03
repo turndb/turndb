@@ -971,7 +971,10 @@ impl Part {
         if end > prog.len() || start > end {
             bail!("{off_name} names a program outside {prog_name}");
         }
-        let program = &prog[start..end];
+        self.decode_program(&prog[start..end])
+    }
+
+    fn decode_program(&self, program: &[u8]) -> Result<Vec<BodyOp>> {
         let mut at = 0usize;
         let n = usize::try_from(get_varint(program, &mut at)?)
             .context("content-op count exceeds this platform's address space")?;
@@ -1100,6 +1103,100 @@ impl Part {
         Ok(out)
     }
 
+    /// Named content selected for several rows, in caller row order and canonical name order.
+    ///
+    /// Column metadata, sparse row ids, offsets, programs and identities are each opened once per
+    /// selected column for the gather. Only the requested programs are decoded.
+    pub fn contents_selected_many(
+        &self,
+        rows: &[usize],
+        names: &std::collections::HashSet<&str>,
+    ) -> Result<Vec<Vec<Content>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        if names.is_empty() {
+            return Ok(vec![Vec::new(); rows.len()]);
+        }
+        if self.version <= 1 {
+            return rows.iter().map(|&row| self.contents_selected(row, names)).collect();
+        }
+
+        for &row in rows {
+            if row >= self.len() {
+                bail!("row {row} out of range");
+            }
+        }
+        let columns = self.content_meta()?;
+        let mut out = vec![Vec::new(); rows.len()];
+        for (col, meta) in
+            columns.iter().enumerate().filter(|(_, meta)| names.contains(meta.name.as_str()))
+        {
+            let sparse_rows = if meta.dense { None } else { Some(self.content_rids(col, meta)?) };
+            let prog_name = format!("con.prog.{col}");
+            let off_name = format!("con.off.{col}");
+            let prog = self.sect(&prog_name)?;
+            let offs = self.nums(&off_name, 8)?;
+            let identities =
+                if self.version >= 3 { Some(self.sect(&format!("con.id.{col}"))?) } else { None };
+
+            for (output, &row) in rows.iter().enumerate() {
+                let occurrence = if meta.dense {
+                    Some(row)
+                } else {
+                    let row = u32::try_from(row).context("content row id exceeds u32")?;
+                    sparse_rows
+                        .as_ref()
+                        .expect("sparse content has row ids")
+                        .binary_search(&row)
+                        .ok()
+                };
+                let Some(occurrence) = occurrence else { continue };
+                if occurrence >= offs.len().saturating_sub(1) {
+                    bail!("content occurrence {occurrence} is outside {off_name}");
+                }
+                let start = usize::try_from(offs[occurrence]).with_context(|| {
+                    format!("content occurrence {occurrence} start exceeds this platform")
+                })?;
+                let end = usize::try_from(offs[occurrence + 1]).with_context(|| {
+                    format!("content occurrence {occurrence} end exceeds this platform")
+                })?;
+                if end > prog.len() || start > end {
+                    bail!("{off_name} names a program outside {prog_name}");
+                }
+                let identity = if let Some(identities) = &identities {
+                    let at = occurrence
+                        .checked_mul(33)
+                        .ok_or_else(|| anyhow::anyhow!("content identity offset overflows"))?;
+                    let end = at
+                        .checked_add(33)
+                        .ok_or_else(|| anyhow::anyhow!("content identity end offset overflows"))?;
+                    let encoded = identities.get(at..end).ok_or_else(|| {
+                        anyhow::anyhow!("content identity occurrence is truncated")
+                    })?;
+                    match encoded[0] {
+                        0 => {
+                            if encoded[1..].iter().any(|&byte| byte != 0) {
+                                bail!("unavailable content identity has a nonzero digest");
+                            }
+                            None
+                        }
+                        1 => Some(ContentHash(encoded[1..].try_into().unwrap())),
+                        marker => {
+                            bail!("content identity has unknown availability marker {marker}")
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut content = Content::new(&meta.name, self.decode_program(&prog[start..end])?);
+                content.identity = identity;
+                out[output].push(content);
+            }
+        }
+        Ok(out)
+    }
+
     /// Compatibility body program. An absent `body` value reads as empty through this legacy API.
     pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
         Ok(self.content(r, BODY_CONTENT)?.unwrap_or_default())
@@ -1117,6 +1214,15 @@ impl Part {
         names: &std::collections::HashSet<&str>,
     ) -> Result<Vec<(String, AttrValue)>> {
         attrs::read_row_selected(self, r, names)
+    }
+
+    /// Selected attributes for several rows, sharing the column decoders across the gather.
+    pub fn attrs_selected_many(
+        &self,
+        rows: &[usize],
+        names: &std::collections::HashSet<&str>,
+    ) -> Result<Vec<Vec<(String, AttrValue)>>> {
+        attrs::read_rows_selected(self, rows, names)
     }
 
     /// Column `c`'s zone map: `(min, max)` over every value the column holds, or `None` when no

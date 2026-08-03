@@ -54,16 +54,27 @@ Projection does not change:
 The existing structured scan request needs no compatibility adapter. The optimization lives behind
 the Rust query contract rather than in a binding.
 
-## Remaining cost gap
+## Grouped physical gather
 
 The pager now retains the authoritative part and row found by its bounded k-way id-range merge. It
 projects that row directly and reuses an already projected content program during reconstruction,
 rather than point-locating the id and decoding the program again. See
 [resolved-row structured paging](resolved-row-paging.md).
 
-It is not yet vectorized physical column execution: globally ordered candidates still invoke
-selected-column decoders one row at a time rather than being gathered by part and decoded as a
-batch. Query statistics report exact operation-local distinct sections and fold blocks, cache access
-counts, and stored/raw bytes. See [structured scan I/O statistics](structured-scan-io.md). A grouped
-physical batch primitive remains the next Phase-2 opportunity and requires no second index or format
-change.
+Resolved immutable candidates are gathered by physical part in chunks of at most 64, then restored to
+their original global id order. Within each part gather, attribute layout and column metadata are
+parsed once; each selected rid, value, and dictionary section is opened once. Named-content metadata,
+sparse row ids, programs, offsets, and identities follow the same rule. Program decoding remains
+row-selective: a gather never materializes a whole content column.
+
+The chunk is also capped by remaining output demand, so a limit-one request does not decode read-ahead
+rows. Every gathered candidate is therefore semantically examined before a full page can stop;
+predicate rejection triggers another gather. Cancellation and deadline checks bracket each chunk and
+each semantic row.
+
+This is a grouped sparse gather, not SIMD expression execution or a materialized Arrow batch.
+Predicates still evaluate against partial semantic records one row at a time, and sparse occurrence
+lookup remains directly indexed per requested row. Query statistics report exact operation-local
+distinct sections and fold blocks, cache access counts, and stored/raw bytes. See
+[structured scan I/O statistics](structured-scan-io.md) and
+[grouped column gather](grouped-column-gather.md).
