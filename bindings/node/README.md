@@ -70,11 +70,14 @@ silently.
   `UNSUPPORTED` on a platform without an OS no-replace directory rename; the capability is exposed
   as `backupRestore`. Both accept `timeoutMs`/`AbortSignal`; cancellation before the final atomic
   link/rename removes unpublished staging and never publishes the requested destination.
-- `recoverManifest(path, { maxRollbackCommits })` is an offline, exclusive recovery control. It
+- `recoverManifest(path, { maxRollbackCommits, timeoutMs, signal })` is an offline, exclusive
+  recovery control. It
   refuses a healthy store or live writer, validates the exact fold prefix, every part/section and
   every visible content value before publication, and defaults to permitting no rollback past the
   newest retained commit. The result reports the selected commit, rollback distance, and validation
-  work; see [the recovery procedure](../../docs/recovery.md).
+  work. Cancellation during validation leaves the damaged manifest and retained history unchanged;
+  promotion is the final uninterruptible boundary. See
+  [the recovery procedure](../../docs/recovery.md).
 - `querySql()` is the richer immutable query plane. The native package deliberately includes the
   Arrow/DataFusion dependency: Rust binds typed `$1` parameters, refuses DDL/DML/session statements,
   enforces a configurable execution-memory pool (256 MiB by default), and returns a
@@ -124,6 +127,6 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose cancellation for offline recovery, SQL planning, sync, or
-flush. Low-level untyped invariant failures also retain the conservative `INTERNAL` class. Those
-remain explicit Phase 3/4 work rather than being simulated in JavaScript.
+The current slice does not yet expose cancellation for SQL planning, sync, or flush. Low-level
+untyped invariant failures also retain the conservative `INTERNAL` class. Those remain explicit
+Phase 3/4 work rather than being simulated in JavaScript.

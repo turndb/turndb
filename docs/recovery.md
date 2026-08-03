@@ -25,9 +25,12 @@ backup or healthy replica.
    abandoned newer timeline.
 
 Validation reconstructs each content value incrementally into a BLAKE3 hasher; it does not allocate
-the complete value. Recovery is nevertheless a full offline scan and has no deadline or cancellation
-control yet. Its report includes the selected commit, rollback distance, records and content values
-validated, part/section counts, and fold segment/block/byte counts.
+the complete value. Part digests and section checksums are also read in bounded chunks. The
+controlled Rust and Node APIs accept cooperative cancellation/deadlines throughout discovery and
+validation. The final checkpoint is immediately before manifest promotion: after publication begins,
+TurnDB completes the crash-safe protocol and reports its actual outcome rather than cancellation.
+The report includes the selected commit, rollback distance, records and content values validated,
+part/section counts, and fold segment/block/byte counts.
 
 The default allowance is zero. This permits replacement by the newest retained commit—for example,
 repairing bit rot in the live manifest from its byte-identical retained copy—but refuses abandoning
@@ -63,14 +66,16 @@ retained manifests from this store directory, so preserve the pre-recovery copy 
 
 ```rust
 use turndb::{
+    control::OperationControl,
     fold::FoldCfg,
-    store::{recover_manifest, RecoveryOptions},
+    store::{recover_manifest_with_control, RecoveryOptions},
 };
 
-let report = recover_manifest(
+let report = recover_manifest_with_control(
     "damaged-store".as_ref(),
     FoldCfg::default(),
     RecoveryOptions { max_rollback_commits: 0 },
+    &OperationControl::default(),
 )?;
 println!("recovered commit {}", report.commit);
 # Ok::<(), anyhow::Error>(())
@@ -84,9 +89,12 @@ println!("recovered commit {}", report.commit);
 
 ```js
 const { recoverManifest } = require('@turndb/native');
+const abort = new AbortController();
 
 const report = await recoverManifest('/data/damaged-store', {
   maxRollbackCommits: 0n,
+  timeoutMs: 120_000,
+  signal: abort.signal,
 });
 ```
 
@@ -96,7 +104,7 @@ Counts and byte values are returned as `bigint`. Failures use stable `TurnDbErro
 - `INVALID_ARGUMENT` for a healthy store or insufficient rollback allowance.
 - `CORRUPTION` when no retained manifest is fully usable.
 - `NOT_FOUND` or `IO` for classified filesystem failures.
+- `CANCELLED` when the signal or deadline stops validation before promotion.
 
-The Node call runs off the event loop but remains an offline, non-cancellable operation. Under WASI,
-TurnDB cannot enforce advisory writer locks; the embedder must provide single-writer and recovery
-exclusion just as it must for ordinary writes.
+The Node call runs off the event loop. Under WASI, TurnDB cannot enforce advisory writer locks; the
+embedder must provide single-writer and recovery exclusion just as it must for ordinary writes.
