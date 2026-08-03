@@ -186,6 +186,8 @@ function encodeAttrs(attrs) {
     if (typeof v === 'string') out.push([k, 's', assertEncodable(v, `attribute ${k}`)]);
     else if (typeof v === 'boolean') out.push([k, 'b', v]);
     else if (typeof v === 'bigint') out.push([k, 'i', v.toString()]);
+    else if (v === null) out.push([k, 'n', null]);
+    else if (v instanceof Uint8Array) out.push([k, 'x', Array.from(v)]);
     else if (typeof v === 'number') {
       // Integer-valued floats are stored as ints, which is almost always what a caller means.
       // Pass a BigInt, or `{ f: n }`, when the distinction matters the other way.
@@ -206,6 +208,21 @@ function encodeAttrs(attrs) {
       else if (typeof i === 'number' && Number.isSafeInteger(i)) out.push([k, 'i', i.toString()]);
       else throw new TypeError(`integer attribute ${k} must be a safe integer or BigInt`);
     }
+    else if (v && typeof v === 'object' && 'u' in v) {
+      const u = v.u;
+      if (typeof u === 'bigint' && u >= 0n && u <= 18446744073709551615n) {
+        out.push([k, 'u', u.toString()]);
+      } else if (typeof u === 'number' && Number.isSafeInteger(u) && u >= 0) {
+        out.push([k, 'u', u.toString()]);
+      } else throw new TypeError(`unsigned attribute ${k} must be a non-negative u64`);
+    }
+    else if (v && typeof v === 'object' && 'timestampNs' in v) {
+      const timestamp = v.timestampNs;
+      if (typeof timestamp === 'bigint') out.push([k, 't', timestamp.toString()]);
+      else if (typeof timestamp === 'number' && Number.isSafeInteger(timestamp)) {
+        out.push([k, 't', timestamp.toString()]);
+      } else throw new TypeError(`timestamp attribute ${k} must be a signed i64 BigInt`);
+    }
     else throw new TypeError(`attribute ${k} has unsupported type ${typeof v}`);
   }
   return JSON.stringify(out);
@@ -219,7 +236,20 @@ function encodeFloat(v) {
 }
 
 function decodeAttrs(tagged) {
-  return tagged.map(([k, tag, v]) => [k, tag === 'i' ? BigInt(v) : tag === 'f' ? decodeFloat(v) : v]);
+  return tagged.map(([k, tag, v]) => [
+    k,
+    tag === 'i'
+      ? BigInt(v)
+      : tag === 'u'
+        ? { u: BigInt(v) }
+        : tag === 't'
+          ? { timestampNs: BigInt(v) }
+      : tag === 'f'
+        ? decodeFloat(v)
+        : tag === 'x'
+          ? Uint8Array.from(v)
+          : v,
+  ]);
 }
 
 function decodeFloat(v) {

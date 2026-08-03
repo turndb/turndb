@@ -54,10 +54,16 @@ with presence, length, and piece count without reading fold blocks. Revision-0/1
 records are read as one dense content value named `body`; revision-0/1/2 values honestly report their
 whole-value identity unavailable rather than substituting a program or piece hash. See
 `docs/record-model-v2.md`, `docs/content-identity-v3.md`, and `FORMAT.md`.
+Revision 4 and WAL tags `0x60`/`0x61` add the remaining scalar attribute types without changing named
+content identity or the original tag encodings.
 
-**Current gap:** the initial attribute types remain UTF-8 string, signed i64, f64, and boolean. The
-roadmap's unsigned integer, binary, timestamp, and explicit null semantics require a deliberate format
-revision; they must not be simulated with lossy strings or floats in a binding.
+Revision 4 completes the initial scalar type system with unsigned u64, arbitrary binary metadata,
+signed Unix-nanosecond timestamps interpreted in UTC, and explicit null in addition to UTF-8 string,
+signed i64, bit-exact f64, and boolean. Missing means the key has no occurrence; explicit null is a
+real ordered attribute occurrence. Structured `attr_exists` and equality-to-null preserve the
+distinction. The Arrow lens exposes `key#null` as a nullable boolean presence marker (`true` explicit,
+Arrow null missing), because an Arrow `Null` array cannot represent that distinction. See
+`docs/field-types-v4.md`.
 
 ## 3. Write, durability, and visibility
 
@@ -183,7 +189,7 @@ must report the reduced profile.
 | in-place hole-punch erasure | Linux only | unavailable; refold only |
 | columnar lens | build feature | omitted from lightweight package |
 | SQL/DataFusion | optional build feature | omitted from lightweight package |
-| format interoperability | revision 3 | revision 3 |
+| format interoperability | revision 4 | revision 4 |
 
 A production native Node package must never catch native-addon load failure and silently open the WASM
 writer. Portable use must be an explicit package or entry point chosen by the caller.

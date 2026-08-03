@@ -171,9 +171,11 @@ pub enum SqlValue {
     Null,
     String(String),
     Int(i64),
+    UInt(u64),
     Float(f64),
     Bool(bool),
     Binary(Vec<u8>),
+    TimestampNs(i64),
 }
 
 impl From<SqlValue> for ScalarValue {
@@ -182,9 +184,13 @@ impl From<SqlValue> for ScalarValue {
             SqlValue::Null => ScalarValue::Null,
             SqlValue::String(value) => ScalarValue::Utf8(Some(value)),
             SqlValue::Int(value) => ScalarValue::Int64(Some(value)),
+            SqlValue::UInt(value) => ScalarValue::UInt64(Some(value)),
             SqlValue::Float(value) => ScalarValue::Float64(Some(value)),
             SqlValue::Bool(value) => ScalarValue::Boolean(Some(value)),
             SqlValue::Binary(value) => ScalarValue::Binary(Some(value)),
+            SqlValue::TimestampNs(value) => {
+                ScalarValue::TimestampNanosecond(Some(value), Some("UTC".into()))
+            }
         }
     }
 }

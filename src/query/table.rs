@@ -172,6 +172,11 @@ fn scalar_to_attr(v: &ScalarValue) -> Option<AttrValue> {
         ScalarValue::Int16(Some(i)) => AttrValue::Int(*i as i64),
         ScalarValue::Int8(Some(i)) => AttrValue::Int(*i as i64),
         ScalarValue::UInt32(Some(i)) => AttrValue::Int(*i as i64),
+        ScalarValue::UInt64(Some(i)) => AttrValue::UInt(*i),
+        ScalarValue::Binary(Some(bytes)) | ScalarValue::LargeBinary(Some(bytes)) => {
+            AttrValue::Bytes(bytes.clone())
+        }
+        ScalarValue::TimestampNanosecond(Some(ns), _) => AttrValue::TimestampNs(*ns),
         ScalarValue::Float64(Some(f)) => AttrValue::Float(*f),
         ScalarValue::Float32(Some(f)) => AttrValue::Float(*f as f64),
         ScalarValue::Boolean(Some(b)) => AttrValue::Bool(*b),

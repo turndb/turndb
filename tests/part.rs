@@ -35,6 +35,10 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
                 ("mixed".into(), AttrValue::Int(7)),
                 ("f".into(), AttrValue::Float(nan)),
                 ("g".into(), AttrValue::Float(-0.0)),
+                ("u".into(), AttrValue::UInt(u64::MAX)),
+                ("bin".into(), AttrValue::Bytes(vec![0, 0xff, 0x80, b'x'])),
+                ("at".into(), AttrValue::TimestampNs(i64::MIN + 1)),
+                ("nothing".into(), AttrValue::Null),
             ],
         },
         Record {
@@ -534,17 +538,23 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
         }
     }
     let dict: Vec<_> = dict_map.into_iter().map(|(h, l)| (l, h)).collect();
-    let mut cols: BTreeMap<(String, u8), BTreeSet<String>> = BTreeMap::new();
+    let mut cols: BTreeMap<(String, u8), BTreeSet<Vec<u8>>> = BTreeMap::new();
     for r in &records {
         for (k, v) in &r.attrs {
             let e = cols.entry((k.clone(), v.type_tag())).or_default();
-            if let AttrValue::Str(s) = v {
-                e.insert(s.clone());
+            match v {
+                AttrValue::Str(s) => {
+                    e.insert(s.as_bytes().to_vec());
+                }
+                AttrValue::Bytes(bytes) => {
+                    e.insert(bytes.clone());
+                }
+                _ => {}
             }
         }
     }
     let columns: Vec<(String, u8)> = cols.keys().cloned().collect();
-    let dicts: Vec<Vec<String>> = cols.values().map(|s| s.iter().cloned().collect()).collect();
+    let dicts: Vec<Vec<Vec<u8>>> = cols.values().map(|s| s.iter().cloned().collect()).collect();
     let content_names: BTreeSet<String> =
         records.iter().flat_map(|r| r.contents.iter().map(|c| c.name.clone())).collect();
 

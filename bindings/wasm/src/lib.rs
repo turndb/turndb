@@ -20,7 +20,8 @@
 //!
 //! turndb preserves attribute ORDER and DUPLICATE KEYS, because byte-exact reconstruction depends
 //! on it. A JSON object can represent neither. So attributes cross as
-//! `[[key, tag, value], ...]` with `tag` one of `s`/`i`/`f`/`b` — ordered, duplicate-tolerant, and
+//! `[[key, tag, value], ...]` with scalar tags `s`/`i`/`f`/`b`/`u`/`x`/`t`/`n` — ordered,
+//! duplicate-tolerant, and
 //! explicit about int-vs-float, which a bare JSON number cannot be. The JS wrapper builds this from
 //! the friendlier shapes a caller actually wants to write.
 //!
@@ -187,6 +188,34 @@ fn decode_attrs(json: &[u8]) -> Result<Vec<(String, AttrValue)>, String> {
             "b" => AttrValue::Bool(
                 val.as_bool().ok_or_else(|| format!("attribute {key} is not a boolean"))?,
             ),
+            "u" => AttrValue::UInt(
+                match val {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => s.parse::<u64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not a u64"))?,
+            ),
+            "x" => AttrValue::Bytes(
+                val.as_array()
+                    .ok_or_else(|| format!("attribute {key} binary value is not a byte array"))?
+                    .iter()
+                    .map(|byte| {
+                        byte.as_u64()
+                            .and_then(|byte| u8::try_from(byte).ok())
+                            .ok_or_else(|| format!("attribute {key} contains a non-byte value"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            "t" => AttrValue::TimestampNs(
+                match val {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not a signed nanosecond timestamp"))?,
+            ),
+            "n" if val.is_null() => AttrValue::Null,
             other => return Err(format!("attribute {key} has unknown tag {other:?}")),
         };
         out.push((key.to_string(), av));
@@ -213,6 +242,15 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
                             .unwrap_or_else(|| serde_json::Value::from(f.to_string())),
                     ),
                     AttrValue::Bool(b) => ("b", serde_json::Value::from(*b)),
+                    AttrValue::UInt(i) => ("u", serde_json::Value::from(i.to_string())),
+                    AttrValue::Bytes(bytes) => (
+                        "x",
+                        serde_json::Value::Array(
+                            bytes.iter().map(|byte| serde_json::Value::from(*byte)).collect(),
+                        ),
+                    ),
+                    AttrValue::TimestampNs(ns) => ("t", serde_json::Value::from(ns.to_string())),
+                    AttrValue::Null => ("n", serde_json::Value::Null),
                 };
                 serde_json::json!([k, tag, val])
             })
@@ -639,10 +677,9 @@ mod tests {
     fn attrs_keep_order_and_duplicate_keys() {
         // The property the tagged-array encoding exists for: a JSON object would silently collapse
         // these two `k` entries and reorder the rest, and reconstruction would stop being exact.
-        let json =
-            br#"[["k","s","first"],["z","i",-5],["k","s","second"],["f","f",1.5],["b","b",true]]"#;
+        let json = br#"[["k","s","first"],["z","i",-5],["k","s","second"],["f","f",1.5],["b","b",true],["u","u","18446744073709551615"],["x","x",[0,255,128]],["t","t","-9223372036854775808"],["n","n",null]]"#;
         let got = decode_attrs(json).unwrap();
-        assert_eq!(got.len(), 5);
+        assert_eq!(got.len(), 9);
         assert_eq!(got[0].0, "k");
         assert_eq!(got[2].0, "k");
         assert!(matches!(&got[0].1, AttrValue::Str(s) if s == "first"));
@@ -650,6 +687,10 @@ mod tests {
         assert!(matches!(got[1].1, AttrValue::Int(-5)));
         assert!(matches!(got[3].1, AttrValue::Float(f) if f == 1.5));
         assert!(matches!(got[4].1, AttrValue::Bool(true)));
+        assert!(matches!(got[5].1, AttrValue::UInt(u64::MAX)));
+        assert!(matches!(&got[6].1, AttrValue::Bytes(bytes) if bytes == &[0, 255, 128]));
+        assert!(matches!(got[7].1, AttrValue::TimestampNs(i64::MIN)));
+        assert!(matches!(got[8].1, AttrValue::Null));
         // and the encoding round-trips
         let back = decode_attrs(encode_attrs(&got).to_string().as_bytes()).unwrap();
         assert_eq!(back.len(), got.len());

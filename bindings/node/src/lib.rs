@@ -135,12 +135,15 @@ fn sql_failure(context: &str, error: anyhow::Error) -> Error {
 #[napi(object)]
 pub struct NativeAttr {
     pub name: String,
-    /// `string`, `int`, `float`, or `bool`.
+    /// `string`, `int`, `float`, `bool`, `uint`, `binary`, `timestamp_ns`, or `null`.
     pub kind: String,
     pub string_value: Option<String>,
     pub int_value: Option<BigInt>,
     pub float_value: Option<f64>,
     pub bool_value: Option<bool>,
+    pub uint_value: Option<BigInt>,
+    pub binary_value: Option<Buffer>,
+    pub timestamp_ns_value: Option<BigInt>,
 }
 
 #[napi(object)]
@@ -248,6 +251,8 @@ pub struct NativeSqlParam {
     pub float_value: Option<f64>,
     pub bool_value: Option<bool>,
     pub binary_value: Option<Buffer>,
+    pub uint_value: Option<BigInt>,
+    pub timestamp_ns_value: Option<BigInt>,
 }
 
 #[cfg(feature = "sql")]
@@ -1334,15 +1339,30 @@ fn decode_write(op: NativeWriteOp) -> Result<WriteOp> {
 }
 
 fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
-    let NativeAttr { name, kind, string_value, int_value, float_value, bool_value } = attr;
+    let NativeAttr {
+        name,
+        kind,
+        string_value,
+        int_value,
+        float_value,
+        bool_value,
+        uint_value,
+        binary_value,
+        timestamp_ns_value,
+    } = attr;
     let supplied = u8::from(string_value.is_some())
         + u8::from(int_value.is_some())
         + u8::from(float_value.is_some())
-        + u8::from(bool_value.is_some());
-    if supplied != 1 {
+        + u8::from(bool_value.is_some())
+        + u8::from(uint_value.is_some())
+        + u8::from(binary_value.is_some())
+        + u8::from(timestamp_ns_value.is_some());
+    if (kind == "null" && supplied != 0) || (kind != "null" && supplied != 1) {
         return Err(Error::new(
             Status::InvalidArg,
-            format!("attribute {name:?} must carry exactly one typed value"),
+            format!(
+                "attribute {name:?} must carry exactly one typed value, except null carries none"
+            ),
         ));
     }
     let missing = |field: &str| {
@@ -1363,6 +1383,23 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
         }
         "float" => AttrValue::Float(float_value.ok_or_else(|| missing("floatValue"))?),
         "bool" => AttrValue::Bool(bool_value.ok_or_else(|| missing("boolValue"))?),
+        "uint" => AttrValue::UInt(decode_u64(
+            uint_value.ok_or_else(|| missing("uintValue"))?,
+            "uintValue",
+        )?),
+        "binary" => AttrValue::Bytes(binary_value.ok_or_else(|| missing("binaryValue"))?.to_vec()),
+        "timestamp_ns" => {
+            let value = timestamp_ns_value.ok_or_else(|| missing("timestampNsValue"))?;
+            let (value, lossless) = value.get_i64();
+            if !lossless {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "timestampNsValue is outside the signed i64 range",
+                ));
+            }
+            AttrValue::TimestampNs(value)
+        }
+        "null" => AttrValue::Null,
         other => {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -1528,6 +1565,25 @@ fn decode_sql_param(param: NativeSqlParam) -> Result<SqlValue> {
                 })?
                 .to_vec(),
         ),
+        "uint" => SqlValue::UInt(decode_u64(
+            param
+                .uint_value
+                .ok_or_else(|| Error::new(Status::InvalidArg, "SQL uint needs uintValue"))?,
+            "SQL uintValue",
+        )?),
+        "timestamp_ns" => {
+            let value = param.timestamp_ns_value.ok_or_else(|| {
+                Error::new(Status::InvalidArg, "SQL timestamp_ns needs timestampNsValue")
+            })?;
+            let (value, lossless) = value.get_i64();
+            if !lossless {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "SQL timestampNsValue is outside the signed i64 range",
+                ));
+            }
+            SqlValue::TimestampNs(value)
+        }
         other => {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -1648,6 +1704,9 @@ fn encode_attr((name, value): (String, AttrValue)) -> NativeAttr {
         int_value: None,
         float_value: None,
         bool_value: None,
+        uint_value: None,
+        binary_value: None,
+        timestamp_ns_value: None,
     };
     match value {
         AttrValue::Str(value) => {
@@ -1666,6 +1725,19 @@ fn encode_attr((name, value): (String, AttrValue)) -> NativeAttr {
             attr.kind = "bool".into();
             attr.bool_value = Some(value);
         }
+        AttrValue::UInt(value) => {
+            attr.kind = "uint".into();
+            attr.uint_value = Some(BigInt::from(value));
+        }
+        AttrValue::Bytes(value) => {
+            attr.kind = "binary".into();
+            attr.binary_value = Some(Buffer::from(value));
+        }
+        AttrValue::TimestampNs(value) => {
+            attr.kind = "timestamp_ns".into();
+            attr.timestamp_ns_value = Some(BigInt::from(value));
+        }
+        AttrValue::Null => attr.kind = "null".into(),
     }
     attr
 }
@@ -1831,6 +1903,10 @@ fn encode_schema(schema: turndb::schema::Schema) -> NativeSchema {
                             turndb::schema::AttrType::Int => "int",
                             turndb::schema::AttrType::Float => "float",
                             turndb::schema::AttrType::Bool => "bool",
+                            turndb::schema::AttrType::UInt => "uint",
+                            turndb::schema::AttrType::Binary => "binary",
+                            turndb::schema::AttrType::TimestampNs => "timestamp_ns",
+                            turndb::schema::AttrType::Null => "null",
                         }
                         .to_string()
                     })

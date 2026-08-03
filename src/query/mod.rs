@@ -42,10 +42,10 @@ use crate::part::{attrs, Part};
 use crate::types::AttrValue;
 use anyhow::{bail, Result};
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Array, Int64Builder, StringArray,
-    StringBuilder,
+    ArrayRef, BinaryArray, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Array, Int64Builder,
+    StringArray, StringBuilder, TimestampNanosecondBuilder, UInt64Builder,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -71,6 +71,10 @@ fn type_name(tag: u8) -> &'static str {
         1 => "int",
         2 => "float",
         3 => "bool",
+        4 => "uint",
+        5 => "binary",
+        6 => "timestamp_ns",
+        7 => "null",
         _ => "unknown",
     }
 }
@@ -81,6 +85,12 @@ fn arrow_type(tag: u8) -> DataType {
         1 => DataType::Int64,
         2 => DataType::Float64,
         3 => DataType::Boolean,
+        4 => DataType::UInt64,
+        5 => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary)),
+        6 => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        // An explicit-null column is a presence marker: true means the attribute occurred with a
+        // null value, Arrow null means it was missing. This preserves the distinction SQL needs.
+        7 => DataType::Boolean,
         _ => DataType::Null,
     }
 }
@@ -106,6 +116,8 @@ fn zone_disproves(op: Cmp, val: &AttrValue, zone: &(AttrValue, AttrValue)) -> bo
             (AttrValue::Int(x), AttrValue::Int(y)) => Some(x.cmp(y)),
             (AttrValue::Float(x), AttrValue::Float(y)) => x.partial_cmp(y),
             (AttrValue::Bool(x), AttrValue::Bool(y)) => Some(x.cmp(y)),
+            (AttrValue::UInt(x), AttrValue::UInt(y)) => Some(x.cmp(y)),
+            (AttrValue::TimestampNs(x), AttrValue::TimestampNs(y)) => Some(x.cmp(y)),
             _ => None,
         }
     }
@@ -264,8 +276,11 @@ impl Lens {
         for (key, ts) in &tags {
             for &t in ts {
                 // A key with one type keeps its name. A key with several is never silently merged.
-                let mut name =
-                    if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                let mut name = if ts.len() == 1 && t != 7 {
+                    key.clone()
+                } else {
+                    format!("{key}#{}", type_name(t))
+                };
                 if used.contains(&name) {
                     name = format!("{key}#{}", type_name(t));
                 }
@@ -347,7 +362,16 @@ impl Lens {
                                 tag,
                                 rids: attrs::rids(part, c, occ, kind)?,
                                 val: part.column_values(c)?,
-                                dict: attrs::read_dict(part, c)?,
+                                dict: if tag == 0 {
+                                    attrs::read_dict(part, c)?
+                                } else {
+                                    Default::default()
+                                },
+                                binary_dict: if tag == 5 {
+                                    attrs::read_binary_dict(part, c)?
+                                } else {
+                                    Default::default()
+                                },
                             });
                         }
                         None => cols.push(Col::Missing(self.schema.field(f).data_type().clone())),
@@ -394,6 +418,16 @@ impl Lens {
                 (AttrValue::Int(v), 1) => Key::Int(*v),
                 (AttrValue::Float(v), 2) => Key::Float(*v),
                 (AttrValue::Bool(v), 3) => Key::Bool(*v),
+                (AttrValue::UInt(v), 4) => Key::UInt(*v),
+                (AttrValue::Bytes(v), 5) => {
+                    let dict = attrs::read_binary_dict(part, c)?;
+                    match dict.binary_search(v) {
+                        Ok(i) => Key::Ord { k: i as u32, exact: true },
+                        Err(i) => Key::Ord { k: i as u32, exact: false },
+                    }
+                }
+                (AttrValue::TimestampNs(v), 6) => Key::TimestampNs(*v),
+                (AttrValue::Null, 7) => Key::Null,
                 // Literal type does not match the column type. Keeping every row is the safe
                 // direction under Inexact.
                 _ => {
@@ -460,6 +494,9 @@ enum Key {
     Int(i64),
     Float(f64),
     Bool(bool),
+    UInt(u64),
+    TimestampNs(i64),
+    Null,
 }
 
 #[inline]
@@ -526,6 +563,30 @@ impl Test {
                                 *kk,
                             ),
                             (3, Key::Bool(kk)) => cmp_ok(*op, val[o] != 0, *kk),
+                            (4, Key::UInt(kk)) => cmp_ok(
+                                *op,
+                                u64::from_le_bytes(val[o..o + 8].try_into().unwrap()),
+                                *kk,
+                            ),
+                            (5, Key::Ord { k: kk, exact }) => {
+                                let v = u32::from_le_bytes(val[o..o + 4].try_into().unwrap());
+                                if *exact {
+                                    cmp_ok(*op, v, *kk)
+                                } else {
+                                    match op {
+                                        Cmp::Eq => false,
+                                        Cmp::Ne => true,
+                                        Cmp::Lt | Cmp::LtEq => v < *kk,
+                                        Cmp::Gt | Cmp::GtEq => v >= *kk,
+                                    }
+                                }
+                            }
+                            (6, Key::TimestampNs(kk)) => cmp_ok(
+                                *op,
+                                i64::from_le_bytes(val[o..o + 8].try_into().unwrap()),
+                                *kk,
+                            ),
+                            (7, Key::Null) => matches!(op, Cmp::Eq),
                             _ => true, // type mismatch: keep it
                         }
                     }
@@ -547,6 +608,7 @@ enum Col {
         rids: Arc<Vec<u32>>,
         val: Arc<Vec<u8>>,
         dict: Arc<Vec<String>>,
+        binary_dict: Arc<Vec<Vec<u8>>>,
     },
     /// This part has no such column; the batch contributes nulls of the right type.
     Missing(DataType),
@@ -724,11 +786,12 @@ impl PartScan {
                     Arc::new(b.finish()) as ArrayRef
                 }
                 Col::Missing(t) => arrow::array::new_null_array(t, len),
-                Col::Attr { tag, rids, val, dict } => scatter(
+                Col::Attr { tag, rids, val, dict, binary_dict } => scatter(
                     *tag,
                     rids,
                     val,
                     dict,
+                    binary_dict,
                     lo,
                     hi,
                     &take,
@@ -764,6 +827,7 @@ fn scatter(
     rids: &[u32],
     val: &[u8],
     dict: &[String],
+    binary_dict: &[Vec<u8>],
     lo: usize,
     hi: usize,
     take: &[usize],
@@ -847,6 +911,53 @@ fn scatter(
             for t in &taken {
                 match *t {
                     Some(k) => b.append_value(at(k)?[0] != 0),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        4 => {
+            let mut b = UInt64Builder::with_capacity(len);
+            for t in &taken {
+                match *t {
+                    Some(k) => b.append_value(u64::from_le_bytes(at(k)?.try_into().unwrap())),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        5 => {
+            let keys: Vec<Option<i32>> = taken
+                .iter()
+                .map(|t| match *t {
+                    Some(k) => {
+                        let bytes = at(k).ok()?;
+                        Some(u32::from_le_bytes(bytes.try_into().ok()?) as i32)
+                    }
+                    None => None,
+                })
+                .collect();
+            let values = BinaryArray::from_iter_values(binary_dict.iter().map(Vec::as_slice));
+            Arc::new(arrow::array::DictionaryArray::try_new(
+                Int32Array::from(keys),
+                Arc::new(values),
+            )?)
+        }
+        6 => {
+            let mut b = TimestampNanosecondBuilder::with_capacity(len).with_timezone("UTC");
+            for t in &taken {
+                match *t {
+                    Some(k) => b.append_value(i64::from_le_bytes(at(k)?.try_into().unwrap())),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        7 => {
+            let mut b = BooleanBuilder::with_capacity(len);
+            for t in &taken {
+                match *t {
+                    Some(_) => b.append_value(true),
                     None => b.append_null(),
                 }
             }

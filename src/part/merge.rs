@@ -179,7 +179,7 @@ pub fn merge_opts_with_control(
     let records_in: usize = lens.iter().sum();
 
     // ---- pass A: winners, counts, and the exact column universe of SURVIVING rows ----
-    let mut columns: std::collections::BTreeMap<(String, u8), std::collections::BTreeSet<String>> =
+    let mut columns: std::collections::BTreeMap<(String, u8), std::collections::BTreeSet<Vec<u8>>> =
         Default::default();
     let mut content_names = std::collections::BTreeSet::new();
     let mut records_out = 0usize;
@@ -205,12 +205,18 @@ pub fn merge_opts_with_control(
         }
         for (k, v) in parts[pi].attrs(row)? {
             let e = columns.entry((k, v.type_tag())).or_default();
-            if let crate::types::AttrValue::Str(s) = v {
-                e.insert(s);
+            match v {
+                crate::types::AttrValue::Str(s) => {
+                    e.insert(s.into_bytes());
+                }
+                crate::types::AttrValue::Bytes(bytes) => {
+                    e.insert(bytes);
+                }
+                _ => {}
             }
         }
     }
-    let string_dicts: Vec<Vec<String>> =
+    let value_dicts: Vec<Vec<Vec<u8>>> =
         columns.values().map(|s| s.iter().cloned().collect()).collect();
     let columns: Vec<(String, u8)> = columns.into_keys().collect();
 
@@ -227,7 +233,7 @@ pub fn merge_opts_with_control(
         dict,
         content_names.into_iter().collect(),
         columns,
-        string_dicts,
+        value_dicts,
     )?;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((id, pi, row, _)) = kway.next_group()? {

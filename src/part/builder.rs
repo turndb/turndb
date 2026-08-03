@@ -63,8 +63,8 @@ impl Drop for Spool {
 struct Col {
     key: String,
     tag: u8,
-    /// Sorted distinct values, for string columns; the ordinal space `val` writes into.
-    dict: Vec<String>,
+    /// Sorted distinct values for string/binary columns; the ordinal space `val` writes into.
+    dict: Vec<Vec<u8>>,
     occurrences: u64,
     dense: bool,
     prev_rid: u32,
@@ -114,17 +114,17 @@ impl StreamBuilder {
     /// `dict` is the full piece dictionary the part will carry (referenced plus retained), in ANY
     /// order — it is sorted to fold order here, exactly as `build_full` sorts it. `columns` is the
     /// exact `(key, tag)` universe of the rows that will be pushed, with each string column's
-    /// sorted-distinct dictionary in `string_dicts` (empty vecs for non-string columns).
+    /// sorted-distinct byte dictionary in `value_dicts` (empty for fixed-width columns).
     pub fn new(
         path: &Path,
         level: i32,
         mut dict: Vec<(Loc, PieceHash)>,
         mut content_names: Vec<String>,
         columns: Vec<(String, u8)>,
-        string_dicts: Vec<Vec<String>>,
+        value_dicts: Vec<Vec<Vec<u8>>>,
     ) -> Result<StreamBuilder> {
-        if columns.len() != string_dicts.len() {
-            bail!("every column needs its string dictionary slot");
+        if columns.len() != value_dicts.len() {
+            bail!("every column needs its value dictionary slot");
         }
         dict.sort_by_key(|(l, _)| (l.block_id, l.in_off));
         let dict_index: HashMap<PieceHash, u32> =
@@ -148,7 +148,7 @@ impl StreamBuilder {
             cols.push(Col {
                 key,
                 tag,
-                dict: string_dicts[i].clone(),
+                dict: value_dicts[i].clone(),
                 occurrences: 0,
                 dense: true,
                 prev_rid: 0,
@@ -289,14 +289,28 @@ impl StreamBuilder {
             col.zone.add(v);
             match v {
                 AttrValue::Str(s) => {
-                    let ord = col.dict.binary_search(s).map_err(|_| {
-                        anyhow::anyhow!("string value outside the declared dictionary for {k:?}")
-                    })?;
+                    let ord = col
+                        .dict
+                        .binary_search_by(|value| value.as_slice().cmp(s.as_bytes()))
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "string value outside the declared dictionary for {k:?}"
+                            )
+                        })?;
                     col.val.append(&(ord as u32).to_le_bytes())?;
                 }
                 AttrValue::Int(x) => col.val.append(&x.to_le_bytes())?,
                 AttrValue::Float(x) => col.val.append(&x.to_bits().to_le_bytes())?,
                 AttrValue::Bool(x) => col.val.append(&[u8::from(*x)])?,
+                AttrValue::UInt(x) => col.val.append(&x.to_le_bytes())?,
+                AttrValue::Bytes(bytes) => {
+                    let ord = col.dict.binary_search(bytes).map_err(|_| {
+                        anyhow::anyhow!("binary value outside the declared dictionary for {k:?}")
+                    })?;
+                    col.val.append(&(ord as u32).to_le_bytes())?;
+                }
+                AttrValue::TimestampNs(ns) => col.val.append(&ns.to_le_bytes())?,
+                AttrValue::Null => {}
             }
         }
         self.layout.append(&l)?;
@@ -391,12 +405,12 @@ impl StreamBuilder {
             if !dense && !rid.is_empty() {
                 self.w.section(&format!("col.rid.{i}"), &rid)?;
             }
-            if c.tag == 0 && !c.dict.is_empty() {
+            if matches!(c.tag, 0 | 5) && !c.dict.is_empty() {
                 let mut d = Vec::new();
                 put_varint(&mut d, c.dict.len() as u64);
-                for s in &c.dict {
-                    put_varint(&mut d, s.len() as u64);
-                    d.extend_from_slice(s.as_bytes());
+                for value in &c.dict {
+                    put_varint(&mut d, value.len() as u64);
+                    d.extend_from_slice(value);
                 }
                 self.w.section(&format!("col.dict.{i}"), &d)?;
             }

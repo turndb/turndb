@@ -3,7 +3,7 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
-**Status: pre-1.0, format version 3, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
+**Status: pre-1.0, format version 4, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
 ## What problem it solves
@@ -98,6 +98,11 @@ per request, never split a row, and return a cursor before the row that would cr
 Named-content metadata includes the BLAKE3 identity of the exact whole value without reconstruction
 for revision-3 records. Writer scans include the memtable;
 `ReadStore::scan` remains pinned to its manifest snapshot.
+
+Format revision 4 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
+timestamps, and explicit null to the existing scalar fields. Missing and null remain distinct, and
+bindings never route exact integers through JavaScript `number`; see
+[general scalar field types](docs/field-types-v4.md).
 
 Long-running compaction, verification, punching, and refold operations accept reusable Rust
 cancellation tokens and absolute deadlines through their controlled variants. The native Node methods

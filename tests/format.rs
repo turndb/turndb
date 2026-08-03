@@ -288,7 +288,7 @@ fn wal_frame_matches_the_document() {
     s.sync().unwrap();
     let b = std::fs::read(dir.join("WAL")).unwrap();
 
-    assert_eq!(b[0], 0x5E, "tag at 0 is 0x5E for a record with content identities");
+    assert_eq!(b[0], 0x60, "tag at 0 is 0x60 for a revision-4 record");
     assert_eq!(le64(&b, 1), 0, "seq at 1");
     let len = le32(&b, 9) as usize;
     assert_eq!(13 + len + 4, b.len(), "header 13 + payload + crc 4 is the whole frame");
@@ -562,7 +562,7 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     let path = dir.join("WAL");
     let mut b = std::fs::read(&path).unwrap();
     let payload = b"a frame type this build does not know";
-    let mut hdr = vec![0x60u8];
+    let mut hdr = vec![0x62u8];
     hdr.extend_from_slice(&99u64.to_le_bytes());
     hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     let mut h = crc32fast::Hasher::new();

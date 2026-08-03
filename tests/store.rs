@@ -455,6 +455,40 @@ fn merge_keeps_the_newest_version_of_a_reput_id() {
 }
 
 #[test]
+fn merge_preserves_every_extended_scalar_type() {
+    let dir = tmp("merge-scalars");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let attrs = vec![
+        ("u".into(), AttrValue::UInt(u64::MAX)),
+        ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 0x80])),
+        ("at".into(), AttrValue::TimestampNs(i64::MIN)),
+        ("nothing".into(), AttrValue::Null),
+    ];
+    s.put_body("a", b"a", attrs.clone()).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.put_body(
+        "b",
+        b"b",
+        vec![
+            ("u".into(), AttrValue::UInt(0)),
+            ("raw".into(), AttrValue::Bytes(vec![1, 2, 3])),
+            ("at".into(), AttrValue::TimestampNs(i64::MAX)),
+        ],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.merge_range(0, 2).unwrap().unwrap();
+    assert_eq!(s.get("a").unwrap().unwrap().attrs, attrs);
+    assert_eq!(s.part_count(), 1);
+    drop(s);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(reader.get("a").unwrap().unwrap().attrs, attrs);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
     // "Sweeps" now means AFTER the retention window: replaced inputs stay on disk while a retained
     // manifest still names them — that is what keeps a reader's snapshot whole — and fall to the

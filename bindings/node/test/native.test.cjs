@@ -19,8 +19,8 @@ function temporaryStore(t) {
 
 test('reports the native capability profile without a portable fallback', () => {
   assert.deepEqual(capabilities(), {
-    partFormatWrite: 3,
-    partFormatReadMax: 3,
+    partFormatWrite: 4,
+    partFormatReadMax: 4,
     writerExclusion: 'os_enforced',
     physicalErasure: process.platform === 'linux' ? 'punch_or_refold' : 'refold_only',
     positionedIo: true,
@@ -145,13 +145,17 @@ test('round-trips exact typed fields and independently named content', async (t)
         { name: 'minimum', kind: 'int', intValue: -9223372036854775808n },
         { name: 'nan', kind: 'float', floatValue: NaN },
         { name: 'sampled', kind: 'bool', boolValue: true },
+        { name: 'unsigned', kind: 'uint', uintValue: 18446744073709551615n },
+        { name: 'binary', kind: 'binary', binaryValue: Buffer.from([0, 0xff, 0x80]) },
+        { name: 'at', kind: 'timestamp_ns', timestampNsValue: -9223372036854775808n },
+        { name: 'nothing', kind: 'null' },
       ],
     }],
     true
   );
 
   const page = await store.scan({
-    attrs: ['tag', 'minimum', 'nan', 'sampled'],
+    attrs: ['tag', 'minimum', 'nan', 'sampled', 'unsigned', 'binary', 'at', 'nothing'],
     contents: [
       { name: 'request', mode: 'metadata' },
       { name: 'response', mode: 'bytes' },
@@ -161,10 +165,14 @@ test('round-trips exact typed fields and independently named content', async (t)
   });
   assert.equal(page.rows.length, 1);
   assert.deepEqual(page.rows[0].attrs.map(({ name }) => name), [
-    'tag', 'tag', 'minimum', 'nan', 'sampled',
+    'tag', 'tag', 'minimum', 'nan', 'sampled', 'unsigned', 'binary', 'at', 'nothing',
   ]);
   assert.equal(page.rows[0].attrs[2].intValue, -9223372036854775808n);
   assert(Number.isNaN(page.rows[0].attrs[3].floatValue));
+  assert.equal(page.rows[0].attrs[5].uintValue, 18446744073709551615n);
+  assert.deepEqual(page.rows[0].attrs[6].binaryValue, Buffer.from([0, 0xff, 0x80]));
+  assert.equal(page.rows[0].attrs[7].timestampNsValue, -9223372036854775808n);
+  assert.equal(page.rows[0].attrs[8].kind, 'null');
   assert.equal(page.rows[0].contents[0].bytes, undefined);
   assert.equal(page.rows[0].contents[0].len, 6n);
   assert.match(page.rows[0].contents[0].identity, /^[0-9a-f]{64}$/);
@@ -284,6 +292,9 @@ test('streams bounded parameterized read-only SQL as Arrow IPC', async (t) => {
       attrs: [
         { name: 'kind', kind: 'string', stringValue: 'keep' },
         { name: 'tokens', kind: 'int', intValue: 3n },
+        { name: 'u', kind: 'uint', uintValue: 18446744073709551615n },
+        { name: 'raw', kind: 'binary', binaryValue: Buffer.from([0, 255]) },
+        { name: 'at', kind: 'timestamp_ns', timestampNsValue: -1n },
       ],
     },
   ]);
@@ -291,10 +302,13 @@ test('streams bounded parameterized read-only SQL as Arrow IPC', async (t) => {
   // Writer SQL takes and publishes an exact actor-ordered snapshot, so accepted unflushed rows are
   // included and query execution no longer occupies the writer actor.
   const query = await store.querySql(
-    'SELECT id, tokens FROM records WHERE kind = $1 AND tokens > $2 ORDER BY id',
+    'SELECT id, tokens FROM records WHERE kind = $1 AND tokens > $2 AND u = $3 AND raw = $4 AND at = $5 ORDER BY id',
     [
       { kind: 'string', stringValue: 'keep' },
       { kind: 'int', intValue: 1n },
+      { kind: 'uint', uintValue: 18446744073709551615n },
+      { kind: 'binary', binaryValue: Buffer.from([0, 255]) },
+      { kind: 'timestamp_ns', timestampNsValue: -1n },
     ],
     { maxMemoryBytes: 32n << 20n }
   );
@@ -531,6 +545,30 @@ test('validates exact values and lifecycle at the boundary', async (t) => {
   await assert.rejects(
     store.write([{
       kind: 'put',
+      id: 'bad-uint',
+      attrs: [{ name: 'wide', kind: 'uint', uintValue: 18446744073709551616n }],
+    }]),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad-time',
+      attrs: [{ name: 'at', kind: 'timestamp_ns', timestampNsValue: 9223372036854775808n }],
+    }]),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad-null',
+      attrs: [{ name: 'none', kind: 'null', boolValue: false }],
+    }]),
+    /except null carries none/,
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
       id: 'bad',
       attrs: [{ name: 'mixed', kind: 'bool', boolValue: true, stringValue: 'also' }],
     }]),
@@ -745,10 +783,22 @@ test('discovers typed field and content namespaces without reading values', asyn
     kind: 'put',
     id: 'schema/1',
     contents: [{ name: 'request', bytes: Buffer.from('request body') }],
-    attrs: [{ name: 'mixed', kind: 'string', stringValue: 'one' }],
+    attrs: [
+      { name: 'mixed', kind: 'string', stringValue: 'one' },
+      { name: 'unsigned', kind: 'uint', uintValue: 1n },
+      { name: 'binary', kind: 'binary', binaryValue: Buffer.from([1]) },
+      { name: 'at', kind: 'timestamp_ns', timestampNsValue: 2n },
+      { name: 'nothing', kind: 'null' },
+    ],
   }]);
   assert.deepEqual(await store.schema(), {
-    attributes: [{ name: 'mixed', types: ['string'] }],
+    attributes: [
+      { name: 'at', types: ['timestamp_ns'] },
+      { name: 'binary', types: ['binary'] },
+      { name: 'mixed', types: ['string'] },
+      { name: 'nothing', types: ['null'] },
+      { name: 'unsigned', types: ['uint'] },
+    ],
     contents: ['request'],
     mayIncludeShadowedFields: false,
   });
@@ -769,7 +819,11 @@ test('discovers typed field and content namespaces without reading values', asyn
   assert.deepEqual(await store.schema(), {
     attributes: [
       { name: 'a', types: ['bool'] },
+      { name: 'at', types: ['timestamp_ns'] },
+      { name: 'binary', types: ['binary'] },
       { name: 'mixed', types: ['string', 'int', 'float'] },
+      { name: 'nothing', types: ['null'] },
+      { name: 'unsigned', types: ['uint'] },
     ],
     contents: ['request', 'response'],
     mayIncludeShadowedFields: true,
@@ -783,7 +837,13 @@ test('discovers typed field and content namespaces without reading values', asyn
     try { await published.close(); } catch {}
   });
   assert.deepEqual(await published.schema(), {
-    attributes: [{ name: 'mixed', types: ['string'] }],
+    attributes: [
+      { name: 'at', types: ['timestamp_ns'] },
+      { name: 'binary', types: ['binary'] },
+      { name: 'mixed', types: ['string'] },
+      { name: 'nothing', types: ['null'] },
+      { name: 'unsigned', types: ['uint'] },
+    ],
     contents: ['request'],
     mayIncludeShadowedFields: true,
   });

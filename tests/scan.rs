@@ -21,6 +21,64 @@ fn status(value: &str) -> Vec<(String, AttrValue)> {
 }
 
 #[test]
+fn extended_scalar_predicates_distinguish_explicit_null_from_missing() {
+    let dir = tmp("extended-scalars");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    store
+        .put_body(
+            "a",
+            b"",
+            vec![
+                ("u".into(), AttrValue::UInt(u64::MAX)),
+                ("raw".into(), AttrValue::Bytes(vec![0, 0xff])),
+                ("at".into(), AttrValue::TimestampNs(-1)),
+                ("maybe".into(), AttrValue::Null),
+            ],
+        )
+        .unwrap();
+    store
+        .put_body(
+            "b",
+            b"",
+            vec![
+                ("u".into(), AttrValue::UInt(4)),
+                ("raw".into(), AttrValue::Bytes(vec![1])),
+                ("at".into(), AttrValue::TimestampNs(10)),
+            ],
+        )
+        .unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let cases = [
+        Predicate::Attr { name: "u".into(), op: Compare::Gt, value: AttrValue::UInt(4) },
+        Predicate::Attr { name: "raw".into(), op: Compare::Lt, value: AttrValue::Bytes(vec![1]) },
+        Predicate::Attr { name: "at".into(), op: Compare::Lt, value: AttrValue::TimestampNs(0) },
+        Predicate::Attr { name: "maybe".into(), op: Compare::Eq, value: AttrValue::Null },
+        Predicate::AttrExists { name: "maybe".into(), present: true },
+    ];
+    for predicate in cases {
+        let page = store
+            .scan(&ScanRequest {
+                attrs: vec!["u".into(), "raw".into(), "at".into(), "maybe".into()],
+                predicates: vec![predicate],
+                ..ScanRequest::default()
+            })
+            .unwrap();
+        assert_eq!(page.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert!(page.rows[0].attrs.contains(&("maybe".into(), AttrValue::Null)));
+    }
+    let missing = store
+        .scan(&ScanRequest {
+            predicates: vec![Predicate::AttrExists { name: "maybe".into(), present: false }],
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(missing.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["b"]);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cancellation_and_deadlines_are_typed_and_return_no_partial_page() {
     let dir = tmp("interruption");
     let store = Store::open(&dir, cfg()).unwrap();
