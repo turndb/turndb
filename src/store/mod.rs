@@ -48,7 +48,120 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
 
+/// Per-writer admission policy. These limits are runtime policy, not store format: reopening with
+/// different values changes which future writes are accepted and never changes or invalidates
+/// records already in the WAL or immutable parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteLimits {
+    /// Worst-case complete WAL frame bytes for one put or delete.
+    pub max_record_bytes: u64,
+    /// Sum of member frames plus the commit-marker frame for one atomic batch.
+    pub max_batch_bytes: u64,
+    /// Number of ordered put/delete members in one atomic batch.
+    pub max_batch_records: usize,
+    /// UTF-8 bytes in a record id, attribute name, or content name.
+    pub max_identifier_bytes: usize,
+}
+
+/// Default worst-case framed-WAL ceiling for one record: 64 MiB.
+pub const DEFAULT_MAX_RECORD_BYTES: u64 = 64 << 20;
+/// Default worst-case framed-WAL ceiling for one atomic batch: 256 MiB.
+pub const DEFAULT_MAX_BATCH_BYTES: u64 = 256 << 20;
+/// Default ordered member ceiling for one atomic batch.
+pub const DEFAULT_MAX_BATCH_RECORDS: usize = 4_096;
+/// Default UTF-8 byte ceiling for ids and field/content names: 4 KiB.
+pub const DEFAULT_MAX_IDENTIFIER_BYTES: usize = 4 << 10;
+
+impl Default for WriteLimits {
+    fn default() -> Self {
+        WriteLimits {
+            max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            max_batch_records: DEFAULT_MAX_BATCH_RECORDS,
+            max_identifier_bytes: DEFAULT_MAX_IDENTIFIER_BYTES,
+        }
+    }
+}
+
+impl WriteLimits {
+    /// Return this policy when every ceiling is usable, or a typed invalid-policy error.
+    pub fn validate(self) -> std::result::Result<Self, WriteAdmissionError> {
+        if self.max_record_bytes == 0 {
+            return Err(WriteAdmissionError::InvalidLimits(
+                "max_record_bytes must be greater than zero",
+            ));
+        }
+        if self.max_batch_bytes == 0 {
+            return Err(WriteAdmissionError::InvalidLimits(
+                "max_batch_bytes must be greater than zero",
+            ));
+        }
+        if self.max_batch_records == 0 {
+            return Err(WriteAdmissionError::InvalidLimits(
+                "max_batch_records must be greater than zero",
+            ));
+        }
+        if self.max_identifier_bytes == 0 {
+            return Err(WriteAdmissionError::InvalidLimits(
+                "max_identifier_bytes must be greater than zero",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Stable write refusal classes. Invalid names/settings are caller errors; size/count refusals are
+/// resource exhaustion and can be handled by splitting input or reopening with a larger policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteAdmissionError {
+    InvalidLimits(&'static str),
+    EmptyIdentifier { kind: &'static str, item: Option<usize> },
+    IdentifierTooLong { kind: &'static str, item: Option<usize>, actual: usize, allowed: usize },
+    DuplicateContentName { item: Option<usize>, name: String },
+    RecordTooLarge { item: Option<usize>, actual: u64, allowed: u64 },
+    BatchTooLarge { actual: u64, allowed: u64 },
+    TooManyBatchRecords { actual: usize, allowed: usize },
+}
+
+impl std::fmt::Display for WriteAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let where_ = |item: &Option<usize>| {
+            item.map_or_else(String::new, |item| format!(" in batch item {item}"))
+        };
+        match self {
+            WriteAdmissionError::InvalidLimits(reason) => write!(f, "invalid write limits: {reason}"),
+            WriteAdmissionError::EmptyIdentifier { kind, item } => {
+                write!(f, "{kind}{} must not be empty", where_(item))
+            }
+            WriteAdmissionError::IdentifierTooLong { kind, item, actual, allowed } => write!(
+                f,
+                "{kind}{} is {actual} UTF-8 bytes, exceeding the configured limit of {allowed}",
+                where_(item)
+            ),
+            WriteAdmissionError::DuplicateContentName { item, name } => {
+                write!(f, "duplicate content name {name:?}{}", where_(item))
+            }
+            WriteAdmissionError::RecordTooLarge { item, actual, allowed } => write!(
+                f,
+                "record{} has a worst-case WAL frame of {actual} bytes, exceeding the configured limit of {allowed}",
+                where_(item)
+            ),
+            WriteAdmissionError::BatchTooLarge { actual, allowed } => write!(
+                f,
+                "atomic batch has a worst-case WAL representation of {actual} bytes, exceeding the configured limit of {allowed}"
+            ),
+            WriteAdmissionError::TooManyBatchRecords { actual, allowed } => write!(
+                f,
+                "atomic batch has {actual} records, exceeding the configured limit of {allowed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteAdmissionError {}
+
 /// A carved span handed to the store: content to fold, or bytes to inline.
+#[derive(Clone, Copy)]
 pub enum Span<'a> {
     /// Connective tissue too small to be worth folding.
     Lit(&'a [u8]),
@@ -125,7 +238,13 @@ impl Batch {
         contents: &[ContentSpans<'_>],
         attrs: Vec<(String, AttrValue)>,
     ) -> Result<()> {
-        validate_content_inputs(id, contents)?;
+        let item = Some(self.items.len());
+        validate_content_inputs(id, contents, item)?;
+        if attrs.iter().any(|(name, _)| name.is_empty()) {
+            return Err(
+                WriteAdmissionError::EmptyIdentifier { kind: "attribute name", item }.into()
+            );
+        }
         let contents = contents
             .iter()
             .map(|content| OwnedContent {
@@ -166,17 +285,156 @@ fn own_spans(spans: &[Span<'_>]) -> Vec<OwnedSpan> {
         .collect()
 }
 
-fn validate_content_inputs(id: &str, contents: &[ContentSpans<'_>]) -> Result<()> {
+const WAL_FRAME_OVERHEAD: u64 = 1 + 8 + 4 + 4;
+
+fn varint_bytes(mut value: u64) -> u64 {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
+    }
+    bytes
+}
+
+fn add_size(total: &mut u64, value: u64) {
+    *total = total.saturating_add(value);
+}
+
+fn bytes_field_size(len: usize) -> u64 {
+    let len = len as u64;
+    varint_bytes(len).saturating_add(len)
+}
+
+fn attr_encoded_size(name: &str, value: &AttrValue) -> u64 {
+    let value = match value {
+        AttrValue::Str(value) => bytes_field_size(value.len()),
+        AttrValue::Int(_)
+        | AttrValue::Float(_)
+        | AttrValue::UInt(_)
+        | AttrValue::TimestampNs(_) => 8,
+        AttrValue::Bool(_) => 1,
+        AttrValue::Bytes(value) => bytes_field_size(value.len()),
+        AttrValue::Null => 0,
+    };
+    bytes_field_size(name.len()).saturating_add(1).saturating_add(value)
+}
+
+fn validate_identifier(
+    kind: &'static str,
+    value: &str,
+    limits: WriteLimits,
+    item: Option<usize>,
+) -> Result<()> {
+    if value.is_empty() {
+        return Err(WriteAdmissionError::EmptyIdentifier { kind, item }.into());
+    }
+    if value.len() > limits.max_identifier_bytes {
+        return Err(WriteAdmissionError::IdentifierTooLong {
+            kind,
+            item,
+            actual: value.len(),
+            allowed: limits.max_identifier_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_attr_names(
+    attrs: &[(String, AttrValue)],
+    limits: WriteLimits,
+    item: Option<usize>,
+) -> Result<()> {
+    for (name, _) in attrs {
+        validate_identifier("attribute name", name, limits, item)?;
+    }
+    Ok(())
+}
+
+fn input_record_admission_bytes(
+    id: &str,
+    contents: &[ContentSpans<'_>],
+    attrs: &[(String, AttrValue)],
+    limits: WriteLimits,
+    item: Option<usize>,
+) -> Result<u64> {
+    validate_identifier("record id", id, limits, item)?;
+    validate_attr_names(attrs, limits, item)?;
+    let mut names = std::collections::BTreeSet::new();
+    let mut size = WAL_FRAME_OVERHEAD;
+    add_size(&mut size, bytes_field_size(id.len()));
+    add_size(&mut size, varint_bytes(contents.len() as u64));
+    for content in contents {
+        validate_identifier("content name", content.name, limits, item)?;
+        if !names.insert(content.name) {
+            return Err(WriteAdmissionError::DuplicateContentName {
+                item,
+                name: content.name.to_string(),
+            }
+            .into());
+        }
+        validate_spans(&content.spans)?;
+        add_size(&mut size, bytes_field_size(content.name.len()));
+        add_size(&mut size, 1 + 32); // present whole-content identity
+        add_size(&mut size, varint_bytes(content.spans.len() as u64));
+        let mut novel = 0u64;
+        for span in &content.spans {
+            match span {
+                Span::Lit(bytes) => {
+                    add_size(&mut size, 1u64.saturating_add(bytes_field_size(bytes.len())))
+                }
+                Span::Piece(bytes) => {
+                    add_size(
+                        &mut size,
+                        1u64.saturating_add(32).saturating_add(varint_bytes(bytes.len() as u64)),
+                    );
+                    add_size(&mut novel, 32u64.saturating_add(bytes_field_size(bytes.len())));
+                }
+            }
+        }
+        // Novel pieces are one record-level list; accumulating the entries here is equivalent.
+        add_size(&mut size, novel);
+    }
+    add_size(&mut size, varint_bytes(attrs.len() as u64));
+    for (name, value) in attrs {
+        add_size(&mut size, attr_encoded_size(name, value));
+    }
+    let piece_count = contents
+        .iter()
+        .flat_map(|content| content.spans.iter())
+        .filter(|span| matches!(span, Span::Piece(_)))
+        .count() as u64;
+    add_size(&mut size, varint_bytes(piece_count));
+    if size > limits.max_record_bytes {
+        return Err(WriteAdmissionError::RecordTooLarge {
+            item,
+            actual: size,
+            allowed: limits.max_record_bytes,
+        }
+        .into());
+    }
+    Ok(size)
+}
+
+fn validate_content_inputs(
+    id: &str,
+    contents: &[ContentSpans<'_>],
+    item: Option<usize>,
+) -> Result<()> {
     if id.is_empty() {
-        bail!("record id must not be empty");
+        return Err(WriteAdmissionError::EmptyIdentifier { kind: "record id", item }.into());
     }
     let mut names = std::collections::BTreeSet::new();
     for content in contents {
         if content.name.is_empty() {
-            bail!("content name must not be empty");
+            return Err(WriteAdmissionError::EmptyIdentifier { kind: "content name", item }.into());
         }
         if !names.insert(content.name) {
-            bail!("duplicate content name {:?}", content.name);
+            return Err(WriteAdmissionError::DuplicateContentName {
+                item,
+                name: content.name.to_string(),
+            }
+            .into());
         }
         validate_spans(&content.spans)?;
     }
@@ -193,26 +451,80 @@ fn validate_spans(spans: &[Span<'_>]) -> Result<()> {
     Ok(())
 }
 
-fn validate_owned_contents(id: &str, contents: &[OwnedContent]) -> Result<()> {
-    if id.is_empty() {
-        bail!("record id must not be empty");
-    }
+fn owned_record_admission_bytes(
+    id: &str,
+    contents: &[OwnedContent],
+    attrs: &[(String, AttrValue)],
+    limits: WriteLimits,
+    item: Option<usize>,
+) -> Result<u64> {
+    validate_identifier("record id", id, limits, item)?;
+    validate_attr_names(attrs, limits, item)?;
     let mut names = std::collections::BTreeSet::new();
+    let mut size = WAL_FRAME_OVERHEAD;
+    add_size(&mut size, bytes_field_size(id.len()));
+    add_size(&mut size, varint_bytes(contents.len() as u64));
+    let mut piece_count = 0u64;
+    let mut novel = 0u64;
     for content in contents {
-        if content.name.is_empty() {
-            bail!("content name must not be empty");
-        }
+        validate_identifier("content name", &content.name, limits, item)?;
         if !names.insert(content.name.as_str()) {
-            bail!("duplicate content name {:?}", content.name);
+            return Err(WriteAdmissionError::DuplicateContentName {
+                item,
+                name: content.name.clone(),
+            }
+            .into());
         }
+        add_size(&mut size, bytes_field_size(content.name.len()));
+        add_size(&mut size, 1 + 32);
+        add_size(&mut size, varint_bytes(content.spans.len() as u64));
         for span in &content.spans {
-            if let OwnedSpan::Piece(bytes) = span {
-                u32::try_from(bytes.len())
-                    .context("one folded piece exceeds the format's u32 length")?;
+            match span {
+                OwnedSpan::Lit(bytes) => {
+                    add_size(&mut size, 1u64.saturating_add(bytes_field_size(bytes.len())))
+                }
+                OwnedSpan::Piece(bytes) => {
+                    u32::try_from(bytes.len())
+                        .context("one folded piece exceeds the format's u32 length")?;
+                    piece_count = piece_count.saturating_add(1);
+                    add_size(
+                        &mut size,
+                        1u64.saturating_add(32).saturating_add(varint_bytes(bytes.len() as u64)),
+                    );
+                    add_size(&mut novel, 32u64.saturating_add(bytes_field_size(bytes.len())));
+                }
             }
         }
     }
-    Ok(())
+    add_size(&mut size, varint_bytes(attrs.len() as u64));
+    for (name, value) in attrs {
+        add_size(&mut size, attr_encoded_size(name, value));
+    }
+    add_size(&mut size, varint_bytes(piece_count));
+    add_size(&mut size, novel);
+    if size > limits.max_record_bytes {
+        return Err(WriteAdmissionError::RecordTooLarge {
+            item,
+            actual: size,
+            allowed: limits.max_record_bytes,
+        }
+        .into());
+    }
+    Ok(size)
+}
+
+fn delete_admission_bytes(id: &str, limits: WriteLimits, item: Option<usize>) -> Result<u64> {
+    validate_identifier("record id", id, limits, item)?;
+    let size = WAL_FRAME_OVERHEAD.saturating_add(id.len() as u64);
+    if size > limits.max_record_bytes {
+        return Err(WriteAdmissionError::RecordTooLarge {
+            item,
+            actual: size,
+            allowed: limits.max_record_bytes,
+        }
+        .into());
+    }
+    Ok(size)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -871,6 +1183,7 @@ pub struct Store {
     mem_bytes: usize,
     wal: Wal,
     cfg: FoldCfg,
+    write_limits: WriteLimits,
     /// ONE budget for every part in this store, not one per part. Section caches are what make a
     /// whole-part walk linear, so they cannot be removed — but unbounded they pinned 9.5x each part's
     /// on-disk size, which is a per-part cost that multiplies by part count.
@@ -932,6 +1245,12 @@ impl Store {
     /// nothing, and the single-writer invariant becomes the embedder's: at most one open writer per
     /// store directory, across every process and every instance. See `src/sys.rs` and FORMAT.md.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
+        Self::open_with_limits(dir, cfg, WriteLimits::default())
+    }
+
+    /// Open a writer with explicit runtime admission policy.
+    pub fn open_with_limits(dir: &Path, cfg: FoldCfg, write_limits: WriteLimits) -> Result<Store> {
+        let write_limits = write_limits.validate()?;
         crate::vfs::mkdir_all(dir)?;
         let manifest = match Manifest::load(dir) {
             Ok(m) => m,
@@ -1016,8 +1335,14 @@ impl Store {
             mem_bytes,
             wal,
             cfg,
+            write_limits,
             pcache,
         })
+    }
+
+    /// The policy governing future writes through this handle.
+    pub fn write_limits(&self) -> WriteLimits {
+        self.write_limits
     }
 
     /// Open for reading only: no lock, no replay, no daemon.
@@ -1188,10 +1513,8 @@ impl Store {
 
     /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
-        if id.is_empty() {
-            bail!("record id must not be empty");
-        }
-        validate_spans(spans)?;
+        let input = [ContentSpans::new(BODY_CONTENT, spans.to_vec())];
+        input_record_admission_bytes(id, &input, &attrs, self.write_limits, None)?;
         let mut novel = Vec::new();
         let body = self.fold_spans(BODY_CONTENT, spans, &mut novel)?;
         let rec = Record::new(id, vec![body], attrs)?;
@@ -1205,8 +1528,8 @@ impl Store {
         contents: &[ContentSpans<'_>],
         attrs: Vec<(String, AttrValue)>,
     ) -> Result<()> {
-        // Validate the whole map before `fold_spans` can append anything to the fold.
-        validate_content_inputs(id, contents)?;
+        // Validate and meter the whole map before `fold_spans` can append anything to the fold.
+        input_record_admission_bytes(id, contents, &attrs, self.write_limits, None)?;
         let mut novel = Vec::new();
         let mut carved = Vec::with_capacity(contents.len());
         for content in contents {
@@ -1289,14 +1612,38 @@ impl Store {
         if batch.items.is_empty() {
             return Ok(());
         }
-        // Refuse the complete batch before folding any member. Otherwise an invalid later item could
-        // leave novel bytes and dedup-window state behind even though no atomic batch was logged.
-        for item in &batch.items {
-            match item {
-                BatchItem::Put { id, contents, .. } => validate_owned_contents(id, contents)?,
-                BatchItem::Delete { id } if id.is_empty() => bail!("record id must not be empty"),
-                BatchItem::Delete { .. } => {}
+        if batch.items.len() > self.write_limits.max_batch_records {
+            return Err(WriteAdmissionError::TooManyBatchRecords {
+                actual: batch.items.len(),
+                allowed: self.write_limits.max_batch_records,
             }
+            .into());
+        }
+        // Refuse and meter the complete batch before folding any member. Otherwise an invalid later item could
+        // leave novel bytes and dedup-window state behind even though no atomic batch was logged.
+        let mut batch_bytes =
+            WAL_FRAME_OVERHEAD.saturating_add(varint_bytes(batch.items.len() as u64));
+        for (index, item) in batch.items.iter().enumerate() {
+            let item_bytes = match item {
+                BatchItem::Put { id, contents, attrs } => owned_record_admission_bytes(
+                    id,
+                    contents,
+                    attrs,
+                    self.write_limits,
+                    Some(index),
+                )?,
+                BatchItem::Delete { id } => {
+                    delete_admission_bytes(id, self.write_limits, Some(index))?
+                }
+            };
+            add_size(&mut batch_bytes, item_bytes);
+        }
+        if batch_bytes > self.write_limits.max_batch_bytes {
+            return Err(WriteAdmissionError::BatchTooLarge {
+                actual: batch_bytes,
+                allowed: self.write_limits.max_batch_bytes,
+            }
+            .into());
         }
         let mut framed: Vec<crate::store::wal::FramedRecord> =
             Vec::with_capacity(batch.items.len());
@@ -1362,9 +1709,7 @@ impl Store {
     /// separate, deliberate operation, because the fold is shared and the same bytes may be referenced
     /// by records that are still live.
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        if id.is_empty() {
-            bail!("record id must not be empty");
-        }
+        delete_admission_bytes(id, self.write_limits, None)?;
         self.wal.append_tomb(self.manifest.next_seq, id)?;
         self.mem_bytes += id.len() + 32;
         self.mem.insert(id.to_string(), None);

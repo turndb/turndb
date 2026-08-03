@@ -496,6 +496,11 @@ the frame chain is unbroken back to the last commit point, so the log is not wha
 down — and the reader must refuse. The marker's count is one byte of redundancy that keeps a batch
 from being quietly shrunk.
 
+Writer admission ceilings are deliberately absent from this format. They are per-open runtime policy:
+a reader and recovery must accept any frame valid under the format even when the current writer would
+decline to create it under lower configured limits. The deterministic charging unit and defaults are
+specified in `docs/write-admission.md`.
+
 A build predating named content refuses 0x5C and later tags by the unknown-tag rule below, which is
 the safe direction. A current reader accepts the old record tags, presents version-1 body programs as
 content named `body`, and reports whole-value identity unavailable for version-1 and version-2

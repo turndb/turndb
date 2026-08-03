@@ -104,6 +104,12 @@ timestamps, and explicit null to the existing scalar fields. Missing and null re
 bindings never route exact integers through JavaScript `number`; see
 [general scalar field types](docs/field-types-v4.md).
 
+Writer opens also carry generic admission policy: worst-case framed-WAL bytes per record and atomic
+batch, batch member count, and UTF-8 identifier/name bytes. Defaults are 64 MiB, 256 MiB, 4,096, and
+4 KiB respectively; Rust, native Node, and portable Node can override them. Complete batches are
+charged before the first fold mutation, and charging is independent of dedup history. See
+[write admission limits](docs/write-admission.md).
+
 Long-running compaction, verification, punching, and refold operations accept reusable Rust
 cancellation tokens and absolute deadlines through their controlled variants. The native Node methods
 map these to queue-inclusive `timeoutMs` and `AbortSignal` options while preserving each operation's

@@ -66,6 +66,15 @@ Call `close()` explicitly. A dropped handle is reclaimed when JavaScript eventua
 forgetting `close()` does not wedge the process forever, but collection has no timing guarantee and
 the next `open()` refuses while the old handle is still live.
 
+## Write admission
+
+`open` accepts `maxRecordBytes`, `maxBatchBytes`, `maxBatchRecords`, and `maxIdentifierBytes` as
+positive u32 numbers. Defaults are 64 MiB, 256 MiB, 4,096, and 4 KiB. The first two are not raw body
+limits: they count deterministic worst-case complete WAL frames, treating every folded piece as
+novel, so acceptance never depends on hidden dedup history. An atomic batch is completely charged and
+validated before any member mutates the fold or WAL. See
+[write admission limits](../../docs/write-admission.md) for the exact unit and native API.
+
 ## When a write stalls, and by how much
 
 This build is single-threaded, so two operations run on **your** thread and nothing else's. Both

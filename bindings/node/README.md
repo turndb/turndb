@@ -22,6 +22,11 @@ silently.
 - `write(ops, durable)` applies the ordered operations as one atomic batch. A successful call with
   `durable: true` has also synced the WAL. With `false` (the default), call `sync()` for a durability
   acknowledgement.
+- Writer-open options `maxRecordBytes`, `maxBatchBytes`, `maxBatchRecords`, and
+  `maxIdentifierBytes` configure Rust-owned admission policy. Batches are fully charged before the
+  first fold mutation; byte limits use deterministic worst-case framed-WAL sizes rather than current
+  dedup state. Size/count refusals are `RESOURCE_EXHAUSTED`, while malformed limits or names are
+  `INVALID_ARGUMENT`. See [write admission limits](../../docs/write-admission.md).
 - Attributes are an ordered array, not an object. Duplicate names and exact scalar types survive.
   Signed/unsigned integers and UTC nanosecond timestamps enter and leave as JavaScript `bigint`;
   binary metadata and content use `Buffer`; explicit null carries its own `kind`. See
@@ -67,8 +72,8 @@ silently.
   Once that many operations are queued, ordinary operations refuse with an overload error rather
   than creating an unbounded backlog. `close()` remains admissible when the queue is full.
 - Rejections use `TurnDbError` with a stable `code`. The initial classes distinguish
-  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, `CANCELLED`, SQL
-  `RESOURCE_EXHAUSTED`/`UNSUPPORTED`, and `INTERNAL`; the original native error is retained as `cause`
+  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, `CANCELLED`, write/SQL
+  `RESOURCE_EXHAUSTED`, `UNSUPPORTED`, and `INTERNAL`; the original native error is retained as `cause`
   and the full contextual message remains available. The declared code union reserves `NOT_FOUND`,
   `CORRUPTION`, and broader `IO` use while typed engine errors are added—unclassified core failures
   report `INTERNAL` rather than being guessed from prose.

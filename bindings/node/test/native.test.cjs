@@ -32,6 +32,11 @@ test('reports the native capability profile without a portable fallback', () => 
     napiVersion: 6,
     commandQueueCapacity: 64,
     commandQueueCapacityMax: 65536,
+    writeAdmissionLimits: true,
+    maxRecordBytesDefault: 67108864n,
+    maxBatchBytesDefault: 268435456n,
+    maxBatchRecordsDefault: 4096,
+    maxIdentifierBytesDefault: 4096,
     immutableSnapshots: true,
     lifecycleOperations: true,
     backupRestore: true,
@@ -68,6 +73,52 @@ test('configures a bounded per-store command backlog without breaking the defaul
   await assert.rejects(
     NativeStore.open(temporaryStore(t), { commandQueueCapacity: 65537 }),
     (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+});
+
+test('enforces configurable write admission with stable error classes', async (t) => {
+  const recordBounded = await NativeStore.open(temporaryStore(t), {
+    maxRecordBytes: 22n,
+    maxBatchBytes: 100n,
+    maxBatchRecords: 2,
+    maxIdentifierBytes: 4,
+  });
+  await recordBounded.write([{ kind: 'put', id: 'x' }]);
+  await assert.rejects(
+    recordBounded.write([{ kind: 'put', id: 'xx' }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /worst-case WAL frame of 23 bytes/.test(error.message),
+  );
+  await assert.rejects(
+    recordBounded.write([{ kind: 'delete', id: 'abcde' }]),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    recordBounded.write([
+      { kind: 'delete', id: 'a' },
+      { kind: 'delete', id: 'b' },
+      { kind: 'delete', id: 'c' },
+    ]),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
+  );
+  await recordBounded.close();
+
+  const batchBounded = await NativeStore.open(temporaryStore(t), {
+    maxRecordBytes: 100n,
+    maxBatchBytes: 53n,
+  });
+  await assert.rejects(
+    batchBounded.write([{ kind: 'delete', id: 'a' }, { kind: 'delete', id: 'b' }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /representation of 54 bytes/.test(error.message),
+  );
+  await batchBounded.close();
+
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { maxRecordBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
   );
 });
 

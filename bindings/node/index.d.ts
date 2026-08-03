@@ -114,6 +114,11 @@ export interface Capabilities {
   napiVersion: 6;
   commandQueueCapacity: number;
   commandQueueCapacityMax: number;
+  writeAdmissionLimits: true;
+  maxRecordBytesDefault: bigint;
+  maxBatchBytesDefault: bigint;
+  maxBatchRecordsDefault: number;
+  maxIdentifierBytesDefault: number;
   immutableSnapshots: true;
   lifecycleOperations: true;
   backupRestore: boolean;
@@ -136,6 +141,14 @@ export interface OpenOptions {
   commandQueueCapacity?: number;
   /** Aggregate reservation ceiling across live SQL queries; defaults to 1 GiB. */
   maxConcurrentSqlMemoryBytes?: bigint;
+  /** Worst-case complete WAL frame bytes admitted for one record; defaults to 64 MiB. */
+  maxRecordBytes?: bigint;
+  /** Member frames plus commit marker admitted for one atomic batch; defaults to 256 MiB. */
+  maxBatchBytes?: bigint;
+  /** Ordered members admitted in one atomic batch; defaults to 4,096. */
+  maxBatchRecords?: number;
+  /** UTF-8 bytes admitted in an id, attribute name, or content name; defaults to 4 KiB. */
+  maxIdentifierBytes?: number;
 }
 
 export interface SnapshotOpenOptions {
