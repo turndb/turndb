@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
 use turndb::control::OperationControl;
+use turndb::error::{classify, ErrorClass, IntegrityError};
 use turndb::fold::FoldCfg;
 use turndb::scan::{ScanExplanation, ScanPage, ScanRequest};
 use turndb::store::{
@@ -47,7 +48,7 @@ const OPEN: u8 = 0;
 const CLOSING_OR_CLOSED: u8 = 1;
 
 #[derive(Debug)]
-enum ActorFault {
+pub(crate) enum ActorFault {
     Busy { capacity: usize },
     Closed,
     WorkerExited,
@@ -58,12 +59,10 @@ impl std::fmt::Display for ActorFault {
         match self {
             ActorFault::Busy { capacity } => write!(
                 f,
-                "[TURNDB_CODE:BUSY] store command queue is full (capacity {capacity}); retry after pending operations settle"
+                "store command queue is full (capacity {capacity}); retry after pending operations settle"
             ),
-            ActorFault::Closed => write!(f, "[TURNDB_CODE:CLOSED] store is closed"),
-            ActorFault::WorkerExited => {
-                write!(f, "[TURNDB_CODE:INTERNAL] store worker has exited")
-            }
+            ActorFault::Closed => write!(f, "store is closed"),
+            ActorFault::WorkerExited => write!(f, "store worker has exited"),
         }
     }
 }
@@ -196,15 +195,7 @@ impl Actor {
                     run(store, &path, rx);
                 }
                 Err(error) => {
-                    let contention = error.chain().any(|cause| {
-                        cause.downcast_ref::<turndb::fold::WriterLocked>().is_some()
-                            || cause
-                                .downcast_ref::<std::io::Error>()
-                                .map(|io| io.kind() == std::io::ErrorKind::WouldBlock)
-                                .unwrap_or(false)
-                    });
-                    let marker = if contention { "[TURNDB_CODE:CONTENTION] " } else { "" };
-                    let _ = ready_tx.send(Err(format!("{marker}{error:#}")));
+                    let _ = ready_tx.send(Err(error));
                 }
             })
             .context("spawn TurnDB store thread")?;
@@ -212,7 +203,7 @@ impl Actor {
             Ok(()) => {
                 Ok(Actor { inner: Arc::new(Inner { tx, state: AtomicU8::new(OPEN), capacity }) })
             }
-            Err(message) => Err(anyhow!(message)).context("open TurnDB store"),
+            Err(error) => Err(error).context("open TurnDB store"),
         }
     }
 
@@ -490,14 +481,30 @@ fn verify(store: &mut Store, path: &Path, control: &OperationControl) -> Result<
     control.check("store verification")?;
     settle(store)?;
     control.check("store verification")?;
-    let chain = turndb::store::verify_chain_with_control(path, control)?;
-    let fold = store.fold().scrub_with_control(control)?;
+    let chain = integrity(
+        "verify retained manifest chain",
+        turndb::store::verify_chain_with_control(path, control),
+    )?;
+    let fold = integrity("verify fold frames", store.fold().scrub_with_control(control))?;
     let mut part_sections = 0usize;
     for part in store.parts() {
         control.check("store verification")?;
-        part_sections += part.verify_sections_with_control(control)?;
+        part_sections += integrity(
+            "verify immutable part sections",
+            part.verify_sections_with_control(control),
+        )?;
     }
     Ok(VerifyResult { chain, fold, parts: store.part_count(), part_sections })
+}
+
+fn integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if classify(&error) == ErrorClass::Internal {
+            IntegrityError::new(context, error).into()
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(test)]

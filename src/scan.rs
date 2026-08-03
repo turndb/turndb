@@ -42,6 +42,29 @@ impl std::fmt::Display for ScanInterrupted {
 
 impl std::error::Error for ScanInterrupted {}
 
+/// A structurally invalid scan request or opaque cursor supplied by the caller.
+///
+/// The message remains descriptive, while this type lets embeddings classify the refusal without
+/// matching that message. Storage decoding failures are deliberately not represented by this type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanInputError {
+    reason: String,
+}
+
+impl ScanInputError {
+    pub(crate) fn new(reason: impl Into<String>) -> ScanInputError {
+        ScanInputError { reason: reason.into() }
+    }
+}
+
+impl std::fmt::Display for ScanInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ScanInputError {}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Direction {
     #[default]
@@ -426,12 +449,18 @@ fn prepare(request: &ScanRequest) -> Result<PreparedScan<'_>> {
         .as_deref()
         .map(decode_cursor)
         .transpose()?
-        .map(|cursor| {
+        .map(|cursor| -> Result<DecodedCursor> {
             if cursor.direction != request.direction {
-                bail!("scan cursor direction does not match this request");
+                return Err(ScanInputError::new(
+                    "scan cursor direction does not match this request",
+                )
+                .into());
             }
             if cursor.fingerprint != fingerprint {
-                bail!("scan cursor belongs to different bounds or predicates");
+                return Err(ScanInputError::new(
+                    "scan cursor belongs to different bounds or predicates",
+                )
+                .into());
             }
             Ok(cursor)
         })
@@ -774,29 +803,43 @@ fn check_interruption(request: &ScanRequest) -> Result<()> {
 
 fn validate(request: &ScanRequest) -> Result<()> {
     if request.limit == 0 || request.limit > MAX_LIMIT {
-        bail!("scan limit must be in 1..={MAX_LIMIT}");
+        return Err(ScanInputError::new(format!("scan limit must be in 1..={MAX_LIMIT}")).into());
     }
     if request.max_examined == 0 || request.max_examined > MAX_EXAMINED {
-        bail!("scan max_examined must be in 1..={MAX_EXAMINED}");
+        return Err(ScanInputError::new(format!(
+            "scan max_examined must be in 1..={MAX_EXAMINED}"
+        ))
+        .into());
     }
     if request.max_resolution_entries == 0
         || request.max_resolution_entries > MAX_RESOLUTION_ENTRIES
     {
-        bail!("scan max_resolution_entries must be in 1..={MAX_RESOLUTION_ENTRIES}");
+        return Err(ScanInputError::new(format!(
+            "scan max_resolution_entries must be in 1..={MAX_RESOLUTION_ENTRIES}"
+        ))
+        .into());
     }
     if request.max_reconstructed_bytes == 0 {
-        bail!("scan max_reconstructed_bytes must be greater than zero");
+        return Err(
+            ScanInputError::new("scan max_reconstructed_bytes must be greater than zero").into()
+        );
     }
     if matches!((&request.from, &request.to), (Some(a), Some(b)) if a >= b) {
-        bail!("scan lower bound must be less than its upper bound");
+        return Err(
+            ScanInputError::new("scan lower bound must be less than its upper bound").into()
+        );
     }
     let mut contents = HashSet::new();
     for selected in &request.contents {
         if selected.name.is_empty() {
-            bail!("selected content name must not be empty");
+            return Err(ScanInputError::new("selected content name must not be empty").into());
         }
         if !contents.insert(selected.name.as_str()) {
-            bail!("content {:?} is selected more than once", selected.name);
+            return Err(ScanInputError::new(format!(
+                "content {:?} is selected more than once",
+                selected.name
+            ))
+            .into());
         }
     }
     for predicate in &request.predicates {
@@ -806,7 +849,7 @@ fn validate(request: &ScanRequest) -> Result<()> {
             | Predicate::ContentExists { name, .. }
                 if name.is_empty() =>
             {
-                bail!("predicate field name must not be empty")
+                return Err(ScanInputError::new("predicate field name must not be empty").into());
             }
             _ => {}
         }
@@ -930,18 +973,21 @@ fn encode_cursor(
 }
 
 fn decode_cursor(token: &str) -> Result<DecodedCursor> {
-    let bytes = unhex(token).context("invalid scan cursor")?;
+    let bytes = unhex(token)
+        .map_err(|error| ScanInputError::new(format!("invalid scan cursor: {error:#}")))?;
     let fixed = 2 + CURSOR_FINGERPRINT + 4 + CURSOR_CHECKSUM;
     if bytes.len() < fixed {
-        bail!("invalid scan cursor: truncated payload");
+        return Err(ScanInputError::new("invalid scan cursor: truncated payload").into());
     }
     if bytes[0] != CURSOR_VERSION {
-        bail!("unsupported scan cursor version {}", bytes[0]);
+        return Err(
+            ScanInputError::new(format!("unsupported scan cursor version {}", bytes[0])).into()
+        );
     }
     let direction = match bytes[1] {
         0 => Direction::Forward,
         1 => Direction::Reverse,
-        v => bail!("invalid scan cursor direction {v}"),
+        v => return Err(ScanInputError::new(format!("invalid scan cursor direction {v}")).into()),
     };
     let mut fingerprint = [0u8; CURSOR_FINGERPRINT];
     fingerprint.copy_from_slice(&bytes[2..2 + CURSOR_FINGERPRINT]);
@@ -949,16 +995,16 @@ fn decode_cursor(token: &str) -> Result<DecodedCursor> {
     let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
     let payload_len = (at + 4)
         .checked_add(len)
-        .ok_or_else(|| anyhow::anyhow!("invalid scan cursor length overflow"))?;
+        .ok_or_else(|| ScanInputError::new("invalid scan cursor length overflow"))?;
     if payload_len + CURSOR_CHECKSUM != bytes.len() {
-        bail!("invalid scan cursor length");
+        return Err(ScanInputError::new("invalid scan cursor length").into());
     }
     let want = blake3::hash(&bytes[..payload_len]);
     if want.as_bytes()[..CURSOR_CHECKSUM] != bytes[payload_len..] {
-        bail!("invalid scan cursor checksum");
+        return Err(ScanInputError::new("invalid scan cursor checksum").into());
     }
     let last_id = String::from_utf8(bytes[at + 4..payload_len].to_vec())
-        .context("scan cursor id is not UTF-8")?;
+        .map_err(|error| ScanInputError::new(format!("scan cursor id is not UTF-8: {error}")))?;
     Ok(DecodedCursor { direction, fingerprint, last_id })
 }
 

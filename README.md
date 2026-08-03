@@ -104,6 +104,9 @@ content program sections remain unopened. See
 `Store::explain_scan` and `ReadStore::explain_scan` run the same request/cursor preparation and report
 required versus predicate-only fields, work ceilings, effective bounds, and exact physical rows in
 scope before visibility resolution. See [structured scan explanation](docs/scan-explanation.md).
+Rust embedders can classify rich error chains through the stable, domain-neutral
+[`ErrorClass`](docs/error-taxonomy.md); the native Node binding exposes the same engine codes through
+`TurnDbError` and adds only its actor-owned `BUSY`/`CLOSED` states.
 
 Format revision 4 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
 timestamps, and explicit null to the existing scalar fields. Missing and null remain distinct, and

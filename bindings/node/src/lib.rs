@@ -8,7 +8,7 @@
 mod actor;
 
 use actor::{
-    Actor, BoundedCompactResult, CompactResult, OwnedContent, VerifyResult, WriteOp,
+    Actor, ActorFault, BoundedCompactResult, CompactResult, OwnedContent, VerifyResult, WriteOp,
     DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
 };
 use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
@@ -19,137 +19,36 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use turndb::control::{OperationControl, OperationInterrupted};
+use turndb::control::OperationControl;
+use turndb::error::classify as classify_engine_error;
 use turndb::fold::FoldCfg;
 #[cfg(feature = "sql")]
 use turndb::query::sql::{
-    classify_error as classify_sql_error, SqlBatch, SqlBudget, SqlErrorClass, SqlOptions, SqlQuery,
-    SqlValue, DEFAULT_AGGREGATE_MEMORY_BYTES, DEFAULT_MEMORY_BYTES,
+    SqlBatch, SqlBudget, SqlOptions, SqlQuery, SqlValue, DEFAULT_AGGREGATE_MEMORY_BYTES,
+    DEFAULT_MEMORY_BYTES,
 };
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
-    ScanExplanation, ScanInterrupted, ScanPage, ScanRequest, ScanRow,
-    DEFAULT_MAX_RECONSTRUCTED_BYTES, DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
+    ScanExplanation, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
+    DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
 };
-use turndb::store::{
-    CompactionBudget, CompactionError, ReadStore, Store, WriteAdmissionError, WriteLimits,
-};
+use turndb::store::{CompactionBudget, ReadStore, Store, WriteLimits};
 use turndb::types::AttrValue;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> Error {
-    Error::new(Status::GenericFailure, format!("{context}: {error:#}"))
+    coded_failure("INTERNAL", format!("{context}: {error:#}"))
 }
 
 fn coded_failure(code: &str, reason: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, format!("[TURNDB_CODE:{code}] {reason}"))
 }
 
-fn scan_failure(context: &str, error: anyhow::Error) -> Error {
-    if error.chain().any(|cause| cause.downcast_ref::<ScanInterrupted>().is_some()) {
-        coded_failure("CANCELLED", format!("{context}: {error:#}"))
-    } else {
-        failure(context, error)
-    }
-}
-
-fn lifecycle_failure(context: &str, error: anyhow::Error) -> Error {
-    if error.chain().any(|cause| cause.downcast_ref::<OperationInterrupted>().is_some()) {
-        coded_failure("CANCELLED", format!("{context}: {error:#}"))
-    } else {
-        failure(context, error)
-    }
-}
-
-fn write_failure(context: &str, error: anyhow::Error) -> Error {
-    let code =
-        error.chain().find_map(|cause| cause.downcast_ref::<WriteAdmissionError>()).map(|error| {
-            match error {
-                WriteAdmissionError::InvalidLimits(_)
-                | WriteAdmissionError::EmptyIdentifier { .. }
-                | WriteAdmissionError::IdentifierTooLong { .. }
-                | WriteAdmissionError::DuplicateContentName { .. } => "INVALID_ARGUMENT",
-                WriteAdmissionError::RecordTooLarge { .. }
-                | WriteAdmissionError::BatchTooLarge { .. }
-                | WriteAdmissionError::TooManyBatchRecords { .. } => "RESOURCE_EXHAUSTED",
-            }
-        });
-    match code {
-        Some(code) => coded_failure(code, format!("{context}: {error:#}")),
-        None => failure(context, error),
-    }
-}
-
-fn compaction_failure(context: &str, error: anyhow::Error) -> Error {
-    if error.chain().any(|cause| cause.downcast_ref::<OperationInterrupted>().is_some()) {
-        return coded_failure("CANCELLED", format!("{context}: {error:#}"));
-    }
-    let code =
-        error.chain().find_map(|cause| cause.downcast_ref::<CompactionError>()).map(|error| {
-            match error {
-                CompactionError::InvalidBudget(_) => "INVALID_ARGUMENT",
-                CompactionError::BudgetTooSmall { .. } => "RESOURCE_EXHAUSTED",
-            }
-        });
-    match code {
-        Some(code) => coded_failure(code, format!("{context}: {error:#}")),
-        None => failure(context, error),
-    }
-}
-
-fn backup_failure(context: &str, error: anyhow::Error) -> Error {
-    let code = if let Some(error) = error.downcast_ref::<turndb::pack::BackupError>() {
-        match error {
-            turndb::pack::BackupError::DestinationExists(_) => "INVALID_ARGUMENT",
-            turndb::pack::BackupError::InvalidBackup { .. } => "CORRUPTION",
-            turndb::pack::BackupError::Unsupported(_) => "UNSUPPORTED",
-        }
-    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
-        match error.kind() {
-            std::io::ErrorKind::NotFound => "NOT_FOUND",
-            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::InvalidInput => {
-                "INVALID_ARGUMENT"
-            }
-            std::io::ErrorKind::Unsupported => "UNSUPPORTED",
-            _ => "IO",
-        }
-    } else {
-        "INTERNAL"
-    };
-    coded_failure(code, format!("{context}: {error:#}"))
-}
-
-fn recovery_failure(context: &str, error: anyhow::Error) -> Error {
-    let code = if error
-        .chain()
-        .any(|cause| cause.downcast_ref::<turndb::fold::WriterLocked>().is_some())
-    {
-        "CONTENTION"
-    } else if let Some(error) = error.downcast_ref::<turndb::store::RecoveryError>() {
-        match error {
-            turndb::store::RecoveryError::Healthy(_)
-            | turndb::store::RecoveryError::RollbackLimit { .. } => "INVALID_ARGUMENT",
-            turndb::store::RecoveryError::NoUsableCandidate { .. } => "CORRUPTION",
-        }
-    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            "NOT_FOUND"
-        } else {
-            "IO"
-        }
-    } else {
-        "INTERNAL"
-    };
-    coded_failure(code, format!("{context}: {error:#}"))
-}
-
-#[cfg(feature = "sql")]
-fn sql_failure(context: &str, error: anyhow::Error) -> Error {
-    let code = match classify_sql_error(&error) {
-        SqlErrorClass::InvalidArgument => "INVALID_ARGUMENT",
-        SqlErrorClass::ResourceExhausted => "RESOURCE_EXHAUSTED",
-        SqlErrorClass::Unsupported => "UNSUPPORTED",
-        SqlErrorClass::Io => "IO",
-        SqlErrorClass::Internal => "INTERNAL",
+fn engine_failure(context: &str, error: anyhow::Error) -> Error {
+    let code = match error.chain().find_map(|cause| cause.downcast_ref::<ActorFault>()) {
+        Some(ActorFault::Busy { .. }) => "BUSY",
+        Some(ActorFault::Closed) => "CLOSED",
+        Some(ActorFault::WorkerExited) => "INTERNAL",
+        None => classify_engine_error(&error).code(),
     };
     coded_failure(code, format!("{context}: {error:#}"))
 }
@@ -763,7 +662,7 @@ async fn pull_sql(
         }
         SqlPull::Batch(Err(error)) => {
             slot.query = None;
-            Err(sql_failure("pull TurnDB SQL query", error))
+            Err(engine_failure("pull TurnDB SQL query", error))
         }
         SqlPull::Interrupted(reason) => {
             slot.stats = slot.query.as_ref().expect("query remains until interruption").stats();
@@ -900,7 +799,7 @@ impl NativeSnapshot {
         })
         .await
         .map_err(|error| failure("join TurnDB snapshot open", error))?
-        .map_err(|error| failure("open TurnDB snapshot", error))?;
+        .map_err(|error| engine_failure("open TurnDB snapshot", error))?;
         #[cfg(feature = "sql")]
         {
             let budget = decode_sql_budget(
@@ -931,7 +830,7 @@ impl NativeSnapshot {
         })
         .await
         .map_err(|error| failure("join retained TurnDB snapshot open", error))?
-        .map_err(|error| failure("open retained TurnDB snapshot", error))?;
+        .map_err(|error| engine_failure("open retained TurnDB snapshot", error))?;
         #[cfg(feature = "sql")]
         {
             let budget = decode_sql_budget(
@@ -966,7 +865,7 @@ impl NativeSnapshot {
                 .await
                 .map_err(|error| failure("join TurnDB snapshot scan", error))?
                 .map(encode_page)
-                .map_err(|error| scan_failure("scan TurnDB snapshot", error))
+                .map_err(|error| engine_failure("scan TurnDB snapshot", error))
         })
     }
 
@@ -986,7 +885,7 @@ impl NativeSnapshot {
                 .await
                 .map_err(|error| failure("join TurnDB snapshot scan explanation", error))?
                 .map(encode_scan_explanation)
-                .map_err(|error| scan_failure("explain TurnDB snapshot scan", error))
+                .map_err(|error| engine_failure("explain TurnDB snapshot scan", error))
         })
     }
 
@@ -997,7 +896,7 @@ impl NativeSnapshot {
             .await
             .map_err(|error| failure("join TurnDB snapshot content read", error))?
             .map(|bytes| bytes.map(Buffer::from))
-            .map_err(|error| failure("read TurnDB snapshot content", error))
+            .map_err(|error| engine_failure("read TurnDB snapshot content", error))
     }
 
     /// Discover field names and scalar types from metadata without decoding values or content.
@@ -1008,7 +907,7 @@ impl NativeSnapshot {
             .await
             .map_err(|error| failure("join TurnDB snapshot schema discovery", error))?
             .map(encode_schema)
-            .map_err(|error| failure("discover TurnDB snapshot schema", error))
+            .map_err(|error| engine_failure("discover TurnDB snapshot schema", error))
     }
 
     #[napi]
@@ -1026,7 +925,7 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
     napi::tokio::task::spawn_blocking(move || turndb::store::retained_commits(&PathBuf::from(path)))
         .await
         .map(|commits| commits.into_iter().map(BigInt::from).collect())
-        .map_err(|error| failure("list retained TurnDB commits", error))
+        .map_err(|error| failure("join retained TurnDB commit listing", error))
 }
 
 /// Validate and restore one immutable backup into a destination that must not exist.
@@ -1051,7 +950,7 @@ pub async fn restore_backup(
         bytes: BigInt::from(stats.bytes),
         commit: BigInt::from(stats.commit),
     })
-    .map_err(|error| backup_failure("restore TurnDB backup", error))
+    .map_err(|error| engine_failure("restore TurnDB backup", error))
 }
 
 /// Exclusively validate and promote a retained manifest over a damaged live commit point.
@@ -1088,7 +987,7 @@ pub async fn recover_manifest(
         fold_blocks: BigInt::from(report.fold_blocks as u64),
         fold_bytes: BigInt::from(report.fold_bytes),
     })
-    .map_err(|error| recovery_failure("recover TurnDB manifest", error))
+    .map_err(|error| engine_failure("recover TurnDB manifest", error))
 }
 
 /// A native writer handle. All operations are asynchronous and serialized by its Rust actor.
@@ -1133,7 +1032,7 @@ impl NativeStore {
         })
         .await
         .map_err(|error| failure("join TurnDB open", error))?
-        .map_err(|error| failure("open TurnDB store", error))?;
+        .map_err(|error| engine_failure("open TurnDB store", error))?;
         #[cfg(feature = "sql")]
         {
             Ok(NativeStore { actor, sql_budget })
@@ -1155,19 +1054,19 @@ impl NativeStore {
         self.actor
             .write(ops, durable.unwrap_or(false))
             .await
-            .map_err(|error| write_failure("write TurnDB batch", error))
+            .map_err(|error| engine_failure("write TurnDB batch", error))
     }
 
     /// Make every previously accepted write crash-durable.
     #[napi]
     pub async fn sync(&self) -> Result<()> {
-        self.actor.sync().await.map_err(|error| failure("sync TurnDB store", error))
+        self.actor.sync().await.map_err(|error| engine_failure("sync TurnDB store", error))
     }
 
     /// Seal the current memtable into an immutable part. Returns whether a part was written.
     #[napi]
     pub async fn flush(&self) -> Result<bool> {
-        self.actor.flush().await.map_err(|error| failure("flush TurnDB store", error))
+        self.actor.flush().await.map_err(|error| engine_failure("flush TurnDB store", error))
     }
 
     /// Page the writer's read-your-writes view using an opaque, checked cursor.
@@ -1184,7 +1083,7 @@ impl NativeStore {
                 .scan(request?.unwrap_or_default())
                 .await
                 .map(encode_page)
-                .map_err(|error| scan_failure("scan TurnDB store", error))
+                .map_err(|error| engine_failure("scan TurnDB store", error))
         })
     }
 
@@ -1202,7 +1101,7 @@ impl NativeStore {
                 .explain_scan(request?.unwrap_or_default())
                 .await
                 .map(encode_scan_explanation)
-                .map_err(|error| scan_failure("explain TurnDB store scan", error))
+                .map_err(|error| engine_failure("explain TurnDB store scan", error))
         })
     }
 
@@ -1213,7 +1112,7 @@ impl NativeStore {
             .read_content(id, name)
             .await
             .map(|bytes| bytes.map(Buffer::from))
-            .map_err(|error| failure("read TurnDB content", error))
+            .map_err(|error| engine_failure("read TurnDB content", error))
     }
 
     /// Publish all earlier accepted writes and return an immutable reader at that exact cut.
@@ -1223,7 +1122,7 @@ impl NativeStore {
             .actor
             .snapshot()
             .await
-            .map_err(|error| failure("create TurnDB snapshot", error))?;
+            .map_err(|error| engine_failure("create TurnDB snapshot", error))?;
         #[cfg(feature = "sql")]
         return Ok(NativeSnapshot::from_store(store, self.sql_budget.clone()));
         #[cfg(not(feature = "sql"))]
@@ -1245,7 +1144,7 @@ impl NativeStore {
                 .compact(full.unwrap_or(false), control)
                 .await
                 .map(encode_compact)
-                .map_err(|error| lifecycle_failure("compact TurnDB store", error))
+                .map_err(|error| engine_failure("compact TurnDB store", error))
         })
     }
 
@@ -1265,7 +1164,7 @@ impl NativeStore {
                 .compact_bounded(budget, control)
                 .await
                 .map(encode_bounded_compact)
-                .map_err(|error| compaction_failure("compact TurnDB store within budget", error))
+                .map_err(|error| engine_failure("compact TurnDB store within budget", error))
         })
     }
 
@@ -1283,7 +1182,7 @@ impl NativeStore {
                 .verify(control)
                 .await
                 .map(encode_verify)
-                .map_err(|error| lifecycle_failure("verify TurnDB store", error))
+                .map_err(|error| engine_failure("verify TurnDB store", error))
         })
     }
 
@@ -1301,7 +1200,7 @@ impl NativeStore {
                 bytes: BigInt::from(stats.bytes),
                 commit: BigInt::from(stats.commit),
             })
-            .map_err(|error| backup_failure("backup TurnDB store", error))
+            .map_err(|error| engine_failure("backup TurnDB store", error))
     }
 
     /// Physically erase ids from this store, including retained history. External copies are out of scope.
@@ -1324,7 +1223,7 @@ impl NativeStore {
                     absent: BigInt::from(stats.absent as u64),
                     refold: stats.refold.map(encode_refold),
                 })
-                .map_err(|error| lifecycle_failure("erase TurnDB records", error))
+                .map_err(|error| engine_failure("erase TurnDB records", error))
         })
     }
 
@@ -1345,7 +1244,7 @@ impl NativeStore {
                     blocks_examined: BigInt::from(stats.blocks_examined as u64),
                     blocks_punched: BigInt::from(stats.blocks_punched as u64),
                 })
-                .map_err(|error| lifecycle_failure("punch unreferenced TurnDB content", error))
+                .map_err(|error| engine_failure("punch unreferenced TurnDB content", error))
         })
     }
 
@@ -1363,7 +1262,7 @@ impl NativeStore {
                 .refold(control)
                 .await
                 .map(encode_refold)
-                .map_err(|error| lifecycle_failure("refold TurnDB store", error))
+                .map_err(|error| engine_failure("refold TurnDB store", error))
         })
     }
 
@@ -1374,7 +1273,7 @@ impl NativeStore {
             .health()
             .await
             .map(encode_health)
-            .map_err(|error| failure("read TurnDB health", error))
+            .map_err(|error| engine_failure("read TurnDB health", error))
     }
 
     /// Discover the part field universe plus accepted writer-memtable fields.
@@ -1384,7 +1283,7 @@ impl NativeStore {
             .schema()
             .await
             .map(encode_schema)
-            .map_err(|error| failure("discover TurnDB schema", error))
+            .map_err(|error| engine_failure("discover TurnDB schema", error))
     }
 
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
@@ -1393,7 +1292,7 @@ impl NativeStore {
         self.actor
             .close(durable.unwrap_or(true))
             .await
-            .map_err(|error| failure("close TurnDB store", error))
+            .map_err(|error| engine_failure("close TurnDB store", error))
     }
 }
 
@@ -1423,7 +1322,7 @@ impl NativeSnapshot {
         SqlQuery::open_with_budget(store, &sql, params, options, &self.state.sql_budget)
             .await
             .map(NativeSqlQuery::new)
-            .map_err(|error| sql_failure("open TurnDB snapshot SQL query", error))
+            .map_err(|error| engine_failure("open TurnDB snapshot SQL query", error))
     }
 }
 
@@ -1453,11 +1352,11 @@ impl NativeStore {
             .actor
             .snapshot()
             .await
-            .map_err(|error| failure("publish TurnDB SQL snapshot", error))?;
+            .map_err(|error| engine_failure("publish TurnDB SQL snapshot", error))?;
         SqlQuery::open_with_budget(store, &sql, params, options, &self.sql_budget)
             .await
             .map(NativeSqlQuery::new)
-            .map_err(|error| sql_failure("open TurnDB SQL query", error))
+            .map_err(|error| engine_failure("open TurnDB SQL query", error))
     }
 }
 

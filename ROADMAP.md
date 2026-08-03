@@ -115,6 +115,12 @@ content model right before compatibility turns today's choices into permanent pr
   predicate classes, request ceilings, and exact immutable-part/physical-row/writer-memtable scope
   before newest-wins resolution. Rust, writer-actor Node, and immutable Node snapshots expose the
   same contract; explanation opens only id structures and explicitly does not estimate results.
+  A public domain-neutral `ErrorClass` now classifies typed causes through arbitrary context without
+  prose matching. Scan validation and opaque-cursor misuse have a typed Rust cause; Node routes every
+  method, including explanation, through the same classifier and adds only actor-owned `BUSY` and
+  `CLOSED`. Verification marks otherwise-unclassified integrity failures as `CORRUPTION` while
+  preserving cancellation and filesystem classes. The contract and conservative `INTERNAL` fallback
+  are documented rather than pretending every low-level parser already has a typed variant.
 
 ## Product boundary
 
@@ -399,8 +405,8 @@ profile rather than misreporting the ordinary release artifact.
 
 Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for backup, restore,
 offline recovery, SQL planning, sync, and flush (batch pulls and major maintenance loops are
-cancellable); a complete typed engine error taxonomy; and measured event-loop/query overhead under a
-representative mixed workload.
+cancellable); typed corruption/invariant markers for low-level paths that still conservatively
+classify as `INTERNAL`; and measured event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 

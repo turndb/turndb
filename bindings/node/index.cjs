@@ -58,8 +58,11 @@ function normalizeError(error) {
 
 function guarded(fn, operation) {
   return function guardedNativeCall(...args) {
-    if (operation === 'scan' && args[0]?.signal?.aborted) {
-      return Promise.reject(new TurnDbError('CANCELLED', 'scan was cancelled before submission'));
+    if (['scan', 'explainScan'].includes(operation) && args[0]?.signal?.aborted) {
+      return Promise.reject(new TurnDbError(
+        'CANCELLED',
+        `${operation} was cancelled before submission`,
+      ));
     }
     if (operation === 'next' && args[0]?.signal?.aborted) {
       // Cancellation is terminal for a pull-based SQL stream. Close before rejecting so an already
@@ -91,7 +94,7 @@ function guarded(fn, operation) {
 
 for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSqlQuery].filter(Boolean)) {
   for (const name of [
-    'write', 'sync', 'flush', 'scan', 'readContent', 'snapshot',
+    'write', 'sync', 'flush', 'scan', 'explainScan', 'readContent', 'snapshot',
     'querySql', 'next', 'stats', 'compact', 'compactBounded', 'verify', 'erase', 'punch', 'refold',
     'backup', 'health', 'schema', 'close',
   ]) {
