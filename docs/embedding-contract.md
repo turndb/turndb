@@ -195,12 +195,15 @@ thread, encode binary content as base64 for the native path, or round i64 throug
 The WASM package remains synchronous internally and single-threaded. Its current object API is a
 lightweight compatibility profile, not the template for native concurrency.
 
-The current native prototype implements one dedicated store thread and a bounded 64-command queue.
-Open and every store operation return Promises; content crosses as `Buffer`, i64 crosses as `bigint`,
-and `scan` calls the Rust structured pager directly. `write(ops, durable)` applies one ordered atomic
-batch and optionally syncs it before resolving. `close` syncs by default, while `close(false)` is an
-explicit no-sync close. Dropping the final handle disconnects the queue and releases the writer rather
-than keeping an orphan actor alive.
+The current native prototype implements one dedicated store thread and a bounded command queue.
+`NativeStore.open` accepts a per-handle capacity from 1 through 65,536, defaults to 64 for
+compatibility, and exposes the selected value on the handle; package capabilities report the default
+and maximum. Open and every store operation return Promises; content crosses as `Buffer`, i64 crosses
+as `bigint`, and `scan` calls the Rust structured pager directly. `write(ops, durable)` applies one
+ordered atomic batch and optionally syncs it before resolving. `close` syncs by default, while
+`close(false)` is an explicit no-sync close. Close submission remains possible even when the ordinary
+command backlog is full. Dropping the final handle disconnects the queue and releases the writer
+rather than keeping an orphan actor alive.
 
 `NativeStore::snapshot` flushes all operations ordered before it on the actor, then opens an immutable
 `ReadStore` at that exact published cut. The snapshot's scans can execute concurrently on the blocking
@@ -208,8 +211,8 @@ pool and remain stable across later writer activity. A read-only process can ope
 manifest directly or request a commit still present in the bounded retained-manifest window; neither
 path takes the writer lock or replays an unflushed WAL.
 
-**Current gaps:** queue depth is fixed; only the binding-owned failure classes and writer contention
-have stable machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, backup/restore
+**Current gaps:** only the binding-owned failure classes and writer contention have stable
+machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, backup/restore
 and recovery controls, and prebuilt artifact selection are not exposed yet. The package is a tested
 source prototype and must not be described as a production distribution.
 
@@ -257,8 +260,9 @@ and raw sizes are u32, and Arrow binary values are limited by i32 offsets. Encod
 overflow. Query batches currently target 8,192 rows or 32 MiB of reconstructed content, while always
 admitting one oversized value so progress remains possible.
 
-Before production binding maturity, the API must add configurable queue depth, query memory, deadline,
-and cancellation budgets. Reaching a budget returns a structured error or partial page with a cursor
+Before production binding maturity, the API must add query memory, deadline, and cancellation budgets;
+the native command backlog is already bounded and configurable. Reaching a budget returns a structured
+error or partial page with a cursor
 only where the operation contract explicitly allows it. It never truncates a record, invents a weaker
 durability acknowledgement, or silently widens a scan.
 

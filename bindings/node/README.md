@@ -32,8 +32,10 @@ silently.
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
 - `close()` syncs by default. Passing `false` is an explicit no-sync close.
-- Calls made after close refuse. When 64 operations are already queued, ordinary operations refuse
-  with an overload error rather than creating an unbounded backlog.
+- Calls made after close refuse. `NativeStore.open(path, { commandQueueCapacity })` sets the accepted
+  backlog from 1 through 65,536; the default remains 64 and the handle reports its actual value.
+  Once that many operations are queued, ordinary operations refuse with an overload error rather
+  than creating an unbounded backlog. `close()` remains admissible when the queue is full.
 - Rejections use `TurnDbError` with a stable `code`. The initial binding-owned classes distinguish
   `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, and `INTERNAL`; the original native error is
   retained as `cause` and the full contextual message remains available. The declared code union
@@ -57,5 +59,5 @@ silently.
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
 The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, backup/restore and
-recovery controls, configurable queue depth, or the complete engine error taxonomy. Those remain
+recovery controls, or the complete engine error taxonomy. Those remain
 explicit Phase 3/4 work rather than being simulated in JavaScript.

@@ -30,13 +30,14 @@ pub(crate) struct VerifyResult {
     pub part_sections: usize,
 }
 
-const QUEUE_CAPACITY: usize = 64;
+pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 64;
+pub(crate) const MAX_QUEUE_CAPACITY: usize = 65_536;
 const OPEN: u8 = 0;
 const CLOSING_OR_CLOSED: u8 = 1;
 
 #[derive(Debug)]
 enum ActorFault {
-    Busy,
+    Busy { capacity: usize },
     Closed,
     WorkerExited,
 }
@@ -44,9 +45,9 @@ enum ActorFault {
 impl std::fmt::Display for ActorFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ActorFault::Busy => write!(
+            ActorFault::Busy { capacity } => write!(
                 f,
-                "[TURNDB_CODE:BUSY] store command queue is full (capacity {QUEUE_CAPACITY}); retry after pending operations settle"
+                "[TURNDB_CODE:BUSY] store command queue is full (capacity {capacity}); retry after pending operations settle"
             ),
             ActorFault::Closed => write!(f, "[TURNDB_CODE:CLOSED] store is closed"),
             ActorFault::WorkerExited => {
@@ -131,6 +132,7 @@ enum Command {
 struct Inner {
     tx: mpsc::SyncSender<Command>,
     state: AtomicU8,
+    capacity: usize,
 }
 
 #[derive(Clone)]
@@ -139,8 +141,13 @@ pub(crate) struct Actor {
 }
 
 impl Actor {
-    pub fn open(path: &Path) -> Result<Actor> {
-        let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
+    pub fn open_with_capacity(path: &Path, capacity: usize) -> Result<Actor> {
+        if !(1..=MAX_QUEUE_CAPACITY).contains(&capacity) {
+            return Err(anyhow!(
+                "command queue capacity must be between 1 and {MAX_QUEUE_CAPACITY}, got {capacity}"
+            ));
+        }
+        let (tx, rx) = mpsc::sync_channel(capacity);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let path = path.to_path_buf();
         std::thread::Builder::new()
@@ -164,7 +171,9 @@ impl Actor {
             })
             .context("spawn TurnDB store thread")?;
         match ready_rx.recv().context("TurnDB store thread exited during open")? {
-            Ok(()) => Ok(Actor { inner: Arc::new(Inner { tx, state: AtomicU8::new(OPEN) }) }),
+            Ok(()) => {
+                Ok(Actor { inner: Arc::new(Inner { tx, state: AtomicU8::new(OPEN), capacity }) })
+            }
             Err(message) => Err(anyhow!(message)).context("open TurnDB store"),
         }
     }
@@ -179,11 +188,17 @@ impl Actor {
         let (reply, receive) = oneshot::channel();
         self.inner.tx.try_send(make(reply)).map_err(|error| -> anyhow::Error {
             match error {
-                mpsc::TrySendError::Full(_) => ActorFault::Busy.into(),
+                mpsc::TrySendError::Full(_) => {
+                    ActorFault::Busy { capacity: self.inner.capacity }.into()
+                }
                 mpsc::TrySendError::Disconnected(_) => ActorFault::WorkerExited.into(),
             }
         })?;
         Ok(receive)
+    }
+
+    pub fn queue_capacity(&self) -> usize {
+        self.inner.capacity
     }
 
     async fn receive<R>(receive: oneshot::Receiver<Result<R>>) -> Result<R> {
@@ -402,7 +417,7 @@ mod tests {
         let runtime = napi::tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let dir = temp();
-            let actor = Actor::open(&dir).unwrap();
+            let actor = Actor::open_with_capacity(&dir, DEFAULT_QUEUE_CAPACITY).unwrap();
             actor
                 .write(
                     vec![WriteOp::Put {
@@ -446,24 +461,46 @@ mod tests {
     #[test]
     fn bounded_queue_refuses_the_first_command_beyond_capacity() {
         let dir = temp();
-        let actor = Actor::open(&dir).unwrap();
+        let capacity = 2;
+        let actor = Actor::open_with_capacity(&dir, capacity).unwrap();
+        assert_eq!(actor.queue_capacity(), capacity);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
         entered_rx.recv().unwrap();
 
         let mut queued = Vec::new();
-        for _ in 0..QUEUE_CAPACITY {
+        for _ in 0..capacity {
             queued.push(actor.submit(|reply| Command::Sync { reply }).unwrap());
         }
         let error = actor.submit(|reply| Command::Sync { reply }).unwrap_err();
         assert!(error.downcast_ref::<ActorFault>().is_some_and(|fault| {
-            matches!(fault, ActorFault::Busy) && fault.to_string().contains("[TURNDB_CODE:BUSY]")
+            matches!(fault, ActorFault::Busy { capacity: 2 })
+                && fault.to_string().contains("capacity 2")
         }));
 
         release_tx.send(()).unwrap();
         drop(queued);
         napi::tokio::runtime::Runtime::new().unwrap().block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queue_capacity_is_bounded_and_defaults_compatibly() {
+        let dir = temp();
+        let actor = Actor::open_with_capacity(&dir, DEFAULT_QUEUE_CAPACITY).unwrap();
+        assert_eq!(actor.queue_capacity(), DEFAULT_QUEUE_CAPACITY);
+        napi::tokio::runtime::Runtime::new().unwrap().block_on(actor.close(false)).unwrap();
+        assert!(Actor::open_with_capacity(&dir, 0)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("between 1"));
+        assert!(Actor::open_with_capacity(&dir, MAX_QUEUE_CAPACITY + 1)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains(&MAX_QUEUE_CAPACITY.to_string()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
