@@ -40,6 +40,7 @@ test('reports the native capability profile without a portable fallback', () => 
     schemaDiscovery: true,
     scanCancellation: true,
     lifecycleCancellation: true,
+    boundedCompaction: true,
     scanReconstructionBudget: true,
     scanReconstructedBytesDefault: 33554432n,
     arrowIpc: true,
@@ -603,6 +604,73 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.equal(refolded.recordsKept, 2n);
   assert.equal(typeof refolded.bytesReclaimed, 'bigint');
   assert.equal((await store.verify()).parts, 1n);
+});
+
+test('compacts one exact bounded work unit and classifies budgets for schedulers', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  for (let part = 0; part < 3; part++) {
+    await store.write([{
+      kind: 'put',
+      id: `bounded/${part}`,
+      contents: [{ name: 'payload', bytes: Buffer.from(`bounded payload ${part}`) }],
+    }]);
+    await store.flush();
+  }
+
+  const result = await store.compactBounded({
+    maxInputParts: 2,
+    maxInputRows: 2n,
+    maxInputBytes: 1n << 40n,
+  });
+  assert.equal(result.partsBefore, 3n);
+  assert.equal(result.partsAfter, 2n);
+  assert.deepEqual(result.plan, {
+    startPart: 0n,
+    inputParts: 2n,
+    inputRows: 2n,
+    inputBytes: result.plan.inputBytes,
+    dropsTombstones: false,
+  });
+  assert(result.plan.inputBytes > 0n);
+  assert(result.outputBytes > 0n);
+  assert.equal(result.merge.inputs, 2n);
+
+  await assert.rejects(
+    store.compactBounded({ maxInputParts: 2, maxInputRows: 1n, maxInputBytes: 1n << 40n }),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
+  );
+  assert.throws(
+    () => store.compactBounded({ maxInputParts: 1, maxInputRows: 10n, maxInputBytes: 1n << 40n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    store.compactBounded(
+      { maxInputParts: 2, maxInputRows: 10n, maxInputBytes: 1n << 40n },
+      { timeoutMs: 0 },
+    ),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+
+  const settled = await store.compactBounded({
+    maxInputParts: 2,
+    maxInputRows: 10n,
+    maxInputBytes: 1n << 40n,
+  });
+  assert.equal(settled.partsAfter, 1n);
+  assert.equal(settled.plan.dropsTombstones, true);
+  const idle = await store.compactBounded({
+    maxInputParts: 2,
+    maxInputRows: 10n,
+    maxInputBytes: 1n << 40n,
+  });
+  assert.equal(idle.partsBefore, 1n);
+  assert.equal(idle.partsAfter, 1n);
+  assert.equal(idle.plan, undefined);
+  assert.equal(idle.outputBytes, undefined);
+  assert.equal(idle.merge, undefined);
 });
 
 test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', async (t) => {

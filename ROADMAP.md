@@ -73,6 +73,11 @@ content model right before compatibility turns today's choices into permanent pr
   safe progress first and now correctly retries declared-but-unpunched blocks after cancellation or
   crash. Strong erasure stops only in its read-only planning phase and becomes intentionally
   non-interruptible once tombstones make completion mandatory.
+  Bounded incremental compaction now selects a contiguous run under simultaneous exact physical
+  part, row, and file-byte ceilings, reports both the executed input plan and output bytes, preserves
+  tombstones for every partial run, and returns typed invalid/insufficient-budget failures instead of
+  overrunning. The native actor settles its exact cut before planning and exposes the same primitive,
+  cancellation, result facts, and capability without adopting a consumer scheduling policy.
 
 ## Product boundary
 
@@ -368,7 +373,9 @@ through years of writes, deletes, crashes, upgrades, and changing retention deci
 
 ### Deliverables
 
-- Bounded incremental compaction with a measurable work budget.
+- Bounded incremental compaction with a measurable work budget. **Implemented:** one work unit is
+  bounded by exact physical input parts, rows, and file bytes, with controlled cancellation and
+  Rust/Node result evidence. Temporary-space preflight remains separate work below.
 - Explicit full compaction for controlled maintenance windows.
 - Physical erasure of unreferenced content.
 - Refold fallback where hole punching is unsupported.

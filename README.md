@@ -75,7 +75,7 @@ s.flush()?;                                   // seal into an immutable part
 |---|---|
 | **Durability** | WAL with an explicit ACK point; batches replay all-or-nothing; one commit point (the manifest) with a checksummed commit log, snapshots, and explicit recovery |
 | **Query** | Bounded structured paging with Rust-owned cursors plus an optional DataFusion lens and read-only SQL-to-Arrow stream — named content is independently projectable, and metadata queries open zero fold blocks |
-| **Compaction** | Total merge at eight parts, chosen by benchmark; merges provably touch zero content bytes |
+| **Compaction** | Total merge at eight parts plus exact input-part/row/byte-bounded work units; merges provably touch zero content bytes |
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
 | **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
@@ -104,6 +104,9 @@ cancellation tokens and absolute deadlines through their controlled variants. Th
 map these to queue-inclusive `timeoutMs` and `AbortSignal` options while preserving each operation's
 publication and restart invariants; see
 [lifecycle cancellation and deadlines](docs/lifecycle-control.md).
+Incremental compaction accepts simultaneous exact physical input-part, row, and file-byte limits,
+reports the executed plan and output bytes, and refuses rather than exceeding an insufficient budget;
+see [bounded incremental compaction](docs/bounded-compaction.md).
 
 With `sql` enabled, `query::sql::SqlQuery` runs positional-parameter SQL against the generic
 `records` table under a configurable DataFusion execution-memory ceiling. DDL, DML, and session

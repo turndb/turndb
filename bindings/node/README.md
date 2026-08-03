@@ -77,6 +77,11 @@ silently.
   `AbortSignal` options backed by Rust cooperative checkpoints. Cancelled compaction/refold staging
   is removed; punching retains safe resumable progress. See
   [lifecycle cancellation and deadlines](../../docs/lifecycle-control.md).
+- `compactBounded({ maxInputParts, maxInputRows, maxInputBytes }, options)` publishes one contiguous
+  merge within all three exact physical-input limits. It reports the executed plan, output bytes,
+  and merge statistics; an insufficient budget is `RESOURCE_EXHAUSTED`, never an implicit overrun.
+  Only a total-live-list step drops tombstones. See
+  [bounded incremental compaction](../../docs/bounded-compaction.md).
 - `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
   content, and purges retained manifests so this store has no snapshot path back to the erased rows.
   It accepts cancellation during read-only planning, then deliberately defers it once tombstones are

@@ -116,6 +116,7 @@ export interface Capabilities {
   schemaDiscovery: true;
   scanCancellation: true;
   lifecycleCancellation: true;
+  boundedCompaction: true;
   scanReconstructionBudget: true;
   scanReconstructedBytesDefault: bigint;
   arrowIpc: boolean;
@@ -157,6 +158,25 @@ export interface MergeStats {
   tombstonesKept: bigint;
   tombstonesDropped: bigint;
   foldBytesTouched: bigint;
+}
+
+export interface CompactionBudget {
+  /** Maximum number of contiguous input parts; must be at least two. */
+  maxInputParts: number;
+  /** Maximum physical rows read from input parts. */
+  maxInputRows: bigint;
+  /** Maximum exact on-disk bytes read from input part files. */
+  maxInputBytes: bigint;
+}
+
+export interface CompactionPlan {
+  /** Zero-based position in the current live part list. */
+  startPart: bigint;
+  inputParts: bigint;
+  inputRows: bigint;
+  inputBytes: bigint;
+  /** True only when this run covers the entire live part list. */
+  dropsTombstones: boolean;
 }
 
 export interface RefoldResult {
@@ -251,6 +271,15 @@ export declare class NativeStore {
     flushed: boolean;
     partsBefore: bigint;
     partsAfter: bigint;
+    merge?: MergeStats;
+  }>;
+  /** Settles prior writes, then merges one contiguous run within exact physical-input limits. */
+  compactBounded(budget: CompactionBudget, options?: LifecycleOptions): Promise<{
+    flushed: boolean;
+    partsBefore: bigint;
+    partsAfter: bigint;
+    plan?: CompactionPlan;
+    outputBytes?: bigint;
     merge?: MergeStats;
   }>;
   verify(options?: LifecycleOptions): Promise<{

@@ -68,7 +68,7 @@ function guarded(fn, operation) {
         throw new TurnDbError('CANCELLED', 'next was cancelled before submission');
       });
     }
-    const lifecycleOptions = operation === 'compact' || operation === 'erase'
+    const lifecycleOptions = ['compact', 'compactBounded', 'erase'].includes(operation)
       ? args[1]
       : ['verify', 'punch', 'refold'].includes(operation)
         ? args[0]
@@ -92,7 +92,7 @@ function guarded(fn, operation) {
 for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSqlQuery].filter(Boolean)) {
   for (const name of [
     'write', 'sync', 'flush', 'scan', 'readContent', 'snapshot',
-    'querySql', 'next', 'stats', 'compact', 'verify', 'erase', 'punch', 'refold',
+    'querySql', 'next', 'stats', 'compact', 'compactBounded', 'verify', 'erase', 'punch', 'refold',
     'backup', 'health', 'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
