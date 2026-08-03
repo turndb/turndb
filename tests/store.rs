@@ -224,6 +224,34 @@ fn crash_after_flush_keeps_the_part_and_empties_the_log() {
 }
 
 #[test]
+fn cancelled_sync_and_flush_refuse_before_their_publication_boundaries() {
+    let dir = tmp("cancel-durability");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "pending", b"content waiting for controlled durability");
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let control =
+        turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) };
+
+    let error = store.sync_with_control(&control).unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    assert_eq!(std::fs::metadata(dir.join("WAL")).unwrap().len(), 0);
+
+    let error = store.flush_with_control(&control).unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    assert_eq!(store.ids().unwrap(), vec!["pending"]);
+    assert!(store.manifest().parts.is_empty());
+    assert!(!std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|extension| extension == "part")));
+
+    assert!(store.flush().unwrap().is_some());
+    assert_eq!(Store::open_read(&dir, cfg()).unwrap().ids().unwrap(), vec!["pending"]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_part_the_manifest_never_named_is_ignored() {
     // The manifest is the only commit point: a part file on disk that the manifest does not name was
     // written by a flush that crashed before committing, and must be invisible.

@@ -935,6 +935,8 @@ test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', a
     promise,
     (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
   );
+  await cancelled(store.sync({ timeoutMs: 0 }));
+  await cancelled(store.flush({ timeoutMs: 0 }));
   await cancelled(store.compact(true, { timeoutMs: 0 }));
   await cancelled(store.verify({ timeoutMs: 0 }));
   await cancelled(store.punch({ timeoutMs: 0 }));
@@ -943,7 +945,12 @@ test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', a
 
   const aborted = new AbortController();
   aborted.abort();
+  await cancelled(store.sync({ signal: aborted.signal }));
+  await cancelled(store.flush({ signal: aborted.signal }));
   await cancelled(store.verify({ signal: aborted.signal }));
+  const health = await store.health();
+  assert.equal(health.memtableEntries, 1n);
+  assert.equal(health.parts, 0n);
   assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['still-present']);
 });
 

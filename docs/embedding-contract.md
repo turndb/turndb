@@ -91,6 +91,13 @@ data that will disappear if the process exits before `sync`.
 WAL frames and novel fold bytes survive the documented crash model. Recovery may restore them to a
 writer memtable even if no part was created.
 
+`sync_with_control` and Node `sync({ timeoutMs, signal })` check interruption before entering WAL
+fsync. Once that durability boundary starts, the operation reports its actual outcome rather than
+claiming cancellation after writes may have become durable. `flush_with_control` checks during
+memtable/locator planning, after its indivisible part-encoding unit, during bounded digest reads, and
+immediately before manifest publication. Cancellation removes the unpublished part and preserves the
+live memtable/manifest; already sealed fold bytes are safe unreachable data.
+
 The future binding-level operation named `commit(records, durability: "sync")` is composition, not a
 new storage transition: apply the atomic batch, then `sync`, and resolve only after both succeed.
 
@@ -318,7 +325,8 @@ compaction/refold/backup/restore staging is removed on
 interruption; punching is durably resumable after cancellation or crash. Strong erasure accepts
 interruption only before its atomic tombstone phase, then drives physical removal to completion so it
 cannot return an ambiguous partial-erasure result. Preflight space estimates and resumable format
-migration remain current gaps. Sync and flush remain non-cancellable.
+migration remain current gaps. Flush part encoding remains an indivisible cancellation unit, while
+sync deliberately stops observing interruption once fsync begins.
 
 Bounded compaction is a generic actor-ordered maintenance primitive, not a built-in scheduling
 policy. A caller supplies simultaneous physical input-part, row, and exact file-byte ceilings. Rust

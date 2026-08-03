@@ -76,7 +76,7 @@ function guarded(fn, operation) {
       lifecycleOptions = args[1];
     } else if (['restoreBackup', 'querySql'].includes(operation)) {
       lifecycleOptions = args[2];
-    } else if (['verify', 'punch', 'refold'].includes(operation)) {
+    } else if (['sync', 'flush', 'verify', 'punch', 'refold'].includes(operation)) {
       lifecycleOptions = args[0];
     }
     if (lifecycleOptions?.signal?.aborted) {

@@ -88,9 +88,11 @@ enum Command {
         reply: oneshot::Sender<Result<()>>,
     },
     Sync {
+        control: OperationControl,
         reply: oneshot::Sender<Result<()>>,
     },
     Flush {
+        control: OperationControl,
         reply: oneshot::Sender<Result<bool>>,
     },
     Scan {
@@ -239,12 +241,12 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Write { ops, durable, reply })?).await
     }
 
-    pub async fn sync(&self) -> Result<()> {
-        Self::receive(self.submit(|reply| Command::Sync { reply })?).await
+    pub async fn sync(&self, control: OperationControl) -> Result<()> {
+        Self::receive(self.submit(|reply| Command::Sync { control, reply })?).await
     }
 
-    pub async fn flush(&self) -> Result<bool> {
-        Self::receive(self.submit(|reply| Command::Flush { reply })?).await
+    pub async fn flush(&self, control: OperationControl) -> Result<bool> {
+        Self::receive(self.submit(|reply| Command::Flush { control, reply })?).await
     }
 
     pub async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
@@ -343,11 +345,11 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = apply(&mut store, ops, durable);
                 let _ = reply.send(result);
             }
-            Command::Sync { reply } => {
-                let _ = reply.send(store.sync());
+            Command::Sync { control, reply } => {
+                let _ = reply.send(store.sync_with_control(&control));
             }
-            Command::Flush { reply } => {
-                let _ = reply.send(store.flush().map(|part| part.is_some()));
+            Command::Flush { control, reply } => {
+                let _ = reply.send(store.flush_with_control(&control).map(|part| part.is_some()));
             }
             Command::Scan { request, reply } => {
                 let _ = reply.send(store.scan(&request));
@@ -586,9 +588,15 @@ mod tests {
 
         let mut queued = Vec::new();
         for _ in 0..capacity {
-            queued.push(actor.submit(|reply| Command::Sync { reply }).unwrap());
+            queued.push(
+                actor
+                    .submit(|reply| Command::Sync { control: OperationControl::default(), reply })
+                    .unwrap(),
+            );
         }
-        let error = actor.submit(|reply| Command::Sync { reply }).unwrap_err();
+        let error = actor
+            .submit(|reply| Command::Sync { control: OperationControl::default(), reply })
+            .unwrap_err();
         assert!(error.downcast_ref::<ActorFault>().is_some_and(|fault| {
             matches!(fault, ActorFault::Busy { capacity: 2 })
                 && fault.to_string().contains("capacity 2")
@@ -717,6 +725,48 @@ mod tests {
             |error| { error.reason == turndb::control::InterruptionReason::DeadlineExceeded }
         ));
         assert!(!artifact.exists());
+        runtime.block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_flush_deadline_includes_actor_queue_time_and_keeps_the_memtable() {
+        let dir = temp();
+        let actor = Actor::open_with_capacity(&dir, DEFAULT_QUEUE_CAPACITY).unwrap();
+        let runtime = napi::tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(actor.write(
+                vec![WriteOp::Put {
+                    id: "pending".into(),
+                    contents: Vec::new(),
+                    attrs: Vec::new(),
+                }],
+                false,
+            ))
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
+        entered_rx.recv().unwrap();
+
+        let flush_actor = actor.clone();
+        let pending = runtime.spawn(async move {
+            flush_actor
+                .flush(OperationControl {
+                    deadline: Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(10),
+                    ),
+                    cancellation: None,
+                })
+                .await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        let error = runtime.block_on(pending).unwrap().unwrap_err();
+        assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some_and(
+            |error| { error.reason == turndb::control::InterruptionReason::DeadlineExceeded }
+        ));
+        assert_eq!(runtime.block_on(actor.health()).unwrap().memtable_entries, 1);
         runtime.block_on(actor.close(false)).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

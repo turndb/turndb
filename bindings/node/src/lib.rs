@@ -1117,14 +1117,30 @@ impl NativeStore {
 
     /// Make every previously accepted write crash-durable.
     #[napi]
-    pub async fn sync(&self) -> Result<()> {
-        self.actor.sync().await.map_err(|error| engine_failure("sync TurnDB store", error))
+    pub fn sync<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, ()>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor.sync(control).await.map_err(|error| engine_failure("sync TurnDB store", error))
+        })
     }
 
     /// Seal the current memtable into an immutable part. Returns whether a part was written.
     #[napi]
-    pub async fn flush(&self) -> Result<bool> {
-        self.actor.flush().await.map_err(|error| engine_failure("flush TurnDB store", error))
+    pub fn flush<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, bool>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor.flush(control).await.map_err(|error| engine_failure("flush TurnDB store", error))
+        })
     }
 
     /// Page the writer's read-your-writes view using an opaque, checked cursor.
