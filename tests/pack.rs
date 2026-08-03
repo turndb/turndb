@@ -2,6 +2,7 @@
 //! are mechanical.
 
 use std::path::{Path, PathBuf};
+use turndb::control::{CancellationToken, OperationControl, OperationInterrupted};
 use turndb::fold::FoldCfg;
 use turndb::store::{Span, Store};
 use turndb::AttrValue;
@@ -276,4 +277,47 @@ fn backup_and_restore_never_replace_destinations_or_publish_corruption() {
         .to_string_lossy()
         .contains("turndb-restore")));
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn cancellation_never_publishes_backup_or_restore_staging() {
+    let root = tmp("cancel");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("store");
+    build_store(&dir);
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let control = OperationControl { deadline: None, cancellation: Some(cancellation.clone()) };
+    let artifact = root.join("cancelled.turndb");
+    let error = turndb::pack::write_with_control(&dir, &artifact, &control).unwrap_err();
+    assert!(error.downcast_ref::<OperationInterrupted>().is_some());
+    assert!(!artifact.exists());
+    assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("turndb-pack")));
+
+    let source = root.join("source.turndb");
+    turndb::pack::write(&dir, &source).unwrap();
+    let error = match turndb::pack::Pack::open_with_control(&source, &control) {
+        Ok(_) => panic!("a cancelled pack open must refuse"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<OperationInterrupted>().is_some());
+    let pack = turndb::pack::Pack::open(&source).unwrap();
+    let error = pack.verify_with_control(&control).unwrap_err();
+    assert!(error.downcast_ref::<OperationInterrupted>().is_some());
+
+    let destination = root.join("cancelled-restore");
+    let error = turndb::pack::restore_with_control(&source, &destination, &control).unwrap_err();
+    assert!(error.downcast_ref::<OperationInterrupted>().is_some());
+    assert!(!destination.exists());
+    assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("turndb-restore")));
+    std::fs::remove_dir_all(root).ok();
 }

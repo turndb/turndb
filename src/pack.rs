@@ -62,6 +62,15 @@ pub struct Pack {
 
 impl Pack {
     pub fn open(path: &Path) -> Result<Pack> {
+        Self::open_with_control(path, &crate::control::OperationControl::default())
+    }
+
+    /// [`Pack::open`] with cooperative checks while validating and parsing the pack TOC.
+    pub fn open_with_control(
+        path: &Path,
+        control: &crate::control::OperationControl,
+    ) -> Result<Pack> {
+        control.check("backup validation")?;
         let f = File::open(path).with_context(|| format!("open pack {}", path.display()))?;
         let len = f.metadata()?.len();
         if len < FOOTER_LEN {
@@ -96,6 +105,7 @@ impl Pack {
             bail!("pack TOC runs past where the footer says the files end");
         }
         let mut tbuf = vec![0u8; toc_stored as usize];
+        control.check("backup validation")?;
         crate::sys::read_exact_at(&f, &mut tbuf, toc_off)?;
         if crc32fast::hash(&tbuf) != toc_xsum {
             bail!("pack TOC fails its checksum");
@@ -110,6 +120,7 @@ impl Pack {
         }
         let mut toc: BTreeMap<String, Entry> = BTreeMap::new();
         for _ in 0..n {
+            control.check("backup validation")?;
             let nl = get_varint(&toc_bytes, &mut at)? as usize;
             if nl > toc_bytes.len() - at {
                 bail!("pack TOC entry name runs past the end of the TOC");
@@ -162,13 +173,20 @@ impl Pack {
     /// same policy as part sections: the inner formats carry their own integrity, and hashing the
     /// whole pack per read would tax every query for a scrub's job.
     pub fn verify(&self) -> Result<usize> {
+        self.verify_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Pack::verify`] with cooperative checks between files and bounded read chunks.
+    pub fn verify_with_control(&self, control: &crate::control::OperationControl) -> Result<usize> {
         let mut checked = 0usize;
         for (name, &(off, len, xsum)) in &self.toc {
+            control.check("backup verification")?;
             let mut remaining = len;
             let mut at = off;
             let mut h = crc32fast::Hasher::new();
             let mut buf = vec![0u8; (1 << 20).min(len.max(1)) as usize];
             while remaining > 0 {
+                control.check("backup verification")?;
                 let take = buf.len().min(remaining as usize);
                 ReadAt::read_exact_at(&self.f, &mut buf[..take], at)?;
                 h.update(&buf[..take]);
@@ -191,16 +209,31 @@ impl Pack {
 /// completed temporary artifact is fully verified, then hard-linked under the final name. That
 /// publication is atomic and refuses an existing destination.
 pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
+    write_with_control(dir, out, &crate::control::OperationControl::default())
+}
+
+/// [`write()`] with cooperative cancellation before atomic artifact publication.
+pub fn write_with_control(
+    dir: &Path,
+    out: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<PackStats> {
+    control.check("backup")?;
     ensure_destination_available(out)?;
     // Taking the writer role makes the public directory-based operation safe alongside other
     // processes and also replays and includes a durable WAL instead of refusing or omitting it.
     let mut store = crate::store::Store::open(dir, crate::fold::FoldCfg::default())?;
-    let stats = store.backup(out)?;
+    let stats = store.backup_with_control(out, control)?;
     Ok(PackStats { files: stats.files, bytes: stats.bytes })
 }
 
 /// Write a snapshot while the caller owns the store's writer role and has settled its WAL.
-pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
+pub(crate) fn write_committed_with_control(
+    dir: &Path,
+    out: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<PackStats> {
+    control.check("backup")?;
     let manifest_bytes = std::fs::read(dir.join("MANIFEST"))
         .with_context(|| format!("read MANIFEST at {} — is this a store?", dir.display()))?;
     let manifest = crate::store::manifest_from_bytes(&manifest_bytes)?;
@@ -218,6 +251,7 @@ pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
     // manifest-then-fold order for a sequential read pattern.
     let mut names: Vec<String> = vec!["MANIFEST".into()];
     for p in &manifest.parts {
+        control.check("backup packing")?;
         names.push(p.file.clone());
     }
     let fold_rel = if manifest.fold_gen == 0 {
@@ -231,6 +265,7 @@ pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
         .with_context(|| format!("read fold dir {}", fold_dir.display()))?
         .flatten()
     {
+        control.check("backup packing")?;
         let n = e.file_name().to_string_lossy().to_string();
         let keep = n.ends_with(".fold")
             || n.ends_with(".dir")
@@ -249,11 +284,13 @@ pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
     let mut entries: Vec<(String, Entry)> = Vec::with_capacity(names.len());
     let mut buf = vec![0u8; 1 << 20];
     for name in &names {
+        control.check("backup packing")?;
         let mut src =
             File::open(dir.join(name)).with_context(|| format!("open {name} for packing"))?;
         let start = off;
         let mut h = crc32fast::Hasher::new();
         loop {
+            control.check("backup packing")?;
             let n = src.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -266,10 +303,12 @@ pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
     }
 
     use crate::part::idcol::put_varint;
+    control.check("backup packing")?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut toc = Vec::new();
     put_varint(&mut toc, entries.len() as u64);
     for (name, (o, l, x)) in &entries {
+        control.check("backup packing")?;
         put_varint(&mut toc, name.len() as u64);
         toc.extend_from_slice(name.as_bytes());
         put_varint(&mut toc, *o);
@@ -297,9 +336,14 @@ pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
     crate::vfs::write_all_at(&f, &tmp, &foot, off)?;
     crate::vfs::sync_file(&f, &tmp)?;
     drop(f);
-    let staged = Pack::open(&tmp).context("open completed backup before publication")?;
-    staged.verify().context("verify completed backup before publication")?;
+    control.check("backup verification")?;
+    let staged = Pack::open_with_control(&tmp, control)
+        .context("open completed backup before publication")?;
+    staged.verify_with_control(control).context("verify completed backup before publication")?;
     drop(staged);
+    // The last cancellation point. Once the link exists, return the publication result rather than
+    // claiming cancellation after making the requested artifact visible.
+    control.check("backup publication")?;
     crate::vfs::link(&tmp, out).map_err(|error| destination_error(out, error))?;
     crate::vfs::unlink(&tmp)?;
     cleanup.disarm();
@@ -317,6 +361,16 @@ pub fn unpack(pack_path: &Path, out_dir: &Path) -> Result<usize> {
 
 /// Restore a verified pack to a new ordinary store directory.
 pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
+    restore_with_control(pack_path, out_dir, &crate::control::OperationControl::default())
+}
+
+/// [`restore`] with cooperative cancellation before atomic destination publication.
+pub fn restore_with_control(
+    pack_path: &Path,
+    out_dir: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<RestoreStats> {
+    control.check("backup restore")?;
     if !ATOMIC_RESTORE {
         return Err(BackupError::Unsupported(
             "this platform has no atomic no-replace directory rename".into(),
@@ -324,22 +378,26 @@ pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
         .into());
     }
     ensure_destination_available(out_dir)?;
-    let pack = Pack::open(pack_path).map_err(|error| {
-        if error
+    let pack = Pack::open_with_control(pack_path, control).map_err(|error| {
+        let interrupted = crate::error::classify(&error) == crate::error::ErrorClass::Cancelled;
+        let missing = error
             .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if interrupted || missing {
             error
         } else {
             invalid_backup(pack_path, error)
         }
     })?;
-    let files = pack.verify().map_err(|error| invalid_backup(pack_path, error))?;
+    let files = pack
+        .verify_with_control(control)
+        .map_err(|error| preserve_interruption_or_invalid_backup(pack_path, error))?;
     let manifest = crate::store::manifest_from_bytes(
         &pack.read_file("MANIFEST").map_err(|error| invalid_backup(pack_path, error))?,
     )
     .map_err(|error| invalid_backup(pack_path, error))?;
     for part in &manifest.parts {
+        control.check("backup restore validation")?;
         if !safe_relative_name(&part.file) {
             return Err(invalid_backup(
                 pack_path,
@@ -348,6 +406,7 @@ pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
         }
     }
     for name in pack.names() {
+        control.check("backup restore validation")?;
         if !safe_relative_name(name) {
             return Err(invalid_backup(
                 pack_path,
@@ -358,10 +417,14 @@ pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
 
     let stage = create_temp_dir(out_dir, "restore")?;
     let mut cleanup = Cleanup::dir(stage.clone());
-    extract_into(&pack, &stage).context("extract verified TurnDB backup")?;
+    extract_into(&pack, &stage, control).context("extract verified TurnDB backup")?;
+    control.check("backup restore validation")?;
     crate::store::Store::open_read(&stage, crate::fold::FoldCfg::default())
         .map_err(|error| invalid_backup(pack_path, error))?;
 
+    // The last cancellation point. Once renamed, the destination exists and must be reported as the
+    // operation's outcome rather than as a cancellation.
+    control.check("backup restore publication")?;
     crate::vfs::rename_noreplace(&stage, out_dir).map_err(|error| {
         if error.kind() == std::io::ErrorKind::Unsupported {
             BackupError::Unsupported(error.to_string()).into()
@@ -374,11 +437,16 @@ pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
     Ok(RestoreStats { files, bytes: std::fs::metadata(pack_path)?.len(), commit: manifest.commit })
 }
 
-fn extract_into(pack: &Pack, out_dir: &Path) -> Result<()> {
+fn extract_into(
+    pack: &Pack,
+    out_dir: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<()> {
     let names: Vec<String> = pack.names().map(String::from).collect();
     let mut dirs = BTreeSet::new();
     dirs.insert(out_dir.to_path_buf());
     for name in &names {
+        control.check("backup restore extraction")?;
         let dst = out_dir.join(name);
         if let Some(parent) = dst.parent() {
             crate::vfs::mkdir_all(parent)?;
@@ -400,6 +468,7 @@ fn extract_into(pack: &Pack, out_dir: &Path) -> Result<()> {
         let mut at = 0u64;
         let mut buf = vec![0u8; (1 << 20).min(len.max(1)) as usize];
         while at < len {
+            control.check("backup restore extraction")?;
             let take = buf.len().min((len - at) as usize);
             source.read_exact_at(&mut buf[..take], at)?;
             crate::vfs::write_all_at(&file, &dst, &buf[..take], at)?;
@@ -412,9 +481,18 @@ fn extract_into(pack: &Pack, out_dir: &Path) -> Result<()> {
     let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for dir in dirs {
+        control.check("backup restore extraction")?;
         crate::vfs::sync_dir(&dir)?;
     }
     Ok(())
+}
+
+fn preserve_interruption_or_invalid_backup(path: &Path, error: anyhow::Error) -> anyhow::Error {
+    if crate::error::classify(&error) == crate::error::ErrorClass::Cancelled {
+        error
+    } else {
+        invalid_backup(path, error)
+    }
 }
 
 /// What a pack write did.

@@ -930,27 +930,36 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
 
 /// Validate and restore one immutable backup into a destination that must not exist.
 #[napi]
-pub async fn restore_backup(
+pub fn restore_backup<'env>(
+    env: &'env Env,
     backup_path: String,
     destination_path: String,
-) -> Result<NativeBackupResult> {
+    options: Option<NativeLifecycleOptions>,
+) -> Result<PromiseRaw<'env, NativeBackupResult>> {
     if backup_path.is_empty() || destination_path.is_empty() {
         return Err(Error::new(
             Status::InvalidArg,
             "backup and destination paths must not be empty",
         ));
     }
-    napi::tokio::task::spawn_blocking(move || {
-        turndb::pack::restore(&PathBuf::from(backup_path), &PathBuf::from(destination_path))
+    let control = decode_lifecycle(options);
+    env.spawn_future(async move {
+        napi::tokio::task::spawn_blocking(move || {
+            turndb::pack::restore_with_control(
+                &PathBuf::from(backup_path),
+                &PathBuf::from(destination_path),
+                &control,
+            )
+        })
+        .await
+        .map_err(|error| failure("join TurnDB backup restore", error))?
+        .map(|stats| NativeBackupResult {
+            files: BigInt::from(stats.files as u64),
+            bytes: BigInt::from(stats.bytes),
+            commit: BigInt::from(stats.commit),
+        })
+        .map_err(|error| engine_failure("restore TurnDB backup", error))
     })
-    .await
-    .map_err(|error| failure("join TurnDB backup restore", error))?
-    .map(|stats| NativeBackupResult {
-        files: BigInt::from(stats.files as u64),
-        bytes: BigInt::from(stats.bytes),
-        commit: BigInt::from(stats.commit),
-    })
-    .map_err(|error| engine_failure("restore TurnDB backup", error))
 }
 
 /// Exclusively validate and promote a retained manifest over a damaged live commit point.
@@ -1188,19 +1197,28 @@ impl NativeStore {
 
     /// Settle earlier writes and publish a verified backup without replacing an existing path.
     #[napi]
-    pub async fn backup(&self, path: String) -> Result<NativeBackupResult> {
+    pub fn backup<'env>(
+        &self,
+        env: &'env Env,
+        path: String,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeBackupResult>> {
         if path.is_empty() {
             return Err(Error::new(Status::InvalidArg, "backup path must not be empty"));
         }
-        self.actor
-            .backup(PathBuf::from(path))
-            .await
-            .map(|stats| NativeBackupResult {
-                files: BigInt::from(stats.files as u64),
-                bytes: BigInt::from(stats.bytes),
-                commit: BigInt::from(stats.commit),
-            })
-            .map_err(|error| engine_failure("backup TurnDB store", error))
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .backup(PathBuf::from(path), control)
+                .await
+                .map(|stats| NativeBackupResult {
+                    files: BigInt::from(stats.files as u64),
+                    bytes: BigInt::from(stats.bytes),
+                    commit: BigInt::from(stats.commit),
+                })
+                .map_err(|error| engine_failure("backup TurnDB store", error))
+        })
     }
 
     /// Physically erase ids from this store, including retained history. External copies are out of scope.

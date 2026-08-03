@@ -309,13 +309,14 @@ Its boundary remains this store: previously written packs, backups, replicas, an
 not affected. Online backup, validated no-overlay restore, and exclusive fully validated manifest
 recovery are exposed in Rust and Node. Recovery defaults to zero rollback, requires explicit authority
 to abandon newer retained commits, and reports its validation evidence. Compaction, verification,
-punching, and refold now accept shared Rust cancellation/deadline controls, exposed as queue-inclusive
-Node `timeoutMs` and `AbortSignal` options. Unpublished compaction/refold staging is removed on
+compaction, verification, punching, refold, backup, and restore accept shared Rust
+cancellation/deadline controls, exposed
+as submission-inclusive Node `timeoutMs` and `AbortSignal` options. Unpublished
+compaction/refold/backup/restore staging is removed on
 interruption; punching is durably resumable after cancellation or crash. Strong erasure accepts
 interruption only before its atomic tombstone phase, then drives physical removal to completion so it
 cannot return an ambiguous partial-erasure result. Preflight space estimates and resumable format
-migration remain current gaps. Backup, restore, offline recovery, SQL planning, sync, and flush remain
-non-cancellable.
+migration remain current gaps. Offline recovery, SQL planning, sync, and flush remain non-cancellable.
 
 Bounded compaction is a generic actor-ordered maintenance primitive, not a built-in scheduling
 policy. A caller supplies simultaneous physical input-part, row, and exact file-byte ceilings. Rust

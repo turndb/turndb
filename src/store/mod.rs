@@ -1727,10 +1727,24 @@ impl Store {
     /// manifest while the packer walks the files it names; the writer lock excludes a second writer
     /// process.
     pub fn backup(&mut self, out: &Path) -> Result<crate::pack::BackupStats> {
+        self.backup_with_control(out, &crate::control::OperationControl::default())
+    }
+
+    /// [`Store::backup`] with cooperative cancellation before atomic artifact publication.
+    ///
+    /// Sync/flush may publish an equivalent immutable representation of earlier accepted writes in
+    /// the source store. Cancellation never publishes the backup destination.
+    pub fn backup_with_control(
+        &mut self,
+        out: &Path,
+        control: &crate::control::OperationControl,
+    ) -> Result<crate::pack::BackupStats> {
+        control.check("backup")?;
         crate::pack::ensure_destination_available(out)?;
         self.sync()?;
         self.flush()?;
-        let stats = crate::pack::write_committed(&self.dir, out)?;
+        control.check("backup")?;
+        let stats = crate::pack::write_committed_with_control(&self.dir, out, control)?;
         Ok(crate::pack::BackupStats {
             files: stats.files,
             bytes: stats.bytes,

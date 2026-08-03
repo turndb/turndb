@@ -61,8 +61,8 @@ content model right before compatibility turns today's choices into permanent pr
   cut, verifies the completed pack, and atomically refuses replacement. Restore verifies before
   mutation, extracts with bounded memory, validates a staged ordinary store, and uses an OS
   no-replace rename so an existing destination cannot be overlaid. The Rust and Node APIs return
-  commit/file/byte facts and typed operational failures; backup scheduling, cancellation, remote
-  transfer, and retention policy remain intentionally outside this slice. Offline manifest recovery
+  commit/file/byte facts and typed operational failures; backup scheduling, remote transfer, and
+  retention policy remain intentionally outside this slice. Offline manifest recovery
   now excludes live writers, refuses healthy stores, validates an exact committed fold prefix plus
   every part, section, visible content program, piece identity, and available whole-value identity,
   and requires explicit authorization before abandoning a newer retained commit. Rust, CLI, and Node
@@ -121,6 +121,12 @@ content model right before compatibility turns today's choices into permanent pr
   `CLOSED`. Verification marks otherwise-unclassified integrity failures as `CORRUPTION` while
   preserving cancellation and filesystem classes. The contract and conservative `INTERNAL` fallback
   are documented rather than pretending every low-level parser already has a typed variant.
+  Backup and restore now use the shared operation-control seam throughout bounded 1 MiB copy and
+  verification chunks. Cancellation removes unpublished sibling staging and never publishes the
+  requested destination; the hard link/no-replace rename is an explicit final checkpoint after which
+  TurnDB reports the real publication outcome. Rust exposes controlled writer, directory-pack, pack
+  verification, and restore variants; Node includes actor/worker scheduling time in
+  `timeoutMs`/`AbortSignal` and returns the shared `CANCELLED` class.
 
 ## Product boundary
 
@@ -403,8 +409,8 @@ exposes SQL and Arrow IPC; the structured no-feature build remains useful for em
 explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
 profile rather than misreporting the ordinary release artifact.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for backup, restore,
-offline recovery, SQL planning, sync, and flush (batch pulls and major maintenance loops are
+Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for offline recovery,
+SQL planning, sync, and flush (batch pulls and major maintenance loops are
 cancellable); typed corruption/invariant markers for low-level paths that still conservatively
 classify as `INTERNAL`; and measured event-loop/query overhead under a representative mixed workload.
 

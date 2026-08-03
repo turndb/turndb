@@ -603,12 +603,36 @@ test('backs up an actor-ordered cut and safely restores a writable store', async
   });
 
   await store.write([{ kind: 'put', id: 'before' }]);
+  const cancelledArtifact = path.join(root, 'cancelled.turndb');
+  await assert.rejects(
+    store.backup(cancelledArtifact, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  assert.equal(fs.existsSync(cancelledArtifact), false);
+  const abortedBackup = new AbortController();
+  abortedBackup.abort();
+  await assert.rejects(
+    store.backup(cancelledArtifact, { signal: abortedBackup.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
   const backup = await store.backup(artifact);
   assert(backup.files >= 3n);
   assert.equal(backup.bytes, BigInt(fs.statSync(artifact).size));
   assert(backup.commit > 0n);
 
   await store.write([{ kind: 'put', id: 'after' }], true);
+  const cancelledRestore = path.join(root, 'cancelled-restore');
+  await assert.rejects(
+    restoreBackup(artifact, cancelledRestore, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  assert.equal(fs.existsSync(cancelledRestore), false);
+  const abortedRestore = new AbortController();
+  abortedRestore.abort();
+  await assert.rejects(
+    restoreBackup(artifact, cancelledRestore, { signal: abortedRestore.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
   const restored = await restoreBackup(artifact, restoredDir);
   assert.deepEqual(restored, backup);
   const restoredStore = await NativeStore.open(restoredDir);

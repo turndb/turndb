@@ -213,7 +213,7 @@ export interface SnapshotOpenOptions {
 }
 
 export interface LifecycleOptions {
-  /** Queue-inclusive relative deadline. Zero refuses before lifecycle mutation. */
+  /** Submission-inclusive relative deadline. Zero refuses before lifecycle mutation. */
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -314,6 +314,7 @@ export declare function recoverManifest(
 export declare function restoreBackup(
   backupPath: string,
   destinationPath: string,
+  options?: LifecycleOptions,
 ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
 
 export declare class NativeSqlQuery {
@@ -379,8 +380,11 @@ export declare class NativeStore {
     foldBytes: bigint;
     trailingUncommittedBytes: bigint;
   }>;
-  /** Settles prior writes; refuses to replace an existing destination. */
-  backup(path: string): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
+  /** Settles prior writes; cancellation never publishes the destination. */
+  backup(
+    path: string,
+    options?: LifecycleOptions,
+  ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
   erase(ids: string[], options?: LifecycleOptions): Promise<{
     requested: bigint;
     tombstoned: bigint;
