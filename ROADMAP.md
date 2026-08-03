@@ -479,12 +479,14 @@ that evidence is sent.
     sync, flush, compaction, backup, punch, refold, and migration now expose monotonic typed outcomes
     and nanosecond totals/maxima; manifest-only commit timing and histograms remain.
   - WAL and in-memory write-state size.
-  - Part count and part-size distribution.
+  - Part count and part-size distribution. **Implemented:** an exact, cancellable live-part snapshot
+    reports file-byte and physical-row totals plus min/p50/p95/max order statistics.
   - Query rows examined and returned.
   - Projected sections and bytes read.
   - Fold reads and reconstructed bytes.
   - Compression and compaction time.
-  - Deduplication ratio.
+  - Deduplication ratio. **Implemented at the write boundary:** handle-local folded-piece attempts,
+    hits, logical bytes, and novel raw bytes let the consumer choose its aggregation window.
   - Live, dead, and reclaimable content.
   - Verification and corruption failures.
 - Structured lifecycle and health events.

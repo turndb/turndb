@@ -2499,12 +2499,17 @@ fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     assert_eq!(opened.open_recovery.succeeded, 1);
     assert_eq!(opened.recovered_wal_frames, 1);
     assert_eq!(opened.sync.attempts, 0);
+    assert_eq!(store.part_distribution().unwrap().parts, 0);
 
     store.sync().unwrap();
     store.flush().unwrap();
     put(&mut store, "second", b"second metric part");
     store.sync().unwrap();
     store.flush().unwrap();
+    let two_parts = store.part_distribution().unwrap();
+    assert_eq!(two_parts.parts, 2);
+    assert_eq!(two_parts.total_rows, 2);
+    assert_eq!(two_parts.p95_bytes, two_parts.max_bytes);
     store.merge_range(0, 2).unwrap().unwrap();
 
     let cancellation = turndb::control::CancellationToken::new();
@@ -2525,6 +2530,13 @@ fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     assert_eq!(metrics.flush.succeeded, 2);
     assert_eq!(metrics.compaction.attempts, 1);
     assert_eq!(metrics.compaction.succeeded, 1);
+    assert_eq!(metrics.folded_content.pieces, 3);
+    assert_eq!(metrics.folded_content.dedup_hits, 2);
+    assert_eq!(metrics.folded_content.novel_bytes, b"second metric part".len() as u64);
+    assert_eq!(
+        metrics.folded_content.logical_bytes,
+        (M1.len() + M2.len() + b"second metric part".len()) as u64
+    );
     for operation in [metrics.open_recovery, metrics.sync, metrics.flush, metrics.compaction] {
         assert_eq!(
             operation.attempts,
@@ -2532,5 +2544,20 @@ fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
         );
         assert!(operation.total_duration_ns >= operation.max_duration_ns);
     }
+    let distribution = store.part_distribution().unwrap();
+    assert_eq!(distribution.parts, 1);
+    assert_eq!(distribution.total_rows, 2);
+    assert_eq!(distribution.min_bytes, distribution.max_bytes);
+    assert_eq!(distribution.p50_bytes, distribution.max_bytes);
+    assert_eq!(distribution.p95_rows, 2);
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .part_distribution_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
     std::fs::remove_dir_all(&dir).ok();
 }

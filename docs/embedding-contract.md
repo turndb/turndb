@@ -348,8 +348,9 @@ Phase-5 work; consumers may poll this generic value into their telemetry system.
 disjoint live, retained-only, and unclassified storage categories. Structured pages separately expose
 exact section/block I/O attributable to that operation.
 `Store::metrics` and Node `metrics()` separately report process-local monotonic lifecycle outcomes and
-nanosecond totals. They are pull-based so consumer exporters never execute on the storage thread; see
-`docs/operation-metrics.md`.
+nanosecond totals plus exact folded-piece dedup counters. The cancellable `part_distribution` /
+`partDistribution` snapshot reports live part byte/row order statistics. These surfaces are pull-based
+so consumer exporters never execute on the storage thread; see `docs/operation-metrics.md`.
 
 ## 7. Compatibility policy
 

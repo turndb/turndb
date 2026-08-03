@@ -37,6 +37,7 @@ test('reports the native capability profile without a portable fallback', () => 
     allocatedSpaceUsage: process.platform !== 'win32',
     formatMigration: true,
     operationMetrics: true,
+    partDistribution: true,
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -1075,6 +1076,16 @@ test('reports cheap health across staging and publication', async (t) => {
     );
     assert(operation.totalDurationNs >= operation.maxDurationNs);
   }
+  assert.equal(metrics.foldedContent.pieces, 1n);
+  assert.equal(metrics.foldedContent.dedupHits, 0n);
+  assert(metrics.foldedContent.logicalBytes > 0n);
+  assert(metrics.foldedContent.novelBytes > 0n);
+  const distribution = await store.partDistribution();
+  assert.equal(distribution.parts, 1n);
+  assert.equal(distribution.totalRows, 1n);
+  assert(distribution.totalBytes > 0n);
+  assert.equal(distribution.minBytes, distribution.maxBytes);
+  assert.equal(distribution.p50Rows, 1n);
 
   fs.writeFileSync(path.join(dir, 'operator-note'), 'not owned by TurnDB');
   const space = await store.spaceUsage();

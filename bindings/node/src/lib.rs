@@ -301,6 +301,7 @@ pub struct NativeCapabilities {
     pub allocated_space_usage: bool,
     pub format_migration: bool,
     pub operation_metrics: bool,
+    pub part_distribution: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -356,6 +357,7 @@ pub fn capabilities() -> NativeCapabilities {
         allocated_space_usage: c.allocated_space_usage,
         format_migration: c.format_migration,
         operation_metrics: c.operation_metrics,
+        part_distribution: c.part_distribution,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -659,6 +661,30 @@ pub struct NativeStoreMetrics {
     pub punch: NativeOperationMetrics,
     pub refold: NativeOperationMetrics,
     pub format_migration: NativeOperationMetrics,
+    pub folded_content: NativeFoldedContentMetrics,
+}
+
+#[napi(object)]
+pub struct NativeFoldedContentMetrics {
+    pub pieces: BigInt,
+    pub dedup_hits: BigInt,
+    pub logical_bytes: BigInt,
+    pub novel_bytes: BigInt,
+}
+
+#[napi(object)]
+pub struct NativePartDistribution {
+    pub parts: BigInt,
+    pub total_bytes: BigInt,
+    pub min_bytes: BigInt,
+    pub p50_bytes: BigInt,
+    pub p95_bytes: BigInt,
+    pub max_bytes: BigInt,
+    pub total_rows: BigInt,
+    pub min_rows: BigInt,
+    pub p50_rows: BigInt,
+    pub p95_rows: BigInt,
+    pub max_rows: BigInt,
 }
 
 #[napi(object)]
@@ -1593,6 +1619,24 @@ impl NativeStore {
             .await
             .map(encode_store_metrics)
             .map_err(|error| engine_failure("read TurnDB operation metrics", error))
+    }
+
+    /// Inspect exact live immutable-part file-size and physical-row distribution.
+    #[napi]
+    pub fn part_distribution<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativePartDistribution>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .part_distribution(control)
+                .await
+                .map(encode_part_distribution)
+                .map_err(|error| engine_failure("measure TurnDB part distribution", error))
+        })
     }
 
     /// Traverse and classify store files for maintenance-space preflight.
@@ -2550,6 +2594,30 @@ fn encode_store_metrics(metrics: turndb::observability::StoreMetrics) -> NativeS
         punch: encode_operation_metrics(metrics.punch),
         refold: encode_operation_metrics(metrics.refold),
         format_migration: encode_operation_metrics(metrics.format_migration),
+        folded_content: NativeFoldedContentMetrics {
+            pieces: BigInt::from(metrics.folded_content.pieces),
+            dedup_hits: BigInt::from(metrics.folded_content.dedup_hits),
+            logical_bytes: BigInt::from(metrics.folded_content.logical_bytes),
+            novel_bytes: BigInt::from(metrics.folded_content.novel_bytes),
+        },
+    }
+}
+
+fn encode_part_distribution(
+    distribution: turndb::observability::PartDistribution,
+) -> NativePartDistribution {
+    NativePartDistribution {
+        parts: BigInt::from(distribution.parts as u64),
+        total_bytes: BigInt::from(distribution.total_bytes),
+        min_bytes: BigInt::from(distribution.min_bytes),
+        p50_bytes: BigInt::from(distribution.p50_bytes),
+        p95_bytes: BigInt::from(distribution.p95_bytes),
+        max_bytes: BigInt::from(distribution.max_bytes),
+        total_rows: BigInt::from(distribution.total_rows),
+        min_rows: BigInt::from(distribution.min_rows),
+        p50_rows: BigInt::from(distribution.p50_rows),
+        p95_rows: BigInt::from(distribution.p95_rows),
+        max_rows: BigInt::from(distribution.max_rows),
     }
 }
 
