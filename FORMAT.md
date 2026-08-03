@@ -859,6 +859,10 @@ the useful promise much weaker than permanence:
 
 > **A build will read the immediately preceding on-disk format revision, and re-fold it forward.**
 
+The operational mechanism is documented in [resumable format migration](docs/format-migration.md):
+live parts advance one manifest-published unit at a time, while retained history remains visible and
+ages out under the ordinary snapshot window.
+
 "Revision" here means a format version, not a *fold generation* — the two are unrelated, and a store
 may sit at fold generation 40 while never having changed format revision at all.
 

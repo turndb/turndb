@@ -41,6 +41,7 @@ pub struct Capabilities {
     pub write_admission_limits: bool,
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
+    pub format_migration: bool,
     pub max_record_bytes_default: u64,
     pub max_batch_bytes_default: u64,
     pub max_batch_records_default: usize,
@@ -70,6 +71,7 @@ pub const fn capabilities() -> Capabilities {
         write_admission_limits: true,
         store_space_usage: true,
         allocated_space_usage: cfg!(unix),
+        format_migration: true,
         max_record_bytes_default: crate::store::DEFAULT_MAX_RECORD_BYTES,
         max_batch_bytes_default: crate::store::DEFAULT_MAX_BATCH_BYTES,
         max_batch_records_default: crate::store::DEFAULT_MAX_BATCH_RECORDS,
@@ -89,5 +91,6 @@ mod tests {
         assert_eq!(c.portable_wasm, cfg!(target_arch = "wasm32"));
         assert!(c.store_space_usage);
         assert_eq!(c.allocated_space_usage, cfg!(unix));
+        assert!(c.format_migration);
     }
 }

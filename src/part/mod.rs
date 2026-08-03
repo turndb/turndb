@@ -579,6 +579,11 @@ impl Part {
         self.meta
     }
 
+    /// On-disk revision declared by this immutable part.
+    pub fn format_version(&self) -> u8 {
+        self.version
+    }
+
     pub fn len(&self) -> usize {
         self.meta.n_records as usize
     }
@@ -1413,6 +1418,33 @@ impl Part {
 }
 
 #[cfg(test)]
+pub(crate) fn build_revision_two_fixture(path: &Path, seq: u64, id: &str) -> Result<PartMeta> {
+    let (ids, restarts) = idcol::build(&[id.to_string()])?;
+    let mut cmeta = Vec::new();
+    put_varint(&mut cmeta, 1);
+    put_varint(&mut cmeta, 7);
+    cmeta.extend_from_slice(b"payload");
+    put_varint(&mut cmeta, 1);
+    cmeta.push(content::RID_DENSE);
+    let mut prog = Vec::new();
+    put_varint(&mut prog, 1);
+    put_varint(&mut prog, (6u64 << 1) | OP_LIT);
+    prog.extend_from_slice(b"legacy");
+
+    let meta = PartMeta { n_records: 1, seq_lo: seq, seq_hi: seq };
+    let mut writer = Writer::new(path, 3)?;
+    writer.section("ids", &ids)?;
+    writer.section("ids.restart", &u32s(&restarts))?;
+    writer.section("cmeta", &cmeta)?;
+    writer.section("con.prog.0", &prog)?;
+    writer.section("con.off.0", &u64s(&[0, prog.len() as u64]))?;
+    writer.section("pdict.loc", &[])?;
+    writer.section("pdict.hash", &[])?;
+    writer.finish_version(meta, 2)?;
+    Ok(meta)
+}
+
+#[cfg(test)]
 mod compatibility_tests {
     use super::*;
     use crate::fold::FoldCfg;
@@ -1468,27 +1500,7 @@ mod compatibility_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy-named.part");
-        let (ids, restarts) = idcol::build(&["legacy".to_string()]).unwrap();
-        let mut cmeta = Vec::new();
-        put_varint(&mut cmeta, 1);
-        put_varint(&mut cmeta, 7);
-        cmeta.extend_from_slice(b"payload");
-        put_varint(&mut cmeta, 1);
-        cmeta.push(content::RID_DENSE);
-        let mut prog = Vec::new();
-        put_varint(&mut prog, 1);
-        put_varint(&mut prog, (6u64 << 1) | OP_LIT);
-        prog.extend_from_slice(b"legacy");
-
-        let mut writer = Writer::new(&path, 3).unwrap();
-        writer.section("ids", &ids).unwrap();
-        writer.section("ids.restart", &u32s(&restarts)).unwrap();
-        writer.section("cmeta", &cmeta).unwrap();
-        writer.section("con.prog.0", &prog).unwrap();
-        writer.section("con.off.0", &u64s(&[0, prog.len() as u64])).unwrap();
-        writer.section("pdict.loc", &[]).unwrap();
-        writer.section("pdict.hash", &[]).unwrap();
-        writer.finish_version(PartMeta { n_records: 1, seq_lo: 1, seq_hi: 1 }, 2).unwrap();
+        build_revision_two_fixture(&path, 1, "legacy").unwrap();
 
         let part = Part::open(&path).unwrap();
         assert_eq!(part.content(0, "payload").unwrap().unwrap(), [BodyOp::Lit(b"legacy".to_vec())]);

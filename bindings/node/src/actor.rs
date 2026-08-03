@@ -45,6 +45,17 @@ pub(crate) struct RefoldSpaceResult {
     pub estimate: Option<turndb::store::RefoldSpaceEstimate>,
 }
 
+pub(crate) struct FormatMigrationPreflightResult {
+    pub flushed: bool,
+    pub status: turndb::store::FormatMigrationStatus,
+    pub estimate: Option<turndb::store::FormatMigrationPlan>,
+}
+
+pub(crate) struct FormatMigrationStepResult {
+    pub flushed: bool,
+    pub step: Option<turndb::store::FormatMigrationStep>,
+}
+
 pub(crate) struct VerifyResult {
     pub chain: ChainReport,
     pub fold: turndb::fold::FoldScrub,
@@ -135,6 +146,18 @@ enum Command {
         budget: CompactionBudget,
         control: OperationControl,
         reply: oneshot::Sender<Result<CompactionSpaceResult>>,
+    },
+    FormatMigrationStatus {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<turndb::store::FormatMigrationStatus>>,
+    },
+    EstimateFormatMigrationSpace {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<FormatMigrationPreflightResult>>,
+    },
+    MigrateFormatStep {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<FormatMigrationStepResult>>,
     },
     Verify {
         control: OperationControl,
@@ -314,6 +337,30 @@ impl Actor {
         .await
     }
 
+    pub async fn format_migration_status(
+        &self,
+        control: OperationControl,
+    ) -> Result<turndb::store::FormatMigrationStatus> {
+        Self::receive(self.submit(|reply| Command::FormatMigrationStatus { control, reply })?).await
+    }
+
+    pub async fn estimate_format_migration_space(
+        &self,
+        control: OperationControl,
+    ) -> Result<FormatMigrationPreflightResult> {
+        Self::receive(
+            self.submit(|reply| Command::EstimateFormatMigrationSpace { control, reply })?,
+        )
+        .await
+    }
+
+    pub async fn migrate_format_step(
+        &self,
+        control: OperationControl,
+    ) -> Result<FormatMigrationStepResult> {
+        Self::receive(self.submit(|reply| Command::MigrateFormatStep { control, reply })?).await
+    }
+
     pub async fn verify(&self, control: OperationControl) -> Result<VerifyResult> {
         Self::receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
@@ -430,6 +477,17 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::EstimateCompactionSpace { budget, control, reply } => {
                 let result = estimate_compaction_space(&mut store, budget, &control);
+                let _ = reply.send(result);
+            }
+            Command::FormatMigrationStatus { control, reply } => {
+                let _ = reply.send(store.format_migration_status_with_control(&control));
+            }
+            Command::EstimateFormatMigrationSpace { control, reply } => {
+                let result = estimate_format_migration_space(&mut store, &control);
+                let _ = reply.send(result);
+            }
+            Command::MigrateFormatStep { control, reply } => {
+                let result = migrate_format_step(&mut store, &control);
                 let _ = reply.send(result);
             }
             Command::Verify { control, reply } => {
@@ -564,6 +622,29 @@ fn estimate_refold_space(
     control.check("refold space preflight")?;
     let estimate = store.estimate_refold_space_with_control(control)?;
     Ok(RefoldSpaceResult { flushed, estimate })
+}
+
+fn estimate_format_migration_space(
+    store: &mut Store,
+    control: &OperationControl,
+) -> Result<FormatMigrationPreflightResult> {
+    control.check("format migration preflight")?;
+    let flushed = settle(store, control)?;
+    control.check("format migration preflight")?;
+    let status = store.format_migration_status_with_control(control)?;
+    let estimate = store.estimate_format_migration_space_with_control(control)?;
+    Ok(FormatMigrationPreflightResult { flushed, status, estimate })
+}
+
+fn migrate_format_step(
+    store: &mut Store,
+    control: &OperationControl,
+) -> Result<FormatMigrationStepResult> {
+    control.check("format migration")?;
+    let flushed = settle(store, control)?;
+    control.check("format migration")?;
+    let step = store.migrate_format_step_with_control(control)?;
+    Ok(FormatMigrationStepResult { flushed, step })
 }
 
 fn verify(store: &mut Store, path: &Path, control: &OperationControl) -> Result<VerifyResult> {

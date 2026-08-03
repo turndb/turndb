@@ -123,6 +123,10 @@ silently.
   facts and explicitly non-binding stage estimates. TurnDB supplies evidence; the embedding
   application chooses admission and reserve policy. See
   [maintenance space accounting and preflight](../../docs/maintenance-space.md).
+- `formatMigrationStatus(options)` distinguishes live legacy parts from old-format files pinned only
+  by retained snapshots. `estimateFormatMigrationSpace(options)` preflights the oldest live legacy
+  part, and `migrateFormatStep(options)` atomically upgrades one part so restart simply continues with
+  the remainder. See [resumable format migration](../../docs/format-migration.md).
 - `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
   content, and purges retained manifests so this store has no snapshot path back to the erased rows.
   It accepts cancellation during read-only planning, then deliberately defers it once tombstones are

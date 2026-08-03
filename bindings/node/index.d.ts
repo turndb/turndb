@@ -170,6 +170,7 @@ export interface Capabilities {
   writeAdmissionLimits: true;
   storeSpaceUsage: true;
   allocatedSpaceUsage: boolean;
+  formatMigration: true;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -320,6 +321,40 @@ export interface RefoldSpaceEstimate {
   filesystemAvailableBytes?: bigint;
 }
 
+export interface FormatMigrationStatus {
+  targetPartVersion: number;
+  liveParts: bigint;
+  currentParts: bigint;
+  legacyParts: bigint;
+  legacyRows: bigint;
+  legacyBytes: bigint;
+  retainedLegacyParts: bigint;
+  retainedLegacyRows: bigint;
+  retainedLegacyBytes: bigint;
+}
+
+export interface FormatMigrationPlan {
+  partIndex: bigint;
+  sourcePartVersion: number;
+  seqLo: bigint;
+  seqHi: bigint;
+  inputRows: bigint;
+  inputBytes: bigint;
+  inputSections: bigint;
+  inputRawSectionBytes: bigint;
+  estimatedStageBytes: bigint;
+  estimateIsHardBound: false;
+  retainedInputBytesAfterCommit: bigint;
+  filesystemAvailableBytes?: bigint;
+}
+
+export interface FormatMigrationStep {
+  plan: FormatMigrationPlan;
+  outputBytes: bigint;
+  remainingLegacyParts: bigint;
+  rewrite: MergeStats;
+}
+
 export type TurnDbErrorCode =
   | 'INVALID_ARGUMENT'
   | 'BUSY'
@@ -424,6 +459,16 @@ export declare class NativeStore {
     budget: CompactionBudget,
     options?: LifecycleOptions,
   ): Promise<{ flushed: boolean; estimate?: CompactionSpaceEstimate }>;
+  formatMigrationStatus(options?: LifecycleOptions): Promise<FormatMigrationStatus>;
+  estimateFormatMigrationSpace(options?: LifecycleOptions): Promise<{
+    flushed: boolean;
+    status: FormatMigrationStatus;
+    estimate?: FormatMigrationPlan;
+  }>;
+  migrateFormatStep(options?: LifecycleOptions): Promise<{
+    flushed: boolean;
+    step?: FormatMigrationStep;
+  }>;
   verify(options?: LifecycleOptions): Promise<{
     manifestLinks: bigint;
     partDigests: bigint;
