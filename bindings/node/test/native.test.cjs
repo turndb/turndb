@@ -28,11 +28,33 @@ test('reports the native capability profile without a portable fallback', () => 
     nativeNode: true,
     napiVersion: 6,
     commandQueueCapacity: 64,
+    commandQueueCapacityMax: 65536,
     immutableSnapshots: true,
     lifecycleOperations: true,
     healthSnapshots: true,
     schemaDiscovery: true,
   });
+});
+
+test('configures a bounded per-store command backlog without breaking the default open call', async (t) => {
+  const defaultStore = await NativeStore.open(temporaryStore(t));
+  assert.equal(defaultStore.commandQueueCapacity, 64);
+  await defaultStore.close();
+
+  const configured = await NativeStore.open(temporaryStore(t), { commandQueueCapacity: 3 });
+  assert.equal(configured.commandQueueCapacity, 3);
+  await configured.close();
+
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { commandQueueCapacity: 0 }),
+    (error) => error instanceof TurnDbError
+      && error.code === 'INVALID_ARGUMENT'
+      && /between 1 and 65536/.test(error.message)
+  );
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { commandQueueCapacity: 65537 }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
 });
 
 test('refuses a missing native artifact instead of silently loading WASM', () => {

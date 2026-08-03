@@ -70,10 +70,16 @@ export interface Capabilities {
   nativeNode: true;
   napiVersion: 6;
   commandQueueCapacity: number;
+  commandQueueCapacityMax: number;
   immutableSnapshots: true;
   lifecycleOperations: true;
   healthSnapshots: true;
   schemaDiscovery: true;
+}
+
+export interface OpenOptions {
+  /** Accepted operations waiting behind the one executing; defaults to 64. */
+  commandQueueCapacity?: number;
 }
 
 export type AttributeType = 'string' | 'int' | 'float' | 'bool';
@@ -137,7 +143,8 @@ export declare class NativeSnapshot {
 }
 
 export declare class NativeStore {
-  static open(path: string): Promise<NativeStore>;
+  static open(path: string, options?: OpenOptions): Promise<NativeStore>;
+  readonly commandQueueCapacity: number;
   write(ops: WriteOp[], durable?: boolean): Promise<void>;
   sync(): Promise<void>;
   flush(): Promise<boolean>;

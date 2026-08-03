@@ -7,7 +7,10 @@
 
 mod actor;
 
-use actor::{Actor, CompactResult, OwnedContent, VerifyResult, WriteOp};
+use actor::{
+    Actor, CompactResult, OwnedContent, VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY,
+    MAX_QUEUE_CAPACITY,
+};
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
@@ -136,6 +139,7 @@ pub struct NativeCapabilities {
     pub native_node: bool,
     pub napi_version: u8,
     pub command_queue_capacity: u32,
+    pub command_queue_capacity_max: u32,
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub health_snapshots: bool,
@@ -165,12 +169,19 @@ pub fn capabilities() -> NativeCapabilities {
         portable_wasm: c.portable_wasm,
         native_node: true,
         napi_version: 6,
-        command_queue_capacity: 64,
+        command_queue_capacity: DEFAULT_QUEUE_CAPACITY as u32,
+        command_queue_capacity_max: MAX_QUEUE_CAPACITY as u32,
         immutable_snapshots: true,
         lifecycle_operations: true,
         health_snapshots: true,
         schema_discovery: true,
     }
+}
+
+#[napi(object)]
+pub struct NativeOpenOptions {
+    /// Accepted commands waiting behind the one currently executing. Defaults to 64.
+    pub command_queue_capacity: Option<u32>,
 }
 
 #[napi(object)]
@@ -408,15 +419,34 @@ pub struct NativeStore {
 impl NativeStore {
     /// Open a writer. Resolves only after recovery and writer-lock acquisition complete.
     #[napi(factory)]
-    pub async fn open(path: String) -> Result<NativeStore> {
+    pub async fn open(path: String, options: Option<NativeOpenOptions>) -> Result<NativeStore> {
         if path.is_empty() {
             return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
         }
-        let actor = napi::tokio::task::spawn_blocking(move || Actor::open(&PathBuf::from(path)))
-            .await
-            .map_err(|error| failure("join TurnDB open", error))?
-            .map_err(|error| failure("open TurnDB store", error))?;
+        let capacity = options
+            .and_then(|options| options.command_queue_capacity)
+            .unwrap_or(DEFAULT_QUEUE_CAPACITY as u32);
+        if !(1..=MAX_QUEUE_CAPACITY as u32).contains(&capacity) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "commandQueueCapacity must be between 1 and {MAX_QUEUE_CAPACITY}, got {capacity}"
+                ),
+            ));
+        }
+        let actor = napi::tokio::task::spawn_blocking(move || {
+            Actor::open_with_capacity(&PathBuf::from(path), capacity as usize)
+        })
+        .await
+        .map_err(|error| failure("join TurnDB open", error))?
+        .map_err(|error| failure("open TurnDB store", error))?;
         Ok(NativeStore { actor })
+    }
+
+    /// The bounded backlog configured for this handle.
+    #[napi(getter)]
+    pub fn command_queue_capacity(&self) -> u32 {
+        self.actor.queue_capacity() as u32
     }
 
     /// Apply an ordered batch atomically. `durable=true` syncs the WAL before resolving.

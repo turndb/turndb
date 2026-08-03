@@ -42,7 +42,9 @@ content model right before compatibility turns today's choices into permanent pr
   ingest, expose them through metadata-only structured scans and Node, preserve them through replay
   and streaming compaction, and report them unavailable for legacy values instead of confusing piece
   or program hashes with byte identity. The Node package remains a source prototype, not yet a
-  production prebuild matrix.
+  production prebuild matrix. Its accepted command backlog is now a validated per-store open option
+  with an explicit default and maximum, deterministic overload behavior, and an actual-capacity
+  handle property.
 
 ## Product boundary
 
@@ -296,8 +298,9 @@ facility.
 
 The first native slice implements open, atomic ordered write/delete batches, sync, flush, immutable
 current/retained snapshots, structured scan, named-content reconstruction, and close. One dedicated
-Rust thread owns the writer; a bounded 64-command queue refuses overload rather than accumulating
-unbounded Promises. Node integration tests load the addon and cover exact `i64::MIN` bigint, NaN,
+Rust thread owns the writer; a bounded per-store command queue defaults to 64, permits an explicit
+capacity from 1 through 65,536, and refuses overload rather than accumulating unbounded Promises.
+Node integration tests load the addon and cover exact `i64::MIN` bigint, NaN,
 ordered duplicate attributes, named and empty content, projection, predicates, paging/cursor misuse,
 snapshot isolation/publication, retained commits, deletion, and close refusal.
 
@@ -315,8 +318,8 @@ profile is useful while the additional query-engine dependency is affordable whe
 are actually exposed.
 
 Remaining Phase-3 gaps are prebuilt platform artifacts, Arrow IPC and SQL, cancellation/deadlines,
-configurable queue limits, a complete typed engine error taxonomy, backup/restore and recovery controls,
-and measured event-loop/query overhead under a representative mixed workload.
+a complete typed engine error taxonomy, backup/restore and recovery controls, and measured
+event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 
