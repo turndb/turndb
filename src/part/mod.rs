@@ -1077,6 +1077,27 @@ impl Part {
         Ok(out)
     }
 
+    /// Named content values selected by name. Sibling program/offset/identity sections are not
+    /// opened, which lets metadata queries retain content-column independence.
+    pub fn contents_selected(
+        &self,
+        r: usize,
+        names: &std::collections::HashSet<&str>,
+    ) -> Result<Vec<Content>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for meta in self.content_meta()?.iter().filter(|meta| names.contains(meta.name.as_str())) {
+            if let Some(ops) = self.content(r, &meta.name)? {
+                let mut content = Content::new(&meta.name, ops);
+                content.identity = self.content_identity(r, &meta.name)?;
+                out.push(content);
+            }
+        }
+        Ok(out)
+    }
+
     /// Compatibility body program. An absent `body` value reads as empty through this legacy API.
     pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
         Ok(self.content(r, BODY_CONTENT)?.unwrap_or_default())
@@ -1085,6 +1106,15 @@ impl Part {
     /// Row `r`'s attributes, in their exact original order, duplicates included.
     pub fn attrs(&self, r: usize) -> Result<Vec<(String, AttrValue)>> {
         attrs::read_row(self, r)
+    }
+
+    /// Selected attributes in exact row order. Only selected value columns are opened.
+    pub fn attrs_selected(
+        &self,
+        r: usize,
+        names: &std::collections::HashSet<&str>,
+    ) -> Result<Vec<(String, AttrValue)>> {
+        attrs::read_row_selected(self, r, names)
     }
 
     /// Column `c`'s zone map: `(min, max)` over every value the column holds, or `None` when no

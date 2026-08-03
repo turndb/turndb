@@ -175,9 +175,15 @@ page stopped. The first matching row is always admitted whole even when it excee
 single large record cannot deadlock pagination. Node exposes the same contract as
 `maxReconstructedBytes: bigint` and `reconstructionBudgetExhausted`.
 
-**Current gaps:** the structured pager point-decodes each eligible record rather than pushing selected
-fields into the columnar lens; scan statistics do not yet report section bytes or distinct fold
-blocks. The `max_examined` budget counts
+The structured pager now point-locates each committed candidate and decodes only attribute/content
+columns named by projections or predicates. Visibility resolution precedes that projection and the
+writer's memtable remains an in-memory newest overlay. Shared layout/metadata sections are necessary,
+but sibling value/dictionary/program sections stay unopened. See
+`docs/projected-structured-scan.md`.
+
+**Current gaps:** committed candidates are still point-located rather than consumed by a batched
+physical column range walk; scan statistics do not yet report section bytes or distinct fold blocks.
+The `max_examined` budget counts
 live records evaluated against predicates, not superseded physical rows encountered while resolving
 them.
 

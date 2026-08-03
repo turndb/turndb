@@ -20,6 +20,58 @@ fn status(value: &str) -> Vec<(String, AttrValue)> {
     vec![("status".into(), AttrValue::Str(value.into()))]
 }
 
+fn part_path(dir: &std::path::Path) -> PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "part"))
+        .expect("a flushed part")
+}
+
+fn section_location(bytes: &[u8], wanted: &str) -> (usize, u8) {
+    let footer = bytes.len() - 56;
+    let toc_off = u64::from_le_bytes(bytes[footer + 8..footer + 16].try_into().unwrap()) as usize;
+    let toc_stored =
+        u32::from_le_bytes(bytes[footer + 16..footer + 20].try_into().unwrap()) as usize;
+    let toc_raw = u32::from_le_bytes(bytes[footer + 20..footer + 24].try_into().unwrap());
+    let toc_codec = bytes[footer + 44];
+    let toc = turndb::fold::codec::decode(
+        toc_codec,
+        &bytes[toc_off..toc_off + toc_stored],
+        toc_raw,
+        None,
+    )
+    .unwrap();
+    let mut at = 0usize;
+    let count = turndb::part::idcol::get_varint(&toc, &mut at).unwrap();
+    for _ in 0..count {
+        let name_len = turndb::part::idcol::get_varint(&toc, &mut at).unwrap() as usize;
+        let name = std::str::from_utf8(&toc[at..at + name_len]).unwrap();
+        at += name_len;
+        let offset = turndb::part::idcol::get_varint(&toc, &mut at).unwrap() as usize;
+        let _stored = turndb::part::idcol::get_varint(&toc, &mut at).unwrap();
+        let _raw = turndb::part::idcol::get_varint(&toc, &mut at).unwrap();
+        let codec = toc[at];
+        at += 1;
+        at += 4; // revision-1+ checksum
+        if name == wanted {
+            return (offset, codec);
+        }
+    }
+    panic!("part has no section {wanted:?}");
+}
+
+fn corrupt_sections(path: &std::path::Path, names: &[&str]) {
+    let mut bytes = std::fs::read(path).unwrap();
+    for name in names {
+        let (offset, codec) = section_location(&bytes, name);
+        assert_ne!(codec, 0, "test section {name} must be compressed so damage is read-fatal");
+        bytes[offset] ^= 0x80;
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[test]
 fn extended_scalar_predicates_distinguish_explicit_null_from_missing() {
     let dir = tmp("extended-scalars");
@@ -76,6 +128,68 @@ fn extended_scalar_predicates_distinguish_explicit_null_from_missing() {
         .unwrap();
     assert_eq!(missing.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["b"]);
     std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
+    let dir = tmp("projected-sections");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        let request = "request".repeat(100);
+        let response = "response".repeat(100);
+        let untouched = "never decode this sibling".repeat(20);
+        for index in 0..256 {
+            store
+                .put_record(
+                    &format!("x{index:03}"),
+                    &[
+                        ContentSpans::new("request", vec![Span::Lit(request.as_bytes())]),
+                        ContentSpans::new("response", vec![Span::Lit(response.as_bytes())]),
+                    ],
+                    vec![
+                        ("selected".into(), AttrValue::Int(index)),
+                        ("untouched".into(), AttrValue::Str(untouched.clone())),
+                    ],
+                )
+                .unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+
+    // Column ordinals are sorted by name, as are content ordinals. Damage one sibling in each
+    // namespace after open metadata was committed. A whole-record point decode would fail below.
+    corrupt_sections(&part_path(&dir), &["col.val.1", "con.prog.1"]);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let selected = reader
+        .scan(&ScanRequest {
+            attrs: vec!["selected".into()],
+            contents: vec![ContentSelect { name: "request".into(), mode: ContentMode::Metadata }],
+            limit: 1,
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(selected.rows[0].attrs, [("selected".into(), AttrValue::Int(0))]);
+    assert_eq!(selected.rows[0].contents[0].name, "request");
+
+    assert!(
+        reader
+            .scan(&ScanRequest { attrs: vec!["untouched".into()], ..ScanRequest::default() })
+            .is_err(),
+        "selecting the damaged attribute column must read and reject it"
+    );
+    assert!(
+        reader
+            .scan(&ScanRequest {
+                contents: vec![ContentSelect {
+                    name: "response".into(),
+                    mode: ContentMode::Metadata,
+                }],
+                ..ScanRequest::default()
+            })
+            .is_err(),
+        "selecting the damaged content column must read and reject it"
+    );
 }
 
 #[test]

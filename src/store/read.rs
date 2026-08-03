@@ -75,6 +75,24 @@ pub fn get(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
     }
 }
 
+/// The newest committed version of `id`, decoding only selected attribute and content columns.
+/// Visibility is resolved before projection, so a predicate can never fall through to an older row.
+pub(crate) fn project(
+    parts: &[Arc<Part>],
+    id: &str,
+    attrs: &HashSet<&str>,
+    contents: &HashSet<&str>,
+) -> Result<Option<Record>> {
+    match locate(parts, id)? {
+        Some((part, row)) => Ok(Some(Record {
+            id: id.to_string(),
+            contents: part.contents_selected(row, contents)?,
+            attrs: part.attrs_selected(row, attrs)?,
+        })),
+        None => Ok(None),
+    }
+}
+
 /// Byte-exact content for `id`, or `None` if it is absent or deleted.
 pub fn reconstruct(parts: &[Arc<Part>], fold: &Fold, id: &str) -> Result<Option<Vec<u8>>> {
     reconstruct_content(parts, fold, id, crate::types::BODY_CONTENT)

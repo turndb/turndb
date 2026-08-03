@@ -98,6 +98,9 @@ per request, never split a row, and return a cursor before the row that would cr
 Named-content metadata includes the BLAKE3 identity of the exact whole value without reconstruction
 for revision-3 records. Writer scans include the memtable;
 `ReadStore::scan` remains pinned to its manifest snapshot.
+Committed rows are projected from physical columns: sibling attribute value/dictionary and named
+content program sections remain unopened. See
+[projected structured scans](docs/projected-structured-scan.md).
 
 Format revision 4 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
 timestamps, and explicit null to the existing scalar fields. Missing and null remain distinct, and

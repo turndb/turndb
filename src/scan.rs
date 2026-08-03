@@ -170,7 +170,12 @@ trait Source {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<String>>;
-    fn get(&self, id: &str) -> Result<Option<Record>>;
+    fn project(
+        &self,
+        id: &str,
+        attrs: &HashSet<&str>,
+        contents: &HashSet<&str>,
+    ) -> Result<Option<Record>>;
     fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>>;
 }
 
@@ -185,8 +190,13 @@ impl Source for Store {
         Store::scan_ids(self, from, to, limit, reverse)
     }
 
-    fn get(&self, id: &str) -> Result<Option<Record>> {
-        Store::get(self, id)
+    fn project(
+        &self,
+        id: &str,
+        attrs: &HashSet<&str>,
+        contents: &HashSet<&str>,
+    ) -> Result<Option<Record>> {
+        Store::project(self, id, attrs, contents)
     }
 
     fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
@@ -205,8 +215,13 @@ impl Source for ReadStore {
         ReadStore::scan_ids(self, from, to, limit, reverse)
     }
 
-    fn get(&self, id: &str) -> Result<Option<Record>> {
-        ReadStore::get(self, id)
+    fn project(
+        &self,
+        id: &str,
+        attrs: &HashSet<&str>,
+        contents: &HashSet<&str>,
+    ) -> Result<Option<Record>> {
+        ReadStore::project(self, id, attrs, contents)
     }
 
     fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
@@ -255,9 +270,21 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     }
 
     let attr_select: HashSet<&str> = request.attrs.iter().map(String::as_str).collect();
-    let needs_record = !request.attrs.is_empty()
-        || !request.contents.is_empty()
-        || request.predicates.iter().any(|p| !matches!(p, Predicate::Id { .. }));
+    let mut attr_needed = attr_select.clone();
+    let mut content_needed: HashSet<&str> =
+        request.contents.iter().map(|content| content.name.as_str()).collect();
+    for predicate in &request.predicates {
+        match predicate {
+            Predicate::Attr { name, .. } | Predicate::AttrExists { name, .. } => {
+                attr_needed.insert(name);
+            }
+            Predicate::ContentExists { name, .. } => {
+                content_needed.insert(name);
+            }
+            Predicate::Id { .. } => {}
+        }
+    }
+    let needs_record = !attr_needed.is_empty() || !content_needed.is_empty();
     let mut rows = Vec::with_capacity(request.limit);
     let mut stats = ScanStats::default();
     // A cursor identifies the last candidate CONSUMED, not merely inspected. They normally coincide,
@@ -288,7 +315,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             processed += 1;
             stats.examined += 1;
             let record = if needs_record {
-                Some(source.get(&id)?.ok_or_else(|| {
+                Some(source.project(&id, &attr_needed, &content_needed)?.ok_or_else(|| {
                     anyhow::anyhow!("id {id:?} disappeared from an immutable scan view")
                 })?)
             } else {
@@ -705,7 +732,12 @@ mod tests {
             Ok(vec!["a".into(), "b".into()])
         }
 
-        fn get(&self, id: &str) -> Result<Option<Record>> {
+        fn project(
+            &self,
+            id: &str,
+            _attrs: &HashSet<&str>,
+            _contents: &HashSet<&str>,
+        ) -> Result<Option<Record>> {
             if id == "a" {
                 self.cancellation.cancel();
             }

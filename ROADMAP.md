@@ -87,6 +87,11 @@ content model right before compatibility turns today's choices into permanent pr
   batch-member, and UTF-8 identifier ceilings at the Rust writer boundary. The deterministic
   all-novel charge is independent of dedup history; complete batches validate before fold mutation;
   native and portable bindings expose the same policy and compiled defaults without trace semantics.
+  Structured scans now resolve newest visibility and then project committed rows from named physical
+  columns. Predicate-only fields are decoded but not returned; unselected attribute value/dictionary
+  and named-content program sections remain unopened; live memtable records use the same semantic
+  projection in memory. A read-fatal sibling-section test proves this is physical isolation rather
+  than filtering a fully decoded record.
 
 ## Product boundary
 
@@ -217,8 +222,9 @@ erasure.
   - Boolean.
   - Binary.
   - Timestamp with an explicit unit and timezone interpretation.
-- A deliberate decision about structured values. Lists and maps may become native columnar types, or
-  they may initially be explicitly encoded content; the API must never blur the two representations.
+- A deliberate decision about structured values. **Revision 4 keeps lists/maps as explicitly encoded
+  named content; TurnDB does not infer or normalize an encoding. Any future native nested column type
+  requires a versioned tag and cannot reinterpret existing content.**
 - Defined behavior for:
   - Missing versus null.
   - Duplicate fields and field ordering.
