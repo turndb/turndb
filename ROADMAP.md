@@ -110,6 +110,11 @@ content model right before compatibility turns today's choices into permanent pr
   ceiling now bounds immutable occurrences plus memtable entries. Complete equal-id groups are atomic,
   the first oversized group is admitted for progress, and checked cursors can advance through
   tombstone-only groups in both directions, allowing bounded empty pages without rescans or gaps.
+  Structured scan explanation now shares the execution request preparer and cursor validator. It
+  reports effective bounds, projected/required/predicate-only fields, byte reconstruction intent,
+  predicate classes, request ceilings, and exact immutable-part/physical-row/writer-memtable scope
+  before newest-wins resolution. Rust, writer-actor Node, and immutable Node snapshots expose the
+  same contract; explanation opens only id structures and explicitly does not estimate results.
 
 ## Product boundary
 

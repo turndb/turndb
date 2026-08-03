@@ -172,6 +172,15 @@ fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
     assert_eq!(selected.rows[0].attrs, [("selected".into(), AttrValue::Int(0))]);
     assert_eq!(selected.rows[0].contents[0].name, "request");
 
+    let explanation = reader
+        .explain_scan(&ScanRequest {
+            attrs: vec!["untouched".into()],
+            contents: vec![ContentSelect { name: "response".into(), mode: ContentMode::Metadata }],
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(explanation.physical.immutable_rows_in_bounds, 256);
+
     assert!(
         reader
             .scan(&ScanRequest { attrs: vec!["untouched".into()], ..ScanRequest::default() })
@@ -341,6 +350,115 @@ fn grouped_projection_does_not_decode_past_a_full_page() {
             ..ScanRequest::default()
         })
         .unwrap_err();
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn scan_explanation_shares_cursor_field_and_physical_scope_planning() {
+    let dir = tmp("explain");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        store
+            .put_record(
+                id,
+                &[ContentSpans::new("response", vec![Span::Lit(id.as_bytes())])],
+                vec![("out".into(), AttrValue::Int(1))],
+            )
+            .unwrap();
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.put_body("b", b"new", vec![("x".into(), AttrValue::Bool(true))]).unwrap();
+    store.delete("c").unwrap();
+    store
+        .put_record(
+            "d",
+            &[ContentSpans::new("payload", vec![Span::Lit(b"payload")])],
+            vec![("y".into(), AttrValue::Bool(true))],
+        )
+        .unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.put_body("bb", b"staged", vec![]).unwrap();
+    store.delete("d").unwrap();
+    store.put_body("e", b"excluded", vec![]).unwrap();
+
+    let request = ScanRequest {
+        from: Some("b".into()),
+        to: Some("e".into()),
+        attrs: vec!["out".into()],
+        contents: vec![
+            ContentSelect { name: "response".into(), mode: ContentMode::Metadata },
+            ContentSelect { name: "payload".into(), mode: ContentMode::Bytes },
+        ],
+        predicates: vec![
+            Predicate::Id { op: Compare::GtEq, value: "b".into() },
+            Predicate::AttrExists { name: "x".into(), present: true },
+            Predicate::AttrExists { name: "y".into(), present: false },
+            Predicate::ContentExists { name: "request".into(), present: false },
+        ],
+        limit: 7,
+        max_examined: 19,
+        max_resolution_entries: 23,
+        max_reconstructed_bytes: 29,
+        ..ScanRequest::default()
+    };
+    let explanation = store.explain_scan(&request).unwrap();
+    assert_eq!(explanation.effective_from.as_deref(), Some("b"));
+    assert_eq!(explanation.effective_to.as_deref(), Some("e"));
+    assert_eq!(explanation.projected_attrs, ["out"]);
+    assert_eq!(explanation.required_attrs, ["out", "x", "y"]);
+    assert_eq!(explanation.predicate_only_attrs, ["x", "y"]);
+    assert_eq!(
+        explanation
+            .projected_contents
+            .iter()
+            .map(|content| (content.name.as_str(), content.mode))
+            .collect::<Vec<_>>(),
+        [("response", ContentMode::Metadata), ("payload", ContentMode::Bytes)]
+    );
+    assert_eq!(explanation.required_contents, ["payload", "request", "response"]);
+    assert_eq!(explanation.predicate_only_contents, ["request"]);
+    assert_eq!(explanation.reconstructed_contents, ["payload"]);
+    assert_eq!(
+        (explanation.id_predicates, explanation.attr_predicates, explanation.content_predicates),
+        (1, 2, 1)
+    );
+    assert_eq!(
+        (explanation.limit, explanation.max_examined),
+        (request.limit, request.max_examined)
+    );
+    assert_eq!(explanation.max_resolution_entries, 23);
+    assert_eq!(explanation.max_reconstructed_bytes, 29);
+    assert_eq!(explanation.physical.immutable_parts_considered, 2);
+    assert_eq!(explanation.physical.immutable_parts_with_rows, 2);
+    assert_eq!(explanation.physical.immutable_rows_in_bounds, 5);
+    assert_eq!(explanation.physical.memtable_entries_in_bounds, 2);
+
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let immutable = reader.explain_scan(&request).unwrap();
+    assert_eq!(immutable.physical.memtable_entries_in_bounds, 0);
+    assert_eq!(immutable.physical.immutable_rows_in_bounds, 5);
+
+    let page_request = ScanRequest {
+        from: Some("b".into()),
+        to: Some("e".into()),
+        limit: 1,
+        ..ScanRequest::default()
+    };
+    let first = store.scan(&page_request).unwrap();
+    let mut continuation = page_request;
+    continuation.cursor = first.next;
+    let resumed = store.explain_scan(&continuation).unwrap();
+    assert!(resumed.uses_cursor);
+    assert_eq!(resumed.effective_from.as_deref(), Some("b\0"));
+
+    let mut invalid = continuation;
+    invalid.from = Some("c".into());
+    assert!(
+        store.explain_scan(&invalid).is_err(),
+        "explain and execution must check cursors alike"
+    );
     std::fs::remove_dir_all(dir).ok();
 }
 

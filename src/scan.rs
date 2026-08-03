@@ -110,6 +110,54 @@ pub struct ScanRequest {
     pub predicates: Vec<Predicate>,
 }
 
+/// One named-content projection in a prepared structured scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanContentPlan {
+    pub name: String,
+    pub mode: ContentMode,
+}
+
+/// Exact physical range scope before newest-wins resolution or predicate evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanPhysicalScope {
+    /// Immutable parts whose id range is initialized. Empty effective ranges initialize none.
+    pub immutable_parts_considered: usize,
+    /// Considered parts with at least one physical row inside the effective bounds.
+    pub immutable_parts_with_rows: usize,
+    /// Immutable row occurrences inside the bounds, including superseded rows and tombstones.
+    pub immutable_rows_in_bounds: usize,
+    /// Writer-memtable puts and deletes inside the bounds. Always zero for immutable snapshots.
+    pub memtable_entries_in_bounds: usize,
+}
+
+/// Rust-owned explanation of the storage-native structured scan plan.
+///
+/// This reports what the engine can know before newest-wins resolution and predicate evaluation. It
+/// deliberately does not estimate result cardinality or claim that semantic predicates are indexes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanExplanation {
+    pub direction: Direction,
+    pub uses_cursor: bool,
+    pub effective_from: Option<String>,
+    pub effective_to: Option<String>,
+    pub empty_range: bool,
+    pub projected_attrs: Vec<String>,
+    pub required_attrs: Vec<String>,
+    pub predicate_only_attrs: Vec<String>,
+    pub projected_contents: Vec<ScanContentPlan>,
+    pub required_contents: Vec<String>,
+    pub predicate_only_contents: Vec<String>,
+    pub reconstructed_contents: Vec<String>,
+    pub id_predicates: usize,
+    pub attr_predicates: usize,
+    pub content_predicates: usize,
+    pub limit: usize,
+    pub max_examined: usize,
+    pub max_resolution_entries: usize,
+    pub max_reconstructed_bytes: u64,
+    pub physical: ScanPhysicalScope,
+}
+
 impl Default for ScanRequest {
     fn default() -> Self {
         ScanRequest {
@@ -259,6 +307,7 @@ trait Source {
         contents: &HashSet<&str>,
     ) -> Result<Vec<Record>>;
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>>;
+    fn physical_scope(&self, from: Option<&str>, to: Option<&str>) -> Result<ScanPhysicalScope>;
 }
 
 impl Source for Store {
@@ -293,6 +342,10 @@ impl Source for Store {
 
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>> {
         Store::reconstruct_candidate_content(self, candidate, content)
+    }
+
+    fn physical_scope(&self, from: Option<&str>, to: Option<&str>) -> Result<ScanPhysicalScope> {
+        Store::scan_physical_scope(self, from, to)
     }
 }
 
@@ -329,6 +382,10 @@ impl Source for ReadStore {
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>> {
         ReadStore::reconstruct_candidate_content(self, candidate, content)
     }
+
+    fn physical_scope(&self, from: Option<&str>, to: Option<&str>) -> Result<ScanPhysicalScope> {
+        ReadStore::scan_physical_scope(self, from, to)
+    }
 }
 
 pub(crate) fn scan_store(store: &Store, request: &ScanRequest) -> Result<ScanPage> {
@@ -339,24 +396,44 @@ pub(crate) fn scan_read_store(store: &ReadStore, request: &ScanRequest) -> Resul
     scan_source(store, request)
 }
 
-fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
+pub(crate) fn explain_store(store: &Store, request: &ScanRequest) -> Result<ScanExplanation> {
+    explain_source(store, request)
+}
+
+pub(crate) fn explain_read_store(
+    store: &ReadStore,
+    request: &ScanRequest,
+) -> Result<ScanExplanation> {
+    explain_source(store, request)
+}
+
+struct PreparedScan<'a> {
+    fingerprint: [u8; CURSOR_FINGERPRINT],
+    cursor_last_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    attr_select: HashSet<&'a str>,
+    attr_needed: HashSet<&'a str>,
+    content_needed: HashSet<&'a str>,
+}
+
+fn prepare(request: &ScanRequest) -> Result<PreparedScan<'_>> {
     validate(request)?;
     check_interruption(request)?;
-    let read_trace = crate::io_trace::ReadTraceScope::start();
     let fingerprint = fingerprint(request);
     let cursor = request
         .cursor
         .as_deref()
         .map(decode_cursor)
         .transpose()?
-        .map(|c| {
-            if c.direction != request.direction {
+        .map(|cursor| {
+            if cursor.direction != request.direction {
                 bail!("scan cursor direction does not match this request");
             }
-            if c.fingerprint != fingerprint {
+            if cursor.fingerprint != fingerprint {
                 bail!("scan cursor belongs to different bounds or predicates");
             }
-            Ok(c)
+            Ok(cursor)
         })
         .transpose()?;
 
@@ -368,10 +445,6 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             Direction::Reverse => to = Some(cursor.last_id.clone()),
         }
     }
-    if matches!((&from, &to), (Some(a), Some(b)) if a >= b) {
-        return Ok(ScanPage { rows: Vec::new(), next: None, stats: ScanStats::default() });
-    }
-
     let attr_select: HashSet<&str> = request.attrs.iter().map(String::as_str).collect();
     let mut attr_needed = attr_select.clone();
     let mut content_needed: HashSet<&str> =
@@ -387,13 +460,121 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             Predicate::Id { .. } => {}
         }
     }
+    Ok(PreparedScan {
+        fingerprint,
+        cursor_last_id: cursor.map(|cursor| cursor.last_id),
+        from,
+        to,
+        attr_select,
+        attr_needed,
+        content_needed,
+    })
+}
+
+fn explain_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanExplanation> {
+    let prepared = prepare(request)?;
+    let empty_range = matches!(
+        (&prepared.from, &prepared.to),
+        (Some(from), Some(to)) if from >= to
+    );
+    let physical = if empty_range {
+        ScanPhysicalScope::default()
+    } else {
+        source.physical_scope(prepared.from.as_deref(), prepared.to.as_deref())?
+    };
+    check_interruption(request)?;
+
+    let mut projected_attrs: Vec<String> =
+        prepared.attr_select.iter().map(|name| (*name).to_string()).collect();
+    projected_attrs.sort();
+    let mut required_attrs: Vec<String> =
+        prepared.attr_needed.iter().map(|name| (*name).to_string()).collect();
+    required_attrs.sort();
+    let mut predicate_only_attrs: Vec<String> = prepared
+        .attr_needed
+        .difference(&prepared.attr_select)
+        .map(|name| (*name).to_string())
+        .collect();
+    predicate_only_attrs.sort();
+
+    let projected_contents: Vec<ScanContentPlan> = request
+        .contents
+        .iter()
+        .map(|content| ScanContentPlan { name: content.name.clone(), mode: content.mode })
+        .collect();
+    let projected_content_names: HashSet<&str> =
+        request.contents.iter().map(|content| content.name.as_str()).collect();
+    let mut required_contents: Vec<String> =
+        prepared.content_needed.iter().map(|name| (*name).to_string()).collect();
+    required_contents.sort();
+    let mut predicate_only_contents: Vec<String> = prepared
+        .content_needed
+        .difference(&projected_content_names)
+        .map(|name| (*name).to_string())
+        .collect();
+    predicate_only_contents.sort();
+    let reconstructed_contents = request
+        .contents
+        .iter()
+        .filter(|content| content.mode == ContentMode::Bytes)
+        .map(|content| content.name.clone())
+        .collect();
+
+    let (mut id_predicates, mut attr_predicates, mut content_predicates) = (0, 0, 0);
+    for predicate in &request.predicates {
+        match predicate {
+            Predicate::Id { .. } => id_predicates += 1,
+            Predicate::Attr { .. } | Predicate::AttrExists { .. } => attr_predicates += 1,
+            Predicate::ContentExists { .. } => content_predicates += 1,
+        }
+    }
+
+    Ok(ScanExplanation {
+        direction: request.direction,
+        uses_cursor: request.cursor.is_some(),
+        effective_from: prepared.from,
+        effective_to: prepared.to,
+        empty_range,
+        projected_attrs,
+        required_attrs,
+        predicate_only_attrs,
+        projected_contents,
+        required_contents,
+        predicate_only_contents,
+        reconstructed_contents,
+        id_predicates,
+        attr_predicates,
+        content_predicates,
+        limit: request.limit,
+        max_examined: request.max_examined,
+        max_resolution_entries: request.max_resolution_entries,
+        max_reconstructed_bytes: request.max_reconstructed_bytes,
+        physical,
+    })
+}
+
+fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
+    let prepared = prepare(request)?;
+    let read_trace = crate::io_trace::ReadTraceScope::start();
+    let PreparedScan {
+        fingerprint,
+        cursor_last_id,
+        mut from,
+        mut to,
+        attr_select,
+        attr_needed,
+        content_needed,
+    } = prepared;
+    if matches!((&from, &to), (Some(a), Some(b)) if a >= b) {
+        return Ok(ScanPage { rows: Vec::new(), next: None, stats: ScanStats::default() });
+    }
     let needs_record = !attr_needed.is_empty() || !content_needed.is_empty();
     let mut rows = Vec::with_capacity(request.limit);
     let mut stats = ScanStats::default();
     // A cursor identifies the last complete id group CONSUMED, not merely inspected. It may be a
     // tombstone-only group. A row deferred by the reconstruction budget remains unconsumed and must
     // be reconsidered on the next page.
-    let mut last_consumed = cursor.as_ref().map(|c| c.last_id.clone());
+    let mut last_consumed = cursor_last_id;
     let mut has_more = false;
     let mut budget_stopped = false;
 
@@ -939,6 +1120,14 @@ mod tests {
             _content: &Content,
         ) -> Result<Vec<u8>> {
             unreachable!("the interruption test projects no content")
+        }
+
+        fn physical_scope(
+            &self,
+            _from: Option<&str>,
+            _to: Option<&str>,
+        ) -> Result<ScanPhysicalScope> {
+            Ok(ScanPhysicalScope::default())
         }
     }
 

@@ -13,7 +13,7 @@ use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
 use turndb::control::OperationControl;
 use turndb::fold::FoldCfg;
-use turndb::scan::{ScanPage, ScanRequest};
+use turndb::scan::{ScanExplanation, ScanPage, ScanRequest};
 use turndb::store::{
     Batch, BoundedCompaction, ChainReport, CompactionBudget, ContentSpans, ErasureStats,
     PunchStats, ReadStore, Store, WriteLimits,
@@ -97,6 +97,10 @@ enum Command {
     Scan {
         request: ScanRequest,
         reply: oneshot::Sender<Result<ScanPage>>,
+    },
+    ExplainScan {
+        request: ScanRequest,
+        reply: oneshot::Sender<Result<ScanExplanation>>,
     },
     ReadContent {
         id: String,
@@ -255,6 +259,10 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Scan { request, reply })?).await
     }
 
+    pub async fn explain_scan(&self, request: ScanRequest) -> Result<ScanExplanation> {
+        Self::receive(self.submit(|reply| Command::ExplainScan { request, reply })?).await
+    }
+
     pub async fn read_content(&self, id: String, name: String) -> Result<Option<Vec<u8>>> {
         Self::receive(self.submit(|reply| Command::ReadContent { id, name, reply })?).await
     }
@@ -347,6 +355,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Scan { request, reply } => {
                 let _ = reply.send(store.scan(&request));
+            }
+            Command::ExplainScan { request, reply } => {
+                let _ = reply.send(store.explain_scan(&request));
             }
             Command::ReadContent { id, name, reply } => {
                 let _ = reply.send(store.reconstruct_content(&id, &name));

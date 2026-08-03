@@ -101,6 +101,9 @@ for revision-3 records. Writer scans include the memtable;
 Committed rows are projected from physical columns: sibling attribute value/dictionary and named
 content program sections remain unopened. See
 [projected structured scans](docs/projected-structured-scan.md).
+`Store::explain_scan` and `ReadStore::explain_scan` run the same request/cursor preparation and report
+required versus predicate-only fields, work ceilings, effective bounds, and exact physical rows in
+scope before visibility resolution. See [structured scan explanation](docs/scan-explanation.md).
 
 Format revision 4 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
 timestamps, and explicit null to the existing scalar fields. Missing and null remain distinct, and
