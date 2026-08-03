@@ -1633,6 +1633,97 @@ impl Store {
         self.merge_range_with_control(0, self.parts.len(), control)
     }
 
+    /// Select a contiguous compaction run whose exact physical input fits every supplied budget.
+    ///
+    /// The widest eligible run wins; ties prefer the oldest run. Contiguity preserves sequence
+    /// visibility, and only a plan covering the complete live list may drop tombstones.
+    pub fn plan_compaction(&self, budget: CompactionBudget) -> Result<Option<CompactionPlan>> {
+        budget.validate()?;
+        if self.manifest.parts.len() < 2 {
+            return Ok(None);
+        }
+        let costs: Vec<(u64, u64)> = self
+            .manifest
+            .parts
+            .iter()
+            .map(|part| {
+                let bytes = std::fs::metadata(self.dir.join(&part.file))
+                    .with_context(|| format!("measure compaction input {}", part.file))?
+                    .len();
+                Ok((u64::from(part.records), bytes))
+            })
+            .collect::<Result<_>>()?;
+
+        let mut best: Option<CompactionPlan> = None;
+        for start in 0..costs.len() - 1 {
+            let mut rows = 0u64;
+            let mut bytes = 0u64;
+            for (offset, &(part_rows, part_bytes)) in
+                costs[start..].iter().take(budget.max_input_parts).enumerate()
+            {
+                rows = rows.saturating_add(part_rows);
+                bytes = bytes.saturating_add(part_bytes);
+                if rows > budget.max_input_rows || bytes > budget.max_input_bytes {
+                    break;
+                }
+                let parts = offset + 1;
+                if parts < 2 {
+                    continue;
+                }
+                let plan = CompactionPlan {
+                    start_part: start,
+                    input_parts: parts,
+                    input_rows: rows,
+                    input_bytes: bytes,
+                    drops_tombstones: start == 0 && parts == costs.len(),
+                };
+                if best.as_ref().is_none_or(|current| plan.input_parts > current.input_parts) {
+                    best = Some(plan);
+                }
+            }
+        }
+        if best.is_some() {
+            return Ok(best);
+        }
+
+        let (start_part, input_rows, input_bytes) = costs
+            .windows(2)
+            .enumerate()
+            .map(|(start, pair)| {
+                (start, pair[0].0.saturating_add(pair[1].0), pair[0].1.saturating_add(pair[1].1))
+            })
+            .min_by_key(|&(start, rows, bytes)| (bytes, rows, start))
+            .expect("at least two parts were checked above");
+        Err(CompactionError::BudgetTooSmall { start_part, input_rows, input_bytes, budget }.into())
+    }
+
+    pub fn compact_bounded(
+        &mut self,
+        budget: CompactionBudget,
+    ) -> Result<Option<BoundedCompaction>> {
+        self.compact_bounded_with_control(budget, &crate::control::OperationControl::default())
+    }
+
+    /// Plan and publish one budget-bounded contiguous compaction run.
+    pub fn compact_bounded_with_control(
+        &mut self,
+        budget: CompactionBudget,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<BoundedCompaction>> {
+        control.check("bounded compaction")?;
+        let Some(plan) = self.plan_compaction(budget)? else {
+            return Ok(None);
+        };
+        let merge = self
+            .merge_range_with_control(plan.start_part, plan.input_parts, control)?
+            .expect("a compaction plan always contains at least two parts");
+        let output = &self.manifest.parts[plan.start_part];
+        let output_bytes = std::fs::metadata(self.dir.join(&output.file))
+            .with_context(|| format!("measure compaction output {}", output.file))?
+            .len();
+        Ok(Some(BoundedCompaction { plan, output_bytes, merge }))
+    }
+
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
         if let Some(v) = self.mem.get(id) {
@@ -2102,6 +2193,104 @@ impl Store {
         Ok(schema.finish())
     }
 }
+
+/// Exact physical-input bounds for one incremental compaction step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionBudget {
+    /// Maximum number of adjacent immutable parts admitted to one work unit.
+    pub max_input_parts: usize,
+    /// Maximum physical rows across the admitted input parts.
+    pub max_input_rows: u64,
+    /// Maximum sum of the admitted input part file lengths.
+    pub max_input_bytes: u64,
+}
+
+impl CompactionBudget {
+    /// Reject structurally unusable limits before any maintenance work begins.
+    pub fn validate(self) -> std::result::Result<(), CompactionError> {
+        if self.max_input_parts < 2 {
+            return Err(CompactionError::InvalidBudget(
+                "max_input_parts must be at least 2".into(),
+            ));
+        }
+        if self.max_input_rows == 0 {
+            return Err(CompactionError::InvalidBudget(
+                "max_input_rows must be greater than zero".into(),
+            ));
+        }
+        if self.max_input_bytes == 0 {
+            return Err(CompactionError::InvalidBudget(
+                "max_input_bytes must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An exact contiguous input selection from the current live part list.
+pub struct CompactionPlan {
+    /// Zero-based index of the oldest selected part.
+    pub start_part: usize,
+    /// Number of adjacent parts selected.
+    pub input_parts: usize,
+    /// Physical rows across the selected files.
+    pub input_rows: u64,
+    /// Sum of the selected files' exact on-disk lengths.
+    pub input_bytes: u64,
+    /// Whether this run covers the complete live list and may settle tombstones.
+    pub drops_tombstones: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// Evidence returned after one bounded compaction work unit is published.
+pub struct BoundedCompaction {
+    /// The exact input plan that was executed.
+    pub plan: CompactionPlan,
+    /// Exact on-disk length of the newly published output part.
+    pub output_bytes: u64,
+    /// Logical merge counters.
+    pub merge: crate::part::merge::MergeStats,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// A budget that cannot describe or admit a compaction work unit.
+pub enum CompactionError {
+    /// One or more limits are structurally unusable.
+    InvalidBudget(String),
+    /// At least two parts exist, but no adjacent pair fits all supplied limits.
+    BudgetTooSmall {
+        /// Start of a concrete smallest-byte adjacent pair.
+        start_part: usize,
+        /// Physical rows required by that pair.
+        input_rows: u64,
+        /// Exact file bytes required by that pair.
+        input_bytes: u64,
+        /// Limits that rejected the pair.
+        budget: CompactionBudget,
+    },
+}
+
+impl std::fmt::Display for CompactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactionError::InvalidBudget(reason) => write!(f, "invalid compaction budget: {reason}"),
+            CompactionError::BudgetTooSmall {
+                start_part,
+                input_rows,
+                input_bytes,
+                budget,
+            } => write!(
+                f,
+                "no adjacent part pair fits the compaction budget; the smallest-byte pair starts at part {start_part} and needs {input_rows} rows / {input_bytes} bytes, limits are {} rows / {} bytes",
+                budget.max_input_rows,
+                budget.max_input_bytes
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompactionError {}
 
 /// What [`Store::punch_unreferenced`] did.
 #[derive(Clone, Copy, Debug, Default)]

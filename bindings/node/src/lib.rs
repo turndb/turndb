@@ -8,8 +8,8 @@
 mod actor;
 
 use actor::{
-    Actor, CompactResult, OwnedContent, VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY,
-    MAX_QUEUE_CAPACITY,
+    Actor, BoundedCompactResult, CompactResult, OwnedContent, VerifyResult, WriteOp,
+    DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
 };
 use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
 use napi::{Env, Error, Result, Status};
@@ -30,7 +30,7 @@ use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
     ScanInterrupted, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
 };
-use turndb::store::{ReadStore, Store};
+use turndb::store::{CompactionBudget, CompactionError, ReadStore, Store};
 use turndb::types::AttrValue;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> Error {
@@ -54,6 +54,23 @@ fn lifecycle_failure(context: &str, error: anyhow::Error) -> Error {
         coded_failure("CANCELLED", format!("{context}: {error:#}"))
     } else {
         failure(context, error)
+    }
+}
+
+fn compaction_failure(context: &str, error: anyhow::Error) -> Error {
+    if error.chain().any(|cause| cause.downcast_ref::<OperationInterrupted>().is_some()) {
+        return coded_failure("CANCELLED", format!("{context}: {error:#}"));
+    }
+    let code =
+        error.chain().find_map(|cause| cause.downcast_ref::<CompactionError>()).map(|error| {
+            match error {
+                CompactionError::InvalidBudget(_) => "INVALID_ARGUMENT",
+                CompactionError::BudgetTooSmall { .. } => "RESOURCE_EXHAUSTED",
+            }
+        });
+    match code {
+        Some(code) => coded_failure(code, format!("{context}: {error:#}")),
+        None => failure(context, error),
     }
 }
 
@@ -292,6 +309,7 @@ pub struct NativeCapabilities {
     pub schema_discovery: bool,
     pub scan_cancellation: bool,
     pub lifecycle_cancellation: bool,
+    pub bounded_compaction: bool,
     pub scan_reconstruction_budget: bool,
     pub scan_reconstructed_bytes_default: BigInt,
     pub arrow_ipc: bool,
@@ -333,6 +351,7 @@ pub fn capabilities() -> NativeCapabilities {
         schema_discovery: true,
         scan_cancellation: true,
         lifecycle_cancellation: true,
+        bounded_compaction: true,
         scan_reconstruction_budget: true,
         scan_reconstructed_bytes_default: BigInt::from(DEFAULT_MAX_RECONSTRUCTED_BYTES),
         arrow_ipc: cfg!(feature = "sql"),
@@ -385,6 +404,32 @@ pub struct NativeCompactResult {
     pub flushed: bool,
     pub parts_before: BigInt,
     pub parts_after: BigInt,
+    pub merge: Option<NativeMergeStats>,
+}
+
+#[napi(object, object_to_js = false)]
+pub struct NativeCompactionBudget {
+    pub max_input_parts: u32,
+    pub max_input_rows: BigInt,
+    pub max_input_bytes: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeCompactionPlan {
+    pub start_part: BigInt,
+    pub input_parts: BigInt,
+    pub input_rows: BigInt,
+    pub input_bytes: BigInt,
+    pub drops_tombstones: bool,
+}
+
+#[napi(object)]
+pub struct NativeBoundedCompactResult {
+    pub flushed: bool,
+    pub parts_before: BigInt,
+    pub parts_after: BigInt,
+    pub plan: Option<NativeCompactionPlan>,
+    pub output_bytes: Option<BigInt>,
     pub merge: Option<NativeMergeStats>,
 }
 
@@ -1043,6 +1088,26 @@ impl NativeStore {
         })
     }
 
+    /// Settle earlier writes, then publish one contiguous merge within exact physical-input bounds.
+    #[napi]
+    pub fn compact_bounded<'env>(
+        &self,
+        env: &'env Env,
+        budget: NativeCompactionBudget,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeBoundedCompactResult>> {
+        let budget = decode_compaction_budget(budget)?;
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .compact_bounded(budget, control)
+                .await
+                .map(encode_bounded_compact)
+                .map_err(|error| compaction_failure("compact TurnDB store within budget", error))
+        })
+    }
+
     /// Settle earlier writes, then verify manifest pins, every part section, and every fold frame.
     #[napi]
     pub fn verify<'env>(
@@ -1533,6 +1598,18 @@ fn decode_u64(value: BigInt, what: &str) -> Result<u64> {
     Ok(value)
 }
 
+fn decode_compaction_budget(input: NativeCompactionBudget) -> Result<CompactionBudget> {
+    let budget = CompactionBudget {
+        max_input_parts: usize::try_from(input.max_input_parts).map_err(|_| {
+            Error::new(Status::InvalidArg, "maxInputParts exceeds this platform's address space")
+        })?,
+        max_input_rows: decode_u64(input.max_input_rows, "maxInputRows")?,
+        max_input_bytes: decode_u64(input.max_input_bytes, "maxInputBytes")?,
+    };
+    budget.validate().map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    Ok(budget)
+}
+
 #[cfg(feature = "sql")]
 fn decode_sql_budget(value: Option<BigInt>) -> Result<SqlBudget> {
     let value = value
@@ -1659,6 +1736,31 @@ fn encode_compact(result: CompactResult) -> NativeCompactResult {
         parts_before: BigInt::from(result.parts_before as u64),
         parts_after: BigInt::from(result.parts_after as u64),
         merge: result.merge.map(encode_merge),
+    }
+}
+
+fn encode_bounded_compact(result: BoundedCompactResult) -> NativeBoundedCompactResult {
+    let (plan, output_bytes, merge) = match result.compaction {
+        Some(compaction) => (
+            Some(NativeCompactionPlan {
+                start_part: BigInt::from(compaction.plan.start_part as u64),
+                input_parts: BigInt::from(compaction.plan.input_parts as u64),
+                input_rows: BigInt::from(compaction.plan.input_rows),
+                input_bytes: BigInt::from(compaction.plan.input_bytes),
+                drops_tombstones: compaction.plan.drops_tombstones,
+            }),
+            Some(BigInt::from(compaction.output_bytes)),
+            Some(encode_merge(compaction.merge)),
+        ),
+        None => (None, None, None),
+    };
+    NativeBoundedCompactResult {
+        flushed: result.flushed,
+        parts_before: BigInt::from(result.parts_before as u64),
+        parts_after: BigInt::from(result.parts_after as u64),
+        plan,
+        output_bytes,
+        merge,
     }
 }
 

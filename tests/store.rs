@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
-use turndb::store::{ContentSpans, Manifest, PartRef, Span, Store};
+use turndb::store::{
+    CompactionBudget, CompactionError, ContentSpans, Manifest, PartRef, Span, Store,
+};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -535,6 +537,144 @@ fn tiering_bounds_part_count_under_sustained_writes() {
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "tiering lost {id}");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
+    let dir = tmp("bounded-compact");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for batch in 0..5 {
+        for i in 0..10 {
+            let id = format!("b{batch}-{i:02}");
+            want.push((id.clone(), put(&mut s, &id, format!("payload {batch}/{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+
+    let part_bytes: Vec<u64> = s
+        .manifest()
+        .parts
+        .iter()
+        .map(|part| std::fs::metadata(dir.join(&part.file)).unwrap().len())
+        .collect();
+    let first_two_bytes = part_bytes[0] + part_bytes[1];
+    let (smallest_start, smallest_pair_bytes) = part_bytes
+        .windows(2)
+        .enumerate()
+        .map(|(start, pair)| (start, pair[0] + pair[1]))
+        .min_by_key(|&(start, bytes)| (bytes, start))
+        .unwrap();
+    let exact_byte_plan = s
+        .plan_compaction(CompactionBudget {
+            max_input_parts: 2,
+            max_input_rows: u64::MAX,
+            max_input_bytes: smallest_pair_bytes,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_byte_plan.start_part, smallest_start);
+    assert_eq!(exact_byte_plan.input_bytes, smallest_pair_bytes);
+    let error = s
+        .plan_compaction(CompactionBudget {
+            max_input_parts: 2,
+            max_input_rows: u64::MAX,
+            max_input_bytes: smallest_pair_bytes - 1,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CompactionError>(),
+        Some(CompactionError::BudgetTooSmall { input_bytes, .. })
+            if *input_bytes == smallest_pair_bytes
+    ));
+
+    let budget =
+        CompactionBudget { max_input_parts: 3, max_input_rows: 25, max_input_bytes: u64::MAX };
+    let plan = s.plan_compaction(budget).unwrap().unwrap();
+    assert_eq!(plan.start_part, 0, "equal-width plans prefer the oldest run");
+    assert_eq!(plan.input_parts, 2);
+    assert_eq!(plan.input_rows, 20);
+    assert_eq!(plan.input_bytes, first_two_bytes);
+    assert!(!plan.drops_tombstones, "a partial run must retain delete markers");
+
+    let result = s.compact_bounded(budget).unwrap().unwrap();
+    assert_eq!(result.plan, plan, "execution must honor the observed plan exactly");
+    assert_eq!(result.merge.inputs, 2);
+    assert_eq!(s.part_count(), 4);
+    let output = &s.manifest().parts[result.plan.start_part];
+    assert_eq!(result.output_bytes, std::fs::metadata(dir.join(&output.file)).unwrap().len());
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "bounded merge lost {id}");
+    }
+
+    let manifest_before = std::fs::read(dir.join("MANIFEST")).unwrap();
+    let parts_before: Vec<_> = s.manifest().parts.iter().map(|part| part.file.clone()).collect();
+    let error = s
+        .compact_bounded(CompactionBudget {
+            max_input_parts: 2,
+            max_input_rows: 1,
+            max_input_bytes: u64::MAX,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CompactionError>(),
+        Some(CompactionError::BudgetTooSmall { .. })
+    ));
+    assert_eq!(
+        s.manifest().parts.iter().map(|part| part.file.clone()).collect::<Vec<_>>(),
+        parts_before,
+        "a rejected budget must not mutate live state"
+    );
+    assert_eq!(std::fs::read(dir.join("MANIFEST")).unwrap(), manifest_before);
+
+    let error = s
+        .plan_compaction(CompactionBudget {
+            max_input_parts: 1,
+            max_input_rows: u64::MAX,
+            max_input_bytes: u64::MAX,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CompactionError>(),
+        Some(CompactionError::InvalidBudget(_))
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repeated_bounded_compaction_settles_tombstones_only_on_the_total_step() {
+    let dir = tmp("bounded-settle");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "gone", b"old");
+    put(&mut s, "keep-a", b"a");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.delete("gone").unwrap();
+    put(&mut s, "keep-b", b"b");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    put(&mut s, "keep-c", b"c");
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let budget = CompactionBudget {
+        max_input_parts: 2,
+        max_input_rows: u64::MAX,
+        max_input_bytes: u64::MAX,
+    };
+    let partial = s.compact_bounded(budget).unwrap().unwrap();
+    assert!(!partial.plan.drops_tombstones);
+    assert_eq!(partial.merge.tombstones_dropped, 0);
+    assert!(s.reconstruct("gone").unwrap().is_none());
+
+    let total = s.compact_bounded(budget).unwrap().unwrap();
+    assert!(total.plan.drops_tombstones);
+    assert_eq!(total.merge.tombstones_dropped, 1);
+    assert_eq!(s.part_count(), 1);
+    assert!(s.reconstruct("gone").unwrap().is_none());
+    assert!(s.plan_compaction(budget).unwrap().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -267,6 +267,14 @@ cannot return an ambiguous partial-erasure result. Preflight space estimates and
 migration remain current gaps. Backup, restore, offline recovery, SQL planning, sync, and flush remain
 non-cancellable.
 
+Bounded compaction is a generic actor-ordered maintenance primitive, not a built-in scheduling
+policy. A caller supplies simultaneous physical input-part, row, and exact file-byte ceilings. Rust
+selects the widest fitting contiguous run (oldest on ties), refuses with a typed insufficient-budget
+error when even an adjacent pair cannot fit, and reports the exact executed inputs and output bytes.
+Partial runs retain tombstones; only a run covering the complete live list may settle them. These
+ceilings bound input work, not elapsed time or temporary disk usage. See
+`docs/bounded-compaction.md`.
+
 `Store::health` and the Node `health()` method are constant-work operational snapshots. They report
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
 memtable entries and bytes, WAL and fold disk bytes, fold and part cache counters/budgets, Tier-0 dedup

@@ -14,7 +14,10 @@ use turndb::carve::Carve;
 use turndb::control::OperationControl;
 use turndb::fold::FoldCfg;
 use turndb::scan::{ScanPage, ScanRequest};
-use turndb::store::{Batch, ChainReport, ContentSpans, ErasureStats, PunchStats, ReadStore, Store};
+use turndb::store::{
+    Batch, BoundedCompaction, ChainReport, CompactionBudget, ContentSpans, ErasureStats,
+    PunchStats, ReadStore, Store,
+};
 use turndb::types::AttrValue;
 
 pub(crate) struct CompactResult {
@@ -22,6 +25,13 @@ pub(crate) struct CompactResult {
     pub parts_before: usize,
     pub parts_after: usize,
     pub merge: Option<turndb::part::merge::MergeStats>,
+}
+
+pub(crate) struct BoundedCompactResult {
+    pub flushed: bool,
+    pub parts_before: usize,
+    pub parts_after: usize,
+    pub compaction: Option<BoundedCompaction>,
 }
 
 pub(crate) struct VerifyResult {
@@ -100,6 +110,11 @@ enum Command {
         full: bool,
         control: OperationControl,
         reply: oneshot::Sender<Result<CompactResult>>,
+    },
+    CompactBounded {
+        budget: CompactionBudget,
+        control: OperationControl,
+        reply: oneshot::Sender<Result<BoundedCompactResult>>,
     },
     Verify {
         control: OperationControl,
@@ -243,6 +258,15 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Compact { full, control, reply })?).await
     }
 
+    pub async fn compact_bounded(
+        &self,
+        budget: CompactionBudget,
+        control: OperationControl,
+    ) -> Result<BoundedCompactResult> {
+        Self::receive(self.submit(|reply| Command::CompactBounded { budget, control, reply })?)
+            .await
+    }
+
     pub async fn verify(&self, control: OperationControl) -> Result<VerifyResult> {
         Self::receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
@@ -330,6 +354,10 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Compact { full, control, reply } => {
                 let result = compact(&mut store, full, &control);
+                let _ = reply.send(result);
+            }
+            Command::CompactBounded { budget, control, reply } => {
+                let result = compact_bounded(&mut store, budget, &control);
                 let _ = reply.send(result);
             }
             Command::Verify { control, reply } => {
@@ -421,6 +449,19 @@ fn compact(store: &mut Store, full: bool, control: &OperationControl) -> Result<
         store.auto_compact_with_control(control)?
     };
     Ok(CompactResult { flushed, parts_before, parts_after: store.part_count(), merge })
+}
+
+fn compact_bounded(
+    store: &mut Store,
+    budget: CompactionBudget,
+    control: &OperationControl,
+) -> Result<BoundedCompactResult> {
+    control.check("bounded compaction")?;
+    let flushed = settle(store)?;
+    control.check("bounded compaction")?;
+    let parts_before = store.part_count();
+    let compaction = store.compact_bounded_with_control(budget, control)?;
+    Ok(BoundedCompactResult { flushed, parts_before, parts_after: store.part_count(), compaction })
 }
 
 fn verify(store: &mut Store, path: &Path, control: &OperationControl) -> Result<VerifyResult> {
