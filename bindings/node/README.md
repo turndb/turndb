@@ -138,7 +138,9 @@ silently.
   records or content and therefore does not claim an exact live-row count.
 - `metrics()` returns monotonic `bigint` outcomes and nanosecond totals for recovery and writer
   lifecycle work. It is handle-local and pull-based; actor queue wait is deliberately separate from
-  core execution time. See [pull-based operation metrics](../../docs/operation-metrics.md).
+  core execution time. Folded-content counters expose exact piece hits/logical/novel bytes, and
+  `partDistribution(options)` reports live immutable-part byte/row order statistics. See
+  [pull-based operation metrics](../../docs/operation-metrics.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to

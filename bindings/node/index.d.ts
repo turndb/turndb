@@ -172,6 +172,7 @@ export interface Capabilities {
   allocatedSpaceUsage: boolean;
   formatMigration: true;
   operationMetrics: true;
+  partDistribution: true;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -276,6 +277,26 @@ export interface StoreMetrics {
   punch: OperationMetrics;
   refold: OperationMetrics;
   formatMigration: OperationMetrics;
+  foldedContent: {
+    pieces: bigint;
+    dedupHits: bigint;
+    logicalBytes: bigint;
+    novelBytes: bigint;
+  };
+}
+
+export interface PartDistribution {
+  parts: bigint;
+  totalBytes: bigint;
+  minBytes: bigint;
+  p50Bytes: bigint;
+  p95Bytes: bigint;
+  maxBytes: bigint;
+  totalRows: bigint;
+  minRows: bigint;
+  p50Rows: bigint;
+  p95Rows: bigint;
+  maxRows: bigint;
 }
 
 export interface MergeStats {
@@ -538,5 +559,6 @@ export declare class NativeStore {
     punchedBlocks: bigint;
   }>;
   metrics(): Promise<StoreMetrics>;
+  partDistribution(options?: LifecycleOptions): Promise<PartDistribution>;
   close(durable?: boolean): Promise<void>;
 }

@@ -1510,6 +1510,65 @@ impl Store {
         self.metrics
     }
 
+    /// Exact file-size and physical-row distribution for the current live immutable parts.
+    pub fn part_distribution(&self) -> Result<crate::observability::PartDistribution> {
+        self.part_distribution_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::part_distribution`] with cooperative checkpoints between part metadata reads.
+    pub fn part_distribution_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<crate::observability::PartDistribution> {
+        control.check("part distribution")?;
+        let mut bytes = Vec::with_capacity(self.manifest.parts.len());
+        let mut rows = Vec::with_capacity(self.manifest.parts.len());
+        let mut total_bytes = 0u64;
+        let mut total_rows = 0u64;
+        for part in &self.manifest.parts {
+            control.check("part distribution")?;
+            let size = std::fs::metadata(self.dir.join(&part.file))
+                .with_context(|| format!("measure live part {}", part.file))?
+                .len();
+            let part_rows = u64::from(part.records);
+            total_bytes = total_bytes
+                .checked_add(size)
+                .ok_or_else(|| anyhow::anyhow!("part distribution byte count overflow"))?;
+            total_rows = total_rows
+                .checked_add(part_rows)
+                .ok_or_else(|| anyhow::anyhow!("part distribution row count overflow"))?;
+            bytes.push(size);
+            rows.push(part_rows);
+        }
+        bytes.sort_unstable();
+        rows.sort_unstable();
+        let percentile = |values: &[u64], percent: usize| -> u64 {
+            let rank = values
+                .len()
+                .saturating_mul(percent)
+                .saturating_add(99)
+                .checked_div(100)
+                .unwrap_or(0);
+            values
+                .get(rank.saturating_sub(1).min(values.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0)
+        };
+        Ok(crate::observability::PartDistribution {
+            parts: bytes.len(),
+            total_bytes,
+            min_bytes: bytes.first().copied().unwrap_or(0),
+            p50_bytes: percentile(&bytes, 50),
+            p95_bytes: percentile(&bytes, 95),
+            max_bytes: bytes.last().copied().unwrap_or(0),
+            total_rows,
+            min_rows: rows.first().copied().unwrap_or(0),
+            p50_rows: percentile(&rows, 50),
+            p95_rows: percentile(&rows, 95),
+            max_rows: rows.last().copied().unwrap_or(0),
+        })
+    }
+
     /// Open for reading only: no lock, no replay, no daemon.
     ///
     /// Sees exactly the committed manifest — uncommitted records in some writer's memtable are
@@ -1668,12 +1727,15 @@ impl Store {
     /// a crash discards.
     fn fold_piece(&mut self, b: &[u8]) -> Result<crate::fold::Put> {
         let hash = PieceHash::of(b);
-        if let Some(loc) = self.locate(&hash)? {
+        let result = if let Some(loc) = self.locate(&hash)? {
             // Seed the window so further references in this flush interval answer from memory.
             self.fold.note(hash, loc);
-            return Ok(crate::fold::Put { hash, loc, deduped: true });
-        }
-        self.fold.put_hashed(b, hash)
+            crate::fold::Put { hash, loc, deduped: true }
+        } else {
+            self.fold.put_hashed(b, hash)?
+        };
+        self.metrics.folded_content.observe(b.len(), result.deduped);
+        Ok(result)
     }
 
     /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].

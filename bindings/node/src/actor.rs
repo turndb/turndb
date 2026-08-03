@@ -191,6 +191,10 @@ enum Command {
     Metrics {
         reply: oneshot::Sender<Result<turndb::observability::StoreMetrics>>,
     },
+    PartDistribution {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<turndb::observability::PartDistribution>>,
+    },
     SpaceUsage {
         control: OperationControl,
         reply: oneshot::Sender<Result<turndb::store::StoreSpaceUsage>>,
@@ -406,6 +410,13 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Metrics { reply })?).await
     }
 
+    pub async fn part_distribution(
+        &self,
+        control: OperationControl,
+    ) -> Result<turndb::observability::PartDistribution> {
+        Self::receive(self.submit(|reply| Command::PartDistribution { control, reply })?).await
+    }
+
     pub async fn space_usage(
         &self,
         control: OperationControl,
@@ -534,6 +545,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Metrics { reply } => {
                 let _ = reply.send(Ok(store.metrics()));
+            }
+            Command::PartDistribution { control, reply } => {
+                let _ = reply.send(store.part_distribution_with_control(&control));
             }
             Command::SpaceUsage { control, reply } => {
                 let _ = reply.send(store.space_usage_with_control(&control));

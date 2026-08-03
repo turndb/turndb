@@ -55,4 +55,45 @@ pub struct StoreMetrics {
     pub punch: OperationMetrics,
     pub refold: OperationMetrics,
     pub format_migration: OperationMetrics,
+    pub folded_content: FoldedContentMetrics,
+}
+
+/// Successful content-piece work observed at the content-addressed write boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FoldedContentMetrics {
+    pub pieces: u64,
+    pub dedup_hits: u64,
+    pub logical_bytes: u64,
+    pub novel_bytes: u64,
+}
+
+impl FoldedContentMetrics {
+    pub(crate) fn observe(&mut self, bytes: usize, deduped: bool) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.pieces = self.pieces.saturating_add(1);
+        self.logical_bytes = self.logical_bytes.saturating_add(bytes);
+        if deduped {
+            self.dedup_hits = self.dedup_hits.saturating_add(1);
+        } else {
+            self.novel_bytes = self.novel_bytes.saturating_add(bytes);
+        }
+    }
+}
+
+/// Exact file-size and physical-row distribution of the current live immutable parts.
+///
+/// All values are zero when `parts == 0`; the count disambiguates an empty distribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartDistribution {
+    pub parts: usize,
+    pub total_bytes: u64,
+    pub min_bytes: u64,
+    pub p50_bytes: u64,
+    pub p95_bytes: u64,
+    pub max_bytes: u64,
+    pub total_rows: u64,
+    pub min_rows: u64,
+    pub p50_rows: u64,
+    pub p95_rows: u64,
+    pub max_rows: u64,
 }

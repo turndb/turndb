@@ -23,6 +23,16 @@ for example a Node maintenance call settles earlier writes through sync/flush, a
 increment their own counters. A no-op flush or migration check is a successful attempt. This makes
 the numbers describe engine work rather than JavaScript method names.
 
+`foldedContent` measures successful piece writes at the content-addressed boundary: piece attempts,
+dedup hits, logical input bytes, and genuinely novel raw bytes. It counts only `Piece` spans (literal
+metadata is intentionally outside the fold) and only work performed by this handle. A consumer can
+derive hit and byte-avoidance ratios without TurnDB choosing an aggregation window.
+
+`Store::part_distribution()` and Node `partDistribution(options)` are a separate inspectable snapshot
+because they read every live part's file metadata. They report exact total/min/p50/p95/max file bytes
+and physical rows using nearest-rank order statistics. All values are zero for an empty store, with
+`parts` disambiguating emptiness. The call accepts cancellation/deadlines and does not decode rows.
+
 Durations cover core execution on the writer thread. They deliberately exclude time waiting in the
 Node actor queue; lifecycle deadlines remain submission-inclusive and therefore separately express
 queue pressure. Query and structured-scan work keeps its operation-local row, resolution, section,
