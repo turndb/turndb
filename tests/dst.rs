@@ -139,6 +139,11 @@ impl Fs {
                     self.volatile_ns.insert(to.clone(), i);
                 }
             }
+            Op::Link { from, to } => {
+                if let Some(&i) = self.volatile_ns.get(from) {
+                    self.volatile_ns.insert(to.clone(), i);
+                }
+            }
             Op::Unlink { path } => {
                 self.volatile_ns.remove(path);
             }
@@ -437,6 +442,7 @@ fn op_summary(op: &Op) -> String {
         Op::SyncFile { path } => format!("SyncFile    {}", short(path)),
         Op::SyncDir { path } => format!("SyncDir     {}", short(path)),
         Op::Rename { from, to } => format!("Rename      {} -> {}", short(from), short(to)),
+        Op::Link { from, to } => format!("Link        {} -> {}", short(from), short(to)),
         Op::Unlink { path } => format!("Unlink      {}", short(path)),
         Op::Mkdir { path } => format!("Mkdir       {}", short(path)),
         Op::RemoveTree { path } => format!("RemoveTree  {}", short(path)),

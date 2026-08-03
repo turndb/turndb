@@ -7,7 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
-  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, retainedCommits, TurnDbError,
+  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, retainedCommits, restoreBackup,
+  TurnDbError,
 } = require('..');
 
 function temporaryStore(t) {
@@ -33,6 +34,7 @@ test('reports the native capability profile without a portable fallback', () => 
     commandQueueCapacityMax: 65536,
     immutableSnapshots: true,
     lifecycleOperations: true,
+    backupRestore: true,
     healthSnapshots: true,
     schemaDiscovery: true,
     scanCancellation: true,
@@ -373,6 +375,60 @@ test('publishes exact immutable cuts and reopens retained commits', async (t) =>
   await retained.close();
   await assert.rejects(retained.scan(), /closed/);
   await second.close();
+});
+
+test('backs up an actor-ordered cut and safely restores a writable store', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-backup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, 'store');
+  const artifact = path.join(root, 'snapshot.turndb');
+  const restoredDir = path.join(root, 'restored');
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write([{ kind: 'put', id: 'before' }]);
+  const backup = await store.backup(artifact);
+  assert(backup.files >= 3n);
+  assert.equal(backup.bytes, BigInt(fs.statSync(artifact).size));
+  assert(backup.commit > 0n);
+
+  await store.write([{ kind: 'put', id: 'after' }], true);
+  const restored = await restoreBackup(artifact, restoredDir);
+  assert.deepEqual(restored, backup);
+  const restoredStore = await NativeStore.open(restoredDir);
+  assert.deepEqual((await restoredStore.scan()).rows.map(({ id }) => id), ['before']);
+  await restoredStore.write([{ kind: 'put', id: 'restored-write' }], true);
+  assert.deepEqual(
+    (await restoredStore.scan()).rows.map(({ id }) => id),
+    ['before', 'restored-write'],
+  );
+  await restoredStore.close();
+
+  await assert.rejects(
+    store.backup(artifact),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    restoreBackup(artifact, restoredDir),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+
+  const corrupt = Buffer.from(fs.readFileSync(artifact));
+  corrupt[0] ^= 1;
+  const corruptPath = path.join(root, 'corrupt.turndb');
+  const absent = path.join(root, 'corrupt-restore');
+  fs.writeFileSync(corruptPath, corrupt);
+  await assert.rejects(
+    restoreBackup(corruptPath, absent),
+    (error) => error instanceof TurnDbError && error.code === 'CORRUPTION',
+  );
+  assert.equal(fs.existsSync(absent), false);
+  await assert.rejects(
+    restoreBackup(path.join(root, 'missing.turndb'), absent),
+    (error) => error instanceof TurnDbError && error.code === 'NOT_FOUND',
+  );
 });
 
 test('validates exact values and lifecycle at the boundary', async (t) => {

@@ -102,6 +102,10 @@ enum Command {
     Verify {
         reply: oneshot::Sender<Result<VerifyResult>>,
     },
+    Backup {
+        path: std::path::PathBuf,
+        reply: oneshot::Sender<Result<turndb::pack::BackupStats>>,
+    },
     Erase {
         ids: Vec<String>,
         reply: oneshot::Sender<Result<ErasureStats>>,
@@ -237,6 +241,10 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Verify { reply })?).await
     }
 
+    pub async fn backup(&self, path: std::path::PathBuf) -> Result<turndb::pack::BackupStats> {
+        Self::receive(self.submit(|reply| Command::Backup { path, reply })?).await
+    }
+
     pub async fn erase(&self, ids: Vec<String>) -> Result<ErasureStats> {
         Self::receive(self.submit(|reply| Command::Erase { ids, reply })?).await
     }
@@ -318,6 +326,11 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             Command::Verify { reply } => {
                 let result = verify(&mut store, path);
                 let _ = reply.send(result);
+            }
+            Command::Backup { path, reply } => {
+                // Actor order fixes the backup cut: earlier writes are settled by `Store::backup`,
+                // while later commands wait until the verified artifact has been published.
+                let _ = reply.send(store.backup(&path));
             }
             Command::Erase { ids, reply } => {
                 let _ = reply.send(store.erase_ids(&ids));

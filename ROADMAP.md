@@ -54,7 +54,12 @@ content model right before compatibility turns today's choices into permanent pr
   batches. Query planning, read-only enforcement, storage scans, statistics, and IPC encoding remain
   in Rust; JavaScript owns only handle lifetime and `Buffer` transport. CI now builds and exercises
   that default addon on every Node major claimed by the native package; platform prebuild production
-  and selection remain a separate unfinished gate.
+  and selection remain a separate unfinished gate. Online backup now settles an exact actor-ordered
+  cut, verifies the completed pack, and atomically refuses replacement. Restore verifies before
+  mutation, extracts with bounded memory, validates a staged ordinary store, and uses an OS
+  no-replace rename so an existing destination cannot be overlaid. The Rust and Node APIs return
+  commit/file/byte facts and typed operational failures; backup scheduling, cancellation, remote
+  transfer, and retention policy remain intentionally outside this slice.
 
 ## Product boundary
 
@@ -334,8 +339,8 @@ profile rather than misreporting the ordinary release artifact.
 
 Remaining Phase-3 gaps are prebuilt platform artifacts, cancellation/deadlines for long-running
 lifecycle operations and SQL planning (batch pulls are cancellable), a complete typed engine error
-taxonomy, backup/restore and recovery controls, aggregate limits across concurrent snapshot queries,
-and measured event-loop/query overhead under a representative mixed workload.
+taxonomy, manifest recovery controls, aggregate limits across concurrent snapshot queries, and
+measured event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 

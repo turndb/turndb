@@ -82,7 +82,7 @@ for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSql
   for (const name of [
     'write', 'sync', 'flush', 'scan', 'readContent', 'snapshot',
     'querySql', 'next', 'stats', 'compact', 'verify', 'erase', 'punch', 'refold',
-    'health', 'schema', 'close',
+    'backup', 'health', 'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
       Class.prototype[name] = guarded(Class.prototype[name], name);
@@ -109,5 +109,6 @@ module.exports = {
   NativeSnapshot: guardFactories(native.NativeSnapshot),
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
+  restoreBackup: guarded(native.restoreBackup),
   TurnDbError,
 };

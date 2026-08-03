@@ -110,6 +110,7 @@ export interface Capabilities {
   commandQueueCapacityMax: number;
   immutableSnapshots: true;
   lifecycleOperations: true;
+  backupRestore: boolean;
   healthSnapshots: true;
   schemaDiscovery: true;
   scanCancellation: true;
@@ -177,6 +178,10 @@ export declare class TurnDbError extends Error {
 
 export declare function capabilities(): Capabilities;
 export declare function retainedCommits(path: string): Promise<bigint[]>;
+export declare function restoreBackup(
+  backupPath: string,
+  destinationPath: string,
+): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
 
 export declare class NativeSqlQuery {
   readonly schemaIpc: Buffer;
@@ -226,6 +231,8 @@ export declare class NativeStore {
     foldBytes: bigint;
     trailingUncommittedBytes: bigint;
   }>;
+  /** Settles prior writes; refuses to replace an existing destination. */
+  backup(path: string): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
   erase(ids: string[]): Promise<{
     requested: bigint;
     tombstoned: bigint;
