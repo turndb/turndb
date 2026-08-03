@@ -71,7 +71,7 @@ s.flush()?;                                   // seal into an immutable part
 | | |
 |---|---|
 | **Durability** | WAL with an explicit ACK point; batches replay all-or-nothing; one commit point (the manifest) with a checksummed commit log, snapshots, and explicit recovery |
-| **Query** | DataFusion lens over the columnar plane — `body` and `content.<name>` are independently projectable, so attribute queries open zero fold blocks (measured, not asserted) |
+| **Query** | Bounded structured paging with Rust-owned cursors plus an optional DataFusion lens — named content is independently projectable, and metadata queries open zero fold blocks |
 | **Compaction** | Total merge at eight parts, chosen by benchmark; merges provably touch zero content bytes |
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
@@ -80,6 +80,11 @@ s.flush()?;                                   // seal into an immutable part
 The query layers are independently selectable: `--features columnar --no-default-features` provides
 the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same
 lens. Storage, visibility, and content semantics remain in TurnDB either way.
+
+`Store::scan` is available without either query feature. It provides id-ordered forward/reverse pages,
+typed predicates, selected attributes, named-content metadata or bytes, opaque checked cursors, and a
+per-call examination bound. Writer scans include the memtable; `ReadStore::scan` remains pinned to its
+manifest snapshot.
 
 ## What it does not do
 

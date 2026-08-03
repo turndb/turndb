@@ -1,0 +1,606 @@
+//! Storage-native structured paging.
+//!
+//! This is the small-query interface a binding can call without SQL or Arrow. It deliberately owns
+//! cursor construction, visibility, exact value comparison, and work bounds in Rust. The first stable
+//! ordering is record id; additional orderings need indexes rather than JavaScript-side sorting.
+
+use crate::store::{ReadStore, Store};
+use crate::types::{AttrValue, Content, Record};
+use anyhow::{bail, Context, Result};
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
+const CURSOR_VERSION: u8 = 1;
+const CURSOR_FINGERPRINT: usize = 16;
+const CURSOR_CHECKSUM: usize = 8;
+pub const DEFAULT_LIMIT: usize = 100;
+pub const MAX_LIMIT: usize = 10_000;
+pub const MAX_EXAMINED: usize = 1_000_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Direction {
+    #[default]
+    Forward,
+    Reverse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compare {
+    Eq,
+    Ne,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+#[derive(Clone, Debug)]
+pub enum Predicate {
+    Id { op: Compare, value: String },
+    Attr { name: String, op: Compare, value: AttrValue },
+    AttrExists { name: String, present: bool },
+    ContentExists { name: String, present: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentMode {
+    Metadata,
+    Bytes,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContentSelect {
+    pub name: String,
+    pub mode: ContentMode,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanRequest {
+    /// Inclusive id lower bound.
+    pub from: Option<String>,
+    /// Exclusive id upper bound.
+    pub to: Option<String>,
+    pub direction: Direction,
+    /// Opaque continuation returned by an earlier request with the same range, direction, and
+    /// predicates. Projection and page size may change between pages.
+    pub cursor: Option<String>,
+    pub limit: usize,
+    /// Hard bound on candidate records examined during this call. A partial page carries a cursor.
+    pub max_examined: usize,
+    /// Attribute keys to return. Matching occurrences preserve their original order and duplicates.
+    pub attrs: Vec<String>,
+    /// Named content values to describe or reconstruct.
+    pub contents: Vec<ContentSelect>,
+    pub predicates: Vec<Predicate>,
+}
+
+impl Default for ScanRequest {
+    fn default() -> Self {
+        ScanRequest {
+            from: None,
+            to: None,
+            direction: Direction::Forward,
+            cursor: None,
+            limit: DEFAULT_LIMIT,
+            max_examined: 10_000,
+            attrs: Vec::new(),
+            contents: Vec::new(),
+            predicates: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectedContent {
+    pub name: String,
+    pub present: bool,
+    pub len: Option<u64>,
+    pub pieces: Option<usize>,
+    /// `Some` only for a present value selected with [`ContentMode::Bytes`].
+    pub bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanRow {
+    pub id: String,
+    pub attrs: Vec<(String, AttrValue)>,
+    pub contents: Vec<ProjectedContent>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub examined: usize,
+    pub returned: usize,
+    pub shadowed_attr_occurrences: usize,
+    pub content_values_reconstructed: usize,
+    pub reconstructed_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanPage {
+    pub rows: Vec<ScanRow>,
+    pub next: Option<String>,
+    pub stats: ScanStats,
+}
+
+trait Source {
+    fn scan_ids(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<String>>;
+    fn get(&self, id: &str) -> Result<Option<Record>>;
+    fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>>;
+}
+
+impl Source for Store {
+    fn scan_ids(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<String>> {
+        Store::scan_ids(self, from, to, limit, reverse)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<Record>> {
+        Store::get(self, id)
+    }
+
+    fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        Store::reconstruct_content(self, id, name)
+    }
+}
+
+impl Source for ReadStore {
+    fn scan_ids(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<String>> {
+        ReadStore::scan_ids(self, from, to, limit, reverse)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<Record>> {
+        ReadStore::get(self, id)
+    }
+
+    fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        ReadStore::reconstruct_content(self, id, name)
+    }
+}
+
+pub(crate) fn scan_store(store: &Store, request: &ScanRequest) -> Result<ScanPage> {
+    scan_source(store, request)
+}
+
+pub(crate) fn scan_read_store(store: &ReadStore, request: &ScanRequest) -> Result<ScanPage> {
+    scan_source(store, request)
+}
+
+fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
+    validate(request)?;
+    let fingerprint = fingerprint(request);
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()?
+        .map(|c| {
+            if c.direction != request.direction {
+                bail!("scan cursor direction does not match this request");
+            }
+            if c.fingerprint != fingerprint {
+                bail!("scan cursor belongs to different bounds or predicates");
+            }
+            Ok(c)
+        })
+        .transpose()?;
+
+    let mut from = request.from.clone();
+    let mut to = request.to.clone();
+    if let Some(cursor) = &cursor {
+        match request.direction {
+            Direction::Forward => from = Some(after(&cursor.last_id)),
+            Direction::Reverse => to = Some(cursor.last_id.clone()),
+        }
+    }
+    if matches!((&from, &to), (Some(a), Some(b)) if a >= b) {
+        return Ok(ScanPage { rows: Vec::new(), next: None, stats: ScanStats::default() });
+    }
+
+    let attr_select: HashSet<&str> = request.attrs.iter().map(String::as_str).collect();
+    let needs_record = !request.attrs.is_empty()
+        || !request.contents.is_empty()
+        || request.predicates.iter().any(|p| !matches!(p, Predicate::Id { .. }));
+    let mut rows = Vec::with_capacity(request.limit);
+    let mut stats = ScanStats::default();
+    let mut last_examined = cursor.as_ref().map(|c| c.last_id.clone());
+    let mut has_more = false;
+
+    while rows.len() < request.limit && stats.examined < request.max_examined {
+        let remaining = request.max_examined - stats.examined;
+        let ask = remaining.min((request.limit - rows.len()).max(64));
+        let ids = source.scan_ids(
+            from.as_deref(),
+            to.as_deref(),
+            ask,
+            request.direction == Direction::Reverse,
+        )?;
+        if ids.is_empty() {
+            has_more = false;
+            break;
+        }
+        let fetched = ids.len();
+        let mut processed = 0usize;
+        for id in ids {
+            processed += 1;
+            stats.examined += 1;
+            last_examined = Some(id.clone());
+            let record = if needs_record {
+                Some(source.get(&id)?.ok_or_else(|| {
+                    anyhow::anyhow!("id {id:?} disappeared from an immutable scan view")
+                })?)
+            } else {
+                None
+            };
+            if !request.predicates.iter().all(|p| matches_predicate(&id, record.as_ref(), p)) {
+                continue;
+            }
+            let mut attrs = Vec::new();
+            if let Some(record) = &record {
+                attrs.extend(
+                    record
+                        .attrs
+                        .iter()
+                        .filter(|(name, _)| attr_select.contains(name.as_str()))
+                        .cloned(),
+                );
+                stats.shadowed_attr_occurrences += shadowed_attrs(&attrs);
+            }
+            let mut contents = Vec::with_capacity(request.contents.len());
+            for selected in &request.contents {
+                let content = record.as_ref().and_then(|r| r.content(&selected.name));
+                let bytes = if content.is_some() && selected.mode == ContentMode::Bytes {
+                    let value =
+                        source.reconstruct_content(&id, &selected.name)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "content {:?} disappeared from record {id:?}",
+                                selected.name
+                            )
+                        })?;
+                    stats.content_values_reconstructed += 1;
+                    stats.reconstructed_bytes =
+                        stats.reconstructed_bytes.saturating_add(value.len() as u64);
+                    Some(value)
+                } else {
+                    None
+                };
+                contents.push(project_content(&selected.name, content, bytes));
+            }
+            rows.push(ScanRow { id, attrs, contents });
+            if rows.len() == request.limit {
+                has_more = processed < fetched || fetched == ask;
+                break;
+            }
+        }
+        if rows.len() == request.limit {
+            break;
+        }
+        if stats.examined == request.max_examined {
+            has_more = processed < fetched || fetched == ask;
+            break;
+        }
+        if fetched < ask {
+            has_more = false;
+            break;
+        }
+        let last = last_examined.as_ref().expect("a non-empty id batch has a last id");
+        match request.direction {
+            Direction::Forward => from = Some(after(last)),
+            Direction::Reverse => to = Some(last.clone()),
+        }
+        has_more = true;
+    }
+
+    stats.returned = rows.len();
+    let next = if has_more {
+        last_examined
+            .map(|last| encode_cursor(request.direction, fingerprint, &last))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(ScanPage { rows, next, stats })
+}
+
+fn validate(request: &ScanRequest) -> Result<()> {
+    if request.limit == 0 || request.limit > MAX_LIMIT {
+        bail!("scan limit must be in 1..={MAX_LIMIT}");
+    }
+    if request.max_examined == 0 || request.max_examined > MAX_EXAMINED {
+        bail!("scan max_examined must be in 1..={MAX_EXAMINED}");
+    }
+    if matches!((&request.from, &request.to), (Some(a), Some(b)) if a >= b) {
+        bail!("scan lower bound must be less than its upper bound");
+    }
+    let mut contents = HashSet::new();
+    for selected in &request.contents {
+        if selected.name.is_empty() {
+            bail!("selected content name must not be empty");
+        }
+        if !contents.insert(selected.name.as_str()) {
+            bail!("content {:?} is selected more than once", selected.name);
+        }
+    }
+    for predicate in &request.predicates {
+        match predicate {
+            Predicate::Attr { name, .. }
+            | Predicate::AttrExists { name, .. }
+            | Predicate::ContentExists { name, .. }
+                if name.is_empty() =>
+            {
+                bail!("predicate field name must not be empty")
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn project_content(
+    name: &str,
+    content: Option<&Content>,
+    bytes: Option<Vec<u8>>,
+) -> ProjectedContent {
+    ProjectedContent {
+        name: name.to_string(),
+        present: content.is_some(),
+        len: content.map(Content::len),
+        pieces: content.map(|c| {
+            c.ops.iter().filter(|op| matches!(op, crate::types::ContentOp::Piece { .. })).count()
+        }),
+        bytes,
+    }
+}
+
+fn shadowed_attrs(attrs: &[(String, AttrValue)]) -> usize {
+    let mut seen = HashSet::new();
+    attrs.iter().filter(|(name, value)| !seen.insert((name.as_str(), value.type_tag()))).count()
+}
+
+fn matches_predicate(id: &str, record: Option<&Record>, predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::Id { op, value } => compare_order(id.as_bytes().cmp(value.as_bytes()), *op),
+        Predicate::Attr { name, op, value } => record
+            .and_then(|r| {
+                r.attrs.iter().find(|(key, candidate)| {
+                    key == name && candidate.type_tag() == value.type_tag()
+                })
+            })
+            .is_some_and(|(_, candidate)| compare_attr(candidate, value, *op)),
+        Predicate::AttrExists { name, present } => {
+            record.is_some_and(|r| r.attrs.iter().any(|(key, _)| key == name)) == *present
+        }
+        Predicate::ContentExists { name, present } => {
+            record.is_some_and(|r| r.content(name).is_some()) == *present
+        }
+    }
+}
+
+fn compare_attr(a: &AttrValue, b: &AttrValue, op: Compare) -> bool {
+    match (a, b) {
+        (AttrValue::Str(a), AttrValue::Str(b)) => compare_order(a.as_bytes().cmp(b.as_bytes()), op),
+        (AttrValue::Int(a), AttrValue::Int(b)) => compare_order(a.cmp(b), op),
+        (AttrValue::Bool(a), AttrValue::Bool(b)) => compare_order(a.cmp(b), op),
+        (AttrValue::Float(a), AttrValue::Float(b)) => match op {
+            Compare::Eq => a.to_bits() == b.to_bits(),
+            Compare::Ne => a.to_bits() != b.to_bits(),
+            _ => a.partial_cmp(b).is_some_and(|ordering| compare_order(ordering, op)),
+        },
+        _ => false,
+    }
+}
+
+fn compare_order(ordering: Ordering, op: Compare) -> bool {
+    match op {
+        Compare::Eq => ordering == Ordering::Equal,
+        Compare::Ne => ordering != Ordering::Equal,
+        Compare::Lt => ordering == Ordering::Less,
+        Compare::LtEq => ordering != Ordering::Greater,
+        Compare::Gt => ordering == Ordering::Greater,
+        Compare::GtEq => ordering != Ordering::Less,
+    }
+}
+
+fn after(id: &str) -> String {
+    let mut out = String::with_capacity(id.len() + 1);
+    out.push_str(id);
+    out.push('\0');
+    out
+}
+
+#[derive(Debug)]
+struct DecodedCursor {
+    direction: Direction,
+    fingerprint: [u8; CURSOR_FINGERPRINT],
+    last_id: String,
+}
+
+fn encode_cursor(
+    direction: Direction,
+    fingerprint: [u8; CURSOR_FINGERPRINT],
+    last_id: &str,
+) -> Result<String> {
+    let id_len =
+        u32::try_from(last_id.len()).context("record id is too large for a scan cursor")?;
+    let mut payload = Vec::with_capacity(22 + last_id.len());
+    payload.push(CURSOR_VERSION);
+    payload.push(u8::from(direction == Direction::Reverse));
+    payload.extend_from_slice(&fingerprint);
+    payload.extend_from_slice(&id_len.to_le_bytes());
+    payload.extend_from_slice(last_id.as_bytes());
+    let checksum = blake3::hash(&payload);
+    payload.extend_from_slice(&checksum.as_bytes()[..CURSOR_CHECKSUM]);
+    Ok(hex(&payload))
+}
+
+fn decode_cursor(token: &str) -> Result<DecodedCursor> {
+    let bytes = unhex(token).context("invalid scan cursor")?;
+    let fixed = 2 + CURSOR_FINGERPRINT + 4 + CURSOR_CHECKSUM;
+    if bytes.len() < fixed {
+        bail!("invalid scan cursor: truncated payload");
+    }
+    if bytes[0] != CURSOR_VERSION {
+        bail!("unsupported scan cursor version {}", bytes[0]);
+    }
+    let direction = match bytes[1] {
+        0 => Direction::Forward,
+        1 => Direction::Reverse,
+        v => bail!("invalid scan cursor direction {v}"),
+    };
+    let mut fingerprint = [0u8; CURSOR_FINGERPRINT];
+    fingerprint.copy_from_slice(&bytes[2..2 + CURSOR_FINGERPRINT]);
+    let at = 2 + CURSOR_FINGERPRINT;
+    let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let payload_len = (at + 4)
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("invalid scan cursor length overflow"))?;
+    if payload_len + CURSOR_CHECKSUM != bytes.len() {
+        bail!("invalid scan cursor length");
+    }
+    let want = blake3::hash(&bytes[..payload_len]);
+    if want.as_bytes()[..CURSOR_CHECKSUM] != bytes[payload_len..] {
+        bail!("invalid scan cursor checksum");
+    }
+    let last_id = String::from_utf8(bytes[at + 4..payload_len].to_vec())
+        .context("scan cursor id is not UTF-8")?;
+    Ok(DecodedCursor { direction, fingerprint, last_id })
+}
+
+fn fingerprint(request: &ScanRequest) -> [u8; CURSOR_FINGERPRINT] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"turndb-scan-v1");
+    hash_optional(&mut h, request.from.as_deref());
+    hash_optional(&mut h, request.to.as_deref());
+    h.update(&[u8::from(request.direction == Direction::Reverse)]);
+    h.update(&(request.predicates.len() as u64).to_le_bytes());
+    for predicate in &request.predicates {
+        match predicate {
+            Predicate::Id { op, value } => {
+                h.update(&[0, op_tag(*op)]);
+                hash_bytes(&mut h, value.as_bytes());
+            }
+            Predicate::Attr { name, op, value } => {
+                h.update(&[1, op_tag(*op), value.type_tag()]);
+                hash_bytes(&mut h, name.as_bytes());
+                hash_attr(&mut h, value);
+            }
+            Predicate::AttrExists { name, present } => {
+                h.update(&[2, u8::from(*present)]);
+                hash_bytes(&mut h, name.as_bytes());
+            }
+            Predicate::ContentExists { name, present } => {
+                h.update(&[3, u8::from(*present)]);
+                hash_bytes(&mut h, name.as_bytes());
+            }
+        }
+    }
+    let digest = h.finalize();
+    digest.as_bytes()[..CURSOR_FINGERPRINT].try_into().unwrap()
+}
+
+fn hash_optional(h: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            h.update(&[1]);
+            hash_bytes(h, value.as_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+}
+
+fn hash_bytes(h: &mut blake3::Hasher, value: &[u8]) {
+    h.update(&(value.len() as u64).to_le_bytes());
+    h.update(value);
+}
+
+fn hash_attr(h: &mut blake3::Hasher, value: &AttrValue) {
+    match value {
+        AttrValue::Str(v) => hash_bytes(h, v.as_bytes()),
+        AttrValue::Int(v) => {
+            h.update(&v.to_le_bytes());
+        }
+        AttrValue::Float(v) => {
+            h.update(&v.to_bits().to_le_bytes());
+        }
+        AttrValue::Bool(v) => {
+            h.update(&[u8::from(*v)]);
+        }
+    }
+}
+
+fn op_tag(op: Compare) -> u8 {
+    match op {
+        Compare::Eq => 0,
+        Compare::Ne => 1,
+        Compare::Lt => 2,
+        Compare::LtEq => 3,
+        Compare::Gt => 4,
+        Compare::GtEq => 5,
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").unwrap();
+    }
+    out
+}
+
+fn unhex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        bail!("hex token has odd length");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let s = std::str::from_utf8(pair).context("hex token is not ASCII")?;
+            u8::from_str_radix(s, 16).context("hex token contains a non-hex byte")
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_roundtrips_arbitrary_valid_ids() {
+        let fingerprint = [7u8; CURSOR_FINGERPRINT];
+        for id in ["", "plain", "nul\0inside", "astral-\u{10ffff}"] {
+            let token = encode_cursor(Direction::Reverse, fingerprint, id).unwrap();
+            let got = decode_cursor(&token).unwrap();
+            assert_eq!(got.direction, Direction::Reverse);
+            assert_eq!(got.fingerprint, fingerprint);
+            assert_eq!(got.last_id, id);
+        }
+    }
+
+    #[test]
+    fn malformed_cursor_text_never_panics() {
+        for token in ["", "0", "gg", "é", "00é", &"ff".repeat(128)] {
+            let _ = decode_cursor(token);
+        }
+    }
+}

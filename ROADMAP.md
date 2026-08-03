@@ -22,7 +22,9 @@ content model right before compatibility turns today's choices into permanent pr
   capability, limit, and Rust-versus-binding decisions, including current gaps rather than presenting
   them as completed guarantees.
 - The columnar lens is separated from DataFusion as the first Phase-2 seam. Writer memtable visibility
-  and the storage-native structured scan/cursor contract remain the next critical path.
+  is now available through a feature-independent structured pager with checked Rust-owned cursors,
+  exact typed predicates, bounded live-record examination, reverse paging, and opt-in named-content
+  reconstruction. Pushing that API down into selected physical columns is the next query-core step.
 
 ## Product boundary
 

@@ -141,35 +141,56 @@ pub fn scan_ids(
     if limit == 0 || parts.is_empty() {
         return Ok(Vec::new());
     }
-    // Candidates from every part's matching run. A part contributes at most its own run, so this
-    // is bounded by the range rather than by the store.
-    let mut cand: Vec<String> = Vec::new();
-    for p in parts {
-        let rows = p.rows_in_range(from, to)?;
-        if rows.is_empty() {
-            continue;
-        }
-        let listed = p.ids()?;
-        for row in rows {
-            if let Some(id) = listed.get(row) {
-                cand.push(id.clone());
-            }
-        }
-    }
-    cand.sort_unstable();
-    cand.dedup();
-    if reverse {
-        cand.reverse();
+    struct Walk {
+        range: std::ops::Range<usize>,
+        row: usize,
+        current: Option<String>,
     }
 
-    // Resolve visibility per candidate, stopping as soon as the page is full — the reason this
-    // does not call `visibility`, which is O(store).
-    let mut out = Vec::with_capacity(limit.min(cand.len()));
-    for id in cand {
-        if locate(parts, &id)?.is_some() {
-            out.push(id);
-            if out.len() == limit {
-                break;
+    let mut walks = Vec::with_capacity(parts.len());
+    for part in parts {
+        let range = part.rows_in_range(from, to)?;
+        let row = if reverse { range.end.saturating_sub(1) } else { range.start };
+        let current = if range.is_empty() { None } else { Some(part.id(row)?) };
+        walks.push(Walk { range, row, current });
+    }
+
+    // K-way walk over the already-sorted ranges. Equal ids are resolved as one group; the newest
+    // part in that group decides, including when it is a tombstone. Crucially, the walk stops once
+    // `limit` live ids are found instead of materialising every candidate in the requested range.
+    let mut out = Vec::with_capacity(limit);
+    while out.len() < limit {
+        let best = walks
+            .iter()
+            .filter_map(|walk| walk.current.as_ref())
+            .min_by(|a, b| if reverse { b.cmp(a) } else { a.cmp(b) })
+            .cloned();
+        let Some(best) = best else { break };
+        let matching: Vec<usize> = walks
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, walk)| (walk.current.as_deref() == Some(best.as_str())).then_some(pi))
+            .collect();
+        let newest = *matching.last().expect("the selected id has at least one source part");
+        if !parts[newest].is_tombstone(walks[newest].row)? {
+            out.push(best);
+        }
+        for pi in matching {
+            let walk = &mut walks[pi];
+            if reverse {
+                if walk.row == walk.range.start {
+                    walk.current = None;
+                } else {
+                    walk.row -= 1;
+                    walk.current = Some(parts[pi].id(walk.row)?);
+                }
+            } else {
+                walk.row += 1;
+                if walk.row >= walk.range.end {
+                    walk.current = None;
+                } else {
+                    walk.current = Some(parts[pi].id(walk.row)?);
+                }
             }
         }
     }

@@ -630,6 +630,19 @@ impl Part {
         Ok(a)
     }
 
+    /// Decode one id by row without materialising the whole id column.
+    ///
+    /// Front-coding restarts every 16 rows, so this reads at most one restart group. Range pagers use
+    /// it to stop with the requested page rather than decoding every id after the range boundary.
+    pub fn id(&self, row: usize) -> Result<String> {
+        if row >= self.len() {
+            bail!("row {row} out of range");
+        }
+        let stream = self.sect("ids")?;
+        let restarts = self.restarts()?;
+        Ok(String::from_utf8(IdCol::new(&stream, &restarts, self.len()).get(row)?)?)
+    }
+
     /// The id column's restart offsets, widened to u32.
     ///
     /// NOT cached, deliberately. Caching it looked obviously right — three call sites rebuild the

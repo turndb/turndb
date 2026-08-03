@@ -99,9 +99,10 @@ The supported writer-side structured query contract is read-your-writes: a query
 writer must include its memtable with newest-wins resolution before predicates. An immutable
 `ReadStore` query sees exactly its manifest snapshot.
 
-**Current gap:** the existing Arrow/DataFusion table is built only from immutable parts. It therefore
-requires a flush to see writer memtable data. The native binding must not paper over this by forcing
-flushes; the structured scan core needs a writer snapshot source that overlays the memtable.
+`Store::scan` implements this writer-side contract without forcing a flush; `ReadStore::scan` uses the
+same request and page types over its immutable snapshot. **Current gap:** the Arrow/DataFusion table is
+still built only from immutable parts. A future live Arrow snapshot must overlay the memtable rather
+than flush as a side effect.
 
 ### Snapshots and compaction
 
@@ -132,9 +133,18 @@ budget individually, but no value may be silently truncated.
 The `columnar` feature now exposes the Arrow lens without DataFusion. The `sql` feature adds DataFusion
 over precisely that lens. DataFusion pushdown is conservative and cannot change answers.
 
-**Current gaps:** field predicates do not yet include id, null/missing, or existence operations;
-ordering is physical part order rather than a public stable cursor contract; cancellation and
-deadlines are absent; scan statistics do not yet report section bytes or distinct fold blocks.
+The initial feature-independent structured pager supports id bounds, exact typed attribute
+comparisons, attribute/content presence, stable id ordering in either direction, projection of
+selected attributes, content metadata without reconstruction, opt-in content bytes, checked opaque
+cursors, and a bound on live records evaluated against predicates. A writer page is a consistent view
+for the duration of one call. Between pages, keyset continuation prevents duplicates but may include a
+new id inserted ahead of the cursor; callers requiring an immutable multi-page view use `ReadStore`.
+
+**Current gaps:** the structured pager point-decodes each eligible record rather than pushing selected
+fields into the columnar lens; arbitrary field ordering, explicit null values, cancellation, and
+deadlines are absent; scan statistics do not yet report section bytes or distinct fold blocks. The
+`max_examined` budget counts live records evaluated against predicates, not superseded physical rows
+encountered while resolving them.
 
 ## 5. Platform capabilities
 
