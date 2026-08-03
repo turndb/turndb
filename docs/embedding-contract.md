@@ -293,12 +293,13 @@ artifact selection is not implemented yet. SQL planning and offline recovery are
 and the aggregate execution budget is not a total-process RSS limit. The package is a tested source
 prototype and must not be described as a production distribution.
 
-The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
-overload, closed handles, typed scan/SQL-pull interruption, typed DataFusion invalid-input,
-unsupported, resource-exhaustion and I/O variants, writer contention, and typed backup destination,
-corruption, unsupported-platform, not-found, and filesystem failures. Contention is a typed
-`WriterLocked` condition in the Rust core; consumers do not match its message. Unknown core failures
-deliberately remain `INTERNAL` until their engine error variants exist.
+The package-level `TurnDbError` uses the same generic typed-cause classifier exposed to Rust
+embedders. It gives stable codes to boundary/scan/cursor validation, bounded-queue overload, closed
+handles, interruption, resource ceilings, typed SQL failures, writer contention, filesystem causes,
+backup/restore, manifest recovery, and explicit verification-integrity failures. Only `BUSY` and
+`CLOSED` are binding-owned. Messages preserve full context but are not API; unknown core failures
+deliberately remain `INTERNAL` until a typed engine boundary proves otherwise. See
+`docs/error-taxonomy.md`.
 
 Writer lifecycle commands are serialized with ingest. `compact`, `verify`, `punch`, and `refold`
 first sync and flush earlier writes, then operate on the resulting published cut. Verification covers

@@ -290,7 +290,13 @@ test('pages and filters in Rust and refuses cursor misuse', async (t) => {
   const first = await store.scan({ ...request, limit: 1 });
   await assert.rejects(
     store.scan({ ...request, from: 'r2', cursor: first.next }),
-    /cursor belongs to different bounds or predicates/
+    (error) => error instanceof TurnDbError
+      && error.code === 'INVALID_ARGUMENT'
+      && /cursor belongs to different bounds or predicates/.test(error.message),
+  );
+  await assert.rejects(
+    store.scan({ cursor: 'not-hex' }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
   );
 });
 
@@ -357,7 +363,19 @@ test('explains structured fields, budgets, cursors, and exact physical scope', a
   assert.equal(resumed.effectiveFrom, 'a\0');
   await assert.rejects(
     store.explainScan({ from: 'b', to: 'z', cursor: first.next }),
-    /cursor belongs to different bounds or predicates/,
+    (error) => error instanceof TurnDbError
+      && error.code === 'INVALID_ARGUMENT'
+      && /cursor belongs to different bounds or predicates/.test(error.message),
+  );
+  await assert.rejects(
+    store.explainScan({ limit: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(
+    store.explainScan({ signal: aborted.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
   );
 
   const snapshot = await store.snapshot();
@@ -878,6 +896,35 @@ test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', a
   aborted.abort();
   await cancelled(store.verify({ signal: aborted.signal }));
   assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['still-present']);
+});
+
+test('classifies verified persisted-byte damage as corruption', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(false); } catch {}
+  });
+  await store.write([{ kind: 'put', id: 'damaged', attrs: [
+    { name: 'kind', kind: 'string', stringValue: 'test' },
+  ] }]);
+  await store.flush();
+
+  const part = fs.readdirSync(dir).find((name) => name.endsWith('.part'));
+  assert(part);
+  const partPath = path.join(dir, part);
+  const fd = fs.openSync(partPath, 'r+');
+  const byte = Buffer.alloc(1);
+  fs.readSync(fd, byte, 0, 1, 0);
+  byte[0] ^= 0xff;
+  fs.writeSync(fd, byte, 0, 1, 0);
+  fs.closeSync(fd);
+
+  await assert.rejects(
+    store.verify(),
+    (error) => error instanceof TurnDbError
+      && error.code === 'CORRUPTION'
+      && /verify retained manifest chain/.test(error.message),
+  );
 });
 
 test('reports cheap health across staging and publication', async (t) => {

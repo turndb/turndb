@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
 use turndb::scan::{
-    CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ScanInterrupted,
-    ScanInterruptionReason, ScanRequest,
+    CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ScanInputError,
+    ScanInterrupted, ScanInterruptionReason, ScanRequest,
 };
 use turndb::store::{ContentSpans, Span, Store};
 use turndb::AttrValue;
@@ -777,19 +777,25 @@ fn cursor_tampering_or_request_reuse_is_refused() {
     let mut changed = request.clone();
     changed.cursor = Some(cursor.clone());
     changed.predicates.push(Predicate::ContentExists { name: "body".into(), present: true });
-    assert!(store.scan(&changed).is_err(), "a cursor cannot skip into a different predicate set");
+    assert!(
+        store.scan(&changed).unwrap_err().downcast_ref::<ScanInputError>().is_some(),
+        "a cursor cannot skip into a different predicate set"
+    );
 
     let mut reversed = request.clone();
     reversed.cursor = Some(cursor.clone());
     reversed.direction = Direction::Reverse;
-    assert!(store.scan(&reversed).is_err());
+    assert!(store.scan(&reversed).unwrap_err().downcast_ref::<ScanInputError>().is_some());
 
     let mut damaged_token = cursor;
     let replacement = if damaged_token.ends_with('0') { "1" } else { "0" };
     damaged_token.replace_range(damaged_token.len() - 1.., replacement);
     let mut damaged = request;
     damaged.cursor = Some(damaged_token);
-    assert!(store.scan(&damaged).is_err(), "cursor checksum must catch tampering");
+    assert!(
+        store.scan(&damaged).unwrap_err().downcast_ref::<ScanInputError>().is_some(),
+        "cursor checksum must catch tampering"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -991,7 +997,9 @@ fn invalid_resolution_budgets_are_refused_before_range_work() {
     for value in [0, turndb::scan::MAX_RESOLUTION_ENTRIES + 1] {
         assert!(store
             .scan(&ScanRequest { max_resolution_entries: value, ..ScanRequest::default() })
-            .is_err());
+            .unwrap_err()
+            .downcast_ref::<ScanInputError>()
+            .is_some());
     }
     std::fs::remove_dir_all(dir).ok();
 }

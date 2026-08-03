@@ -57,6 +57,9 @@ silently.
   projected, predicate-only, and byte-reconstructed fields; effective bounds and budgets; and exact
   pre-resolution part/row/memtable scope. It does not estimate result counts or read value/content
   columns. See [structured scan explanation](../../docs/scan-explanation.md).
+- Every rejection is normalized to `TurnDbError`. Its stable `code` comes from the Rust engine's
+  typed cause classifier; `BUSY` and `CLOSED` are the only binding-owned states. Messages retain full
+  diagnostic context but are not an API. See [error taxonomy](../../docs/error-taxonomy.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.

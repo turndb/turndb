@@ -47,6 +47,7 @@
 pub mod capabilities;
 pub mod carve;
 pub mod control;
+pub mod error;
 pub mod fold;
 mod io_trace;
 pub mod pack;
