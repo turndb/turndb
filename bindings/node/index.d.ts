@@ -63,6 +63,37 @@ export interface ScanPage {
   };
 }
 
+export type SqlParam =
+  | { kind: 'null' }
+  | { kind: 'string'; stringValue: string }
+  | { kind: 'int'; intValue: bigint }
+  | { kind: 'float'; floatValue: number }
+  | { kind: 'bool'; boolValue: boolean }
+  | { kind: 'binary'; binaryValue: Buffer };
+
+export interface SqlQueryOptions {
+  /** DataFusion execution memory; defaults to 256 MiB. IPC output and store caches are separate. */
+  maxMemoryBytes?: bigint;
+}
+
+export interface SqlStats {
+  rows: bigint;
+  batches: bigint;
+  columnsDecoded: bigint;
+  foldReads: bigint;
+  rowsFiltered: bigint;
+  rowsHidden: bigint;
+  batchesSkipped: bigint;
+  shadowedOccurrences: bigint;
+}
+
+export interface SqlBatch {
+  /** Complete Arrow IPC stream containing the result schema and exactly one record batch. */
+  ipc: Buffer;
+  rows: number;
+  stats: SqlStats;
+}
+
 export interface Capabilities {
   partFormatWrite: number;
   partFormatReadMax: number;
@@ -84,6 +115,9 @@ export interface Capabilities {
   scanCancellation: true;
   scanReconstructionBudget: true;
   scanReconstructedBytesDefault: bigint;
+  arrowIpc: boolean;
+  parameterizedSql: boolean;
+  sqlMemoryBytesDefault?: bigint;
 }
 
 export interface OpenOptions {
@@ -128,6 +162,8 @@ export type TurnDbErrorCode =
   | 'BUSY'
   | 'CLOSED'
   | 'CANCELLED'
+  | 'RESOURCE_EXHAUSTED'
+  | 'UNSUPPORTED'
   | 'CONTENTION'
   | 'NOT_FOUND'
   | 'CORRUPTION'
@@ -142,11 +178,20 @@ export declare class TurnDbError extends Error {
 export declare function capabilities(): Capabilities;
 export declare function retainedCommits(path: string): Promise<bigint[]>;
 
+export declare class NativeSqlQuery {
+  readonly schemaIpc: Buffer;
+  /** Pull one batch; null is stable at EOF. Dropping or closing the query cancels remaining work. */
+  next(options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<SqlBatch | null>;
+  stats(): Promise<SqlStats>;
+  close(): Promise<void>;
+}
+
 export declare class NativeSnapshot {
   static open(path: string): Promise<NativeSnapshot>;
   static openAt(path: string, commit: bigint): Promise<NativeSnapshot>;
   readonly commit: bigint;
   scan(request?: ScanRequest): Promise<ScanPage>;
+  querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   schema(): Promise<StoreSchema>;
   close(): Promise<void>;
@@ -159,6 +204,8 @@ export declare class NativeStore {
   sync(): Promise<void>;
   flush(): Promise<boolean>;
   scan(request?: ScanRequest): Promise<ScanPage>;
+  /** Publishes earlier writes as an immutable cut before planning the query. */
+  querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   snapshot(): Promise<NativeSnapshot>;
   schema(): Promise<StoreSchema>;

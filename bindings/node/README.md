@@ -37,16 +37,24 @@ silently.
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
+- `querySql()` is the richer immutable query plane. The native package deliberately includes the
+  Arrow/DataFusion dependency: Rust binds typed `$1` parameters, refuses DDL/DML/session statements,
+  enforces a configurable execution-memory pool (256 MiB by default), and returns a
+  `NativeSqlQuery`. `schemaIpc` is a zero-batch Arrow stream; each `next()` returns one complete,
+  independently decodable Arrow IPC stream in a `Buffer`. Pulls accept `timeoutMs` and `AbortSignal`,
+  and close/drop cancels work not yet pulled. Calling it on a writer first publishes an exact
+  actor-ordered snapshot; calling it on `NativeSnapshot` never mutates the store.
 - `close()` syncs by default. Passing `false` is an explicit no-sync close.
 - Calls made after close refuse. `NativeStore.open(path, { commandQueueCapacity })` sets the accepted
   backlog from 1 through 65,536; the default remains 64 and the handle reports its actual value.
   Once that many operations are queued, ordinary operations refuse with an overload error rather
   than creating an unbounded backlog. `close()` remains admissible when the queue is full.
 - Rejections use `TurnDbError` with a stable `code`. The initial classes distinguish
-  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, `CANCELLED`, and `INTERNAL`; the original native
-  error is retained as `cause` and the full contextual message remains available. The declared code
-  union reserves `NOT_FOUND`, `CORRUPTION`, and `IO` while typed engine errors are added—unclassified
-  core failures report `INTERNAL` rather than being guessed from prose.
+  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, `CANCELLED`, SQL
+  `RESOURCE_EXHAUSTED`/`UNSUPPORTED`, and `INTERNAL`; the original native error is retained as `cause`
+  and the full contextual message remains available. The declared code union reserves `NOT_FOUND`,
+  `CORRUPTION`, and broader `IO` use while typed engine errors are added—unclassified core failures
+  report `INTERNAL` rather than being guessed from prose.
 - `compact()`, `verify()`, `punch()`, and `refold()` run on the same serialized writer actor. They
   sync and flush earlier writes before operating, so their reports cover an exact cut and their
   filesystem work stays off the event loop. `compact(true)` requests a full merge; the default uses
@@ -64,6 +72,7 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose Arrow IPC, SQL, backup/restore and recovery controls,
-cancellation for long-running lifecycle operations, or the complete engine error taxonomy. Those
-remain explicit Phase 3/4 work rather than being simulated in JavaScript.
+The current slice does not yet expose backup/restore and recovery controls, cancellation for
+long-running lifecycle operations or SQL planning, aggregate budgets across concurrent snapshot
+queries, or the complete engine error taxonomy. Those remain explicit Phase 3/4 work rather than
+being simulated in JavaScript.

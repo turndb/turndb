@@ -10,7 +10,8 @@
 # green tick that means less than it looks like:
 #
 #   every push and PR   fmt, clippy, rustdoc, `cargo test` x3 profiles, the example classifier,
-#                       and the npm package built from committed Rust
+#                       the portable npm package built from committed Rust, and the native N-API
+#                       addon across every Node major its package claims
 #   nightly + on demand the DST harness, which reconstructs crash states and is the one suite too
 #                       slow to sit in front of every push
 #
@@ -109,6 +110,32 @@ jobs:
       # generated; on a fresh checkout there is nothing stale to inherit.
       - name: build wasm from source and run the package suite
         run: bash npm/build.sh
+
+  native-node:
+    # This matrix is the native package's `engines.node` claim. N-API 6 is meant to decouple the
+    # addon from a single Node/V8 release; only loading and exercising the same Rust surface across
+    # the declared majors proves that seam. Platform prebuild coverage is a separate shipping gate.
+    name: native addon (node ${{ matrix.node }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-node
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # test:dev builds the default native profile (including Arrow/DataFusion), loads Cargo's
+      # shared library through process.dlopen, and runs the N-API contract suite against it.
+      - name: build and test native addon
+        run: npm run test:dev --prefix bindings/node
 
   dst:
     name: deterministic simulation (nightly)

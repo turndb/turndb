@@ -33,6 +33,8 @@
 //! version can never fall through and reveal an older version that happens to match.
 
 #[cfg(feature = "sql")]
+pub mod sql;
+#[cfg(feature = "sql")]
 pub mod table;
 
 use crate::fold::Fold;
