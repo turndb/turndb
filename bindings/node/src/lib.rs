@@ -8,8 +8,9 @@
 mod actor;
 
 use actor::{
-    Actor, ActorFault, BoundedCompactResult, CompactResult, CompactionSpaceResult, OwnedContent,
-    RefoldSpaceResult, VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
+    Actor, ActorFault, BoundedCompactResult, CompactResult, CompactionSpaceResult,
+    FormatMigrationPreflightResult, FormatMigrationStepResult, OwnedContent, RefoldSpaceResult,
+    VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
 };
 use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
 use napi::{Env, Error, Result, Status};
@@ -298,6 +299,7 @@ pub struct NativeCapabilities {
     pub write_admission_limits: bool,
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
+    pub format_migration: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -351,6 +353,7 @@ pub fn capabilities() -> NativeCapabilities {
         write_admission_limits: c.write_admission_limits,
         store_space_usage: c.store_space_usage,
         allocated_space_usage: c.allocated_space_usage,
+        format_migration: c.format_migration,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -480,6 +483,56 @@ pub struct NativeRefoldSpaceEstimate {
 pub struct NativeRefoldSpaceResult {
     pub flushed: bool,
     pub estimate: Option<NativeRefoldSpaceEstimate>,
+}
+
+#[napi(object)]
+pub struct NativeFormatMigrationStatus {
+    pub target_part_version: u8,
+    pub live_parts: BigInt,
+    pub current_parts: BigInt,
+    pub legacy_parts: BigInt,
+    pub legacy_rows: BigInt,
+    pub legacy_bytes: BigInt,
+    pub retained_legacy_parts: BigInt,
+    pub retained_legacy_rows: BigInt,
+    pub retained_legacy_bytes: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeFormatMigrationPlan {
+    pub part_index: BigInt,
+    pub source_part_version: u8,
+    pub seq_lo: BigInt,
+    pub seq_hi: BigInt,
+    pub input_rows: BigInt,
+    pub input_bytes: BigInt,
+    pub input_sections: BigInt,
+    pub input_raw_section_bytes: BigInt,
+    pub estimated_stage_bytes: BigInt,
+    pub estimate_is_hard_bound: bool,
+    pub retained_input_bytes_after_commit: BigInt,
+    pub filesystem_available_bytes: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct NativeFormatMigrationPreflightResult {
+    pub flushed: bool,
+    pub status: NativeFormatMigrationStatus,
+    pub estimate: Option<NativeFormatMigrationPlan>,
+}
+
+#[napi(object)]
+pub struct NativeFormatMigrationStep {
+    pub plan: NativeFormatMigrationPlan,
+    pub output_bytes: BigInt,
+    pub remaining_legacy_parts: BigInt,
+    pub rewrite: NativeMergeStats,
+}
+
+#[napi(object)]
+pub struct NativeFormatMigrationStepResult {
+    pub flushed: bool,
+    pub step: Option<NativeFormatMigrationStep>,
 }
 
 #[napi(object)]
@@ -1314,6 +1367,60 @@ impl NativeStore {
                 .await
                 .map(encode_compaction_space)
                 .map_err(|error| engine_failure("estimate TurnDB compaction space", error))
+        })
+    }
+
+    /// Inspect live immutable-part migration progress without changing store state.
+    #[napi]
+    pub fn format_migration_status<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeFormatMigrationStatus>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .format_migration_status(control)
+                .await
+                .map(encode_format_migration_status)
+                .map_err(|error| engine_failure("read TurnDB format migration status", error))
+        })
+    }
+
+    /// Settle earlier writes and preflight the next resumable format migration step.
+    #[napi]
+    pub fn estimate_format_migration_space<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeFormatMigrationPreflightResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .estimate_format_migration_space(control)
+                .await
+                .map(encode_format_migration_preflight)
+                .map_err(|error| engine_failure("preflight TurnDB format migration", error))
+        })
+    }
+
+    /// Settle earlier writes and atomically upgrade one legacy immutable part.
+    #[napi]
+    pub fn migrate_format_step<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeFormatMigrationStepResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .migrate_format_step(control)
+                .await
+                .map(encode_format_migration_step_result)
+                .map_err(|error| engine_failure("migrate TurnDB format", error))
         })
     }
 
@@ -2233,6 +2340,65 @@ fn encode_compaction_space(result: CompactionSpaceResult) -> NativeCompactionSpa
                 estimate.retained_input_bytes_after_commit,
             ),
             filesystem_available_bytes: estimate.filesystem_available_bytes.map(BigInt::from),
+        }),
+    }
+}
+
+fn encode_format_migration_status(
+    status: turndb::store::FormatMigrationStatus,
+) -> NativeFormatMigrationStatus {
+    NativeFormatMigrationStatus {
+        target_part_version: status.target_part_version,
+        live_parts: BigInt::from(status.live_parts as u64),
+        current_parts: BigInt::from(status.current_parts as u64),
+        legacy_parts: BigInt::from(status.legacy_parts as u64),
+        legacy_rows: BigInt::from(status.legacy_rows),
+        legacy_bytes: BigInt::from(status.legacy_bytes),
+        retained_legacy_parts: BigInt::from(status.retained_legacy_parts as u64),
+        retained_legacy_rows: BigInt::from(status.retained_legacy_rows),
+        retained_legacy_bytes: BigInt::from(status.retained_legacy_bytes),
+    }
+}
+
+fn encode_format_migration_plan(
+    plan: turndb::store::FormatMigrationPlan,
+) -> NativeFormatMigrationPlan {
+    NativeFormatMigrationPlan {
+        part_index: BigInt::from(plan.part_index as u64),
+        source_part_version: plan.source_part_version,
+        seq_lo: BigInt::from(plan.seq_lo),
+        seq_hi: BigInt::from(plan.seq_hi),
+        input_rows: BigInt::from(plan.input_rows),
+        input_bytes: BigInt::from(plan.input_bytes),
+        input_sections: BigInt::from(plan.input_sections as u64),
+        input_raw_section_bytes: BigInt::from(plan.input_raw_section_bytes),
+        estimated_stage_bytes: BigInt::from(plan.estimated_stage_bytes),
+        estimate_is_hard_bound: plan.estimate_is_hard_bound,
+        retained_input_bytes_after_commit: BigInt::from(plan.retained_input_bytes_after_commit),
+        filesystem_available_bytes: plan.filesystem_available_bytes.map(BigInt::from),
+    }
+}
+
+fn encode_format_migration_preflight(
+    result: FormatMigrationPreflightResult,
+) -> NativeFormatMigrationPreflightResult {
+    NativeFormatMigrationPreflightResult {
+        flushed: result.flushed,
+        status: encode_format_migration_status(result.status),
+        estimate: result.estimate.map(encode_format_migration_plan),
+    }
+}
+
+fn encode_format_migration_step_result(
+    result: FormatMigrationStepResult,
+) -> NativeFormatMigrationStepResult {
+    NativeFormatMigrationStepResult {
+        flushed: result.flushed,
+        step: result.step.map(|step| NativeFormatMigrationStep {
+            plan: encode_format_migration_plan(step.plan),
+            output_bytes: BigInt::from(step.output_bytes),
+            remaining_legacy_parts: BigInt::from(step.remaining_legacy_parts as u64),
+            rewrite: encode_merge(step.rewrite),
         }),
     }
 }

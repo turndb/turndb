@@ -81,6 +81,7 @@ function guarded(fn, operation) {
       lifecycleOptions = args[2];
     } else if ([
       'sync', 'flush', 'verify', 'punch', 'refold', 'estimateRefoldSpace', 'spaceUsage',
+      'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
     ].includes(operation)) {
       lifecycleOptions = args[0];
     }
@@ -105,6 +106,7 @@ for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSql
     'write', 'sync', 'flush', 'scan', 'explainScan', 'readContent', 'snapshot',
     'querySql', 'next', 'stats', 'compact', 'compactBounded', 'estimateCompactionSpace',
     'verify', 'erase', 'punch', 'refold', 'estimateRefoldSpace',
+    'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
     'backup', 'health', 'spaceUsage', 'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {

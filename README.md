@@ -130,6 +130,9 @@ see [bounded incremental compaction](docs/bounded-compaction.md).
 Reachability-aware storage inventory separates live, retained-only, and unclassified files, while
 compaction and refold expose exact source facts plus explicitly advisory staging estimates; see
 [maintenance space accounting and preflight](docs/maintenance-space.md).
+Live immutable parts can be upgraded one atomic, restartable unit at a time, with retained-snapshot
+dependencies and advisory stage space reported separately; see
+[resumable format migration](docs/format-migration.md).
 
 With `sql` enabled, `query::sql::SqlQuery` runs positional-parameter SQL against the generic
 `records` table under a configurable DataFusion execution-memory ceiling. DDL, DML, and session

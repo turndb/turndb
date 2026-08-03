@@ -138,7 +138,26 @@ pub fn merge_opts_with_control(
     drop_tombstones: bool,
     control: &crate::control::OperationControl,
 ) -> Result<(PartMeta, MergeStats)> {
-    control.check("part compaction")?;
+    merge_opts_with_control_for_operation(
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        control,
+        "part compaction",
+    )
+}
+
+/// Shared rewrite engine for callers with different publication protocols.
+pub(crate) fn merge_opts_with_control_for_operation(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+) -> Result<(PartMeta, MergeStats)> {
+    control.check(operation)?;
     if inputs.is_empty() {
         bail!("merge needs at least one input part");
     }
@@ -167,7 +186,7 @@ pub fn merge_opts_with_control(
     let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
     for p in &parts {
         for i in 0..p.piece_count()? {
-            control.check("part compaction")?;
+            control.check(operation)?;
             let (loc, hash) = p.piece(i)?;
             locs.entry(hash).or_insert(loc);
         }
@@ -188,7 +207,7 @@ pub fn merge_opts_with_control(
     let mut tombs_dropped = 0usize;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((_, pi, row, shadowed)) = kway.next_group()? {
-        control.check("part compaction")?;
+        control.check(operation)?;
         superseded += shadowed;
         if parts[pi].is_tombstone(row)? {
             if drop_tombstones {
@@ -237,7 +256,7 @@ pub fn merge_opts_with_control(
     )?;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((id, pi, row, _)) = kway.next_group()? {
-        control.check("part compaction")?;
+        control.check(operation)?;
         if parts[pi].is_tombstone(row)? {
             if !drop_tombstones {
                 b.push(&id, true, &[], &[])?;
@@ -246,7 +265,7 @@ pub fn merge_opts_with_control(
         }
         b.push(&id, false, &parts[pi].contents(row)?, &parts[pi].attrs(row)?)?;
     }
-    control.check("part compaction")?;
+    control.check(operation)?;
     let meta = b.finish(seq_lo, seq_hi)?;
 
     let stats = MergeStats {

@@ -1325,6 +1325,47 @@ pub struct RefoldSpaceEstimate {
     pub filesystem_available_bytes: Option<u64>,
 }
 
+/// Exact progress of upgrading the current live immutable-part set to this build's format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormatMigrationStatus {
+    pub target_part_version: u8,
+    pub live_parts: usize,
+    pub current_parts: usize,
+    pub legacy_parts: usize,
+    pub legacy_rows: u64,
+    pub legacy_bytes: u64,
+    /// Unique legacy parts pinned only by retained manifests, not counted in `legacy_parts`.
+    pub retained_legacy_parts: usize,
+    pub retained_legacy_rows: u64,
+    pub retained_legacy_bytes: u64,
+}
+
+/// Exact source facts and an advisory stage estimate for one resumable migration step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatMigrationPlan {
+    pub part_index: usize,
+    pub source_part_version: u8,
+    pub seq_lo: u64,
+    pub seq_hi: u64,
+    pub input_rows: u64,
+    pub input_bytes: u64,
+    pub input_sections: usize,
+    pub input_raw_section_bytes: u64,
+    pub estimated_stage_bytes: u64,
+    pub estimate_is_hard_bound: bool,
+    pub retained_input_bytes_after_commit: u64,
+    pub filesystem_available_bytes: Option<u64>,
+}
+
+/// Evidence returned after atomically publishing one migrated part.
+#[derive(Clone, Copy, Debug)]
+pub struct FormatMigrationStep {
+    pub plan: FormatMigrationPlan,
+    pub output_bytes: u64,
+    pub remaining_legacy_parts: usize,
+    pub rewrite: crate::part::merge::MergeStats,
+}
+
 /// Refuse an inverted scan range before it reaches `BTreeMap::range`, which PANICS on
 /// `start > end` rather than returning empty.
 ///
@@ -2311,6 +2352,229 @@ impl Store {
         Ok(Some(BoundedCompaction { plan, output_bytes, merge }))
     }
 
+    /// Report exact live-part format migration progress without decoding rows or content.
+    pub fn format_migration_status(&self) -> Result<FormatMigrationStatus> {
+        self.format_migration_status_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::format_migration_status`] with cooperative part checkpoints.
+    pub fn format_migration_status_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<FormatMigrationStatus> {
+        control.check("format migration status")?;
+        let mut status = FormatMigrationStatus {
+            target_part_version: crate::part::PART_VERSION,
+            live_parts: self.parts.len(),
+            ..FormatMigrationStatus::default()
+        };
+        for (part, part_ref) in self.parts.iter().zip(&self.manifest.parts) {
+            control.check("format migration status")?;
+            if part.format_version() == crate::part::PART_VERSION {
+                status.current_parts = status
+                    .current_parts
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("current format part count overflow"))?;
+                continue;
+            }
+            status.legacy_parts = status
+                .legacy_parts
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("legacy format part count overflow"))?;
+            status.legacy_rows = status
+                .legacy_rows
+                .checked_add(u64::from(part_ref.records))
+                .ok_or_else(|| anyhow::anyhow!("legacy format row count overflow"))?;
+            status.legacy_bytes = status
+                .legacy_bytes
+                .checked_add(std::fs::metadata(self.dir.join(&part_ref.file))?.len())
+                .ok_or_else(|| anyhow::anyhow!("legacy format byte count overflow"))?;
+        }
+        let live_files: HashSet<&str> =
+            self.manifest.parts.iter().map(|part| part.file.as_str()).collect();
+        let mut retained_seen = HashSet::new();
+        for commit in list_retained(&self.dir) {
+            control.check("format migration status")?;
+            let manifest = load_retained(&self.dir, commit)
+                .with_context(|| format!("inspect migration state at retained commit {commit}"))?;
+            for part_ref in manifest.parts {
+                control.check("format migration status")?;
+                if live_files.contains(part_ref.file.as_str())
+                    || !retained_seen.insert(part_ref.file.clone())
+                {
+                    continue;
+                }
+                let path = self.dir.join(&part_ref.file);
+                let part = Part::open_in(&path, self.pcache.clone())?;
+                if part.format_version() == crate::part::PART_VERSION {
+                    continue;
+                }
+                status.retained_legacy_parts = status
+                    .retained_legacy_parts
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("retained legacy part count overflow"))?;
+                status.retained_legacy_rows = status
+                    .retained_legacy_rows
+                    .checked_add(u64::from(part_ref.records))
+                    .ok_or_else(|| anyhow::anyhow!("retained legacy row count overflow"))?;
+                status.retained_legacy_bytes = status
+                    .retained_legacy_bytes
+                    .checked_add(std::fs::metadata(path)?.len())
+                    .ok_or_else(|| anyhow::anyhow!("retained legacy byte count overflow"))?;
+            }
+        }
+        Ok(status)
+    }
+
+    /// Preflight the oldest remaining live legacy part for one resumable migration step.
+    pub fn estimate_format_migration_space(&self) -> Result<Option<FormatMigrationPlan>> {
+        self.estimate_format_migration_space_with_control(
+            &crate::control::OperationControl::default(),
+        )
+    }
+
+    /// [`Store::estimate_format_migration_space`] with cooperative section checkpoints.
+    pub fn estimate_format_migration_space_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<FormatMigrationPlan>> {
+        control.check("format migration preflight")?;
+        if !self.mem.is_empty() {
+            bail!(
+                "format migration preflight requires a flushed memtable; call sync() and flush() first"
+            );
+        }
+        let Some(part_index) =
+            self.parts.iter().position(|part| part.format_version() < crate::part::PART_VERSION)
+        else {
+            return Ok(None);
+        };
+        let part = &self.parts[part_index];
+        let part_ref = &self.manifest.parts[part_index];
+        let input_bytes = std::fs::metadata(self.dir.join(&part_ref.file))?.len();
+        let mut input_sections = 0usize;
+        let mut input_raw_section_bytes = 0u64;
+        for (_, _, raw, _) in part.sections() {
+            control.check("format migration preflight")?;
+            input_sections = input_sections
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("migration section count overflow"))?;
+            input_raw_section_bytes = input_raw_section_bytes
+                .checked_add(u64::from(raw))
+                .ok_or_else(|| anyhow::anyhow!("migration raw section byte count overflow"))?;
+        }
+        let input_rows = u64::from(part_ref.records);
+        let row_allowance = input_rows
+            .checked_mul(64)
+            .ok_or_else(|| anyhow::anyhow!("migration row framing estimate overflow"))?;
+        let section_allowance = u64::try_from(input_sections)
+            .map_err(|_| anyhow::anyhow!("migration section count exceeds u64"))?
+            .checked_mul(256)
+            .ok_or_else(|| anyhow::anyhow!("migration section framing estimate overflow"))?;
+        let estimated_stage_bytes = input_raw_section_bytes
+            .checked_add(row_allowance)
+            .and_then(|bytes| bytes.checked_add(section_allowance))
+            .and_then(|bytes| bytes.checked_add(1 << 20))
+            .ok_or_else(|| anyhow::anyhow!("migration stage estimate overflow"))?;
+        Ok(Some(FormatMigrationPlan {
+            part_index,
+            source_part_version: part.format_version(),
+            seq_lo: part_ref.seq_lo,
+            seq_hi: part_ref.seq_hi,
+            input_rows,
+            input_bytes,
+            input_sections,
+            input_raw_section_bytes,
+            estimated_stage_bytes,
+            estimate_is_hard_bound: false,
+            retained_input_bytes_after_commit: input_bytes,
+            filesystem_available_bytes: crate::sys::filesystem_available_bytes(&self.dir)
+                .with_context(|| {
+                    format!("measure available filesystem bytes at {}", self.dir.display())
+                })?,
+        }))
+    }
+
+    /// Atomically rewrite the oldest remaining live legacy part in the current format.
+    ///
+    /// Each call is one durable progress unit. Cancellation removes its unpublished output; after
+    /// publication, reopening observes the migrated part and a later call resumes with the next.
+    /// Content bytes are not rewritten, and unavailable legacy identities remain unavailable.
+    pub fn migrate_format_step(&mut self) -> Result<Option<FormatMigrationStep>> {
+        self.migrate_format_step_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::migrate_format_step`] with cooperative checkpoints before publication.
+    pub fn migrate_format_step_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<FormatMigrationStep>> {
+        let Some(plan) = self.estimate_format_migration_space_with_control(control)? else {
+            return Ok(None);
+        };
+        let input = self.parts[plan.part_index].clone();
+        let file = format!(
+            "part-mv{}-{:08}-{:08}.part",
+            crate::part::PART_VERSION,
+            plan.seq_lo,
+            plan.seq_hi
+        );
+        let path = self.dir.join(&file);
+        if path.exists() {
+            bail!("format migration staging path already exists: {}", path.display());
+        }
+        let (meta, rewrite) = match crate::part::merge::merge_opts_with_control_for_operation(
+            &path,
+            &[input],
+            self.cfg.level,
+            false,
+            control,
+            "format migration",
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error);
+            }
+        };
+        let digest = match hash_file_with_control(&path, control, "format migration") {
+            Ok(hash) => hash.to_hex().to_string(),
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = control.check("format migration publication") {
+            let _ = crate::vfs::unlink(&path);
+            return Err(error.into());
+        }
+        let output_bytes = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error.into());
+            }
+        };
+        let mut manifest = self.manifest.clone();
+        manifest.parts[plan.part_index] = PartRef {
+            file,
+            seq_lo: meta.seq_lo,
+            seq_hi: meta.seq_hi,
+            records: meta.n_records,
+            b3: Some(digest),
+        };
+        manifest.commit(&self.dir)?;
+        self.parts[plan.part_index] = Arc::new(Part::open_in(&path, self.pcache.clone())?);
+        self.manifest = manifest;
+        sweep_unreachable(&self.dir)?;
+        let remaining_legacy_parts = self
+            .parts
+            .iter()
+            .filter(|part| part.format_version() < crate::part::PART_VERSION)
+            .count();
+        Ok(Some(FormatMigrationStep { plan, output_bytes, remaining_legacy_parts, rewrite }))
+    }
+
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
         if let Some(v) = self.mem.get(id) {
@@ -3036,13 +3300,7 @@ fn store_space_usage(
         retained_files: &retained_files,
         retained_folds: &retained_folds,
     };
-    account_store_files(
-        dir,
-        dir,
-        &reachability,
-        &mut usage,
-        control,
-    )?;
+    account_store_files(dir, dir, &reachability, &mut usage, control)?;
     Ok(usage)
 }
 
@@ -3077,13 +3335,7 @@ fn account_store_files(
         let entry = entry?;
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            account_store_files(
-                root,
-                &entry.path(),
-                reachability,
-                usage,
-                control,
-            )?;
+            account_store_files(root, &entry.path(), reachability, usage, control)?;
         } else if file_type.is_file() {
             let relative = relative_store_path(root, &entry.path())?;
             let metadata = entry.metadata()?;
@@ -3595,6 +3847,92 @@ mod tests {
         assert_eq!(got.next_seq, 9);
         assert_eq!(got.commit, 1, "commit() must advance the commit counter");
         assert!(!d.join("MANIFEST.tmp").exists(), "staging file must not survive a commit");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn format_migration_is_one_part_atomic_resumable_and_content_preserving() {
+        let d = std::env::temp_dir().join(format!(
+            "turndb-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut fold =
+            crate::fold::Fold::open(&d.join("fold"), crate::fold::FoldCfg::default()).unwrap();
+        fold.sync().unwrap();
+        let tail = fold.tail();
+        drop(fold);
+        let mut part_refs = Vec::new();
+        for (seq, id) in [(1, "legacy-one"), (2, "legacy-two")] {
+            let file = format!("legacy-{seq}.part");
+            let meta = crate::part::build_revision_two_fixture(&d.join(&file), seq, id).unwrap();
+            part_refs.push(super::PartRef {
+                file,
+                seq_lo: meta.seq_lo,
+                seq_hi: meta.seq_hi,
+                records: meta.n_records,
+                b3: None,
+            });
+        }
+        let mut manifest = super::Manifest {
+            parts: part_refs,
+            fold_seg: tail.seg,
+            fold_off: tail.off,
+            next_seq: 2,
+            ..super::Manifest::default()
+        };
+        manifest.commit(&d).unwrap();
+
+        let mut store = super::Store::open(&d, crate::fold::FoldCfg::default()).unwrap();
+        let before = store.format_migration_status().unwrap();
+        assert_eq!(before.legacy_parts, 2);
+        assert_eq!(before.current_parts, 0);
+        let plan = store.estimate_format_migration_space().unwrap().unwrap();
+        assert_eq!(plan.source_part_version, 2);
+        assert_eq!(plan.input_rows, 1);
+        assert!(!plan.estimate_is_hard_bound);
+
+        let cancellation = crate::control::CancellationToken::new();
+        cancellation.cancel();
+        let error = store
+            .migrate_format_step_with_control(&crate::control::OperationControl {
+                deadline: None,
+                cancellation: Some(cancellation),
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<crate::control::OperationInterrupted>().is_some());
+        assert_eq!(store.format_migration_status().unwrap().legacy_parts, 2);
+
+        let step = store.migrate_format_step().unwrap().unwrap();
+        assert_eq!(step.plan.part_index, plan.part_index);
+        assert_eq!(step.plan.source_part_version, plan.source_part_version);
+        assert_eq!((step.plan.seq_lo, step.plan.seq_hi), (plan.seq_lo, plan.seq_hi));
+        assert_eq!(step.plan.input_bytes, plan.input_bytes);
+        assert_eq!(step.rewrite.inputs, 1);
+        assert_eq!(step.remaining_legacy_parts, 1);
+        assert!(step.output_bytes <= plan.estimated_stage_bytes);
+        let record = store.get("legacy-one").unwrap().unwrap();
+        assert_eq!(record.contents[0].name, "payload");
+        assert_eq!(record.contents[0].identity, None, "migration must not invent identity");
+        assert_eq!(record.contents[0].ops, [crate::BodyOp::Lit(b"legacy".to_vec())]);
+        drop(store);
+
+        let mut reopened = super::Store::open(&d, crate::fold::FoldCfg::default()).unwrap();
+        let midway = reopened.format_migration_status().unwrap();
+        assert_eq!(midway.legacy_parts, 1);
+        assert_eq!(midway.current_parts, 1);
+        assert_eq!(midway.retained_legacy_parts, 1);
+        let resumed = reopened.migrate_format_step().unwrap().unwrap();
+        assert_eq!(resumed.remaining_legacy_parts, 0);
+        assert!(reopened.migrate_format_step().unwrap().is_none());
+        let after = reopened.format_migration_status().unwrap();
+        assert_eq!(after.legacy_parts, 0);
+        assert_eq!(after.current_parts, 2);
+        assert_eq!(after.retained_legacy_parts, 2);
+        assert!(after.retained_legacy_bytes > 0);
+        assert_eq!(reopened.get("legacy-one").unwrap().unwrap(), record);
+        assert!(reopened.get("legacy-two").unwrap().is_some());
         std::fs::remove_dir_all(&d).ok();
     }
 

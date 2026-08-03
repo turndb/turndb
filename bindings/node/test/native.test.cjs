@@ -35,6 +35,7 @@ test('reports the native capability profile without a portable fallback', () => 
     writeAdmissionLimits: true,
     storeSpaceUsage: true,
     allocatedSpaceUsage: process.platform !== 'win32',
+    formatMigration: true,
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -1040,6 +1041,26 @@ test('reports cheap health across staging and publication', async (t) => {
   assert.equal(published.retainedCommits, 1n);
   assert.equal(typeof published.foldCacheHits, 'bigint');
   assert.equal(typeof published.partCacheBudget, 'bigint');
+
+  const migration = await store.formatMigrationStatus();
+  assert.deepEqual(migration, {
+    targetPartVersion: 4,
+    liveParts: 1n,
+    currentParts: 1n,
+    legacyParts: 0n,
+    legacyRows: 0n,
+    legacyBytes: 0n,
+    retainedLegacyParts: 0n,
+    retainedLegacyRows: 0n,
+    retainedLegacyBytes: 0n,
+  });
+  const migrationPreflight = await store.estimateFormatMigrationSpace();
+  assert.equal(migrationPreflight.flushed, false);
+  assert.deepEqual(migrationPreflight.status, migration);
+  assert.equal(migrationPreflight.estimate, undefined);
+  const migrationStep = await store.migrateFormatStep();
+  assert.equal(migrationStep.flushed, false);
+  assert.equal(migrationStep.step, undefined);
 
   fs.writeFileSync(path.join(dir, 'operator-note'), 'not owned by TurnDB');
   const space = await store.spaceUsage();

@@ -23,6 +23,7 @@ Controlled operations currently include:
 - Offline candidate validation/publication through `store::recover_manifest_with_control`.
 - Store inventory and Node maintenance-space preflight while traversing or settling the
   actor-ordered store cut.
+- Format migration status, preflight, and one-part atomic publication.
 
 Checkpoints occur between records, dictionary entries, sections, fold frames, copied pieces, rebuilt
 parts, and independently punchable blocks. An individual unit is not split, so cancellation latency

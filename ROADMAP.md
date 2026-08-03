@@ -455,7 +455,9 @@ through years of writes, deletes, crashes, upgrades, and changing retention deci
 - Disk-space estimation before maintenance operations that may temporarily duplicate data.
   **Implemented for compaction and refold:** Rust and Node report exact source facts, retained-only
   pinning, filesystem availability where supported, and estimates explicitly marked as non-binding.
-- Format migration tooling with resumability and preflight checks.
+- Format migration tooling with resumability and preflight checks. **Implemented:** each step rewrites
+  one live legacy part and atomically publishes progress; status distinguishes live work from
+  retained-snapshot dependencies, and preflight exposes exact source facts plus an advisory estimate.
 - Generic deletion and erasure primitives that accept records selected by the consumer. TurnDB may
   execute a retention decision, but it should not invent the consumer's retention policy.
 

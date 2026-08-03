@@ -324,8 +324,9 @@ as submission-inclusive Node `timeoutMs` and `AbortSignal` options. Unpublished
 compaction/refold/backup/restore staging is removed on
 interruption; punching is durably resumable after cancellation or crash. Strong erasure accepts
 interruption only before its atomic tombstone phase, then drives physical removal to completion so it
-cannot return an ambiguous partial-erasure result. Resumable format migration remains a current gap.
-Flush part encoding remains an indivisible cancellation unit, while
+cannot return an ambiguous partial-erasure result. Format migration rewrites one live legacy part per
+atomic manifest commit, with separate retained-history status and space preflight. Flush part encoding
+remains an indivisible cancellation unit, while
 sync deliberately stops observing interruption once fsync begins.
 
 Bounded compaction is a generic actor-ordered maintenance primitive, not a built-in scheduling
