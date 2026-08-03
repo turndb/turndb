@@ -71,15 +71,14 @@ function guarded(fn, operation) {
         throw new TurnDbError('CANCELLED', 'next was cancelled before submission');
       });
     }
-    const lifecycleOptions = ['compact', 'compactBounded', 'erase', 'backup'].includes(operation)
-      ? args[1]
-      : operation === 'restoreBackup'
-        ? args[2]
-        : operation === 'recoverManifest'
-          ? args[1]
-          : ['verify', 'punch', 'refold'].includes(operation)
-          ? args[0]
-          : undefined;
+    let lifecycleOptions;
+    if (['compact', 'compactBounded', 'erase', 'backup', 'recoverManifest'].includes(operation)) {
+      lifecycleOptions = args[1];
+    } else if (['restoreBackup', 'querySql'].includes(operation)) {
+      lifecycleOptions = args[2];
+    } else if (['verify', 'punch', 'refold'].includes(operation)) {
+      lifecycleOptions = args[0];
+    }
     if (lifecycleOptions?.signal?.aborted) {
       return Promise.reject(new TurnDbError(
         'CANCELLED',

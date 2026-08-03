@@ -459,6 +459,19 @@ test('streams bounded parameterized read-only SQL as Arrow IPC', async (t) => {
     },
   ]);
 
+  await assert.rejects(
+    store.querySql('SELECT id FROM records', undefined, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+  assert.equal((await store.health()).memtableEntries, 3n);
+  const planningAbort = new AbortController();
+  planningAbort.abort();
+  await assert.rejects(
+    store.querySql('SELECT id FROM records', undefined, { signal: planningAbort.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+  assert.equal((await store.health()).memtableEntries, 3n);
+
   // Writer SQL takes and publishes an exact actor-ordered snapshot, so accepted unflushed rows are
   // included and query execution no longer occupies the writer actor.
   const query = await store.querySql(

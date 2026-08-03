@@ -81,9 +81,10 @@ silently.
 - `querySql()` is the richer immutable query plane. The native package deliberately includes the
   Arrow/DataFusion dependency: Rust binds typed `$1` parameters, refuses DDL/DML/session statements,
   enforces a configurable execution-memory pool (256 MiB by default), and returns a
-  `NativeSqlQuery`. `schemaIpc` is a zero-batch Arrow stream; each `next()` returns one complete,
-  independently decodable Arrow IPC stream in a `Buffer`. Pulls accept `timeoutMs` and `AbortSignal`,
-  and close/drop cancels work not yet pulled. Calling it on a writer first publishes an exact
+  `NativeSqlQuery`. Query options and pull options accept `timeoutMs` and `AbortSignal`; planning
+  cancellation drops the unfinished DataFusion future and releases its memory reservation.
+  `schemaIpc` is a zero-batch Arrow stream; each `next()` returns one complete, independently
+  decodable Arrow IPC stream in a `Buffer`, and close/drop cancels work not yet pulled. Calling it on a writer first publishes an exact
   actor-ordered snapshot; calling it on `NativeSnapshot` never mutates the store.
   Live queries reserve those per-query ceilings from a shared aggregate budget (1 GiB by default,
   configurable with `maxConcurrentSqlMemoryBytes`). Writer-derived snapshots share their writer's
@@ -127,6 +128,6 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose cancellation for SQL planning, sync, or flush. Low-level
-untyped invariant failures also retain the conservative `INTERNAL` class. Those remain explicit
-Phase 3/4 work rather than being simulated in JavaScript.
+The current slice does not yet expose cancellation for sync or flush. Low-level untyped invariant
+failures also retain the conservative `INTERNAL` class. Those remain explicit Phase 3/4 work rather
+than being simulated in JavaScript.

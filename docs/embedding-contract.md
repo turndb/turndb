@@ -284,13 +284,15 @@ shared aggregate budget defaults to 1 GiB and reserves each live query's configu
 writer-derived snapshots share their writer's governor. A pull-based `NativeSqlQuery` returns schema
 IPC separately and one complete, independently decodable
 Arrow IPC stream per batch; JavaScript never reconstructs a dynamic schema or walks Arrow rows.
-Batch pulls have timeouts and AbortSignal cancellation and dropping the Rust execution stream aborts
-unfinished work.
+Planning and batch pulls have absolute deadlines and AbortSignal cancellation; dropping either the
+unfinished planning future or Rust execution stream aborts its query work and releases reservations.
+For a writer query, an already-expired deadline refuses before actor submission. Cancellation after
+submission does not retract an ordered snapshot sync/flush that the actor may already complete.
 
 **Current gaps:** binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption,
 writer contention, backup/restore, and manifest recovery have stable machine-readable codes; prebuilt
-artifact selection is not implemented yet. SQL planning is not interruptible,
-and the aggregate execution budget is not a total-process RSS limit. The package is a tested source
+artifact selection is not implemented yet, and the aggregate execution budget is not a total-process
+RSS limit. The package is a tested source
 prototype and must not be described as a production distribution.
 
 The package-level `TurnDbError` uses the same generic typed-cause classifier exposed to Rust
@@ -316,7 +318,7 @@ compaction/refold/backup/restore staging is removed on
 interruption; punching is durably resumable after cancellation or crash. Strong erasure accepts
 interruption only before its atomic tombstone phase, then drives physical removal to completion so it
 cannot return an ambiguous partial-erasure result. Preflight space estimates and resumable format
-migration remain current gaps. SQL planning, sync, and flush remain non-cancellable.
+migration remain current gaps. Sync and flush remain non-cancellable.
 
 Bounded compaction is a generic actor-ordered maintenance primitive, not a built-in scheduling
 policy. A caller supplies simultaneous physical input-part, row, and exact file-byte ceilings. Rust

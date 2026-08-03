@@ -55,7 +55,11 @@ content model right before compatibility turns today's choices into permanent pr
   batches. Concurrent queries reserve their per-query ceilings from a configurable shared aggregate
   budget; writer-created snapshots inherit that governor and reservations release promptly. Query
   planning, read-only enforcement, storage scans, statistics, IPC encoding, and budget accounting
-  remain in Rust; JavaScript owns only handle lifetime and `Buffer` transport. CI builds and exercises
+  remain in Rust; JavaScript owns only handle lifetime and `Buffer` transport. Native query creation
+  now applies absolute `timeoutMs`/`AbortSignal` interruption across writer-actor queueing, DataFusion
+  planning, and stream startup; cancellation drops unfinished query work and releases its aggregate
+  reservation without pretending it can retract a snapshot publication already submitted to the
+  writer. CI builds and exercises
   that default addon on every Node major claimed by the native package; platform prebuild production
   and selection remain a separate unfinished gate. Online backup now settles an exact actor-ordered
   cut, verifies the completed pack, and atomically refuses replacement. Restore verifies before
@@ -412,8 +416,8 @@ exposes SQL and Arrow IPC; the structured no-feature build remains useful for em
 explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
 profile rather than misreporting the ordinary release artifact.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for SQL planning,
-sync, and flush (batch pulls and major maintenance loops are
+Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for sync and flush
+(SQL planning/pulls and major maintenance loops are
 cancellable); typed corruption/invariant markers for low-level paths that still conservatively
 classify as `INTERNAL`; and measured event-loop/query overhead under a representative mixed workload.
 
