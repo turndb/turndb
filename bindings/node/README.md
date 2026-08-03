@@ -166,3 +166,7 @@ silently.
 Part encoding during flush remains one uninterruptible unit. Low-level untyped invariant failures
 also retain the conservative `INTERNAL` class. Those remain explicit Phase 3/4 work rather than being
 simulated in JavaScript.
+
+The external [reference-consumer qualification](../../docs/reference-consumer-qualification.md)
+uses this public surface for both linked application/AI telemetry and a non-telemetry build pipeline.
+It is executable evidence for the general record seam, not an additional package API or core schema.
