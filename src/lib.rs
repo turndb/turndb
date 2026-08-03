@@ -50,6 +50,7 @@ pub mod control;
 pub mod error;
 pub mod fold;
 mod io_trace;
+pub mod observability;
 pub mod pack;
 pub mod part;
 #[cfg(feature = "columnar")]

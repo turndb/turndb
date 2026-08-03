@@ -136,6 +136,9 @@ silently.
   endpoint: commit and fold generation, part pressure, staged entries and bytes, WAL/fold bytes,
   cache counters and budgets, dedup-window size, retained commits, and punched blocks. It decodes no
   records or content and therefore does not claim an exact live-row count.
+- `metrics()` returns monotonic `bigint` outcomes and nanosecond totals for recovery and writer
+  lifecycle work. It is handle-local and pull-based; actor queue wait is deliberately separate from
+  core execution time. See [pull-based operation metrics](../../docs/operation-metrics.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to

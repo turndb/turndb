@@ -347,6 +347,9 @@ Phase-5 work; consumers may poll this generic value into their telemetry system.
 `space_usage` / `spaceUsage` inventory performs reachability-aware traversal and reports exact,
 disjoint live, retained-only, and unclassified storage categories. Structured pages separately expose
 exact section/block I/O attributable to that operation.
+`Store::metrics` and Node `metrics()` separately report process-local monotonic lifecycle outcomes and
+nanosecond totals. They are pull-based so consumer exporters never execute on the storage thread; see
+`docs/operation-metrics.md`.
 
 ## 7. Compatibility policy
 

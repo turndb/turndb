@@ -300,6 +300,7 @@ pub struct NativeCapabilities {
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
     pub format_migration: bool,
+    pub operation_metrics: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -354,6 +355,7 @@ pub fn capabilities() -> NativeCapabilities {
         store_space_usage: c.store_space_usage,
         allocated_space_usage: c.allocated_space_usage,
         format_migration: c.format_migration,
+        operation_metrics: c.operation_metrics,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -633,6 +635,30 @@ pub struct NativeHealth {
     pub dedup_window_entries: BigInt,
     pub retained_commits: BigInt,
     pub punched_blocks: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeOperationMetrics {
+    pub attempts: BigInt,
+    pub succeeded: BigInt,
+    pub failed: BigInt,
+    pub cancelled: BigInt,
+    pub total_duration_ns: BigInt,
+    pub last_duration_ns: BigInt,
+    pub max_duration_ns: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeStoreMetrics {
+    pub open_recovery: NativeOperationMetrics,
+    pub recovered_wal_frames: BigInt,
+    pub sync: NativeOperationMetrics,
+    pub flush: NativeOperationMetrics,
+    pub compaction: NativeOperationMetrics,
+    pub backup: NativeOperationMetrics,
+    pub punch: NativeOperationMetrics,
+    pub refold: NativeOperationMetrics,
+    pub format_migration: NativeOperationMetrics,
 }
 
 #[napi(object)]
@@ -1557,6 +1583,16 @@ impl NativeStore {
             .await
             .map(encode_health)
             .map_err(|error| engine_failure("read TurnDB health", error))
+    }
+
+    /// Return monotonic operation outcomes and wall-time totals since this handle opened.
+    #[napi]
+    pub async fn metrics(&self) -> Result<NativeStoreMetrics> {
+        self.actor
+            .metrics()
+            .await
+            .map(encode_store_metrics)
+            .map_err(|error| engine_failure("read TurnDB operation metrics", error))
     }
 
     /// Traverse and classify store files for maintenance-space preflight.
@@ -2486,6 +2522,34 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
         retained_commits: BigInt::from(health.retained_commits as u64),
         punched_blocks: BigInt::from(health.punched_blocks),
+    }
+}
+
+fn encode_operation_metrics(
+    metrics: turndb::observability::OperationMetrics,
+) -> NativeOperationMetrics {
+    NativeOperationMetrics {
+        attempts: BigInt::from(metrics.attempts),
+        succeeded: BigInt::from(metrics.succeeded),
+        failed: BigInt::from(metrics.failed),
+        cancelled: BigInt::from(metrics.cancelled),
+        total_duration_ns: BigInt::from(metrics.total_duration_ns),
+        last_duration_ns: BigInt::from(metrics.last_duration_ns),
+        max_duration_ns: BigInt::from(metrics.max_duration_ns),
+    }
+}
+
+fn encode_store_metrics(metrics: turndb::observability::StoreMetrics) -> NativeStoreMetrics {
+    NativeStoreMetrics {
+        open_recovery: encode_operation_metrics(metrics.open_recovery),
+        recovered_wal_frames: BigInt::from(metrics.recovered_wal_frames),
+        sync: encode_operation_metrics(metrics.sync),
+        flush: encode_operation_metrics(metrics.flush),
+        compaction: encode_operation_metrics(metrics.compaction),
+        backup: encode_operation_metrics(metrics.backup),
+        punch: encode_operation_metrics(metrics.punch),
+        refold: encode_operation_metrics(metrics.refold),
+        format_migration: encode_operation_metrics(metrics.format_migration),
     }
 }
 

@@ -1249,6 +1249,7 @@ pub struct Store {
     /// whole-part walk linear, so they cannot be removed — but unbounded they pinned 9.5x each part's
     /// on-disk size, which is a per-part cost that multiplies by part count.
     pcache: Arc<SectionCache>,
+    metrics: crate::observability::StoreMetrics,
 }
 
 /// Cheap operational state for an embedder's health and metrics endpoint.
@@ -1401,6 +1402,7 @@ impl Store {
 
     /// Open a writer with explicit runtime admission policy.
     pub fn open_with_limits(dir: &Path, cfg: FoldCfg, write_limits: WriteLimits) -> Result<Store> {
+        let recovery_started = std::time::Instant::now();
         let write_limits = write_limits.validate()?;
         crate::vfs::mkdir_all(dir)?;
         let manifest = match Manifest::load(dir) {
@@ -1459,6 +1461,7 @@ impl Store {
 
         let wal_path = dir.join("WAL");
         let frames = Wal::replay(&wal_path)?;
+        let recovered_wal_frames = u64::try_from(frames.len()).unwrap_or(u64::MAX);
         let mut mem: BTreeMap<String, Option<Record>> = BTreeMap::new();
         let mut mem_bytes = 0usize;
         for f in frames {
@@ -1477,6 +1480,11 @@ impl Store {
         }
         let wal = Wal::open(&wal_path)?;
 
+        let mut metrics = crate::observability::StoreMetrics {
+            recovered_wal_frames,
+            ..crate::observability::StoreMetrics::default()
+        };
+        metrics.open_recovery.observe_success(recovery_started.elapsed());
         Ok(Store {
             dir: dir.to_path_buf(),
             fold,
@@ -1488,12 +1496,18 @@ impl Store {
             cfg,
             write_limits,
             pcache,
+            metrics,
         })
     }
 
     /// The policy governing future writes through this handle.
     pub fn write_limits(&self) -> WriteLimits {
         self.write_limits
+    }
+
+    /// Monotonic, process-lifetime operation metrics for this writer handle.
+    pub fn metrics(&self) -> crate::observability::StoreMetrics {
+        self.metrics
     }
 
     /// Open for reading only: no lock, no replay, no daemon.
@@ -1877,8 +1891,13 @@ impl Store {
     /// Once WAL fsync begins, cancellation is no longer observed: returning cancellation after the
     /// writes became durable would misreport the acknowledgement outcome.
     pub fn sync_with_control(&mut self, control: &crate::control::OperationControl) -> Result<()> {
-        control.check("store sync")?;
-        self.wal.sync()
+        let started = std::time::Instant::now();
+        let result = (|| {
+            control.check("store sync")?;
+            self.wal.sync()
+        })();
+        self.metrics.sync.observe(started.elapsed(), &result);
+        result
     }
 
     /// Settle every accepted operation and publish a verified, immutable backup artifact.
@@ -1895,6 +1914,17 @@ impl Store {
     /// Sync/flush may publish an equivalent immutable representation of earlier accepted writes in
     /// the source store. Cancellation never publishes the backup destination.
     pub fn backup_with_control(
+        &mut self,
+        out: &Path,
+        control: &crate::control::OperationControl,
+    ) -> Result<crate::pack::BackupStats> {
+        let started = std::time::Instant::now();
+        let result = self.backup_inner_with_control(out, control);
+        self.metrics.backup.observe(started.elapsed(), &result);
+        result
+    }
+
+    fn backup_inner_with_control(
         &mut self,
         out: &Path,
         control: &crate::control::OperationControl,
@@ -1926,6 +1956,16 @@ impl Store {
     /// manifest and memtable remain unchanged. An unpublished part is removed. Once manifest commit
     /// begins, cancellation is no longer observed and the ordinary crash protocol owns the outcome.
     pub fn flush_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<PartRef>> {
+        let started = std::time::Instant::now();
+        let result = self.flush_inner_with_control(control);
+        self.metrics.flush.observe(started.elapsed(), &result);
+        result
+    }
+
+    fn flush_inner_with_control(
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<Option<PartRef>> {
@@ -2060,6 +2100,18 @@ impl Store {
 
     /// [`Store::merge_range`] with cooperative checkpoints before its manifest publication.
     pub fn merge_range_with_control(
+        &mut self,
+        lo: usize,
+        len: usize,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<crate::part::merge::MergeStats>> {
+        let started = std::time::Instant::now();
+        let result = self.merge_range_inner_with_control(lo, len, control);
+        self.metrics.compaction.observe(started.elapsed(), &result);
+        result
+    }
+
+    fn merge_range_inner_with_control(
         &mut self,
         lo: usize,
         len: usize,
@@ -2506,6 +2558,16 @@ impl Store {
 
     /// [`Store::migrate_format_step`] with cooperative checkpoints before publication.
     pub fn migrate_format_step_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<FormatMigrationStep>> {
+        let started = std::time::Instant::now();
+        let result = self.migrate_format_step_inner_with_control(control);
+        self.metrics.format_migration.observe(started.elapsed(), &result);
+        result
+    }
+
+    fn migrate_format_step_inner_with_control(
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<Option<FormatMigrationStep>> {
@@ -2964,6 +3026,16 @@ impl Store {
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<PunchStats> {
+        let started = std::time::Instant::now();
+        let result = self.punch_unreferenced_inner_with_control(control);
+        self.metrics.punch.observe(started.elapsed(), &result);
+        result
+    }
+
+    fn punch_unreferenced_inner_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<PunchStats> {
         control.check("content punching")?;
         if !self.mem.is_empty() {
             bail!("punching requires a flushed memtable; call sync() and flush() first");
@@ -3101,6 +3173,16 @@ impl Store {
     /// attempted, cancellation is no longer observed: the crash-safe commit protocol and mandatory
     /// handle/retention cleanup must run to a definite result.
     pub fn refold_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<refold::RefoldStats> {
+        let started = std::time::Instant::now();
+        let result = self.refold_inner_with_control(control);
+        self.metrics.refold.observe(started.elapsed(), &result);
+        result
+    }
+
+    fn refold_inner_with_control(
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<refold::RefoldStats> {

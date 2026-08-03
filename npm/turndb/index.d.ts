@@ -106,6 +106,7 @@ export interface Capabilities {
   store_space_usage: true;
   allocated_space_usage: boolean;
   format_migration: true;
+  operation_metrics: true;
   max_record_bytes_default: number;
   max_batch_bytes_default: number;
   max_batch_records_default: number;
