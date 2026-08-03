@@ -50,6 +50,10 @@ silently.
   independently decodable Arrow IPC stream in a `Buffer`. Pulls accept `timeoutMs` and `AbortSignal`,
   and close/drop cancels work not yet pulled. Calling it on a writer first publishes an exact
   actor-ordered snapshot; calling it on `NativeSnapshot` never mutates the store.
+  Live queries reserve those per-query ceilings from a shared aggregate budget (1 GiB by default,
+  configurable with `maxConcurrentSqlMemoryBytes`). Writer-derived snapshots share their writer's
+  budget; exhaustion fails immediately and reservations release on EOF, error, cancellation, close,
+  or drop. Handles expose both the limit and currently reserved bytes.
 - `close()` syncs by default. Passing `false` is an explicit no-sync close.
 - Calls made after close refuse. `NativeStore.open(path, { commandQueueCapacity })` sets the accepted
   backlog from 1 through 65,536; the default remains 64 and the handle reports its actual value.
@@ -79,6 +83,5 @@ silently.
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
 The current slice does not yet expose manifest recovery controls, cancellation for long-running
-lifecycle operations or SQL planning, aggregate budgets across concurrent snapshot queries, or the
-complete engine error taxonomy. Those remain explicit Phase 3/4 work rather than being simulated in
-JavaScript.
+lifecycle operations or SQL planning, or the complete engine error taxonomy. Those remain explicit
+Phase 3/4 work rather than being simulated in JavaScript.

@@ -51,8 +51,10 @@ content model right before compatibility turns today's choices into permanent pr
   one oversized row for progress, and resume before rather than after a deferred row. The default
   native build now also exposes immutable read-only SQL with typed positional parameters, a
   configurable DataFusion execution-memory pool, and pull-based independently decodable Arrow IPC
-  batches. Query planning, read-only enforcement, storage scans, statistics, and IPC encoding remain
-  in Rust; JavaScript owns only handle lifetime and `Buffer` transport. CI now builds and exercises
+  batches. Concurrent queries reserve their per-query ceilings from a configurable shared aggregate
+  budget; writer-created snapshots inherit that governor and reservations release promptly. Query
+  planning, read-only enforcement, storage scans, statistics, IPC encoding, and budget accounting
+  remain in Rust; JavaScript owns only handle lifetime and `Buffer` transport. CI builds and exercises
   that default addon on every Node major claimed by the native package; platform prebuild production
   and selection remain a separate unfinished gate. Online backup now settles an exact actor-ordered
   cut, verifies the completed pack, and atomically refuses replacement. Restore verifies before
@@ -339,8 +341,8 @@ profile rather than misreporting the ordinary release artifact.
 
 Remaining Phase-3 gaps are prebuilt platform artifacts, cancellation/deadlines for long-running
 lifecycle operations and SQL planning (batch pulls are cancellable), a complete typed engine error
-taxonomy, manifest recovery controls, aggregate limits across concurrent snapshot queries, and
-measured event-loop/query overhead under a representative mixed workload.
+taxonomy, manifest recovery controls, and measured event-loop/query overhead under a representative
+mixed workload.
 
 ### Maturity gate
 

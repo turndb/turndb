@@ -119,11 +119,18 @@ export interface Capabilities {
   arrowIpc: boolean;
   parameterizedSql: boolean;
   sqlMemoryBytesDefault?: bigint;
+  sqlAggregateMemoryBytesDefault?: bigint;
 }
 
 export interface OpenOptions {
   /** Accepted operations waiting behind the one executing; defaults to 64. */
   commandQueueCapacity?: number;
+  /** Aggregate reservation ceiling across live SQL queries; defaults to 1 GiB. */
+  maxConcurrentSqlMemoryBytes?: bigint;
+}
+
+export interface SnapshotOpenOptions {
+  maxConcurrentSqlMemoryBytes?: bigint;
 }
 
 export type AttributeType = 'string' | 'int' | 'float' | 'bool';
@@ -192,9 +199,11 @@ export declare class NativeSqlQuery {
 }
 
 export declare class NativeSnapshot {
-  static open(path: string): Promise<NativeSnapshot>;
-  static openAt(path: string, commit: bigint): Promise<NativeSnapshot>;
+  static open(path: string, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
+  static openAt(path: string, commit: bigint, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
   readonly commit: bigint;
+  readonly maxConcurrentSqlMemoryBytes: bigint;
+  readonly reservedSqlMemoryBytes: bigint;
   scan(request?: ScanRequest): Promise<ScanPage>;
   querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
@@ -205,6 +214,8 @@ export declare class NativeSnapshot {
 export declare class NativeStore {
   static open(path: string, options?: OpenOptions): Promise<NativeStore>;
   readonly commandQueueCapacity: number;
+  readonly maxConcurrentSqlMemoryBytes: bigint;
+  readonly reservedSqlMemoryBytes: bigint;
   write(ops: WriteOp[], durable?: boolean): Promise<void>;
   sync(): Promise<void>;
   flush(): Promise<boolean>;
