@@ -48,7 +48,7 @@ Projection does not change:
 - missing versus explicit null;
 - forward/reverse checked-cursor pagination;
 - live memtable visibility;
-- examination and reconstructed-content byte budgets;
+- live-candidate examination, pre-predicate resolution, and reconstructed-content byte budgets;
 - cooperative cancellation/deadline behavior.
 
 The existing structured scan request needs no compatibility adapter. The optimization lives behind

@@ -34,6 +34,8 @@ export interface ScanRequest {
   cursor?: string;
   limit?: number;
   maxExamined?: number;
+  /** Pre-predicate immutable-row plus memtable-entry ceiling; one id group may exceed it. */
+  maxResolutionEntries?: number;
   /** Whole-page content byte ceiling; one oversized row is admitted to guarantee progress. */
   maxReconstructedBytes?: bigint;
   /** Milliseconds from submission, including actor-queue wait; zero cancels before scan work. */
@@ -83,6 +85,7 @@ export interface ScanPage {
       supersededRows: bigint;
       tombstones: bigint;
       memtableEntries: bigint;
+      budgetExhausted: boolean;
     };
   };
 }
@@ -150,6 +153,9 @@ export interface Capabilities {
   boundedCompaction: true;
   scanReconstructionBudget: true;
   scanReconstructedBytesDefault: bigint;
+  scanResolutionBudget: true;
+  scanResolutionEntriesDefault: number;
+  scanResolutionEntriesMax: number;
   arrowIpc: boolean;
   parameterizedSql: boolean;
   sqlMemoryBytesDefault?: bigint;

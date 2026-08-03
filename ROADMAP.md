@@ -101,7 +101,10 @@ content model right before compatibility turns today's choices into permanent pr
   selected-column decoding remains to be replaced by grouped physical gathers. Structured-page
   resolution statistics now distinguish immutable physical occurrences, superseded occurrences,
   deciding tombstones, and inspected memtable entries from live candidates examined by predicates;
-  this exposes amplification without mislabeling it as a hard bound.
+  this exposes amplification without mislabeling it as predicate work. A configurable per-page hard
+  ceiling now bounds immutable occurrences plus memtable entries. Complete equal-id groups are atomic,
+  the first oversized group is admitted for progress, and checked cursors can advance through
+  tombstone-only groups in both directions, allowing bounded empty pages without rescans or gaps.
 
 ## Product boundary
 

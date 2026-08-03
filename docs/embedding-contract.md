@@ -192,10 +192,15 @@ contaminate one another through global counter deltas. See `docs/structured-scan
 deciding tombstones, and live-writer memtable entries consumed before predicate evaluation. This
 keeps `examined`'s live-candidate meaning intact while exposing version-resolution amplification.
 
+`max_resolution_entries` (1,000,000 by default) hard-bounds immutable occurrences plus memtable
+entries per page. Equal-id groups are atomic and the first oversized group is admitted for progress.
+The cursor can advance through a fully consumed tombstone-only group, so a bounded empty page may
+legitimately carry a continuation without rescanning or skipping history. The Node spelling is
+`maxResolutionEntries` and `stats.resolution.budgetExhausted` reports when this ceiling stopped work.
+
 **Current gap:** resolved candidates still invoke selected-column decoders per row rather than being
-grouped by part for vectorized physical gathers. The `max_examined` budget counts live records
-evaluated against predicates, not superseded physical rows encountered while resolving them; a hard
-resolution-work budget and tombstone-only continuation are not yet implemented.
+grouped by part for vectorized physical gathers. Range initialization still visits every live part;
+`max_examined` separately counts live records evaluated against predicates.
 
 ## 5. Platform capabilities
 
@@ -335,7 +340,10 @@ and raw sizes are u32, and Arrow binary values are limited by i32 offsets. Encod
 overflow. Arrow query batches currently target 8,192 rows or 32 MiB of reconstructed content, while
 always admitting one oversized row so progress remains possible. Structured pages use the same 32
 MiB default as a per-request configurable ceiling, report when the ceiling stops a page, and preserve
-an exact continuation without truncating or skipping the deferred row.
+an exact continuation without truncating or skipping the deferred row. Structured pages also default
+to 1,000,000 pre-predicate resolution entries, counted across immutable row occurrences and memtable
+entries. Complete equal-id groups remain atomic and one oversized first group is admitted for
+progress; tombstone-only progress is represented by the ordinary checked cursor.
 
 Writer admission adds explicit runtime ceilings before those format limits: 64 MiB worst-case framed
 WAL bytes per record, 256 MiB per atomic batch, 4,096 members per batch, and 4 KiB per id/attribute

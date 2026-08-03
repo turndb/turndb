@@ -19,6 +19,9 @@ const CURSOR_CHECKSUM: usize = 8;
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_EXAMINED: usize = 1_000_000;
+/// Default ceiling for immutable row occurrences plus memtable entries resolved by one page.
+pub const DEFAULT_MAX_RESOLUTION_ENTRIES: usize = 1_000_000;
+pub const MAX_RESOLUTION_ENTRIES: usize = 10_000_000;
 /// Default ceiling for content bytes materialized into one structured page.
 pub const DEFAULT_MAX_RECONSTRUCTED_BYTES: u64 = 32 << 20;
 
@@ -89,6 +92,9 @@ pub struct ScanRequest {
     pub limit: usize,
     /// Hard bound on candidate records examined during this call. A partial page carries a cursor.
     pub max_examined: usize,
+    /// Ceiling for pre-predicate newest-wins work. Complete equal-id groups are atomic; the first
+    /// group may exceed this ceiling so pagination always makes progress.
+    pub max_resolution_entries: usize,
     /// Ceiling for content bytes reconstructed into this page. A row is never split or truncated;
     /// the first matching row is admitted even when it alone exceeds this value so paging can make
     /// progress.
@@ -113,6 +119,7 @@ impl Default for ScanRequest {
             cursor: None,
             limit: DEFAULT_LIMIT,
             max_examined: 10_000,
+            max_resolution_entries: DEFAULT_MAX_RESOLUTION_ENTRIES,
             max_reconstructed_bytes: DEFAULT_MAX_RECONSTRUCTED_BYTES,
             deadline: None,
             cancellation: None,
@@ -177,6 +184,8 @@ pub struct ScanResolutionStats {
     pub tombstones: usize,
     /// Ordered live-writer memtable entries inspected while overlaying committed candidates.
     pub memtable_entries: usize,
+    /// The page stopped at a complete id-group boundary because the resolution ceiling was reached.
+    pub budget_exhausted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,6 +222,8 @@ pub(crate) enum ScanCandidate {
 pub(crate) struct CandidateBatch {
     pub candidates: Vec<ScanCandidate>,
     pub resolution: ScanResolutionStats,
+    pub resolved_through: Option<String>,
+    pub has_more: bool,
 }
 
 impl ScanCandidate {
@@ -238,6 +249,8 @@ trait Source {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
+        max_resolution_entries: usize,
+        allow_oversized_group: bool,
     ) -> Result<CandidateBatch>;
     fn project(
         &self,
@@ -255,8 +268,18 @@ impl Source for Store {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
+        max_resolution_entries: usize,
+        allow_oversized_group: bool,
     ) -> Result<CandidateBatch> {
-        Store::scan_candidates(self, from, to, limit, reverse)
+        Store::scan_candidates(
+            self,
+            from,
+            to,
+            limit,
+            reverse,
+            max_resolution_entries,
+            allow_oversized_group,
+        )
     }
 
     fn project(
@@ -280,8 +303,18 @@ impl Source for ReadStore {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
+        max_resolution_entries: usize,
+        allow_oversized_group: bool,
     ) -> Result<CandidateBatch> {
-        ReadStore::scan_candidates(self, from, to, limit, reverse)
+        ReadStore::scan_candidates(
+            self,
+            from,
+            to,
+            limit,
+            reverse,
+            max_resolution_entries,
+            allow_oversized_group,
+        )
     }
 
     fn project(
@@ -357,50 +390,68 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     let needs_record = !attr_needed.is_empty() || !content_needed.is_empty();
     let mut rows = Vec::with_capacity(request.limit);
     let mut stats = ScanStats::default();
-    // A cursor identifies the last candidate CONSUMED, not merely inspected. They normally coincide,
-    // but a row deferred by the reconstruction budget must be reconsidered on the next page.
+    // A cursor identifies the last complete id group CONSUMED, not merely inspected. It may be a
+    // tombstone-only group. A row deferred by the reconstruction budget remains unconsumed and must
+    // be reconsidered on the next page.
     let mut last_consumed = cursor.as_ref().map(|c| c.last_id.clone());
     let mut has_more = false;
     let mut budget_stopped = false;
 
-    while rows.len() < request.limit && stats.examined < request.max_examined {
+    while rows.len() < request.limit
+        && stats.examined < request.max_examined
+        && !stats.resolution.budget_exhausted
+    {
         check_interruption(request)?;
         let remaining = request.max_examined - stats.examined;
         let ask = remaining.min((request.limit - rows.len()).max(64));
+        let resolution_used = stats
+            .resolution
+            .physical_rows
+            .checked_add(stats.resolution.memtable_entries)
+            .context("structured scan resolution-entry counter overflow")?;
+        let resolution_remaining = request.max_resolution_entries.saturating_sub(resolution_used);
         let batch = source.scan_candidates(
             from.as_deref(),
             to.as_deref(),
             ask,
             request.direction == Direction::Reverse,
+            resolution_remaining,
+            resolution_used == 0,
         )?;
         check_interruption(request)?;
+        let CandidateBatch { candidates, resolution, resolved_through, has_more: batch_has_more } =
+            batch;
         stats.resolution.physical_rows = stats
             .resolution
             .physical_rows
-            .checked_add(batch.resolution.physical_rows)
+            .checked_add(resolution.physical_rows)
             .context("structured scan physical-row counter overflow")?;
         stats.resolution.superseded_rows = stats
             .resolution
             .superseded_rows
-            .checked_add(batch.resolution.superseded_rows)
+            .checked_add(resolution.superseded_rows)
             .context("structured scan superseded-row counter overflow")?;
         stats.resolution.tombstones = stats
             .resolution
             .tombstones
-            .checked_add(batch.resolution.tombstones)
+            .checked_add(resolution.tombstones)
             .context("structured scan tombstone counter overflow")?;
         stats.resolution.memtable_entries = stats
             .resolution
             .memtable_entries
-            .checked_add(batch.resolution.memtable_entries)
+            .checked_add(resolution.memtable_entries)
             .context("structured scan memtable-entry counter overflow")?;
-        if batch.candidates.is_empty() {
-            has_more = false;
+        stats.resolution.budget_exhausted |= resolution.budget_exhausted;
+        if candidates.is_empty() {
+            if let Some(resolved_through) = resolved_through {
+                last_consumed = Some(resolved_through);
+            }
+            has_more = batch_has_more;
             break;
         }
-        let fetched = batch.candidates.len();
+        let fetched = candidates.len();
         let mut processed = 0usize;
-        for candidate in batch.candidates {
+        for candidate in candidates {
             check_interruption(request)?;
             processed += 1;
             stats.examined += 1;
@@ -461,8 +512,13 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             rows.push(ScanRow { id: candidate.into_id(), attrs, contents });
             last_consumed = Some(rows.last().expect("row was just pushed").id.clone());
             if rows.len() == request.limit {
-                has_more = processed < fetched || fetched == ask;
+                has_more = processed < fetched || batch_has_more;
                 break;
+            }
+        }
+        if processed == fetched && !budget_stopped {
+            if let Some(resolved_through) = resolved_through {
+                last_consumed = Some(resolved_through);
             }
         }
         if budget_stopped {
@@ -472,10 +528,14 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             break;
         }
         if stats.examined == request.max_examined {
-            has_more = processed < fetched || fetched == ask;
+            has_more = processed < fetched || batch_has_more;
             break;
         }
-        if fetched < ask {
+        if stats.resolution.budget_exhausted {
+            has_more = batch_has_more;
+            break;
+        }
+        if !batch_has_more {
             has_more = false;
             break;
         }
@@ -527,6 +587,11 @@ fn validate(request: &ScanRequest) -> Result<()> {
     }
     if request.max_examined == 0 || request.max_examined > MAX_EXAMINED {
         bail!("scan max_examined must be in 1..={MAX_EXAMINED}");
+    }
+    if request.max_resolution_entries == 0
+        || request.max_resolution_entries > MAX_RESOLUTION_ENTRIES
+    {
+        bail!("scan max_resolution_entries must be in 1..={MAX_RESOLUTION_ENTRIES}");
     }
     if request.max_reconstructed_bytes == 0 {
         bail!("scan max_reconstructed_bytes must be greater than zero");
@@ -827,6 +892,8 @@ mod tests {
             _to: Option<&str>,
             _limit: usize,
             _reverse: bool,
+            _max_resolution_entries: usize,
+            _allow_oversized_group: bool,
         ) -> Result<CandidateBatch> {
             Ok(CandidateBatch {
                 candidates: vec![
@@ -834,6 +901,7 @@ mod tests {
                     ScanCandidate::Memtable("b".into()),
                 ],
                 resolution: ScanResolutionStats { memtable_entries: 2, ..Default::default() },
+                ..CandidateBatch::default()
             })
         }
 

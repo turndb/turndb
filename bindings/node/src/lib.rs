@@ -29,6 +29,7 @@ use turndb::query::sql::{
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
     ScanInterrupted, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
+    DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
 };
 use turndb::store::{
     CompactionBudget, CompactionError, ReadStore, Store, WriteAdmissionError, WriteLimits,
@@ -211,6 +212,8 @@ pub struct NativeScanRequest {
     pub cursor: Option<String>,
     pub limit: Option<u32>,
     pub max_examined: Option<u32>,
+    /// Immutable row occurrences plus memtable entries resolved before predicate evaluation.
+    pub max_resolution_entries: Option<u32>,
     /// Whole-page content reconstruction ceiling. Rows are never truncated.
     pub max_reconstructed_bytes: Option<BigInt>,
     /// Milliseconds from submission; zero is an immediate, deterministic deadline.
@@ -265,6 +268,7 @@ pub struct NativeScanResolutionStats {
     pub superseded_rows: BigInt,
     pub tombstones: BigInt,
     pub memtable_entries: BigInt,
+    pub budget_exhausted: bool,
 }
 
 #[napi(object)]
@@ -367,6 +371,9 @@ pub struct NativeCapabilities {
     pub bounded_compaction: bool,
     pub scan_reconstruction_budget: bool,
     pub scan_reconstructed_bytes_default: BigInt,
+    pub scan_resolution_budget: bool,
+    pub scan_resolution_entries_default: u32,
+    pub scan_resolution_entries_max: u32,
     pub arrow_ipc: bool,
     pub parameterized_sql: bool,
     pub sql_memory_bytes_default: Option<BigInt>,
@@ -414,6 +421,9 @@ pub fn capabilities() -> NativeCapabilities {
         bounded_compaction: true,
         scan_reconstruction_budget: true,
         scan_reconstructed_bytes_default: BigInt::from(DEFAULT_MAX_RECONSTRUCTED_BYTES),
+        scan_resolution_budget: true,
+        scan_resolution_entries_default: DEFAULT_MAX_RESOLUTION_ENTRIES as u32,
+        scan_resolution_entries_max: MAX_RESOLUTION_ENTRIES as u32,
         arrow_ipc: cfg!(feature = "sql"),
         parameterized_sql: cfg!(feature = "sql"),
         sql_memory_bytes_default: cfg!(feature = "sql").then(|| {
@@ -1568,6 +1578,15 @@ fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
     if let Some(max_examined) = input.max_examined {
         request.max_examined = max_examined as usize;
     }
+    if let Some(max_resolution_entries) = input.max_resolution_entries {
+        if max_resolution_entries == 0 || max_resolution_entries as usize > MAX_RESOLUTION_ENTRIES {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("maxResolutionEntries must be in 1..={MAX_RESOLUTION_ENTRIES}"),
+            ));
+        }
+        request.max_resolution_entries = max_resolution_entries as usize;
+    }
     if let Some(max_reconstructed_bytes) = max_reconstructed_bytes {
         request.max_reconstructed_bytes = max_reconstructed_bytes;
     }
@@ -1880,6 +1899,7 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
                 superseded_rows: BigInt::from(page.stats.resolution.superseded_rows as u64),
                 tombstones: BigInt::from(page.stats.resolution.tombstones as u64),
                 memtable_entries: BigInt::from(page.stats.resolution.memtable_entries as u64),
+                budget_exhausted: page.stats.resolution.budget_exhausted,
             },
         },
     }

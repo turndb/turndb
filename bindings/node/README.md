@@ -46,9 +46,13 @@ silently.
   reports exact operation-local part sections and fold blocks touched, cache access counts, and
   stored/raw bytes as `bigint`; concurrent snapshots cannot contaminate those numbers.
   `stats.resolution` reports physical immutable rows, superseded rows, deciding tombstones, and
-  writer-memtable entries consumed before predicates, also as `bigint`. See
+  writer-memtable entries consumed before predicates, also as `bigint`. `maxResolutionEntries`
+  bounds the sum per page (1,000,000 by default); equal-id groups stay atomic, one oversized first
+  group is admitted for progress, and `budgetExhausted` explains a partial page. Empty pages may carry
+  `next` after bounded progress through tombstone-only groups. See
   [projected structured scans](../../docs/projected-structured-scan.md) and
-  [structured scan I/O statistics](../../docs/structured-scan-io.md).
+  [structured scan I/O statistics](../../docs/structured-scan-io.md), plus the
+  [resolved-row budget contract](../../docs/resolved-row-paging.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.

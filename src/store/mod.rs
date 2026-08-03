@@ -2233,7 +2233,7 @@ impl Store {
         reverse: bool,
     ) -> Result<Vec<String>> {
         Ok(self
-            .scan_candidates(from, to, limit, reverse)?
+            .scan_candidates(from, to, limit, reverse, usize::MAX, true)?
             .candidates
             .into_iter()
             .map(crate::scan::ScanCandidate::into_id)
@@ -2247,6 +2247,8 @@ impl Store {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
+        max_resolution_entries: usize,
+        allow_oversized_group: bool,
     ) -> Result<crate::scan::CandidateBatch> {
         check_range(from, to)?;
         if limit == 0 {
@@ -2256,40 +2258,48 @@ impl Store {
             from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
             to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
         );
-        // A staged deletion SHADOWS a committed id: the id still occupies a slot in the committed
-        // scan and is dropped afterwards. Asking for exactly `limit` candidates therefore returns a
-        // short page while live ids sit just past the cut — silently, which is the worst way for a
-        // paged read to be wrong. At most one candidate can be shadowed per staged deletion in the
-        // range, so `limit + deletions` candidates cannot under-fill. Deletions that hit no
-        // committed id merely over-fetch, which the truncate below absorbs.
-        let staged: Vec<_> = self.mem.range::<str, _>(range).collect();
-        let staged_deletions = staged.iter().filter(|(_, value)| value.is_none()).count();
-        let want = limit.saturating_add(staged_deletions);
-        let committed = read::scan_rows(&self.parts, from, to, want, reverse)?;
-        let mut resolved = BTreeMap::new();
-        for row in committed.rows {
-            resolved.insert(row.id.clone(), crate::scan::ScanCandidate::Committed(row));
-        }
-        for (id, value) in &staged {
-            if value.is_some() {
-                resolved.insert((*id).clone(), crate::scan::ScanCandidate::Memtable((*id).clone()));
-            } else {
-                resolved.remove(*id);
-            }
-        }
-        let mut all: Vec<_> = resolved.into_values().collect();
-        if reverse {
-            all.reverse();
-        }
-        all.truncate(limit);
-        Ok(crate::scan::CandidateBatch {
-            candidates: all,
-            resolution: crate::scan::ScanResolutionStats {
-                physical_rows: committed.physical_rows,
-                superseded_rows: committed.superseded_rows,
-                tombstones: committed.tombstones,
-                memtable_entries: staged.len(),
+        let overlay: Box<dyn Iterator<Item = (&str, bool)> + '_> = if reverse {
+            Box::new(
+                self.mem
+                    .range::<str, _>(range)
+                    .rev()
+                    .map(|(id, value)| (id.as_str(), value.is_some())),
+            )
+        } else {
+            Box::new(
+                self.mem.range::<str, _>(range).map(|(id, value)| (id.as_str(), value.is_some())),
+            )
+        };
+        let resolved = read::scan_rows(
+            &self.parts,
+            overlay,
+            read::RowScan {
+                from,
+                to,
+                limit,
+                reverse,
+                max_resolution_entries,
+                allow_oversized_group,
             },
+        )?;
+        Ok(crate::scan::CandidateBatch {
+            candidates: resolved
+                .rows
+                .into_iter()
+                .map(|row| match row.origin {
+                    read::RowOrigin::Part { .. } => crate::scan::ScanCandidate::Committed(row),
+                    read::RowOrigin::Memtable => crate::scan::ScanCandidate::Memtable(row.id),
+                })
+                .collect(),
+            resolution: crate::scan::ScanResolutionStats {
+                physical_rows: resolved.physical_rows,
+                superseded_rows: resolved.superseded_rows,
+                tombstones: resolved.tombstones,
+                memtable_entries: resolved.memtable_entries,
+                budget_exhausted: resolved.budget_exhausted,
+            },
+            resolved_through: resolved.resolved_through,
+            has_more: resolved.has_more,
         })
     }
 
@@ -2831,7 +2841,7 @@ impl ReadStore {
         reverse: bool,
     ) -> Result<Vec<String>> {
         Ok(self
-            .scan_candidates(from, to, limit, reverse)?
+            .scan_candidates(from, to, limit, reverse, usize::MAX, true)?
             .candidates
             .into_iter()
             .map(crate::scan::ScanCandidate::into_id)
@@ -2844,9 +2854,22 @@ impl ReadStore {
         to: Option<&str>,
         limit: usize,
         reverse: bool,
+        max_resolution_entries: usize,
+        allow_oversized_group: bool,
     ) -> Result<crate::scan::CandidateBatch> {
         check_range(from, to)?;
-        let resolved = read::scan_rows(&self.parts, from, to, limit, reverse)?;
+        let resolved = read::scan_rows(
+            &self.parts,
+            std::iter::empty::<(&str, bool)>(),
+            read::RowScan {
+                from,
+                to,
+                limit,
+                reverse,
+                max_resolution_entries,
+                allow_oversized_group,
+            },
+        )?;
         Ok(crate::scan::CandidateBatch {
             candidates: resolved
                 .rows
@@ -2857,8 +2880,11 @@ impl ReadStore {
                 physical_rows: resolved.physical_rows,
                 superseded_rows: resolved.superseded_rows,
                 tombstones: resolved.tombstones,
-                memtable_entries: 0,
+                memtable_entries: resolved.memtable_entries,
+                budget_exhausted: resolved.budget_exhausted,
             },
+            resolved_through: resolved.resolved_through,
+            has_more: resolved.has_more,
         })
     }
 
