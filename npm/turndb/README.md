@@ -1,5 +1,10 @@
 # turndb
 
+This package declares Node `>=22 <27`; its required rebuild/test matrix is Node 22, 24, and 26. See the
+[support and compatibility policy](https://github.com/turndb/turndb/blob/main/docs/support-and-compatibility.md)
+for the distinction between the portable WASI profile, native source qualification, and published
+support.
+
 A content-addressed columnar store for AI traces. Byte-exact, embedded, single-writer — a store is
 a directory you can `tar`.
 

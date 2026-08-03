@@ -64,3 +64,37 @@ fn every_example_is_either_shipped_or_deliberately_excluded() {
     let missing: Vec<&String> = shipped.iter().filter(|e| !on_disk.contains(*e)).collect();
     assert!(missing.is_empty(), "SHIPPED names an example that no longer exists: {missing:?}");
 }
+
+#[test]
+fn node_engine_claims_are_closed_and_match_the_ci_majors() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let portable: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(format!("{root}/npm/turndb/package.json")).unwrap(),
+    )
+    .unwrap();
+    let native: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(format!("{root}/bindings/node/package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(portable["engines"]["node"], ">=22 <27");
+    assert_eq!(native["engines"]["node"], ">=22 <27");
+    assert_eq!(native["private"], true, "the native addon has no published prebuild contract yet");
+
+    let ci = fs::read_to_string(format!("{root}/.github/workflows/ci.yml")).unwrap();
+    let portable_job = ci
+        .split_once("  npm:\n")
+        .and_then(|(_, rest)| rest.split_once("  native-node:\n").map(|(job, _)| job))
+        .expect("CI must retain a distinct portable npm job");
+    let native_job = ci
+        .split_once("  native-node:\n")
+        .and_then(|(_, rest)| rest.split_once("  dst:\n").map(|(job, _)| job))
+        .expect("CI must retain a distinct native Node job");
+    for (name, job) in [("portable", portable_job), ("native", native_job)] {
+        assert!(
+            job.contains("node: ['22', '24', '26']"),
+            "{name} package range and CI majors drifted"
+        );
+        assert!(!job.contains("node: ['18'"), "{name} CI resurrected an EOL major");
+        assert!(!job.contains("node: ['20'"), "{name} CI resurrected an EOL major");
+    }
+}

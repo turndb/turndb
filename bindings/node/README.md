@@ -12,6 +12,10 @@ workspace with:
 npm run test:dev --prefix bindings/node
 ```
 
+Its closed Node range is `>=22 <27`; the required Linux x86-64 matrix is Node 22, 24, and 26. N-API
+6 does not by itself establish support or prove that matrix green; see the repository's
+[support and compatibility policy](https://github.com/turndb/turndb/blob/main/docs/support-and-compatibility.md).
+
 The package loader accepts `TURNDB_NATIVE_PATH` for development and otherwise looks for a packaged
 platform prebuild. It intentionally does not fall back to `turndb-wasm`: native writer exclusion,
 threads, and physical reclamation are capabilities, not implementation details that may disappear
