@@ -41,6 +41,8 @@ test('reports the native capability profile without a portable fallback', () => 
     contentLiveness: true,
     lifecycleEventJournal: true,
     lifecycleEventCapacity: 256,
+    queryTimings: true,
+    sqlExplain: true,
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -243,6 +245,7 @@ test('round-trips exact typed fields and independently named content', async (t)
   assert.equal(page.rows[0].contents[1].identity, page.rows[0].contents[0].identity);
   assert.equal(page.rows[0].contents[2].present, true);
   assert.equal(page.rows[0].contents[2].bytes.length, 0);
+  assert.equal(typeof page.stats.durationNs, 'bigint');
   assert.match(page.rows[0].contents[2].identity, /^[0-9a-f]{64}$/);
   assert.notEqual(page.rows[0].contents[2].identity, page.rows[0].contents[0].identity);
   assert.equal(page.rows[0].contents[3].present, false);
@@ -503,8 +506,13 @@ test('streams bounded parameterized read-only SQL as Arrow IPC', async (t) => {
   assert(Buffer.isBuffer(batch.ipc));
   assert.equal(batch.ipc.readUInt32LE(0), 0xffffffff);
   assert(batch.stats.rows > 0n);
+  assert(batch.stats.planningDurationNs > 0n);
+  assert(batch.stats.executionDurationNs > 0n);
   assert.equal(await query.next(), null);
-  assert.deepEqual(await query.stats(), batch.stats);
+  const finalStats = await query.stats();
+  assert.equal(finalStats.planningDurationNs, batch.stats.planningDurationNs);
+  assert(finalStats.executionDurationNs >= batch.stats.executionDurationNs);
+  assert.equal(finalStats.rows, batch.stats.rows);
 
   const snapshot = await store.snapshot();
   const forbidden = snapshot.querySql('CREATE TABLE forbidden (value INT)');

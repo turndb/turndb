@@ -47,6 +47,8 @@ pub struct Capabilities {
     pub content_liveness: bool,
     pub lifecycle_event_journal: bool,
     pub lifecycle_event_capacity: usize,
+    pub query_timings: bool,
+    pub sql_explain: bool,
     pub max_record_bytes_default: u64,
     pub max_batch_bytes_default: u64,
     pub max_batch_records_default: usize,
@@ -82,6 +84,8 @@ pub const fn capabilities() -> Capabilities {
         content_liveness: true,
         lifecycle_event_journal: true,
         lifecycle_event_capacity: crate::observability::EVENT_JOURNAL_CAPACITY,
+        query_timings: true,
+        sql_explain: cfg!(feature = "sql"),
         max_record_bytes_default: crate::store::DEFAULT_MAX_RECORD_BYTES,
         max_batch_bytes_default: crate::store::DEFAULT_MAX_BATCH_BYTES,
         max_batch_records_default: crate::store::DEFAULT_MAX_BATCH_RECORDS,
@@ -107,5 +111,7 @@ mod tests {
         assert!(c.content_liveness);
         assert!(c.lifecycle_event_journal);
         assert_eq!(c.lifecycle_event_capacity, crate::observability::EVENT_JOURNAL_CAPACITY);
+        assert!(c.query_timings);
+        assert_eq!(c.sql_explain, cfg!(feature = "sql"));
     }
 }

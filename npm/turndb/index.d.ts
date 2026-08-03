@@ -111,6 +111,8 @@ export interface Capabilities {
   content_liveness: true;
   lifecycle_event_journal: true;
   lifecycle_event_capacity: number;
+  query_timings: true;
+  sql_explain: false;
   max_record_bytes_default: number;
   max_batch_bytes_default: number;
   max_batch_records_default: number;

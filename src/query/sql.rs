@@ -209,6 +209,8 @@ pub struct SqlQuery {
     table: std::sync::Arc<TurndbTable>,
     finished: bool,
     reservation: Option<SqlReservation>,
+    planning_duration_ns: u64,
+    execution_duration_ns: u64,
 }
 
 impl SqlQuery {
@@ -240,6 +242,7 @@ impl SqlQuery {
         options: SqlOptions,
         budget: Option<&SqlBudget>,
     ) -> Result<SqlQuery> {
+        let planning_started = std::time::Instant::now();
         if sql.trim().is_empty() {
             bail!("SQL query must not be empty");
         }
@@ -271,7 +274,17 @@ impl SqlQuery {
             .context("bind TurnDB SQL parameters")?;
         let stream = frame.execute_stream().await.context("start TurnDB SQL execution")?;
         let schema_ipc = encode_schema(&stream.schema()).context("encode SQL result schema")?;
-        Ok(SqlQuery { stream: Some(stream), schema_ipc, table, finished: false, reservation })
+        let planning_duration_ns =
+            u64::try_from(planning_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Ok(SqlQuery {
+            stream: Some(stream),
+            schema_ipc,
+            table,
+            finished: false,
+            reservation,
+            planning_duration_ns,
+            execution_duration_ns: 0,
+        })
     }
 
     /// A complete zero-batch Arrow IPC stream carrying the result schema, available before pulling.
@@ -284,6 +297,14 @@ impl SqlQuery {
         if self.finished {
             return Ok(None);
         }
+        let started = std::time::Instant::now();
+        let result = self.next_inner().await;
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.execution_duration_ns = self.execution_duration_ns.saturating_add(elapsed);
+        result
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<SqlBatch>> {
         let batch = match self
             .stream
             .as_mut()
@@ -313,7 +334,11 @@ impl SqlQuery {
     }
 
     pub fn stats(&self) -> ScanStats {
-        self.table.stats()
+        ScanStats {
+            planning_duration_ns: self.planning_duration_ns,
+            execution_duration_ns: self.execution_duration_ns,
+            ..self.table.stats()
+        }
     }
 
     pub fn is_finished(&self) -> bool {

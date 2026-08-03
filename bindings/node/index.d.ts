@@ -60,6 +60,8 @@ export interface ScanPage {
   rows: Array<{ id: string; attrs: Attr[]; contents: ProjectedContent[] }>;
   next?: string;
   stats: {
+    /** Complete successful storage-page execution; excludes actor queue wait. */
+    durationNs: bigint;
     examined: number;
     returned: number;
     shadowedAttrOccurrences: number;
@@ -136,6 +138,10 @@ export interface SqlQueryOptions extends LifecycleOptions {
 }
 
 export interface SqlStats {
+  /** Successful planning and execution-stream startup time; excludes actor queue wait. */
+  planningDurationNs: bigint;
+  /** Cumulative active pull/IPC encoding time; excludes time idle between consumer pulls. */
+  executionDurationNs: bigint;
   rows: bigint;
   batches: bigint;
   columnsDecoded: bigint;
@@ -176,6 +182,8 @@ export interface Capabilities {
   contentLiveness: true;
   lifecycleEventJournal: true;
   lifecycleEventCapacity: number;
+  queryTimings: true;
+  sqlExplain: true;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;

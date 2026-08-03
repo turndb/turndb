@@ -151,6 +151,10 @@ pub struct Pred {
 /// What a scan actually touched. Exists so that "projection avoids the fold" is a measurement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
+    /// Successful SQL planning and execution-stream startup time.
+    pub planning_duration_ns: u64,
+    /// Cumulative time spent actively pulling and encoding result batches, excluding consumer idle.
+    pub execution_duration_ns: u64,
     pub rows: usize,
     pub batches: usize,
     /// Attribute column sections decoded. A projected scan should decode only what it projects.
@@ -176,6 +180,8 @@ impl ScanStats {
     /// stops early (LIMIT, an error, a dropped stream) reports what it actually touched.
     pub fn since(&self, prev: ScanStats) -> ScanStats {
         ScanStats {
+            planning_duration_ns: self.planning_duration_ns - prev.planning_duration_ns,
+            execution_duration_ns: self.execution_duration_ns - prev.execution_duration_ns,
             rows: self.rows - prev.rows,
             batches: self.batches - prev.batches,
             columns_decoded: self.columns_decoded - prev.columns_decoded,
@@ -188,6 +194,10 @@ impl ScanStats {
     }
 
     pub fn add(&mut self, o: ScanStats) {
+        self.planning_duration_ns =
+            self.planning_duration_ns.saturating_add(o.planning_duration_ns);
+        self.execution_duration_ns =
+            self.execution_duration_ns.saturating_add(o.execution_duration_ns);
         self.rows += o.rows;
         self.batches += o.batches;
         self.columns_decoded += o.columns_decoded;

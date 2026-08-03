@@ -358,6 +358,9 @@ payload eligible for punch/refold; see `docs/content-liveness.md`.
 `lifecycle_events_after` / `lifecycleEvents` provide a bounded, non-destructive structured outcome
 journal with independent sequence cursors and explicit loss accounting; see
 `docs/lifecycle-events.md`. Consumers own timestamps, correlation, thresholds, and export policy.
+Structured scan pages expose successful execution nanoseconds beside exact work/I/O counters and a
+shared-plan explanation API. SQL separates planning/stream-start time from cumulative active pull
+and IPC time and supports read-only `EXPLAIN`; consumers decide what is slow.
 
 ## 7. Compatibility policy
 
