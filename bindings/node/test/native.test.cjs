@@ -33,6 +33,7 @@ test('reports the native capability profile without a portable fallback', () => 
     lifecycleOperations: true,
     healthSnapshots: true,
     schemaDiscovery: true,
+    scanCancellation: true,
   });
 });
 
@@ -168,6 +169,37 @@ test('pages and filters in Rust and refuses cursor misuse', async (t) => {
   await assert.rejects(
     store.scan({ ...request, from: 'r2', cursor: first.next }),
     /cursor belongs to different bounds or predicates/
+  );
+});
+
+test('enforces scan deadlines and AbortSignal through the Rust cancellation target', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await assert.rejects(
+    store.scan({ timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError
+      && error.code === 'CANCELLED'
+      && /deadline exceeded/.test(error.message)
+  );
+
+  const alreadyAborted = new AbortController();
+  alreadyAborted.abort();
+  await assert.rejects(
+    store.scan({ signal: alreadyAborted.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+
+  const active = new AbortController();
+  const pending = store.scan({ signal: active.signal });
+  active.abort();
+  await assert.rejects(
+    pending,
+    (error) => error instanceof TurnDbError
+      && error.code === 'CANCELLED'
+      && /cancelled/.test(error.message)
   );
 });
 

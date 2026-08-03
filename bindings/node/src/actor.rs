@@ -503,4 +503,35 @@ mod tests {
             .contains(&MAX_QUEUE_CAPACITY.to_string()));
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn a_scan_deadline_includes_time_waiting_in_the_actor_queue() {
+        let dir = temp();
+        let actor = Actor::open_with_capacity(&dir, DEFAULT_QUEUE_CAPACITY).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
+        entered_rx.recv().unwrap();
+
+        let runtime = napi::tokio::runtime::Runtime::new().unwrap();
+        let scan_actor = actor.clone();
+        let pending = runtime.spawn(async move {
+            scan_actor
+                .scan(ScanRequest {
+                    deadline: Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(10),
+                    ),
+                    ..ScanRequest::default()
+                })
+                .await
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        let error = runtime.block_on(pending).unwrap().unwrap_err();
+        assert!(error.downcast_ref::<turndb::scan::ScanInterrupted>().is_some_and(|error| {
+            error.reason == turndb::scan::ScanInterruptionReason::DeadlineExceeded
+        }));
+        runtime.block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

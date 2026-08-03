@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
-use turndb::scan::{Compare, ContentMode, ContentSelect, Direction, Predicate, ScanRequest};
+use turndb::scan::{
+    CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ScanInterrupted,
+    ScanInterruptionReason, ScanRequest,
+};
 use turndb::store::{ContentSpans, Span, Store};
 use turndb::AttrValue;
 
@@ -15,6 +18,31 @@ fn cfg() -> FoldCfg {
 
 fn status(value: &str) -> Vec<(String, AttrValue)> {
     vec![("status".into(), AttrValue::Str(value.into()))]
+}
+
+#[test]
+fn cancellation_and_deadlines_are_typed_and_return_no_partial_page() {
+    let dir = tmp("interruption");
+    let store = Store::open(&dir, cfg()).unwrap();
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .scan(&ScanRequest { cancellation: Some(cancellation), ..ScanRequest::default() })
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ScanInterrupted>().unwrap().reason,
+        ScanInterruptionReason::Cancelled
+    );
+
+    let error = store
+        .scan(&ScanRequest { deadline: Some(std::time::Instant::now()), ..ScanRequest::default() })
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ScanInterrupted>().unwrap().reason,
+        ScanInterruptionReason::DeadlineExceeded
+    );
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
