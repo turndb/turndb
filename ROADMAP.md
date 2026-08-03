@@ -81,6 +81,11 @@ content model right before compatibility turns today's choices into permanent pr
   safe progress first and now correctly retries declared-but-unpunched blocks after cancellation or
   crash. Strong erasure stops only in its read-only planning phase and becomes intentionally
   non-interruptible once tombstones make completion mandatory.
+  Durability controls now give sync a queue-inclusive pre-fsync refusal and give flush checkpoints
+  through memtable/locator planning, bounded output hashing, and the instant before manifest
+  publication. Cancelled flush removes its unpublished part and retains the live memtable; part
+  encoding and any operation after its final durability/publication boundary remain intentionally
+  uninterruptible so the reported outcome cannot contradict durable state.
   Bounded incremental compaction now selects a contiguous run under simultaneous exact physical
   part, row, and file-byte ceilings, reports both the executed input plan and output bytes, preserves
   tombstones for every partial run, and returns typed invalid/insufficient-budget failures instead of
@@ -416,9 +421,9 @@ exposes SQL and Arrow IPC; the structured no-feature build remains useful for em
 explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
 profile rather than misreporting the ordinary release artifact.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for sync and flush
-(SQL planning/pulls and major maintenance loops are
-cancellable); typed corruption/invariant markers for low-level paths that still conservatively
+Remaining Phase-3 gaps are prebuilt platform artifacts; finer-grained interruption inside flush part
+encoding (SQL planning/pulls and major maintenance loops already have safe controls); typed
+corruption/invariant markers for low-level paths that still conservatively
 classify as `INTERNAL`; and measured event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate

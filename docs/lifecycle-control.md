@@ -10,6 +10,8 @@ typed reason. Existing no-options methods remain and delegate to controlled vari
 
 Controlled operations currently include:
 
+- Durability entry through `Store::sync_with_control` and memtable publication through
+  `Store::flush_with_control`.
 - Part compaction through `merge_range_with_control` and `auto_compact_with_control`.
 - Manifest-chain, part-section, and fold-frame verification.
 - In-place punching through `punch_unreferenced_with_control`.
@@ -29,6 +31,13 @@ by a real-time scheduler guarantee.
 
 Each operation deliberately interprets interruption according to its publication protocol:
 
+- **Sync** checks once before WAL fsync. Once the durability boundary begins, TurnDB reports its real
+  outcome and does not claim cancellation after accepted writes may have become durable.
+- **Flush** checks during memtable/locator planning, after part construction, during bounded digest
+  reads, and immediately before manifest publication. Cancellation may leave fold bytes durably
+  sealed but unreachable; it removes the unpublished part and preserves the live memtable/manifest.
+  Part encoding remains one uninterruptible work unit. Once manifest commit begins, ordinary crash
+  recovery owns the result.
 - **Compaction** writes an unreachable output part. Cancellation before manifest publication removes
   that part and leaves the live part set unchanged. Once manifest commit begins, cancellation is no
   longer observed because the crash-safe commit protocol owns the outcome.
@@ -69,6 +78,8 @@ const result = await store.compact(true, {
   signal: abort.signal,
 });
 
+await store.sync({ timeoutMs: 30_000 });
+await store.flush({ signal: abort.signal });
 await store.verify({ timeoutMs: 30_000 });
 await store.punch({ signal: abort.signal });
 await store.refold({ timeoutMs: 120_000 });
@@ -91,5 +102,5 @@ Dropping or ignoring the Promise does not cancel the operation—pass a signal w
 required.
 
 The native capability profile reports `lifecycleCancellation: true`. SQL planning/pulls expose their
-own interruption controls. Sync and flush retain their existing non-cancellable contracts, and their
-omission is explicit rather than represented as cancellable work.
+own interruption controls. Sync intentionally has only a pre-fsync checkpoint, and flush's part
+encoder remains an indivisible work unit; neither is represented as asynchronously killable work.

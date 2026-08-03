@@ -1117,7 +1117,9 @@ fn validate_recovery_candidate(
         control.check("manifest recovery validation")?;
         let path = dir.join(&part_ref.file);
         if let Some(want) = &part_ref.b3 {
-            let got = hash_file_with_control(&path, control)?.to_hex().to_string();
+            let got = hash_file_with_control(&path, control, "manifest recovery validation")?
+                .to_hex()
+                .to_string();
             if &got != want {
                 bail!(
                     "candidate commit {} names part {} with the wrong digest",
@@ -1196,6 +1198,7 @@ fn validate_recovery_candidate(
 fn hash_file_with_control(
     path: &Path,
     control: &crate::control::OperationControl,
+    operation: &'static str,
 ) -> Result<blake3::Hash> {
     use std::io::Read;
 
@@ -1203,7 +1206,7 @@ fn hash_file_with_control(
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
-        control.check("manifest recovery validation")?;
+        control.check(operation)?;
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
@@ -1776,6 +1779,15 @@ impl Store {
 
     /// The ACK point: everything put so far survives a crash.
     pub fn sync(&mut self) -> Result<()> {
+        self.sync_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::sync`] with an interruption checkpoint before entering the durability boundary.
+    ///
+    /// Once WAL fsync begins, cancellation is no longer observed: returning cancellation after the
+    /// writes became durable would misreport the acknowledgement outcome.
+    pub fn sync_with_control(&mut self, control: &crate::control::OperationControl) -> Result<()> {
+        control.check("store sync")?;
         self.wal.sync()
     }
 
@@ -1815,6 +1827,19 @@ impl Store {
     /// Data before pointers, and the manifest last: the fold is durable before a part names any of
     /// it, and the part is durable before the manifest names the part.
     pub fn flush(&mut self) -> Result<Option<PartRef>> {
+        self.flush_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::flush`] with cooperative checks before manifest publication.
+    ///
+    /// Fold sync may make accepted content bytes durable before a later cancellation, but the live
+    /// manifest and memtable remain unchanged. An unpublished part is removed. Once manifest commit
+    /// begins, cancellation is no longer observed and the ordinary crash protocol owns the outcome.
+    pub fn flush_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<PartRef>> {
+        control.check("memtable flush")?;
         if self.mem.is_empty() {
             return Ok(None);
         }
@@ -1825,6 +1850,7 @@ impl Store {
         let mut recs: Vec<Record> = Vec::with_capacity(self.mem.len());
         let mut tombs: Vec<bool> = Vec::with_capacity(self.mem.len());
         for (id, v) in &self.mem {
+            control.check("memtable flush planning")?;
             match v {
                 Some(r) => {
                     recs.push(r.clone());
@@ -1850,8 +1876,10 @@ impl Store {
         // first flush.
         let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
         for r in &recs {
+            control.check("memtable flush planning")?;
             for content in &r.contents {
                 for op in &content.ops {
+                    control.check("memtable flush planning")?;
                     let BodyOp::Piece { hash, .. } = op else { continue };
                     if locs.contains_key(hash) {
                         continue;
@@ -1865,7 +1893,7 @@ impl Store {
                 }
             }
         }
-        let meta = part::build_full(
+        let meta = match part::build_full(
             &path,
             &recs,
             &tombs,
@@ -1874,7 +1902,25 @@ impl Store {
             self.cfg.level,
             |h| locs.get(h).copied(),
             &HashMap::new(),
-        )?;
+        ) {
+            Ok(meta) => meta,
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = control.check("memtable flush") {
+            let _ = crate::vfs::unlink(&path);
+            return Err(error.into());
+        }
+        let digest = match hash_file_with_control(&path, control, "memtable flush") {
+            Ok(hash) => hash.to_hex().to_string(),
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error);
+            }
+        };
 
         let mut m = self.manifest.clone();
         m.parts.push(PartRef {
@@ -1882,11 +1928,15 @@ impl Store {
             seq_lo: seq,
             seq_hi: seq,
             records: meta.n_records,
-            b3: Some(blake3::hash(&std::fs::read(&path)?).to_hex().to_string()),
+            b3: Some(digest),
         });
         m.fold_seg = tail.seg;
         m.fold_off = tail.off;
         m.next_seq = seq;
+        if let Err(error) = control.check("memtable flush publication") {
+            let _ = crate::vfs::unlink(&path);
+            return Err(error.into());
+        }
         m.commit(&self.dir)?; // <- the linearization point
 
         self.parts.push(Arc::new(Part::open_in(&path, self.pcache.clone())?));

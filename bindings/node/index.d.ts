@@ -349,8 +349,10 @@ export declare class NativeStore {
   readonly maxConcurrentSqlMemoryBytes: bigint;
   readonly reservedSqlMemoryBytes: bigint;
   write(ops: WriteOp[], durable?: boolean): Promise<void>;
-  sync(): Promise<void>;
-  flush(): Promise<boolean>;
+  /** Cancellation is observed before entering the WAL fsync boundary. */
+  sync(options?: LifecycleOptions): Promise<void>;
+  /** Cancellation is observed before manifest publication; staged parts remain unreachable. */
+  flush(options?: LifecycleOptions): Promise<boolean>;
   scan(request?: ScanRequest): Promise<ScanPage>;
   explainScan(request?: ScanRequest): Promise<ScanExplanation>;
   /** Publishes earlier writes as an immutable cut before planning; timeout includes actor queue time. */

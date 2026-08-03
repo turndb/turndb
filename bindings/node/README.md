@@ -90,6 +90,10 @@ silently.
   configurable with `maxConcurrentSqlMemoryBytes`). Writer-derived snapshots share their writer's
   budget; exhaustion fails immediately and reservations release on EOF, error, cancellation, close,
   or drop. Handles expose both the limit and currently reserved bytes.
+- `sync({ timeoutMs, signal })` and `flush({ timeoutMs, signal })` include actor queue time. Sync
+  observes interruption only before WAL fsync; flush also checks its unpublished planning and digest
+  phases and removes a staged part on cancellation. Neither reports cancellation after its final
+  durability/publication boundary begins.
 - `close()` syncs by default. Passing `false` is an explicit no-sync close.
 - Calls made after close refuse. `NativeStore.open(path, { commandQueueCapacity })` sets the accepted
   backlog from 1 through 65,536; the default remains 64 and the handle reports its actual value.
@@ -128,6 +132,6 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose cancellation for sync or flush. Low-level untyped invariant
-failures also retain the conservative `INTERNAL` class. Those remain explicit Phase 3/4 work rather
-than being simulated in JavaScript.
+Part encoding during flush remains one uninterruptible unit. Low-level untyped invariant failures
+also retain the conservative `INTERNAL` class. Those remain explicit Phase 3/4 work rather than being
+simulated in JavaScript.
