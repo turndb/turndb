@@ -21,6 +21,8 @@ Controlled operations currently include:
   `pack::write_with_control`.
 - Validated extraction/publication through `pack::restore_with_control`.
 - Offline candidate validation/publication through `store::recover_manifest_with_control`.
+- Store inventory and Node maintenance-space preflight while traversing or settling the
+  actor-ordered store cut.
 
 Checkpoints occur between records, dictionary entries, sections, fold frames, copied pieces, rebuilt
 parts, and independently punchable blocks. An individual unit is not split, so cancellation latency

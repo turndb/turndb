@@ -660,6 +660,14 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
     assert_eq!(plan.input_rows, 20);
     assert_eq!(plan.input_bytes, first_two_bytes);
     assert!(!plan.drops_tombstones, "a partial run must retain delete markers");
+    let estimate = s.estimate_compaction_space(budget).unwrap().unwrap();
+    assert_eq!(estimate.plan, plan);
+    assert!(estimate.input_sections > 0);
+    assert!(estimate.input_raw_section_bytes > 0);
+    assert!(estimate.estimated_stage_bytes > estimate.input_raw_section_bytes);
+    assert!(!estimate.estimate_is_hard_bound);
+    assert_eq!(estimate.retained_input_bytes_after_commit, plan.input_bytes);
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
 
     let result = s.compact_bounded(budget).unwrap().unwrap();
     assert_eq!(result.plan, plan, "execution must honor the observed plan exactly");
@@ -667,6 +675,7 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
     assert_eq!(s.part_count(), 4);
     let output = &s.manifest().parts[result.plan.start_part];
     assert_eq!(result.output_bytes, std::fs::metadata(dir.join(&output.file)).unwrap().len());
+    assert!(result.output_bytes <= estimate.estimated_stage_bytes);
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "bounded merge lost {id}");
     }
@@ -1653,11 +1662,27 @@ fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
     // Deleting reclaims nothing on its own — that is the whole reason this operation exists.
     assert_eq!(fold_gen_bytes(&dir), before, "a delete must not touch the fold");
 
+    let estimate = s.estimate_refold_space().unwrap().unwrap();
+    assert_eq!(estimate.source_fold_logical_bytes, before);
+    assert!(estimate.source_part_bytes > 0);
+    assert!(estimate.source_part_sections > 0);
+    assert!(estimate.source_part_raw_section_bytes > 0);
+    assert!(estimate.estimated_stage_bytes > estimate.source_fold_logical_bytes);
+    assert!(!estimate.estimate_is_hard_bound);
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+
     let st = s.refold().unwrap();
     assert_eq!(st.tombstones_dropped, 10);
     assert_eq!(st.records_kept, 10);
     assert_eq!(st.pieces_dropped, 10, "the deleted records' content must be dropped");
     let after = fold_gen_bytes(&dir);
+    let rebuilt_part_bytes: u64 = s
+        .manifest()
+        .parts
+        .iter()
+        .map(|part| std::fs::metadata(dir.join(&part.file)).unwrap().len())
+        .sum();
+    assert!(after + rebuilt_part_bytes <= estimate.estimated_stage_bytes);
     // Half the content was deleted, so about half should be gone — "about", because a segment carries
     // a header and each block a frame, and asserting an exact half would be asserting the framing.
     assert!(
@@ -2401,5 +2426,58 @@ fn health_is_cheap_complete_and_tracks_publication() {
     assert_eq!(published.retained_commits, 1);
     assert!(published.fold_disk_bytes > 0);
     assert_eq!(published.fold_segments, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn space_usage_separates_live_retained_and_unclassified_files_without_double_counting() {
+    let dir = tmp("space-usage");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "one", b"first retained value long enough to fold");
+    store.flush().unwrap();
+    put(&mut store, "two", b"second retained value long enough to fold");
+    store.flush().unwrap();
+    store.merge_range(0, 2).unwrap();
+
+    std::fs::write(dir.join("operator-note"), b"not owned by TurnDB").unwrap();
+    let usage = store.space_usage().unwrap();
+    assert!(usage.live.files > 0);
+    assert!(usage.retained_only.files > 0, "retained manifests and replaced parts are pinned");
+    assert!(usage.unclassified.logical_bytes >= b"not owned by TurnDB".len() as u64);
+    assert_eq!(
+        usage.total.files,
+        usage.live.files + usage.retained_only.files + usage.unclassified.files
+    );
+    assert_eq!(
+        usage.total.logical_bytes,
+        usage.live.logical_bytes
+            + usage.retained_only.logical_bytes
+            + usage.unclassified.logical_bytes
+    );
+    match (
+        usage.total.allocated_bytes,
+        usage.live.allocated_bytes,
+        usage.retained_only.allocated_bytes,
+        usage.unclassified.allocated_bytes,
+    ) {
+        (Some(total), Some(live), Some(retained), Some(unclassified)) => {
+            assert_eq!(total, live + retained + unclassified);
+            assert!(usage.filesystem_available_bytes.is_some());
+        }
+        (None, None, None, None) => assert!(usage.filesystem_available_bytes.is_none()),
+        other => panic!("space allocation capability was inconsistent: {other:?}"),
+    }
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .space_usage_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<turndb::control::OperationInterrupted>().is_some(),
+        "inventory cancellation must remain typed: {error:#}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

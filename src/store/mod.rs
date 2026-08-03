@@ -1276,6 +1276,55 @@ pub struct StoreHealth {
     pub punched_blocks: u64,
 }
 
+/// File bytes in one reachability class.
+///
+/// `logical_bytes` is portable file length. `allocated_bytes` measures filesystem blocks and is
+/// `None` where the platform cannot report sparse allocation honestly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceAmount {
+    pub files: usize,
+    pub logical_bytes: u64,
+    pub allocated_bytes: Option<u64>,
+}
+
+impl Default for SpaceAmount {
+    fn default() -> Self {
+        SpaceAmount {
+            files: 0,
+            logical_bytes: 0,
+            allocated_bytes: if cfg!(unix) { Some(0) } else { None },
+        }
+    }
+}
+
+/// Exact reachability-aware storage facts for preflight and operational reporting.
+///
+/// Categories are disjoint. `retained_only` is not garbage: bounded time-travel manifests still
+/// require it. `unclassified` is deliberately not called reclaimable because an embedder may have
+/// placed an unrelated file in the directory and TurnDB has no authority to delete it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreSpaceUsage {
+    pub live: SpaceAmount,
+    pub retained_only: SpaceAmount,
+    pub unclassified: SpaceAmount,
+    pub total: SpaceAmount,
+    /// Bytes available to the current user on the containing filesystem, or `None` when unavailable.
+    pub filesystem_available_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Space facts and an explicitly advisory duplicate-generation estimate for refold.
+pub struct RefoldSpaceEstimate {
+    pub source_fold_logical_bytes: u64,
+    pub source_part_bytes: u64,
+    pub source_part_sections: usize,
+    pub source_part_raw_section_bytes: u64,
+    pub retained_only_bytes_before: u64,
+    pub estimated_stage_bytes: u64,
+    pub estimate_is_hard_bound: bool,
+    pub filesystem_available_bytes: Option<u64>,
+}
+
 /// Refuse an inverted scan range before it reaches `BTreeMap::range`, which PANICS on
 /// `start > end` rather than returning empty.
 ///
@@ -1811,8 +1860,8 @@ impl Store {
     ) -> Result<crate::pack::BackupStats> {
         control.check("backup")?;
         crate::pack::ensure_destination_available(out)?;
-        self.sync()?;
-        self.flush()?;
+        self.sync_with_control(control)?;
+        self.flush_with_control(control)?;
         control.check("backup")?;
         let stats = crate::pack::write_committed_with_control(&self.dir, out, control)?;
         Ok(crate::pack::BackupStats {
@@ -2162,6 +2211,77 @@ impl Store {
             .min_by_key(|&(start, rows, bytes)| (bytes, rows, start))
             .expect("at least two parts were checked above");
         Err(CompactionError::BudgetTooSmall { start_part, input_rows, input_bytes, budget }.into())
+    }
+
+    /// Estimate temporary output space for the current bounded-compaction plan.
+    ///
+    /// Input file lengths, section counts/raw bytes, retained-input bytes, and filesystem
+    /// availability are exact at this cut. `estimated_stage_bytes` is intentionally not a hard
+    /// bound: recompression and merged index encoding can change output size. Callers may apply
+    /// their own safety factor; TurnDB exposes the basis instead of hiding policy in a boolean.
+    pub fn estimate_compaction_space(
+        &self,
+        budget: CompactionBudget,
+    ) -> Result<Option<CompactionSpaceEstimate>> {
+        self.estimate_compaction_space_with_control(
+            budget,
+            &crate::control::OperationControl::default(),
+        )
+    }
+
+    /// [`Store::estimate_compaction_space`] with cooperative planning checkpoints.
+    pub fn estimate_compaction_space_with_control(
+        &self,
+        budget: CompactionBudget,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<CompactionSpaceEstimate>> {
+        control.check("compaction space preflight")?;
+        let Some(plan) = self.plan_compaction(budget)? else {
+            return Ok(None);
+        };
+        let end = plan.start_part + plan.input_parts;
+        let mut input_sections = 0usize;
+        let mut input_raw_section_bytes = 0u64;
+        for part in &self.parts[plan.start_part..end] {
+            control.check("compaction space preflight")?;
+            for (_, _, raw, _) in part.sections() {
+                control.check("compaction space preflight")?;
+                input_sections = input_sections
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("compaction section count overflow"))?;
+                input_raw_section_bytes = input_raw_section_bytes
+                    .checked_add(u64::from(raw))
+                    .ok_or_else(|| anyhow::anyhow!("compaction raw section byte count overflow"))?;
+            }
+        }
+        // Raw section bytes are the strongest cheap basis before running the merge. Explicit row
+        // and section framing allowance plus one MiB covers ordinary metadata variation, but is not
+        // represented as an admission guarantee.
+        let row_allowance = plan
+            .input_rows
+            .checked_mul(64)
+            .ok_or_else(|| anyhow::anyhow!("compaction row framing estimate overflow"))?;
+        let section_allowance = u64::try_from(input_sections)
+            .map_err(|_| anyhow::anyhow!("compaction section count exceeds u64"))?
+            .checked_mul(256)
+            .ok_or_else(|| anyhow::anyhow!("compaction section framing estimate overflow"))?;
+        let estimated_stage_bytes = input_raw_section_bytes
+            .checked_add(row_allowance)
+            .and_then(|bytes| bytes.checked_add(section_allowance))
+            .and_then(|bytes| bytes.checked_add(1 << 20))
+            .ok_or_else(|| anyhow::anyhow!("compaction stage estimate overflow"))?;
+        Ok(Some(CompactionSpaceEstimate {
+            plan,
+            input_sections,
+            input_raw_section_bytes,
+            estimated_stage_bytes,
+            estimate_is_hard_bound: false,
+            retained_input_bytes_after_commit: plan.input_bytes,
+            filesystem_available_bytes: crate::sys::filesystem_available_bytes(&self.dir)
+                .with_context(|| {
+                    format!("measure available filesystem bytes at {}", self.dir.display())
+                })?,
+        }))
     }
 
     pub fn compact_bounded(
@@ -2641,6 +2761,76 @@ impl Store {
         self.refold_with_control(&crate::control::OperationControl::default())
     }
 
+    /// Estimate duplicate-generation space for a future refold without decoding records/content.
+    ///
+    /// Source and retention bytes are exact. The stage estimate assumes the current logical fold
+    /// plus uncompressed part sections and explicit framing allowance; it is conservative planning
+    /// evidence, not a hard admission bound.
+    pub fn estimate_refold_space(&self) -> Result<Option<RefoldSpaceEstimate>> {
+        self.estimate_refold_space_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::estimate_refold_space`] with cooperative source and inventory checkpoints.
+    pub fn estimate_refold_space_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<RefoldSpaceEstimate>> {
+        control.check("refold space preflight")?;
+        if !self.mem.is_empty() {
+            bail!("refold space estimation requires a flushed memtable; call sync() and flush() first");
+        }
+        if self.parts.is_empty() {
+            return Ok(None);
+        }
+        let source_fold_logical_bytes = self.fold.disk_bytes();
+        let mut source_part_bytes = 0u64;
+        let mut source_part_sections = 0usize;
+        let mut source_part_raw_section_bytes = 0u64;
+        for (part, part_ref) in self.parts.iter().zip(&self.manifest.parts) {
+            control.check("refold space preflight")?;
+            source_part_bytes = source_part_bytes
+                .checked_add(std::fs::metadata(self.dir.join(&part_ref.file))?.len())
+                .ok_or_else(|| anyhow::anyhow!("refold source part byte count overflow"))?;
+            for (_, _, raw, _) in part.sections() {
+                control.check("refold space preflight")?;
+                source_part_sections = source_part_sections
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("refold section count overflow"))?;
+                source_part_raw_section_bytes = source_part_raw_section_bytes
+                    .checked_add(u64::from(raw))
+                    .ok_or_else(|| anyhow::anyhow!("refold raw section byte count overflow"))?;
+            }
+        }
+        let rows = self.manifest.parts.iter().try_fold(0u64, |rows, part| {
+            rows.checked_add(u64::from(part.records))
+                .ok_or_else(|| anyhow::anyhow!("refold row count overflow"))
+        })?;
+        let row_allowance = rows
+            .checked_mul(64)
+            .ok_or_else(|| anyhow::anyhow!("refold row framing estimate overflow"))?;
+        let section_allowance = u64::try_from(source_part_sections)
+            .map_err(|_| anyhow::anyhow!("refold section count exceeds u64"))?
+            .checked_mul(256)
+            .ok_or_else(|| anyhow::anyhow!("refold section framing estimate overflow"))?;
+        let estimated_stage_bytes = source_fold_logical_bytes
+            .checked_add(source_part_raw_section_bytes)
+            .and_then(|bytes| bytes.checked_add(row_allowance))
+            .and_then(|bytes| bytes.checked_add(section_allowance))
+            .and_then(|bytes| bytes.checked_add(1 << 20))
+            .ok_or_else(|| anyhow::anyhow!("refold stage estimate overflow"))?;
+        let usage = self.space_usage_with_control(control)?;
+        Ok(Some(RefoldSpaceEstimate {
+            source_fold_logical_bytes,
+            source_part_bytes,
+            source_part_sections,
+            source_part_raw_section_bytes,
+            retained_only_bytes_before: usage.retained_only.logical_bytes,
+            estimated_stage_bytes,
+            estimate_is_hard_bound: false,
+            filesystem_available_bytes: usage.filesystem_available_bytes,
+        }))
+    }
+
     /// [`Store::refold`] with cooperative checkpoints before the generation swap.
     ///
     /// Cancellation removes the unpublished generation and rebuilt parts. Once manifest commit is
@@ -2784,6 +2974,23 @@ impl Store {
         }
     }
 
+    /// Walk the store directory once and classify every regular file by manifest reachability.
+    ///
+    /// This is intentionally separate from [`Store::health`]: it performs filesystem traversal and
+    /// parses the retained window, so callers opt into its cost. No records, column values, or
+    /// content are decoded.
+    pub fn space_usage(&self) -> Result<StoreSpaceUsage> {
+        self.space_usage_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::space_usage`] with cooperative checks between manifests and filesystem entries.
+    pub fn space_usage_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<StoreSpaceUsage> {
+        store_space_usage(&self.dir, &self.manifest, control)
+    }
+
     /// Discover attribute names/types and named-content columns without decoding stored values.
     pub fn schema(&self) -> Result<crate::schema::Schema> {
         let mut schema = crate::schema::Builder::default();
@@ -2793,6 +3000,126 @@ impl Store {
         }
         Ok(schema.finish())
     }
+}
+
+fn store_space_usage(
+    dir: &Path,
+    live_manifest: &Manifest,
+    control: &crate::control::OperationControl,
+) -> Result<StoreSpaceUsage> {
+    control.check("store space inventory")?;
+    let mut live_files: HashSet<PathBuf> =
+        [PathBuf::from("MANIFEST"), PathBuf::from("WAL")].into_iter().collect();
+    live_files.extend(live_manifest.parts.iter().map(|part| PathBuf::from(&part.file)));
+    let live_fold = fold_relative_dir(dir, live_manifest.fold_gen)?;
+
+    let mut retained_files = HashSet::new();
+    let mut retained_folds = HashSet::new();
+    for commit in list_retained(dir) {
+        control.check("store space inventory")?;
+        let retained_path = retained_path(dir, commit);
+        retained_files.insert(relative_store_path(dir, &retained_path)?);
+        let manifest = load_retained(dir, commit)
+            .with_context(|| format!("account retained manifest {commit}"))?;
+        retained_files.extend(manifest.parts.iter().map(|part| PathBuf::from(&part.file)));
+        retained_folds.insert(fold_relative_dir(dir, manifest.fold_gen)?);
+    }
+
+    let mut usage = StoreSpaceUsage {
+        filesystem_available_bytes: crate::sys::filesystem_available_bytes(dir)
+            .with_context(|| format!("measure available filesystem bytes at {}", dir.display()))?,
+        ..StoreSpaceUsage::default()
+    };
+    let reachability = SpaceReachability {
+        live_files: &live_files,
+        live_fold: &live_fold,
+        retained_files: &retained_files,
+        retained_folds: &retained_folds,
+    };
+    account_store_files(
+        dir,
+        dir,
+        &reachability,
+        &mut usage,
+        control,
+    )?;
+    Ok(usage)
+}
+
+fn fold_relative_dir(dir: &Path, generation: u32) -> Result<PathBuf> {
+    relative_store_path(dir, &refold::fold_dir(dir, generation))
+}
+
+fn relative_store_path(dir: &Path, path: &Path) -> Result<PathBuf> {
+    path.strip_prefix(dir)
+        .map(Path::to_path_buf)
+        .with_context(|| format!("{} is outside store {}", path.display(), dir.display()))
+}
+
+struct SpaceReachability<'a> {
+    live_files: &'a HashSet<PathBuf>,
+    live_fold: &'a Path,
+    retained_files: &'a HashSet<PathBuf>,
+    retained_folds: &'a HashSet<PathBuf>,
+}
+
+fn account_store_files(
+    root: &Path,
+    dir: &Path,
+    reachability: &SpaceReachability<'_>,
+    usage: &mut StoreSpaceUsage,
+    control: &crate::control::OperationControl,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read store space directory {}", dir.display()))?
+    {
+        control.check("store space inventory")?;
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            account_store_files(
+                root,
+                &entry.path(),
+                reachability,
+                usage,
+                control,
+            )?;
+        } else if file_type.is_file() {
+            let relative = relative_store_path(root, &entry.path())?;
+            let metadata = entry.metadata()?;
+            add_space(&mut usage.total, &metadata)?;
+            let live = reachability.live_files.contains(&relative)
+                || relative.starts_with(reachability.live_fold);
+            let retained = reachability.retained_files.contains(&relative)
+                || reachability.retained_folds.iter().any(|fold| relative.starts_with(fold));
+            if live {
+                add_space(&mut usage.live, &metadata)?;
+            } else if retained {
+                add_space(&mut usage.retained_only, &metadata)?;
+            } else {
+                add_space(&mut usage.unclassified, &metadata)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_space(amount: &mut SpaceAmount, metadata: &std::fs::Metadata) -> Result<()> {
+    amount.files =
+        amount.files.checked_add(1).ok_or_else(|| anyhow::anyhow!("store file count overflow"))?;
+    amount.logical_bytes = amount
+        .logical_bytes
+        .checked_add(metadata.len())
+        .ok_or_else(|| anyhow::anyhow!("store logical byte count overflow"))?;
+    amount.allocated_bytes = match (amount.allocated_bytes, crate::sys::allocated_bytes(metadata)) {
+        (Some(total), Some(bytes)) => Some(
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("store allocated byte count overflow"))?,
+        ),
+        _ => None,
+    };
+    Ok(())
 }
 
 /// Exact physical-input bounds for one incremental compaction step.
@@ -2841,6 +3168,19 @@ pub struct CompactionPlan {
     pub input_bytes: u64,
     /// Whether this run covers the complete live list and may settle tombstones.
     pub drops_tombstones: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Space facts and an explicitly advisory stage estimate for one compaction plan.
+pub struct CompactionSpaceEstimate {
+    pub plan: CompactionPlan,
+    pub input_sections: usize,
+    pub input_raw_section_bytes: u64,
+    pub estimated_stage_bytes: u64,
+    pub estimate_is_hard_bound: bool,
+    /// Selected inputs remain pinned by the immediately preceding retained manifest after commit.
+    pub retained_input_bytes_after_commit: u64,
+    pub filesystem_available_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]

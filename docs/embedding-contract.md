@@ -324,8 +324,8 @@ as submission-inclusive Node `timeoutMs` and `AbortSignal` options. Unpublished
 compaction/refold/backup/restore staging is removed on
 interruption; punching is durably resumable after cancellation or crash. Strong erasure accepts
 interruption only before its atomic tombstone phase, then drives physical removal to completion so it
-cannot return an ambiguous partial-erasure result. Preflight space estimates and resumable format
-migration remain current gaps. Flush part encoding remains an indivisible cancellation unit, while
+cannot return an ambiguous partial-erasure result. Resumable format migration remains a current gap.
+Flush part encoding remains an indivisible cancellation unit, while
 sync deliberately stops observing interruption once fsync begins.
 
 Bounded compaction is a generic actor-ordered maintenance primitive, not a built-in scheduling
@@ -333,16 +333,19 @@ policy. A caller supplies simultaneous physical input-part, row, and exact file-
 selects the widest fitting contiguous run (oldest on ties), refuses with a typed insufficient-budget
 error when even an adjacent pair cannot fit, and reports the exact executed inputs and output bytes.
 Partial runs retain tombstones; only a run covering the complete live list may settle them. These
-ceilings bound input work, not elapsed time or temporary disk usage. See
-`docs/bounded-compaction.md`.
+ceilings bound input work, not elapsed time. Separate reachability-aware inventory and advisory
+staging estimates expose disk-planning evidence without inventing a consumer policy. See
+`docs/bounded-compaction.md` and `docs/maintenance-space.md`.
 
 `Store::health` and the Node `health()` method are constant-work operational snapshots. They report
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
 memtable entries and bytes, WAL and fold disk bytes, fold and part cache counters/budgets, Tier-0 dedup
 window entries, retained commits, and punched blocks. No record or content is decoded. Latency
 histograms, slow-query events, dedup ratios, reclaimable-byte estimation, and export hooks remain
-Phase-5 work; consumers may poll this generic value into their telemetry system. Structured pages
-separately expose exact section/block I/O attributable to that operation.
+Phase-5 work; consumers may poll this generic value into their telemetry system. The separate
+`space_usage` / `spaceUsage` inventory performs reachability-aware traversal and reports exact,
+disjoint live, retained-only, and unclassified storage categories. Structured pages separately expose
+exact section/block I/O attributable to that operation.
 
 ## 7. Compatibility policy
 

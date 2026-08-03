@@ -168,6 +168,8 @@ export interface Capabilities {
   commandQueueCapacity: number;
   commandQueueCapacityMax: number;
   writeAdmissionLimits: true;
+  storeSpaceUsage: true;
+  allocatedSpaceUsage: boolean;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -234,6 +236,24 @@ export interface StoreSchema {
   mayIncludeShadowedFields: boolean;
 }
 
+export interface SpaceAmount {
+  files: bigint;
+  logicalBytes: bigint;
+  /** Filesystem blocks in bytes; absent when the platform cannot report sparse allocation. */
+  allocatedBytes?: bigint;
+}
+
+export interface StoreSpaceUsage {
+  live: SpaceAmount;
+  /** Files needed only by retained time-travel manifests, not by the current manifest. */
+  retainedOnly: SpaceAmount;
+  /** Files TurnDB cannot prove are live or retention-pinned; not authorization to delete them. */
+  unclassified: SpaceAmount;
+  total: SpaceAmount;
+  /** Bytes available to the current user on the containing filesystem, when supported. */
+  filesystemAvailableBytes?: bigint;
+}
+
 export interface MergeStats {
   inputs: bigint;
   recordsIn: bigint;
@@ -263,6 +283,17 @@ export interface CompactionPlan {
   dropsTombstones: boolean;
 }
 
+export interface CompactionSpaceEstimate {
+  plan: CompactionPlan;
+  inputSections: bigint;
+  inputRawSectionBytes: bigint;
+  /** Conservative planning estimate, explicitly not an admission limit or hard upper bound. */
+  estimatedStageBytes: bigint;
+  estimateIsHardBound: false;
+  retainedInputBytesAfterCommit: bigint;
+  filesystemAvailableBytes?: bigint;
+}
+
 export interface RefoldResult {
   partsIn: bigint;
   partsOut: bigint;
@@ -275,6 +306,18 @@ export interface RefoldResult {
   foldBytesAfter: bigint;
   bytesReclaimed: bigint;
   staleGenerationLeft: boolean;
+}
+
+export interface RefoldSpaceEstimate {
+  sourceFoldLogicalBytes: bigint;
+  sourcePartBytes: bigint;
+  sourcePartSections: bigint;
+  sourcePartRawSectionBytes: bigint;
+  retainedOnlyBytesBefore: bigint;
+  /** Conservative duplicate-generation estimate; not an admission limit or hard upper bound. */
+  estimatedStageBytes: bigint;
+  estimateIsHardBound: false;
+  filesystemAvailableBytes?: bigint;
 }
 
 export type TurnDbErrorCode =
@@ -359,6 +402,7 @@ export declare class NativeStore {
   querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   snapshot(): Promise<NativeSnapshot>;
+  spaceUsage(options?: LifecycleOptions): Promise<StoreSpaceUsage>;
   schema(): Promise<StoreSchema>;
   compact(full?: boolean, options?: LifecycleOptions): Promise<{
     flushed: boolean;
@@ -375,6 +419,11 @@ export declare class NativeStore {
     outputBytes?: bigint;
     merge?: MergeStats;
   }>;
+  /** Settles the actor cut, then returns exact estimate inputs and an explicitly advisory result. */
+  estimateCompactionSpace(
+    budget: CompactionBudget,
+    options?: LifecycleOptions,
+  ): Promise<{ flushed: boolean; estimate?: CompactionSpaceEstimate }>;
   verify(options?: LifecycleOptions): Promise<{
     manifestLinks: bigint;
     partDigests: bigint;
@@ -399,6 +448,9 @@ export declare class NativeStore {
   }>;
   punch(options?: LifecycleOptions): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
   refold(options?: LifecycleOptions): Promise<RefoldResult>;
+  estimateRefoldSpace(
+    options?: LifecycleOptions,
+  ): Promise<{ flushed: boolean; estimate?: RefoldSpaceEstimate }>;
   health(): Promise<{
     commit: bigint;
     foldGeneration: number;
