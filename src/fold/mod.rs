@@ -732,6 +732,7 @@ impl Fold {
     /// pipeline, or a (cached) decompressed block — WITHOUT copying them anywhere first. Every
     /// read shape is a projection of this one.
     fn with_piece<T>(&self, loc: Loc, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        crate::io_trace::fold_block_touched(loc.block_id);
         let end = loc.in_off as u64 + loc.raw as u64;
         // still gathering — not yet sealed
         if loc.block_id == self.next_block {
@@ -800,6 +801,7 @@ impl Fold {
     /// The decompressed bytes of the block holding `loc`, through the cache.
     fn block_bytes(&self, loc: Loc) -> Result<Arc<Vec<u8>>> {
         if let Some(v) = self.cache.lock().unwrap().get(loc.block_id) {
+            crate::io_trace::fold_block_cache_hit();
             return Ok(v);
         }
         let (seg, off) =
@@ -847,7 +849,8 @@ impl Fold {
 
         let span = hdr.frame_len() as usize;
         let mut buf = vec![0u8; span];
-        f.read_exact_at(&mut buf, off as u64)
+        buf[..block::BLOCK_HDR_LEN].copy_from_slice(&hb);
+        f.read_exact_at(&mut buf[block::BLOCK_HDR_LEN..], off as u64 + block::BLOCK_HDR_LEN as u64)
             .with_context(|| format!("read block at seg {seg} off {off}"))?;
         block::verify_frame_bytes(&buf, has_dict)?;
 
@@ -863,6 +866,7 @@ impl Fold {
         }
         let arc = Arc::new(raw);
         self.cache.lock().unwrap().put(loc.block_id, arc.clone());
+        crate::io_trace::fold_block_cache_miss(span as u64, hdr.raw);
         Ok(arc)
     }
 

@@ -64,6 +64,19 @@ export interface ScanPage {
     contentValuesReconstructed: number;
     reconstructedBytes: bigint;
     reconstructionBudgetExhausted: boolean;
+    /** Exact reads attributable to this page; activity by concurrent scans is excluded. */
+    io: {
+      partSectionsTouched: bigint;
+      partSectionCacheHits: bigint;
+      partSectionCacheMisses: bigint;
+      partStoredBytesRead: bigint;
+      partRawBytesDecoded: bigint;
+      foldBlocksTouched: bigint;
+      foldBlockCacheHits: bigint;
+      foldBlockCacheMisses: bigint;
+      foldStoredBytesRead: bigint;
+      foldRawBytesDecoded: bigint;
+    };
   };
 }
 

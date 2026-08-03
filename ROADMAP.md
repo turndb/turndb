@@ -91,7 +91,10 @@ content model right before compatibility turns today's choices into permanent pr
   columns. Predicate-only fields are decoded but not returned; unselected attribute value/dictionary
   and named-content program sections remain unopened; live memtable records use the same semantic
   projection in memory. A read-fatal sibling-section test proves this is physical isolation rather
-  than filtering a fully decoded record.
+  than filtering a fully decoded record. Each successful structured page now also reports exact
+  operation-local part-section and fold-block touches, cache access counts, stored bytes requested,
+  and raw bytes decoded. Instrumentation sits below shared caches rather than subtracting global
+  counters, so concurrent snapshots cannot contaminate one another's evidence.
 
 ## Product boundary
 

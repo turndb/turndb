@@ -193,6 +193,52 @@ fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
 }
 
 #[test]
+fn page_io_stats_are_operation_local_and_distinguish_cold_from_cached_reads() {
+    let dir = tmp("io-stats");
+    let cfg = FoldCfg { block_target: 4 << 10, ..cfg() };
+    let payload = vec![b'x'; 8 << 10];
+    {
+        let mut store = Store::open(&dir, cfg).unwrap();
+        store
+            .put_record(
+                "a",
+                &[ContentSpans::new("payload", vec![Span::Piece(&payload)])],
+                status("ok"),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+
+    let reader = Store::open_read(&dir, cfg).unwrap();
+    let request = ScanRequest {
+        attrs: vec!["status".into()],
+        contents: vec![ContentSelect { name: "payload".into(), mode: ContentMode::Bytes }],
+        ..ScanRequest::default()
+    };
+    let cold = reader.scan(&request).unwrap();
+    assert_eq!(cold.rows[0].contents[0].bytes.as_deref(), Some(payload.as_slice()));
+    assert!(cold.stats.io.part_sections_touched > 0);
+    assert!(cold.stats.io.part_section_cache_misses > 0);
+    assert!(cold.stats.io.part_stored_bytes_read > 0);
+    assert!(cold.stats.io.part_raw_bytes_decoded >= cold.stats.io.part_stored_bytes_read);
+    assert_eq!(cold.stats.io.fold_blocks_touched, 1);
+    assert_eq!(cold.stats.io.fold_block_cache_misses, 1);
+    assert_eq!(cold.stats.io.fold_block_cache_hits, 0);
+    assert!(cold.stats.io.fold_stored_bytes_read > 0);
+    assert!(cold.stats.io.fold_raw_bytes_decoded >= payload.len() as u64);
+
+    let warm = reader.scan(&request).unwrap();
+    assert_eq!(warm.rows, cold.rows);
+    assert_eq!(warm.stats.io.fold_blocks_touched, 1);
+    assert_eq!(warm.stats.io.fold_block_cache_hits, 1);
+    assert_eq!(warm.stats.io.fold_block_cache_misses, 0);
+    assert_eq!(warm.stats.io.fold_stored_bytes_read, 0);
+    assert_eq!(warm.stats.io.fold_raw_bytes_decoded, 0);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn cancellation_and_deadlines_are_typed_and_return_no_partial_page() {
     let dir = tmp("interruption");
     let store = Store::open(&dir, cfg()).unwrap();
