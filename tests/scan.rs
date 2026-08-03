@@ -12,6 +12,14 @@ fn tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("turndb-scan-{tag}-{}-{n}", std::process::id()))
 }
 
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 fn cfg() -> FoldCfg {
     FoldCfg { seg_max: 1 << 22, ..FoldCfg::default() }
 }
@@ -133,6 +141,7 @@ fn extended_scalar_predicates_distinguish_explicit_null_from_missing() {
 #[test]
 fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
     let dir = tmp("projected-sections");
+    let _cleanup = RemoveOnDrop(dir.clone());
     {
         let mut store = Store::open(&dir, cfg()).unwrap();
         let request = "request".repeat(100);

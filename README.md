@@ -150,6 +150,8 @@ reference model by the [three-path differential gate](docs/differential-query-te
 No daemon, no network, no cluster, no consensus. Scale-out is more stores, not a bigger one. No
 encryption (the format reserves a flag bit and refuses it — see FORMAT.md). No parity/erasure
 coding: corruption is detected at every level and repair is the storage layer's job.
+The parser/binding threat model, completed hardening, and remaining availability risks are recorded
+in the [security review](docs/security-review.md); checksums are integrity evidence, not authentication.
 
 **One writer per store.** Readers need no lock and see a consistent committed snapshot. On Unix
 the engine enforces this with `flock`, which the kernel releases when the process dies — so a

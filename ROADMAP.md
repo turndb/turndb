@@ -611,6 +611,10 @@ This phase turns demonstrated behavior into promises that downstream projects ca
 - Published artifact sizes and measured costs for lightweight and full-featured packages.
 - An operational handbook covering backup, recovery, maintenance, upgrades, and failure diagnosis.
 - A security review of file parsing, malformed inputs, binding boundaries, and resource exhaustion.
+  **Initial review implemented and published:** manifest authority is semantically validated and
+  allocation-bounded; backup source paths are canonical and symlink-free; pack metadata has
+  configurable pre-allocation admission; advisory sidecars and dictionary candidates are bounded;
+  parser, native, and portable boundaries plus residual data-plane frame risks are documented.
 
 ### 1.0 gate
 

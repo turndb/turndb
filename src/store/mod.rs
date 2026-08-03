@@ -44,7 +44,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
 
@@ -71,6 +72,10 @@ pub const DEFAULT_MAX_BATCH_BYTES: u64 = 256 << 20;
 pub const DEFAULT_MAX_BATCH_RECORDS: usize = 4_096;
 /// Default UTF-8 byte ceiling for ids and field/content names: 4 KiB.
 pub const DEFAULT_MAX_IDENTIFIER_BYTES: usize = 4 << 10;
+/// Maximum committed-manifest bytes accepted from disk or a pack under the default format reader.
+/// A maintained store's manifest is orders of magnitude smaller; this prevents an untrusted sparse
+/// file from becoming an unbounded `read_to_end` allocation before JSON parsing can refuse it.
+pub const MAX_MANIFEST_BYTES: u64 = 64 << 20;
 
 impl Default for WriteLimits {
     fn default() -> Self {
@@ -605,6 +610,43 @@ pub struct Manifest {
     pub prev: Option<String>,
 }
 
+fn safe_part_file_name(name: &str) -> bool {
+    if name.is_empty() || name.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn valid_blake3_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Read the one small authoritative file through a hard allocation boundary. Metadata is checked
+/// first for the common/sparse-file case and `take(max + 1)` closes a concurrent-growth race.
+pub(crate) fn read_manifest_file(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let announced = file.metadata()?.len();
+    if announced > MAX_MANIFEST_BYTES {
+        bail!(
+            "MANIFEST at {} is {announced} bytes, exceeding the supported {MAX_MANIFEST_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    let capacity =
+        usize::try_from(announced).context("MANIFEST length does not fit this platform")?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).context("reserve MANIFEST buffer")?;
+    file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        bail!(
+            "MANIFEST at {} grew past the supported {MAX_MANIFEST_BYTES}-byte limit while reading",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
 impl Manifest {
     /// A MISSING manifest is a new store. An UNREADABLE one is an error.
     ///
@@ -612,9 +654,13 @@ impl Manifest {
     /// or EIO yielded an empty manifest, and the sweep then unlinked every part it did not name. One
     /// unreadable byte turned a live store into an empty directory.
     fn load(dir: &Path) -> Result<Manifest> {
-        match std::fs::read(dir.join("MANIFEST")) {
+        let path = dir.join("MANIFEST");
+        match read_manifest_file(&path) {
             Ok(b) => Manifest::parse(&b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
                 // A missing manifest is a new store — UNLESS a commit log exists, in which case
                 // this store has committed before and `MANIFEST` was lost. Opening it as new
                 // would be the destructive conflation all over again, one deletion further
@@ -631,9 +677,9 @@ impl Manifest {
                     )
                 }
             }
-            Err(e) => Err(anyhow::Error::new(e).context(format!(
+            Err(e) => Err(e.context(format!(
                 "cannot read {} — refusing to treat an unreadable manifest as an empty store",
-                dir.join("MANIFEST").display()
+                path.display()
             ))),
         }
     }
@@ -664,7 +710,50 @@ impl Manifest {
             }
             None => bytes,
         };
-        serde_json::from_slice(payload).context("corrupt MANIFEST")
+        if payload.len() as u64 > MAX_MANIFEST_BYTES {
+            bail!(
+                "MANIFEST is {} bytes, exceeding the supported {MAX_MANIFEST_BYTES}-byte limit",
+                payload.len()
+            );
+        }
+        let manifest: Manifest = serde_json::from_slice(payload).context("corrupt MANIFEST")?;
+        manifest.validate()
+    }
+
+    /// Validate semantic fields before any one of them becomes a filesystem path or allocation
+    /// input. JSON syntax and a checksum prove faithful bytes, not safe meaning.
+    fn validate(self) -> Result<Manifest> {
+        let mut files = HashSet::with_capacity(self.parts.len());
+        for part in &self.parts {
+            if !safe_part_file_name(&part.file) {
+                bail!("MANIFEST part file {:?} is not one store-local path component", part.file);
+            }
+            if !files.insert(part.file.as_str()) {
+                bail!("MANIFEST names part file {:?} more than once", part.file);
+            }
+            if part.seq_lo > part.seq_hi {
+                bail!(
+                    "MANIFEST part {:?} has inverted sequence range {}..{}",
+                    part.file,
+                    part.seq_lo,
+                    part.seq_hi
+                );
+            }
+            if part.b3.as_deref().is_some_and(|digest| !valid_blake3_hex(digest)) {
+                bail!("MANIFEST part {:?} carries an invalid BLAKE3 digest", part.file);
+            }
+        }
+        if self.prev.as_deref().is_some_and(|digest| !valid_blake3_hex(digest)) {
+            bail!("MANIFEST carries an invalid previous-manifest BLAKE3 digest");
+        }
+        let mut previous_hi = None;
+        for &(lo, hi) in &self.punched {
+            if lo > hi || previous_hi.is_some_and(|previous| lo <= previous) {
+                bail!("MANIFEST punched ranges must be ascending, disjoint, and non-empty");
+            }
+            previous_hi = Some(hi);
+        }
+        Ok(self)
     }
 
     /// The bytes as committed: compact JSON, then a `\ncrc32=XXXXXXXX` trailer over the JSON.
@@ -689,8 +778,9 @@ impl Manifest {
         self.commit += 1;
         // Chain onto whatever is being replaced. Hashed from disk rather than from memory,
         // because the chain's claim is about the BYTES a verifier can read back.
-        self.prev =
-            std::fs::read(dir.join("MANIFEST")).ok().map(|b| blake3::hash(&b).to_hex().to_string());
+        self.prev = read_manifest_file(&dir.join("MANIFEST"))
+            .ok()
+            .map(|b| blake3::hash(&b).to_hex().to_string());
         let bytes = self.encode()?;
         {
             let p = retained_path(dir, self.commit);
@@ -780,7 +870,7 @@ pub(crate) fn manifest_from_bytes(b: &[u8]) -> Result<Manifest> {
 /// under an open handle on an immutable artifact.
 pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
     let pack = crate::pack::Pack::open(path)?;
-    let manifest = Manifest::parse(&pack.read_file("MANIFEST")?)?;
+    let manifest = Manifest::parse(&pack.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
 
     let fold_rel = if manifest.fold_gen == 0 {
         "fold".to_string()
@@ -792,14 +882,21 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
     for name in pack.names().map(String::from).collect::<Vec<_>>() {
         let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
         if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            let extent = pack.file(&name).expect("name came from this pack's TOC");
+            let segment_len = crate::readat::ReadAt::len(&extent)?;
             segs.push(crate::fold::SegmentInput {
                 seg: n,
-                reader: Arc::new(pack.file(&name).expect("named file exists"))
-                    as Arc<dyn crate::readat::ReadAt>,
-                sidecar: pack.read_file(&format!("{fold_rel}/seg-{n:08}.dir")).ok(),
+                reader: Arc::new(extent) as Arc<dyn crate::readat::ReadAt>,
+                // Advisory: an overlarge sidecar is ignored and the segment is scanned instead.
+                sidecar: pack
+                    .read_file_bounded(
+                        &format!("{fold_rel}/seg-{n:08}.dir"),
+                        crate::fold::segment::max_dir_sidecar_bytes(segment_len),
+                    )
+                    .ok(),
             });
         } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
-            dict_files.push(pack.read_file(&name)?);
+            dict_files.push(pack.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
         }
     }
     let fold = Fold::open_read_from(segs, dict_files, cfg, path)?;
@@ -817,7 +914,7 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
 
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
     let p = retained_path(dir, commit);
-    let b = std::fs::read(&p).with_context(|| {
+    let b = read_manifest_file(&p).with_context(|| {
         format!("no retained manifest {} — the retention window has moved past it", p.display())
     })?;
     Manifest::parse(&b).with_context(|| format!("retained manifest {} is corrupt", p.display()))
@@ -912,7 +1009,7 @@ pub fn verify_chain_with_control(
     let mut prev_bytes: Option<Vec<u8>> = None;
     for &c in &commits {
         control.check("manifest verification")?;
-        let bytes = std::fs::read(retained_path(dir, c))?;
+        let bytes = read_manifest_file(&retained_path(dir, c))?;
         let m =
             Manifest::parse(&bytes).with_context(|| format!("retained manifest {c} is corrupt"))?;
         if let (Some(want), Some(pb)) = (&m.prev, &prev_bytes) {
@@ -926,10 +1023,12 @@ pub fn verify_chain_with_control(
             control.check("manifest verification")?;
             match &p.b3 {
                 Some(want) => {
-                    let got = blake3::hash(
-                        &std::fs::read(dir.join(&p.file))
-                            .with_context(|| format!("part {} named by commit {c}", p.file))?,
+                    let got = hash_file_with_control(
+                        &dir.join(&p.file),
+                        control,
+                        "manifest verification",
                     )
+                    .with_context(|| format!("part {} named by commit {c}", p.file))?
                     .to_hex()
                     .to_string();
                     if *want != got {
@@ -944,7 +1043,7 @@ pub fn verify_chain_with_control(
     }
     // The live MANIFEST must be byte-identical to its retained copy — same commit, same bytes.
     if let (Some(&newest), Some(pb)) = (commits.last(), &prev_bytes) {
-        let live = std::fs::read(dir.join("MANIFEST"))?;
+        let live = read_manifest_file(&dir.join("MANIFEST"))?;
         if live != *pb {
             bail!("MANIFEST diverges from its retained copy at commit {newest}");
         }
@@ -976,7 +1075,7 @@ fn complete_first_commit(dir: &Path) -> Result<u64> {
         if load_retained(dir, c).is_err() {
             continue;
         }
-        let bytes = std::fs::read(retained_path(dir, c))?;
+        let bytes = read_manifest_file(&retained_path(dir, c))?;
         promote_manifest(dir, c, &bytes)?;
         return Ok(c);
     }
@@ -1091,7 +1190,7 @@ pub fn recover_manifest_with_control(
                     }
                     .into());
                 }
-                let bytes = std::fs::read(retained_path(dir, c))?;
+                let bytes = read_manifest_file(&retained_path(dir, c))?;
                 // No cancellation checkpoint after this point. Promotion can change MANIFEST and
                 // prune newer retained manifests, so its actual outcome must be reported.
                 control.check("manifest recovery publication")?;
@@ -4164,6 +4263,83 @@ compile_error!(
 
 #[cfg(test)]
 mod tests {
+    fn manifest_bytes_with_part(file: &str) -> Vec<u8> {
+        serde_json::to_vec(&super::Manifest {
+            parts: vec![super::PartRef {
+                file: file.into(),
+                seq_lo: 1,
+                seq_hi: 1,
+                records: 1,
+                b3: None,
+            }],
+            next_seq: 2,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn manifest_part_names_cannot_escape_the_store_root() {
+        for hostile in
+            ["../secret.part", "/absolute/secret.part", "nested/secret.part", "..\\secret.part"]
+        {
+            let error =
+                super::Manifest::parse(&manifest_bytes_with_part(hostile)).unwrap_err().to_string();
+            assert!(error.contains("store-local path component"), "{hostile:?}: {error}");
+        }
+        assert!(
+            super::Manifest::parse(&manifest_bytes_with_part("part-00000001.part")).is_ok(),
+            "an ordinary legacy manifest remains accepted"
+        );
+    }
+
+    #[test]
+    fn manifest_semantics_reject_ambiguous_or_malformed_authority() {
+        let part = super::PartRef {
+            file: "part-00000001.part".into(),
+            seq_lo: 2,
+            seq_hi: 1,
+            records: 1,
+            b3: None,
+        };
+        let inverted = super::Manifest { parts: vec![part.clone()], ..Default::default() };
+        assert!(super::Manifest::parse(&serde_json::to_vec(&inverted).unwrap()).is_err());
+
+        let duplicate = super::Manifest {
+            parts: vec![
+                super::PartRef { seq_lo: 1, seq_hi: 1, ..part.clone() },
+                super::PartRef { seq_lo: 2, seq_hi: 2, ..part.clone() },
+            ],
+            ..Default::default()
+        };
+        assert!(super::Manifest::parse(&serde_json::to_vec(&duplicate).unwrap()).is_err());
+
+        let bad_digest = super::Manifest {
+            parts: vec![super::PartRef {
+                seq_lo: 1,
+                seq_hi: 1,
+                b3: Some("not-a-blake3-digest".into()),
+                ..part
+            }],
+            ..Default::default()
+        };
+        assert!(super::Manifest::parse(&serde_json::to_vec(&bad_digest).unwrap()).is_err());
+
+        let punched = super::Manifest { punched: vec![(5, 9), (9, 12)], ..Default::default() };
+        assert!(super::Manifest::parse(&serde_json::to_vec(&punched).unwrap()).is_err());
+    }
+
+    #[test]
+    fn manifest_size_is_refused_before_reading_a_sparse_body() {
+        let d = std::env::temp_dir().join(format!("turndb-manifest-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("MANIFEST");
+        std::fs::File::create(&path).unwrap().set_len(super::MAX_MANIFEST_BYTES + 1).unwrap();
+        let error = format!("{:#}", super::Manifest::load(&d).unwrap_err());
+        std::fs::remove_dir_all(d).ok();
+        assert!(error.contains("exceeding") && error.contains("limit"), "{error}");
+    }
+
     /// The bug this exists to prevent: corruption that still PARSES. A shortened `fold_off` here
     /// would have been believed, and recovery would then have truncated durable fold bytes to
     /// match it — data destroyed by one flipped bit with no error anywhere.

@@ -1,15 +1,32 @@
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use turndb::fold::FoldCfg;
 use turndb::store::{Batch, ContentSpans, Span, Store, WriteAdmissionError, WriteLimits};
 use turndb::AttrValue;
 
-fn tmp(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+struct ScopedDir(PathBuf);
+
+impl Deref for ScopedDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScopedDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn tmp(label: &str) -> ScopedDir {
+    ScopedDir(std::env::temp_dir().join(format!(
         "turndb-write-limits-{label}-{}-{}",
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-    ))
+    )))
 }
 
 fn limits(record: u64, batch: u64) -> WriteLimits {

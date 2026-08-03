@@ -40,12 +40,34 @@ use segment::{SegHeader, SEG_HDR_LEN, SEG_MAX_DEFAULT, SEG_MAX_LIMIT};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const SEGMENT_MAX_DEFAULT: u32 = SEG_MAX_DEFAULT;
 pub const SEGMENT_MAX_LIMIT: u64 = SEG_MAX_LIMIT;
 pub const BLOCK_TARGET_MAX: u64 = (u32::MAX as u64) / 2;
+/// Candidate dictionary bytes admitted during open. Zstd dictionaries are normally measured in
+/// KiB; this generous ceiling prevents an unrelated sparse file with a dictionary-shaped name from
+/// becoming an unbounded allocation.
+pub const MAX_DICTIONARY_BYTES: u64 = 64 << 20;
+
+fn read_bounded_candidate(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max {
+        bail!("candidate file {} is {len} bytes, exceeding the {max}-byte limit", path.display());
+    }
+    let capacity =
+        usize::try_from(len).context("candidate file length does not fit this platform")?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).context("reserve candidate file buffer")?;
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        bail!("candidate file {} grew past the {max}-byte limit while reading", path.display());
+    }
+    Ok(bytes)
+}
 
 /// Another writer currently owns this fold's OS lock.
 ///
@@ -530,10 +552,12 @@ impl Fold {
         nums.sort_unstable();
         let mut segs = Vec::with_capacity(nums.len());
         for &n in &nums {
+            let reader = Arc::new(segment::open_read(dir, n)?);
+            let len = reader.metadata()?.len();
             segs.push(SegmentInput {
                 seg: n,
-                reader: Arc::new(segment::open_read(dir, n)?) as Arc<dyn ReadAt>,
-                sidecar: std::fs::read(segment::dir_path(dir, n)).ok(),
+                reader: reader as Arc<dyn ReadAt>,
+                sidecar: segment::read_dir_sidecar_bytes(dir, n, len),
             });
         }
         let mut dict_files = Vec::new();
@@ -541,7 +565,7 @@ impl Fold {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
                 if n.starts_with("zdict-") && n.ends_with(".zd") {
-                    dict_files.push(std::fs::read(e.path())?);
+                    dict_files.push(read_bounded_candidate(&e.path(), MAX_DICTIONARY_BYTES)?);
                 }
             }
         }
@@ -578,7 +602,7 @@ impl Fold {
                 // active, and punched blocks can only be located through its sidecar. The parser
                 // below accepts it only when its embedded tail equals this bounded reader's length,
                 // so a sidecar describing a newer suffix remains safely advisory.
-                sidecar: std::fs::read(segment::dir_path(dir, segment)).ok(),
+                sidecar: segment::read_dir_sidecar_bytes(dir, segment, len),
             });
         }
         let mut dict_files = Vec::new();
@@ -586,7 +610,7 @@ impl Fold {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with("zdict-") && name.ends_with(".zd") {
-                    dict_files.push(std::fs::read(entry.path())?);
+                    dict_files.push(read_bounded_candidate(&entry.path(), MAX_DICTIONARY_BYTES)?);
                 }
             }
         }
