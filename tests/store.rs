@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
 use turndb::store::{
-    CompactionBudget, CompactionError, ContentSpans, Manifest, PartRef, Span, Store,
+    CompactionBudget, CompactionError, ContentSpans, Manifest, PartRef, Span, Store, StoreOptions,
 };
 use turndb::AttrValue;
 
@@ -75,6 +75,52 @@ fn put_flush_get_is_byte_exact() {
         assert_eq!(r.attrs[0].1, AttrValue::Str("claude".into()));
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
+    let dir = tmp("store-options");
+    let options = StoreOptions {
+        fold: FoldCfg {
+            block_target: 4096,
+            cache_bytes: 2 << 20,
+            seg_max: 1 << 20,
+            level: 3,
+            compress_threads: 1,
+        },
+        part_cache_bytes: 4 << 20,
+        ..StoreOptions::default()
+    };
+    let mut store = Store::open_with_options(&dir, options).unwrap();
+    let health = store.health();
+    assert_eq!(health.fold_block_target_bytes, 4096);
+    assert_eq!(health.fold_cache_budget, 2 << 20);
+    assert_eq!(health.part_cache_budget, 4 << 20);
+    assert_eq!(health.fold_segment_max_bytes, 1 << 20);
+    assert_eq!(health.fold_compression_level, 3);
+    assert_eq!(health.fold_compression_threads, 1);
+    put(&mut store, "configured", b"runtime policy survives a refold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.refold().unwrap();
+    assert_eq!(store.health().part_cache_budget, 4 << 20);
+    drop(store);
+
+    // Reopening with other runtime policy reads the same format without migration.
+    let reopened = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(reopened.health().fold_block_target_bytes, cfg().block_target);
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let invalid = tmp("store-options-invalid");
+    let error = Store::open_with_options(
+        &invalid,
+        StoreOptions { part_cache_bytes: 0, ..StoreOptions::default() },
+    )
+    .err()
+    .expect("invalid cache budget must refuse open");
+    assert!(error.to_string().contains("part_cache_bytes"));
+    std::fs::remove_dir_all(&invalid).ok();
 }
 
 #[test]

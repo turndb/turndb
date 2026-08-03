@@ -45,6 +45,8 @@ use super::ContentMeta;
 
 /// Default budget across all parts sharing one cache. See the module note on why this is not small.
 pub const BUDGET_DEFAULT: usize = 512 << 20;
+/// Smallest effective shared cache budget.
+pub const BUDGET_MIN: usize = 1 << 20;
 
 /// Distinguishes the four caches within one part, so their keys cannot collide.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -119,7 +121,7 @@ pub fn next_part_id() -> u64 {
 impl SectionCache {
     pub fn new(budget: usize) -> SectionCache {
         SectionCache {
-            budget: budget.max(1 << 20),
+            budget: budget.max(BUDGET_MIN),
             inner: Mutex::new(Inner { bytes: 0, clock: 0, map: HashMap::new() }),
         }
     }

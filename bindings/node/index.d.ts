@@ -184,6 +184,7 @@ export interface Capabilities {
   lifecycleEventCapacity: number;
   queryTimings: true;
   sqlExplain: true;
+  storageRuntimeOptions: true;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -222,6 +223,18 @@ export interface OpenOptions {
   maxBatchRecords?: number;
   /** UTF-8 bytes admitted in an id, attribute name, or content name; defaults to 4 KiB. */
   maxIdentifierBytes?: number;
+  /** Raw bytes gathered per compressed content block; defaults to 4 MiB. */
+  blockTargetBytes?: bigint;
+  /** Decompressed content-block cache budget; defaults to 64 MiB. */
+  foldCacheBytes?: bigint;
+  /** One decoded-section cache shared by all immutable parts; defaults to 512 MiB. */
+  partCacheBytes?: bigint;
+  /** Fold segment roll threshold below 4 GiB; defaults to 1 GiB. */
+  segmentMaxBytes?: bigint;
+  /** Zstd write level from 1 through 22; defaults to 19. */
+  compressionLevel?: number;
+  /** Compression workers; zero selects available parallelism. */
+  compressionThreads?: number;
 }
 
 export interface SnapshotOpenOptions {
@@ -605,6 +618,12 @@ export declare class NativeStore {
     foldSegments: number;
     foldCacheHits: bigint;
     foldCacheMisses: bigint;
+    foldCacheBytes: bigint;
+    foldCacheBudget: bigint;
+    foldBlockTargetBytes: bigint;
+    foldSegmentMaxBytes: bigint;
+    foldCompressionLevel: number;
+    foldCompressionThreads: bigint;
     partCacheBytes: bigint;
     partCacheBudget: bigint;
     dedupWindowEntries: bigint;

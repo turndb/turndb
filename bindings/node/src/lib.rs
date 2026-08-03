@@ -33,7 +33,7 @@ use turndb::scan::{
     ScanExplanation, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
     DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
 };
-use turndb::store::{CompactionBudget, ReadStore, Store, WriteLimits};
+use turndb::store::{CompactionBudget, ReadStore, Store, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> Error {
@@ -310,6 +310,7 @@ pub struct NativeCapabilities {
     pub lifecycle_event_capacity: u32,
     pub query_timings: bool,
     pub sql_explain: bool,
+    pub storage_runtime_options: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -371,6 +372,7 @@ pub fn capabilities() -> NativeCapabilities {
         lifecycle_event_capacity: c.lifecycle_event_capacity as u32,
         query_timings: c.query_timings,
         sql_explain: c.sql_explain,
+        storage_runtime_options: true,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -425,6 +427,18 @@ pub struct NativeOpenOptions {
     pub max_batch_records: Option<u32>,
     /// UTF-8 bytes admitted in an id, attribute name, or content name. Defaults to 4 KiB.
     pub max_identifier_bytes: Option<u32>,
+    /// Raw bytes gathered per compressed fold block. Defaults to 4 MiB.
+    pub block_target_bytes: Option<BigInt>,
+    /// Decompressed fold-block cache budget. Defaults to 64 MiB.
+    pub fold_cache_bytes: Option<BigInt>,
+    /// Shared immutable-part section-cache budget. Defaults to 512 MiB.
+    pub part_cache_bytes: Option<BigInt>,
+    /// Fold segment roll threshold. Defaults to 1 GiB.
+    pub segment_max_bytes: Option<BigInt>,
+    /// Zstd write level in 1..=22. Defaults to 19.
+    pub compression_level: Option<i32>,
+    /// Fold compression workers; zero selects available parallelism.
+    pub compression_threads: Option<u32>,
 }
 
 #[napi(object)]
@@ -645,6 +659,12 @@ pub struct NativeHealth {
     pub fold_segments: u32,
     pub fold_cache_hits: BigInt,
     pub fold_cache_misses: BigInt,
+    pub fold_cache_bytes: BigInt,
+    pub fold_cache_budget: BigInt,
+    pub fold_block_target_bytes: BigInt,
+    pub fold_segment_max_bytes: BigInt,
+    pub fold_compression_level: i32,
+    pub fold_compression_threads: BigInt,
     pub part_cache_bytes: BigInt,
     pub part_cache_budget: BigInt,
     pub dedup_window_entries: BigInt,
@@ -1290,12 +1310,12 @@ impl NativeStore {
         let sql_budget = decode_sql_budget(
             options.as_ref().and_then(|options| options.max_concurrent_sql_memory_bytes.clone()),
         )?;
-        let write_limits = decode_write_limits(options.as_ref())?;
+        let store_options = decode_store_options(options.as_ref())?;
         let actor = napi::tokio::task::spawn_blocking(move || {
-            Actor::open_with_capacity_and_limits(
+            Actor::open_with_capacity_and_options(
                 &PathBuf::from(path),
                 capacity as usize,
-                write_limits,
+                store_options,
             )
         })
         .await
@@ -2254,6 +2274,78 @@ fn decode_write_limits(options: Option<&NativeOpenOptions>) -> Result<WriteLimit
     limits.validate().map_err(|error| Error::new(Status::InvalidArg, error.to_string()))
 }
 
+fn decode_store_options(options: Option<&NativeOpenOptions>) -> Result<StoreOptions> {
+    let defaults = StoreOptions::default();
+    let decode_usize = |value: BigInt, name: &str| -> Result<usize> {
+        usize::try_from(decode_u64(value, name)?).map_err(|_| {
+            Error::new(Status::InvalidArg, format!("{name} exceeds this platform's address space"))
+        })
+    };
+    let block_target = match options.and_then(|options| options.block_target_bytes.clone()) {
+        Some(value) => decode_usize(value, "blockTargetBytes")?,
+        None => defaults.fold.block_target,
+    };
+    if block_target == 0 || block_target as u64 > turndb::fold::BLOCK_TARGET_MAX {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("blockTargetBytes must be between 1 and {}", turndb::fold::BLOCK_TARGET_MAX),
+        ));
+    }
+    let fold_cache_bytes = match options.and_then(|options| options.fold_cache_bytes.clone()) {
+        Some(value) => decode_usize(value, "foldCacheBytes")?,
+        None => defaults.fold.cache_bytes,
+    };
+    if fold_cache_bytes == 0 {
+        return Err(Error::new(Status::InvalidArg, "foldCacheBytes must be greater than zero"));
+    }
+    let part_cache_bytes = match options.and_then(|options| options.part_cache_bytes.clone()) {
+        Some(value) => decode_usize(value, "partCacheBytes")?,
+        None => defaults.part_cache_bytes,
+    };
+    if part_cache_bytes < turndb::part::cache::BUDGET_MIN {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("partCacheBytes must be at least {}", turndb::part::cache::BUDGET_MIN),
+        ));
+    }
+    let segment_max = match options.and_then(|options| options.segment_max_bytes.clone()) {
+        Some(value) => decode_u64(value, "segmentMaxBytes")?,
+        None => u64::from(defaults.fold.seg_max),
+    };
+    if segment_max == 0 || segment_max >= turndb::fold::SEGMENT_MAX_LIMIT {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "segmentMaxBytes must be between 1 and {}",
+                turndb::fold::SEGMENT_MAX_LIMIT - 1
+            ),
+        ));
+    }
+    let segment_max = u32::try_from(segment_max).map_err(|_| {
+        Error::new(Status::InvalidArg, "segmentMaxBytes must be smaller than 4 GiB")
+    })?;
+    let level =
+        options.and_then(|options| options.compression_level).unwrap_or(defaults.fold.level);
+    if !(1..=22).contains(&level) {
+        return Err(Error::new(Status::InvalidArg, "compressionLevel must be between 1 and 22"));
+    }
+    let compress_threads = options
+        .and_then(|options| options.compression_threads)
+        .map(|value| value as usize)
+        .unwrap_or(defaults.fold.compress_threads);
+    Ok(StoreOptions {
+        fold: FoldCfg {
+            seg_max: segment_max,
+            cache_bytes: fold_cache_bytes,
+            block_target,
+            level,
+            compress_threads,
+        },
+        write_limits: decode_write_limits(options)?,
+        part_cache_bytes,
+    })
+}
+
 fn decode_compaction_budget(input: NativeCompactionBudget) -> Result<CompactionBudget> {
     let budget = CompactionBudget {
         max_input_parts: usize::try_from(input.max_input_parts).map_err(|_| {
@@ -2650,6 +2742,12 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         fold_segments: health.fold_segments,
         fold_cache_hits: BigInt::from(health.fold_cache_hits),
         fold_cache_misses: BigInt::from(health.fold_cache_misses),
+        fold_cache_bytes: BigInt::from(health.fold_cache_bytes as u64),
+        fold_cache_budget: BigInt::from(health.fold_cache_budget as u64),
+        fold_block_target_bytes: BigInt::from(health.fold_block_target_bytes as u64),
+        fold_segment_max_bytes: BigInt::from(u64::from(health.fold_segment_max_bytes)),
+        fold_compression_level: health.fold_compression_level,
+        fold_compression_threads: BigInt::from(health.fold_compression_threads as u64),
         part_cache_bytes: BigInt::from(health.part_cache_bytes as u64),
         part_cache_budget: BigInt::from(health.part_cache_budget as u64),
         dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
