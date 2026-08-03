@@ -28,7 +28,9 @@ content model right before compatibility turns today's choices into permanent pr
 - The first Phase-3 native Node slice lives in `bindings/node`: a stable N-API 6 addon, one bounded
   Rust store actor per writer, Promise operations, atomic batches with explicit durability, native
   buffers and bigint, the Rust structured pager, explicit capability reporting, and no silent WASM
-  fallback. It is a source prototype, not yet a production prebuild matrix.
+  fallback. Writer-created immutable cuts and independently opened live/retained reader snapshots now
+  carry stable multi-page reads without taking a writer lock. It is a source prototype, not yet a
+  production prebuild matrix.
 
 ## Product boundary
 
@@ -280,11 +282,12 @@ facility.
 
 ### Current prototype evidence
 
-The first native slice implements open, atomic ordered write/delete batches, sync, flush, structured
-scan, named-content reconstruction, and close. One dedicated Rust thread owns the writer; a bounded
-64-command queue refuses overload rather than accumulating unbounded Promises. Node integration tests
-load the addon and cover exact `i64::MIN` bigint, NaN, ordered duplicate attributes, named and empty
-content, projection, predicates, paging/cursor misuse, deletion, and close refusal.
+The first native slice implements open, atomic ordered write/delete batches, sync, flush, immutable
+current/retained snapshots, structured scan, named-content reconstruction, and close. One dedicated
+Rust thread owns the writer; a bounded 64-command queue refuses overload rather than accumulating
+unbounded Promises. Node integration tests load the addon and cover exact `i64::MIN` bigint, NaN,
+ordered duplicate attributes, named and empty content, projection, predicates, paging/cursor misuse,
+snapshot isolation/publication, retained commits, deletion, and close refusal.
 
 Measured on Linux x86-64 from the 2026-08-02 tree with the workspace release profile and GNU `strip`:
 
@@ -299,9 +302,9 @@ not include npm metadata or per-platform duplication. It does show that keeping 
 profile is useful while the additional query-engine dependency is affordable when its capabilities
 are actually exposed.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts, immutable read handles, Arrow IPC and SQL,
-cancellation/deadlines, configurable queue limits, structured error codes, lifecycle maintenance,
-and measured event-loop/query overhead under a representative mixed workload.
+Remaining Phase-3 gaps are prebuilt platform artifacts, Arrow IPC and SQL, cancellation/deadlines,
+configurable queue limits, structured error codes, lifecycle maintenance, and measured event-loop/query
+overhead under a representative mixed workload.
 
 ### Maturity gate
 

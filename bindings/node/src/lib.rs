@@ -12,10 +12,13 @@ use napi::bindgen_prelude::{BigInt, Buffer};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use turndb::fold::FoldCfg;
 use turndb::scan::{
     Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent, ScanPage,
     ScanRequest, ScanRow,
 };
+use turndb::store::{ReadStore, Store};
 use turndb::types::AttrValue;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> Error {
@@ -128,6 +131,7 @@ pub struct NativeCapabilities {
     pub native_node: bool,
     pub napi_version: u8,
     pub command_queue_capacity: u32,
+    pub immutable_snapshots: bool,
 }
 
 #[napi]
@@ -154,7 +158,128 @@ pub fn capabilities() -> NativeCapabilities {
         native_node: true,
         napi_version: 6,
         command_queue_capacity: 64,
+        immutable_snapshots: true,
     }
+}
+
+struct SnapshotState {
+    store: Mutex<Option<Arc<ReadStore>>>,
+    commit: u64,
+}
+
+impl SnapshotState {
+    fn new(store: ReadStore) -> SnapshotState {
+        let commit = store.manifest().commit;
+        SnapshotState { store: Mutex::new(Some(Arc::new(store))), commit }
+    }
+
+    fn get(&self) -> Result<Arc<ReadStore>> {
+        self.store
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "TurnDB snapshot state is poisoned"))?
+            .clone()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "TurnDB snapshot is closed"))
+    }
+
+    fn close(&self) -> Result<()> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "TurnDB snapshot state is poisoned"))?;
+        if store.take().is_none() {
+            return Err(Error::new(Status::GenericFailure, "TurnDB snapshot is already closed"));
+        }
+        Ok(())
+    }
+}
+
+/// An immutable manifest snapshot. Independent operations may execute concurrently.
+#[napi]
+pub struct NativeSnapshot {
+    state: Arc<SnapshotState>,
+}
+
+impl NativeSnapshot {
+    fn from_store(store: ReadStore) -> NativeSnapshot {
+        NativeSnapshot { state: Arc::new(SnapshotState::new(store)) }
+    }
+}
+
+#[napi]
+impl NativeSnapshot {
+    /// Open the currently published manifest without taking the writer lock or replaying its WAL.
+    #[napi(factory)]
+    pub async fn open(path: String) -> Result<NativeSnapshot> {
+        if path.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
+        }
+        let store = napi::tokio::task::spawn_blocking(move || {
+            Store::open_read(&PathBuf::from(path), FoldCfg::default())
+        })
+        .await
+        .map_err(|error| failure("join TurnDB snapshot open", error))?
+        .map_err(|error| failure("open TurnDB snapshot", error))?;
+        Ok(NativeSnapshot::from_store(store))
+    }
+
+    /// Open one retained manifest commit. Retention is bounded and erasure can purge history.
+    #[napi(factory)]
+    pub async fn open_at(path: String, commit: BigInt) -> Result<NativeSnapshot> {
+        if path.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
+        }
+        let commit = decode_u64(commit, "snapshot commit")?;
+        let store = napi::tokio::task::spawn_blocking(move || {
+            Store::open_read_at(&PathBuf::from(path), FoldCfg::default(), commit)
+        })
+        .await
+        .map_err(|error| failure("join retained TurnDB snapshot open", error))?
+        .map_err(|error| failure("open retained TurnDB snapshot", error))?;
+        Ok(NativeSnapshot::from_store(store))
+    }
+
+    #[napi(getter)]
+    pub fn commit(&self) -> BigInt {
+        BigInt::from(self.state.commit)
+    }
+
+    #[napi]
+    pub async fn scan(&self, request: Option<NativeScanRequest>) -> Result<NativeScanPage> {
+        let request = request.map(decode_scan).transpose()?.unwrap_or_default();
+        let store = self.state.get()?;
+        napi::tokio::task::spawn_blocking(move || store.scan(&request))
+            .await
+            .map_err(|error| failure("join TurnDB snapshot scan", error))?
+            .map(encode_page)
+            .map_err(|error| failure("scan TurnDB snapshot", error))
+    }
+
+    #[napi]
+    pub async fn read_content(&self, id: String, name: String) -> Result<Option<Buffer>> {
+        let store = self.state.get()?;
+        napi::tokio::task::spawn_blocking(move || store.reconstruct_content(&id, &name))
+            .await
+            .map_err(|error| failure("join TurnDB snapshot content read", error))?
+            .map(|bytes| bytes.map(Buffer::from))
+            .map_err(|error| failure("read TurnDB snapshot content", error))
+    }
+
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        self.state.close()
+    }
+}
+
+/// Retained commits currently available to [`NativeSnapshot::open_at`].
+#[napi]
+pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
+    if path.is_empty() {
+        return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
+    }
+    napi::tokio::task::spawn_blocking(move || turndb::store::retained_commits(&PathBuf::from(path)))
+        .await
+        .map(|commits| commits.into_iter().map(BigInt::from).collect())
+        .map_err(|error| failure("list retained TurnDB commits", error))
 }
 
 /// A native writer handle. All operations are asynchronous and serialized by its Rust actor.
@@ -219,6 +344,16 @@ impl NativeStore {
             .await
             .map(|bytes| bytes.map(Buffer::from))
             .map_err(|error| failure("read TurnDB content", error))
+    }
+
+    /// Publish all earlier accepted writes and return an immutable reader at that exact cut.
+    #[napi]
+    pub async fn snapshot(&self) -> Result<NativeSnapshot> {
+        self.actor
+            .snapshot()
+            .await
+            .map(NativeSnapshot::from_store)
+            .map_err(|error| failure("create TurnDB snapshot", error))
     }
 
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
@@ -389,6 +524,14 @@ fn decode_predicate(input: NativePredicate) -> Result<Predicate> {
 
 fn required<T>(value: Option<T>, message: &str) -> Result<T> {
     value.ok_or_else(|| Error::new(Status::InvalidArg, message))
+}
+
+fn decode_u64(value: BigInt, what: &str) -> Result<u64> {
+    let (negative, value, lossless) = value.get_u64();
+    if negative || !lossless {
+        return Err(Error::new(Status::InvalidArg, format!("{what} is outside the u64 range")));
+    }
+    Ok(value)
 }
 
 fn decode_compare(op: String) -> Result<Compare> {
