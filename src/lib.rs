@@ -52,6 +52,7 @@ pub mod part;
 #[cfg(feature = "columnar")]
 pub mod query;
 pub mod readat;
+pub mod scan;
 pub mod store;
 mod sys;
 pub mod types;

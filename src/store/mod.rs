@@ -1446,6 +1446,11 @@ impl Store {
         Ok(all)
     }
 
+    /// Bounded structured paging over the writer's complete read-your-writes view.
+    pub fn scan(&self, request: &crate::scan::ScanRequest) -> Result<crate::scan::ScanPage> {
+        crate::scan::scan_store(self, request)
+    }
+
     /// ERASE records: tombstone, settle, and rewrite until the content is physically gone.
     ///
     /// This is the compliance path, and it composes three operations that each already existed:
@@ -1712,6 +1717,11 @@ impl ReadStore {
     /// Distinct committed ids, sorted — the union across parts, newest-wins.
     pub fn ids(&self) -> Result<Vec<String>> {
         read::ids(&self.parts)
+    }
+
+    /// Bounded structured paging over this immutable manifest snapshot.
+    pub fn scan(&self, request: &crate::scan::ScanRequest) -> Result<crate::scan::ScanPage> {
+        crate::scan::scan_read_store(self, request)
     }
 
     /// Live ids in `[from, to)`, at most `limit`, id-ordered or reversed — the paged read.
