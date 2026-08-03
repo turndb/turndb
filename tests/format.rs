@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use turndb::fold::{FoldCfg, Loc};
 use turndb::store::{Span, Store};
+use turndb::types::ContentHash;
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -241,6 +242,7 @@ fn a_part_declares_the_sections_the_document_lists() {
         "cmeta",
         "con.prog.0",
         "con.off.0",
+        "con.id.0",
         "pdict.loc",
         "pdict.hash",
         "pdict.hsort",
@@ -261,11 +263,16 @@ fn a_part_declares_the_sections_the_document_lists() {
     let secs = p.sections();
     let loc = secs.iter().find(|(n, _, _, _)| n == "pdict.loc").unwrap();
     let hash = secs.iter().find(|(n, _, _, _)| n == "pdict.hash").unwrap();
+    let identities = secs.iter().find(|(n, _, _, _)| n == "con.id.0").unwrap();
     assert_eq!(
         loc.2 as usize / 12,
         hash.2 as usize / 32,
         "pdict.loc (12 B/piece) and pdict.hash (32 B/piece) must describe the same pieces"
     );
+    assert_eq!(identities.2, 30 * 33, "one fixed-width identity entry per content occurrence");
+    let first_body: Vec<u8> =
+        (0..400u32).flat_map(|j| blake3::hash(&j.to_le_bytes()).as_bytes()[..8].to_vec()).collect();
+    assert_eq!(p.content_identity(0, "body").unwrap(), Some(ContentHash::of(&first_body)));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -281,7 +288,7 @@ fn wal_frame_matches_the_document() {
     s.sync().unwrap();
     let b = std::fs::read(dir.join("WAL")).unwrap();
 
-    assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a named-content record");
+    assert_eq!(b[0], 0x5E, "tag at 0 is 0x5E for a record with content identities");
     assert_eq!(le64(&b, 1), 0, "seq at 1");
     let len = le32(&b, 9) as usize;
     assert_eq!(13 + len + 4, b.len(), "header 13 + payload + crc 4 is the whole frame");
@@ -555,7 +562,7 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     let path = dir.join("WAL");
     let mut b = std::fs::read(&path).unwrap();
     let payload = b"a frame type this build does not know";
-    let mut hdr = vec![0x5Fu8];
+    let mut hdr = vec![0x60u8];
     hdr.extend_from_slice(&99u64.to_le_bytes());
     hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     let mut h = crc32fast::Hasher::new();

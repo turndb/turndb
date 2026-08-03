@@ -3,7 +3,7 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
-**Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
+**Status: pre-1.0, format version 3, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
 ## What problem it solves
@@ -83,8 +83,9 @@ lens. Storage, visibility, and content semantics remain in TurnDB either way.
 
 `Store::scan` is available without either query feature. It provides id-ordered forward/reverse pages,
 typed predicates, selected attributes, named-content metadata or bytes, opaque checked cursors, and a
-per-call examination bound. Writer scans include the memtable; `ReadStore::scan` remains pinned to its
-manifest snapshot.
+per-call examination bound. Named-content metadata includes the BLAKE3 identity of the exact whole
+value without reconstruction for revision-3 records. Writer scans include the memtable;
+`ReadStore::scan` remains pinned to its manifest snapshot.
 
 ## What it does not do
 

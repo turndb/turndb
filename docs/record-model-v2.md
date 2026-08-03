@@ -1,5 +1,9 @@
 # General records and named content: format revision 2
 
+Revision 3 retains this named-column model and adds exact whole-value identities in parallel
+`con.id.N` sections. See [`content-identity-v3.md`](content-identity-v3.md); this document remains the
+design and compatibility record for the revision-2 generalization.
+
 Status: accepted for implementation on `codex/turn-maturity`.
 
 This decision is the first format-bearing step in the roadmap. It describes the logical record model,

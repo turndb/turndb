@@ -6,7 +6,7 @@
 
 use super::idcol::put_varint;
 use super::{OP_LIT, OP_PIECE};
-use crate::types::{BodyOp, PieceHash, Record};
+use crate::types::{BodyOp, Content, PieceHash, Record};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, HashMap};
 
@@ -20,6 +20,7 @@ pub(crate) struct BuiltColumn {
     pub prog: Vec<u8>,
     pub offsets: Vec<u64>,
     pub rid: Vec<u8>,
+    pub identities: Vec<u8>,
 }
 
 pub(crate) struct Built {
@@ -57,11 +58,11 @@ pub(crate) fn encode_program(
 
 /// Build named content columns from records already arranged in part row order.
 pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -> Result<Built> {
-    let mut universe: BTreeMap<String, Vec<(usize, &[BodyOp])>> = BTreeMap::new();
+    let mut universe: BTreeMap<String, Vec<(usize, &Content)>> = BTreeMap::new();
     for (row, record) in ordered.iter().enumerate() {
         crate::types::validate_contents(&record.contents)?;
         for content in &record.contents {
-            universe.entry(content.name.clone()).or_default().push((row, &content.ops));
+            universe.entry(content.name.clone()).or_default().push((row, content));
         }
     }
 
@@ -72,10 +73,12 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
         let mut prog = Vec::new();
         let mut offsets = Vec::with_capacity(values.len() + 1);
         let mut rid = Vec::new();
+        let mut identities = Vec::with_capacity(values.len() * 33);
         let mut previous = 0usize;
-        for (occurrence, (row, ops)) in values.into_iter().enumerate() {
+        for (occurrence, (row, content)) in values.into_iter().enumerate() {
             offsets.push(prog.len() as u64);
-            encode_program(&mut prog, ops, dict_index)?;
+            encode_program(&mut prog, &content.ops, dict_index)?;
+            encode_identity(&mut identities, content);
             if !dense {
                 let delta = if occurrence == 0 { row } else { row - previous };
                 if occurrence > 0 && delta == 0 {
@@ -86,7 +89,15 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
             }
         }
         offsets.push(prog.len() as u64);
-        cols.push(BuiltColumn { name, occurrences: offsets.len() - 1, dense, prog, offsets, rid });
+        cols.push(BuiltColumn {
+            name,
+            occurrences: offsets.len() - 1,
+            dense,
+            prog,
+            offsets,
+            rid,
+            identities,
+        });
     }
 
     let mut meta = Vec::new();
@@ -98,4 +109,17 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
         meta.push(if col.dense { RID_DENSE } else { RID_DELTA });
     }
     Ok(Built { meta, cols })
+}
+
+pub(crate) fn encode_identity(out: &mut Vec<u8>, content: &Content) {
+    match content.identity {
+        Some(identity) => {
+            out.push(1);
+            out.extend_from_slice(&identity.0);
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&[0; 32]);
+        }
+    }
 }

@@ -1,6 +1,6 @@
 # turndb on-disk format
 
-**Status: format version 2. Not frozen.** See [Compatibility](#compatibility) for what is
+**Status: format version 3. Not frozen.** See [Compatibility](#compatibility) for what is
 promised and what is not.
 
 This is the one document in this repository, and the only place mechanics are written down twice. It
@@ -228,7 +228,7 @@ Absence is meaningful, but it does **not** mean "anything may be missing". Three
 |---|---|
 | `ids` | front-coded id column, strictly increasing |
 | `ids.restart` | u32 stream offsets, one every `RESTART` = 16 ids |
-| `cmeta` | named content-column metadata; required even when it declares zero columns (version 2) |
+| `cmeta` | named content-column metadata; required even when it declares zero columns (version ≥ 2) |
 | `pdict.loc` | piece dictionary `Loc`s, 12 bytes each, sorted in FOLD order |
 | `pdict.hash` | piece hashes, 32 bytes each, parallel to `pdict.loc` |
 
@@ -240,6 +240,7 @@ dictionary's size.
 | name | required when |
 |---|---|
 | `con.prog.N`, `con.off.N` | content column *N* exists in `cmeta` |
+| `con.id.N` | content column *N* exists in `cmeta` (version ≥ 3) |
 | `con.rid.N` | content column *N* is sparse; absent and **elided** when dense |
 | `layout`, `layout.off`, `colmeta` | any record carries an attribute |
 | `col.val.N` | column *N* exists in `colmeta` |
@@ -260,8 +261,9 @@ Unknown section names must be ignored, not rejected: that is what lets a later v
 moving `version`.
 
 Version-0 and version-1 parts predate named content. They require `prog` and `prog.off`, holding one
-body program per row, instead of `cmeta` and `con.*`; a version-2 reader presents that physical body as
-a dense content column named `body`. Version 2 never writes the legacy sections.
+body program per row, instead of `cmeta` and `con.*`; a current reader presents that physical body as
+a dense content column named `body`. Version 2 introduced named content without whole-value
+identities. Version 3 adds `con.id.N`; it never writes the legacy sections.
 
 **The piece dictionary is sorted in fold order, not hash order**, and `pdict.hsort` carries hash order
 separately. Two orders over one dictionary rather than two dictionaries: fold order keeps `pdict.loc`
@@ -344,10 +346,14 @@ repeated n_content_columns times:
 ```
 
 Each column *N* has `con.prog.N`, containing programs in occurrence order, and `con.off.N`, containing
-`occurrences + 1` little-endian u64 offsets. A sparse column also has `con.rid.N`, an ascending
-delta-varint sequence of row ids; a dense column occurs exactly once on every row and elides that
-section. Content names must be non-empty, unique, and strictly sorted. Row ids must be unique and in
-range. Any disagreement among `cmeta`, offsets, row ids, and section presence is corruption.
+`occurrences + 1` little-endian u64 offsets. Version 3 also has `con.id.N`, exactly 33 bytes per
+occurrence in the same order: one availability byte followed by a 32-byte digest. Availability `1`
+means the digest is BLAKE3 of the exact reconstructed value; availability `0` requires an all-zero
+digest and represents a value carried forward from an older or explicitly unidentified source. No
+other availability value is valid. A sparse column also has `con.rid.N`, an ascending delta-varint
+sequence of row ids; a dense column occurs exactly once on every row and elides that section. Content
+names must be non-empty, unique, and strictly sorted. Row ids must be unique and in range. Any
+disagreement among `cmeta`, offsets, identities, row ids, and section presence is corruption.
 
 An occurrence's program is:
 
@@ -467,8 +473,10 @@ a reader to act on.
 | 0x5A | legacy version-1 body record, **inside a batch** | as 0x57 |
 | 0x5B | tombstone, inside a batch | as 0x58 |
 | 0x59 | **batch commit** | varint member count |
-| 0x5C | version-2 record with named content | current payload below |
+| 0x5C | version-2 record with named content | current payload below, without identity fields |
 | 0x5D | version-2 record, **inside a batch** | as 0x5C |
+| 0x5E | version-3 record with whole-content identities | current payload below |
+| 0x5F | version-3 record, **inside a batch** | as 0x5E |
 
 A batch is a group of writes that replays **all or none** — the unit an ingest source actually
 sent, kept whole across a crash. Its members are ordinary record and tombstone payloads under the
@@ -481,9 +489,10 @@ the frame chain is unbroken back to the last commit point, so the log is not wha
 down — and the reader must refuse. The marker's count is one byte of redundancy that keeps a batch
 from being quietly shrunk.
 
-A build predating named content refuses 0x5C and 0x5D by the unknown-tag rule below, which is the safe
-direction. A version-2 reader accepts the old record tags and presents their one body program as
-content named `body`.
+A build predating named content refuses 0x5C and later tags by the unknown-tag rule below, which is
+the safe direction. A current reader accepts the old record tags, presents version-1 body programs as
+content named `body`, and reports whole-value identity unavailable for version-1 and version-2
+records.
 
 A current record payload is:
 
@@ -494,6 +503,8 @@ varint   n_contents
 repeated n_contents times, in UTF-8 name order:
   varint  name_len
   bytes   utf8_name
+  u8      identity_present  0 unavailable, 1 followed by 32-byte BLAKE3
+  bytes   identity          present only when identity_present is 1
   varint  n_ops
   repeated n_ops times:
     u8      op               0 literal, 1 piece
@@ -512,8 +523,9 @@ repeated n_novel times:
   bytes    piece content
 ```
 
-The legacy 0x57/0x5A payload places one `n_ops` program directly after the id, followed by the same
-attribute and novel-piece encodings. It has no content count or name.
+The version-2 0x5C/0x5D payload omits `identity_present` and `identity` but otherwise matches the
+named-content layout. The legacy 0x57/0x5A payload places one `n_ops` program directly after the id,
+followed by the same attribute and novel-piece encodings. It has no content count or name.
 
 Two differences from a part's `con.prog.N`, both deliberate and neither incidental:
 
@@ -819,9 +831,9 @@ damaged member is to restore it. Adding an erasure-coding dependency to duplicat
 layer already provides would read as thorough and be surface. Where belt-and-braces is wanted,
 external PAR2 over a sealed pack is an operations recipe and needs nothing from this format.
 
-**A second content hash.** BLAKE3 identifies content, and one identity function is the whole point
-of content addressing. Where a cheaper check is wanted for a hot path, `r16` and the frame
-checksums already provide it; neither ever concludes identity.
+**A second identity algorithm.** BLAKE3 identifies both individual fold pieces and complete named
+values; the scopes differ, the identity function does not. Where a cheaper check is wanted for a hot
+path, `r16` and the frame checksums already provide it; neither ever concludes identity.
 
 ## Compatibility
 
@@ -836,7 +848,7 @@ may sit at fold generation 40 while never having changed format revision at all.
 
 What that requires of a change:
 
-* a change a version-2 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
+* a change a version-3 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
 * note what these levers do **not** cover: they guard against misparsing, not against a conformant
   writer violating a privacy or retention invariant. A part that parses perfectly can still carry

@@ -38,7 +38,7 @@ pub mod wal;
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
-use crate::types::{AttrValue, BodyOp, Content, PieceHash, Record, BODY_CONTENT};
+use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -988,10 +988,15 @@ impl Store {
         novel: &mut Vec<(PieceHash, Vec<u8>)>,
     ) -> Result<Content> {
         let mut ops = Vec::with_capacity(spans.len());
+        let mut identity = blake3::Hasher::new();
         for s in spans {
             match s {
-                Span::Lit(b) => ops.push(BodyOp::Lit(b.to_vec())),
+                Span::Lit(b) => {
+                    identity.update(b);
+                    ops.push(BodyOp::Lit(b.to_vec()));
+                }
                 Span::Piece(b) => {
+                    identity.update(b);
                     let put = self.fold_piece(b)?;
                     if !put.deduped {
                         // new content: the log must carry the bytes, because recovery discards
@@ -1002,7 +1007,7 @@ impl Store {
                 }
             }
         }
-        Ok(Content::new(name, ops))
+        Ok(Content::identified(name, ops, ContentHash(identity.finalize().into())))
     }
 
     fn stage_record(&mut self, rec: Record, novel: Vec<(PieceHash, Vec<u8>)>) -> Result<()> {
@@ -1067,10 +1072,15 @@ impl Store {
                     let mut carved = Vec::with_capacity(contents.len());
                     for content in contents {
                         let mut ops = Vec::with_capacity(content.spans.len());
+                        let mut identity = blake3::Hasher::new();
                         for s in &content.spans {
                             match s {
-                                OwnedSpan::Lit(b) => ops.push(BodyOp::Lit(b.clone())),
+                                OwnedSpan::Lit(b) => {
+                                    identity.update(b);
+                                    ops.push(BodyOp::Lit(b.clone()));
+                                }
                                 OwnedSpan::Piece(b) => {
+                                    identity.update(b);
                                     let put = self.fold_piece(b)?;
                                     if !put.deduped {
                                         novel.push((put.hash, b.clone()));
@@ -1079,7 +1089,11 @@ impl Store {
                                 }
                             }
                         }
-                        carved.push(Content::new(&content.name, ops));
+                        carved.push(Content::identified(
+                            &content.name,
+                            ops,
+                            ContentHash(identity.finalize().into()),
+                        ));
                     }
                     framed.push((Record::new(id, carved, attrs.clone())?, novel, false));
                 }
@@ -1378,6 +1392,12 @@ impl Store {
                         .ok_or_else(|| anyhow::anyhow!("piece {hash} not resolvable"))?;
                     self.fold.read_verified_into(loc, *hash, &mut out)?;
                 }
+            }
+        }
+        if let Some(expected) = content.identity {
+            let got = ContentHash::of(&out);
+            if got != expected {
+                bail!("content {name:?} reconstructed as {got} but its identity is {expected}");
             }
         }
         Ok(Some(out))

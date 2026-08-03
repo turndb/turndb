@@ -40,6 +40,8 @@ export interface ProjectedContent {
   present: boolean;
   len?: bigint;
   pieces?: number;
+  /** BLAKE3 of the exact reconstructed bytes; unavailable for values written by legacy formats. */
+  identity?: string;
   bytes?: Buffer;
 }
 

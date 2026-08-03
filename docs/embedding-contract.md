@@ -47,14 +47,13 @@ Content remains structurally content-addressed: part programs reference the shar
 piece identities. Compaction rewrites programs and columns, not carved piece bytes. Identical pieces
 deduplicate across record ids, content names, record families, and consumers using the same store.
 
-Part format revision 2 and WAL tags `0x5C`/`0x5D` carry named content. Revision-0/1 parts and legacy WAL
-records are read as one dense content value named `body`. See `docs/record-model-v2.md` and
-`FORMAT.md` for the normative physical layout.
-
-**Current gap:** the core exposes per-piece identities and logical content length, but it does not yet
-persist a BLAKE3 identity for the fully reconstructed named value. A whole-value reference API must
-not pretend a program hash is the byte identity. The next content-reference revision must either
-persist the exact-byte digest at ingest or explicitly report it unavailable for legacy values.
+Part format revision 2 and WAL tags `0x5C`/`0x5D` introduced named content. Revision 3 and WAL tags
+`0x5E`/`0x5F` additionally persist BLAKE3 of each complete reconstructed value. The digest is computed
+over ingest spans without concatenating them, survives WAL replay and compaction, and is projected
+with presence, length, and piece count without reading fold blocks. Revision-0/1 parts and legacy WAL
+records are read as one dense content value named `body`; revision-0/1/2 values honestly report their
+whole-value identity unavailable rather than substituting a program or piece hash. See
+`docs/record-model-v2.md`, `docs/content-identity-v3.md`, and `FORMAT.md`.
 
 **Current gap:** the initial attribute types remain UTF-8 string, signed i64, f64, and boolean. The
 roadmap's unsigned integer, binary, timestamp, and explicit null semantics require a deliberate format
@@ -169,7 +168,7 @@ must report the reduced profile.
 | in-place hole-punch erasure | Linux only | unavailable; refold only |
 | columnar lens | build feature | omitted from lightweight package |
 | SQL/DataFusion | optional build feature | omitted from lightweight package |
-| format interoperability | revision 2 | revision 2 |
+| format interoperability | revision 3 | revision 3 |
 
 A production native Node package must never catch native-addon load failure and silently open the WASM
 writer. Portable use must be an explicit package or entry point chosen by the caller.

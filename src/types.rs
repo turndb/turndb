@@ -38,6 +38,39 @@ impl fmt::Display for PieceHash {
     }
 }
 
+/// A named content value's byte identity: BLAKE3 of the complete reconstructed byte sequence.
+///
+/// This is deliberately distinct from [`PieceHash`]. A value can contain literals and any number
+/// of pieces, and its identity must remain the same when carving boundaries change.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentHash(pub [u8; 32]);
+
+impl ContentHash {
+    pub fn of(bytes: &[u8]) -> ContentHash {
+        ContentHash(blake3::hash(bytes).into())
+    }
+
+    pub fn to_hex(self) -> String {
+        let mut s = String::with_capacity(64);
+        for b in self.0 {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+}
+
+impl fmt::Debug for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "content:{:02x}{:02x}{:02x}{:02x}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
 /// A typed attribute value — the queryable metadata plane. Deliberately four scalars: these are what
 /// you filter and aggregate on. Bulk content is not an attribute; it is folded into pieces.
 ///
@@ -126,11 +159,22 @@ pub type BodyOp = ContentOp;
 pub struct Content {
     pub name: String,
     pub ops: Vec<ContentOp>,
+    /// Exact reconstructed-byte identity when the ingest or on-disk format carried it. Legacy
+    /// records leave this unavailable rather than substituting a program or piece hash.
+    pub identity: Option<ContentHash>,
 }
 
 impl Content {
     pub fn new(name: impl Into<String>, ops: Vec<ContentOp>) -> Content {
-        Content { name: name.into(), ops }
+        Content { name: name.into(), ops, identity: None }
+    }
+
+    pub fn identified(
+        name: impl Into<String>,
+        ops: Vec<ContentOp>,
+        identity: ContentHash,
+    ) -> Content {
+        Content { name: name.into(), ops, identity: Some(identity) }
     }
 
     /// Reconstructed length without touching the fold.

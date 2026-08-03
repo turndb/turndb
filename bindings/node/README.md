@@ -25,7 +25,9 @@ silently.
 - Attributes are an ordered array, not an object. Duplicate names and exact scalar types survive.
   Integers enter and leave as JavaScript `bigint`; binary content uses `Buffer`.
 - `scan()` is the Rust structured pager. Rust owns visibility, filtering, ordering, work bounds, and
-  opaque cursor validation. The writer view includes accepted unflushed writes.
+  opaque cursor validation. The writer view includes accepted unflushed writes. Content metadata
+  includes `identity`, the lowercase BLAKE3 hex digest of the complete reconstructed value, when its
+  record format carried one; obtaining it does not read the content.
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
