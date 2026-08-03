@@ -34,7 +34,11 @@ content model right before compatibility turns today's choices into permanent pr
   matching. Compaction, whole-store verification, in-place reclamation, refold, and physical record
   erasure are actor operations rather than CLI dependencies. A constant-work generic health snapshot
   now exposes write-state, part/fold growth, cache, retention, and reclamation facts without choosing
-  a telemetry backend. It is a source prototype, not yet a production prebuild matrix.
+  a telemetry backend. Feature-independent schema discovery now inventories the separate attribute
+  and named-content namespaces from part metadata plus the live writer memtable, preserving observed
+  scalar types without reading values or fold blocks. Its explicit conservative-result flag admits
+  when shadowed physical rows may contribute names. The Node binding exposes the same structured
+  contract. It is a source prototype, not yet a production prebuild matrix.
 
 ## Product boundary
 

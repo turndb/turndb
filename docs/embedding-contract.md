@@ -140,6 +140,15 @@ cursors, and a bound on live records evaluated against predicates. A writer page
 for the duration of one call. Between pages, keyset continuation prevents duplicates but may include a
 new id inserted ahead of the cursor; callers requiring an immutable multi-page view use `ReadStore`.
 
+`Store::schema`, `ReadStore::schema`, and the corresponding Node methods discover the store's
+attribute namespace, every physical scalar type observed for each attribute name, and its separate
+named-content namespace without requiring Arrow or SQL. They inspect part metadata rather than
+decoding record values, content programs, or fold blocks; the writer view additionally inspects its
+live memtable. Discovery across immutable parts is intentionally a conservative physical superset,
+because a name may occur only in a row shadowed by a newer version or tombstone. The explicit
+`may_include_shadowed_fields`/`mayIncludeShadowedFields` result flag prevents consumers from confusing
+that inexpensive descriptive inventory with a required or exact live-row schema.
+
 **Current gaps:** the structured pager point-decodes each eligible record rather than pushing selected
 fields into the columnar lens; arbitrary field ordering, explicit null values, cancellation, and
 deadlines are absent; scan statistics do not yet report section bytes or distinct fold blocks. The

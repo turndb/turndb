@@ -114,6 +114,9 @@ enum Command {
     Health {
         reply: oneshot::Sender<Result<turndb::store::StoreHealth>>,
     },
+    Schema {
+        reply: oneshot::Sender<Result<turndb::schema::Schema>>,
+    },
     Close {
         durable: bool,
         reply: oneshot::Sender<Result<()>>,
@@ -235,6 +238,10 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Health { reply })?).await
     }
 
+    pub async fn schema(&self) -> Result<turndb::schema::Schema> {
+        Self::receive(self.submit(|reply| Command::Schema { reply })?).await
+    }
+
     pub async fn close(&self, durable: bool) -> Result<()> {
         if self
             .inner
@@ -310,6 +317,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Health { reply } => {
                 let _ = reply.send(Ok(store.health()));
+            }
+            Command::Schema { reply } => {
+                let _ = reply.send(store.schema());
             }
             Command::Close { durable, reply } => {
                 let result = if durable { store.sync() } else { Ok(()) };

@@ -1708,6 +1708,16 @@ impl Store {
             punched_blocks,
         }
     }
+
+    /// Discover attribute names/types and named-content columns without decoding stored values.
+    pub fn schema(&self) -> Result<crate::schema::Schema> {
+        let mut schema = crate::schema::Builder::default();
+        schema.add_parts(&self.parts)?;
+        for record in self.mem.values().flatten() {
+            schema.add_record(record);
+        }
+        Ok(schema.finish())
+    }
 }
 
 /// What [`Store::punch_unreferenced`] did.
@@ -1810,6 +1820,13 @@ impl ReadStore {
     }
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Discover this immutable snapshot's physical field universe without decoding stored values.
+    pub fn schema(&self) -> Result<crate::schema::Schema> {
+        let mut schema = crate::schema::Builder::default();
+        schema.add_parts(&self.parts)?;
+        Ok(schema.finish())
     }
 }
 

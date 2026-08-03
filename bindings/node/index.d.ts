@@ -71,6 +71,15 @@ export interface Capabilities {
   immutableSnapshots: true;
   lifecycleOperations: true;
   healthSnapshots: true;
+  schemaDiscovery: true;
+}
+
+export type AttributeType = 'string' | 'int' | 'float' | 'bool';
+
+export interface StoreSchema {
+  attributes: Array<{ name: string; types: AttributeType[] }>;
+  contents: string[];
+  mayIncludeShadowedFields: boolean;
 }
 
 export interface MergeStats {
@@ -121,6 +130,7 @@ export declare class NativeSnapshot {
   readonly commit: bigint;
   scan(request?: ScanRequest): Promise<ScanPage>;
   readContent(id: string, name: string): Promise<Buffer | null>;
+  schema(): Promise<StoreSchema>;
   close(): Promise<void>;
 }
 
@@ -132,6 +142,7 @@ export declare class NativeStore {
   scan(request?: ScanRequest): Promise<ScanPage>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   snapshot(): Promise<NativeSnapshot>;
+  schema(): Promise<StoreSchema>;
   compact(full?: boolean): Promise<{
     flushed: boolean;
     partsBefore: bigint;
