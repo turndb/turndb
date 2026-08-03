@@ -198,11 +198,14 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
         }
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
             // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
-            // it (that is what keeping the header buys) and the block is left OUT of the
-            // directory, so nothing can resolve a Loc into erased bytes. Anything else that fails
-            // here is a torn write, and ends the segment's valid span.
+            // it (that is what keeping the header buys) and retains its location. The manifest's
+            // punched declaration—not directory omission—is the authority that makes a later read
+            // report ERASED. Without that declaration, resolving this entry still fails checksum
+            // verification and cannot expose bytes. Retaining it is essential when a historical
+            // committed prefix predates the sidecar written after this segment was sealed.
             let body = &payload[BLOCK_HDR_LEN..span - BLOCK_XSUM_LEN];
             if h.stored > 0 && body.iter().all(|&b| b == 0) {
+                dir.push((h.block_id, off as u32));
                 off = end;
                 continue;
             }

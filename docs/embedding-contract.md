@@ -239,8 +239,8 @@ Batch pulls have timeouts and AbortSignal cancellation and dropping the Rust exe
 unfinished work.
 
 **Current gaps:** binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption,
-writer contention, and backup/restore failures have stable machine-readable codes; manifest recovery
-controls and prebuilt artifact selection are not exposed yet. SQL planning is not yet interruptible,
+writer contention, backup/restore, and manifest recovery have stable machine-readable codes; prebuilt
+artifact selection is not implemented yet. SQL planning and offline recovery are not interruptible,
 and the aggregate execution budget is not a total-process RSS limit. The package is a tested source
 prototype and must not be described as a production distribution.
 
@@ -256,8 +256,10 @@ first sync and flush earlier writes, then operate on the resulting published cut
 the retained manifest hash chain and part pins, every live part section, and every fold frame; it is
 not a backup. `erase(ids)` invokes the engine's strong erasure composition and purges retained history.
 Its boundary remains this store: previously written packs, backups, replicas, and consumer exports are
-not affected. Online backup and validated no-overlay restore are exposed in Rust and Node; manifest
-recovery, preflight space estimates, resumable maintenance, and cancellation remain current gaps.
+not affected. Online backup, validated no-overlay restore, and exclusive fully validated manifest
+recovery are exposed in Rust and Node. Recovery defaults to zero rollback, requires explicit authority
+to abandon newer retained commits, and reports its validation evidence. Preflight space estimates,
+resumable maintenance, and lifecycle-operation cancellation remain current gaps.
 
 `Store::health` and the Node `health()` method are constant-work operational snapshots. They report
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged

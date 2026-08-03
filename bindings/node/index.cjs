@@ -110,5 +110,6 @@ module.exports = {
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
   restoreBackup: guarded(native.restoreBackup),
+  recoverManifest: guarded(native.recoverManifest),
   TurnDbError,
 };

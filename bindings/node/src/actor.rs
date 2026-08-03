@@ -351,8 +351,11 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Close { durable, reply } => {
                 let result = if durable { store.sync() } else { Ok(()) };
+                // Close acknowledgement includes releasing the OS writer lock. Sending first and
+                // dropping on function exit leaves a real race for immediate reopen/recovery.
+                drop(store);
                 let _ = reply.send(result);
-                break;
+                return;
             }
             #[cfg(test)]
             Command::Hold { entered, release } => {

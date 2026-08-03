@@ -825,8 +825,13 @@ fn a_corrupt_manifest_recovers_from_the_commit_log() {
     std::fs::write(&man, &b).unwrap();
 
     assert!(Store::open(&dir, cfg()).is_err(), "a corrupt manifest must refuse, not open empty");
-    let c = turndb::store::recover_manifest(&dir).unwrap();
-    assert!(c > 0);
+    let recovered =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap();
+    assert!(recovered.commit > 0);
+    assert_eq!(recovered.rollback_commits, 0);
+    assert_eq!(recovered.records, want.len());
+    assert!(recovered.content_values >= want.len());
 
     // The newest retained copy carried the same commit, so recovery lost nothing — and the store
     // is a working store again, not merely a readable one.
@@ -838,6 +843,85 @@ fn a_corrupt_manifest_recovers_from_the_commit_log() {
     s.sync().unwrap();
     s.flush().unwrap();
     assert_eq!(s.reconstruct("after").unwrap().unwrap(), after);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checked_recovery_excludes_a_live_writer_and_never_promotes_an_unreadable_candidate() {
+    let dir = tmp("checked-recovery");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "one", b"content large enough to live in the fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let manifest_path = dir.join("MANIFEST");
+    let mut damaged = std::fs::read(&manifest_path).unwrap();
+    damaged[10] ^= 0xff;
+    std::fs::write(&manifest_path, &damaged).unwrap();
+
+    let error =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap_err();
+    assert!(error.downcast_ref::<turndb::fold::WriterLocked>().is_some());
+    drop(store);
+
+    let part = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "part"))
+        .unwrap();
+    let mut bytes = std::fs::read(&part).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&part, bytes).unwrap();
+    let error =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<turndb::store::RecoveryError>(),
+        Some(turndb::store::RecoveryError::NoUsableCandidate { .. })
+    ));
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), damaged);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checked_recovery_requires_an_explicit_rollback_allowance() {
+    let dir = tmp("checked-rollback");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "first", b"first committed value long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let first_commit = store.manifest().commit;
+    put(&mut store, "second", b"second committed value long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let newest = store.manifest().commit;
+    drop(store);
+
+    let manifest_path = dir.join("MANIFEST");
+    let mut damaged = std::fs::read(&manifest_path).unwrap();
+    damaged[10] ^= 0xff;
+    std::fs::write(&manifest_path, &damaged).unwrap();
+    std::fs::write(dir.join(format!("MANIFEST.{newest:08}")), b"damaged retained copy").unwrap();
+
+    let error =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<turndb::store::RecoveryError>(),
+        Some(turndb::store::RecoveryError::RollbackLimit { needed: 1, allowed: 0 })
+    ));
+    let report = turndb::store::recover_manifest(
+        &dir,
+        cfg(),
+        turndb::store::RecoveryOptions { max_rollback_commits: 1 },
+    )
+    .unwrap();
+    assert_eq!(report.commit, first_commit);
+    assert_eq!(report.rollback_commits, 1);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert!(reader.get("first").unwrap().is_some());
+    assert!(reader.get("second").unwrap().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 

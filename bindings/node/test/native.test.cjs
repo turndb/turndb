@@ -7,8 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
-  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, retainedCommits, restoreBackup,
-  TurnDbError,
+  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest, retainedCommits,
+  restoreBackup, TurnDbError,
 } = require('..');
 
 function temporaryStore(t) {
@@ -35,6 +35,7 @@ test('reports the native capability profile without a portable fallback', () => 
     immutableSnapshots: true,
     lifecycleOperations: true,
     backupRestore: true,
+    recoveryControls: true,
     healthSnapshots: true,
     schemaDiscovery: true,
     scanCancellation: true,
@@ -466,6 +467,48 @@ test('backs up an actor-ordered cut and safely restores a writable store', async
     restoreBackup(path.join(root, 'missing.turndb'), absent),
     (error) => error instanceof TurnDbError && error.code === 'NOT_FOUND',
   );
+});
+
+test('recovers only a fully validated retained manifest under writer exclusion', async (t) => {
+  const dir = temporaryStore(t);
+  let store = await NativeStore.open(dir);
+  await store.write([{
+    kind: 'put',
+    id: 'survives',
+    contents: [{ name: 'payload', bytes: Buffer.from('content validated during recovery') }],
+  }]);
+  await store.flush();
+  await store.close();
+
+  const manifestPath = path.join(dir, 'MANIFEST');
+  const damageManifest = () => {
+    const bytes = Buffer.from(fs.readFileSync(manifestPath));
+    bytes[10] ^= 0xff;
+    fs.writeFileSync(manifestPath, bytes);
+  };
+  damageManifest();
+  const report = await recoverManifest(dir);
+  assert.equal(report.rollbackCommits, 0n);
+  assert.equal(report.records, 1n);
+  assert.equal(report.contentValues, 1n);
+  assert(report.partSections > 0n);
+
+  const snapshot = await NativeSnapshot.open(dir);
+  assert.deepEqual((await snapshot.scan()).rows.map(({ id }) => id), ['survives']);
+  await snapshot.close();
+  await assert.rejects(
+    recoverManifest(dir),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+
+  store = await NativeStore.open(dir);
+  damageManifest();
+  await assert.rejects(
+    recoverManifest(dir),
+    (error) => error instanceof TurnDbError && error.code === 'CONTENTION',
+  );
+  await store.close(false);
+  await recoverManifest(dir);
 });
 
 test('validates exact values and lifecycle at the boundary', async (t) => {

@@ -30,7 +30,8 @@ usage: turndb <verb> [args]
     refold    <DIR>              rewrite the fold, dropping content no live record references
     punch     <DIR>              deallocate unreachable fold blocks IN PLACE — the cheap half of
                                  erasure; no offsets move, no parts are rebuilt
-    recover   <DIR>              promote the newest intact retained manifest over a damaged one
+    recover   <DIR> [--max-rollback N]
+                                 validate and promote a retained manifest; rollback defaults to 0
     snapshots <DIR>              list retained commits available to time travel
     erase     <DIR> (--id ID ... | --attr KEY=VALUE)
                                  tombstone, settle, and REWRITE until content and metadata are
@@ -142,8 +143,22 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "recover" => {
-            let c = turndb::store::recover_manifest(&arg(0, "DIR")?)?;
-            println!("promoted retained commit {c} to MANIFEST");
+            let max_rollback_commits = match rest.get(1..) {
+                Some(["--max-rollback", value]) => value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid --max-rollback value {value:?}"))?,
+                Some([]) | None => 0,
+                _ => bail!("recover accepts only --max-rollback N\n\n{USAGE}"),
+            };
+            let report = turndb::store::recover_manifest(
+                &arg(0, "DIR")?,
+                FoldCfg::default(),
+                turndb::store::RecoveryOptions { max_rollback_commits },
+            )?;
+            println!(
+                "promoted retained commit {} to MANIFEST (rollback {}, {} records, {} content values verified)",
+                report.commit, report.rollback_commits, report.records, report.content_values
+            );
             Ok(())
         }
         "snapshots" => {

@@ -306,6 +306,47 @@ fn committed_tail_discards_uncommitted_frames() {
 }
 
 #[test]
+fn read_only_committed_prefix_ignores_damaged_later_bytes() {
+    let dir = tmp("read-prefix");
+    let keep = b"content named by the retained manifest".to_vec();
+    let (keep_loc, committed, later_loc) = {
+        let mut fold = Fold::open(&dir, FoldCfg::default()).unwrap();
+        let keep_loc = fold.put(&keep).unwrap().loc;
+        let committed = fold.sync().unwrap();
+        let later_loc = fold.put(b"append residue from a newer commit").unwrap().loc;
+        fold.sync().unwrap();
+        (keep_loc, committed, later_loc)
+    };
+
+    // Damage only the suffix beyond the retained manifest's authority. Recovery of that older
+    // candidate must neither trust nor reject bytes the candidate does not name.
+    {
+        use std::os::unix::fs::FileExt;
+        let path = dir.join(format!("seg-{:08}.fold", committed.seg));
+        let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, committed.off as u64 + 20).unwrap();
+        byte[0] ^= 0xff;
+        file.write_all_at(&byte, committed.off as u64 + 20).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let fold = Fold::open_read_at(&dir, FoldCfg::default(), committed).unwrap();
+    assert_eq!(fold.read(keep_loc).unwrap(), keep);
+    assert!(fold.read(later_loc).is_err(), "the bounded reader must not expose a newer suffix");
+    assert_eq!(fold.scrub().unwrap().trailing_uncommitted, 0);
+
+    let physical =
+        std::fs::metadata(dir.join(format!("seg-{:08}.fold", committed.seg))).unwrap().len();
+    let beyond = FoldTail { seg: committed.seg, off: u32::try_from(physical + 1).unwrap() };
+    assert!(
+        Fold::open_read_at(&dir, FoldCfg::default(), beyond).is_err(),
+        "a retained manifest cannot claim bytes that do not exist"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn dedup_window_seals_without_affecting_reads() {
     let dir = tmp("window");
     let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
