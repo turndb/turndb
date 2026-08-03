@@ -37,7 +37,14 @@ silently.
   retained as `cause` and the full contextual message remains available. The declared code union
   reserves `NOT_FOUND`, `CORRUPTION`, and `IO` while typed engine errors are added—unclassified core
   failures report `INTERNAL` rather than being guessed from prose.
+- `compact()`, `verify()`, `punch()`, and `refold()` run on the same serialized writer actor. They
+  sync and flush earlier writes before operating, so their reports cover an exact cut and their
+  filesystem work stays off the event loop. `compact(true)` requests a full merge; the default uses
+  the engine's measured automatic policy.
+- `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
+  content, and purges retained manifests so this store has no snapshot path back to the erased rows.
+  It cannot erase packs, backups, replicas, or any other external copy.
 
-The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, lifecycle maintenance,
-configurable queue depth, or the complete engine error taxonomy. Those remain explicit Phase 3/4 work
-rather than being simulated in JavaScript.
+The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, backup/restore and
+recovery controls, configurable queue depth, or the complete engine error taxonomy. Those remain
+explicit Phase 3/4 work rather than being simulated in JavaScript.

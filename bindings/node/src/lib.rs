@@ -7,7 +7,7 @@
 
 mod actor;
 
-use actor::{Actor, OwnedContent, WriteOp};
+use actor::{Actor, CompactResult, OwnedContent, VerifyResult, WriteOp};
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
@@ -136,6 +136,7 @@ pub struct NativeCapabilities {
     pub napi_version: u8,
     pub command_queue_capacity: u32,
     pub immutable_snapshots: bool,
+    pub lifecycle_operations: bool,
 }
 
 #[napi]
@@ -163,7 +164,69 @@ pub fn capabilities() -> NativeCapabilities {
         napi_version: 6,
         command_queue_capacity: 64,
         immutable_snapshots: true,
+        lifecycle_operations: true,
     }
+}
+
+#[napi(object)]
+pub struct NativeMergeStats {
+    pub inputs: BigInt,
+    pub records_in: BigInt,
+    pub records_out: BigInt,
+    pub superseded: BigInt,
+    pub tombstones_kept: BigInt,
+    pub tombstones_dropped: BigInt,
+    pub fold_bytes_touched: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeCompactResult {
+    pub flushed: bool,
+    pub parts_before: BigInt,
+    pub parts_after: BigInt,
+    pub merge: Option<NativeMergeStats>,
+}
+
+#[napi(object)]
+pub struct NativeVerifyResult {
+    pub manifest_links: BigInt,
+    pub part_digests: BigInt,
+    pub undigested_parts: BigInt,
+    pub parts: BigInt,
+    pub part_sections: BigInt,
+    pub fold_segments: u32,
+    pub fold_blocks: BigInt,
+    pub fold_bytes: BigInt,
+    pub trailing_uncommitted_bytes: BigInt,
+}
+
+#[napi(object)]
+pub struct NativePunchResult {
+    pub blocks_examined: BigInt,
+    pub blocks_punched: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeRefoldResult {
+    pub parts_in: BigInt,
+    pub parts_out: BigInt,
+    pub records_kept: BigInt,
+    pub records_dropped: BigInt,
+    pub tombstones_dropped: BigInt,
+    pub pieces_kept: BigInt,
+    pub pieces_dropped: BigInt,
+    pub fold_bytes_before: BigInt,
+    pub fold_bytes_after: BigInt,
+    pub bytes_reclaimed: BigInt,
+    pub stale_generation_left: bool,
+}
+
+#[napi(object)]
+pub struct NativeEraseResult {
+    pub requested: BigInt,
+    pub tombstoned: BigInt,
+    pub absent: BigInt,
+    pub refold: Option<NativeRefoldResult>,
 }
 
 struct SnapshotState {
@@ -358,6 +421,64 @@ impl NativeStore {
             .await
             .map(NativeSnapshot::from_store)
             .map_err(|error| failure("create TurnDB snapshot", error))
+    }
+
+    /// Settle earlier writes and compact. `full=true` merges every live part; false uses policy.
+    #[napi]
+    pub async fn compact(&self, full: Option<bool>) -> Result<NativeCompactResult> {
+        self.actor
+            .compact(full.unwrap_or(false))
+            .await
+            .map(encode_compact)
+            .map_err(|error| failure("compact TurnDB store", error))
+    }
+
+    /// Settle earlier writes, then verify manifest pins, every part section, and every fold frame.
+    #[napi]
+    pub async fn verify(&self) -> Result<NativeVerifyResult> {
+        self.actor
+            .verify()
+            .await
+            .map(encode_verify)
+            .map_err(|error| failure("verify TurnDB store", error))
+    }
+
+    /// Physically erase ids from this store, including retained history. External copies are out of scope.
+    #[napi]
+    pub async fn erase(&self, ids: Vec<String>) -> Result<NativeEraseResult> {
+        self.actor
+            .erase(ids)
+            .await
+            .map(|stats| NativeEraseResult {
+                requested: BigInt::from(stats.requested as u64),
+                tombstoned: BigInt::from(stats.tombstoned as u64),
+                absent: BigInt::from(stats.absent as u64),
+                refold: stats.refold.map(encode_refold),
+            })
+            .map_err(|error| failure("erase TurnDB records", error))
+    }
+
+    /// Reclaim unreachable fold blocks in place where the platform supports punching.
+    #[napi]
+    pub async fn punch(&self) -> Result<NativePunchResult> {
+        self.actor
+            .punch()
+            .await
+            .map(|stats| NativePunchResult {
+                blocks_examined: BigInt::from(stats.blocks_examined as u64),
+                blocks_punched: BigInt::from(stats.blocks_punched as u64),
+            })
+            .map_err(|error| failure("punch unreferenced TurnDB content", error))
+    }
+
+    /// Rewrite all live content into a new fold generation and purge retained history.
+    #[napi]
+    pub async fn refold(&self) -> Result<NativeRefoldResult> {
+        self.actor
+            .refold()
+            .await
+            .map(encode_refold)
+            .map_err(|error| failure("refold TurnDB store", error))
     }
 
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
@@ -612,5 +733,56 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
             content_values_reconstructed: page.stats.content_values_reconstructed as u32,
             reconstructed_bytes: BigInt::from(page.stats.reconstructed_bytes),
         },
+    }
+}
+
+fn encode_merge(stats: turndb::part::merge::MergeStats) -> NativeMergeStats {
+    NativeMergeStats {
+        inputs: BigInt::from(stats.inputs as u64),
+        records_in: BigInt::from(stats.records_in as u64),
+        records_out: BigInt::from(stats.records_out as u64),
+        superseded: BigInt::from(stats.superseded as u64),
+        tombstones_kept: BigInt::from(stats.tombstones_kept as u64),
+        tombstones_dropped: BigInt::from(stats.tombstones_dropped as u64),
+        fold_bytes_touched: BigInt::from(stats.fold_bytes_touched),
+    }
+}
+
+fn encode_compact(result: CompactResult) -> NativeCompactResult {
+    NativeCompactResult {
+        flushed: result.flushed,
+        parts_before: BigInt::from(result.parts_before as u64),
+        parts_after: BigInt::from(result.parts_after as u64),
+        merge: result.merge.map(encode_merge),
+    }
+}
+
+fn encode_verify(result: VerifyResult) -> NativeVerifyResult {
+    NativeVerifyResult {
+        manifest_links: BigInt::from(result.chain.links as u64),
+        part_digests: BigInt::from(result.chain.part_digests as u64),
+        undigested_parts: BigInt::from(result.chain.undigested as u64),
+        parts: BigInt::from(result.parts as u64),
+        part_sections: BigInt::from(result.part_sections as u64),
+        fold_segments: result.fold.segments,
+        fold_blocks: BigInt::from(result.fold.blocks as u64),
+        fold_bytes: BigInt::from(result.fold.bytes),
+        trailing_uncommitted_bytes: BigInt::from(result.fold.trailing_uncommitted),
+    }
+}
+
+fn encode_refold(stats: turndb::store::refold::RefoldStats) -> NativeRefoldResult {
+    NativeRefoldResult {
+        parts_in: BigInt::from(stats.parts_in as u64),
+        parts_out: BigInt::from(stats.parts_out as u64),
+        records_kept: BigInt::from(stats.records_kept as u64),
+        records_dropped: BigInt::from(stats.records_dropped as u64),
+        tombstones_dropped: BigInt::from(stats.tombstones_dropped as u64),
+        pieces_kept: BigInt::from(stats.pieces_kept as u64),
+        pieces_dropped: BigInt::from(stats.pieces_dropped as u64),
+        fold_bytes_before: BigInt::from(stats.fold_bytes_before),
+        fold_bytes_after: BigInt::from(stats.fold_bytes_after),
+        bytes_reclaimed: BigInt::from(stats.bytes_reclaimed()),
+        stale_generation_left: stats.stale_generation_left,
     }
 }

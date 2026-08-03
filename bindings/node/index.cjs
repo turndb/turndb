@@ -69,7 +69,10 @@ function guarded(fn) {
 }
 
 for (const Class of [native.NativeStore, native.NativeSnapshot]) {
-  for (const name of ['write', 'sync', 'flush', 'scan', 'readContent', 'snapshot', 'close']) {
+  for (const name of [
+    'write', 'sync', 'flush', 'scan', 'readContent', 'snapshot',
+    'compact', 'verify', 'erase', 'punch', 'refold', 'close',
+  ]) {
     if (typeof Class.prototype[name] === 'function') {
       Class.prototype[name] = guarded(Class.prototype[name]);
     }

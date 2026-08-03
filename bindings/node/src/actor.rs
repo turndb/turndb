@@ -13,8 +13,22 @@ use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
 use turndb::fold::FoldCfg;
 use turndb::scan::{ScanPage, ScanRequest};
-use turndb::store::{Batch, ContentSpans, ReadStore, Store};
+use turndb::store::{Batch, ChainReport, ContentSpans, ErasureStats, PunchStats, ReadStore, Store};
 use turndb::types::AttrValue;
+
+pub(crate) struct CompactResult {
+    pub flushed: bool,
+    pub parts_before: usize,
+    pub parts_after: usize,
+    pub merge: Option<turndb::part::merge::MergeStats>,
+}
+
+pub(crate) struct VerifyResult {
+    pub chain: ChainReport,
+    pub fold: turndb::fold::FoldScrub,
+    pub parts: usize,
+    pub part_sections: usize,
+}
 
 const QUEUE_CAPACITY: usize = 64;
 const OPEN: u8 = 0;
@@ -79,6 +93,23 @@ enum Command {
     },
     Snapshot {
         reply: oneshot::Sender<Result<ReadStore>>,
+    },
+    Compact {
+        full: bool,
+        reply: oneshot::Sender<Result<CompactResult>>,
+    },
+    Verify {
+        reply: oneshot::Sender<Result<VerifyResult>>,
+    },
+    Erase {
+        ids: Vec<String>,
+        reply: oneshot::Sender<Result<ErasureStats>>,
+    },
+    Punch {
+        reply: oneshot::Sender<Result<PunchStats>>,
+    },
+    Refold {
+        reply: oneshot::Sender<Result<turndb::store::refold::RefoldStats>>,
     },
     Close {
         durable: bool,
@@ -177,6 +208,26 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Snapshot { reply })?).await
     }
 
+    pub async fn compact(&self, full: bool) -> Result<CompactResult> {
+        Self::receive(self.submit(|reply| Command::Compact { full, reply })?).await
+    }
+
+    pub async fn verify(&self) -> Result<VerifyResult> {
+        Self::receive(self.submit(|reply| Command::Verify { reply })?).await
+    }
+
+    pub async fn erase(&self, ids: Vec<String>) -> Result<ErasureStats> {
+        Self::receive(self.submit(|reply| Command::Erase { ids, reply })?).await
+    }
+
+    pub async fn punch(&self) -> Result<PunchStats> {
+        Self::receive(self.submit(|reply| Command::Punch { reply })?).await
+    }
+
+    pub async fn refold(&self) -> Result<turndb::store::refold::RefoldStats> {
+        Self::receive(self.submit(|reply| Command::Refold { reply })?).await
+    }
+
     pub async fn close(&self, durable: bool) -> Result<()> {
         if self
             .inner
@@ -231,6 +282,25 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                     .context("publish immutable reader snapshot");
                 let _ = reply.send(result);
             }
+            Command::Compact { full, reply } => {
+                let result = compact(&mut store, full);
+                let _ = reply.send(result);
+            }
+            Command::Verify { reply } => {
+                let result = verify(&mut store, path);
+                let _ = reply.send(result);
+            }
+            Command::Erase { ids, reply } => {
+                let _ = reply.send(store.erase_ids(&ids));
+            }
+            Command::Punch { reply } => {
+                let result = settle(&mut store).and_then(|_| store.punch_unreferenced());
+                let _ = reply.send(result);
+            }
+            Command::Refold { reply } => {
+                let result = settle(&mut store).and_then(|_| store.refold());
+                let _ = reply.send(result);
+            }
             Command::Close { durable, reply } => {
                 let result = if durable { store.sync() } else { Ok(()) };
                 let _ = reply.send(result);
@@ -265,6 +335,31 @@ fn apply(store: &mut Store, ops: Vec<WriteOp>, durable: bool) -> Result<()> {
         store.sync()?;
     }
     Ok(())
+}
+
+fn settle(store: &mut Store) -> Result<bool> {
+    store.sync()?;
+    Ok(store.flush()?.is_some())
+}
+
+fn compact(store: &mut Store, full: bool) -> Result<CompactResult> {
+    let flushed = settle(store)?;
+    let parts_before = store.part_count();
+    let merge = if full { store.merge_range(0, parts_before)? } else { store.auto_compact()? };
+    Ok(CompactResult { flushed, parts_before, parts_after: store.part_count(), merge })
+}
+
+fn verify(store: &mut Store, path: &Path) -> Result<VerifyResult> {
+    // Settling makes the report cover every operation accepted before this command, and actor
+    // serialization prevents a new manifest from racing the chain walk.
+    settle(store)?;
+    let chain = turndb::store::verify_chain(path)?;
+    let fold = store.fold().scrub()?;
+    let mut part_sections = 0usize;
+    for part in store.parts() {
+        part_sections += part.verify_sections()?;
+    }
+    Ok(VerifyResult { chain, fold, parts: store.part_count(), part_sections })
 }
 
 #[cfg(test)]
