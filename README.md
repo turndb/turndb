@@ -83,8 +83,10 @@ lens. Storage, visibility, and content semantics remain in TurnDB either way.
 
 `Store::scan` is available without either query feature. It provides id-ordered forward/reverse pages,
 typed predicates, selected attributes, named-content metadata or bytes, opaque checked cursors, and a
-per-call examination bound. Named-content metadata includes the BLAKE3 identity of the exact whole
-value without reconstruction for revision-3 records. Writer scans include the memtable;
+per-call examination bound. Reconstructed pages default to a 32 MiB content ceiling, can override it
+per request, never split a row, and return a cursor before the row that would cross the ceiling.
+Named-content metadata includes the BLAKE3 identity of the exact whole value without reconstruction
+for revision-3 records. Writer scans include the memtable;
 `ReadStore::scan` remains pinned to its manifest snapshot.
 
 ## What it does not do

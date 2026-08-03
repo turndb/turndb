@@ -127,7 +127,7 @@ The storage-native scan API will own:
 
 Metadata-only scans must reconstruct no content and open no fold blocks. Projecting one named content
 column must not read sibling content program sections. Large values may exceed the normal batch byte
-budget individually, but no value may be silently truncated.
+budget individually, but no value or row may be silently truncated.
 
 The `columnar` feature now exposes the Arrow lens without DataFusion. The `sql` feature adds DataFusion
 over precisely that lens. DataFusion pushdown is conservative and cannot change answers.
@@ -153,6 +153,15 @@ Checks occur before range work, between candidate records and selected content v
 potentially blocking reads. Interruption returns a typed `ScanInterrupted` error and never a partial
 page. The Node binding maps `timeoutMs` to a deadline before actor submission (therefore including
 queue time) and maps `AbortSignal` to the same Rust token; both reject with `CANCELLED`.
+
+The pager also bounds the selected content bytes retained by one result. Its
+`max_reconstructed_bytes` default is 32 MiB and metadata-only selections spend none of it. Before
+opening fold blocks, TurnDB totals every byte-projected content value in the candidate row from its
+reconstruction program. A row that would cross the remaining budget is left unconsumed and the
+partial page's checked cursor resumes at that row; `reconstruction_budget_exhausted` records why the
+page stopped. The first matching row is always admitted whole even when it exceeds the ceiling, so a
+single large record cannot deadlock pagination. Node exposes the same contract as
+`maxReconstructedBytes: bigint` and `reconstructionBudgetExhausted`.
 
 **Current gaps:** the structured pager point-decodes each eligible record rather than pushing selected
 fields into the columnar lens; arbitrary field ordering and explicit null values are absent; scan
@@ -264,15 +273,17 @@ TurnDB is pre-1.0 and the format is not frozen, but every accepted revision foll
 
 Existing hard limits are format-derived: part record counts and piece lengths are u32, section stored
 and raw sizes are u32, and Arrow binary values are limited by i32 offsets. Encoders and parsers refuse
-overflow. Query batches currently target 8,192 rows or 32 MiB of reconstructed content, while always
-admitting one oversized value so progress remains possible.
+overflow. Arrow query batches currently target 8,192 rows or 32 MiB of reconstructed content, while
+always admitting one oversized row so progress remains possible. Structured pages use the same 32
+MiB default as a per-request configurable ceiling, report when the ceiling stops a page, and preserve
+an exact continuation without truncating or skipping the deferred row.
 
-Before production binding maturity, the API must add query-memory budgets and interruption for
-long-running lifecycle operations; structured scans already have deadlines and cooperative
-cancellation, and the native command backlog is bounded and configurable. Reaching a budget returns a
-structured error or partial page with a cursor only where the operation contract explicitly allows
-it. It never truncates a record, invents a weaker durability acknowledgement, or silently widens a
-scan.
+Before production binding maturity, the Arrow/SQL execution plane still needs caller-configurable
+query-memory budgets, and long-running lifecycle operations need interruption. Structured scans
+already have byte ceilings, deadlines, and cooperative cancellation, and the native command backlog
+is bounded and configurable. Reaching a budget returns a structured error or partial page with a
+cursor only where the operation contract explicitly allows it. It never truncates a record, invents
+a weaker durability acknowledgement, or silently widens a scan.
 
 Ambiguous recovery is an error. Corruption, deliberate erasure, unsupported capability, contention,
 cancellation, invalid input, and resource exhaustion remain distinguishable machine-readable classes

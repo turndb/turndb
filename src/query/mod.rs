@@ -56,7 +56,7 @@ pub const BATCH_ROWS: usize = 8192;
 /// Row count alone is the wrong bound for content columns: trace payloads here average ~97 KiB, so
 /// 8192 of them is a 795 MiB batch. Records are unbounded in size and rows are not fungible, so a
 /// batch closes on whichever limit is reached first. Attribute-only scans never come near this.
-pub const BATCH_BYTES: usize = 32 << 20;
+pub const BATCH_BYTES: usize = crate::scan::DEFAULT_MAX_RECONSTRUCTED_BYTES as usize;
 
 /// Synthetic field names. `id` is always present; `body` appears only when at least one scanned part
 /// declares conventional content with that name.

@@ -30,7 +30,10 @@ silently.
   record format carried one; obtaining it does not read the content. `timeoutMs` establishes an
   absolute deadline before submission, so actor-queue time counts, and `signal` accepts an
   `AbortSignal`. Both stop cooperatively in Rust and reject with `CANCELLED`; no partial page is
-  presented as success.
+  presented as success. Byte projections are limited to 32 MiB per page by default;
+  `maxReconstructedBytes` overrides the ceiling as a lossless `bigint`. TurnDB never splits a row,
+  admits one oversized row so paging can progress, and sets `reconstructionBudgetExhausted` when the
+  continuation resumes at a row deferred by the ceiling. Metadata-only projections spend zero bytes.
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.

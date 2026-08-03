@@ -34,6 +34,8 @@ test('reports the native capability profile without a portable fallback', () => 
     healthSnapshots: true,
     schemaDiscovery: true,
     scanCancellation: true,
+    scanReconstructionBudget: true,
+    scanReconstructedBytesDefault: 33554432n,
   });
 });
 
@@ -169,6 +171,44 @@ test('pages and filters in Rust and refuses cursor misuse', async (t) => {
   await assert.rejects(
     store.scan({ ...request, from: 'r2', cursor: first.next }),
     /cursor belongs to different bounds or predicates/
+  );
+});
+
+test('bounds reconstructed scan bytes without splitting or skipping rows', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write(
+    ['a', 'b', 'c'].map((id) => ({
+      kind: 'put',
+      id,
+      contents: [{ name: 'payload', bytes: Buffer.from('123456') }],
+    }))
+  );
+
+  const request = {
+    contents: [{ name: 'payload', mode: 'bytes' }],
+    maxReconstructedBytes: 10n,
+  };
+  const first = await store.scan(request);
+  assert.deepEqual(first.rows.map(({ id }) => id), ['a']);
+  assert.equal(first.stats.reconstructedBytes, 6n);
+  assert.equal(first.stats.reconstructionBudgetExhausted, true);
+  assert.equal(first.stats.examined, 2);
+
+  const second = await store.scan({ ...request, cursor: first.next });
+  assert.deepEqual(second.rows.map(({ id }) => id), ['b']);
+  assert.equal(second.stats.reconstructionBudgetExhausted, true);
+
+  const third = await store.scan({ ...request, cursor: second.next });
+  assert.deepEqual(third.rows.map(({ id }) => id), ['c']);
+  assert.equal(third.stats.reconstructionBudgetExhausted, false);
+  assert.equal(third.next, undefined);
+
+  await assert.rejects(
+    store.scan({ maxReconstructedBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
   );
 });
 

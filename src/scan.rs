@@ -19,6 +19,8 @@ const CURSOR_CHECKSUM: usize = 8;
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_EXAMINED: usize = 1_000_000;
+/// Default ceiling for content bytes materialized into one structured page.
+pub const DEFAULT_MAX_RECONSTRUCTED_BYTES: u64 = 32 << 20;
 
 /// A cheap cooperative cancellation target shared by a scan and its caller.
 #[derive(Clone, Debug, Default)]
@@ -111,6 +113,10 @@ pub struct ScanRequest {
     pub limit: usize,
     /// Hard bound on candidate records examined during this call. A partial page carries a cursor.
     pub max_examined: usize,
+    /// Ceiling for content bytes reconstructed into this page. A row is never split or truncated;
+    /// the first matching row is admitted even when it alone exceeds this value so paging can make
+    /// progress.
+    pub max_reconstructed_bytes: u64,
     /// Absolute deadline. It may be created before queue submission so queue time is included.
     pub deadline: Option<Instant>,
     /// Cooperative cancellation checked before and during record/content evaluation.
@@ -131,6 +137,7 @@ impl Default for ScanRequest {
             cursor: None,
             limit: DEFAULT_LIMIT,
             max_examined: 10_000,
+            max_reconstructed_bytes: DEFAULT_MAX_RECONSTRUCTED_BYTES,
             deadline: None,
             cancellation: None,
             attrs: Vec::new(),
@@ -167,6 +174,9 @@ pub struct ScanStats {
     pub shadowed_attr_occurrences: usize,
     pub content_values_reconstructed: usize,
     pub reconstructed_bytes: u64,
+    /// A matching row was deliberately left for the next page because adding all of its selected
+    /// content bytes would have crossed the request's reconstruction ceiling.
+    pub reconstruction_budget_exhausted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -274,8 +284,11 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         || request.predicates.iter().any(|p| !matches!(p, Predicate::Id { .. }));
     let mut rows = Vec::with_capacity(request.limit);
     let mut stats = ScanStats::default();
-    let mut last_examined = cursor.as_ref().map(|c| c.last_id.clone());
+    // A cursor identifies the last candidate CONSUMED, not merely inspected. They normally coincide,
+    // but a row deferred by the reconstruction budget must be reconsidered on the next page.
+    let mut last_consumed = cursor.as_ref().map(|c| c.last_id.clone());
     let mut has_more = false;
+    let mut budget_stopped = false;
 
     while rows.len() < request.limit && stats.examined < request.max_examined {
         check_interruption(request)?;
@@ -298,7 +311,6 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             check_interruption(request)?;
             processed += 1;
             stats.examined += 1;
-            last_examined = Some(id.clone());
             let record = if needs_record {
                 Some(source.get(&id)?.ok_or_else(|| {
                     anyhow::anyhow!("id {id:?} disappeared from an immutable scan view")
@@ -307,7 +319,20 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
                 None
             };
             if !request.predicates.iter().all(|p| matches_predicate(&id, record.as_ref(), p)) {
+                last_consumed = Some(id);
                 continue;
+            }
+            let row_reconstructed_bytes = projected_reconstructed_bytes(record.as_ref(), request)?;
+            if !rows.is_empty()
+                && row_reconstructed_bytes
+                    > request.max_reconstructed_bytes.saturating_sub(stats.reconstructed_bytes)
+            {
+                // Do not consume `id`: the continuation must resume at this matching row. The row
+                // was examined, so it still counts against max_examined for this call.
+                stats.reconstruction_budget_exhausted = true;
+                has_more = true;
+                budget_stopped = true;
+                break;
             }
             let mut attrs = Vec::new();
             if let Some(record) = &record {
@@ -334,8 +359,10 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
                         })?;
                     check_interruption(request)?;
                     stats.content_values_reconstructed += 1;
-                    stats.reconstructed_bytes =
-                        stats.reconstructed_bytes.saturating_add(value.len() as u64);
+                    stats.reconstructed_bytes = stats
+                        .reconstructed_bytes
+                        .checked_add(value.len() as u64)
+                        .context("structured scan reconstructed-byte counter overflow")?;
                     Some(value)
                 } else {
                     None
@@ -343,10 +370,14 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
                 contents.push(project_content(&selected.name, content, bytes));
             }
             rows.push(ScanRow { id, attrs, contents });
+            last_consumed = Some(rows.last().expect("row was just pushed").id.clone());
             if rows.len() == request.limit {
                 has_more = processed < fetched || fetched == ask;
                 break;
             }
+        }
+        if budget_stopped {
+            break;
         }
         if rows.len() == request.limit {
             break;
@@ -359,7 +390,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             has_more = false;
             break;
         }
-        let last = last_examined.as_ref().expect("a non-empty id batch has a last id");
+        let last = last_consumed.as_ref().expect("a consumed id batch has a last id");
         match request.direction {
             Direction::Forward => from = Some(after(last)),
             Direction::Reverse => to = Some(last.clone()),
@@ -370,7 +401,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     check_interruption(request)?;
     stats.returned = rows.len();
     let next = if has_more {
-        last_examined
+        last_consumed
             .map(|last| encode_cursor(request.direction, fingerprint, &last))
             .transpose()?
     } else {
@@ -395,6 +426,9 @@ fn validate(request: &ScanRequest) -> Result<()> {
     }
     if request.max_examined == 0 || request.max_examined > MAX_EXAMINED {
         bail!("scan max_examined must be in 1..={MAX_EXAMINED}");
+    }
+    if request.max_reconstructed_bytes == 0 {
+        bail!("scan max_reconstructed_bytes must be greater than zero");
     }
     if matches!((&request.from, &request.to), (Some(a), Some(b)) if a >= b) {
         bail!("scan lower bound must be less than its upper bound");
@@ -421,6 +455,19 @@ fn validate(request: &ScanRequest) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn projected_reconstructed_bytes(record: Option<&Record>, request: &ScanRequest) -> Result<u64> {
+    request
+        .contents
+        .iter()
+        .filter(|selected| selected.mode == ContentMode::Bytes)
+        .filter_map(|selected| record.and_then(|record| record.content(&selected.name)))
+        .try_fold(0u64, |bytes, content| {
+            bytes.checked_add(content.len()).ok_or_else(|| {
+                anyhow::anyhow!("selected content lengths overflow the u64 scan byte counter")
+            })
+        })
 }
 
 fn project_content(

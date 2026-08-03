@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use turndb::fold::FoldCfg;
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
-    ScanInterrupted, ScanPage, ScanRequest, ScanRow,
+    ScanInterrupted, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
 };
 use turndb::store::{ReadStore, Store};
 use turndb::types::AttrValue;
@@ -96,6 +96,8 @@ pub struct NativeScanRequest {
     pub cursor: Option<String>,
     pub limit: Option<u32>,
     pub max_examined: Option<u32>,
+    /// Whole-page content reconstruction ceiling. Rows are never truncated.
+    pub max_reconstructed_bytes: Option<BigInt>,
     /// Milliseconds from submission; zero is an immediate, deterministic deadline.
     pub timeout_ms: Option<u32>,
     pub signal: Option<AbortSignal>,
@@ -128,6 +130,7 @@ pub struct NativeScanStats {
     pub shadowed_attr_occurrences: u32,
     pub content_values_reconstructed: u32,
     pub reconstructed_bytes: BigInt,
+    pub reconstruction_budget_exhausted: bool,
 }
 
 #[napi(object)]
@@ -157,6 +160,8 @@ pub struct NativeCapabilities {
     pub health_snapshots: bool,
     pub schema_discovery: bool,
     pub scan_cancellation: bool,
+    pub scan_reconstruction_budget: bool,
+    pub scan_reconstructed_bytes_default: BigInt,
 }
 
 #[napi]
@@ -189,6 +194,8 @@ pub fn capabilities() -> NativeCapabilities {
         health_snapshots: true,
         schema_discovery: true,
         scan_cancellation: true,
+        scan_reconstruction_budget: true,
+        scan_reconstructed_bytes_default: BigInt::from(DEFAULT_MAX_RECONSTRUCTED_BYTES),
     }
 }
 
@@ -693,6 +700,19 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
 }
 
 fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
+    let max_reconstructed_bytes = input
+        .max_reconstructed_bytes
+        .map(|value| {
+            let value = decode_u64(value, "maxReconstructedBytes")?;
+            if value == 0 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "maxReconstructedBytes must be greater than zero",
+                ));
+            }
+            Ok(value)
+        })
+        .transpose()?;
     let cancellation = input.signal.map(|signal| {
         let token = CancellationToken::new();
         let cancelled = token.clone();
@@ -753,6 +773,9 @@ fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
     }
     if let Some(max_examined) = input.max_examined {
         request.max_examined = max_examined as usize;
+    }
+    if let Some(max_reconstructed_bytes) = max_reconstructed_bytes {
+        request.max_reconstructed_bytes = max_reconstructed_bytes;
     }
     Ok(request)
 }
@@ -871,6 +894,7 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
             shadowed_attr_occurrences: page.stats.shadowed_attr_occurrences as u32,
             content_values_reconstructed: page.stats.content_values_reconstructed as u32,
             reconstructed_bytes: BigInt::from(page.stats.reconstructed_bytes),
+            reconstruction_budget_exhausted: page.stats.reconstruction_budget_exhausted,
         },
     }
 }
