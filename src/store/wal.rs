@@ -474,6 +474,15 @@ impl Wal {
     /// an unsealed run at the end of the log is. A standalone frame arriving over a non-empty pen
     /// discards the pen the same way: whatever batch those members belonged to never committed.
     pub fn replay(path: &Path) -> Result<Vec<Frame>> {
+        Self::replay_with_limits(path, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Replay with explicit atomic-frame admission before payload allocation.
+    pub fn replay_with_limits(
+        path: &Path,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Vec<Frame>> {
+        let read_limits = read_limits.validate()?;
         let f = match File::open(path) {
             Ok(f) => f,
             Err(_) => return Ok(Vec::new()),
@@ -517,6 +526,7 @@ impl Wal {
             if end > len {
                 break;
             }
+            read_limits.admit("WAL frame", plen as u64, plen as u64)?;
             let mut payload = vec![0u8; plen];
             if crate::sys::read_exact_at(&f, &mut payload, off + HDR as u64).is_err() {
                 break;
@@ -650,6 +660,32 @@ mod tests {
             },
             vec![(h, bytes)],
         )
+    }
+
+    #[test]
+    fn replay_admits_a_complete_frame_before_payload_allocation() {
+        let p = std::env::temp_dir().join(format!(
+            "turndb-wal-read-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut wal = Wal::open(&p).unwrap();
+        wal.append_tomb(1, &"x".repeat(128)).unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+
+        let error = match Wal::replay_with_limits(
+            &p,
+            crate::read_limits::ReadLimits {
+                max_stored_frame_bytes: 64,
+                max_decoded_frame_bytes: 64,
+            },
+        ) {
+            Ok(_) => panic!("strict replay must refuse the complete larger frame"),
+            Err(error) => error,
+        };
+        assert_eq!(crate::error::classify(&error), crate::error::ErrorClass::ResourceExhausted);
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]

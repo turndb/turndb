@@ -138,6 +138,25 @@ pub fn merge_opts_with_control(
     drop_tombstones: bool,
     control: &crate::control::OperationControl,
 ) -> Result<(PartMeta, MergeStats)> {
+    merge_opts_with_control_and_limits(
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        control,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// [`merge_opts_with_control`] with atomic-frame admission on the output part.
+pub fn merge_opts_with_control_and_limits(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(PartMeta, MergeStats)> {
     merge_opts_with_control_for_operation(
         out,
         inputs,
@@ -145,6 +164,7 @@ pub fn merge_opts_with_control(
         drop_tombstones,
         control,
         "part compaction",
+        read_limits,
     )
 }
 
@@ -156,6 +176,7 @@ pub(crate) fn merge_opts_with_control_for_operation(
     drop_tombstones: bool,
     control: &crate::control::OperationControl,
     operation: &'static str,
+    read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(PartMeta, MergeStats)> {
     control.check(operation)?;
     if inputs.is_empty() {
@@ -246,13 +267,14 @@ pub(crate) fn merge_opts_with_control_for_operation(
     // stored and still worth deduping against — and a record staged but not yet flushed may have
     // matched against an entry that would otherwise stop being referenced here.
     let dict: Vec<(Loc, PieceHash)> = locs.iter().map(|(h, l)| (*l, *h)).collect();
-    let mut b = crate::part::builder::StreamBuilder::new(
+    let mut b = crate::part::builder::StreamBuilder::new_with_limits(
         out,
         level,
         dict,
         content_names.into_iter().collect(),
         columns,
         value_dicts,
+        read_limits,
     )?;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((id, pi, row, _)) = kway.next_group()? {

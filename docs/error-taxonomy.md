@@ -15,7 +15,7 @@ Consequently, adding diagnostic context cannot change a class, and an untyped er
 |---|---|---|
 | `InvalidArgument` | `INVALID_ARGUMENT` | The request, cursor, policy, or authorized operation is structurally invalid. Retrying unchanged cannot succeed. |
 | `Cancelled` | `CANCELLED` | A cancellation token or deadline stopped the operation at a documented safe checkpoint. No partial scan page is returned. |
-| `ResourceExhausted` | `RESOURCE_EXHAUSTED` | A declared write, query, or maintenance work ceiling refused the operation. |
+| `ResourceExhausted` | `RESOURCE_EXHAUSTED` | A declared write, read, query, or maintenance work ceiling refused the operation. |
 | `Unsupported` | `UNSUPPORTED` | The operation requires a capability this build or platform does not provide. |
 | `Contention` | `CONTENTION` | Another writer owns the store's enforced exclusive lock. |
 | `NotFound` | `NOT_FOUND` | A required filesystem object does not exist. Absence of a record/content value is ordinary `None`/`null`, not this error. |
@@ -29,7 +29,7 @@ conflicts such as backup destination replacement use explicit engine variants ra
 every low-level `AlreadyExists` as a request error.
 
 The initial typed engine causes include scan request/cursor validation, scan and lifecycle
-interruption, write admission, bounded-compaction planning, SQL planning/execution and memory
+interruption, write and atomic-frame read admission, bounded-compaction planning, SQL planning/execution and memory
 admission, writer exclusion, backup/restore, manifest recovery, and explicit verification-integrity
 failures. `IntegrityError` preserves a low-level source chain while identifying a verification
 failure as corruption. Unknown parser or invariant failures outside an integrity operation still

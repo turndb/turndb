@@ -28,6 +28,7 @@ use turndb::query::sql::{
     SqlBatch, SqlBudget, SqlOptions, SqlQuery, SqlValue, DEFAULT_AGGREGATE_MEMORY_BYTES,
     DEFAULT_MEMORY_BYTES,
 };
+use turndb::read_limits::ReadLimits;
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
     ScanExplanation, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
@@ -300,6 +301,7 @@ pub struct NativeCapabilities {
     pub command_queue_capacity: u32,
     pub command_queue_capacity_max: u32,
     pub write_admission_limits: bool,
+    pub read_admission_limits: bool,
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
     pub format_migration: bool,
@@ -315,6 +317,8 @@ pub struct NativeCapabilities {
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
     pub max_identifier_bytes_default: u32,
+    pub max_stored_frame_bytes_default: BigInt,
+    pub max_decoded_frame_bytes_default: BigInt,
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub backup_restore: bool,
@@ -362,6 +366,7 @@ pub fn capabilities() -> NativeCapabilities {
         command_queue_capacity: DEFAULT_QUEUE_CAPACITY as u32,
         command_queue_capacity_max: MAX_QUEUE_CAPACITY as u32,
         write_admission_limits: c.write_admission_limits,
+        read_admission_limits: c.read_admission_limits,
         store_space_usage: c.store_space_usage,
         allocated_space_usage: c.allocated_space_usage,
         format_migration: c.format_migration,
@@ -377,6 +382,8 @@ pub fn capabilities() -> NativeCapabilities {
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
         max_identifier_bytes_default: c.max_identifier_bytes_default as u32,
+        max_stored_frame_bytes_default: BigInt::from(c.max_stored_frame_bytes_default),
+        max_decoded_frame_bytes_default: BigInt::from(c.max_decoded_frame_bytes_default),
         immutable_snapshots: true,
         lifecycle_operations: true,
         backup_restore: turndb::pack::ATOMIC_RESTORE,
@@ -427,6 +434,10 @@ pub struct NativeOpenOptions {
     pub max_batch_records: Option<u32>,
     /// UTF-8 bytes admitted in an id, attribute name, or content name. Defaults to 4 KiB.
     pub max_identifier_bytes: Option<u32>,
+    /// Stored bytes admitted for one WAL/TOC/section/fold frame. Defaults to 512 MiB.
+    pub max_stored_frame_bytes: Option<BigInt>,
+    /// Decoded bytes admitted for one TOC/section/fold frame. Defaults to 512 MiB.
+    pub max_decoded_frame_bytes: Option<BigInt>,
     /// Raw bytes gathered per compressed fold block. Defaults to 4 MiB.
     pub block_target_bytes: Option<BigInt>,
     /// Decompressed fold-block cache budget. Defaults to 64 MiB.
@@ -444,6 +455,8 @@ pub struct NativeOpenOptions {
 #[napi(object)]
 pub struct NativeSnapshotOpenOptions {
     pub max_concurrent_sql_memory_bytes: Option<BigInt>,
+    pub max_stored_frame_bytes: Option<BigInt>,
+    pub max_decoded_frame_bytes: Option<BigInt>,
 }
 
 #[napi(object)]
@@ -599,7 +612,17 @@ pub struct NativeBackupResult {
 #[napi(object, object_to_js = false)]
 pub struct NativeRecoveryOptions {
     pub max_rollback_commits: Option<BigInt>,
+    pub max_stored_frame_bytes: Option<BigInt>,
+    pub max_decoded_frame_bytes: Option<BigInt>,
     /// Milliseconds from submission; worker-scheduling time is included.
+    pub timeout_ms: Option<u32>,
+    pub signal: Option<AbortSignal>,
+}
+
+#[napi(object, object_to_js = false)]
+pub struct NativeRestoreOptions {
+    pub max_stored_frame_bytes: Option<BigInt>,
+    pub max_decoded_frame_bytes: Option<BigInt>,
     pub timeout_ms: Option<u32>,
     pub signal: Option<AbortSignal>,
 }
@@ -667,6 +690,8 @@ pub struct NativeHealth {
     pub fold_compression_threads: BigInt,
     pub part_cache_bytes: BigInt,
     pub part_cache_budget: BigInt,
+    pub max_stored_frame_bytes: BigInt,
+    pub max_decoded_frame_bytes: BigInt,
     pub dedup_window_entries: BigInt,
     pub retained_commits: BigInt,
     pub punched_blocks: BigInt,
@@ -1060,17 +1085,22 @@ impl NativeSnapshot {
         if path.is_empty() {
             return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
         }
+        let read_limits = decode_read_limits(
+            options.as_ref().and_then(|value| value.max_stored_frame_bytes.clone()),
+            options.as_ref().and_then(|value| value.max_decoded_frame_bytes.clone()),
+        )?;
+        #[cfg(feature = "sql")]
+        let budget = decode_sql_budget(
+            options.as_ref().and_then(|value| value.max_concurrent_sql_memory_bytes.clone()),
+        )?;
         let store = napi::tokio::task::spawn_blocking(move || {
-            Store::open_read(&PathBuf::from(path), FoldCfg::default())
+            Store::open_read_with_limits(&PathBuf::from(path), FoldCfg::default(), read_limits)
         })
         .await
         .map_err(|error| failure("join TurnDB snapshot open", error))?
         .map_err(|error| engine_failure("open TurnDB snapshot", error))?;
         #[cfg(feature = "sql")]
         {
-            let budget = decode_sql_budget(
-                options.and_then(|options| options.max_concurrent_sql_memory_bytes),
-            )?;
             Ok(NativeSnapshot::from_store(store, budget))
         }
         #[cfg(not(feature = "sql"))]
@@ -1091,17 +1121,27 @@ impl NativeSnapshot {
             return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
         }
         let commit = decode_u64(commit, "snapshot commit")?;
+        let read_limits = decode_read_limits(
+            options.as_ref().and_then(|value| value.max_stored_frame_bytes.clone()),
+            options.as_ref().and_then(|value| value.max_decoded_frame_bytes.clone()),
+        )?;
+        #[cfg(feature = "sql")]
+        let budget = decode_sql_budget(
+            options.as_ref().and_then(|value| value.max_concurrent_sql_memory_bytes.clone()),
+        )?;
         let store = napi::tokio::task::spawn_blocking(move || {
-            Store::open_read_at(&PathBuf::from(path), FoldCfg::default(), commit)
+            Store::open_read_at_with_limits(
+                &PathBuf::from(path),
+                FoldCfg::default(),
+                commit,
+                read_limits,
+            )
         })
         .await
         .map_err(|error| failure("join retained TurnDB snapshot open", error))?
         .map_err(|error| engine_failure("open retained TurnDB snapshot", error))?;
         #[cfg(feature = "sql")]
         {
-            let budget = decode_sql_budget(
-                options.and_then(|options| options.max_concurrent_sql_memory_bytes),
-            )?;
             Ok(NativeSnapshot::from_store(store, budget))
         }
         #[cfg(not(feature = "sql"))]
@@ -1114,6 +1154,16 @@ impl NativeSnapshot {
     #[napi(getter)]
     pub fn commit(&self) -> BigInt {
         BigInt::from(self.state.commit)
+    }
+
+    #[napi(getter)]
+    pub fn max_stored_frame_bytes(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.state.get()?.read_limits().max_stored_frame_bytes))
+    }
+
+    #[napi(getter)]
+    pub fn max_decoded_frame_bytes(&self) -> Result<BigInt> {
+        Ok(BigInt::from(self.state.get()?.read_limits().max_decoded_frame_bytes))
     }
 
     #[napi]
@@ -1200,7 +1250,7 @@ pub fn restore_backup<'env>(
     env: &'env Env,
     backup_path: String,
     destination_path: String,
-    options: Option<NativeLifecycleOptions>,
+    options: Option<NativeRestoreOptions>,
 ) -> Result<PromiseRaw<'env, NativeBackupResult>> {
     if backup_path.is_empty() || destination_path.is_empty() {
         return Err(Error::new(
@@ -1208,12 +1258,22 @@ pub fn restore_backup<'env>(
             "backup and destination paths must not be empty",
         ));
     }
-    let control = decode_lifecycle(options);
+    let (read_limits, control) = match options {
+        Some(options) => (
+            decode_read_limits(options.max_stored_frame_bytes, options.max_decoded_frame_bytes)?,
+            decode_lifecycle(Some(NativeLifecycleOptions {
+                timeout_ms: options.timeout_ms,
+                signal: options.signal,
+            })),
+        ),
+        None => (ReadLimits::default(), OperationControl::default()),
+    };
     env.spawn_future(async move {
         napi::tokio::task::spawn_blocking(move || {
-            turndb::pack::restore_with_control(
+            turndb::pack::restore_with_limits_and_control(
                 &PathBuf::from(backup_path),
                 &PathBuf::from(destination_path),
+                read_limits,
                 &control,
             )
         })
@@ -1238,26 +1298,28 @@ pub fn recover_manifest<'env>(
     if path.is_empty() {
         return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
     }
-    let (max_rollback_commits, control) = match options {
+    let (max_rollback_commits, read_limits, control) = match options {
         Some(options) => (
             options
                 .max_rollback_commits
                 .map(|value| decode_u64(value, "maxRollbackCommits"))
                 .transpose()?
                 .unwrap_or(0),
+            decode_read_limits(options.max_stored_frame_bytes, options.max_decoded_frame_bytes)?,
             decode_lifecycle(Some(NativeLifecycleOptions {
                 timeout_ms: options.timeout_ms,
                 signal: options.signal,
             })),
         ),
-        None => (0, OperationControl::default()),
+        None => (0, ReadLimits::default(), OperationControl::default()),
     };
     env.spawn_future(async move {
         napi::tokio::task::spawn_blocking(move || {
-            turndb::store::recover_manifest_with_control(
+            turndb::store::recover_manifest_with_limits_and_control(
                 &PathBuf::from(path),
                 FoldCfg::default(),
                 turndb::store::RecoveryOptions { max_rollback_commits },
+                read_limits,
                 &control,
             )
         })
@@ -2274,6 +2336,24 @@ fn decode_write_limits(options: Option<&NativeOpenOptions>) -> Result<WriteLimit
     limits.validate().map_err(|error| Error::new(Status::InvalidArg, error.to_string()))
 }
 
+fn decode_read_limits(
+    max_stored_frame_bytes: Option<BigInt>,
+    max_decoded_frame_bytes: Option<BigInt>,
+) -> Result<ReadLimits> {
+    let defaults = ReadLimits::default();
+    let limits = ReadLimits {
+        max_stored_frame_bytes: match max_stored_frame_bytes {
+            Some(value) => decode_u64(value, "maxStoredFrameBytes")?,
+            None => defaults.max_stored_frame_bytes,
+        },
+        max_decoded_frame_bytes: match max_decoded_frame_bytes {
+            Some(value) => decode_u64(value, "maxDecodedFrameBytes")?,
+            None => defaults.max_decoded_frame_bytes,
+        },
+    };
+    limits.validate().map_err(|error| Error::new(Status::InvalidArg, error.to_string()))
+}
+
 fn decode_store_options(options: Option<&NativeOpenOptions>) -> Result<StoreOptions> {
     let defaults = StoreOptions::default();
     let decode_usize = |value: BigInt, name: &str| -> Result<usize> {
@@ -2342,6 +2422,10 @@ fn decode_store_options(options: Option<&NativeOpenOptions>) -> Result<StoreOpti
             compress_threads,
         },
         write_limits: decode_write_limits(options)?,
+        read_limits: decode_read_limits(
+            options.and_then(|value| value.max_stored_frame_bytes.clone()),
+            options.and_then(|value| value.max_decoded_frame_bytes.clone()),
+        )?,
         part_cache_bytes,
     })
 }
@@ -2750,6 +2834,8 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         fold_compression_threads: BigInt::from(health.fold_compression_threads as u64),
         part_cache_bytes: BigInt::from(health.part_cache_bytes as u64),
         part_cache_budget: BigInt::from(health.part_cache_budget as u64),
+        max_stored_frame_bytes: BigInt::from(health.max_stored_frame_bytes),
+        max_decoded_frame_bytes: BigInt::from(health.max_decoded_frame_bytes),
         dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
         retained_commits: BigInt::from(health.retained_commits as u64),
         punched_blocks: BigInt::from(health.punched_blocks),

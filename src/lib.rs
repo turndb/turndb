@@ -55,6 +55,7 @@ pub mod pack;
 pub mod part;
 #[cfg(feature = "columnar")]
 pub mod query;
+pub mod read_limits;
 pub mod readat;
 pub mod scan;
 pub mod schema;

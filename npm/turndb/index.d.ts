@@ -52,6 +52,10 @@ export interface OpenOptions {
   maxBatchRecords?: number;
   /** UTF-8 bytes admitted in an id, attribute name, or content name; defaults to 4 KiB. */
   maxIdentifierBytes?: number;
+  /** Stored input admitted for one WAL, part-TOC/section, or fold-block frame; defaults to 512 MiB. */
+  maxStoredFrameBytes?: number;
+  /** Decoded output admitted for one part-TOC/section or fold-block frame; defaults to 512 MiB. */
+  maxDecodedFrameBytes?: number;
 }
 
 export interface ScanOptions {
@@ -103,6 +107,7 @@ export interface Capabilities {
   sql: boolean;
   portable_wasm: boolean;
   write_admission_limits: true;
+  read_admission_limits: true;
   store_space_usage: true;
   allocated_space_usage: boolean;
   format_migration: true;
@@ -117,6 +122,8 @@ export interface Capabilities {
   max_batch_bytes_default: number;
   max_batch_records_default: number;
   max_identifier_bytes_default: number;
+  max_stored_frame_bytes_default: number;
+  max_decoded_frame_bytes_default: number;
 }
 
 /** Every engine-reported failure, carrying the engine's own message. */
@@ -142,6 +149,8 @@ export declare class Store {
   readonly closed: boolean;
   /** Guarantees of the compiled portable core. */
   capabilities(): Capabilities;
+  /** Exact atomic persisted-frame admission configured for this handle. */
+  readLimits(): { maxStoredFrameBytes: number; maxDecodedFrameBytes: number };
   /** Write one record. Not durable until {@link Store.sync}. */
   putBody(id: string, body: Uint8Array | string, attrs?: Attrs): void;
   /** Apply many records atomically — all-or-nothing, so a crash cannot commit half an export. */

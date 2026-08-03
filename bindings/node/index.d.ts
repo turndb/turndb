@@ -174,6 +174,7 @@ export interface Capabilities {
   commandQueueCapacity: number;
   commandQueueCapacityMax: number;
   writeAdmissionLimits: true;
+  readAdmissionLimits: true;
   storeSpaceUsage: true;
   allocatedSpaceUsage: boolean;
   formatMigration: true;
@@ -189,6 +190,8 @@ export interface Capabilities {
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
   maxIdentifierBytesDefault: number;
+  maxStoredFrameBytesDefault: bigint;
+  maxDecodedFrameBytesDefault: bigint;
   immutableSnapshots: true;
   lifecycleOperations: true;
   backupRestore: boolean;
@@ -223,6 +226,10 @@ export interface OpenOptions {
   maxBatchRecords?: number;
   /** UTF-8 bytes admitted in an id, attribute name, or content name; defaults to 4 KiB. */
   maxIdentifierBytes?: number;
+  /** Stored input admitted for one WAL, part-TOC/section, or fold-block frame; defaults to 512 MiB. */
+  maxStoredFrameBytes?: bigint;
+  /** Decoded output admitted for one part-TOC/section or fold-block frame; defaults to 512 MiB. */
+  maxDecodedFrameBytes?: bigint;
   /** Raw bytes gathered per compressed content block; defaults to 4 MiB. */
   blockTargetBytes?: bigint;
   /** Decompressed content-block cache budget; defaults to 64 MiB. */
@@ -239,6 +246,8 @@ export interface OpenOptions {
 
 export interface SnapshotOpenOptions {
   maxConcurrentSqlMemoryBytes?: bigint;
+  maxStoredFrameBytes?: bigint;
+  maxDecodedFrameBytes?: bigint;
 }
 
 export interface LifecycleOptions {
@@ -488,6 +497,12 @@ export declare function retainedCommits(path: string): Promise<bigint[]>;
 export interface RecoveryOptions extends LifecycleOptions {
   /** Maximum number of newer retained commits that recovery may abandon; defaults to zero. */
   maxRollbackCommits?: bigint;
+  maxStoredFrameBytes?: bigint;
+  maxDecodedFrameBytes?: bigint;
+}
+export interface RestoreOptions extends LifecycleOptions {
+  maxStoredFrameBytes?: bigint;
+  maxDecodedFrameBytes?: bigint;
 }
 export declare function recoverManifest(
   path: string,
@@ -506,7 +521,7 @@ export declare function recoverManifest(
 export declare function restoreBackup(
   backupPath: string,
   destinationPath: string,
-  options?: LifecycleOptions,
+  options?: RestoreOptions,
 ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
 
 export declare class NativeSqlQuery {
@@ -522,6 +537,8 @@ export declare class NativeSnapshot {
   static openAt(path: string, commit: bigint, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
   readonly commit: bigint;
   readonly maxConcurrentSqlMemoryBytes: bigint;
+  readonly maxStoredFrameBytes: bigint;
+  readonly maxDecodedFrameBytes: bigint;
   readonly reservedSqlMemoryBytes: bigint;
   scan(request?: ScanRequest): Promise<ScanPage>;
   explainScan(request?: ScanRequest): Promise<ScanExplanation>;
@@ -626,6 +643,8 @@ export declare class NativeStore {
     foldCompressionThreads: bigint;
     partCacheBytes: bigint;
     partCacheBudget: bigint;
+    maxStoredFrameBytes: bigint;
+    maxDecodedFrameBytes: bigint;
     dedupWindowEntries: bigint;
     retainedCommits: bigint;
     punchedBlocks: bigint;

@@ -43,7 +43,12 @@ impl Spool {
         Ok(())
     }
     /// Everything appended so far, loaded whole — `finish`'s per-section working set.
-    fn take(mut self) -> Result<Vec<u8>> {
+    fn take(
+        mut self,
+        read_limits: crate::read_limits::ReadLimits,
+        section: &str,
+    ) -> Result<Vec<u8>> {
+        read_limits.admit_decoded(format!("new part section {section:?}"), self.len)?;
         self.w.flush()?;
         let b = std::fs::read(&self.path)?;
         let _ = std::fs::remove_file(&self.path);
@@ -108,6 +113,7 @@ pub struct StreamBuilder {
     tomb_prev: u64,
 
     rows: u64,
+    read_limits: crate::read_limits::ReadLimits,
 }
 
 impl StreamBuilder {
@@ -118,11 +124,33 @@ impl StreamBuilder {
     pub fn new(
         path: &Path,
         level: i32,
+        dict: Vec<(Loc, PieceHash)>,
+        content_names: Vec<String>,
+        columns: Vec<(String, u8)>,
+        value_dicts: Vec<Vec<Vec<u8>>>,
+    ) -> Result<StreamBuilder> {
+        Self::new_with_limits(
+            path,
+            level,
+            dict,
+            content_names,
+            columns,
+            value_dicts,
+            crate::read_limits::ReadLimits::default(),
+        )
+    }
+
+    /// [`StreamBuilder::new`] with atomic-frame limits applied while spools become sections.
+    pub fn new_with_limits(
+        path: &Path,
+        level: i32,
         mut dict: Vec<(Loc, PieceHash)>,
         mut content_names: Vec<String>,
         columns: Vec<(String, u8)>,
         value_dicts: Vec<Vec<Vec<u8>>>,
+        read_limits: crate::read_limits::ReadLimits,
     ) -> Result<StreamBuilder> {
+        let read_limits = read_limits.validate()?;
         if columns.len() != value_dicts.len() {
             bail!("every column needs its value dictionary slot");
         }
@@ -183,7 +211,7 @@ impl StreamBuilder {
         }
 
         Ok(StreamBuilder {
-            w: Writer::new(path, level)?,
+            w: Writer::new_with_limits(path, level, read_limits)?,
             dict,
             dict_index,
             cols,
@@ -201,6 +229,7 @@ impl StreamBuilder {
             tomb_n: 0,
             tomb_prev: 0,
             rows: 0,
+            read_limits,
         })
     }
 
@@ -335,7 +364,7 @@ impl StreamBuilder {
         let n = self.rows;
         self.layout_off.append(&self.layout_len.to_le_bytes())?;
 
-        self.w.section("ids", &self.ids.take()?)?;
+        self.w.section("ids", &self.ids.take(self.read_limits, "ids")?)?;
         let restarts: Vec<u8> = self.id_restarts.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.w.section("ids.restart", &restarts)?;
         let mut cmeta = Vec::new();
@@ -353,10 +382,19 @@ impl StreamBuilder {
         self.w.section("cmeta", &cmeta)?;
         for (i, mut c) in self.content_cols.into_iter().enumerate() {
             c.off.append(&c.prog_len.to_le_bytes())?;
-            self.w.section(&format!("con.prog.{i}"), &c.prog.take()?)?;
-            self.w.section(&format!("con.off.{i}"), &c.off.take()?)?;
-            self.w.section(&format!("con.id.{i}"), &c.identity.take()?)?;
-            let rid = c.rid.take()?;
+            self.w.section(
+                &format!("con.prog.{i}"),
+                &c.prog.take(self.read_limits, &format!("con.prog.{i}"))?,
+            )?;
+            self.w.section(
+                &format!("con.off.{i}"),
+                &c.off.take(self.read_limits, &format!("con.off.{i}"))?,
+            )?;
+            self.w.section(
+                &format!("con.id.{i}"),
+                &c.identity.take(self.read_limits, &format!("con.id.{i}"))?,
+            )?;
+            let rid = c.rid.take(self.read_limits, &format!("con.rid.{i}"))?;
             if !(c.dense && c.occurrences == n) {
                 self.w.section(&format!("con.rid.{i}"), &rid)?;
             }
@@ -382,8 +420,8 @@ impl StreamBuilder {
             out.extend_from_slice(&self.tomb);
             self.w.section("tomb", &out)?;
         }
-        self.w.section("layout", &self.layout.take()?)?;
-        self.w.section("layout.off", &self.layout_off.take()?)?;
+        self.w.section("layout", &self.layout.take(self.read_limits, "layout")?)?;
+        self.w.section("layout.off", &self.layout_off.take(self.read_limits, "layout.off")?)?;
 
         let mut meta = Vec::new();
         put_varint(&mut meta, self.cols.len() as u64);
@@ -400,8 +438,11 @@ impl StreamBuilder {
 
         for (i, c) in self.cols.into_iter().enumerate() {
             let dense = c.dense && c.occurrences == n;
-            self.w.section(&format!("col.val.{i}"), &c.val.take()?)?;
-            let rid = c.rid.take()?;
+            self.w.section(
+                &format!("col.val.{i}"),
+                &c.val.take(self.read_limits, &format!("col.val.{i}"))?,
+            )?;
+            let rid = c.rid.take(self.read_limits, &format!("col.rid.{i}"))?;
             if !dense && !rid.is_empty() {
                 self.w.section(&format!("col.rid.{i}"), &rid)?;
             }

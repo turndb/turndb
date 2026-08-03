@@ -502,9 +502,12 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 // A reader never replays the writer's WAL. Flush is therefore the only honest way
                 // to include every earlier accepted write in an immutable view, and actor
                 // serialization makes this an exact cut rather than a race around `open_read`.
+                let read_limits = store.read_limits();
                 let result = store
                     .flush()
-                    .and_then(|_| Store::open_read(path, FoldCfg::default()))
+                    .and_then(|_| {
+                        Store::open_read_with_limits(path, FoldCfg::default(), read_limits)
+                    })
                     .context("publish immutable reader snapshot");
                 let _ = reply.send(result);
             }

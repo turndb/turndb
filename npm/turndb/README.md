@@ -80,6 +80,15 @@ novel, so acceptance never depends on hidden dedup history. An atomic batch is c
 validated before any member mutates the fold or WAL. See
 [write admission limits](../../docs/write-admission.md) for the exact unit and native API.
 
+## Atomic frame read admission
+
+`open` also accepts `maxStoredFrameBytes` and `maxDecodedFrameBytes`, positive u32 values defaulting
+to 512 MiB. They are checked before a WAL, part, or fold frame allocates stored or decoded linear
+memory. `store.readLimits()` reports the effective pair. A strict profile seals fold blocks early so
+small records keep progressing; one indivisible oversized piece is refused before mutation, and an
+oversized part output is refused before publication. See
+[atomic frame read admission](../../docs/read-admission.md).
+
 ## When a write stalls, and by how much
 
 This build is single-threaded, so two operations run on **your** thread and nothing else's. Both

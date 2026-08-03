@@ -79,7 +79,10 @@ Before staging, the writer applies its per-open `WriteLimits`. The deterministic
 worst-case complete WAL frame with every piece occurrence treated as novel; a batch is all member
 frames plus its commit marker. Record/batch byte ceilings, batch member count, and UTF-8 identifier
 bytes are inclusive and configurable. Complete validation precedes any fold mutation, and recovery
-does not reapply newly chosen policy to accepted WAL frames. See `docs/write-admission.md`.
+does not reapply newly chosen *write* policy to accepted WAL frames. The separate per-open
+`ReadLimits` is deliberately applied during replay before allocating a persisted frame; reopening a
+legitimate large-frame store under a stricter profile returns resource exhaustion and does not
+discard it. See `docs/write-admission.md` and `docs/read-admission.md`.
 
 The writer provides read-your-writes immediately after successful staging. Point reads and id scans
 through that writer include its memtable, including staged tombstones. These reads may therefore see
@@ -240,6 +243,7 @@ must report the reduced profile.
 | SQL/DataFusion | optional build feature | omitted from lightweight package |
 | format interoperability | revision 4 | revision 4 |
 | configurable write admission | u64 byte ceilings | positive u32 byte ceilings |
+| atomic frame read admission | u64 ceilings within address space | positive u32 ceilings |
 
 A production native Node package must never catch native-addon load failure and silently open the WASM
 writer. Portable use must be an explicit package or entry point chosen by the caller.
@@ -361,7 +365,7 @@ journal with independent sequence cursors and explicit loss accounting; see
 Structured scan pages expose successful execution nanoseconds beside exact work/I/O counters and a
 shared-plan explanation API. SQL separates planning/stream-start time from cumulative active pull
 and IPC time and supports read-only `EXPLAIN`; consumers decide what is slow.
-Rust `StoreOptions` and native Node open options carry storage cache/compression policy through the
+Rust `StoreOptions` and native Node open options carry storage cache/compression/read-admission policy through the
 same seam. Queue, write, scan, SQL, compaction, and cache overload behavior is explicit and typed;
 see `docs/resource-budgets.md`.
 
@@ -402,6 +406,12 @@ WAL bytes per record, 256 MiB per atomic batch, 4,096 members per batch, and 4 K
 name/content name by default. All are per-open and configurable. Size and count refusals are resource
 exhaustion; malformed policy and names are invalid input. Exact definitions and binding ranges are in
 `docs/write-admission.md`.
+
+Atomic data-plane admission is separate: stored and decoded WAL/part/fold frame allocations default
+to 512 MiB and are configurable per open. A cache budget does not substitute for this check because
+one entry must be materialized before it can be cached or evicted. Fold output splits early for
+progress; indivisible piece/part output refuses before mutation/publication. See
+`docs/read-admission.md`.
 
 The native SQL stream has a caller-configurable DataFusion execution-memory pool, while structured
 scans have byte ceilings, deadlines, and cooperative cancellation and the native command backlog is

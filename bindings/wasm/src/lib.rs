@@ -43,7 +43,8 @@
 use std::cell::RefCell;
 use std::path::Path;
 use turndb::fold::FoldCfg;
-use turndb::store::{Store, WriteLimits};
+use turndb::read_limits::ReadLimits;
+use turndb::store::{Store, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
 
 thread_local! {
@@ -290,6 +291,41 @@ pub unsafe extern "C" fn tdb_open(
     max_batch_records: u32,
     max_identifier_bytes: u32,
 ) -> i32 {
+    // Keep the original ABI for direct embedders. New readers use `tdb_open_v2`; zero selects the
+    // same compiled defaults here.
+    unsafe {
+        tdb_open_v2(
+            dir,
+            dir_len,
+            block_target,
+            level,
+            max_record_bytes,
+            max_batch_bytes,
+            max_batch_records,
+            max_identifier_bytes,
+            0,
+            0,
+        )
+    }
+}
+
+/// Open with explicit atomic persisted-frame admission. Numeric options are 0 for defaults.
+///
+/// # Safety
+/// `dir` must be valid UTF-8 of `dir_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_open_v2(
+    dir: *const u8,
+    dir_len: u32,
+    block_target: u32,
+    level: i32,
+    max_record_bytes: u32,
+    max_batch_bytes: u32,
+    max_batch_records: u32,
+    max_identifier_bytes: u32,
+    max_stored_frame_bytes: u32,
+    max_decoded_frame_bytes: u32,
+) -> i32 {
     clear_err();
     let dir = match text(dir, dir_len) {
         Ok(d) => d,
@@ -325,7 +361,23 @@ pub unsafe extern "C" fn tdb_open(
             max_identifier_bytes as usize
         },
     };
-    match Store::open_with_limits(Path::new(dir), cfg, limits) {
+    let read_defaults = ReadLimits::default();
+    let read_limits = ReadLimits {
+        max_stored_frame_bytes: if max_stored_frame_bytes == 0 {
+            read_defaults.max_stored_frame_bytes
+        } else {
+            u64::from(max_stored_frame_bytes)
+        },
+        max_decoded_frame_bytes: if max_decoded_frame_bytes == 0 {
+            read_defaults.max_decoded_frame_bytes
+        } else {
+            u64::from(max_decoded_frame_bytes)
+        },
+    };
+    match Store::open_with_options(
+        Path::new(dir),
+        StoreOptions { fold: cfg, write_limits: limits, read_limits, ..StoreOptions::default() },
+    ) {
         Ok(s) => STORES.with(|slot| {
             let mut slot = slot.borrow_mut();
             // Reuse a closed slot before growing, so a long-lived process that opens and closes

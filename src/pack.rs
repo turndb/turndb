@@ -486,6 +486,22 @@ pub fn restore_with_control(
     out_dir: &Path,
     control: &crate::control::OperationControl,
 ) -> Result<RestoreStats> {
+    restore_with_limits_and_control(
+        pack_path,
+        out_dir,
+        crate::read_limits::ReadLimits::default(),
+        control,
+    )
+}
+
+/// [`restore_with_control`] with explicit atomic-frame admission while validating the staged store.
+pub fn restore_with_limits_and_control(
+    pack_path: &Path,
+    out_dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<RestoreStats> {
+    let read_limits = read_limits.validate()?;
     control.check("backup restore")?;
     if !ATOMIC_RESTORE {
         return Err(BackupError::Unsupported(
@@ -507,13 +523,13 @@ pub fn restore_with_control(
     })?;
     let files = pack
         .verify_with_control(control)
-        .map_err(|error| preserve_interruption_or_invalid_backup(pack_path, error))?;
+        .map_err(|error| preserve_control_refusal_or_invalid_backup(pack_path, error))?;
     let manifest = crate::store::manifest_from_bytes(
         &pack
             .read_file_bounded("MANIFEST", crate::store::MAX_MANIFEST_BYTES)
             .map_err(|error| invalid_backup(pack_path, error))?,
     )
-    .map_err(|error| invalid_backup(pack_path, error))?;
+    .map_err(|error| preserve_control_refusal_or_invalid_backup(pack_path, error))?;
     for part in &manifest.parts {
         control.check("backup restore validation")?;
         if !safe_relative_name(&part.file) {
@@ -537,8 +553,12 @@ pub fn restore_with_control(
     let mut cleanup = Cleanup::dir(stage.clone());
     extract_into(&pack, &stage, control).context("extract verified TurnDB backup")?;
     control.check("backup restore validation")?;
-    crate::store::Store::open_read(&stage, crate::fold::FoldCfg::default())
-        .map_err(|error| invalid_backup(pack_path, error))?;
+    crate::store::Store::open_read_with_limits(
+        &stage,
+        crate::fold::FoldCfg::default(),
+        read_limits,
+    )
+    .map_err(|error| preserve_control_refusal_or_invalid_backup(pack_path, error))?;
 
     // The last cancellation point. Once renamed, the destination exists and must be reported as the
     // operation's outcome rather than as a cancellation.
@@ -605,8 +625,11 @@ fn extract_into(
     Ok(())
 }
 
-fn preserve_interruption_or_invalid_backup(path: &Path, error: anyhow::Error) -> anyhow::Error {
-    if crate::error::classify(&error) == crate::error::ErrorClass::Cancelled {
+fn preserve_control_refusal_or_invalid_backup(path: &Path, error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        crate::error::classify(&error),
+        crate::error::ErrorClass::Cancelled | crate::error::ErrorClass::ResourceExhausted
+    ) {
         error
     } else {
         invalid_backup(path, error)

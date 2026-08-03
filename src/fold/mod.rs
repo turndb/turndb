@@ -275,11 +275,21 @@ pub struct Fold {
     ///
     /// Empty for a fold nobody declared anything about, which reads exactly as it did before.
     punched: Vec<(u32, u32)>,
+    read_limits: crate::read_limits::ReadLimits,
 }
 
 impl Fold {
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
-        Fold::open_at(dir, cfg, None)
+        Fold::open_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open a writer with explicit atomic-frame read/write admission.
+    pub fn open_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        Fold::open_at_with_limits(dir, cfg, None, read_limits)
     }
 
     /// Open, recovering to `committed`: the tail some higher layer durably recorded.
@@ -289,6 +299,17 @@ impl Fold {
     /// committed tail **beyond** the last good block means the disk broke an fsync promise, and we
     /// refuse rather than serve a fold that silently lost durable bytes.
     pub fn open_at(dir: &Path, cfg: FoldCfg, committed: Option<FoldTail>) -> Result<Fold> {
+        Fold::open_at_with_limits(dir, cfg, committed, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open and recover a writer under explicit atomic-frame admission.
+    pub fn open_at_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: Option<FoldTail>,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
         if (cfg.seg_max as u64) > SEG_MAX_LIMIT {
             bail!(
                 "seg_max {} exceeds the {} format bound (Loc.block_off is u32)",
@@ -411,6 +432,7 @@ impl Fold {
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
                 _lock: Some(lock),
                 punched: Vec::new(),
+                read_limits,
             });
         }
 
@@ -420,9 +442,10 @@ impl Fold {
                 continue;
             }
             let name = format!("zdict-{}.zd", PieceHash(h.dict_id).to_hex());
-            let bytes = std::fs::read(dir.join(&name)).with_context(|| {
-                format!("segment {} names dictionary {name} but it is unreadable", h.seg)
-            })?;
+            let bytes = read_bounded_candidate(&dir.join(&name), MAX_DICTIONARY_BYTES)
+                .with_context(|| {
+                    format!("segment {} names dictionary {name} but it is unreadable", h.seg)
+                })?;
             let got: [u8; 32] = blake3::hash(&bytes).into();
             if got != h.dict_id {
                 bail!("dictionary {name} content hash does not match the id naming it");
@@ -435,7 +458,8 @@ impl Fold {
         let flen = active_f.metadata()?.len();
         let has_dict = headers[active as usize].has_dict();
 
-        let (good_tail, _) = segment::scan_tail(&active_f, flen, has_dict)?;
+        let (good_tail, _) =
+            segment::scan_tail_with_limits(&active_f, flen, has_dict, read_limits)?;
 
         let target = match committed {
             None => good_tail,
@@ -483,7 +507,12 @@ impl Fold {
                 match segment::read_dir_sidecar(dir, h.seg, len) {
                     Some((_, e)) => e,
                     None => {
-                        let (tail, e) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+                        let (tail, e) = segment::scan_tail_with_limits(
+                            &readers[i],
+                            len,
+                            h.has_dict(),
+                            read_limits,
+                        )?;
                         // Regenerate so the next open finds it. Best-effort: advisory data must
                         // never fail an open, only slow one down.
                         let _ = segment::write_dir_sidecar(dir, h.seg, tail as u32, &e);
@@ -491,7 +520,7 @@ impl Fold {
                     }
                 }
             } else {
-                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+                segment::scan_tail_with_limits(&readers[i], len, h.has_dict(), read_limits)?.1
             };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -522,6 +551,7 @@ impl Fold {
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
             _lock: Some(lock),
             punched: Vec::new(),
+            read_limits,
         })
     }
 
@@ -545,6 +575,15 @@ impl Fold {
     }
 
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
+        Fold::open_read_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open an unlocked reader with explicit atomic-frame admission.
+    pub fn open_read_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
         let mut nums = list_segments(dir)?;
         if nums.is_empty() {
             bail!("no fold segments under {}", dir.display());
@@ -569,11 +608,26 @@ impl Fold {
                 }
             }
         }
-        Fold::open_read_from(segs, dict_files, cfg, dir)
+        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, read_limits)
     }
 
     /// Open only the durable prefix named by a manifest, ignoring later append residue.
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, committed: FoldTail) -> Result<Fold> {
+        Fold::open_read_at_with_limits(
+            dir,
+            cfg,
+            committed,
+            crate::read_limits::ReadLimits::default(),
+        )
+    }
+
+    /// Open a committed read-only prefix with explicit atomic-frame admission.
+    pub fn open_read_at_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: FoldTail,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
         let mut nums = list_segments(dir)?;
         nums.retain(|segment| *segment <= committed.seg);
         nums.sort_unstable();
@@ -614,7 +668,7 @@ impl Fold {
                 }
             }
         }
-        Fold::open_read_from(segs, dict_files, cfg, dir)
+        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, read_limits)
     }
 
     /// Open read-only from prepared inputs — the entry every SOURCE uses. A directory hands in
@@ -625,11 +679,29 @@ impl Fold {
     /// naming a dictionary no candidate hashes to is refused. `label` names the source in errors
     /// and [`Fold::dir`], and is never touched as a path.
     pub fn open_read_from(
-        mut segs: Vec<SegmentInput>,
+        segs: Vec<SegmentInput>,
         dict_files: Vec<Vec<u8>>,
         cfg: FoldCfg,
         label: &Path,
     ) -> Result<Fold> {
+        Fold::open_read_from_with_limits(
+            segs,
+            dict_files,
+            cfg,
+            label,
+            crate::read_limits::ReadLimits::default(),
+        )
+    }
+
+    /// Backend-neutral read open with explicit atomic-frame admission.
+    pub fn open_read_from_with_limits(
+        mut segs: Vec<SegmentInput>,
+        dict_files: Vec<Vec<u8>>,
+        cfg: FoldCfg,
+        label: &Path,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
         if segs.is_empty() {
             bail!("no fold segments under {}", label.display());
         }
@@ -677,7 +749,9 @@ impl Fold {
                 .and_then(|b| segment::parse_dir_sidecar(b, h.seg, len))
             {
                 Some((_, entries)) => entries,
-                None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
+                None => {
+                    segment::scan_tail_with_limits(&readers[i], len, h.has_dict(), read_limits)?.1
+                }
             };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -708,6 +782,7 @@ impl Fold {
             pool: pipe::Pool::new(1, cfg.level, None),
             _lock: None,
             punched: Vec::new(),
+            read_limits,
         })
     }
 
@@ -740,6 +815,20 @@ impl Fold {
         );
         if let Some(loc) = self.dedup.get(&hash) {
             return Ok(Put { hash, loc, deduped: true });
+        }
+
+        // A limit smaller than the ordinary block target deliberately becomes the effective seal
+        // target. Seal BEFORE appending when needed, and refuse one indivisible piece before any
+        // fold mutation. This is the progress rule that lets strict profiles keep accepting small
+        // records without ever writing a block they cannot reopen.
+        let atomic =
+            self.read_limits.max_stored_frame_bytes.min(self.read_limits.max_decoded_frame_bytes);
+        self.read_limits.admit("new fold block", raw.len() as u64, raw.len() as u64)?;
+        if !self.open_block.is_empty()
+            && self.open_block.len() as u64 > atomic.saturating_sub(raw.len() as u64)
+        {
+            self.seal_block()?;
+            self.write_ready(false)?;
         }
 
         let loc = Loc {
@@ -876,6 +965,12 @@ impl Fold {
         if hdr.block_id != loc.block_id {
             bail!("directory sent block {} to a frame carrying id {}", loc.block_id, hdr.block_id);
         }
+
+        self.read_limits.admit(
+            format!("fold block {}", hdr.block_id),
+            u64::from(hdr.stored),
+            u64::from(hdr.raw),
+        )?;
 
         let span = hdr.frame_len() as usize;
         let mut buf = vec![0u8; span];
@@ -1092,12 +1187,13 @@ impl Fold {
         for (i, h) in self.headers.iter().enumerate() {
             control.check("fold verification")?;
             let len = self.readers[i].len()?;
-            let (end, entries) = segment::scan_tail_controlled(
+            let (end, entries) = segment::scan_tail_controlled_with_limits(
                 &self.readers[i],
                 len,
                 h.has_dict(),
                 control,
                 "fold verification",
+                self.read_limits,
             )?;
             report.segments += 1;
             report.blocks += entries.len();
