@@ -1,6 +1,7 @@
 //! The pack gate: a store in one file answers exactly as the directory did, and both crossings
 //! are mechanical.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use turndb::control::{CancellationToken, OperationControl, OperationInterrupted};
 use turndb::fold::FoldCfg;
@@ -15,6 +16,28 @@ fn tmp(tag: &str) -> PathBuf {
 fn cfg() -> FoldCfg {
     // small blocks and segments so the pack carries a multi-segment fold with sidecars
     FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() }
+}
+
+fn write_sparse_pack_footer(path: &Path, toc_stored: u32, toc_raw: u32, files: u32) {
+    let mut footer = Vec::with_capacity(turndb::pack::FOOTER_LEN as usize);
+    footer.extend_from_slice(turndb::pack::MAGIC);
+    footer.extend_from_slice(&0u64.to_le_bytes());
+    footer.extend_from_slice(&toc_stored.to_le_bytes());
+    footer.extend_from_slice(&toc_raw.to_le_bytes());
+    footer.extend_from_slice(&files.to_le_bytes());
+    footer.push(0); // stored TOC; parsing never reaches it in these admission tests
+    footer.push(turndb::pack::PACK_VERSION);
+    footer.extend_from_slice(&[0u8; 2]);
+    footer.extend_from_slice(&0u32.to_le_bytes());
+    let checksum = blake3::hash(&footer);
+    footer.extend_from_slice(&checksum.as_bytes()[..4]);
+    assert_eq!(footer.len(), turndb::pack::FOOTER_LEN as usize);
+
+    let mut file = std::fs::File::create(path).unwrap();
+    let len = u64::from(toc_stored) + turndb::pack::FOOTER_LEN;
+    file.set_len(len).unwrap();
+    file.seek(SeekFrom::Start(len - turndb::pack::FOOTER_LEN)).unwrap();
+    file.write_all(&footer).unwrap();
 }
 
 /// Deterministic incompressible bytes — segments must actually roll.
@@ -172,6 +195,69 @@ fn a_pack_refuses_what_it_must() {
     };
     assert!(err.contains("reserved"), "non-zero reserved bytes must refuse, got: {err}");
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn pack_metadata_admission_precedes_hostile_sparse_allocations() {
+    let root = tmp("metadata-limits");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("hostile.turndb");
+
+    write_sparse_pack_footer(&path, (turndb::pack::DEFAULT_MAX_TOC_BYTES + 1) as u32, 1, 1);
+    let error =
+        turndb::pack::Pack::open(&path).err().expect("stored TOC limit must refuse").to_string();
+    assert!(error.contains("TOC stores") && error.contains("limit"), "{error}");
+
+    write_sparse_pack_footer(&path, 1, (turndb::pack::DEFAULT_MAX_TOC_BYTES + 1) as u32, 1);
+    let error =
+        turndb::pack::Pack::open(&path).err().expect("raw TOC limit must refuse").to_string();
+    assert!(error.contains("TOC expands") && error.contains("limit"), "{error}");
+
+    write_sparse_pack_footer(&path, 1, 1, (turndb::pack::DEFAULT_MAX_PACK_FILES + 1) as u32);
+    let error =
+        turndb::pack::Pack::open(&path).err().expect("file-count limit must refuse").to_string();
+    assert!(error.contains("files") && error.contains("limit"), "{error}");
+
+    // Limits are embedding policy, not a format dialect: a caller can choose a stricter profile.
+    let store = root.join("store");
+    build_store(&store);
+    let valid = root.join("valid.turndb");
+    turndb::pack::write(&store, &valid).unwrap();
+    let strict = turndb::pack::PackLimits { max_files: 1, ..turndb::pack::PackLimits::default() };
+    assert!(turndb::pack::Pack::open_with_limits(&valid, strict).is_err());
+    let pack = turndb::pack::Pack::open(&valid).unwrap();
+    assert!(pack.read_file_bounded("MANIFEST", 0).is_err());
+    assert!(!pack
+        .read_file_bounded("MANIFEST", turndb::store::MAX_MANIFEST_BYTES)
+        .unwrap()
+        .is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_refuses_store_members_that_resolve_through_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = tmp("backup-symlink");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = root.join("store");
+    build_store(&store);
+    let part = std::fs::read_dir(&store)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "part"))
+        .expect("fixture has a part");
+    let outside = root.join("outside.part");
+    std::fs::rename(&part, &outside).unwrap();
+    symlink(&outside, &part).unwrap();
+
+    let artifact = root.join("must-not-exist.turndb");
+    let error = format!("{:#}", turndb::pack::write(&store, &artifact).unwrap_err());
+    assert!(!artifact.exists());
+    std::fs::remove_dir_all(root).ok();
+    assert!(error.contains("symlink") || error.contains("resolves to"), "{error}");
 }
 
 #[test]

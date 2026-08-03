@@ -14,6 +14,8 @@ policies, not persisted schema or format commitments.
 | Immutable-part cache | `partCacheBytes` | current bytes and effective shared budget in `health()` |
 | Compression/read tradeoff | `blockTargetBytes`, `compressionLevel`, `compressionThreads`, `segmentMaxBytes` | effective values in `health()`; invalid settings refused at open |
 | Lifecycle event retention | fixed bounded journal | cumulative evictions and cursor-specific `gap` |
+| Pack parser metadata | `PackLimits` (`max_toc_stored_bytes`, `max_toc_raw_bytes`, `max_files`, `max_name_bytes`) | refusal before TOC read/decompression/name allocation |
+| Manifest and dictionary candidates | supported-reader ceilings; structurally derived sidecar bound | refusal or advisory fallback before whole-file allocation |
 
 Rust groups storage settings in `StoreOptions`, containing `FoldCfg`, `WriteLimits`, and one cache
 budget shared by every immutable part in that handle. `Store::open` and `Store::open_with_limits`
@@ -29,3 +31,9 @@ No single process-wide "memory limit" is claimed. Output buffers belong to calle
 is external, and DataFusion documents allocations outside its execution pool. The health, metrics,
 query stats, and preflight APIs provide the separate facts needed for an embedder to set policy and
 detect pressure honestly.
+
+The parser limits above bound metadata, not all data-plane decoding. A selected part section or fold
+block remains an atomic compressed frame and can be as large as its u32 format field permits. The
+current reader must materialize that frame to decode it. Configurable per-open data-plane admission
+or streaming section codecs remain security-hardening work; the distinction is tracked explicitly in
+the [security review](security-review.md).

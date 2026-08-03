@@ -599,6 +599,13 @@ without a version lever — **provided the new field has a documented default**,
 keep omitting it. `fold_gen` was added exactly that way and absent means 0, and `commit` likewise. A
 field without a default is a breaking change that JSON merely fails to announce.
 
+Syntax and checksum are not the end of manifest validation. A part `file` is exactly one non-empty
+store-local path component; absolute paths, parent traversal, nested paths, backslash separators,
+and duplicate names are refused before filesystem access. Sequence ranges cannot be inverted,
+optional BLAKE3 values are exactly 32-byte hex digests, and `punched` ranges must be ascending and
+disjoint. A valid checksum authenticates none of these meanings—it only proves the bytes did not
+drift—so semantic validation is mandatory.
+
 `punched` is a field of that kind, and it is **normative for erasure**: an array of inclusive
 `[lo, hi]` block-id ranges, ascending and disjoint, naming blocks whose payload bytes were
 deallocated by [erasure](#erasure). Absent — and it is omitted when empty — means nothing has been
@@ -814,7 +821,7 @@ crossings are mechanical; nothing is reinterpreted in either direction.
 ## Limits
 
 Enforced, not assumed. Each refuses rather than truncating, because a store that cannot be written is
-recoverable and one that lies is not.
+recoverable and one that lies is not. The first table contains representational format bounds.
 
 All are checked at the point of writing, and each refuses rather than truncating.
 
@@ -830,6 +837,24 @@ All are checked at the point of writing, and each refuses rather than truncating
 
 `block_target` is bounded well below 4 GiB at open, because a block is admitted into a fresh segment
 however large it is — so it, not `seg_max`, is what can overflow the segment append point.
+
+Readers additionally apply admission policy before allocating parser metadata. These defaults do
+not narrow the on-disk integer fields: pack limits are configurable through `PackLimits`, while the
+manifest and candidate-dictionary ceilings define this reader's supported profile.
+
+| reader admission | default | behavior |
+|---|---:|---|
+| manifest bytes | 64 MiB | checked from file metadata and again during a bounded read |
+| pack TOC stored bytes | 64 MiB | refused before reading/allocating; configurable |
+| pack TOC decoded bytes | 64 MiB | refused before decompression; configurable |
+| pack file entries | 100,000 | refused before iterating the TOC; configurable |
+| pack entry-name bytes | 16 KiB | refused before allocating the name; configurable |
+| candidate zstd dictionary | 64 MiB | refused before whole-file read |
+| segment sidecar | derived from segment length | impossible advisory sizes are ignored; the segment is scanned |
+
+Backup additionally resolves every source against the canonical store root and accepts only the
+ordinary file at that exact path. A symlinked part, fold directory, segment, sidecar, dictionary, or
+manifest is refused rather than followed into the backup artifact.
 
 ---
 

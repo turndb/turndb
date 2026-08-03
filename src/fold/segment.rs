@@ -4,6 +4,7 @@ use super::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
 use crate::readat::ReadAt;
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Segment header length. The first block begins here, so a `Loc.block_off` below it is invalid.
@@ -293,7 +294,30 @@ pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) 
 /// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
 /// means the sidecar and the segment parted ways.
 pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
-    parse_dir_sidecar(&std::fs::read(dir_path(dir, n)).ok()?, n, file_len)
+    parse_dir_sidecar(&read_dir_sidecar_bytes(dir, n, file_len)?, n, file_len)
+}
+
+/// Largest structurally possible sidecar for a segment extent. Every indexed block consumes at
+/// least one frame overhead in the segment, so advisory metadata cannot legitimately outgrow this.
+pub fn max_dir_sidecar_bytes(file_len: u64) -> u64 {
+    let frames = file_len.saturating_sub(SEG_HDR_LEN).div_ceil(super::block::BLOCK_OVERHEAD as u64);
+    24u64.saturating_add(frames.saturating_mul(8))
+}
+
+/// Read advisory bytes only after their filesystem length fits what the segment could describe.
+/// `None` is intentionally the only failure: callers rescan the authoritative segment.
+pub fn read_dir_sidecar_bytes(dir: &Path, n: u32, file_len: u64) -> Option<Vec<u8>> {
+    let file = File::open(dir_path(dir, n)).ok()?;
+    let max = max_dir_sidecar_bytes(file_len);
+    let len = file.metadata().ok()?.len();
+    if len > max {
+        return None;
+    }
+    let capacity = usize::try_from(len).ok()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).ok()?;
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
 }
 
 /// [`read_dir_sidecar`]'s validation core, over bytes from ANY source — a directory or a pack.
@@ -308,7 +332,8 @@ pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<(u32, Vec<(u
     let seg = u32::from_le_bytes(b[8..12].try_into().unwrap());
     let tail = u32::from_le_bytes(b[12..16].try_into().unwrap());
     let n_entries = u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize;
-    if seg != n || tail as u64 != file_len || b.len() != 24 + n_entries * 8 {
+    let expected_len = n_entries.checked_mul(8).and_then(|bytes| 24usize.checked_add(bytes));
+    if seg != n || tail as u64 != file_len || expected_len != Some(b.len()) {
         return None;
     }
     let mut entries = Vec::with_capacity(n_entries);
@@ -366,5 +391,17 @@ mod tests {
         let mut future = b;
         future[13] = 0x04;
         assert!(SegHeader::decode(&future, 5).is_err(), "unknown flags must refuse");
+    }
+
+    #[test]
+    fn advisory_sidecar_size_is_bounded_by_the_segment_it_describes() {
+        let dir = std::env::temp_dir().join(format!("turndb-sidecar-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_len = SEG_HDR_LEN + crate::fold::block::BLOCK_OVERHEAD as u64;
+        let max = max_dir_sidecar_bytes(file_len);
+        std::fs::File::create(dir_path(&dir, 0)).unwrap().set_len(max + 1).unwrap();
+        let got = read_dir_sidecar_bytes(&dir, 0, file_len);
+        std::fs::remove_dir_all(dir).ok();
+        assert!(got.is_none(), "an impossible sparse sidecar must be ignored before allocation");
     }
 }
