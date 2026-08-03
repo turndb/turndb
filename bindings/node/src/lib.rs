@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use turndb::fold::FoldCfg;
 #[cfg(feature = "sql")]
 use turndb::query::sql::{
-    classify_error as classify_sql_error, SqlBatch, SqlErrorClass, SqlOptions, SqlQuery, SqlValue,
-    DEFAULT_MEMORY_BYTES,
+    classify_error as classify_sql_error, SqlBatch, SqlBudget, SqlErrorClass, SqlOptions, SqlQuery,
+    SqlValue, DEFAULT_AGGREGATE_MEMORY_BYTES, DEFAULT_MEMORY_BYTES,
 };
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
@@ -255,6 +255,7 @@ pub struct NativeCapabilities {
     pub arrow_ipc: bool,
     pub parameterized_sql: bool,
     pub sql_memory_bytes_default: Option<BigInt>,
+    pub sql_aggregate_memory_bytes_default: Option<BigInt>,
 }
 
 #[napi]
@@ -300,6 +301,14 @@ pub fn capabilities() -> NativeCapabilities {
             #[cfg(not(feature = "sql"))]
             unreachable!()
         }),
+        sql_aggregate_memory_bytes_default: cfg!(feature = "sql").then(|| {
+            #[cfg(feature = "sql")]
+            {
+                BigInt::from(DEFAULT_AGGREGATE_MEMORY_BYTES as u64)
+            }
+            #[cfg(not(feature = "sql"))]
+            unreachable!()
+        }),
     }
 }
 
@@ -307,6 +316,13 @@ pub fn capabilities() -> NativeCapabilities {
 pub struct NativeOpenOptions {
     /// Accepted commands waiting behind the one currently executing. Defaults to 64.
     pub command_queue_capacity: Option<u32>,
+    /// Sum of the execution-memory ceilings reserved by live SQL queries. Defaults to 1 GiB.
+    pub max_concurrent_sql_memory_bytes: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct NativeSnapshotOpenOptions {
+    pub max_concurrent_sql_memory_bytes: Option<BigInt>,
 }
 
 #[napi(object)]
@@ -413,6 +429,8 @@ pub struct NativeSchema {
 struct SnapshotState {
     store: Mutex<Option<Arc<ReadStore>>>,
     commit: u64,
+    #[cfg(feature = "sql")]
+    sql_budget: SqlBudget,
 }
 
 #[cfg(feature = "sql")]
@@ -586,6 +604,18 @@ impl NativeSqlQuery {
 }
 
 impl SnapshotState {
+    #[cfg(feature = "sql")]
+    fn new(store: ReadStore, sql_budget: SqlBudget) -> SnapshotState {
+        let commit = store.manifest().commit;
+        SnapshotState {
+            store: Mutex::new(Some(Arc::new(store))),
+            commit,
+            #[cfg(feature = "sql")]
+            sql_budget,
+        }
+    }
+
+    #[cfg(not(feature = "sql"))]
     fn new(store: ReadStore) -> SnapshotState {
         let commit = store.manifest().commit;
         SnapshotState { store: Mutex::new(Some(Arc::new(store))), commit }
@@ -618,6 +648,12 @@ pub struct NativeSnapshot {
 }
 
 impl NativeSnapshot {
+    #[cfg(feature = "sql")]
+    fn from_store(store: ReadStore, sql_budget: SqlBudget) -> NativeSnapshot {
+        NativeSnapshot { state: Arc::new(SnapshotState::new(store, sql_budget)) }
+    }
+
+    #[cfg(not(feature = "sql"))]
     fn from_store(store: ReadStore) -> NativeSnapshot {
         NativeSnapshot { state: Arc::new(SnapshotState::new(store)) }
     }
@@ -627,7 +663,10 @@ impl NativeSnapshot {
 impl NativeSnapshot {
     /// Open the currently published manifest without taking the writer lock or replaying its WAL.
     #[napi(factory)]
-    pub async fn open(path: String) -> Result<NativeSnapshot> {
+    pub async fn open(
+        path: String,
+        options: Option<NativeSnapshotOpenOptions>,
+    ) -> Result<NativeSnapshot> {
         if path.is_empty() {
             return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
         }
@@ -637,12 +676,27 @@ impl NativeSnapshot {
         .await
         .map_err(|error| failure("join TurnDB snapshot open", error))?
         .map_err(|error| failure("open TurnDB snapshot", error))?;
-        Ok(NativeSnapshot::from_store(store))
+        #[cfg(feature = "sql")]
+        {
+            let budget = decode_sql_budget(
+                options.and_then(|options| options.max_concurrent_sql_memory_bytes),
+            )?;
+            Ok(NativeSnapshot::from_store(store, budget))
+        }
+        #[cfg(not(feature = "sql"))]
+        {
+            let _ = options;
+            Ok(NativeSnapshot::from_store(store))
+        }
     }
 
     /// Open one retained manifest commit. Retention is bounded and erasure can purge history.
     #[napi(factory)]
-    pub async fn open_at(path: String, commit: BigInt) -> Result<NativeSnapshot> {
+    pub async fn open_at(
+        path: String,
+        commit: BigInt,
+        options: Option<NativeSnapshotOpenOptions>,
+    ) -> Result<NativeSnapshot> {
         if path.is_empty() {
             return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
         }
@@ -653,7 +707,18 @@ impl NativeSnapshot {
         .await
         .map_err(|error| failure("join retained TurnDB snapshot open", error))?
         .map_err(|error| failure("open retained TurnDB snapshot", error))?;
-        Ok(NativeSnapshot::from_store(store))
+        #[cfg(feature = "sql")]
+        {
+            let budget = decode_sql_budget(
+                options.and_then(|options| options.max_concurrent_sql_memory_bytes),
+            )?;
+            Ok(NativeSnapshot::from_store(store, budget))
+        }
+        #[cfg(not(feature = "sql"))]
+        {
+            let _ = options;
+            Ok(NativeSnapshot::from_store(store))
+        }
     }
 
     #[napi(getter)]
@@ -748,6 +813,8 @@ pub async fn restore_backup(
 #[napi]
 pub struct NativeStore {
     actor: Actor,
+    #[cfg(feature = "sql")]
+    sql_budget: SqlBudget,
 }
 
 #[napi]
@@ -759,6 +826,7 @@ impl NativeStore {
             return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
         }
         let capacity = options
+            .as_ref()
             .and_then(|options| options.command_queue_capacity)
             .unwrap_or(DEFAULT_QUEUE_CAPACITY as u32);
         if !(1..=MAX_QUEUE_CAPACITY as u32).contains(&capacity) {
@@ -769,12 +837,21 @@ impl NativeStore {
                 ),
             ));
         }
+        #[cfg(feature = "sql")]
+        let sql_budget = decode_sql_budget(
+            options.as_ref().and_then(|options| options.max_concurrent_sql_memory_bytes.clone()),
+        )?;
         let actor = napi::tokio::task::spawn_blocking(move || {
             Actor::open_with_capacity(&PathBuf::from(path), capacity as usize)
         })
         .await
         .map_err(|error| failure("join TurnDB open", error))?
         .map_err(|error| failure("open TurnDB store", error))?;
+        #[cfg(feature = "sql")]
+        {
+            Ok(NativeStore { actor, sql_budget })
+        }
+        #[cfg(not(feature = "sql"))]
         Ok(NativeStore { actor })
     }
 
@@ -837,11 +914,15 @@ impl NativeStore {
     /// Publish all earlier accepted writes and return an immutable reader at that exact cut.
     #[napi]
     pub async fn snapshot(&self) -> Result<NativeSnapshot> {
-        self.actor
+        let store = self
+            .actor
             .snapshot()
             .await
-            .map(NativeSnapshot::from_store)
-            .map_err(|error| failure("create TurnDB snapshot", error))
+            .map_err(|error| failure("create TurnDB snapshot", error))?;
+        #[cfg(feature = "sql")]
+        return Ok(NativeSnapshot::from_store(store, self.sql_budget.clone()));
+        #[cfg(not(feature = "sql"))]
+        Ok(NativeSnapshot::from_store(store))
     }
 
     /// Settle earlier writes and compact. `full=true` merges every live part; false uses policy.
@@ -952,6 +1033,16 @@ impl NativeStore {
 #[cfg(feature = "sql")]
 #[napi]
 impl NativeSnapshot {
+    #[napi(getter)]
+    pub fn max_concurrent_sql_memory_bytes(&self) -> BigInt {
+        BigInt::from(self.state.sql_budget.limit() as u64)
+    }
+
+    #[napi(getter)]
+    pub fn reserved_sql_memory_bytes(&self) -> BigInt {
+        BigInt::from(self.state.sql_budget.reserved() as u64)
+    }
+
     /// Execute bounded, read-only SQL over this immutable snapshot and return a pull-based IPC stream.
     #[napi]
     pub async fn query_sql(
@@ -962,7 +1053,7 @@ impl NativeSnapshot {
     ) -> Result<NativeSqlQuery> {
         let (params, options) = decode_sql(sql.as_str(), params, options)?;
         let store = self.state.get()?.as_ref().clone();
-        SqlQuery::open(store, &sql, params, options)
+        SqlQuery::open_with_budget(store, &sql, params, options, &self.state.sql_budget)
             .await
             .map(NativeSqlQuery::new)
             .map_err(|error| sql_failure("open TurnDB snapshot SQL query", error))
@@ -972,6 +1063,16 @@ impl NativeSnapshot {
 #[cfg(feature = "sql")]
 #[napi]
 impl NativeStore {
+    #[napi(getter)]
+    pub fn max_concurrent_sql_memory_bytes(&self) -> BigInt {
+        BigInt::from(self.sql_budget.limit() as u64)
+    }
+
+    #[napi(getter)]
+    pub fn reserved_sql_memory_bytes(&self) -> BigInt {
+        BigInt::from(self.sql_budget.reserved() as u64)
+    }
+
     /// Publish earlier writes as an exact immutable cut, then execute read-only SQL over that cut.
     #[napi]
     pub async fn query_sql(
@@ -986,7 +1087,7 @@ impl NativeStore {
             .snapshot()
             .await
             .map_err(|error| failure("publish TurnDB SQL snapshot", error))?;
-        SqlQuery::open(store, &sql, params, options)
+        SqlQuery::open_with_budget(store, &sql, params, options, &self.sql_budget)
             .await
             .map(NativeSqlQuery::new)
             .map_err(|error| sql_failure("open TurnDB SQL query", error))
@@ -1274,6 +1375,21 @@ fn decode_u64(value: BigInt, what: &str) -> Result<u64> {
         return Err(Error::new(Status::InvalidArg, format!("{what} is outside the u64 range")));
     }
     Ok(value)
+}
+
+#[cfg(feature = "sql")]
+fn decode_sql_budget(value: Option<BigInt>) -> Result<SqlBudget> {
+    let value = value
+        .map(|value| decode_u64(value, "maxConcurrentSqlMemoryBytes"))
+        .transpose()?
+        .unwrap_or(DEFAULT_AGGREGATE_MEMORY_BYTES as u64);
+    let value = usize::try_from(value).map_err(|_| {
+        Error::new(
+            Status::InvalidArg,
+            "maxConcurrentSqlMemoryBytes exceeds this platform's address space",
+        )
+    })?;
+    SqlBudget::new(value).map_err(|error| Error::new(Status::InvalidArg, error.to_string()))
 }
 
 fn decode_compare(op: String) -> Result<Compare> {

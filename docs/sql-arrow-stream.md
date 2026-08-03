@@ -39,8 +39,17 @@ Each query uses a separate DataFusion execution-memory pool, 256 MiB by default 
 `maxMemoryBytes`. Resource exhaustion is returned as `RESOURCE_EXHAUSTED`. The value bounds tracked
 execution allocations, not total process memory: TurnDB's fold/part caches are bounded separately,
 the returned IPC buffer belongs to the caller, and DataFusion itself documents allocations that do
-not participate in its pool. An aggregate budget shared by concurrent queries remains future work and
-is reported as such rather than implied by the per-query option.
+not participate in its pool.
+
+Concurrent queries also reserve their complete per-query ceilings from a shared `SqlBudget`. This is
+deliberately conservative: it bounds the sum of possible DataFusion execution-pool use rather than
+waiting for actual allocations to create memory pressure. The default native aggregate is 1 GiB and
+`maxConcurrentSqlMemoryBytes` configures it when opening a writer or independent snapshot. A writer
+and every snapshot derived from it share one budget. A query that cannot reserve its ceiling fails
+immediately with `RESOURCE_EXHAUSTED`; it does not wait in JavaScript or create an unbounded queue.
+Reservations are released at EOF, execution error, cancellation/close, or handle drop. The handle
+getters `maxConcurrentSqlMemoryBytes` and `reservedSqlMemoryBytes` expose the configured and current
+facts without claiming to measure total process RSS.
 
 Query statistics accompany each batch and remain available from `stats()`: storage rows and batches,
 attribute columns decoded, fold reads, rows rejected or hidden, batches skipped, and duplicate

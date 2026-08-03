@@ -231,7 +231,9 @@ immutable `ReadStore`: a snapshot handle uses its existing cut, while a writer c
 new published cut first. The isolated DataFusion session exposes one generic table named `records`,
 accepts typed positional `$1` parameters, and refuses DDL, DML, and session statements before
 execution. Its per-query execution-memory pool defaults to 256 MiB and is caller-configurable. A
-pull-based `NativeSqlQuery` returns schema IPC separately and one complete, independently decodable
+shared aggregate budget defaults to 1 GiB and reserves each live query's configured ceiling;
+writer-derived snapshots share their writer's governor. A pull-based `NativeSqlQuery` returns schema
+IPC separately and one complete, independently decodable
 Arrow IPC stream per batch; JavaScript never reconstructs a dynamic schema or walks Arrow rows.
 Batch pulls have timeouts and AbortSignal cancellation and dropping the Rust execution stream aborts
 unfinished work.
@@ -239,8 +241,8 @@ unfinished work.
 **Current gaps:** binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption,
 writer contention, and backup/restore failures have stable machine-readable codes; manifest recovery
 controls and prebuilt artifact selection are not exposed yet. SQL planning is not yet interruptible,
-and per-query memory pools do not impose an aggregate cap across concurrent snapshot queries. The
-package is a tested source prototype and must not be described as a production distribution.
+and the aggregate execution budget is not a total-process RSS limit. The package is a tested source
+prototype and must not be described as a production distribution.
 
 The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
 overload, closed handles, typed scan/SQL-pull interruption, typed DataFusion invalid-input,
@@ -293,8 +295,9 @@ The native SQL stream has a caller-configurable DataFusion execution-memory pool
 scans have byte ceilings, deadlines, and cooperative cancellation and the native command backlog is
 bounded and configurable. The SQL pool is not represented as a total-process RSS guarantee:
 DataFusion documents allocations outside its pool, Arrow IPC output is returned to the caller, and
-TurnDB's bounded caches are accounted independently. Before production binding maturity, concurrent
-queries still need an aggregate budget and long-running lifecycle operations need interruption.
+TurnDB's bounded caches are accounted independently. Concurrent queries reserve their per-query
+ceilings against a shared aggregate governor; long-running lifecycle operations still need
+interruption.
 Reaching a budget returns a structured error or partial page with a cursor only where the operation
 contract explicitly allows it. It never truncates a record, invents a weaker durability
 acknowledgement, or silently widens a scan.

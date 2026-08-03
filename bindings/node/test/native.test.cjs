@@ -43,6 +43,7 @@ test('reports the native capability profile without a portable fallback', () => 
     arrowIpc: true,
     parameterizedSql: true,
     sqlMemoryBytesDefault: 268435456n,
+    sqlAggregateMemoryBytesDefault: 1073741824n,
   });
 });
 
@@ -64,6 +65,42 @@ test('configures a bounded per-store command backlog without breaking the defaul
   await assert.rejects(
     NativeStore.open(temporaryStore(t), { commandQueueCapacity: 65537 }),
     (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+});
+
+test('bounds aggregate SQL reservations across a store and its snapshots', async (t) => {
+  const limit = 48n << 20n;
+  const perQuery = 32n << 20n;
+  const store = await NativeStore.open(temporaryStore(t), {
+    maxConcurrentSqlMemoryBytes: limit,
+  });
+  assert.equal(store.maxConcurrentSqlMemoryBytes, limit);
+  await store.write([{ kind: 'put', id: 'one' }]);
+  const snapshot = await store.snapshot();
+  assert.equal(snapshot.maxConcurrentSqlMemoryBytes, limit);
+
+  const first = await snapshot.querySql('SELECT id FROM records', undefined, {
+    maxMemoryBytes: perQuery,
+  });
+  assert.equal(store.reservedSqlMemoryBytes, perQuery);
+  assert.equal(snapshot.reservedSqlMemoryBytes, perQuery);
+  await assert.rejects(
+    store.querySql('SELECT id FROM records', undefined, { maxMemoryBytes: perQuery }),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
+  );
+  await first.close();
+  assert.equal(store.reservedSqlMemoryBytes, 0n);
+
+  const afterRelease = await store.querySql('SELECT id FROM records', undefined, {
+    maxMemoryBytes: perQuery,
+  });
+  await afterRelease.close();
+  await snapshot.close();
+  await store.close();
+
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { maxConcurrentSqlMemoryBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
   );
 });
 

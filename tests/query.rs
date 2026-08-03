@@ -14,7 +14,7 @@ use turndb::fold::FoldCfg;
 use turndb::part::Part;
 use turndb::query::{
     collect,
-    sql::{classify_error, SqlErrorClass, SqlOptions, SqlQuery, SqlValue},
+    sql::{classify_error, SqlBudget, SqlErrorClass, SqlOptions, SqlQuery, SqlValue},
     table::TurndbTable,
     Lens,
 };
@@ -455,6 +455,49 @@ async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
     .err()
     .expect("zero memory must be rejected");
     assert!(error.to_string().contains("must be greater than zero"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn shared_sql_budget_bounds_concurrent_query_ceilings_and_releases_promptly() {
+    let dir = tmp("sql-aggregate-budget");
+    build(&dir, 1, 3);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let budget = SqlBudget::new(48 << 20).unwrap();
+    let options = SqlOptions { max_memory_bytes: 32 << 20 };
+
+    let mut first = SqlQuery::open_with_budget(
+        reader.clone(),
+        "SELECT id FROM records",
+        vec![],
+        options,
+        &budget,
+    )
+    .await
+    .unwrap();
+    assert_eq!(budget.reserved(), 32 << 20);
+    let error = SqlQuery::open_with_budget(
+        reader.clone(),
+        "SELECT id FROM records",
+        vec![],
+        options,
+        &budget,
+    )
+    .await
+    .err()
+    .expect("the second ceiling exceeds the remaining aggregate budget");
+    assert_eq!(classify_error(&error), SqlErrorClass::ResourceExhausted);
+    assert_eq!(budget.reserved(), 32 << 20, "a failed reservation must consume nothing");
+
+    while first.next().await.unwrap().is_some() {}
+    assert_eq!(budget.reserved(), 0, "EOF releases before the query handle is dropped");
+    let second =
+        SqlQuery::open_with_budget(reader, "SELECT id FROM records", vec![], options, &budget)
+            .await
+            .unwrap();
+    assert_eq!(budget.reserved(), 32 << 20);
+    drop(second);
+    assert_eq!(budget.reserved(), 0, "drop/cancellation releases the reservation");
     std::fs::remove_dir_all(&dir).ok();
 }
 
