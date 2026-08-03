@@ -342,8 +342,8 @@ staging estimates expose disk-planning evidence without inventing a consumer pol
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
 memtable entries and bytes, WAL and fold disk bytes, fold and part cache counters/budgets, Tier-0 dedup
 window entries, retained commits, and punched blocks. No record or content is decoded. Latency
-histograms, slow-query events, dedup ratios, reclaimable-byte estimation, and export hooks remain
-Phase-5 work; consumers may poll this generic value into their telemetry system. The separate
+histograms, slow-query events, and structured export hooks remain Phase-5 work; consumers may poll
+this generic value into their telemetry system. The separate
 `space_usage` / `spaceUsage` inventory performs reachability-aware traversal and reports exact,
 disjoint live, retained-only, and unclassified storage categories. Structured pages separately expose
 exact section/block I/O attributable to that operation.
@@ -351,6 +351,9 @@ exact section/block I/O attributable to that operation.
 nanosecond totals plus exact folded-piece dedup counters. The cancellable `part_distribution` /
 `partDistribution` snapshot reports live part byte/row order statistics. These surfaces are pull-based
 so consumer exporters never execute on the storage thread; see `docs/operation-metrics.md`.
+The cancellable `content_liveness` / `contentLiveness` inventory requires a settled memtable and
+separates live piece bytes, dead bytes stranded inside mixed blocks, and whole-block compressed
+payload eligible for punch/refold; see `docs/content-liveness.md`.
 
 ## 7. Compatibility policy
 

@@ -173,6 +173,7 @@ export interface Capabilities {
   formatMigration: true;
   operationMetrics: true;
   partDistribution: true;
+  contentLiveness: true;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -297,6 +298,25 @@ export interface PartDistribution {
   p50Rows: bigint;
   p95Rows: bigint;
   maxRows: bigint;
+}
+
+export interface FoldBlockSpace {
+  blocks: bigint;
+  /** Decompressed content bytes represented by these blocks. */
+  rawBytes: bigint;
+  /** Compressed payload bytes, excluding block framing and filesystem allocation granularity. */
+  storedBytes: bigint;
+}
+
+export interface ContentLiveness {
+  livePieces: bigint;
+  liveLogicalBytes: bigint;
+  deadLogicalBytes: bigint;
+  /** Dead bytes sharing a compressed block with live content; reclaimable only by refold. */
+  strandedDeadLogicalBytes: bigint;
+  liveBlocks: FoldBlockSpace;
+  /** Whole blocks with no live references, eligible for punching or removal by refold. */
+  reclaimableBlocks: FoldBlockSpace;
 }
 
 export interface MergeStats {
@@ -560,5 +580,6 @@ export declare class NativeStore {
   }>;
   metrics(): Promise<StoreMetrics>;
   partDistribution(options?: LifecycleOptions): Promise<PartDistribution>;
+  contentLiveness(options?: LifecycleOptions): Promise<ContentLiveness>;
   close(durable?: boolean): Promise<void>;
 }

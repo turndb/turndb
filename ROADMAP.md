@@ -487,7 +487,9 @@ that evidence is sent.
   - Compression and compaction time.
   - Deduplication ratio. **Implemented at the write boundary:** handle-local folded-piece attempts,
     hits, logical bytes, and novel raw bytes let the consumer choose its aggregation window.
-  - Live, dead, and reclaimable content.
+  - Live, dead, and reclaimable content. **Implemented:** an exact, cancellable settled-snapshot
+    inventory separates unique live piece bytes, dead bytes stranded in mixed compressed blocks,
+    and wholly unreferenced raw/compressed block payload eligible for punch or refold.
   - Verification and corruption failures.
 - Structured lifecycle and health events.
 - Slow-query reporting and query plans suitable for diagnosis.
