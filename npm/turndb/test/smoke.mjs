@@ -21,6 +21,11 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.columnar, false);
   assert.equal(c.sql, false);
   assert.equal(c.part_format_write, 4);
+  assert.equal(c.write_admission_limits, true);
+  assert.equal(c.max_record_bytes_default, 64 << 20);
+  assert.equal(c.max_batch_bytes_default, 256 << 20);
+  assert.equal(c.max_batch_records_default, 4096);
+  assert.equal(c.max_identifier_bytes_default, 4096);
 
   await withStore((s) => assert.deepEqual(s.capabilities(), c));
 });
@@ -143,6 +148,32 @@ test('a batch applies atomically and delete shadows', async () => {
     assert.equal(s.get('b/1'), null, 'a tombstone must resolve to absence');
     assert.equal(s.getText('b/2'), 'two');
   });
+});
+
+test('portable writes honor the same configurable admission policy', async () => {
+  await withStore((s) => {
+    assert.throws(() => s.putBody('x', ''), /worst-case WAL frame/);
+    assert.equal(s.get('x'), null);
+  }, { maxRecordBytes: 1 });
+
+  await withStore((s) => {
+    assert.throws(
+      () => s.applyBatch([{ id: 'a', delete: true }, { id: 'b', delete: true }]),
+      /exceeding the configured limit of 1/,
+    );
+    assert.equal(s.get('a'), null, 'a refused oversized batch applies nothing');
+  }, { maxBatchRecords: 1 });
+
+  await withStore((s) => {
+    assert.throws(() => s.putBody('abcde', ''), /record id.*5 UTF-8 bytes/);
+  }, { maxIdentifierBytes: 4 });
+
+  const dir = await mkdtemp(join(tmpdir(), 'turndb-invalid-limits-'));
+  try {
+    await assert.rejects(open(dir, { maxBatchBytes: 0 }), /between 1 and 4294967295/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('errors carry the engine message, not a generic one', async () => {

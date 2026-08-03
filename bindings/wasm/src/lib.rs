@@ -43,7 +43,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use turndb::fold::FoldCfg;
-use turndb::store::Store;
+use turndb::store::{Store, WriteLimits};
 use turndb::types::AttrValue;
 
 thread_local! {
@@ -275,7 +275,7 @@ pub extern "C" fn tdb_capabilities() -> i32 {
 
 /// Open (or create) a store. Returns a handle, or -1.
 ///
-/// `block_target` and `level` are 0 for the engine defaults.
+/// Numeric options are 0 for the engine defaults.
 ///
 /// # Safety
 /// `dir` must be valid UTF-8 of `dir_len` bytes.
@@ -285,6 +285,10 @@ pub unsafe extern "C" fn tdb_open(
     dir_len: u32,
     block_target: u32,
     level: i32,
+    max_record_bytes: u32,
+    max_batch_bytes: u32,
+    max_batch_records: u32,
+    max_identifier_bytes: u32,
 ) -> i32 {
     clear_err();
     let dir = match text(dir, dir_len) {
@@ -298,7 +302,30 @@ pub unsafe extern "C" fn tdb_open(
     if level != 0 {
         cfg.level = level;
     }
-    match Store::open(Path::new(dir), cfg) {
+    let defaults = WriteLimits::default();
+    let limits = WriteLimits {
+        max_record_bytes: if max_record_bytes == 0 {
+            defaults.max_record_bytes
+        } else {
+            u64::from(max_record_bytes)
+        },
+        max_batch_bytes: if max_batch_bytes == 0 {
+            defaults.max_batch_bytes
+        } else {
+            u64::from(max_batch_bytes)
+        },
+        max_batch_records: if max_batch_records == 0 {
+            defaults.max_batch_records
+        } else {
+            max_batch_records as usize
+        },
+        max_identifier_bytes: if max_identifier_bytes == 0 {
+            defaults.max_identifier_bytes
+        } else {
+            max_identifier_bytes as usize
+        },
+    };
+    match Store::open_with_limits(Path::new(dir), cfg, limits) {
         Ok(s) => STORES.with(|slot| {
             let mut slot = slot.borrow_mut();
             // Reuse a closed slot before growing, so a long-lived process that opens and closes

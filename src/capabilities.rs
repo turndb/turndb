@@ -38,6 +38,11 @@ pub struct Capabilities {
     pub columnar: bool,
     pub sql: bool,
     pub portable_wasm: bool,
+    pub write_admission_limits: bool,
+    pub max_record_bytes_default: u64,
+    pub max_batch_bytes_default: u64,
+    pub max_batch_records_default: usize,
+    pub max_identifier_bytes_default: usize,
 }
 
 /// Report what this build can actually guarantee.
@@ -60,6 +65,11 @@ pub const fn capabilities() -> Capabilities {
         columnar: cfg!(feature = "columnar"),
         sql: cfg!(feature = "sql"),
         portable_wasm: cfg!(target_arch = "wasm32"),
+        write_admission_limits: true,
+        max_record_bytes_default: crate::store::DEFAULT_MAX_RECORD_BYTES,
+        max_batch_bytes_default: crate::store::DEFAULT_MAX_BATCH_BYTES,
+        max_batch_records_default: crate::store::DEFAULT_MAX_BATCH_RECORDS,
+        max_identifier_bytes_default: crate::store::DEFAULT_MAX_IDENTIFIER_BYTES,
     }
 }
 

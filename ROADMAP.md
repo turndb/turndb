@@ -83,6 +83,10 @@ content model right before compatibility turns today's choices into permanent pr
   revisions, full and streaming builders share the new encodings, structured scans distinguish null
   from missing, Arrow preserves unsigned/binary/timestamp types and uses an explicit null-presence
   marker, and native/portable bindings keep every discriminant without lossy JavaScript numbers.
+  Generic write admission now applies configurable inclusive record-WAL-byte, atomic-batch-byte,
+  batch-member, and UTF-8 identifier ceilings at the Rust writer boundary. The deterministic
+  all-novel charge is independent of dedup history; complete batches validate before fold mutation;
+  native and portable bindings expose the same policy and compiled defaults without trace semantics.
 
 ## Product boundary
 
@@ -158,8 +162,9 @@ Before widening the implementation, document the promises an embedder can depend
   and migration tooling.
 - A native-versus-WASM capability matrix. Missing facilities must be reported, not silently emulated
   with weaker guarantees.
-- Initial resource and limit semantics: maximum record size, maximum batch size, bounded query memory,
-  and cancellation behavior.
+- Initial resource and limit semantics: **implemented for configurable maximum record/batch write
+  admission, query/scan memory, and cooperative cancellation; further operation-specific budgets
+  continue in later phases.**
 
 ### Maturity gate
 
@@ -219,7 +224,9 @@ erasure.
   - Duplicate fields and field ordering.
   - The same field name appearing with different types.
   - Empty content versus absent content.
-  - Field-name and content-name validation.
+  - Field-name and content-name validation. **Implemented as non-empty configurable UTF-8 byte
+    bounds without a reserved vocabulary; content names are unique and attribute duplicates remain
+    exact.**
 - Schema discovery across parts without treating a discovered schema as a required global schema.
 - A versioned migration from the current `body` representation.
 - Byte-exact and content-identity tests for every content position and supported field type.

@@ -75,6 +75,12 @@ These stage changes in the writer's WAL buffer and memtable. `apply` is an atomi
 replay applies every member only when its batch commit marker is intact. A successful staging call is
 not a durability acknowledgement.
 
+Before staging, the writer applies its per-open `WriteLimits`. The deterministic charge is a
+worst-case complete WAL frame with every piece occurrence treated as novel; a batch is all member
+frames plus its commit marker. Record/batch byte ceilings, batch member count, and UTF-8 identifier
+bytes are inclusive and configurable. Complete validation precedes any fold mutation, and recovery
+does not reapply newly chosen policy to accepted WAL frames. See `docs/write-admission.md`.
+
 The writer provides read-your-writes immediately after successful staging. Point reads and id scans
 through that writer include its memtable, including staged tombstones. These reads may therefore see
 data that will disappear if the process exits before `sync`.
@@ -170,8 +176,8 @@ single large record cannot deadlock pagination. Node exposes the same contract a
 `maxReconstructedBytes: bigint` and `reconstructionBudgetExhausted`.
 
 **Current gaps:** the structured pager point-decodes each eligible record rather than pushing selected
-fields into the columnar lens; arbitrary field ordering and explicit null values are absent; scan
-statistics do not yet report section bytes or distinct fold blocks. The `max_examined` budget counts
+fields into the columnar lens; scan statistics do not yet report section bytes or distinct fold
+blocks. The `max_examined` budget counts
 live records evaluated against predicates, not superseded physical rows encountered while resolving
 them.
 
@@ -190,6 +196,7 @@ must report the reduced profile.
 | columnar lens | build feature | omitted from lightweight package |
 | SQL/DataFusion | optional build feature | omitted from lightweight package |
 | format interoperability | revision 4 | revision 4 |
+| configurable write admission | u64 byte ceilings | positive u32 byte ceilings |
 
 A production native Node package must never catch native-addon load failure and silently open the WASM
 writer. Portable use must be an explicit package or entry point chosen by the caller.
@@ -312,6 +319,12 @@ overflow. Arrow query batches currently target 8,192 rows or 32 MiB of reconstru
 always admitting one oversized row so progress remains possible. Structured pages use the same 32
 MiB default as a per-request configurable ceiling, report when the ceiling stops a page, and preserve
 an exact continuation without truncating or skipping the deferred row.
+
+Writer admission adds explicit runtime ceilings before those format limits: 64 MiB worst-case framed
+WAL bytes per record, 256 MiB per atomic batch, 4,096 members per batch, and 4 KiB per id/attribute
+name/content name by default. All are per-open and configurable. Size and count refusals are resource
+exhaustion; malformed policy and names are invalid input. Exact definitions and binding ranges are in
+`docs/write-admission.md`.
 
 The native SQL stream has a caller-configurable DataFusion execution-memory pool, while structured
 scans have byte ceilings, deadlines, and cooperative cancellation and the native command backlog is

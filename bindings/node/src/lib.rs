@@ -30,7 +30,9 @@ use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
     ScanInterrupted, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
 };
-use turndb::store::{CompactionBudget, CompactionError, ReadStore, Store};
+use turndb::store::{
+    CompactionBudget, CompactionError, ReadStore, Store, WriteAdmissionError, WriteLimits,
+};
 use turndb::types::AttrValue;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> Error {
@@ -54,6 +56,25 @@ fn lifecycle_failure(context: &str, error: anyhow::Error) -> Error {
         coded_failure("CANCELLED", format!("{context}: {error:#}"))
     } else {
         failure(context, error)
+    }
+}
+
+fn write_failure(context: &str, error: anyhow::Error) -> Error {
+    let code =
+        error.chain().find_map(|cause| cause.downcast_ref::<WriteAdmissionError>()).map(|error| {
+            match error {
+                WriteAdmissionError::InvalidLimits(_)
+                | WriteAdmissionError::EmptyIdentifier { .. }
+                | WriteAdmissionError::IdentifierTooLong { .. }
+                | WriteAdmissionError::DuplicateContentName { .. } => "INVALID_ARGUMENT",
+                WriteAdmissionError::RecordTooLarge { .. }
+                | WriteAdmissionError::BatchTooLarge { .. }
+                | WriteAdmissionError::TooManyBatchRecords { .. } => "RESOURCE_EXHAUSTED",
+            }
+        });
+    match code {
+        Some(code) => coded_failure(code, format!("{context}: {error:#}")),
+        None => failure(context, error),
     }
 }
 
@@ -306,6 +327,11 @@ pub struct NativeCapabilities {
     pub napi_version: u8,
     pub command_queue_capacity: u32,
     pub command_queue_capacity_max: u32,
+    pub write_admission_limits: bool,
+    pub max_record_bytes_default: BigInt,
+    pub max_batch_bytes_default: BigInt,
+    pub max_batch_records_default: u32,
+    pub max_identifier_bytes_default: u32,
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub backup_restore: bool,
@@ -348,6 +374,11 @@ pub fn capabilities() -> NativeCapabilities {
         napi_version: 6,
         command_queue_capacity: DEFAULT_QUEUE_CAPACITY as u32,
         command_queue_capacity_max: MAX_QUEUE_CAPACITY as u32,
+        write_admission_limits: c.write_admission_limits,
+        max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
+        max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
+        max_batch_records_default: c.max_batch_records_default as u32,
+        max_identifier_bytes_default: c.max_identifier_bytes_default as u32,
         immutable_snapshots: true,
         lifecycle_operations: true,
         backup_restore: turndb::pack::ATOMIC_RESTORE,
@@ -386,6 +417,14 @@ pub struct NativeOpenOptions {
     pub command_queue_capacity: Option<u32>,
     /// Sum of the execution-memory ceilings reserved by live SQL queries. Defaults to 1 GiB.
     pub max_concurrent_sql_memory_bytes: Option<BigInt>,
+    /// Worst-case framed-WAL bytes admitted for one record. Defaults to 64 MiB.
+    pub max_record_bytes: Option<BigInt>,
+    /// Worst-case framed-WAL bytes admitted for one atomic batch. Defaults to 256 MiB.
+    pub max_batch_bytes: Option<BigInt>,
+    /// Ordered members admitted in one atomic batch. Defaults to 4,096.
+    pub max_batch_records: Option<u32>,
+    /// UTF-8 bytes admitted in an id, attribute name, or content name. Defaults to 4 KiB.
+    pub max_identifier_bytes: Option<u32>,
 }
 
 #[napi(object)]
@@ -990,8 +1029,13 @@ impl NativeStore {
         let sql_budget = decode_sql_budget(
             options.as_ref().and_then(|options| options.max_concurrent_sql_memory_bytes.clone()),
         )?;
+        let write_limits = decode_write_limits(options.as_ref())?;
         let actor = napi::tokio::task::spawn_blocking(move || {
-            Actor::open_with_capacity(&PathBuf::from(path), capacity as usize)
+            Actor::open_with_capacity_and_limits(
+                &PathBuf::from(path),
+                capacity as usize,
+                write_limits,
+            )
         })
         .await
         .map_err(|error| failure("join TurnDB open", error))?
@@ -1017,7 +1061,7 @@ impl NativeStore {
         self.actor
             .write(ops, durable.unwrap_or(false))
             .await
-            .map_err(|error| failure("write TurnDB batch", error))
+            .map_err(|error| write_failure("write TurnDB batch", error))
     }
 
     /// Make every previously accepted write crash-durable.
@@ -1652,6 +1696,29 @@ fn decode_u64(value: BigInt, what: &str) -> Result<u64> {
         return Err(Error::new(Status::InvalidArg, format!("{what} is outside the u64 range")));
     }
     Ok(value)
+}
+
+fn decode_write_limits(options: Option<&NativeOpenOptions>) -> Result<WriteLimits> {
+    let defaults = WriteLimits::default();
+    let limits = WriteLimits {
+        max_record_bytes: match options.and_then(|options| options.max_record_bytes.clone()) {
+            Some(value) => decode_u64(value, "maxRecordBytes")?,
+            None => defaults.max_record_bytes,
+        },
+        max_batch_bytes: match options.and_then(|options| options.max_batch_bytes.clone()) {
+            Some(value) => decode_u64(value, "maxBatchBytes")?,
+            None => defaults.max_batch_bytes,
+        },
+        max_batch_records: options
+            .and_then(|options| options.max_batch_records)
+            .map(|value| value as usize)
+            .unwrap_or(defaults.max_batch_records),
+        max_identifier_bytes: options
+            .and_then(|options| options.max_identifier_bytes)
+            .map(|value| value as usize)
+            .unwrap_or(defaults.max_identifier_bytes),
+    };
+    limits.validate().map_err(|error| Error::new(Status::InvalidArg, error.to_string()))
 }
 
 fn decode_compaction_budget(input: NativeCompactionBudget) -> Result<CompactionBudget> {

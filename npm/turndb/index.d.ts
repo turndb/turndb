@@ -44,6 +44,14 @@ export interface OpenOptions {
    * only — a reader never needs to know it, so the choice is per-open, never a format commitment.
    */
   level?: number;
+  /** Worst-case complete WAL frame bytes admitted for one record; defaults to 64 MiB. */
+  maxRecordBytes?: number;
+  /** Member frames plus commit marker admitted for one atomic batch; defaults to 256 MiB. */
+  maxBatchBytes?: number;
+  /** Ordered members admitted in one atomic batch; defaults to 4,096. */
+  maxBatchRecords?: number;
+  /** UTF-8 bytes admitted in an id, attribute name, or content name; defaults to 4 KiB. */
+  maxIdentifierBytes?: number;
 }
 
 export interface ScanOptions {
@@ -94,6 +102,11 @@ export interface Capabilities {
   columnar: boolean;
   sql: boolean;
   portable_wasm: boolean;
+  write_admission_limits: true;
+  max_record_bytes_default: number;
+  max_batch_bytes_default: number;
+  max_batch_records_default: number;
+  max_identifier_bytes_default: number;
 }
 
 /** Every engine-reported failure, carrying the engine's own message. */

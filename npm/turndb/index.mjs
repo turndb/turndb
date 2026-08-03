@@ -98,6 +98,14 @@ function assertId(id, what = 'id') {
   return assertEncodable(id, what);
 }
 
+function openLimit(value, name) {
+  if (value === undefined) return 0;
+  if (!Number.isInteger(value) || value < 1 || value > 0xffff_ffff) {
+    throw new TurndbError(`${name} must be an integer between 1 and 4294967295`);
+  }
+  return value;
+}
+
 /**
  * The first id that cannot start with `prefix` — the exclusive upper bound of its range — or
  * `null` when no such id exists and the range is therefore unbounded above.
@@ -667,7 +675,8 @@ async function acquireRuntime(hostDir) {
  * Open (or create) a store at `dir`.
  *
  * @param {string} dir  Host directory. Created if absent.
- * @param {{blockTarget?: number, level?: number}} [opts]
+ * @param {{blockTarget?: number, level?: number, maxRecordBytes?: number,
+ *   maxBatchBytes?: number, maxBatchRecords?: number, maxIdentifierBytes?: number}} [opts]
  *   `blockTarget` is the bytes gathered before a block seals (default 4 MiB) — bigger compresses
  *   harder and costs more per read. `level` is the zstd level — **this package defaults it to 3,
  *   not the engine's 19**, because this build is single-threaded: the block seal compresses on the
@@ -681,6 +690,10 @@ async function acquireRuntime(hostDir) {
  * @returns {Promise<Store>}
  */
 export async function open(dir, opts = {}) {
+  const maxRecordBytes = openLimit(opts.maxRecordBytes, 'maxRecordBytes');
+  const maxBatchBytes = openLimit(opts.maxBatchBytes, 'maxBatchBytes');
+  const maxBatchRecords = openLimit(opts.maxBatchRecords, 'maxBatchRecords');
+  const maxIdentifierBytes = openLimit(opts.maxIdentifierBytes, 'maxIdentifierBytes');
   const hostDir = resolve(dir);
   const runtime = await acquireRuntime(hostDir);
   const { instance } = runtime;
@@ -692,7 +705,16 @@ export async function open(dir, opts = {}) {
     const ptr = instance.exports.tdb_alloc(path.length);
     new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
     try {
-      handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 3);
+      handle = instance.exports.tdb_open(
+        ptr,
+        path.length,
+        opts.blockTarget ?? 0,
+        opts.level ?? 3,
+        maxRecordBytes,
+        maxBatchBytes,
+        maxBatchRecords,
+        maxIdentifierBytes,
+      );
     } finally {
       instance.exports.tdb_free(ptr, path.length);
     }
