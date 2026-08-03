@@ -90,6 +90,6 @@ Both conditions reject with
 Dropping or ignoring the Promise does not cancel the operation—pass a signal when cancellation is
 required.
 
-The native capability profile reports `lifecycleCancellation: true`. This does not cover SQL
-planning, sync, or flush. Those operations retain their existing contracts, and their omission is
-explicit rather than represented as cancellable work.
+The native capability profile reports `lifecycleCancellation: true`. SQL planning/pulls expose their
+own interruption controls. Sync and flush retain their existing non-cancellable contracts, and their
+omission is explicit rather than represented as cancellable work.

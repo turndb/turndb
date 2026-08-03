@@ -130,7 +130,7 @@ export type SqlParam =
   | { kind: 'uint'; uintValue: bigint }
   | { kind: 'timestamp_ns'; timestampNsValue: bigint };
 
-export interface SqlQueryOptions {
+export interface SqlQueryOptions extends LifecycleOptions {
   /** DataFusion execution memory; defaults to 256 MiB. IPC output and store caches are separate. */
   maxMemoryBytes?: bigint;
 }
@@ -353,7 +353,7 @@ export declare class NativeStore {
   flush(): Promise<boolean>;
   scan(request?: ScanRequest): Promise<ScanPage>;
   explainScan(request?: ScanRequest): Promise<ScanExplanation>;
-  /** Publishes earlier writes as an immutable cut before planning the query. */
+  /** Publishes earlier writes as an immutable cut before planning; timeout includes actor queue time. */
   querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   snapshot(): Promise<NativeSnapshot>;

@@ -19,8 +19,12 @@ small schema/dictionary envelope per pull, but it gives simple ownership, bounde
 retry boundaries, and interoperability without requiring a JavaScript stream adapter to preserve an
 incremental IPC writer's hidden state. End-of-stream is stable.
 
-The native Node binding maps this to `NativeSqlQuery.schemaIpc` and
-`await NativeSqlQuery.next({ timeoutMs, signal })`. The returned `ipc` is a native `Buffer`; no
+The native Node binding maps this to
+`await snapshot.querySql(sql, params, { timeoutMs, signal })`, `NativeSqlQuery.schemaIpc`, and
+`await NativeSqlQuery.next({ timeoutMs, signal })`. Planning and stream startup can be cancelled;
+their absolute deadline includes addon scheduling and, for writer-backed queries, actor queue time.
+Dropping the unfinished DataFusion future releases its aggregate memory reservation. The returned
+`ipc` is a native `Buffer`; no
 base64, JSON, or row-by-row N-API conversion occurs. Only one pull may be in flight on a query handle.
 Closing the handle drops its DataFusion stream. A cancelled or timed-out pull also drops the stream,
 returns `CANCELLED`, and cannot be resumed as though execution state were unchanged.
@@ -34,6 +38,9 @@ Snapshot ownership is explicit:
 This gives writer queries read-your-writes behavior without letting concurrent DataFusion tasks touch
 the mutable store. It also makes the publication cost visible in the API contract; callers issuing
 many queries should retain a snapshot instead of repeatedly querying through the writer.
+An already-expired planning deadline or pre-aborted signal refuses before submitting the snapshot
+command. Once a writer-backed query has submitted that command, later cancellation stops waiting and
+planning but does not retract actor-ordered sync/flush work that may already have published the cut.
 
 Each query uses a separate DataFusion execution-memory pool, 256 MiB by default and configurable with
 `maxMemoryBytes`. Resource exhaustion is returned as `RESOURCE_EXHAUSTED`. The value bounds tracked

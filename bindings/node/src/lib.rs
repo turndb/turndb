@@ -246,6 +246,9 @@ pub struct NativeSqlParam {
 pub struct NativeSqlOptions {
     /// DataFusion execution memory. TurnDB caches and the returned IPC buffer are accounted apart.
     pub max_memory_bytes: Option<BigInt>,
+    /// Milliseconds from submission, including actor queue time for writer-backed queries.
+    pub timeout_ms: Option<u32>,
+    pub signal: Option<AbortSignal>,
 }
 
 #[cfg(feature = "sql")]
@@ -606,24 +609,49 @@ enum SqlPull {
 #[cfg(feature = "sql")]
 async fn wait_sql_interrupt(
     abort: Option<tokio::sync::oneshot::Receiver<()>>,
-    timeout: Option<Duration>,
+    deadline_at: Option<Instant>,
+    cancelled: &'static str,
+    deadline_reason: &'static str,
 ) -> &'static str {
-    match (abort, timeout) {
-        (Some(mut abort), Some(timeout)) => {
+    match (abort, deadline_at) {
+        (Some(mut abort), Some(deadline_at)) => {
             tokio::select! {
-                _ = &mut abort => "SQL query pull was cancelled",
-                _ = tokio::time::sleep(timeout) => "SQL query pull deadline exceeded",
+                _ = &mut abort => cancelled,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline_at)) => deadline_reason,
             }
         }
         (Some(abort), None) => {
             let _ = abort.await;
-            "SQL query pull was cancelled"
+            cancelled
         }
-        (None, Some(timeout)) => {
-            tokio::time::sleep(timeout).await;
-            "SQL query pull deadline exceeded"
+        (None, Some(at)) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+            deadline_reason
         }
         (None, None) => std::future::pending().await,
+    }
+}
+
+#[cfg(feature = "sql")]
+async fn interruptible_sql_open<F>(
+    work: F,
+    abort: Option<tokio::sync::oneshot::Receiver<()>>,
+    deadline: Option<Instant>,
+) -> Result<NativeSqlQuery>
+where
+    F: std::future::Future<Output = Result<SqlQuery>>,
+{
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(coded_failure("CANCELLED", "SQL query planning deadline exceeded"));
+    }
+    tokio::select! {
+        query = work => query.map(NativeSqlQuery::new),
+        reason = wait_sql_interrupt(
+            abort,
+            deadline,
+            "SQL query planning was cancelled",
+            "SQL query planning deadline exceeded",
+        ) => Err(coded_failure("CANCELLED", reason)),
     }
 }
 
@@ -631,10 +659,10 @@ async fn wait_sql_interrupt(
 async fn pull_sql(
     state: Arc<SqlQueryState>,
     abort: Option<tokio::sync::oneshot::Receiver<()>>,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
 ) -> Result<Option<NativeSqlBatch>> {
     let mut slot = state.slot.lock().await;
-    if timeout.is_some_and(|timeout| timeout.is_zero()) {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         if let Some(query) = slot.query.take() {
             slot.stats = query.stats();
         }
@@ -645,7 +673,12 @@ async fn pull_sql(
     };
     let result = tokio::select! {
         result = query.next() => SqlPull::Batch(result),
-        reason = wait_sql_interrupt(abort, timeout) => SqlPull::Interrupted(reason),
+        reason = wait_sql_interrupt(
+            abort,
+            deadline,
+            "SQL query pull was cancelled",
+            "SQL query pull deadline exceeded",
+        ) => SqlPull::Interrupted(reason),
     };
     match result {
         SqlPull::Batch(Ok(Some(batch))) => {
@@ -699,11 +732,11 @@ impl NativeSqlQuery {
         {
             return Err(coded_failure("BUSY", "a SQL query pull is already in progress"));
         }
-        let (abort, timeout) = decode_sql_next(options);
+        let (abort, deadline) = decode_sql_next(options);
         let state = self.state.clone();
         let pulling = self.state.clone();
         match env.spawn_future(async move {
-            let result = pull_sql(state, abort, timeout).await;
+            let result = pull_sql(state, abort, deadline).await;
             pulling.pulling.store(false, AtomicOrdering::Release);
             result
         }) {
@@ -1345,18 +1378,31 @@ impl NativeSnapshot {
 
     /// Execute bounded, read-only SQL over this immutable snapshot and return a pull-based IPC stream.
     #[napi]
-    pub async fn query_sql(
+    pub fn query_sql<'env>(
         &self,
+        env: &'env Env,
         sql: String,
         params: Option<Vec<NativeSqlParam>>,
         options: Option<NativeSqlOptions>,
-    ) -> Result<NativeSqlQuery> {
-        let (params, options) = decode_sql(sql.as_str(), params, options)?;
-        let store = self.state.get()?.as_ref().clone();
-        SqlQuery::open_with_budget(store, &sql, params, options, &self.state.sql_budget)
+    ) -> Result<PromiseRaw<'env, NativeSqlQuery>> {
+        let decoded = decode_sql(sql.as_str(), params, options);
+        let store = self.state.get().map(|store| store.as_ref().clone());
+        let budget = self.state.sql_budget.clone();
+        env.spawn_future(async move {
+            let store = store?;
+            let decoded = decoded?;
+            let DecodedSql { params, options, abort, deadline } = decoded;
+            interruptible_sql_open(
+                async move {
+                    SqlQuery::open_with_budget(store, &sql, params, options, &budget)
+                        .await
+                        .map_err(|error| engine_failure("open TurnDB snapshot SQL query", error))
+                },
+                abort,
+                deadline,
+            )
             .await
-            .map(NativeSqlQuery::new)
-            .map_err(|error| engine_failure("open TurnDB snapshot SQL query", error))
+        })
     }
 }
 
@@ -1375,22 +1421,34 @@ impl NativeStore {
 
     /// Publish earlier writes as an exact immutable cut, then execute read-only SQL over that cut.
     #[napi]
-    pub async fn query_sql(
+    pub fn query_sql<'env>(
         &self,
+        env: &'env Env,
         sql: String,
         params: Option<Vec<NativeSqlParam>>,
         options: Option<NativeSqlOptions>,
-    ) -> Result<NativeSqlQuery> {
-        let (params, options) = decode_sql(sql.as_str(), params, options)?;
-        let store = self
-            .actor
-            .snapshot()
+    ) -> Result<PromiseRaw<'env, NativeSqlQuery>> {
+        let decoded = decode_sql(sql.as_str(), params, options);
+        let actor = self.actor.clone();
+        let budget = self.sql_budget.clone();
+        env.spawn_future(async move {
+            let decoded = decoded?;
+            let DecodedSql { params, options, abort, deadline } = decoded;
+            interruptible_sql_open(
+                async move {
+                    let store = actor
+                        .snapshot()
+                        .await
+                        .map_err(|error| engine_failure("publish TurnDB SQL snapshot", error))?;
+                    SqlQuery::open_with_budget(store, &sql, params, options, &budget)
+                        .await
+                        .map_err(|error| engine_failure("open TurnDB SQL query", error))
+                },
+                abort,
+                deadline,
+            )
             .await
-            .map_err(|error| engine_failure("publish TurnDB SQL snapshot", error))?;
-        SqlQuery::open_with_budget(store, &sql, params, options, &self.sql_budget)
-            .await
-            .map(NativeSqlQuery::new)
-            .map_err(|error| engine_failure("open TurnDB SQL query", error))
+        })
     }
 }
 
@@ -1605,18 +1663,29 @@ fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
 }
 
 #[cfg(feature = "sql")]
+struct DecodedSql {
+    params: Vec<SqlValue>,
+    options: SqlOptions,
+    abort: Option<tokio::sync::oneshot::Receiver<()>>,
+    deadline: Option<Instant>,
+}
+
+#[cfg(feature = "sql")]
 fn decode_sql(
     sql: &str,
     params: Option<Vec<NativeSqlParam>>,
     options: Option<NativeSqlOptions>,
-) -> Result<(Vec<SqlValue>, SqlOptions)> {
+) -> Result<DecodedSql> {
     if sql.trim().is_empty() {
         return Err(Error::new(Status::InvalidArg, "SQL query must not be empty"));
     }
     let params =
         params.unwrap_or_default().into_iter().map(decode_sql_param).collect::<Result<Vec<_>>>()?;
-    let max_memory_bytes = options
-        .and_then(|options| options.max_memory_bytes)
+    let (max_memory_bytes, timeout_ms, signal) = match options {
+        Some(options) => (options.max_memory_bytes, options.timeout_ms, options.signal),
+        None => (None, None, None),
+    };
+    let max_memory_bytes = max_memory_bytes
         .map(|value| decode_u64(value, "maxMemoryBytes"))
         .transpose()?
         .unwrap_or(DEFAULT_MEMORY_BYTES as u64);
@@ -1626,7 +1695,8 @@ fn decode_sql(
     if max_memory_bytes == 0 {
         return Err(Error::new(Status::InvalidArg, "maxMemoryBytes must be greater than zero"));
     }
-    Ok((params, SqlOptions { max_memory_bytes }))
+    let (abort, deadline) = decode_sql_interrupt(timeout_ms, signal);
+    Ok(DecodedSql { params, options: SqlOptions { max_memory_bytes }, abort, deadline })
 }
 
 #[cfg(feature = "sql")]
@@ -1696,9 +1766,17 @@ fn decode_sql_param(param: NativeSqlParam) -> Result<SqlValue> {
 #[cfg(feature = "sql")]
 fn decode_sql_next(
     options: Option<NativeSqlNextOptions>,
-) -> (Option<tokio::sync::oneshot::Receiver<()>>, Option<Duration>) {
+) -> (Option<tokio::sync::oneshot::Receiver<()>>, Option<Instant>) {
     let Some(options) = options else { return (None, None) };
-    let abort = options.signal.map(|signal| {
+    decode_sql_interrupt(options.timeout_ms, options.signal)
+}
+
+#[cfg(feature = "sql")]
+fn decode_sql_interrupt(
+    timeout_ms: Option<u32>,
+    signal: Option<AbortSignal>,
+) -> (Option<tokio::sync::oneshot::Receiver<()>>, Option<Instant>) {
+    let abort = signal.map(|signal| {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let sender = Arc::new(Mutex::new(Some(sender)));
         signal.on_abort(move || {
@@ -1708,8 +1786,9 @@ fn decode_sql_next(
         });
         receiver
     });
-    let timeout = options.timeout_ms.map(|millis| Duration::from_millis(u64::from(millis)));
-    (abort, timeout)
+    let deadline =
+        timeout_ms.map(|millis| Instant::now() + Duration::from_millis(u64::from(millis)));
+    (abort, deadline)
 }
 
 fn decode_predicate(input: NativePredicate) -> Result<Predicate> {
@@ -2108,5 +2187,41 @@ fn encode_schema(schema: turndb::schema::Schema) -> NativeSchema {
             .collect(),
         contents: schema.contents,
         may_include_shadowed_fields: schema.may_include_shadowed_fields,
+    }
+}
+
+#[cfg(all(test, feature = "sql"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropNotice(Arc<AtomicBool>);
+
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn a_planning_deadline_drops_the_unfinished_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let notice = DropNotice(dropped.clone());
+        let work = async move {
+            let _notice = notice;
+            std::future::pending::<Result<SqlQuery>>().await
+        };
+        let runtime = napi::tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(interruptible_sql_open(
+            work,
+            None,
+            Some(Instant::now() + Duration::from_millis(1)),
+        ));
+        let error = match result {
+            Ok(_) => panic!("a pending planning future beat its deadline"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("planning deadline exceeded"));
+        assert!(dropped.load(Ordering::Acquire), "the losing planning future remained alive");
     }
 }
