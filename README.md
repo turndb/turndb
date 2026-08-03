@@ -142,6 +142,8 @@ statements are refused. Results are pulled one bounded batch at a time as comple
 bindings therefore transport dynamic columnar results without translating them through JSON or
 JavaScript objects. The ownership, snapshot, cancellation, and memory semantics are detailed in
 [Read-only SQL and Arrow IPC streaming](docs/sql-arrow-stream.md).
+Point reads, storage-native structured scans, and DataFusion are held to one versioned-record
+reference model by the [three-path differential gate](docs/differential-query-testing.md).
 
 ## What it does not do
 

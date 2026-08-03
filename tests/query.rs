@@ -1,13 +1,15 @@
 //! The query lens: columnar reads, projection, and SQL over a real store.
 //!
-//! The load-bearing test here is `columnar_and_row_paths_agree_exactly`. Two independent decoders now
-//! read the same bytes — the row API walks the layout, the lens scatters columns — and a divergence
-//! between them is a silent wrong answer, the worst failure this system can have.
+//! The load-bearing gates here compare independent decoders and independent query interfaces. The
+//! row API walks the layout while the lens scatters columns; a versioned generalized-record corpus
+//! then compares point reads, structured paging, and DataFusion against one reference model. A
+//! divergence is a silent wrong answer, the worst failure this system can have.
 
 #![cfg(feature = "sql")]
 
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::catalog::TableProvider;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turndb::fold::FoldCfg;
@@ -18,12 +20,35 @@ use turndb::query::{
     table::TurndbTable,
     Lens,
 };
-use turndb::store::{ContentSpans, Span, Store};
+use turndb::scan::{
+    Compare, ContentMode, ContentSelect, Direction, Predicate, ScanRequest, ScanRow,
+};
+use turndb::store::{ContentSpans, ReadStore, Span, Store};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     std::env::temp_dir().join(format!("turndb-query-{tag}-{}-{n}", std::process::id()))
+}
+
+/// Test corpora that exercise failures must not become persistent disk fixtures when an assertion
+/// trips. Existing tests predate this guard; new sustained/differential cases should use it.
+struct ScopedDir(PathBuf);
+
+impl ScopedDir {
+    fn new(tag: &str) -> ScopedDir {
+        ScopedDir(tmp(tag))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScopedDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
 }
 
 fn cfg() -> FoldCfg {
@@ -333,6 +358,386 @@ fn columnar_and_row_paths_agree_exactly() {
         assert_eq!(&store.reconstruct(id).unwrap().unwrap(), body);
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DifferentialRecord {
+    attrs: Vec<(String, AttrValue)>,
+    body: Vec<u8>,
+    attachment: Option<Vec<u8>>,
+}
+
+fn differential_id(slot: usize) -> String {
+    format!("record/{slot:04}")
+}
+
+fn differential_record(slot: usize, revision: usize) -> DifferentialRecord {
+    let kind = ["activity", "generation", "build"][(slot + revision * 2) % 3];
+    let mut attrs = vec![
+        ("kind".into(), AttrValue::Str(kind.into())),
+        ("score".into(), AttrValue::Int(slot as i64 * 17 - revision as i64 * 29 - 200)),
+        ("ratio".into(), AttrValue::Float((slot as f64 - revision as f64) / 8.0)),
+        ("active".into(), AttrValue::Bool((slot + revision).is_multiple_of(2))),
+        ("epoch".into(), AttrValue::UInt(u64::MAX - (slot * 16 + revision) as u64)),
+        ("raw".into(), AttrValue::Bytes(vec![0, slot as u8, revision as u8, 255])),
+        (
+            "at".into(),
+            AttrValue::TimestampNs(-1_700_000_000_000_000_000 + (slot * 100 + revision) as i64),
+        ),
+    ];
+    if (slot + revision).is_multiple_of(4) {
+        attrs.push(("nil".into(), AttrValue::Null));
+    }
+    // The row API and structured projection retain both occurrences. The flat SQL view deliberately
+    // takes the first and reports the shadowed one in its execution statistics.
+    attrs.push(("tag".into(), AttrValue::Str(format!("first-{slot}"))));
+    attrs.push(("tag".into(), AttrValue::Str(format!("second-{revision}"))));
+
+    let body = format!(
+        "common content-addressed prefix {}|slot={slot}|revision={revision}|{}",
+        "shared ".repeat(32),
+        "tail".repeat((slot + revision) % 11)
+    )
+    .into_bytes();
+    let attachment = (!(slot + revision).is_multiple_of(3))
+        .then(|| format!("attachment/{slot:04}/{revision}:{}", "same".repeat(9)).into_bytes());
+    DifferentialRecord { attrs, body, attachment }
+}
+
+fn put_differential_record(
+    store: &mut Store,
+    expected: &mut BTreeMap<String, DifferentialRecord>,
+    slot: usize,
+    revision: usize,
+) {
+    let id = differential_id(slot);
+    let record = differential_record(slot, revision);
+    let mut contents = vec![ContentSpans::new("body", vec![Span::Piece(&record.body)])];
+    if let Some(attachment) = &record.attachment {
+        contents.push(ContentSpans::new("attachment", vec![Span::Piece(attachment)]));
+    }
+    store.put_record(&id, &contents, record.attrs.clone()).unwrap();
+    expected.insert(id, record);
+}
+
+#[derive(Default)]
+struct DifferentialScan {
+    rows: Vec<ScanRow>,
+    pages: usize,
+    empty_pages: usize,
+    physical_rows: usize,
+    superseded_rows: usize,
+    tombstones: usize,
+}
+
+fn differential_scan(store: &ReadStore, mut request: ScanRequest) -> DifferentialScan {
+    let mut result = DifferentialScan::default();
+    loop {
+        result.pages += 1;
+        assert!(result.pages < 1_000, "structured cursor failed to make bounded progress");
+        let page = store.scan(&request).unwrap();
+        result.empty_pages += usize::from(page.rows.is_empty());
+        result.physical_rows += page.stats.resolution.physical_rows;
+        result.superseded_rows += page.stats.resolution.superseded_rows;
+        result.tombstones += page.stats.resolution.tombstones;
+        result.rows.extend(page.rows);
+        let Some(next) = page.next else { break };
+        request.cursor = Some(next);
+    }
+    result
+}
+
+fn first_attr<'a>(record: &'a DifferentialRecord, name: &str) -> Option<&'a AttrValue> {
+    record.attrs.iter().find_map(|(key, value)| (key == name).then_some(value))
+}
+
+async fn differential_sql_ids(
+    context: &datafusion::prelude::SessionContext,
+    predicate: &str,
+) -> Vec<String> {
+    let sql = format!("SELECT id FROM records WHERE {predicate} ORDER BY id");
+    let batches = context.sql(&sql).await.unwrap().collect().await.unwrap();
+    let mut ids = Vec::new();
+    for batch in batches {
+        let column = batch.column(0).as_string::<i32>();
+        ids.extend((0..batch.num_rows()).map(|row| column.value(row).to_string()));
+    }
+    ids
+}
+
+async fn assert_differential_filter(
+    context: &datafusion::prelude::SessionContext,
+    store: &ReadStore,
+    expected: Vec<String>,
+    predicates: Vec<Predicate>,
+    sql_predicate: &str,
+) {
+    let scan = differential_scan(
+        store,
+        ScanRequest {
+            limit: 2,
+            max_examined: 3,
+            max_resolution_entries: 7,
+            predicates,
+            ..ScanRequest::default()
+        },
+    );
+    let scan_ids: Vec<String> = scan.rows.into_iter().map(|row| row.id).collect();
+    assert_eq!(scan_ids, expected, "structured predicate diverged from the reference model");
+    assert_eq!(
+        differential_sql_ids(context, sql_predicate).await,
+        expected,
+        "DataFusion predicate diverged from the point/structured reference model"
+    );
+}
+
+#[tokio::test]
+async fn point_structured_and_datafusion_paths_agree_on_versioned_general_records() {
+    let dir = ScopedDir::new("three-path-differential");
+    let mut writer = Store::open(dir.path(), cfg()).unwrap();
+    let mut expected = BTreeMap::new();
+
+    // Seed every key, then retain seven independently flushed mutation layers. The final view has
+    // overwritten rows, absent older rows, and live rows whose newest occurrence sits in every part.
+    for slot in 0usize..48 {
+        put_differential_record(&mut writer, &mut expected, slot, 0);
+    }
+    writer.sync().unwrap();
+    writer.flush().unwrap();
+    for revision in 1usize..=7 {
+        for slot in 0usize..48 {
+            let selector = slot * 31 + revision * 17;
+            if selector.is_multiple_of(5) {
+                continue;
+            }
+            let id = differential_id(slot);
+            if selector.is_multiple_of(13) {
+                writer.delete(&id).unwrap();
+                expected.remove(&id);
+            } else {
+                put_differential_record(&mut writer, &mut expected, slot, revision);
+            }
+        }
+        writer.sync().unwrap();
+        writer.flush().unwrap();
+    }
+    drop(writer);
+
+    let reader = Store::open_read(dir.path(), cfg()).unwrap();
+    assert!(expected.len() > 30, "the deterministic corpus unexpectedly lost most live rows");
+
+    // Point reads are checked against the independently maintained mutation model, including
+    // byte-exact named content. This anchors the two query paths to more than each other.
+    for slot in 0usize..48 {
+        let id = differential_id(slot);
+        match expected.get(&id) {
+            Some(want) => {
+                let got = reader.get(&id).unwrap().expect("reference says the row is live");
+                assert_eq!(got.attrs, want.attrs, "point metadata differs for {id}");
+                assert_eq!(
+                    reader.reconstruct_content(&id, "body").unwrap(),
+                    Some(want.body.clone())
+                );
+                assert_eq!(
+                    reader.reconstruct_content(&id, "attachment").unwrap(),
+                    want.attachment,
+                    "point named content differs for {id}"
+                );
+            }
+            None => {
+                assert!(reader.get(&id).unwrap().is_none(), "point read resurrected {id}");
+                assert!(reader.reconstruct(&id).unwrap().is_none());
+            }
+        }
+    }
+
+    let projection = ScanRequest {
+        direction: Direction::Forward,
+        limit: 3,
+        max_examined: 4,
+        max_resolution_entries: 7,
+        attrs: vec![
+            "kind".into(),
+            "score".into(),
+            "ratio".into(),
+            "active".into(),
+            "epoch".into(),
+            "raw".into(),
+            "at".into(),
+            "nil".into(),
+            "tag".into(),
+        ],
+        contents: vec![
+            ContentSelect { name: "body".into(), mode: ContentMode::Bytes },
+            ContentSelect { name: "attachment".into(), mode: ContentMode::Bytes },
+        ],
+        ..ScanRequest::default()
+    };
+    let forward = differential_scan(&reader, projection.clone());
+    assert!(forward.pages > 1, "the test must exercise real cursor continuation");
+    assert!(forward.physical_rows > forward.rows.len());
+    assert!(forward.superseded_rows > 0, "older physical versions were not exercised");
+    assert!(forward.tombstones > 0, "newest tombstones were not exercised");
+    assert!(forward.empty_pages > 0, "bounded tombstone-only progress was not exercised");
+    assert_eq!(forward.rows.len(), expected.len());
+    for (row, (id, want)) in forward.rows.iter().zip(&expected) {
+        assert_eq!(&row.id, id);
+        assert_eq!(row.attrs, want.attrs, "structured metadata differs for {id}");
+        assert_eq!(row.contents[0].name, "body");
+        assert_eq!(row.contents[0].bytes.as_deref(), Some(want.body.as_slice()));
+        assert_eq!(row.contents[1].name, "attachment");
+        assert_eq!(row.contents[1].present, want.attachment.is_some());
+        assert_eq!(row.contents[1].bytes.as_deref(), want.attachment.as_deref());
+    }
+
+    let mut reverse_request = projection;
+    reverse_request.direction = Direction::Reverse;
+    let reverse = differential_scan(&reader, reverse_request);
+    let reverse_ids: Vec<String> = reverse.rows.into_iter().map(|row| row.id).collect();
+    let mut expected_reverse: Vec<String> = expected.keys().cloned().collect();
+    expected_reverse.reverse();
+    assert_eq!(reverse_ids, expected_reverse, "reverse structured paging lost or repeated a row");
+
+    // The full SQL projection covers every scalar representation, explicit-null presence, the first
+    // duplicate occurrence, and both named content values.
+    let (context, table) = TurndbTable::context(reader.clone(), "records").unwrap();
+    let batches = context
+        .sql(
+            "SELECT id, kind, score, ratio, active, epoch, raw, at, \"nil#null\", tag, body, \
+             \"content.attachment\" FROM records ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected_rows: Vec<_> = expected.iter().collect();
+    let mut at = 0usize;
+    for batch in &batches {
+        let ids = batch.column(0).as_string::<i32>();
+        let kinds = batch.column(1).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
+        let kind_values = kinds.values().as_string::<i32>();
+        let scores = batch.column(2).as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        let ratios = batch.column(3).as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+        let active = batch.column(4).as_boolean();
+        let epochs = batch.column(5).as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
+        let raw = batch.column(6).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
+        let raw_values = raw.values().as_binary::<i32>();
+        let timestamps =
+            batch.column(7).as_primitive::<datafusion::arrow::datatypes::TimestampNanosecondType>();
+        let nil = batch.column(8).as_boolean();
+        let tags = batch.column(9).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
+        let tag_values = tags.values().as_string::<i32>();
+        let bodies = batch.column(10).as_binary::<i32>();
+        let attachments = batch.column(11).as_binary::<i32>();
+        for row in 0..batch.num_rows() {
+            let (id, want) = expected_rows[at];
+            assert_eq!(ids.value(row), id);
+            let AttrValue::Str(kind) = first_attr(want, "kind").unwrap() else { unreachable!() };
+            assert_eq!(kind_values.value(kinds.key(row).unwrap()), kind);
+            let AttrValue::Int(score) = first_attr(want, "score").unwrap() else { unreachable!() };
+            assert_eq!(scores.value(row), *score);
+            let AttrValue::Float(ratio) = first_attr(want, "ratio").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(ratios.value(row), *ratio);
+            let AttrValue::Bool(want_active) = first_attr(want, "active").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(active.value(row), *want_active);
+            let AttrValue::UInt(epoch) = first_attr(want, "epoch").unwrap() else { unreachable!() };
+            assert_eq!(epochs.value(row), *epoch);
+            let AttrValue::Bytes(want_raw) = first_attr(want, "raw").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(raw_values.value(raw.key(row).unwrap()), want_raw);
+            let AttrValue::TimestampNs(timestamp) = first_attr(want, "at").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(timestamps.value(row), *timestamp);
+            let has_explicit_null = first_attr(want, "nil") == Some(&AttrValue::Null);
+            assert_eq!(nil.is_valid(row), has_explicit_null);
+            if has_explicit_null {
+                assert!(nil.value(row));
+            }
+            let AttrValue::Str(first_tag) = first_attr(want, "tag").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(tag_values.value(tags.key(row).unwrap()), first_tag);
+            assert_eq!(bodies.value(row), want.body);
+            assert_eq!(attachments.is_valid(row), want.attachment.is_some());
+            if let Some(attachment) = &want.attachment {
+                assert_eq!(attachments.value(row), attachment);
+            }
+            at += 1;
+        }
+    }
+    assert_eq!(at, expected.len(), "SQL projection returned the wrong live cardinality");
+
+    let expected_kind: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| {
+            matches!(first_attr(record, "kind"), Some(AttrValue::Str(kind)) if kind == "activity")
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_kind,
+        vec![Predicate::Attr {
+            name: "kind".into(),
+            op: Compare::Eq,
+            value: AttrValue::Str("activity".into()),
+        }],
+        "kind = 'activity'",
+    )
+    .await;
+    let expected_score: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| {
+            matches!(first_attr(record, "score"), Some(AttrValue::Int(score)) if *score >= 0)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_score,
+        vec![Predicate::Attr { name: "score".into(), op: Compare::GtEq, value: AttrValue::Int(0) }],
+        "score >= 0",
+    )
+    .await;
+    let expected_attachment: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| record.attachment.is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_attachment,
+        vec![Predicate::ContentExists { name: "attachment".into(), present: true }],
+        "\"content.attachment\" IS NOT NULL",
+    )
+    .await;
+    let expected_null: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| first_attr(record, "nil") == Some(&AttrValue::Null))
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_null,
+        vec![Predicate::Attr { name: "nil".into(), op: Compare::Eq, value: AttrValue::Null }],
+        "\"nil#null\" = true",
+    )
+    .await;
+
+    let stats = table.stats();
+    assert!(stats.rows_hidden > 0, "SQL did not exercise newest-wins hiding");
+    assert!(stats.shadowed_occurrences > 0, "SQL did not exercise duplicate-field flattening");
 }
 
 #[test]
