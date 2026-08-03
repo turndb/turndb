@@ -92,6 +92,29 @@ pub(crate) struct RowScan<'a> {
     pub allow_oversized_group: bool,
 }
 
+/// Exact immutable physical scope for a prepared id range, before visibility resolution.
+pub(crate) fn scan_physical_scope(
+    parts: &[Arc<Part>],
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<crate::scan::ScanPhysicalScope> {
+    let mut scope = crate::scan::ScanPhysicalScope {
+        immutable_parts_considered: parts.len(),
+        ..Default::default()
+    };
+    for part in parts {
+        let rows = part.rows_in_range(from, to)?;
+        if !rows.is_empty() {
+            scope.immutable_parts_with_rows += 1;
+        }
+        scope.immutable_rows_in_bounds = scope
+            .immutable_rows_in_bounds
+            .checked_add(rows.len())
+            .ok_or_else(|| anyhow::anyhow!("scan explanation physical-row count overflow"))?;
+    }
+    Ok(scope)
+}
+
 pub(crate) fn visibility(parts: &[Arc<Part>]) -> Result<Visibility> {
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); parts.len()];
     let mut seen: HashSet<String> = HashSet::new();

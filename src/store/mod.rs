@@ -2343,6 +2343,29 @@ impl Store {
         crate::scan::scan_store(self, request)
     }
 
+    /// Explain a structured scan against the current read-your-writes view without resolving rows
+    /// or evaluating predicates.
+    pub fn explain_scan(
+        &self,
+        request: &crate::scan::ScanRequest,
+    ) -> Result<crate::scan::ScanExplanation> {
+        crate::scan::explain_store(self, request)
+    }
+
+    pub(crate) fn scan_physical_scope(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<crate::scan::ScanPhysicalScope> {
+        let mut scope = read::scan_physical_scope(&self.parts, from, to)?;
+        let range = (
+            from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
+            to.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+        );
+        scope.memtable_entries_in_bounds = self.mem.range::<str, _>(range).count();
+        Ok(scope)
+    }
+
     /// ERASE records: tombstone, settle, and rewrite until the content is physically gone.
     ///
     /// This is the compliance path, and it composes three operations that each already existed:
@@ -2846,6 +2869,23 @@ impl ReadStore {
     /// Bounded structured paging over this immutable manifest snapshot.
     pub fn scan(&self, request: &crate::scan::ScanRequest) -> Result<crate::scan::ScanPage> {
         crate::scan::scan_read_store(self, request)
+    }
+
+    /// Explain a structured scan against this immutable snapshot without resolving rows or
+    /// evaluating predicates.
+    pub fn explain_scan(
+        &self,
+        request: &crate::scan::ScanRequest,
+    ) -> Result<crate::scan::ScanExplanation> {
+        crate::scan::explain_read_store(self, request)
+    }
+
+    pub(crate) fn scan_physical_scope(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<crate::scan::ScanPhysicalScope> {
+        read::scan_physical_scope(&self.parts, from, to)
     }
 
     /// Live ids in `[from, to)`, at most `limit`, id-ordered or reversed — the paged read.

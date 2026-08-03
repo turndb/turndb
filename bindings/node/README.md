@@ -53,6 +53,10 @@ silently.
   [projected structured scans](../../docs/projected-structured-scan.md) and
   [structured scan I/O statistics](../../docs/structured-scan-io.md), plus the
   [resolved-row budget contract](../../docs/resolved-row-paging.md).
+- `explainScan()` validates and prepares the same request and opaque cursor as `scan()`, then reports
+  projected, predicate-only, and byte-reconstructed fields; effective bounds and budgets; and exact
+  pre-resolution part/row/memtable scope. It does not estimate result counts or read value/content
+  columns. See [structured scan explanation](../../docs/scan-explanation.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.

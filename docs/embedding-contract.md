@@ -204,6 +204,14 @@ The cursor can advance through a fully consumed tombstone-only group, so a bound
 legitimately carry a continuation without rescanning or skipping history. The Node spelling is
 `maxResolutionEntries` and `stats.resolution.budgetExhausted` reports when this ceiling stopped work.
 
+`Store::explain_scan` and `ReadStore::explain_scan` use the same validation, checked-cursor, effective
+range, and required-field preparation as execution. They report the request's work ceilings and exact
+pre-resolution physical rows across initialized parts, plus writer-memtable entries. Explanation does
+not resolve visibility, evaluate predicates, estimate returned rows, open value/content sections, or
+read fold blocks. It does open id structures and may warm their caches. Node exposes the same method
+as `explainScan()` on writer and snapshot handles and declares `scanExplanation`. See
+`docs/scan-explanation.md`.
+
 **Current gap:** range initialization still visits every live part, sparse row occurrences are
 directly indexed per requested row, and predicates evaluate partial semantic records rather than an
 encoded/vector expression batch. `max_examined` separately counts live records evaluated against

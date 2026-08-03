@@ -28,8 +28,8 @@ use turndb::query::sql::{
 };
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
-    ScanInterrupted, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
-    DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
+    ScanExplanation, ScanInterrupted, ScanPage, ScanRequest, ScanRow,
+    DEFAULT_MAX_RECONSTRUCTED_BYTES, DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
 };
 use turndb::store::{
     CompactionBudget, CompactionError, ReadStore, Store, WriteAdmissionError, WriteLimits,
@@ -290,6 +290,44 @@ pub struct NativeScanPage {
     pub stats: NativeScanStats,
 }
 
+#[napi(object)]
+pub struct NativeScanContentPlan {
+    pub name: String,
+    pub mode: String,
+}
+
+#[napi(object)]
+pub struct NativeScanPhysicalScope {
+    pub immutable_parts_considered: BigInt,
+    pub immutable_parts_with_rows: BigInt,
+    pub immutable_rows_in_bounds: BigInt,
+    pub memtable_entries_in_bounds: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeScanExplanation {
+    pub direction: String,
+    pub uses_cursor: bool,
+    pub effective_from: Option<String>,
+    pub effective_to: Option<String>,
+    pub empty_range: bool,
+    pub projected_attrs: Vec<String>,
+    pub required_attrs: Vec<String>,
+    pub predicate_only_attrs: Vec<String>,
+    pub projected_contents: Vec<NativeScanContentPlan>,
+    pub required_contents: Vec<String>,
+    pub predicate_only_contents: Vec<String>,
+    pub reconstructed_contents: Vec<String>,
+    pub id_predicates: u32,
+    pub attr_predicates: u32,
+    pub content_predicates: u32,
+    pub limit: u32,
+    pub max_examined: u32,
+    pub max_resolution_entries: u32,
+    pub max_reconstructed_bytes: BigInt,
+    pub physical: NativeScanPhysicalScope,
+}
+
 #[cfg(feature = "sql")]
 #[napi(object)]
 pub struct NativeSqlParam {
@@ -366,6 +404,7 @@ pub struct NativeCapabilities {
     pub recovery_controls: bool,
     pub health_snapshots: bool,
     pub schema_discovery: bool,
+    pub scan_explanation: bool,
     pub scan_cancellation: bool,
     pub lifecycle_cancellation: bool,
     pub bounded_compaction: bool,
@@ -416,6 +455,7 @@ pub fn capabilities() -> NativeCapabilities {
         recovery_controls: true,
         health_snapshots: true,
         schema_discovery: true,
+        scan_explanation: true,
         scan_cancellation: true,
         lifecycle_cancellation: true,
         bounded_compaction: true,
@@ -930,6 +970,26 @@ impl NativeSnapshot {
         })
     }
 
+    /// Explain the prepared structured scan and exact pre-resolution physical scope.
+    #[napi]
+    pub fn explain_scan<'env>(
+        &self,
+        env: &'env Env,
+        request: Option<NativeScanRequest>,
+    ) -> Result<PromiseRaw<'env, NativeScanExplanation>> {
+        let request = request.map(decode_scan).transpose();
+        let store = self.state.get();
+        env.spawn_future(async move {
+            let request = request?.unwrap_or_default();
+            let store = store?;
+            napi::tokio::task::spawn_blocking(move || store.explain_scan(&request))
+                .await
+                .map_err(|error| failure("join TurnDB snapshot scan explanation", error))?
+                .map(encode_scan_explanation)
+                .map_err(|error| scan_failure("explain TurnDB snapshot scan", error))
+        })
+    }
+
     #[napi]
     pub async fn read_content(&self, id: String, name: String) -> Result<Option<Buffer>> {
         let store = self.state.get()?;
@@ -1125,6 +1185,24 @@ impl NativeStore {
                 .await
                 .map(encode_page)
                 .map_err(|error| scan_failure("scan TurnDB store", error))
+        })
+    }
+
+    /// Explain the prepared structured scan and exact pre-resolution physical scope.
+    #[napi]
+    pub fn explain_scan<'env>(
+        &self,
+        env: &'env Env,
+        request: Option<NativeScanRequest>,
+    ) -> Result<PromiseRaw<'env, NativeScanExplanation>> {
+        let request = request.map(decode_scan).transpose();
+        let actor = self.actor.clone();
+        env.spawn_future(async move {
+            actor
+                .explain_scan(request?.unwrap_or_default())
+                .await
+                .map(encode_scan_explanation)
+                .map_err(|error| scan_failure("explain TurnDB store scan", error))
         })
     }
 
@@ -1901,6 +1979,59 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
                 memtable_entries: BigInt::from(page.stats.resolution.memtable_entries as u64),
                 budget_exhausted: page.stats.resolution.budget_exhausted,
             },
+        },
+    }
+}
+
+fn encode_scan_explanation(explanation: ScanExplanation) -> NativeScanExplanation {
+    NativeScanExplanation {
+        direction: match explanation.direction {
+            Direction::Forward => "forward",
+            Direction::Reverse => "reverse",
+        }
+        .into(),
+        uses_cursor: explanation.uses_cursor,
+        effective_from: explanation.effective_from,
+        effective_to: explanation.effective_to,
+        empty_range: explanation.empty_range,
+        projected_attrs: explanation.projected_attrs,
+        required_attrs: explanation.required_attrs,
+        predicate_only_attrs: explanation.predicate_only_attrs,
+        projected_contents: explanation
+            .projected_contents
+            .into_iter()
+            .map(|content| NativeScanContentPlan {
+                name: content.name,
+                mode: match content.mode {
+                    ContentMode::Metadata => "metadata",
+                    ContentMode::Bytes => "bytes",
+                }
+                .into(),
+            })
+            .collect(),
+        required_contents: explanation.required_contents,
+        predicate_only_contents: explanation.predicate_only_contents,
+        reconstructed_contents: explanation.reconstructed_contents,
+        id_predicates: explanation.id_predicates as u32,
+        attr_predicates: explanation.attr_predicates as u32,
+        content_predicates: explanation.content_predicates as u32,
+        limit: explanation.limit as u32,
+        max_examined: explanation.max_examined as u32,
+        max_resolution_entries: explanation.max_resolution_entries as u32,
+        max_reconstructed_bytes: BigInt::from(explanation.max_reconstructed_bytes),
+        physical: NativeScanPhysicalScope {
+            immutable_parts_considered: BigInt::from(
+                explanation.physical.immutable_parts_considered as u64,
+            ),
+            immutable_parts_with_rows: BigInt::from(
+                explanation.physical.immutable_parts_with_rows as u64,
+            ),
+            immutable_rows_in_bounds: BigInt::from(
+                explanation.physical.immutable_rows_in_bounds as u64,
+            ),
+            memtable_entries_in_bounds: BigInt::from(
+                explanation.physical.memtable_entries_in_bounds as u64,
+            ),
         },
     }
 }

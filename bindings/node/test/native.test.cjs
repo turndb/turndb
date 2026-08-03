@@ -43,6 +43,7 @@ test('reports the native capability profile without a portable fallback', () => 
     recoveryControls: true,
     healthSnapshots: true,
     schemaDiscovery: true,
+    scanExplanation: true,
     scanCancellation: true,
     lifecycleCancellation: true,
     boundedCompaction: true,
@@ -291,6 +292,83 @@ test('pages and filters in Rust and refuses cursor misuse', async (t) => {
     store.scan({ ...request, from: 'r2', cursor: first.next }),
     /cursor belongs to different bounds or predicates/
   );
+});
+
+test('explains structured fields, budgets, cursors, and exact physical scope', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([
+    {
+      kind: 'put', id: 'a',
+      contents: [{ name: 'payload', bytes: Buffer.from('a') }],
+      attrs: [{ name: 'projected', kind: 'bool', boolValue: true }],
+    },
+    { kind: 'put', id: 'b' },
+  ]);
+
+  const request = {
+    from: 'a',
+    to: 'z',
+    limit: 7,
+    maxExamined: 11,
+    maxResolutionEntries: 13,
+    maxReconstructedBytes: 17n,
+    attrs: ['projected'],
+    contents: [{ name: 'payload', mode: 'bytes' }],
+    predicates: [
+      { kind: 'attr_exists', name: 'predicate_only', present: false },
+      { kind: 'content_exists', name: 'request', present: false },
+    ],
+  };
+  const explanation = await store.explainScan(request);
+  assert.deepEqual(explanation, {
+    direction: 'forward',
+    usesCursor: false,
+    effectiveFrom: 'a',
+    effectiveTo: 'z',
+    emptyRange: false,
+    projectedAttrs: ['projected'],
+    requiredAttrs: ['predicate_only', 'projected'],
+    predicateOnlyAttrs: ['predicate_only'],
+    projectedContents: [{ name: 'payload', mode: 'bytes' }],
+    requiredContents: ['payload', 'request'],
+    predicateOnlyContents: ['request'],
+    reconstructedContents: ['payload'],
+    idPredicates: 0,
+    attrPredicates: 1,
+    contentPredicates: 1,
+    limit: 7,
+    maxExamined: 11,
+    maxResolutionEntries: 13,
+    maxReconstructedBytes: 17n,
+    physical: {
+      immutablePartsConsidered: 0n,
+      immutablePartsWithRows: 0n,
+      immutableRowsInBounds: 0n,
+      memtableEntriesInBounds: 2n,
+    },
+  });
+
+  const first = await store.scan({ from: 'a', to: 'z', limit: 1 });
+  const resumed = await store.explainScan({ from: 'a', to: 'z', cursor: first.next });
+  assert.equal(resumed.usesCursor, true);
+  assert.equal(resumed.effectiveFrom, 'a\0');
+  await assert.rejects(
+    store.explainScan({ from: 'b', to: 'z', cursor: first.next }),
+    /cursor belongs to different bounds or predicates/,
+  );
+
+  const snapshot = await store.snapshot();
+  t.after(async () => {
+    try { await snapshot.close(); } catch {}
+  });
+  const immutable = await snapshot.explainScan({ from: 'a', to: 'z' });
+  assert.equal(immutable.physical.immutablePartsConsidered, 1n);
+  assert.equal(immutable.physical.immutablePartsWithRows, 1n);
+  assert.equal(immutable.physical.immutableRowsInBounds, 2n);
+  assert.equal(immutable.physical.memtableEntriesInBounds, 0n);
 });
 
 test('bounds reconstructed scan bytes without splitting or skipping rows', async (t) => {

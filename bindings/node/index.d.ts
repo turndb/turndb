@@ -90,6 +90,36 @@ export interface ScanPage {
   };
 }
 
+export interface ScanExplanation {
+  direction: 'forward' | 'reverse';
+  usesCursor: boolean;
+  /** Bounds after applying a checked cursor; lower inclusive, upper exclusive. */
+  effectiveFrom?: string;
+  effectiveTo?: string;
+  emptyRange: boolean;
+  projectedAttrs: string[];
+  requiredAttrs: string[];
+  predicateOnlyAttrs: string[];
+  projectedContents: Array<{ name: string; mode: 'metadata' | 'bytes' }>;
+  requiredContents: string[];
+  predicateOnlyContents: string[];
+  reconstructedContents: string[];
+  idPredicates: number;
+  attrPredicates: number;
+  contentPredicates: number;
+  limit: number;
+  maxExamined: number;
+  maxResolutionEntries: number;
+  maxReconstructedBytes: bigint;
+  /** Exact physical scope before newest-wins resolution; not estimated result cardinality. */
+  physical: {
+    immutablePartsConsidered: bigint;
+    immutablePartsWithRows: bigint;
+    immutableRowsInBounds: bigint;
+    memtableEntriesInBounds: bigint;
+  };
+}
+
 export type SqlParam =
   | { kind: 'null' }
   | { kind: 'string'; stringValue: string }
@@ -148,6 +178,7 @@ export interface Capabilities {
   recoveryControls: true;
   healthSnapshots: true;
   schemaDiscovery: true;
+  scanExplanation: true;
   scanCancellation: true;
   lifecycleCancellation: true;
   boundedCompaction: true;
@@ -300,6 +331,7 @@ export declare class NativeSnapshot {
   readonly maxConcurrentSqlMemoryBytes: bigint;
   readonly reservedSqlMemoryBytes: bigint;
   scan(request?: ScanRequest): Promise<ScanPage>;
+  explainScan(request?: ScanRequest): Promise<ScanExplanation>;
   querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
   schema(): Promise<StoreSchema>;
@@ -315,6 +347,7 @@ export declare class NativeStore {
   sync(): Promise<void>;
   flush(): Promise<boolean>;
   scan(request?: ScanRequest): Promise<ScanPage>;
+  explainScan(request?: ScanRequest): Promise<ScanExplanation>;
   /** Publishes earlier writes as an immutable cut before planning the query. */
   querySql(sql: string, params?: SqlParam[], options?: SqlQueryOptions): Promise<NativeSqlQuery>;
   readContent(id: string, name: string): Promise<Buffer | null>;
