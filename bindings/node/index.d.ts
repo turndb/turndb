@@ -174,6 +174,8 @@ export interface Capabilities {
   operationMetrics: true;
   partDistribution: true;
   contentLiveness: true;
+  lifecycleEventJournal: true;
+  lifecycleEventCapacity: number;
   maxRecordBytesDefault: bigint;
   maxBatchBytesDefault: bigint;
   maxBatchRecordsDefault: number;
@@ -319,6 +321,27 @@ export interface ContentLiveness {
   liveBlocks: FoldBlockSpace;
   /** Whole blocks with no live references, eligible for punching or removal by refold. */
   reclaimableBlocks: FoldBlockSpace;
+}
+
+export interface LifecycleEvent {
+  sequence: bigint;
+  operation:
+    | 'open_recovery' | 'sync' | 'flush' | 'compaction' | 'backup'
+    | 'verification' | 'punch' | 'refold' | 'format_migration';
+  outcome: 'succeeded' | 'failed' | 'cancelled';
+  /** Stable TurnDB error code; absent on success. */
+  errorClass?: TurnDbErrorCode;
+  durationNs: bigint;
+}
+
+export interface LifecycleEventBatch {
+  events: LifecycleEvent[];
+  oldestAvailableSequence?: bigint;
+  latestSequence: bigint;
+  /** Cumulative events evicted from this handle's bounded journal. */
+  droppedEvents: bigint;
+  /** The requested next sequence was older than the first retained event. */
+  gap: boolean;
 }
 
 export interface MergeStats {
@@ -581,6 +604,7 @@ export declare class NativeStore {
     punchedBlocks: bigint;
   }>;
   metrics(): Promise<StoreMetrics>;
+  lifecycleEvents(afterSequence?: bigint, limit?: number): Promise<LifecycleEventBatch>;
   partDistribution(options?: LifecycleOptions): Promise<PartDistribution>;
   contentLiveness(options?: LifecycleOptions): Promise<ContentLiveness>;
   close(durable?: boolean): Promise<void>;

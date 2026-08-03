@@ -3,7 +3,145 @@
 //! TurnDB records facts and never invokes consumer callbacks on its storage thread. Embedders can
 //! poll these monotonic process-lifetime counters and export deltas to any telemetry system.
 
+use std::collections::VecDeque;
 use std::time::Duration;
+
+/// Number of lifecycle outcomes retained per writer handle.
+pub const EVENT_JOURNAL_CAPACITY: usize = 256;
+
+/// Stable lifecycle operation names carried by [`LifecycleEvent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleOperation {
+    OpenRecovery,
+    Sync,
+    Flush,
+    Compaction,
+    Backup,
+    Verification,
+    Punch,
+    Refold,
+    FormatMigration,
+}
+
+impl LifecycleOperation {
+    pub const fn name(self) -> &'static str {
+        match self {
+            LifecycleOperation::OpenRecovery => "open_recovery",
+            LifecycleOperation::Sync => "sync",
+            LifecycleOperation::Flush => "flush",
+            LifecycleOperation::Compaction => "compaction",
+            LifecycleOperation::Backup => "backup",
+            LifecycleOperation::Verification => "verification",
+            LifecycleOperation::Punch => "punch",
+            LifecycleOperation::Refold => "refold",
+            LifecycleOperation::FormatMigration => "format_migration",
+        }
+    }
+}
+
+/// Stable terminal outcome for a lifecycle event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl LifecycleOutcome {
+    pub const fn name(self) -> &'static str {
+        match self {
+            LifecycleOutcome::Succeeded => "succeeded",
+            LifecycleOutcome::Failed => "failed",
+            LifecycleOutcome::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One bounded, telemetry-neutral lifecycle fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleEvent {
+    pub sequence: u64,
+    pub operation: LifecycleOperation,
+    pub outcome: LifecycleOutcome,
+    pub error_class: Option<crate::error::ErrorClass>,
+    pub duration_ns: u64,
+}
+
+/// Non-destructive journal read for one independent consumer cursor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleEventBatch {
+    pub events: Vec<LifecycleEvent>,
+    pub oldest_available_sequence: Option<u64>,
+    pub latest_sequence: u64,
+    pub dropped_events: u64,
+    pub gap: bool,
+}
+
+pub(crate) struct EventJournal {
+    events: VecDeque<LifecycleEvent>,
+    next_sequence: u64,
+    dropped_events: u64,
+}
+
+impl Default for EventJournal {
+    fn default() -> Self {
+        EventJournal {
+            events: VecDeque::with_capacity(EVENT_JOURNAL_CAPACITY),
+            next_sequence: 1,
+            dropped_events: 0,
+        }
+    }
+}
+
+impl EventJournal {
+    pub(crate) fn observe<T>(
+        &mut self,
+        operation: LifecycleOperation,
+        duration: Duration,
+        result: &anyhow::Result<T>,
+    ) {
+        let error_class = result.as_ref().err().map(crate::error::classify);
+        let outcome = match error_class {
+            None => LifecycleOutcome::Succeeded,
+            Some(crate::error::ErrorClass::Cancelled) => LifecycleOutcome::Cancelled,
+            Some(_) => LifecycleOutcome::Failed,
+        };
+        if self.events.len() == EVENT_JOURNAL_CAPACITY {
+            self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.events.push_back(LifecycleEvent {
+            sequence,
+            operation,
+            outcome,
+            error_class,
+            duration_ns: u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        });
+    }
+
+    pub(crate) fn read_after(&self, after_sequence: u64, limit: usize) -> LifecycleEventBatch {
+        let oldest_available_sequence = self.events.front().map(|event| event.sequence);
+        let latest_sequence = self.next_sequence.saturating_sub(1);
+        let gap = oldest_available_sequence
+            .is_some_and(|oldest| after_sequence.saturating_add(1) < oldest);
+        let events = self
+            .events
+            .iter()
+            .filter(|event| event.sequence > after_sequence)
+            .take(limit)
+            .copied()
+            .collect();
+        LifecycleEventBatch {
+            events,
+            oldest_available_sequence,
+            latest_sequence,
+            dropped_events: self.dropped_events,
+            gap,
+        }
+    }
+}
 
 /// Monotonic outcomes and wall time for one operation class on one writer handle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,4 +271,32 @@ pub struct ContentLiveness {
     pub stranded_dead_logical_bytes: u64,
     pub live_blocks: FoldBlockSpace,
     pub reclaimable_blocks: FoldBlockSpace,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_event_journal_reports_cursor_gaps_without_destructive_reads() {
+        let mut journal = EventJournal::default();
+        let result: anyhow::Result<()> = Ok(());
+        for _ in 0..EVENT_JOURNAL_CAPACITY + 2 {
+            journal.observe(LifecycleOperation::Sync, Duration::from_nanos(7), &result);
+        }
+        let first = journal.read_after(0, 3);
+        assert_eq!(first.events.len(), 3);
+        assert_eq!(first.events[0].sequence, 3);
+        assert_eq!(first.oldest_available_sequence, Some(3));
+        assert_eq!(first.latest_sequence, (EVENT_JOURNAL_CAPACITY + 2) as u64);
+        assert_eq!(first.dropped_events, 2);
+        assert!(first.gap);
+        assert_eq!(first.events[0].duration_ns, 7);
+
+        let again = journal.read_after(0, 3);
+        assert_eq!(again, first, "reads must not consume another observer's events");
+        let current = journal.read_after(2, 1);
+        assert!(!current.gap);
+        assert_eq!(current.events[0].sequence, 3);
+    }
 }

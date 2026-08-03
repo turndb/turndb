@@ -185,6 +185,11 @@ enum Command {
     Metrics {
         reply: oneshot::Sender<Result<turndb::observability::StoreMetrics>>,
     },
+    LifecycleEvents {
+        after_sequence: u64,
+        limit: usize,
+        reply: oneshot::Sender<Result<turndb::observability::LifecycleEventBatch>>,
+    },
     PartDistribution {
         control: OperationControl,
         reply: oneshot::Sender<Result<turndb::observability::PartDistribution>>,
@@ -408,6 +413,19 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Metrics { reply })?).await
     }
 
+    pub async fn lifecycle_events(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<turndb::observability::LifecycleEventBatch> {
+        Self::receive(self.submit(|reply| Command::LifecycleEvents {
+            after_sequence,
+            limit,
+            reply,
+        })?)
+        .await
+    }
+
     pub async fn part_distribution(
         &self,
         control: OperationControl,
@@ -550,6 +568,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             }
             Command::Metrics { reply } => {
                 let _ = reply.send(Ok(store.metrics()));
+            }
+            Command::LifecycleEvents { after_sequence, limit, reply } => {
+                let _ = reply.send(Ok(store.lifecycle_events_after(after_sequence, limit)));
             }
             Command::PartDistribution { control, reply } => {
                 let _ = reply.send(store.part_distribution_with_control(&control));

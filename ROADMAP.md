@@ -493,13 +493,17 @@ that evidence is sent.
   - Verification and corruption failures. **Implemented:** complete committed-store verification
     has typed monotonic outcomes plus a dedicated corruption-failure counter at the integrity
     boundary; cancellations and ordinary I/O remain distinct.
-- Structured lifecycle and health events.
+- Structured lifecycle and health events. **Lifecycle outcomes implemented:** a bounded,
+  sequence-numbered, non-destructive journal exposes operation, outcome, stable error class, and
+  duration with explicit cursor-gap/eviction accounting. Threshold-derived health events remain a
+  consumer policy; additional engine state transitions can extend the same generic journal.
 - Slow-query reporting and query plans suitable for diagnosis.
 - Configurable resource budgets and overload behavior.
 - A health snapshot API suitable for an embedding application's health endpoint.
 - Hooks through which a consumer can export OpenTelemetry without introducing OTel into the storage
   core. **Implemented for metrics:** Rust and Node expose a pull snapshot with stable integer fields;
-  consumers export deltas without callbacks or an SDK on the writer thread. Structured events remain.
+  consumers export deltas without callbacks or an SDK on the writer thread. **Implemented for
+  lifecycle events:** independent cursors poll a bounded stable journal with explicit loss evidence.
 
 ### Maturity gate
 

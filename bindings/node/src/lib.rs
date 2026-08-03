@@ -303,6 +303,8 @@ pub struct NativeCapabilities {
     pub operation_metrics: bool,
     pub part_distribution: bool,
     pub content_liveness: bool,
+    pub lifecycle_event_journal: bool,
+    pub lifecycle_event_capacity: u32,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -360,6 +362,8 @@ pub fn capabilities() -> NativeCapabilities {
         operation_metrics: c.operation_metrics,
         part_distribution: c.part_distribution,
         content_liveness: c.content_liveness,
+        lifecycle_event_journal: c.lifecycle_event_journal,
+        lifecycle_event_capacity: c.lifecycle_event_capacity as u32,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -706,6 +710,24 @@ pub struct NativeContentLiveness {
     pub stranded_dead_logical_bytes: BigInt,
     pub live_blocks: NativeFoldBlockSpace,
     pub reclaimable_blocks: NativeFoldBlockSpace,
+}
+
+#[napi(object)]
+pub struct NativeLifecycleEvent {
+    pub sequence: BigInt,
+    pub operation: String,
+    pub outcome: String,
+    pub error_class: Option<String>,
+    pub duration_ns: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeLifecycleEventBatch {
+    pub events: Vec<NativeLifecycleEvent>,
+    pub oldest_available_sequence: Option<BigInt>,
+    pub latest_sequence: BigInt,
+    pub dropped_events: BigInt,
+    pub gap: bool,
 }
 
 #[napi(object)]
@@ -1640,6 +1662,24 @@ impl NativeStore {
             .await
             .map(encode_store_metrics)
             .map_err(|error| engine_failure("read TurnDB operation metrics", error))
+    }
+
+    /// Read bounded lifecycle outcomes after an independent sequence cursor.
+    #[napi]
+    pub async fn lifecycle_events(
+        &self,
+        after_sequence: Option<BigInt>,
+        limit: Option<u32>,
+    ) -> Result<NativeLifecycleEventBatch> {
+        let after_sequence = after_sequence
+            .map(|value| decode_u64(value, "afterSequence"))
+            .transpose()?
+            .unwrap_or(0);
+        self.actor
+            .lifecycle_events(after_sequence, limit.unwrap_or(100) as usize)
+            .await
+            .map(encode_lifecycle_events)
+            .map_err(|error| engine_failure("read TurnDB lifecycle events", error))
     }
 
     /// Inspect exact live immutable-part file-size and physical-row distribution.
@@ -2677,6 +2717,28 @@ fn encode_content_liveness(
         stranded_dead_logical_bytes: BigInt::from(liveness.stranded_dead_logical_bytes),
         live_blocks: encode_space(liveness.live_blocks),
         reclaimable_blocks: encode_space(liveness.reclaimable_blocks),
+    }
+}
+
+fn encode_lifecycle_events(
+    batch: turndb::observability::LifecycleEventBatch,
+) -> NativeLifecycleEventBatch {
+    NativeLifecycleEventBatch {
+        events: batch
+            .events
+            .into_iter()
+            .map(|event| NativeLifecycleEvent {
+                sequence: BigInt::from(event.sequence),
+                operation: event.operation.name().to_string(),
+                outcome: event.outcome.name().to_string(),
+                error_class: event.error_class.map(|class| class.code().to_string()),
+                duration_ns: BigInt::from(event.duration_ns),
+            })
+            .collect(),
+        oldest_available_sequence: batch.oldest_available_sequence.map(BigInt::from),
+        latest_sequence: BigInt::from(batch.latest_sequence),
+        dropped_events: BigInt::from(batch.dropped_events),
+        gap: batch.gap,
     }
 }
 

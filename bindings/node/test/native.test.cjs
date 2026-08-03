@@ -39,6 +39,8 @@ test('reports the native capability profile without a portable fallback', () => 
     operationMetrics: true,
     partDistribution: true,
     contentLiveness: true,
+    lifecycleEventJournal: true,
+    lifecycleEventCapacity: 256,
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -870,6 +872,18 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.equal(metrics.verification.succeeded, 2n);
   assert.equal(metrics.verification.failed, 0n);
   assert.equal(metrics.verificationCorruptionFailures, 0n);
+  const events = await store.lifecycleEvents();
+  assert.equal(events.gap, false);
+  assert.equal(events.droppedEvents, 0n);
+  assert.equal(events.events[0].sequence, 1n);
+  assert.equal(events.events[0].operation, 'open_recovery');
+  assert.equal(events.events[0].outcome, 'succeeded');
+  assert.equal(events.events[0].errorClass, undefined);
+  assert.equal(events.latestSequence, events.events.at(-1).sequence);
+  assert.equal(events.events.filter(({ operation }) => operation === 'verification').length, 2);
+  const tail = await store.lifecycleEvents(events.events.at(-2).sequence, 1);
+  assert.equal(tail.events.length, 1);
+  assert.equal(tail.events[0].sequence, events.events.at(-1).sequence);
 });
 
 test('compacts one exact bounded work unit and classifies budgets for schedulers', async (t) => {

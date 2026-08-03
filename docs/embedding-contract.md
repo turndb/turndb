@@ -355,6 +355,9 @@ so consumer exporters never execute on the storage thread; see `docs/operation-m
 The cancellable `content_liveness` / `contentLiveness` inventory requires a settled memtable and
 separates live piece bytes, dead bytes stranded inside mixed blocks, and whole-block compressed
 payload eligible for punch/refold; see `docs/content-liveness.md`.
+`lifecycle_events_after` / `lifecycleEvents` provide a bounded, non-destructive structured outcome
+journal with independent sequence cursors and explicit loss accounting; see
+`docs/lifecycle-events.md`. Consumers own timestamps, correlation, thresholds, and export policy.
 
 ## 7. Compatibility policy
 

@@ -146,6 +146,10 @@ silently.
   piece bytes, dead bytes stranded inside mixed compressed blocks, and wholly unreferenced block
   payload eligible for punch/refold. It requires a flushed memtable and accepts cancellation; see
   [content liveness and reclamation](../../docs/content-liveness.md).
+- `lifecycleEvents(afterSequence, limit)` reads a bounded, non-destructive journal of stable lifecycle
+  operation/outcome/error-class/duration facts. Sequence gaps and cumulative eviction are explicit,
+  so independent exporters can detect loss; see
+  [bounded lifecycle events](../../docs/lifecycle-events.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to

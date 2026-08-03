@@ -2660,5 +2660,19 @@ fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
         })
         .unwrap_err();
     assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    let events = store.lifecycle_events_after(0, 100);
+    assert_eq!(events.events.len(), 7);
+    assert_eq!(events.events[0].sequence, 1);
+    assert_eq!(events.events[0].operation, turndb::observability::LifecycleOperation::OpenRecovery);
+    assert_eq!(events.events[0].outcome, turndb::observability::LifecycleOutcome::Succeeded);
+    let cancelled = events.events.last().unwrap();
+    assert_eq!(cancelled.operation, turndb::observability::LifecycleOperation::Sync);
+    assert_eq!(cancelled.outcome, turndb::observability::LifecycleOutcome::Cancelled);
+    assert_eq!(cancelled.error_class, Some(turndb::error::ErrorClass::Cancelled));
+    assert_eq!(events.latest_sequence, cancelled.sequence);
+    assert_eq!(events.dropped_events, 0);
+    assert!(!events.gap);
+    let tail = store.lifecycle_events_after(cancelled.sequence - 1, 1);
+    assert_eq!(tail.events, [*cancelled]);
     std::fs::remove_dir_all(&dir).ok();
 }

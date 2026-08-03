@@ -48,6 +48,6 @@ queue pressure. Query and structured-scan work keeps its operation-local row, re
 fold, and byte counters in each query/page result, where concurrent readers cannot contaminate one
 another through global deltas.
 
-This pull model is the first exporter hook: polling cannot block or re-enter storage execution, and
-the stable shape is straightforward to translate into an external metrics vocabulary. TurnDB may add
-bounded structured event polling later; it will not add OpenTelemetry concepts to the storage core.
+This pull model also includes bounded structured lifecycle event polling. The sequence cursor and
+explicit eviction/gap fields let exporters detect loss without callbacks or re-entry; see
+`lifecycle-events.md`. TurnDB does not add OpenTelemetry concepts to the storage core.
