@@ -7,7 +7,13 @@
  */
 
 /** An attribute value. Pass `{i}`/`{f}` to force int-vs-float when it matters. */
-export type AttrValue = string | number | boolean | bigint | { i: number } | { f: number };
+export type AttrValue =
+  | string
+  | number
+  | boolean
+  | bigint
+  | { i: number | bigint }
+  | { f: number };
 
 /**
  * Attributes as an object, or as pairs.
@@ -66,12 +72,24 @@ export interface StoreRecord {
   id: string;
   body: Uint8Array;
   /** Order and duplicate keys preserved, exactly as stored. */
-  attrs: Array<[string, unknown]>;
+  attrs: Array<[string, string | bigint | number | boolean]>;
 }
 
 export interface Stats {
   records: number;
   parts: number;
+}
+
+export interface Capabilities {
+  part_format_write: number;
+  part_format_read_max: number;
+  writer_exclusion: 'os_enforced' | 'embedder_enforced';
+  physical_erasure: 'punch_or_refold' | 'refold_only';
+  positioned_io: boolean;
+  threads: boolean;
+  columnar: boolean;
+  sql: boolean;
+  portable_wasm: boolean;
 }
 
 /** Every engine-reported failure, carrying the engine's own message. */
@@ -95,6 +113,8 @@ export declare class TurndbError extends Error {
 export declare class Store {
   /** True once {@link Store.close} has run. */
   readonly closed: boolean;
+  /** Guarantees of the compiled portable core. */
+  capabilities(): Capabilities;
   /** Write one record. Not durable until {@link Store.sync}. */
   putBody(id: string, body: Uint8Array | string, attrs?: Attrs): void;
   /** Apply many records atomically — all-or-nothing, so a crash cannot commit half an export. */
@@ -165,6 +185,9 @@ export declare class Store {
  */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
 
+/** Guarantees of the compiled portable core, independent of the host OS running WASI. */
+export declare function capabilities(): Promise<Capabilities>;
+
 /**
  * The first id that cannot start with `prefix`, or `null` when the range is unbounded above.
  *
@@ -175,5 +198,10 @@ export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
  */
 export declare function prefixUpperBound(prefix: string): string | null;
 
-declare const _default: { open: typeof open; Store: typeof Store; TurndbError: typeof TurndbError };
+declare const _default: {
+  open: typeof open;
+  capabilities: typeof capabilities;
+  Store: typeof Store;
+  TurndbError: typeof TurndbError;
+};
 export default _default;

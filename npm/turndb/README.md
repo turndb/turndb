@@ -115,6 +115,17 @@ for convenience, or an array of pairs when it matters:
 store.putBody(id, body, [['finishReason', 'end_turn'], ['finishReason', 'max_tokens']]);
 ```
 
+Stored integers return as JavaScript `bigint`, including small values. Integer-valued `number`
+inputs are accepted only inside JavaScript's safe range; use `bigint` for the full signed-i64 range.
+The JSON-only WASM boundary carries those values as decimal text internally, never through a float.
+Non-finite f64 values also use explicit text spellings rather than JSON `null`.
+
+## Capability profile
+
+`await capabilities()` (or `store.capabilities()`) reports the compiled core's actual guarantees.
+These describe the WASI guest, not the host OS: this package reports embedder-enforced writer
+exclusion, no threads, and refold-only physical reclamation even when Node itself runs on Linux.
+
 ## No SQL here, on purpose
 
 The query engine would dominate the artifact, and the two things an application does — a point

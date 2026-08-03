@@ -169,10 +169,20 @@ fn decode_attrs(json: &[u8]) -> Result<Vec<(String, AttrValue)>, String> {
                 val.as_str().ok_or_else(|| format!("attribute {key} is not a string"))?.to_string(),
             ),
             "i" => AttrValue::Int(
-                val.as_i64().ok_or_else(|| format!("attribute {key} is not an i64"))?,
+                match val {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not an i64"))?,
             ),
             "f" => AttrValue::Float(
-                val.as_f64().ok_or_else(|| format!("attribute {key} is not a number"))?,
+                match val {
+                    serde_json::Value::Number(n) => n.as_f64(),
+                    serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not an f64"))?,
             ),
             "b" => AttrValue::Bool(
                 val.as_bool().ok_or_else(|| format!("attribute {key} is not a boolean"))?,
@@ -191,7 +201,9 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
             .map(|(k, v)| {
                 let (tag, val) = match v {
                     AttrValue::Str(s) => ("s", serde_json::Value::from(s.clone())),
-                    AttrValue::Int(i) => ("i", serde_json::Value::from(*i)),
+                    // JSON numbers cross JavaScript as f64 and cannot represent every i64. Decimal
+                    // text keeps the portable ABI exact; the JS wrapper returns a BigInt.
+                    AttrValue::Int(i) => ("i", serde_json::Value::from(i.to_string())),
                     // A non-finite float has no JSON spelling. Carrying it across as a string
                     // keeps the value visible rather than silently turning it into null.
                     AttrValue::Float(f) => (
@@ -209,6 +221,19 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
+
+/// Machine-readable guarantees of this compiled WASI core.
+#[no_mangle]
+pub extern "C" fn tdb_capabilities() -> i32 {
+    clear_err();
+    match serde_json::to_vec(&turndb::capabilities::capabilities()) {
+        Ok(v) => {
+            set_out(&v);
+            0
+        }
+        Err(e) => fail(format!("encode capability profile: {e}")),
+    }
+}
 
 /// Open (or create) a store. Returns a handle, or -1.
 ///
@@ -645,5 +670,25 @@ mod tests {
             assert!(decode_attrs(bad).is_err(), "{:?} must be refused", std::str::from_utf8(bad));
         }
         assert!(decode_attrs(b"").unwrap().is_empty(), "empty means no attributes");
+    }
+
+    #[test]
+    fn json_boundary_keeps_i64_and_non_finite_f64_exact() {
+        let attrs = vec![
+            ("min".into(), AttrValue::Int(i64::MIN)),
+            ("max".into(), AttrValue::Int(i64::MAX)),
+            ("nan".into(), AttrValue::Float(f64::NAN)),
+            ("pos".into(), AttrValue::Float(f64::INFINITY)),
+            ("neg".into(), AttrValue::Float(f64::NEG_INFINITY)),
+        ];
+        let json = encode_attrs(&attrs);
+        assert_eq!(json[0][2], i64::MIN.to_string());
+        assert_eq!(json[1][2], i64::MAX.to_string());
+        let got = decode_attrs(json.to_string().as_bytes()).unwrap();
+        assert!(matches!(got[0].1, AttrValue::Int(i64::MIN)));
+        assert!(matches!(got[1].1, AttrValue::Int(i64::MAX)));
+        assert!(matches!(got[2].1, AttrValue::Float(v) if v.is_nan()));
+        assert!(matches!(got[3].1, AttrValue::Float(v) if v == f64::INFINITY));
+        assert!(matches!(got[4].1, AttrValue::Float(v) if v == f64::NEG_INFINITY));
     }
 }
