@@ -56,6 +56,12 @@ export interface OpenOptions {
   maxStoredFrameBytes?: number;
   /** Decoded output admitted for one part-TOC/section or fold-block frame; defaults to 512 MiB. */
   maxDecodedFrameBytes?: number;
+  /** Entries visited in one filesystem directory enumeration; defaults to 100,000. */
+  maxDirectoryEntries?: number;
+  /** Physical frames admitted in one unflushed WAL; defaults to 100,000. */
+  maxWalFrames?: number;
+  /** Content blocks admitted in one fold generation; defaults to 1,000,000. */
+  maxFoldBlocks?: number;
 }
 
 export interface ScanOptions {
@@ -108,6 +114,7 @@ export interface Capabilities {
   portable_wasm: boolean;
   write_admission_limits: true;
   read_admission_limits: true;
+  object_count_admission: true;
   store_space_usage: true;
   allocated_space_usage: boolean;
   format_migration: true;
@@ -124,6 +131,9 @@ export interface Capabilities {
   max_identifier_bytes_default: number;
   max_stored_frame_bytes_default: number;
   max_decoded_frame_bytes_default: number;
+  max_directory_entries_default: number;
+  max_wal_frames_default: number;
+  max_fold_blocks_default: number;
 }
 
 /** Every engine-reported failure, carrying the engine's own message. */
@@ -149,8 +159,14 @@ export declare class Store {
   readonly closed: boolean;
   /** Guarantees of the compiled portable core. */
   capabilities(): Capabilities;
-  /** Exact atomic persisted-frame admission configured for this handle. */
-  readLimits(): { maxStoredFrameBytes: number; maxDecodedFrameBytes: number };
+  /** Exact frame-byte and persistent object-count admission configured for this handle. */
+  readLimits(): {
+    maxStoredFrameBytes: number;
+    maxDecodedFrameBytes: number;
+    maxDirectoryEntries: number;
+    maxWalFrames: number;
+    maxFoldBlocks: number;
+  };
   /** Write one record. Not durable until {@link Store.sync}. */
   putBody(id: string, body: Uint8Array | string, attrs?: Attrs): void;
   /** Apply many records atomically — all-or-nothing, so a crash cannot commit half an export. */

@@ -35,7 +35,11 @@ impl Drop for ScopedDir {
 }
 
 fn limits(stored: u64, decoded: u64) -> ReadLimits {
-    ReadLimits { max_stored_frame_bytes: stored, max_decoded_frame_bytes: decoded }
+    ReadLimits {
+        max_stored_frame_bytes: stored,
+        max_decoded_frame_bytes: decoded,
+        ..ReadLimits::default()
+    }
 }
 
 fn binary_record(bytes: usize) -> Record {

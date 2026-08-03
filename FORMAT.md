@@ -853,12 +853,18 @@ manifest and candidate-dictionary ceilings define this reader's supported profil
 | segment sidecar | derived from segment length | impossible advisory sizes are ignored; the segment is scanned |
 | atomic frame stored bytes | 512 MiB | checked before WAL/part/fold input allocation; configurable per open |
 | atomic frame decoded bytes | 512 MiB | checked before part/fold codec output allocation; configurable per open |
+| filesystem directory entries | 100,000 | checked before enumeration-driven collection growth; configurable per open |
+| physical WAL frames | 100,000 | checked during replay and before writer/batch append; configurable per open |
+| fold blocks / block-id span | 1,000,000 | checked before sidecar/scan vectors and sparse-directory resize; configurable per open |
 
 The atomic-frame defaults are `ReadLimits`, not narrower format fields. A caller can raise them to
 open an older legitimate large-frame store or lower them for a stricter deployment. Tail scanning
 surfaces an over-budget valid frame as resource exhaustion rather than treating it as torn residue.
 Writers seal fold blocks early under the effective ceiling and check part sections/TOCs before the
 footer completeness marker, so they do not publish frames the same handle refuses to read.
+The object-count fields share the same runtime-only `ReadLimits`: they do not narrow any on-disk
+integer. Writer output reserves directory names, WAL frames, and fold block ids before mutation so a
+handle does not deliberately create structures it cannot later admit.
 
 Backup additionally resolves every source against the canonical store root and accepts only the
 ordinary file at that exact path. A symlinked part, fold directory, segment, sidecar, dictionary, or

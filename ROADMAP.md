@@ -616,7 +616,9 @@ This phase turns demonstrated behavior into promises that downstream projects ca
   configurable pre-allocation admission; advisory sidecars and dictionary candidates are bounded;
   atomic WAL/part/fold stored and decoded frames now have configurable per-open admission across
   Rust, native Node, and portable WASI, including writer-side output checks and fold progress;
-  parser, native, and portable boundaries plus remaining object-count/CPU risks are documented.
+  filesystem enumeration, physical WAL frames, and fold block/id growth now have configurable
+  object-count admission across the same surfaces, including writer-side output reservations;
+  parser, native, and portable boundaries plus remaining containment/CPU risks are documented.
 
 ### 1.0 gate
 

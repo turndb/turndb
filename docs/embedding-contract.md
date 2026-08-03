@@ -243,7 +243,7 @@ must report the reduced profile.
 | SQL/DataFusion | optional build feature | omitted from lightweight package |
 | format interoperability | revision 4 | revision 4 |
 | configurable write admission | u64 byte ceilings | positive u32 byte ceilings |
-| atomic frame read admission | u64 ceilings within address space | positive u32 ceilings |
+| atomic frame/object admission | u64 ceilings within address/format spaces | positive u32 ceilings |
 
 A production native Node package must never catch native-addon load failure and silently open the WASM
 writer. Portable use must be an explicit package or entry point chosen by the caller.
@@ -412,6 +412,12 @@ to 512 MiB and are configurable per open. A cache budget does not substitute for
 one entry must be materialized before it can be cached or evicted. Fold output splits early for
 progress; indivisible piece/part output refuses before mutation/publication. See
 `docs/read-admission.md`.
+
+Persistent collection admission closes the small-object counterpart: directory enumeration, physical
+WAL frames, and fold blocks/block-id span default to 100,000, 100,000, and 1,000,000. Checks precede
+reader collection growth and future writer mutation. A batch charges every member frame plus its
+commit marker, and a sparse checksummed block id cannot choose the fold-directory allocation. See
+`docs/object-admission.md`.
 
 The native SQL stream has a caller-configurable DataFusion execution-memory pool, while structured
 scans have byte ceilings, deadlines, and cooperative cancellation and the native command backlog is

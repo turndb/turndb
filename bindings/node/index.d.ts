@@ -175,6 +175,7 @@ export interface Capabilities {
   commandQueueCapacityMax: number;
   writeAdmissionLimits: true;
   readAdmissionLimits: true;
+  objectCountAdmission: true;
   storeSpaceUsage: true;
   allocatedSpaceUsage: boolean;
   formatMigration: true;
@@ -192,6 +193,9 @@ export interface Capabilities {
   maxIdentifierBytesDefault: number;
   maxStoredFrameBytesDefault: bigint;
   maxDecodedFrameBytesDefault: bigint;
+  maxDirectoryEntriesDefault: bigint;
+  maxWalFramesDefault: bigint;
+  maxFoldBlocksDefault: bigint;
   immutableSnapshots: true;
   lifecycleOperations: true;
   backupRestore: boolean;
@@ -230,6 +234,12 @@ export interface OpenOptions {
   maxStoredFrameBytes?: bigint;
   /** Decoded output admitted for one part-TOC/section or fold-block frame; defaults to 512 MiB. */
   maxDecodedFrameBytes?: bigint;
+  /** Entries visited in one filesystem directory enumeration; defaults to 100,000. */
+  maxDirectoryEntries?: bigint;
+  /** Physical frames admitted in one unflushed WAL; defaults to 100,000. */
+  maxWalFrames?: bigint;
+  /** Content blocks admitted in one fold generation; defaults to 1,000,000. */
+  maxFoldBlocks?: bigint;
   /** Raw bytes gathered per compressed content block; defaults to 4 MiB. */
   blockTargetBytes?: bigint;
   /** Decompressed content-block cache budget; defaults to 64 MiB. */
@@ -248,6 +258,9 @@ export interface SnapshotOpenOptions {
   maxConcurrentSqlMemoryBytes?: bigint;
   maxStoredFrameBytes?: bigint;
   maxDecodedFrameBytes?: bigint;
+  maxDirectoryEntries?: bigint;
+  maxWalFrames?: bigint;
+  maxFoldBlocks?: bigint;
 }
 
 export interface LifecycleOptions {
@@ -499,10 +512,16 @@ export interface RecoveryOptions extends LifecycleOptions {
   maxRollbackCommits?: bigint;
   maxStoredFrameBytes?: bigint;
   maxDecodedFrameBytes?: bigint;
+  maxDirectoryEntries?: bigint;
+  maxWalFrames?: bigint;
+  maxFoldBlocks?: bigint;
 }
 export interface RestoreOptions extends LifecycleOptions {
   maxStoredFrameBytes?: bigint;
   maxDecodedFrameBytes?: bigint;
+  maxDirectoryEntries?: bigint;
+  maxWalFrames?: bigint;
+  maxFoldBlocks?: bigint;
 }
 export declare function recoverManifest(
   path: string,
@@ -539,6 +558,9 @@ export declare class NativeSnapshot {
   readonly maxConcurrentSqlMemoryBytes: bigint;
   readonly maxStoredFrameBytes: bigint;
   readonly maxDecodedFrameBytes: bigint;
+  readonly maxDirectoryEntries: bigint;
+  readonly maxWalFrames: bigint;
+  readonly maxFoldBlocks: bigint;
   readonly reservedSqlMemoryBytes: bigint;
   scan(request?: ScanRequest): Promise<ScanPage>;
   explainScan(request?: ScanRequest): Promise<ScanExplanation>;
@@ -631,6 +653,7 @@ export declare class NativeStore {
     memtableEntries: bigint;
     memtableBytes: bigint;
     walBytes: bigint;
+    walFrames: bigint;
     foldDiskBytes: bigint;
     foldSegments: number;
     foldCacheHits: bigint;
@@ -645,6 +668,9 @@ export declare class NativeStore {
     partCacheBudget: bigint;
     maxStoredFrameBytes: bigint;
     maxDecodedFrameBytes: bigint;
+    maxDirectoryEntries: bigint;
+    maxWalFrames: bigint;
+    maxFoldBlocks: bigint;
     dedupWindowEntries: bigint;
     retainedCommits: bigint;
     punchedBlocks: bigint;

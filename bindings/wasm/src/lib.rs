@@ -291,7 +291,7 @@ pub unsafe extern "C" fn tdb_open(
     max_batch_records: u32,
     max_identifier_bytes: u32,
 ) -> i32 {
-    // Keep the original ABI for direct embedders. New readers use `tdb_open_v2`; zero selects the
+    // Keep the original ABI for direct embedders. New readers use `tdb_open_v3`; zero selects the
     // same compiled defaults here.
     unsafe {
         tdb_open_v2(
@@ -325,6 +325,45 @@ pub unsafe extern "C" fn tdb_open_v2(
     max_identifier_bytes: u32,
     max_stored_frame_bytes: u32,
     max_decoded_frame_bytes: u32,
+) -> i32 {
+    unsafe {
+        tdb_open_v3(
+            dir,
+            dir_len,
+            block_target,
+            level,
+            max_record_bytes,
+            max_batch_bytes,
+            max_batch_records,
+            max_identifier_bytes,
+            max_stored_frame_bytes,
+            max_decoded_frame_bytes,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Open with explicit atomic-frame and object-count admission. Numeric options are 0 for defaults.
+///
+/// # Safety
+/// `dir` must be valid UTF-8 of `dir_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_open_v3(
+    dir: *const u8,
+    dir_len: u32,
+    block_target: u32,
+    level: i32,
+    max_record_bytes: u32,
+    max_batch_bytes: u32,
+    max_batch_records: u32,
+    max_identifier_bytes: u32,
+    max_stored_frame_bytes: u32,
+    max_decoded_frame_bytes: u32,
+    max_directory_entries: u32,
+    max_wal_frames: u32,
+    max_fold_blocks: u32,
 ) -> i32 {
     clear_err();
     let dir = match text(dir, dir_len) {
@@ -372,6 +411,21 @@ pub unsafe extern "C" fn tdb_open_v2(
             read_defaults.max_decoded_frame_bytes
         } else {
             u64::from(max_decoded_frame_bytes)
+        },
+        max_directory_entries: if max_directory_entries == 0 {
+            read_defaults.max_directory_entries
+        } else {
+            u64::from(max_directory_entries)
+        },
+        max_wal_frames: if max_wal_frames == 0 {
+            read_defaults.max_wal_frames
+        } else {
+            u64::from(max_wal_frames)
+        },
+        max_fold_blocks: if max_fold_blocks == 0 {
+            read_defaults.max_fold_blocks
+        } else {
+            u64::from(max_fold_blocks)
         },
     };
     match Store::open_with_options(

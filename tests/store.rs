@@ -93,6 +93,7 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
         read_limits: ReadLimits {
             max_stored_frame_bytes: 2 << 20,
             max_decoded_frame_bytes: 3 << 20,
+            ..ReadLimits::default()
         },
         ..StoreOptions::default()
     };
@@ -1062,7 +1063,7 @@ fn a_retained_snapshot_reads_the_past() {
 
     // The snapshot at c1 is the first flush, exactly: the old version, and no `gone` — it did not
     // exist yet, rather than "was deleted".
-    assert!(turndb::store::retained_commits(&dir).contains(&c1));
+    assert!(turndb::store::retained_commits(&dir).unwrap().contains(&c1));
     let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
     assert_eq!(old.reconstruct("k").unwrap().unwrap(), v1);
     assert!(old.reconstruct("gone").unwrap().is_none());
@@ -2092,7 +2093,7 @@ fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
     }
 
     // and TIME TRAVEL cannot resurrect it: the retained log was purged to the erasure's commit
-    let snaps = turndb::store::retained_commits(&dir);
+    let snaps = turndb::store::retained_commits(&dir).unwrap();
     assert_eq!(snaps.len(), 1, "erasure must purge every snapshot that could still serve the data");
     std::fs::remove_dir_all(&dir).ok();
 }

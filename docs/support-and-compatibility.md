@@ -72,6 +72,11 @@ declared as `bigint` never narrow through JavaScript `number`. Capability/result
 fields in a compatible release, so consumers should select fields rather than require exact object
 equality. Existing fields are not silently repurposed.
 
+The portable package's JavaScript wrapper is the public package API. Its low-level WASI exports are
+kept source-compatible for direct embedders where practical: `tdb_open` uses compiled admission
+defaults, `tdb_open_v2` adds frame-byte policy, and `tdb_open_v3` adds persistent object-count policy.
+New optional dimensions use a new export instead of changing an existing function signature.
+
 ## Errors and deprecation
 
 The stable Rust `ErrorClass`/Node `TurnDbError.code` spellings are versioned API; rendered messages and

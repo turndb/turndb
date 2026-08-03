@@ -283,7 +283,7 @@ impl Fold {
         Fold::open_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
     }
 
-    /// Open a writer with explicit atomic-frame read/write admission.
+    /// Open a writer with explicit frame and persistent object-count admission.
     pub fn open_with_limits(
         dir: &Path,
         cfg: FoldCfg,
@@ -302,7 +302,7 @@ impl Fold {
         Fold::open_at_with_limits(dir, cfg, committed, crate::read_limits::ReadLimits::default())
     }
 
-    /// Open and recover a writer under explicit atomic-frame admission.
+    /// Open and recover a writer under explicit frame and object-count admission.
     pub fn open_at_with_limits(
         dir: &Path,
         cfg: FoldCfg,
@@ -340,17 +340,27 @@ impl Fold {
             bail!("zstd level {} is outside the 1..=22 range this fold accepts", cfg.level);
         }
         crate::vfs::mkdir_all(dir).with_context(|| format!("create fold dir {}", dir.display()))?;
+        let (entries, has_lock, has_segment) = fold_directory_shape(dir, read_limits)?;
+        let additions = u64::from(!has_lock) + u64::from(!has_segment);
+        read_limits.admit_directory_entries(
+            "fold directory during writer open",
+            entries.saturating_add(additions),
+        )?;
         let lock = acquire_writer_lock(dir)?;
 
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().ends_with(".tmp") {
-                    let _ = crate::vfs::unlink(&e.path());
-                }
+        let rd = std::fs::read_dir(dir)
+            .with_context(|| format!("read fold directory {} for cleanup", dir.display()))?;
+        let mut visited = 0u64;
+        for e in rd {
+            visited = visited.saturating_add(1);
+            read_limits.admit_directory_entries("fold directory", visited)?;
+            let e = e?;
+            if e.file_name().to_string_lossy().ends_with(".tmp") {
+                let _ = crate::vfs::unlink(&e.path());
             }
         }
 
-        let mut nums = list_segments(dir)?;
+        let mut nums = list_segments_with_limits(dir, read_limits)?;
         nums.sort_unstable();
         for (i, n) in nums.iter().enumerate() {
             if *n != i as u32 {
@@ -501,10 +511,11 @@ impl Fold {
         // regenerated) when they cannot.
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
+        let mut seen_blocks = 0u64;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
             let entries = if h.seg != active {
-                match segment::read_dir_sidecar(dir, h.seg, len) {
+                match segment::read_dir_sidecar_with_limits(dir, h.seg, len, read_limits)? {
                     Some((_, e)) => e,
                     None => {
                         let (tail, e) = segment::scan_tail_with_limits(
@@ -523,11 +534,14 @@ impl Fold {
                 segment::scan_tail_with_limits(&readers[i], len, h.has_dict(), read_limits)?.1
             };
             for (id, off) in entries {
-                if blockdir.len() <= id as usize {
-                    blockdir.resize(id as usize + 1, None);
-                }
-                blockdir[id as usize] = Some((h.seg, off));
-                next_block = next_block.max(id + 1);
+                install_block_location(
+                    &mut blockdir,
+                    &mut next_block,
+                    &mut seen_blocks,
+                    id,
+                    (h.seg, off),
+                    read_limits,
+                )?;
             }
         }
 
@@ -578,13 +592,14 @@ impl Fold {
         Fold::open_read_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
     }
 
-    /// Open an unlocked reader with explicit atomic-frame admission.
+    /// Open an unlocked reader with explicit frame and object-count admission.
     pub fn open_read_with_limits(
         dir: &Path,
         cfg: FoldCfg,
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
-        let mut nums = list_segments(dir)?;
+        let read_limits = read_limits.validate()?;
+        let mut nums = list_segments_with_limits(dir, read_limits)?;
         if nums.is_empty() {
             bail!("no fold segments under {}", dir.display());
         }
@@ -596,16 +611,20 @@ impl Fold {
             segs.push(SegmentInput {
                 seg: n,
                 reader: reader as Arc<dyn ReadAt>,
-                sidecar: segment::read_dir_sidecar_bytes(dir, n, len),
+                sidecar: segment::read_dir_sidecar_bytes_with_limits(dir, n, len, read_limits)?,
             });
         }
         let mut dict_files = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("zdict-") && n.ends_with(".zd") {
-                    dict_files.push(read_bounded_candidate(&e.path(), MAX_DICTIONARY_BYTES)?);
-                }
+        let rd = std::fs::read_dir(dir)
+            .with_context(|| format!("read fold directory {} for dictionaries", dir.display()))?;
+        let mut visited = 0u64;
+        for e in rd {
+            visited = visited.saturating_add(1);
+            read_limits.admit_directory_entries("fold directory", visited)?;
+            let e = e?;
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("zdict-") && n.ends_with(".zd") {
+                dict_files.push(read_bounded_candidate(&e.path(), MAX_DICTIONARY_BYTES)?);
             }
         }
         Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, read_limits)
@@ -621,14 +640,15 @@ impl Fold {
         )
     }
 
-    /// Open a committed read-only prefix with explicit atomic-frame admission.
+    /// Open a committed read-only prefix with explicit frame and object-count admission.
     pub fn open_read_at_with_limits(
         dir: &Path,
         cfg: FoldCfg,
         committed: FoldTail,
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
-        let mut nums = list_segments(dir)?;
+        let read_limits = read_limits.validate()?;
+        let mut nums = list_segments_with_limits(dir, read_limits)?;
         nums.retain(|segment| *segment <= committed.seg);
         nums.sort_unstable();
         if nums.last().copied() != Some(committed.seg) {
@@ -656,16 +676,25 @@ impl Fold {
                 // active, and punched blocks can only be located through its sidecar. The parser
                 // below accepts it only when its embedded tail equals this bounded reader's length,
                 // so a sidecar describing a newer suffix remains safely advisory.
-                sidecar: segment::read_dir_sidecar_bytes(dir, segment, len),
+                sidecar: segment::read_dir_sidecar_bytes_with_limits(
+                    dir,
+                    segment,
+                    len,
+                    read_limits,
+                )?,
             });
         }
         let mut dict_files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("zdict-") && name.ends_with(".zd") {
-                    dict_files.push(read_bounded_candidate(&entry.path(), MAX_DICTIONARY_BYTES)?);
-                }
+        let entries = std::fs::read_dir(dir)
+            .with_context(|| format!("read fold directory {} for dictionaries", dir.display()))?;
+        let mut visited = 0u64;
+        for entry in entries {
+            visited = visited.saturating_add(1);
+            read_limits.admit_directory_entries("fold directory", visited)?;
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("zdict-") && name.ends_with(".zd") {
+                dict_files.push(read_bounded_candidate(&entry.path(), MAX_DICTIONARY_BYTES)?);
             }
         }
         Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, read_limits)
@@ -693,7 +722,7 @@ impl Fold {
         )
     }
 
-    /// Backend-neutral read open with explicit atomic-frame admission.
+    /// Backend-neutral read open with explicit frame and object-count admission.
     pub fn open_read_from_with_limits(
         mut segs: Vec<SegmentInput>,
         dict_files: Vec<Vec<u8>>,
@@ -741,24 +770,37 @@ impl Fold {
         // not mutate a store it does not own, and a slower open is the whole cost.
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
+        let mut seen_blocks = 0u64;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
-            let entries = match segs[i]
-                .sidecar
-                .as_ref()
-                .and_then(|b| segment::parse_dir_sidecar(b, h.seg, len))
-            {
-                Some((_, entries)) => entries,
+            let entries = match segs[i].sidecar.as_ref() {
+                Some(bytes) => {
+                    match segment::parse_dir_sidecar_with_limits(bytes, h.seg, len, read_limits)? {
+                        Some((_, entries)) => entries,
+                        None => {
+                            segment::scan_tail_with_limits(
+                                &readers[i],
+                                len,
+                                h.has_dict(),
+                                read_limits,
+                            )?
+                            .1
+                        }
+                    }
+                }
                 None => {
                     segment::scan_tail_with_limits(&readers[i], len, h.has_dict(), read_limits)?.1
                 }
             };
             for (id, off) in entries {
-                if blockdir.len() <= id as usize {
-                    blockdir.resize(id as usize + 1, None);
-                }
-                blockdir[id as usize] = Some((h.seg, off));
-                next_block = next_block.max(id + 1);
+                install_block_location(
+                    &mut blockdir,
+                    &mut next_block,
+                    &mut seen_blocks,
+                    id,
+                    (h.seg, off),
+                    read_limits,
+                )?;
             }
         }
         let cur_off = readers.last().unwrap().len()? as u32;
@@ -824,9 +866,21 @@ impl Fold {
         let atomic =
             self.read_limits.max_stored_frame_bytes.min(self.read_limits.max_decoded_frame_bytes);
         self.read_limits.admit("new fold block", raw.len() as u64, raw.len() as u64)?;
-        if !self.open_block.is_empty()
-            && self.open_block.len() as u64 > atomic.saturating_sub(raw.len() as u64)
-        {
+        let starts_new_block = self.open_block.is_empty()
+            || self.open_block.len() as u64 > atomic.saturating_sub(raw.len() as u64);
+        let proposed_block = if self.open_block.is_empty() {
+            self.next_block
+        } else if starts_new_block {
+            self.next_block
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("block id space exhausted"))?
+        } else {
+            self.next_block
+        };
+        if starts_new_block {
+            self.read_limits.admit_fold_blocks(u64::from(proposed_block) + 1)?;
+        }
+        if !self.open_block.is_empty() && starts_new_block {
             self.seal_block()?;
             self.write_ready(false)?;
         }
@@ -1042,10 +1096,13 @@ impl Fold {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }
+        self.read_limits.admit_fold_blocks(u64::from(d.block_id) + 1)?;
         if self.blockdir.len() <= d.block_id as usize {
             self.blockdir.resize(d.block_id as usize + 1, None);
         }
-        self.blockdir[d.block_id as usize] = Some((self.active, self.cur_off));
+        if self.blockdir[d.block_id as usize].replace((self.active, self.cur_off)).is_some() {
+            bail!("fold block id {} was written more than once", d.block_id);
+        }
         self.cur_off += n as u32;
         match self.inflight.entry(d.block_id) {
             Entry::Occupied(e) => {
@@ -1290,6 +1347,11 @@ impl Fold {
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
+        let entries = count_fold_directory_entries(&self.dir, self.read_limits)?;
+        self.read_limits.admit_directory_entries(
+            "fold directory during segment roll",
+            entries.saturating_add(2),
+        )?;
         let flags = self.headers[self.active as usize].flags;
         let f =
             self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
@@ -1351,14 +1413,71 @@ fn nthreads(cfg: usize) -> usize {
     }
 }
 
-fn list_segments(dir: &Path) -> Result<Vec<u32>> {
+fn list_segments_with_limits(
+    dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Vec<u32>> {
     let mut out = Vec::new();
-    for e in std::fs::read_dir(dir)?.flatten() {
+    let mut visited = 0u64;
+    for e in std::fs::read_dir(dir)? {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("fold directory", visited)?;
+        let e = e?;
         if let Some(n) = segment::parse_seg_name(&e.file_name().to_string_lossy()) {
             out.push(n);
         }
     }
     Ok(out)
+}
+
+fn count_fold_directory_entries(
+    dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<u64> {
+    Ok(fold_directory_shape(dir, read_limits)?.0)
+}
+
+fn fold_directory_shape(
+    dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, bool, bool)> {
+    let mut visited = 0u64;
+    let mut has_lock = false;
+    let mut has_segment = false;
+    for entry in std::fs::read_dir(dir)? {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("fold directory", visited)?;
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        has_lock |= name == "WRITER.lock";
+        has_segment |= segment::parse_seg_name(&name).is_some();
+    }
+    Ok((visited, has_lock, has_segment))
+}
+
+fn install_block_location(
+    blockdir: &mut Vec<Option<(u32, u32)>>,
+    next_block: &mut u32,
+    seen_blocks: &mut u64,
+    id: u32,
+    location: (u32, u32),
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<()> {
+    let required_ids = u64::from(id) + 1;
+    let required_entries = seen_blocks.saturating_add(1);
+    read_limits.admit_fold_blocks(required_ids)?;
+    read_limits.admit_fold_blocks(required_entries)?;
+    if blockdir.len() <= id as usize {
+        blockdir.resize(id as usize + 1, None);
+    }
+    if blockdir[id as usize].replace(location).is_some() {
+        bail!("fold block id {id} appears more than once in one generation");
+    }
+    *seen_blocks = required_entries;
+    *next_block = (*next_block)
+        .max(id.checked_add(1).ok_or_else(|| anyhow::anyhow!("fold block id space exhausted"))?);
+    Ok(())
 }
 
 /// Exclusive writer lock held for the fold's whole lifetime — the single-writer invariant.

@@ -80,14 +80,20 @@ novel, so acceptance never depends on hidden dedup history. An atomic batch is c
 validated before any member mutates the fold or WAL. See
 [write admission limits](../../docs/write-admission.md) for the exact unit and native API.
 
-## Atomic frame read admission
+## Frame and persistent object admission
 
 `open` also accepts `maxStoredFrameBytes` and `maxDecodedFrameBytes`, positive u32 values defaulting
 to 512 MiB. They are checked before a WAL, part, or fold frame allocates stored or decoded linear
-memory. `store.readLimits()` reports the effective pair. A strict profile seals fold blocks early so
-small records keep progressing; one indivisible oversized piece is refused before mutation, and an
-oversized part output is refused before publication. See
-[atomic frame read admission](../../docs/read-admission.md).
+memory. `maxDirectoryEntries`, `maxWalFrames`, and `maxFoldBlocks` are positive u32 object-count
+ceilings defaulting to 100,000, 100,000, and 1,000,000. They bound enumeration-driven collection
+growth, physical frames in an unflushed WAL, and blocks plus block-id span in one fold generation.
+`store.readLimits()` reports all five effective values.
+
+A strict frame profile seals fold blocks early so small records keep progressing; one indivisible
+oversized piece is refused before mutation, and an oversized part output is refused before
+publication. Batch WAL frames and future filesystem/block objects are likewise admitted before the
+associated mutation. See [atomic frame read admission](../../docs/read-admission.md) and
+[persistent object-count admission](../../docs/object-admission.md).
 
 ## When a write stalls, and by how much
 

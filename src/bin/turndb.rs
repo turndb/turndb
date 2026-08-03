@@ -162,7 +162,7 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "snapshots" => {
-            for c in turndb::store::retained_commits(&arg(0, "DIR")?) {
+            for c in turndb::store::retained_commits(&arg(0, "DIR")?)? {
                 println!("{c}");
             }
             Ok(())
@@ -207,7 +207,7 @@ fn inspect(path: &Path) -> Result<()> {
     let ids = rs.ids()?;
     println!("live records: {}", ids.len());
     if !path.is_file() {
-        let snaps = turndb::store::retained_commits(path);
+        let snaps = turndb::store::retained_commits(path)?;
         if !snaps.is_empty() {
             println!(
                 "snapshots: {}",

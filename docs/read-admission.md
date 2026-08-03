@@ -4,7 +4,7 @@ TurnDB checks persisted frame lengths before allocating either their stored inpu
 This is separate from cache budgeting: a cache can evict an entry after materialization, but cannot
 protect the allocation needed to materialize that one entry.
 
-`ReadLimits` has two inclusive runtime ceilings:
+`ReadLimits` has two inclusive atomic-frame ceilings:
 
 | Rust field | native/portable Node option | default |
 |---|---|---:|
@@ -66,6 +66,11 @@ persisted or newly built bytes is `RESOURCE_EXHAUSTED`. The Rust causes are type
 `ReadAdmissionError` variants, so bindings do not classify rendered prose.
 
 ## Related limits
+
+The same policy struct also bounds persistent object counts: filesystem directory entries, physical
+WAL frames, and fold blocks/block-id space. Those controls prevent many tiny objects or one sparse id
+from bypassing the byte limits described here; see
+[persistent object-count admission](object-admission.md).
 
 These controls do not replace write admission, scan reconstruction/work ceilings, SQL memory pools,
 or cache budgets. Pack TOC counts/names and metadata bytes use `PackLimits`; manifests and candidate
