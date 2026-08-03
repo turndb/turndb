@@ -37,6 +37,33 @@ migrates one part, closes and reopens, resumes the second part, and verifies tha
 whole-content identities remain exact. Old parts pinned by retained snapshots stay reported
 separately from the current-format live parts.
 
-This is not yet a claim that Phase 6 is complete. The executable suite still needs a measured
-sustained retention/compaction soak. It should extend the same external harness; adding consumer
-concepts to `src/` is not an acceptable way to make a fixture pass.
+## Sustained profile
+
+`bindings/node/qualification/soak.cjs` is a reusable workload driver. Each cycle durably acknowledges
+one atomic batch, flushes an immutable cut, creates both overwritten and tombstoned ids, and
+periodically drains part pressure through compaction units capped at eight inputs. It restarts the
+writer, pages and compares the complete live id set, measures dead content, preflights and performs a
+refold, verifies zero remaining dead/reclaimable bytes, and runs complete store verification. The
+ordinary Node suite runs 64 cycles as a bounded regression profile.
+
+On 2026-08-03, the larger local profile ran:
+
+```text
+node qualification/soak.cjs <empty-store-dir> 512
+512 cycles; 8 records/cycle; 2 KiB payloads
+5,630 acknowledged ops; 4,106 live records
+127 bounded compactions; 31 writer restarts; 9 live parts high-water
+2,074,624 dead logical bytes before refold
+25,165 fold bytes before refold; 201 after
+21,472 final logical store bytes; 22,298.89 ms elapsed
+```
+
+This is lifecycle evidence, not a throughput benchmark: the payload is deliberately compressible and
+the result includes local filesystem/fsync behavior. A first policy that ran only one eight-input
+compaction every eight produced parts reached a high-water of 71. It was rejected: the merge output is
+itself a part, so that cadence accumulates one part per interval. Draining through additional bounded
+units held the high-water at 9 without replacing bounded work with an unbounded operation. Compaction
+cadence remains consumer policy; TurnDB supplies exact backlog, plans, limits, and outcomes.
+
+The Phase 6 matrix now exercises every listed workload property through public consumer seams. Adding
+consumer concepts to `src/` remains an unacceptable way to keep it passing.
