@@ -23,7 +23,9 @@ silently.
   `durable: true` has also synced the WAL. With `false` (the default), call `sync()` for a durability
   acknowledgement.
 - Attributes are an ordered array, not an object. Duplicate names and exact scalar types survive.
-  Integers enter and leave as JavaScript `bigint`; binary content uses `Buffer`.
+  Signed/unsigned integers and UTC nanosecond timestamps enter and leave as JavaScript `bigint`;
+  binary metadata and content use `Buffer`; explicit null carries its own `kind`. See
+  [the revision-4 scalar contract](../../docs/field-types-v4.md).
 - `scan()` is the Rust structured pager. Rust owns visibility, filtering, ordering, work bounds, and
   opaque cursor validation. The writer view includes accepted unflushed writes. Content metadata
   includes `identity`, the lowercase BLAKE3 hex digest of the complete reconstructed value, when its

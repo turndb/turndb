@@ -6,14 +6,18 @@
  * either.
  */
 
-/** An attribute value. Pass `{i}`/`{f}` to force int-vs-float when it matters. */
+/** An attribute value. Wrappers preserve distinctions JavaScript primitives cannot express. */
 export type AttrValue =
   | string
   | number
   | boolean
   | bigint
+  | Uint8Array
+  | null
   | { i: number | bigint }
-  | { f: number };
+  | { f: number }
+  | { u: number | bigint }
+  | { timestampNs: number | bigint };
 
 /**
  * Attributes as an object, or as pairs.
@@ -72,7 +76,7 @@ export interface StoreRecord {
   id: string;
   body: Uint8Array;
   /** Order and duplicate keys preserved, exactly as stored. */
-  attrs: Array<[string, string | bigint | number | boolean]>;
+  attrs: Array<[string, AttrValue]>;
 }
 
 export interface Stats {

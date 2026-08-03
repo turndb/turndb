@@ -117,6 +117,10 @@ store.putBody(id, body, [['finishReason', 'end_turn'], ['finishReason', 'max_tok
 
 Stored integers return as JavaScript `bigint`, including small values. Integer-valued `number`
 inputs are accepted only inside JavaScript's safe range; use `bigint` for the full signed-i64 range.
+Unsigned u64 and UTC nanosecond timestamps use `{ u: bigint }` and
+`{ timestampNs: bigint }` wrappers so a read-modify-write cycle retains their type. `Uint8Array`
+stores binary metadata and `null` stores explicit null; missing remains absence of the key. See
+[the revision-4 scalar contract](../../docs/field-types-v4.md).
 The JSON-only WASM boundary carries those values as decimal text internally, never through a float.
 Non-finite f64 values also use explicit text spellings rather than JSON `null`.
 

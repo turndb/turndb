@@ -20,7 +20,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.threads, false);
   assert.equal(c.columnar, false);
   assert.equal(c.sql, false);
-  assert.equal(c.part_format_write, 3);
+  assert.equal(c.part_format_write, 4);
 
   await withStore((s) => assert.deepEqual(s.capabilities(), c));
 });
@@ -74,6 +74,23 @@ test('i64 attributes never round through a JavaScript Number', async () => {
       () => s.putBody('unsafe', 'body', { n: Number.MAX_SAFE_INTEGER + 1 }),
       /pass a BigInt/,
     );
+  });
+});
+
+test('extended scalar attributes preserve their type and exact value', async () => {
+  await withStore((s) => {
+    const attrs = [
+      ['u', { u: 18446744073709551615n }],
+      ['raw', Uint8Array.from([0, 255, 128])],
+      ['at', { timestampNs: -9223372036854775808n }],
+      ['nothing', null],
+    ];
+    s.putBody('extended', 'body', attrs);
+    const got = Object.fromEntries(s.getRecord('extended').attrs);
+    assert.deepEqual(got.u, { u: 18446744073709551615n });
+    assert.deepEqual(got.raw, Uint8Array.from([0, 255, 128]));
+    assert.deepEqual(got.at, { timestampNs: -9223372036854775808n });
+    assert.equal(got.nothing, null);
   });
 });
 

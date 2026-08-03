@@ -50,6 +50,10 @@ pub const BATCH_RECORD_V2_TAG: u8 = 0x5D;
 pub const RECORD_V3_TAG: u8 = 0x5E;
 /// [`RECORD_V3_TAG`], inside a batch.
 pub const BATCH_RECORD_V3_TAG: u8 = 0x5F;
+/// A revision-4 general record carrying the complete scalar attribute type system.
+pub const RECORD_V4_TAG: u8 = 0x60;
+/// [`RECORD_V4_TAG`], inside a batch.
+pub const BATCH_RECORD_V4_TAG: u8 = 0x61;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
@@ -140,11 +144,15 @@ fn put_attrs(out: &mut Vec<u8>, attrs: &[(String, AttrValue)]) {
             // bit pattern, not value — NaN payloads and -0.0 must replay exactly
             AttrValue::Float(f) => out.extend_from_slice(&f.to_bits().to_le_bytes()),
             AttrValue::Bool(b) => out.push(u8::from(*b)),
+            AttrValue::UInt(i) => out.extend_from_slice(&i.to_le_bytes()),
+            AttrValue::Bytes(bytes) => put_bytes(out, bytes),
+            AttrValue::TimestampNs(ns) => out.extend_from_slice(&ns.to_le_bytes()),
+            AttrValue::Null => {}
         }
     }
 }
 
-fn get_attrs(b: &[u8], at: &mut usize) -> Result<Vec<(String, AttrValue)>> {
+fn get_attrs(b: &[u8], at: &mut usize, revision_four: bool) -> Result<Vec<(String, AttrValue)>> {
     let n_attrs = usize::try_from(get_varint(b, at)?)
         .context("wal: attribute count exceeds this platform's address space")?;
     let mut attrs = Vec::with_capacity(n_attrs.min(b.len()));
@@ -159,6 +167,14 @@ fn get_attrs(b: &[u8], at: &mut usize) -> Result<Vec<(String, AttrValue)>> {
                 take(b, at, 8)?.try_into().unwrap(),
             ))),
             3 => AttrValue::Bool(take(b, at, 1)?[0] != 0),
+            4 if revision_four => {
+                AttrValue::UInt(u64::from_le_bytes(take(b, at, 8)?.try_into().unwrap()))
+            }
+            5 if revision_four => AttrValue::Bytes(get_bytes(b, at)?.to_vec()),
+            6 if revision_four => {
+                AttrValue::TimestampNs(i64::from_le_bytes(take(b, at, 8)?.try_into().unwrap()))
+            }
+            7 if revision_four => AttrValue::Null,
             t => bail!("wal: unknown attr type tag {t}"),
         };
         attrs.push((key, v));
@@ -186,7 +202,7 @@ fn get_novel(b: &[u8], at: &mut usize) -> Result<Vec<(PieceHash, Vec<u8>)>> {
     Ok(novel)
 }
 
-/// Encode the general record payload written by revision 3.
+/// Encode the general record payload written by revision 4.
 pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
     crate::types::validate_contents(&r.contents)?;
     if r.id.is_empty() {
@@ -241,6 +257,14 @@ fn encode_record_v1(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)
 /// every count is capped by the bytes that would have to carry it before it sizes an allocation,
 /// and every fixed-width read is bounds-checked: corrupt input is an error, never a panic.
 pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
+    decode_record_with_attr_revision(b, true)
+}
+
+fn decode_record_v3(b: &[u8]) -> Result<CarvedRecord> {
+    decode_record_with_attr_revision(b, false)
+}
+
+fn decode_record_with_attr_revision(b: &[u8], revision_four: bool) -> Result<CarvedRecord> {
     let mut at = 0usize;
     let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
     let n_contents = usize::try_from(get_varint(b, &mut at)?)
@@ -264,7 +288,7 @@ pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
         content.identity = identity;
         contents.push(content);
     }
-    let attrs = get_attrs(b, &mut at)?;
+    let attrs = get_attrs(b, &mut at, revision_four)?;
     let novel = get_novel(b, &mut at)?;
     if at != b.len() {
         bail!("wal: record has {} trailing bytes", b.len() - at);
@@ -282,7 +306,7 @@ fn decode_record_v2(b: &[u8]) -> Result<CarvedRecord> {
         let name = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
         contents.push(Content::new(name, get_ops(b, &mut at)?));
     }
-    let attrs = get_attrs(b, &mut at)?;
+    let attrs = get_attrs(b, &mut at, false)?;
     let novel = get_novel(b, &mut at)?;
     if at != b.len() {
         bail!("wal: revision-2 record has {} trailing bytes", b.len() - at);
@@ -294,7 +318,7 @@ fn decode_record_v1(b: &[u8]) -> Result<CarvedRecord> {
     let mut at = 0usize;
     let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
     let body = get_ops(b, &mut at)?;
-    let attrs = get_attrs(b, &mut at)?;
+    let attrs = get_attrs(b, &mut at, false)?;
     let novel = get_novel(b, &mut at)?;
     if at != b.len() {
         bail!("wal: legacy record has {} trailing bytes", b.len() - at);
@@ -391,7 +415,7 @@ impl Wal {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         let encoded = encode_record(&mut scratch, r, novel);
-        let res = encoded.and_then(|()| self.append_frame(RECORD_V3_TAG, seq, &scratch));
+        let res = encoded.and_then(|()| self.append_frame(RECORD_V4_TAG, seq, &scratch));
         self.scratch = scratch;
         res
     }
@@ -410,7 +434,7 @@ impl Wal {
                 BATCH_TOMB_TAG
             } else {
                 encode_record(&mut scratch, r, novel)?;
-                BATCH_RECORD_V3_TAG
+                BATCH_RECORD_V4_TAG
             };
             let res = self.append_frame(tag, seq, &scratch);
             self.scratch = scratch;
@@ -484,6 +508,8 @@ impl Wal {
                     | BATCH_RECORD_V2_TAG
                     | RECORD_V3_TAG
                     | BATCH_RECORD_V3_TAG
+                    | RECORD_V4_TAG
+                    | BATCH_RECORD_V4_TAG
             );
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
@@ -553,11 +579,13 @@ impl Wal {
                     }
                 }
                 FRAME_TAG | BATCH_FRAME_TAG | RECORD_V2_TAG | BATCH_RECORD_V2_TAG
-                | RECORD_V3_TAG | BATCH_RECORD_V3_TAG => {
+                | RECORD_V3_TAG | BATCH_RECORD_V3_TAG | RECORD_V4_TAG | BATCH_RECORD_V4_TAG => {
                     let decoded = if matches!(hdr[0], FRAME_TAG | BATCH_FRAME_TAG) {
                         decode_record_v1(&payload)
                     } else if matches!(hdr[0], RECORD_V2_TAG | BATCH_RECORD_V2_TAG) {
                         decode_record_v2(&payload)
+                    } else if matches!(hdr[0], RECORD_V3_TAG | BATCH_RECORD_V3_TAG) {
+                        decode_record_v3(&payload)
                     } else {
                         decode_record(&payload)
                     };
@@ -566,7 +594,10 @@ impl Wal {
                             let fr = Frame { seq, tomb: false, record, novel };
                             if matches!(
                                 hdr[0],
-                                BATCH_FRAME_TAG | BATCH_RECORD_V2_TAG | BATCH_RECORD_V3_TAG
+                                BATCH_FRAME_TAG
+                                    | BATCH_RECORD_V2_TAG
+                                    | BATCH_RECORD_V3_TAG
+                                    | BATCH_RECORD_V4_TAG
                             ) {
                                 pending.push(fr);
                             } else {
@@ -611,6 +642,10 @@ mod tests {
                     ("f".into(), AttrValue::Float(f64::from_bits(0x7ff8_0000_0000_0001))),
                     ("z".into(), AttrValue::Float(-0.0)),
                     ("b".into(), AttrValue::Bool(true)),
+                    ("u".into(), AttrValue::UInt(u64::MAX)),
+                    ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 1])),
+                    ("at".into(), AttrValue::TimestampNs(i64::MIN)),
+                    ("none".into(), AttrValue::Null),
                 ],
             },
             vec![(h, bytes)],
@@ -634,11 +669,12 @@ mod tests {
     }
 
     #[test]
-    fn three_record_revisions_replay_together() {
+    fn four_record_revisions_replay_together() {
         let d = std::env::temp_dir().join(format!("turndb-wal-mixed-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("wal");
-        let (legacy, novel) = rec();
+        let (mut legacy, novel) = rec();
+        legacy.attrs.truncate(5); // revisions 1-3 know only the original scalar tags
         let revision_two = Record::new(
             "v2",
             vec![
@@ -658,6 +694,8 @@ mod tests {
             vec![],
         )
         .unwrap();
+        let (mut revision_four, revision_four_novel) = rec();
+        revision_four.id = "v4".into();
         {
             let mut w = Wal::open(&p).unwrap();
             let mut old_payload = Vec::new();
@@ -666,16 +704,20 @@ mod tests {
             let mut v2_payload = Vec::new();
             encode_record_v2(&mut v2_payload, &revision_two, &[]).unwrap();
             w.append_frame(RECORD_V2_TAG, 1, &v2_payload).unwrap();
-            w.append(1, &revision_three, &[]).unwrap();
+            let mut v3_payload = Vec::new();
+            encode_record(&mut v3_payload, &revision_three, &[]).unwrap();
+            w.append_frame(RECORD_V3_TAG, 1, &v3_payload).unwrap();
+            w.append(1, &revision_four, &revision_four_novel).unwrap();
             w.sync().unwrap();
         }
         let replay = Wal::replay(&p).unwrap();
-        assert_eq!(replay.len(), 3);
+        assert_eq!(replay.len(), 4);
         assert_eq!(replay[0].record.contents, legacy.contents);
         assert_eq!(replay[0].record.contents[0].name, BODY_CONTENT);
         assert_eq!(replay[1].record, revision_two);
         assert_eq!(replay[1].record.contents[0].identity, None);
         assert_eq!(replay[2].record, revision_three);
+        assert_eq!(replay[3].record, revision_four);
         std::fs::remove_dir_all(&d).ok();
     }
 

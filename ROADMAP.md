@@ -78,6 +78,11 @@ content model right before compatibility turns today's choices into permanent pr
   tombstones for every partial run, and returns typed invalid/insufficient-budget failures instead of
   overrunning. The native actor settles its exact cut before planning and exposes the same primitive,
   cancellation, result facts, and capability without adopting a consumer scheduling policy.
+  Format revision 4 completes the initial generic scalar field system with exact u64, arbitrary
+  binary metadata, UTC Unix-nanosecond timestamps, and explicit null. WAL/part readers retain old
+  revisions, full and streaming builders share the new encodings, structured scans distinguish null
+  from missing, Arrow preserves unsigned/binary/timestamp types and uses an explicit null-presence
+  marker, and native/portable bindings keep every discriminant without lossy JavaScript numbers.
 
 ## Product boundary
 
@@ -200,7 +205,7 @@ erasure.
 - APIs that expose a content reference's identity, logical length, and presence without reconstructing
   its bytes.
 - Deduplication across records, content names, record families, and consumers sharing a store.
-- A defined initial field type system, including at least:
+- A defined initial field type system, including at least: **implemented in revision 4:**
   - UTF-8 string.
   - Signed and unsigned integer with exact widths or ranges.
   - Floating point with the existing byte-exact guarantees for special values.
@@ -334,7 +339,8 @@ current/retained snapshots, structured scan, bounded parameterized SQL-to-Arrow 
 named-content reconstruction, and close. One dedicated
 Rust thread owns the writer; a bounded per-store command queue defaults to 64, permits an explicit
 capacity from 1 through 65,536, and refuses overload rather than accumulating unbounded Promises.
-Node integration tests load the addon and cover exact `i64::MIN` bigint, NaN,
+Node integration tests load the addon and cover exact signed/unsigned bigint, binary metadata, UTC
+nanosecond timestamps, explicit null, NaN,
 ordered duplicate attributes, named and empty content, projection, predicates, paging/cursor misuse,
 snapshot isolation/publication, retained commits, typed SQL parameters, Arrow IPC batch pulls,
 read-only plan enforcement, query memory exhaustion/cancellation, deletion, and close refusal.

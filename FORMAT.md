@@ -1,6 +1,6 @@
 # turndb on-disk format
 
-**Status: format version 3. Not frozen.** See [Compatibility](#compatibility) for what is
+**Status: format version 4. Not frozen.** See [Compatibility](#compatibility) for what is
 promised and what is not.
 
 This is the one document in this repository, and the only place mechanics are written down twice. It
@@ -245,7 +245,7 @@ dictionary's size.
 | `layout`, `layout.off`, `colmeta` | any record carries an attribute |
 | `col.val.N` | column *N* exists in `colmeta` |
 | `col.rid.N` | column *N*'s `rid_kind` is 1 (delta); absent and **elided** when dense |
-| `col.dict.N` | column *N*'s tag is 0 (string) |
+| `col.dict.N` | column *N*'s tag is 0 (string) or 5 (binary) |
 
 **Optional / advisory.** A reader may ignore these entirely and remain correct, only slower or less
 strict. A writer at this version always emits all of them except `tomb`.
@@ -263,7 +263,8 @@ moving `version`.
 Version-0 and version-1 parts predate named content. They require `prog` and `prog.off`, holding one
 body program per row, instead of `cmeta` and `con.*`; a current reader presents that physical body as
 a dense content column named `body`. Version 2 introduced named content without whole-value
-identities. Version 3 adds `con.id.N`; it never writes the legacy sections.
+identities. Version 3 adds `con.id.N`. Version 4 adds the extended attribute tags 4 through 7; it
+never writes the legacy sections.
 
 **The piece dictionary is sorted in fold order, not hash order**, and `pdict.hsort` carries hash order
 separately. Two orders over one dictionary rather than two dictionaries: fold order keeps `pdict.loc`
@@ -308,14 +309,14 @@ repeated n_tombstones times:
 
 #### col.dict.N
 
-Sorted and distinct, which is what lets a reader binary-search it for a value and compare ordinals
-instead of strings.
+Sorted and distinct, which is what lets a reader binary-search it for a value and compare ordinals.
+Entries are UTF-8 for tag 0 and arbitrary bytes for tag 5.
 
 ```
 varint   n_entries
 repeated n_entries times:
   varint  len
-  bytes   utf8
+  bytes   utf8 for tag 0, arbitrary bytes for tag 5
 ```
 
 #### layout
@@ -404,10 +405,10 @@ repeated n_columns times:
   if 1:  8 bytes min, 8 bytes max
 ```
 
-Min and max encode in the column's own width rules: i64 little-endian, f64 as **bits** (compared
-as floats by the reader), bool widened to 8 bytes as 0 or 1. Three deliberate absences: a string
-column never carries a zone, because its sorted-distinct dictionary already bounds it and bytes
-repeating that would say nothing; a float column that ever saw a **NaN** declares itself
+Min and max encode in the column's own width rules: i64/timestamp and u64 little-endian, f64 as
+**bits** (compared as floats by the reader), bool widened to 8 bytes as 0 or 1. Deliberate absences:
+string and binary columns use their sorted-distinct dictionaries as bounds; explicit null is
+unordered; a float column that ever saw a **NaN** declares itself
 unprunable, because NaN is unordered and any range claiming to cover it would prune wrongly; and a
 column with no occurrences has nothing to bound. A reader resolves **every** doubt — absent
 section, damaged entry, out-of-range ordinal — to "no pruning": a zone map may only ever widen
@@ -424,6 +425,10 @@ homogeneous columns rather than one that can mis-decode. Type tags and value wid
 | 1 | i64 | 8 | |
 | 2 | f64 | 8 | stored as **bits**, so -0.0 and NaN payloads round-trip exactly |
 | 3 | bool | 1 | |
+| 4 | u64 | 8 | full unsigned range; never rounded through i64 |
+| 5 | binary | 4 | u32 ordinal into a byte-sorted `col.dict.N` |
+| 6 | timestamp | 8 | signed Unix nanoseconds, UTC |
+| 7 | explicit null | 0 | occurrence lives entirely in `rid` and `layout` |
 
 A column is a sparse pair of parallel arrays: `rid` (ascending row indices) and `val`. `col.rid.N` is
 encoded per `colmeta`: kind 0 (`RID_DENSE`) means the array is exactly `0..n` and is **elided** — it
@@ -475,8 +480,10 @@ a reader to act on.
 | 0x59 | **batch commit** | varint member count |
 | 0x5C | version-2 record with named content | current payload below, without identity fields |
 | 0x5D | version-2 record, **inside a batch** | as 0x5C |
-| 0x5E | version-3 record with whole-content identities | current payload below |
+| 0x5E | version-3 record with whole-content identities | current payload below, attribute tags 0 through 3 only |
 | 0x5F | version-3 record, **inside a batch** | as 0x5E |
+| 0x60 | version-4 record with the complete scalar attribute tags | current payload below |
+| 0x61 | version-4 record, **inside a batch** | as 0x60 |
 
 A batch is a group of writes that replays **all or none** — the unit an ingest source actually
 sent, kept whole across a crash. Its members are ordinary record and tombstone payloads under the
@@ -514,8 +521,10 @@ varint   n_attrs
 repeated n_attrs times:
   varint  key_len
   bytes   key
-  u8      tag              0 string, 1 i64, 2 f64 bits, 3 bool
-  value   tag 0: varint len + utf8;  1: 8 bytes i64;  2: 8 bytes f64 BITS;  3: 1 byte
+  u8      tag              0 string, 1 i64, 2 f64 bits, 3 bool, 4 u64,
+                           5 binary, 6 UTC Unix nanoseconds, 7 explicit null
+  value   tag 0: varint len + utf8; 1: 8 bytes i64; 2: 8 bytes f64 BITS; 3: 1 byte;
+          4: 8 bytes u64; 5: varint len + bytes; 6: 8 bytes i64; 7: no bytes
 varint   n_novel
 repeated n_novel times:
   32 bytes hash
@@ -523,9 +532,10 @@ repeated n_novel times:
   bytes    piece content
 ```
 
-The version-2 0x5C/0x5D payload omits `identity_present` and `identity` but otherwise matches the
-named-content layout. The legacy 0x57/0x5A payload places one `n_ops` program directly after the id,
-followed by the same attribute and novel-piece encodings. It has no content count or name.
+The version-3 0x5E/0x5F payload has the same content layout but accepts only attribute tags 0 through
+3. Version 2 omits `identity_present` and `identity` and likewise accepts only those original tags.
+The legacy 0x57/0x5A payload places one `n_ops` program directly after the id, followed by the
+original attribute and novel-piece encodings. It has no content count or name.
 
 Two differences from a part's `con.prog.N`, both deliberate and neither incidental:
 
@@ -849,7 +859,7 @@ may sit at fold generation 40 while never having changed format revision at all.
 
 What that requires of a change:
 
-* a change a version-3 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
+* a change a version-4 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
 * note what these levers do **not** cover: they guard against misparsing, not against a conformant
   writer violating a privacy or retention invariant. A part that parses perfectly can still carry

@@ -94,6 +94,97 @@ fn schema_names_columns_by_key_and_never_merges_two_types() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test]
+async fn extended_scalar_columns_keep_exact_arrow_types_and_null_presence() {
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+    let dir = tmp("extended-scalars");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put(
+        "a",
+        &[Span::Lit(b"")],
+        vec![
+            ("u".into(), AttrValue::UInt(u64::MAX)),
+            ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 1])),
+            ("at".into(), AttrValue::TimestampNs(-1_234_567_890)),
+            ("nothing".into(), AttrValue::Null),
+        ],
+    )
+    .unwrap();
+    s.put(
+        "b",
+        &[Span::Lit(b"")],
+        vec![
+            ("u".into(), AttrValue::UInt(7)),
+            ("raw".into(), AttrValue::Bytes(vec![0, 1])),
+            ("at".into(), AttrValue::TimestampNs(i64::MAX)),
+        ],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let parts = parts_of(&dir);
+    let lens = Lens::new(&parts).unwrap();
+    let schema = lens.schema();
+    assert_eq!(schema.field_with_name("u").unwrap().data_type(), &DataType::UInt64);
+    assert_eq!(
+        schema.field_with_name("raw").unwrap().data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary))
+    );
+    assert_eq!(
+        schema.field_with_name("at").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+    );
+    assert_eq!(schema.field_with_name("nothing#null").unwrap().data_type(), &DataType::Boolean);
+
+    let projection = lens.project(&["id", "u", "raw", "at", "nothing#null"]).unwrap();
+    let (batches, _) = collect(&parts, None, &lens, &projection).unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let null_presence = batch.column(4).as_boolean();
+    assert!(null_presence.value(0));
+    assert!(null_presence.is_null(1), "missing and explicit null must remain distinct");
+
+    for id in ["a", "b"] {
+        let row = s.get(id).unwrap().unwrap();
+        assert_eq!(
+            row.attrs,
+            if id == "a" {
+                vec![
+                    ("u".into(), AttrValue::UInt(u64::MAX)),
+                    ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 1])),
+                    ("at".into(), AttrValue::TimestampNs(-1_234_567_890)),
+                    ("nothing".into(), AttrValue::Null),
+                ]
+            } else {
+                vec![
+                    ("u".into(), AttrValue::UInt(7)),
+                    ("raw".into(), AttrValue::Bytes(vec![0, 1])),
+                    ("at".into(), AttrValue::TimestampNs(i64::MAX)),
+                ]
+            }
+        );
+    }
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let mut query = SqlQuery::open(
+        reader,
+        "SELECT id FROM records WHERE u = $1 AND raw = $2 AND at = $3",
+        vec![
+            SqlValue::UInt(u64::MAX),
+            SqlValue::Binary(vec![0, 0xff, 1]),
+            SqlValue::TimestampNs(-1_234_567_890),
+        ],
+        SqlOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(query.next().await.unwrap().unwrap().rows, 1);
+    assert!(query.next().await.unwrap().is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn parts_with_different_columns_share_one_row_shape() {
     let dir = tmp("union");

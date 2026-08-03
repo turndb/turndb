@@ -342,6 +342,12 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
                             v.parse::<f64>().is_ok_and(|p| p.to_bits() == x.to_bits())
                         }
                         turndb::AttrValue::Bool(x) => v.parse::<bool>() == Ok(*x),
+                        turndb::AttrValue::UInt(x) => v.parse::<u64>() == Ok(*x),
+                        turndb::AttrValue::TimestampNs(x) => v.parse::<i64>() == Ok(*x),
+                        turndb::AttrValue::Null => v == "null",
+                        // The string-only CLI selector has no binary literal syntax. Use the Rust
+                        // or native structured API when exact binary selection is required.
+                        turndb::AttrValue::Bytes(_) => false,
                     }
             });
             if hit {

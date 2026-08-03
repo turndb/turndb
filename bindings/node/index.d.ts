@@ -4,7 +4,11 @@ export type Attr =
   | { name: string; kind: 'string'; stringValue: string }
   | { name: string; kind: 'int'; intValue: bigint }
   | { name: string; kind: 'float'; floatValue: number }
-  | { name: string; kind: 'bool'; boolValue: boolean };
+  | { name: string; kind: 'bool'; boolValue: boolean }
+  | { name: string; kind: 'uint'; uintValue: bigint }
+  | { name: string; kind: 'binary'; binaryValue: Buffer }
+  | { name: string; kind: 'timestamp_ns'; timestampNsValue: bigint }
+  | { name: string; kind: 'null' };
 
 export interface Content {
   name: string;
@@ -69,7 +73,9 @@ export type SqlParam =
   | { kind: 'int'; intValue: bigint }
   | { kind: 'float'; floatValue: number }
   | { kind: 'bool'; boolValue: boolean }
-  | { kind: 'binary'; binaryValue: Buffer };
+  | { kind: 'binary'; binaryValue: Buffer }
+  | { kind: 'uint'; uintValue: bigint }
+  | { kind: 'timestamp_ns'; timestampNsValue: bigint };
 
 export interface SqlQueryOptions {
   /** DataFusion execution memory; defaults to 256 MiB. IPC output and store caches are separate. */
@@ -142,7 +148,15 @@ export interface LifecycleOptions {
   signal?: AbortSignal;
 }
 
-export type AttributeType = 'string' | 'int' | 'float' | 'bool';
+export type AttributeType =
+  | 'string'
+  | 'int'
+  | 'float'
+  | 'bool'
+  | 'uint'
+  | 'binary'
+  | 'timestamp_ns'
+  | 'null';
 
 export interface StoreSchema {
   attributes: Array<{ name: string; types: AttributeType[] }>;

@@ -491,6 +491,10 @@ fn compare_attr(a: &AttrValue, b: &AttrValue, op: Compare) -> bool {
         (AttrValue::Str(a), AttrValue::Str(b)) => compare_order(a.as_bytes().cmp(b.as_bytes()), op),
         (AttrValue::Int(a), AttrValue::Int(b)) => compare_order(a.cmp(b), op),
         (AttrValue::Bool(a), AttrValue::Bool(b)) => compare_order(a.cmp(b), op),
+        (AttrValue::UInt(a), AttrValue::UInt(b)) => compare_order(a.cmp(b), op),
+        (AttrValue::Bytes(a), AttrValue::Bytes(b)) => compare_order(a.cmp(b), op),
+        (AttrValue::TimestampNs(a), AttrValue::TimestampNs(b)) => compare_order(a.cmp(b), op),
+        (AttrValue::Null, AttrValue::Null) => op == Compare::Eq,
         (AttrValue::Float(a), AttrValue::Float(b)) => match op {
             Compare::Eq => a.to_bits() == b.to_bits(),
             Compare::Ne => a.to_bits() != b.to_bits(),
@@ -637,6 +641,14 @@ fn hash_attr(h: &mut blake3::Hasher, value: &AttrValue) {
         AttrValue::Bool(v) => {
             h.update(&[u8::from(*v)]);
         }
+        AttrValue::UInt(v) => {
+            h.update(&v.to_le_bytes());
+        }
+        AttrValue::Bytes(v) => hash_bytes(h, v),
+        AttrValue::TimestampNs(v) => {
+            h.update(&v.to_le_bytes());
+        }
+        AttrValue::Null => {}
     }
 }
 

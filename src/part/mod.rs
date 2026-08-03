@@ -64,7 +64,7 @@ pub const FOOTER_LEN: u64 = 56;
 ///
 /// This claims one of the footer's padding bytes, which cost nothing because they were already
 /// zero-filled: a part written before this existed reads as version 0, which is exactly what it is.
-pub const PART_VERSION: u8 = 3;
+pub const PART_VERSION: u8 = 4;
 
 /// Content-program op tags, packed into the low bit of a varint.
 pub(crate) const OP_LIT: u64 = 0;
@@ -1217,6 +1217,19 @@ impl Part {
     pub(crate) fn dict_put(&self, c: usize, v: Vec<String>) -> Arc<Vec<String>> {
         let a = Arc::new(v);
         self.cache.put(self.id, Kind::Dict(c), Held::Strings(a.clone()));
+        a
+    }
+
+    pub(crate) fn binary_dict_cached(&self, c: usize) -> Option<Arc<Vec<Vec<u8>>>> {
+        match self.cache.get(self.id, &Kind::BinaryDict(c)) {
+            Some(Held::ByteStrings(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn binary_dict_put(&self, c: usize, v: Vec<Vec<u8>>) -> Arc<Vec<Vec<u8>>> {
+        let a = Arc::new(v);
+        self.cache.put(self.id, Kind::BinaryDict(c), Held::ByteStrings(a.clone()));
         a
     }
 

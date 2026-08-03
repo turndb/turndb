@@ -16,6 +16,10 @@ pub enum AttrType {
     Int,
     Float,
     Bool,
+    UInt,
+    Binary,
+    TimestampNs,
+    Null,
 }
 
 impl AttrType {
@@ -25,6 +29,10 @@ impl AttrType {
             1 => Ok(AttrType::Int),
             2 => Ok(AttrType::Float),
             3 => Ok(AttrType::Bool),
+            4 => Ok(AttrType::UInt),
+            5 => Ok(AttrType::Binary),
+            6 => Ok(AttrType::TimestampNs),
+            7 => Ok(AttrType::Null),
             other => bail!("unknown attribute type tag {other} in schema metadata"),
         }
     }
@@ -35,6 +43,10 @@ impl AttrType {
             AttrValue::Int(_) => AttrType::Int,
             AttrValue::Float(_) => AttrType::Float,
             AttrValue::Bool(_) => AttrType::Bool,
+            AttrValue::UInt(_) => AttrType::UInt,
+            AttrValue::Bytes(_) => AttrType::Binary,
+            AttrValue::TimestampNs(_) => AttrType::TimestampNs,
+            AttrValue::Null => AttrType::Null,
         }
     }
 }

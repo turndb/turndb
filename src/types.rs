@@ -71,8 +71,9 @@ impl fmt::Display for ContentHash {
     }
 }
 
-/// A typed attribute value — the queryable metadata plane. Deliberately four scalars: these are what
-/// you filter and aggregate on. Bulk content is not an attribute; it is folded into pieces.
+/// A typed attribute value in the queryable metadata plane. Bulk content belongs in named content,
+/// not an attribute; binary attributes are intended for compact identifiers and filterable metadata.
+/// Timestamps are signed Unix nanoseconds in UTC, with no implicit local-time interpretation.
 ///
 /// Equality compares floats by **bit pattern**, not by IEEE value. In a store whose contract is
 /// byte-exact round-trip, two values are the same exactly when they are stored the same — so NaN
@@ -84,6 +85,10 @@ pub enum AttrValue {
     Int(i64),
     Float(f64),
     Bool(bool),
+    UInt(u64),
+    Bytes(Vec<u8>),
+    TimestampNs(i64),
+    Null,
 }
 
 impl PartialEq for AttrValue {
@@ -93,6 +98,10 @@ impl PartialEq for AttrValue {
             (AttrValue::Int(a), AttrValue::Int(b)) => a == b,
             (AttrValue::Float(a), AttrValue::Float(b)) => a.to_bits() == b.to_bits(),
             (AttrValue::Bool(a), AttrValue::Bool(b)) => a == b,
+            (AttrValue::UInt(a), AttrValue::UInt(b)) => a == b,
+            (AttrValue::Bytes(a), AttrValue::Bytes(b)) => a == b,
+            (AttrValue::TimestampNs(a), AttrValue::TimestampNs(b)) => a == b,
+            (AttrValue::Null, AttrValue::Null) => true,
             _ => false,
         }
     }
@@ -109,6 +118,10 @@ impl AttrValue {
             AttrValue::Int(_) => 1,
             AttrValue::Float(_) => 2,
             AttrValue::Bool(_) => 3,
+            AttrValue::UInt(_) => 4,
+            AttrValue::Bytes(_) => 5,
+            AttrValue::TimestampNs(_) => 6,
+            AttrValue::Null => 7,
         }
     }
 }

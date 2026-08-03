@@ -61,6 +61,8 @@ pub enum Kind {
     ContentMeta,
     /// A decoded string dictionary, by column ordinal.
     Dict(usize),
+    /// A decoded binary dictionary, by column ordinal.
+    BinaryDict(usize),
     /// The decoded id column. Front-coded on disk, so every read of it reconstructs prefixes and
     /// validates UTF-8 — worth doing once.
     Ids,
@@ -72,6 +74,7 @@ pub enum Held {
     Nums(Arc<Vec<u64>>),
     Rids(Arc<Vec<u32>>),
     Strings(Arc<Vec<String>>),
+    ByteStrings(Arc<Vec<Vec<u8>>>),
     ContentMeta(Arc<Vec<ContentMeta>>),
 }
 
@@ -84,6 +87,9 @@ impl Held {
             // A String is a pointer, length and capacity beyond its bytes; ignoring that would
             // under-count a dictionary of short strings several times over.
             Held::Strings(v) => v.iter().map(|s| s.len() + std::mem::size_of::<String>()).sum(),
+            Held::ByteStrings(v) => {
+                v.iter().map(|s| s.len() + std::mem::size_of::<Vec<u8>>()).sum()
+            }
             Held::ContentMeta(v) => {
                 v.iter().map(|m| m.name.len() + std::mem::size_of::<ContentMeta>()).sum()
             }
