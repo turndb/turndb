@@ -56,11 +56,22 @@ impl TurndbTable {
 
     /// Register a read-only store as table `name` in a fresh session.
     pub fn context(store: ReadStore, name: &str) -> Result<(SessionContext, Arc<TurndbTable>)> {
+        let ctx = SessionContext::new();
+        let table = TurndbTable::register(store, &ctx, name)?;
+        Ok((ctx, table))
+    }
+
+    /// Register a read-only store in a caller-configured session. The caller can therefore set
+    /// execution memory and concurrency policy without reimplementing TurnDB's table adapter.
+    pub fn register(
+        store: ReadStore,
+        ctx: &SessionContext,
+        name: &str,
+    ) -> Result<Arc<TurndbTable>> {
         let (fold, parts) = store.into_parts();
         let t = Arc::new(TurndbTable::new(parts, fold)?);
-        let ctx = SessionContext::new();
         ctx.register_table(name, t.clone())?;
-        Ok((ctx, t))
+        Ok(t)
     }
 
     /// What every scan through this table has touched so far.

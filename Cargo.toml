@@ -54,8 +54,14 @@ dst = []
 # The storage-native query lens. Kept at DataFusion 54's exact Arrow line so enabling SQL unifies one
 # Arrow graph rather than compiling two incompatible ABIs.
 arrow = { version = "58.4.0", default-features = false, optional = true }
-# Optional SQL planner/executor over the lens.
-datafusion = { version = "54", optional = true }
+# Optional SQL planner/executor over the lens. The embedded context registers only TurnDB's table
+# and rejects DDL, so Parquet plus external compression readers are unreachable bulk. Keep the
+# ordinary expression families and recursive parser protection, but do not ship file-format stacks
+# merely because DataFusion enables them by default.
+datafusion = { version = "54", default-features = false, optional = true, features = [
+    "crypto_expressions", "datetime_expressions", "encoding_expressions", "nested_expressions",
+    "recursive_protection", "regex_expressions", "sql", "string_expressions", "unicode_expressions",
+] }
 # TableProvider is an async trait; this is datafusion's own requirement, not an extra choice.
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }

@@ -7,9 +7,9 @@ description = "Native Node.js N-API binding for TurnDB."
 publish = false
 
 [features]
-default = []
+default = ["sql"]
 columnar = ["turndb/columnar"]
-sql = ["columnar", "turndb/sql"]
+sql = ["columnar", "turndb/sql", "dep:tokio"]
 
 [lib]
 crate-type = ["cdylib"]
@@ -22,6 +22,7 @@ turndb = { path = "../..", default-features = false }
 anyhow = "1"
 napi = { version = "3.12.0", default-features = false, features = ["napi6", "tokio_rt", "dyn-symbols"] }
 napi-derive = "3.6.2"
+tokio = { version = "1", features = ["sync", "time"], optional = true }
 
 [build-dependencies]
 napi-build = "2.4.0"

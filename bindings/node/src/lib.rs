@@ -15,9 +15,16 @@ use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
 use napi::{Env, Error, Result, Status};
 use napi_derive::napi;
 use std::path::PathBuf;
+#[cfg(feature = "sql")]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use turndb::fold::FoldCfg;
+#[cfg(feature = "sql")]
+use turndb::query::sql::{
+    classify_error as classify_sql_error, SqlBatch, SqlErrorClass, SqlOptions, SqlQuery, SqlValue,
+    DEFAULT_MEMORY_BYTES,
+};
 use turndb::scan::{
     CancellationToken, Compare, ContentMode, ContentSelect, Direction, Predicate, ProjectedContent,
     ScanInterrupted, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
@@ -39,6 +46,18 @@ fn scan_failure(context: &str, error: anyhow::Error) -> Error {
     } else {
         failure(context, error)
     }
+}
+
+#[cfg(feature = "sql")]
+fn sql_failure(context: &str, error: anyhow::Error) -> Error {
+    let code = match classify_sql_error(&error) {
+        SqlErrorClass::InvalidArgument => "INVALID_ARGUMENT",
+        SqlErrorClass::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        SqlErrorClass::Unsupported => "UNSUPPORTED",
+        SqlErrorClass::Io => "IO",
+        SqlErrorClass::Internal => "INTERNAL",
+    };
+    coded_failure(code, format!("{context}: {error:#}"))
 }
 
 #[napi(object)]
@@ -140,6 +159,54 @@ pub struct NativeScanPage {
     pub stats: NativeScanStats,
 }
 
+#[cfg(feature = "sql")]
+#[napi(object)]
+pub struct NativeSqlParam {
+    /// `null`, `string`, `int`, `float`, `bool`, or `binary`.
+    pub kind: String,
+    pub string_value: Option<String>,
+    pub int_value: Option<BigInt>,
+    pub float_value: Option<f64>,
+    pub bool_value: Option<bool>,
+    pub binary_value: Option<Buffer>,
+}
+
+#[cfg(feature = "sql")]
+#[napi(object, object_to_js = false)]
+pub struct NativeSqlOptions {
+    /// DataFusion execution memory. TurnDB caches and the returned IPC buffer are accounted apart.
+    pub max_memory_bytes: Option<BigInt>,
+}
+
+#[cfg(feature = "sql")]
+#[napi(object, object_to_js = false)]
+pub struct NativeSqlNextOptions {
+    pub timeout_ms: Option<u32>,
+    pub signal: Option<AbortSignal>,
+}
+
+#[cfg(feature = "sql")]
+#[napi(object)]
+pub struct NativeSqlStats {
+    pub rows: BigInt,
+    pub batches: BigInt,
+    pub columns_decoded: BigInt,
+    pub fold_reads: BigInt,
+    pub rows_filtered: BigInt,
+    pub rows_hidden: BigInt,
+    pub batches_skipped: BigInt,
+    pub shadowed_occurrences: BigInt,
+}
+
+#[cfg(feature = "sql")]
+#[napi(object)]
+pub struct NativeSqlBatch {
+    /// A complete, independently decodable Arrow IPC stream containing exactly one record batch.
+    pub ipc: Buffer,
+    pub rows: u32,
+    pub stats: NativeSqlStats,
+}
+
 #[napi(object)]
 pub struct NativeCapabilities {
     pub part_format_write: u8,
@@ -162,6 +229,9 @@ pub struct NativeCapabilities {
     pub scan_cancellation: bool,
     pub scan_reconstruction_budget: bool,
     pub scan_reconstructed_bytes_default: BigInt,
+    pub arrow_ipc: bool,
+    pub parameterized_sql: bool,
+    pub sql_memory_bytes_default: Option<BigInt>,
 }
 
 #[napi]
@@ -196,6 +266,16 @@ pub fn capabilities() -> NativeCapabilities {
         scan_cancellation: true,
         scan_reconstruction_budget: true,
         scan_reconstructed_bytes_default: BigInt::from(DEFAULT_MAX_RECONSTRUCTED_BYTES),
+        arrow_ipc: cfg!(feature = "sql"),
+        parameterized_sql: cfg!(feature = "sql"),
+        sql_memory_bytes_default: cfg!(feature = "sql").then(|| {
+            #[cfg(feature = "sql")]
+            {
+                BigInt::from(DEFAULT_MEMORY_BYTES as u64)
+            }
+            #[cfg(not(feature = "sql"))]
+            unreachable!()
+        }),
     }
 }
 
@@ -302,6 +382,176 @@ pub struct NativeSchema {
 struct SnapshotState {
     store: Mutex<Option<Arc<ReadStore>>>,
     commit: u64,
+}
+
+#[cfg(feature = "sql")]
+struct SqlSlot {
+    query: Option<SqlQuery>,
+    stats: turndb::query::ScanStats,
+}
+
+#[cfg(feature = "sql")]
+struct SqlQueryState {
+    slot: tokio::sync::Mutex<SqlSlot>,
+    schema_ipc: Vec<u8>,
+    pulling: AtomicBool,
+}
+
+/// A pull-based read-only SQL result. Each pull retains at most one Arrow batch in the binding.
+#[cfg(feature = "sql")]
+#[napi]
+pub struct NativeSqlQuery {
+    state: Arc<SqlQueryState>,
+}
+
+#[cfg(feature = "sql")]
+impl NativeSqlQuery {
+    fn new(query: SqlQuery) -> NativeSqlQuery {
+        let schema_ipc = query.schema_ipc().to_vec();
+        NativeSqlQuery {
+            state: Arc::new(SqlQueryState {
+                slot: tokio::sync::Mutex::new(SqlSlot {
+                    query: Some(query),
+                    stats: turndb::query::ScanStats::default(),
+                }),
+                schema_ipc,
+                pulling: AtomicBool::new(false),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
+enum SqlPull {
+    Batch(anyhow::Result<Option<SqlBatch>>),
+    Interrupted(&'static str),
+}
+
+#[cfg(feature = "sql")]
+async fn wait_sql_interrupt(
+    abort: Option<tokio::sync::oneshot::Receiver<()>>,
+    timeout: Option<Duration>,
+) -> &'static str {
+    match (abort, timeout) {
+        (Some(mut abort), Some(timeout)) => {
+            tokio::select! {
+                _ = &mut abort => "SQL query pull was cancelled",
+                _ = tokio::time::sleep(timeout) => "SQL query pull deadline exceeded",
+            }
+        }
+        (Some(abort), None) => {
+            let _ = abort.await;
+            "SQL query pull was cancelled"
+        }
+        (None, Some(timeout)) => {
+            tokio::time::sleep(timeout).await;
+            "SQL query pull deadline exceeded"
+        }
+        (None, None) => std::future::pending().await,
+    }
+}
+
+#[cfg(feature = "sql")]
+async fn pull_sql(
+    state: Arc<SqlQueryState>,
+    abort: Option<tokio::sync::oneshot::Receiver<()>>,
+    timeout: Option<Duration>,
+) -> Result<Option<NativeSqlBatch>> {
+    let mut slot = state.slot.lock().await;
+    if timeout.is_some_and(|timeout| timeout.is_zero()) {
+        if let Some(query) = slot.query.take() {
+            slot.stats = query.stats();
+        }
+        return Err(coded_failure("CANCELLED", "SQL query pull deadline exceeded"));
+    }
+    let Some(query) = slot.query.as_mut() else {
+        return Ok(None);
+    };
+    let result = tokio::select! {
+        result = query.next() => SqlPull::Batch(result),
+        reason = wait_sql_interrupt(abort, timeout) => SqlPull::Interrupted(reason),
+    };
+    match result {
+        SqlPull::Batch(Ok(Some(batch))) => {
+            slot.stats =
+                slot.query.as_ref().expect("query remains while a batch is returned").stats();
+            Ok(Some(NativeSqlBatch {
+                rows: u32::try_from(batch.rows)
+                    .map_err(|_| coded_failure("INTERNAL", "SQL batch row count exceeds u32"))?,
+                ipc: Buffer::from(batch.ipc),
+                stats: encode_sql_stats(slot.stats),
+            }))
+        }
+        SqlPull::Batch(Ok(None)) => {
+            slot.stats = slot.query.as_ref().expect("query remains at end of stream").stats();
+            slot.query = None;
+            Ok(None)
+        }
+        SqlPull::Batch(Err(error)) => {
+            slot.query = None;
+            Err(sql_failure("pull TurnDB SQL query", error))
+        }
+        SqlPull::Interrupted(reason) => {
+            slot.stats = slot.query.as_ref().expect("query remains until interruption").stats();
+            slot.query = None;
+            Err(coded_failure("CANCELLED", reason))
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
+#[napi]
+impl NativeSqlQuery {
+    /// A complete zero-batch Arrow IPC stream carrying the result schema.
+    #[napi(getter)]
+    pub fn schema_ipc(&self) -> Buffer {
+        Buffer::from(self.state.schema_ipc.clone())
+    }
+
+    /// Pull one independently decodable Arrow IPC record batch. `null` remains stable at EOF.
+    #[napi]
+    pub fn next<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeSqlNextOptions>,
+    ) -> Result<PromiseRaw<'env, Option<NativeSqlBatch>>> {
+        if self
+            .state
+            .pulling
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return Err(coded_failure("BUSY", "a SQL query pull is already in progress"));
+        }
+        let (abort, timeout) = decode_sql_next(options);
+        let state = self.state.clone();
+        let pulling = self.state.clone();
+        match env.spawn_future(async move {
+            let result = pull_sql(state, abort, timeout).await;
+            pulling.pulling.store(false, AtomicOrdering::Release);
+            result
+        }) {
+            Ok(promise) => Ok(promise),
+            Err(error) => {
+                self.state.pulling.store(false, AtomicOrdering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    #[napi]
+    pub async fn stats(&self) -> NativeSqlStats {
+        encode_sql_stats(self.state.slot.lock().await.stats)
+    }
+
+    /// Drop the execution stream. DataFusion treats dropping an unfinished stream as cancellation.
+    #[napi]
+    pub async fn close(&self) {
+        let mut slot = self.state.slot.lock().await;
+        if let Some(query) = slot.query.take() {
+            slot.stats = query.stats();
+        }
+    }
 }
 
 impl SnapshotState {
@@ -626,6 +876,50 @@ impl NativeStore {
     }
 }
 
+#[cfg(feature = "sql")]
+#[napi]
+impl NativeSnapshot {
+    /// Execute bounded, read-only SQL over this immutable snapshot and return a pull-based IPC stream.
+    #[napi]
+    pub async fn query_sql(
+        &self,
+        sql: String,
+        params: Option<Vec<NativeSqlParam>>,
+        options: Option<NativeSqlOptions>,
+    ) -> Result<NativeSqlQuery> {
+        let (params, options) = decode_sql(sql.as_str(), params, options)?;
+        let store = self.state.get()?.as_ref().clone();
+        SqlQuery::open(store, &sql, params, options)
+            .await
+            .map(NativeSqlQuery::new)
+            .map_err(|error| sql_failure("open TurnDB snapshot SQL query", error))
+    }
+}
+
+#[cfg(feature = "sql")]
+#[napi]
+impl NativeStore {
+    /// Publish earlier writes as an exact immutable cut, then execute read-only SQL over that cut.
+    #[napi]
+    pub async fn query_sql(
+        &self,
+        sql: String,
+        params: Option<Vec<NativeSqlParam>>,
+        options: Option<NativeSqlOptions>,
+    ) -> Result<NativeSqlQuery> {
+        let (params, options) = decode_sql(sql.as_str(), params, options)?;
+        let store = self
+            .actor
+            .snapshot()
+            .await
+            .map_err(|error| failure("publish TurnDB SQL snapshot", error))?;
+        SqlQuery::open(store, &sql, params, options)
+            .await
+            .map(NativeSqlQuery::new)
+            .map_err(|error| sql_failure("open TurnDB SQL query", error))
+    }
+}
+
 fn decode_write(op: NativeWriteOp) -> Result<WriteOp> {
     match op.kind.as_str() {
         "put" => Ok(WriteOp::Put {
@@ -780,6 +1074,95 @@ fn decode_scan(input: NativeScanRequest) -> Result<ScanRequest> {
     Ok(request)
 }
 
+#[cfg(feature = "sql")]
+fn decode_sql(
+    sql: &str,
+    params: Option<Vec<NativeSqlParam>>,
+    options: Option<NativeSqlOptions>,
+) -> Result<(Vec<SqlValue>, SqlOptions)> {
+    if sql.trim().is_empty() {
+        return Err(Error::new(Status::InvalidArg, "SQL query must not be empty"));
+    }
+    let params =
+        params.unwrap_or_default().into_iter().map(decode_sql_param).collect::<Result<Vec<_>>>()?;
+    let max_memory_bytes = options
+        .and_then(|options| options.max_memory_bytes)
+        .map(|value| decode_u64(value, "maxMemoryBytes"))
+        .transpose()?
+        .unwrap_or(DEFAULT_MEMORY_BYTES as u64);
+    let max_memory_bytes = usize::try_from(max_memory_bytes).map_err(|_| {
+        Error::new(Status::InvalidArg, "maxMemoryBytes exceeds this platform's address space")
+    })?;
+    if max_memory_bytes == 0 {
+        return Err(Error::new(Status::InvalidArg, "maxMemoryBytes must be greater than zero"));
+    }
+    Ok((params, SqlOptions { max_memory_bytes }))
+}
+
+#[cfg(feature = "sql")]
+fn decode_sql_param(param: NativeSqlParam) -> Result<SqlValue> {
+    Ok(match param.kind.as_str() {
+        "null" => SqlValue::Null,
+        "string" => SqlValue::String(param.string_value.ok_or_else(|| {
+            Error::new(Status::InvalidArg, "SQL string parameter needs stringValue")
+        })?),
+        "int" => {
+            let value = param.int_value.ok_or_else(|| {
+                Error::new(Status::InvalidArg, "SQL int parameter needs intValue")
+            })?;
+            let (value, lossless) = value.get_i64();
+            if !lossless {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "SQL int parameter is outside the signed i64 range",
+                ));
+            }
+            SqlValue::Int(value)
+        }
+        "float" => SqlValue::Float(param.float_value.ok_or_else(|| {
+            Error::new(Status::InvalidArg, "SQL float parameter needs floatValue")
+        })?),
+        "bool" => SqlValue::Bool(param.bool_value.ok_or_else(|| {
+            Error::new(Status::InvalidArg, "SQL bool parameter needs boolValue")
+        })?),
+        "binary" => SqlValue::Binary(
+            param
+                .binary_value
+                .ok_or_else(|| {
+                    Error::new(Status::InvalidArg, "SQL binary parameter needs binaryValue")
+                })?
+                .to_vec(),
+        ),
+        other => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "unknown SQL parameter kind {other:?}; expected null, string, int, float, bool, or binary"
+                ),
+            ))
+        }
+    })
+}
+
+#[cfg(feature = "sql")]
+fn decode_sql_next(
+    options: Option<NativeSqlNextOptions>,
+) -> (Option<tokio::sync::oneshot::Receiver<()>>, Option<Duration>) {
+    let Some(options) = options else { return (None, None) };
+    let abort = options.signal.map(|signal| {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Arc::new(Mutex::new(Some(sender)));
+        signal.on_abort(move || {
+            if let Some(sender) = sender.lock().ok().and_then(|mut sender| sender.take()) {
+                let _ = sender.send(());
+            }
+        });
+        receiver
+    });
+    let timeout = options.timeout_ms.map(|millis| Duration::from_millis(u64::from(millis)));
+    (abort, timeout)
+}
+
 fn decode_predicate(input: NativePredicate) -> Result<Predicate> {
     match input.kind.as_str() {
         "id" => Ok(Predicate::Id {
@@ -896,6 +1279,20 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
             reconstructed_bytes: BigInt::from(page.stats.reconstructed_bytes),
             reconstruction_budget_exhausted: page.stats.reconstruction_budget_exhausted,
         },
+    }
+}
+
+#[cfg(feature = "sql")]
+fn encode_sql_stats(stats: turndb::query::ScanStats) -> NativeSqlStats {
+    NativeSqlStats {
+        rows: BigInt::from(stats.rows as u64),
+        batches: BigInt::from(stats.batches as u64),
+        columns_decoded: BigInt::from(stats.columns_decoded as u64),
+        fold_reads: BigInt::from(stats.fold_reads as u64),
+        rows_filtered: BigInt::from(stats.rows_filtered as u64),
+        rows_hidden: BigInt::from(stats.rows_hidden as u64),
+        batches_skipped: BigInt::from(stats.batches_skipped as u64),
+        shadowed_occurrences: BigInt::from(stats.shadowed_occurrences as u64),
     }
 }
 

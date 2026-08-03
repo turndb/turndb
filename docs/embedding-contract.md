@@ -226,17 +226,28 @@ pool and remain stable across later writer activity. A read-only process can ope
 manifest directly or request a commit still present in the bounded retained-manifest window; neither
 path takes the writer lock or replays an unflushed WAL.
 
-**Current gaps:** only the binding-owned failure classes, scan interruption, and writer contention
-have stable machine-readable codes; Arrow IPC, SQL, backup/restore and recovery controls, and prebuilt
-artifact selection are not exposed yet. The package is a tested source prototype and must not be
-described as a production distribution.
+The default native build includes the richer query dependencies. `querySql` runs only against an
+immutable `ReadStore`: a snapshot handle uses its existing cut, while a writer call actor-serializes a
+new published cut first. The isolated DataFusion session exposes one generic table named `records`,
+accepts typed positional `$1` parameters, and refuses DDL, DML, and session statements before
+execution. Its per-query execution-memory pool defaults to 256 MiB and is caller-configurable. A
+pull-based `NativeSqlQuery` returns schema IPC separately and one complete, independently decodable
+Arrow IPC stream per batch; JavaScript never reconstructs a dynamic schema or walks Arrow rows.
+Batch pulls have timeouts and AbortSignal cancellation and dropping the Rust execution stream aborts
+unfinished work.
+
+**Current gaps:** only the binding-owned failure classes, typed DataFusion failures, scan/SQL-pull
+interruption, and writer contention have stable machine-readable codes; backup/restore and recovery
+controls and prebuilt artifact selection are not exposed yet. SQL planning is not yet interruptible,
+and per-query memory pools do not impose an aggregate cap across concurrent snapshot queries. The
+package is a tested source prototype and must not be described as a production distribution.
 
 The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
-overload, closed handles, typed scan interruption, and writer contention. Contention is a typed
+overload, closed handles, typed scan/SQL-pull interruption, typed DataFusion invalid-input,
+unsupported, resource-exhaustion and I/O variants, and writer contention. Contention is a typed
 `WriterLocked` condition in the Rust core; consumers do not match its message. Unknown core failures
-deliberately remain `INTERNAL`
-until their engine error variants exist. `NOT_FOUND`, `CORRUPTION`, and `IO` are reserved in the Node
-union but must not be assigned through message heuristics.
+deliberately remain `INTERNAL` until their engine error variants exist. `NOT_FOUND`, `CORRUPTION`, and
+broader `IO` use are reserved in the Node union but must not be assigned through message heuristics.
 
 Writer lifecycle commands are serialized with ingest. `compact`, `verify`, `punch`, and `refold`
 first sync and flush earlier writes, then operate on the resulting published cut. Verification covers
@@ -278,12 +289,15 @@ always admitting one oversized row so progress remains possible. Structured page
 MiB default as a per-request configurable ceiling, report when the ceiling stops a page, and preserve
 an exact continuation without truncating or skipping the deferred row.
 
-Before production binding maturity, the Arrow/SQL execution plane still needs caller-configurable
-query-memory budgets, and long-running lifecycle operations need interruption. Structured scans
-already have byte ceilings, deadlines, and cooperative cancellation, and the native command backlog
-is bounded and configurable. Reaching a budget returns a structured error or partial page with a
-cursor only where the operation contract explicitly allows it. It never truncates a record, invents
-a weaker durability acknowledgement, or silently widens a scan.
+The native SQL stream has a caller-configurable DataFusion execution-memory pool, while structured
+scans have byte ceilings, deadlines, and cooperative cancellation and the native command backlog is
+bounded and configurable. The SQL pool is not represented as a total-process RSS guarantee:
+DataFusion documents allocations outside its pool, Arrow IPC output is returned to the caller, and
+TurnDB's bounded caches are accounted independently. Before production binding maturity, concurrent
+queries still need an aggregate budget and long-running lifecycle operations need interruption.
+Reaching a budget returns a structured error or partial page with a cursor only where the operation
+contract explicitly allows it. It never truncates a record, invents a weaker durability
+acknowledgement, or silently widens a scan.
 
 Ambiguous recovery is an error. Corruption, deliberate erasure, unsupported capability, contention,
 cancellation, invalid input, and resource exhaustion remain distinguishable machine-readable classes

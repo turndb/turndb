@@ -61,6 +61,13 @@ function guarded(fn, operation) {
     if (operation === 'scan' && args[0]?.signal?.aborted) {
       return Promise.reject(new TurnDbError('CANCELLED', 'scan was cancelled before submission'));
     }
+    if (operation === 'next' && args[0]?.signal?.aborted) {
+      // Cancellation is terminal for a pull-based SQL stream. Close before rejecting so an already
+      // aborted signal has the same ownership semantics as Rust winning the in-flight select.
+      return Promise.resolve(this.close()).then(() => {
+        throw new TurnDbError('CANCELLED', 'next was cancelled before submission');
+      });
+    }
     try {
       return Promise.resolve(fn.apply(this, args)).catch((error) => {
         throw normalizeError(error);
@@ -71,10 +78,11 @@ function guarded(fn, operation) {
   };
 }
 
-for (const Class of [native.NativeStore, native.NativeSnapshot]) {
+for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSqlQuery].filter(Boolean)) {
   for (const name of [
     'write', 'sync', 'flush', 'scan', 'readContent', 'snapshot',
-    'compact', 'verify', 'erase', 'punch', 'refold', 'health', 'schema', 'close',
+    'querySql', 'next', 'stats', 'compact', 'verify', 'erase', 'punch', 'refold',
+    'health', 'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
       Class.prototype[name] = guarded(Class.prototype[name], name);
@@ -99,6 +107,7 @@ module.exports = {
   ...native,
   NativeStore: guardFactories(native.NativeStore),
   NativeSnapshot: guardFactories(native.NativeSnapshot),
+  ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
   TurnDbError,
 };

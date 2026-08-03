@@ -48,7 +48,13 @@ content model right before compatibility turns today's choices into permanent pr
   deadline; Node maps `AbortSignal` and queue-inclusive `timeoutMs` onto them and classifies both as
   `CANCELLED` without returning partial success. Structured pages now also enforce a configurable
   whole-row reconstruction ceiling (32 MiB by default), expose when it caused a partial page, admit
-  one oversized row for progress, and resume before rather than after a deferred row.
+  one oversized row for progress, and resume before rather than after a deferred row. The default
+  native build now also exposes immutable read-only SQL with typed positional parameters, a
+  configurable DataFusion execution-memory pool, and pull-based independently decodable Arrow IPC
+  batches. Query planning, read-only enforcement, storage scans, statistics, and IPC encoding remain
+  in Rust; JavaScript owns only handle lifetime and `Buffer` transport. CI now builds and exercises
+  that default addon on every Node major claimed by the native package; platform prebuild production
+  and selection remain a separate unfinished gate.
 
 ## Product boundary
 
@@ -301,29 +307,35 @@ facility.
 ### Current prototype evidence
 
 The first native slice implements open, atomic ordered write/delete batches, sync, flush, immutable
-current/retained snapshots, structured scan, named-content reconstruction, and close. One dedicated
+current/retained snapshots, structured scan, bounded parameterized SQL-to-Arrow streaming,
+named-content reconstruction, and close. One dedicated
 Rust thread owns the writer; a bounded per-store command queue defaults to 64, permits an explicit
 capacity from 1 through 65,536, and refuses overload rather than accumulating unbounded Promises.
 Node integration tests load the addon and cover exact `i64::MIN` bigint, NaN,
 ordered duplicate attributes, named and empty content, projection, predicates, paging/cursor misuse,
-snapshot isolation/publication, retained commits, deletion, and close refusal.
+snapshot isolation/publication, retained commits, typed SQL parameters, Arrow IPC batch pulls,
+read-only plan enforcement, query memory exhaustion/cancellation, deletion, and close refusal.
 
 Measured on Linux x86-64 from the 2026-08-02 tree with the workspace release profile and GNU `strip`:
 
 | native build | stripped addon | gzip -9 |
 |---|---:|---:|
-| structured core, no Arrow/DataFusion | 2,947,024 bytes | 1,211,755 bytes |
-| compiled with `turndb-node/sql` | 7,818,112 bytes | 3,181,197 bytes |
+| structured core, no Arrow/DataFusion | 3,888,168 bytes | 1,482,093 bytes |
+| default native package with SQL/Arrow | 115,467,704 bytes | 36,931,819 bytes |
 
-The full feature build therefore adds 4,871,088 installed bytes and 1,969,442 gzip bytes on this
-host. This measurement does **not** prove a SQL API—the prototype does not expose one yet—and does
-not include npm metadata or per-platform duplication. It does show that keeping the structured core
-profile is useful while the additional query-engine dependency is affordable when its capabilities
-are actually exposed.
+The full feature build therefore adds 111,579,536 installed bytes and 35,449,726 gzip bytes on this
+host. It does not include npm metadata or per-platform duplication. This is materially larger than
+the earlier dependency-only estimate; the current number measures the actually exported query path.
+DataFusion's unreachable Parquet and external compression features are disabled, while its ordinary
+SQL expression families remain. The default native package chooses the full profile because it
+exposes SQL and Arrow IPC; the structured no-feature build remains useful for embedders that
+explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
+profile rather than misreporting the ordinary release artifact.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts, Arrow IPC and SQL, cancellation/deadlines for
-long-running lifecycle operations, a complete typed engine error taxonomy, backup/restore and recovery
-controls, and measured event-loop/query overhead under a representative mixed workload.
+Remaining Phase-3 gaps are prebuilt platform artifacts, cancellation/deadlines for long-running
+lifecycle operations and SQL planning (batch pulls are cancellable), a complete typed engine error
+taxonomy, backup/restore and recovery controls, aggregate limits across concurrent snapshot queries,
+and measured event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 

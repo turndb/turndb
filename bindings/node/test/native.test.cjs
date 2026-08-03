@@ -6,7 +6,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { capabilities, NativeSnapshot, NativeStore, retainedCommits, TurnDbError } = require('..');
+const {
+  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, retainedCommits, TurnDbError,
+} = require('..');
 
 function temporaryStore(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-'));
@@ -22,8 +24,8 @@ test('reports the native capability profile without a portable fallback', () => 
     physicalErasure: process.platform === 'linux' ? 'punch_or_refold' : 'refold_only',
     positionedIo: true,
     threads: true,
-    columnar: false,
-    sql: false,
+    columnar: true,
+    sql: true,
     portableWasm: false,
     nativeNode: true,
     napiVersion: 6,
@@ -36,6 +38,9 @@ test('reports the native capability profile without a portable fallback', () => 
     scanCancellation: true,
     scanReconstructionBudget: true,
     scanReconstructedBytesDefault: 33554432n,
+    arrowIpc: true,
+    parameterizedSql: true,
+    sqlMemoryBytesDefault: 268435456n,
   });
 });
 
@@ -212,7 +217,102 @@ test('bounds reconstructed scan bytes without splitting or skipping rows', async
   );
 });
 
-test('enforces scan deadlines and AbortSignal through the Rust cancellation target', async (t) => {
+test('streams bounded parameterized read-only SQL as Arrow IPC', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([
+    {
+      kind: 'put', id: 'a',
+      attrs: [
+        { name: 'kind', kind: 'string', stringValue: 'keep' },
+        { name: 'tokens', kind: 'int', intValue: 1n },
+      ],
+    },
+    {
+      kind: 'put', id: 'b',
+      attrs: [
+        { name: 'kind', kind: 'string', stringValue: 'drop' },
+        { name: 'tokens', kind: 'int', intValue: 2n },
+      ],
+    },
+    {
+      kind: 'put', id: 'c',
+      attrs: [
+        { name: 'kind', kind: 'string', stringValue: 'keep' },
+        { name: 'tokens', kind: 'int', intValue: 3n },
+      ],
+    },
+  ]);
+
+  // Writer SQL takes and publishes an exact actor-ordered snapshot, so accepted unflushed rows are
+  // included and query execution no longer occupies the writer actor.
+  const query = await store.querySql(
+    'SELECT id, tokens FROM records WHERE kind = $1 AND tokens > $2 ORDER BY id',
+    [
+      { kind: 'string', stringValue: 'keep' },
+      { kind: 'int', intValue: 1n },
+    ],
+    { maxMemoryBytes: 32n << 20n }
+  );
+  assert(query instanceof NativeSqlQuery);
+  assert(Buffer.isBuffer(query.schemaIpc));
+  assert.equal(query.schemaIpc.readUInt32LE(0), 0xffffffff);
+  assert.equal((await store.health()).memtableEntries, 0n);
+
+  const batch = await query.next();
+  assert.equal(batch.rows, 1);
+  assert(Buffer.isBuffer(batch.ipc));
+  assert.equal(batch.ipc.readUInt32LE(0), 0xffffffff);
+  assert(batch.stats.rows > 0n);
+  assert.equal(await query.next(), null);
+  assert.deepEqual(await query.stats(), batch.stats);
+
+  const snapshot = await store.snapshot();
+  const forbidden = snapshot.querySql('CREATE TABLE forbidden (value INT)');
+  await assert.rejects(
+    forbidden,
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+
+  const starved = await snapshot.querySql(
+    'SELECT id FROM records ORDER BY id',
+    undefined,
+    { maxMemoryBytes: 1n << 20n }
+  );
+  await assert.rejects(
+    starved.next(),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED'
+  );
+
+  const timed = await snapshot.querySql('SELECT id FROM records');
+  await assert.rejects(
+    timed.next({ timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const cancelled = await snapshot.querySql('SELECT id FROM records');
+  await assert.rejects(
+    cancelled.next({ signal: preAborted.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+  assert.equal(await cancelled.next(), null);
+
+  await assert.rejects(
+    snapshot.querySql('SELECT id FROM records', undefined, { maxMemoryBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+  const closed = await snapshot.querySql('SELECT id FROM records');
+  await closed.close();
+  assert.equal(await closed.next(), null);
+  await query.close();
+  await snapshot.close();
+});
+
+test('enforces deterministic scan deadlines and pre-aborted signals', async (t) => {
   const store = await NativeStore.open(temporaryStore(t));
   t.after(async () => {
     try { await store.close(); } catch {}
@@ -232,15 +332,9 @@ test('enforces scan deadlines and AbortSignal through the Rust cancellation targ
     (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
   );
 
-  const active = new AbortController();
-  const pending = store.scan({ signal: active.signal });
-  active.abort();
-  await assert.rejects(
-    pending,
-    (error) => error instanceof TurnDbError
-      && error.code === 'CANCELLED'
-      && /cancelled/.test(error.message)
-  );
+  // A core Source test cancels after its first record read and proves in-flight work discards its
+  // partial page. An empty native scan may correctly finish before an abort issued after submission,
+  // so the ABI test intentionally avoids asserting a scheduler race.
 });
 
 test('publishes exact immutable cuts and reopens retained commits', async (t) => {

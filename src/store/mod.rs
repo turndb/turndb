@@ -480,7 +480,7 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
         })?;
         parts.push(Arc::new(Part::open_reader(Box::new(ext), pcache.clone())?));
     }
-    Ok(ReadStore { fold, parts, manifest })
+    Ok(ReadStore { fold: Arc::new(fold), parts, manifest })
 }
 
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
@@ -863,7 +863,7 @@ impl Store {
                     ));
                     continue;
                 }
-                return Ok(ReadStore { fold, parts, manifest });
+                return Ok(ReadStore { fold: Arc::new(fold), parts, manifest });
             }
         }
         Err(last.unwrap_or_else(|| {
@@ -920,7 +920,7 @@ impl Store {
         for p in &manifest.parts {
             parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
         }
-        Ok(ReadStore { fold, parts, manifest })
+        Ok(ReadStore { fold: Arc::new(fold), parts, manifest })
     }
 
     /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
@@ -1772,9 +1772,11 @@ pub struct ErasureStats {
     pub refold: Option<refold::RefoldStats>,
 }
 
-/// A reader over the committed state. No lock, no writer, no daemon.
+/// A reader over the committed state. No lock, no writer, no daemon. Clones retain the same
+/// immutable parts and fold handles, making ownership by concurrent query streams cheap.
+#[derive(Clone)]
 pub struct ReadStore {
-    fold: Fold,
+    fold: Arc<Fold>,
     parts: Vec<Arc<Part>>,
     manifest: Manifest,
 }
@@ -1824,7 +1826,7 @@ impl ReadStore {
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
     /// of both; the manifest snapshot it was opened at is already baked into `parts`.
     pub fn into_parts(self) -> (Arc<Fold>, Vec<Arc<Part>>) {
-        (Arc::new(self.fold), self.parts)
+        (self.fold, self.parts)
     }
 
     pub fn part_count(&self) -> usize {

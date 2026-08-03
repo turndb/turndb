@@ -12,7 +12,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turndb::fold::FoldCfg;
 use turndb::part::Part;
-use turndb::query::{collect, table::TurndbTable, Lens};
+use turndb::query::{
+    collect,
+    sql::{classify_error, SqlErrorClass, SqlOptions, SqlQuery, SqlValue},
+    table::TurndbTable,
+    Lens,
+};
 use turndb::store::{ContentSpans, Span, Store};
 use turndb::AttrValue;
 
@@ -357,6 +362,99 @@ async fn sql_selects_filters_and_aggregates() {
             );
         }
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
+    use datafusion::arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let dir = tmp("embedded-sql");
+    let mut writer = Store::open(&dir, cfg()).unwrap();
+    for (id, kind, tokens) in [("a", "keep", 1), ("b", "drop", 2), ("c", "keep", 3)] {
+        writer
+            .put_body(
+                id,
+                b"payload",
+                vec![
+                    ("kind".into(), AttrValue::Str(kind.into())),
+                    ("tokens".into(), AttrValue::Int(tokens)),
+                ],
+            )
+            .unwrap();
+    }
+    writer.sync().unwrap();
+    writer.flush().unwrap();
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+
+    // ReadStore clones retain the same immutable fold and parts rather than reopening files or
+    // moving the caller's snapshot into one query.
+    let mut query = SqlQuery::open(
+        reader.clone(),
+        "SELECT id, tokens FROM records WHERE kind = $1 AND tokens > $2 ORDER BY id",
+        vec![SqlValue::String("keep".into()), SqlValue::Int(1)],
+        SqlOptions { max_memory_bytes: 32 << 20 },
+    )
+    .await
+    .unwrap();
+    let schema = StreamReader::try_new(Cursor::new(query.schema_ipc()), None).unwrap();
+    assert_eq!(schema.schema().fields().len(), 2);
+    assert_eq!(schema.count(), 0, "schema IPC contains no invented result row");
+
+    let mut ids = Vec::new();
+    while let Some(batch) = query.next().await.unwrap() {
+        assert_eq!(batch.rows, 1);
+        let decoded = StreamReader::try_new(Cursor::new(batch.ipc), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(decoded.len(), 1, "each pull is one independently decodable IPC batch");
+        let column = decoded[0].column(0).as_string::<i32>();
+        ids.extend((0..decoded[0].num_rows()).map(|row| column.value(row).to_string()));
+    }
+    assert_eq!(ids, ["c"]);
+    assert!(query.is_finished());
+    assert!(query.next().await.unwrap().is_none(), "end of stream is stable");
+    assert!(query.stats().rows > 0);
+
+    let mut starved = SqlQuery::open(
+        reader.clone(),
+        "SELECT id FROM records ORDER BY id",
+        vec![],
+        SqlOptions { max_memory_bytes: 1 << 20 },
+    )
+    .await
+    .unwrap();
+    let error = starved.next().await.unwrap_err();
+    assert_eq!(classify_error(&error), SqlErrorClass::ResourceExhausted);
+    assert!(
+        error.to_string().contains("execute TurnDB SQL batch"),
+        "the configured execution pool must bound work rather than be advisory: {error:#}"
+    );
+
+    let error = SqlQuery::open(
+        reader.clone(),
+        "CREATE TABLE forbidden (value INT)",
+        vec![],
+        SqlOptions::default(),
+    )
+    .await
+    .err()
+    .expect("DDL must be rejected");
+    assert_eq!(classify_error(&error), SqlErrorClass::InvalidArgument);
+    assert!(error.to_string().contains("read-only"));
+
+    let error = SqlQuery::open(
+        reader,
+        "SELECT id FROM records",
+        vec![],
+        SqlOptions { max_memory_bytes: 0 },
+    )
+    .await
+    .err()
+    .expect("zero memory must be rejected");
+    assert!(error.to_string().contains("must be greater than zero"));
     std::fs::remove_dir_all(&dir).ok();
 }
 
