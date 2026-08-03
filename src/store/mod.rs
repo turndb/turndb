@@ -1141,6 +1141,23 @@ impl Store {
         self.wal.sync()
     }
 
+    /// Settle every accepted operation and publish a verified, immutable backup artifact.
+    ///
+    /// The destination must not exist. Holding `&mut self` prevents this process from changing the
+    /// manifest while the packer walks the files it names; the writer lock excludes a second writer
+    /// process.
+    pub fn backup(&mut self, out: &Path) -> Result<crate::pack::BackupStats> {
+        crate::pack::ensure_destination_available(out)?;
+        self.sync()?;
+        self.flush()?;
+        let stats = crate::pack::write_committed(&self.dir, out)?;
+        Ok(crate::pack::BackupStats {
+            files: stats.files,
+            bytes: stats.bytes,
+            commit: self.manifest.commit,
+        })
+    }
+
     /// Seal the memtable into a part and commit it.
     ///
     /// Data before pointers, and the manifest last: the fold is durable before a part names any of

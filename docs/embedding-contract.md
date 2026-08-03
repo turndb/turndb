@@ -236,26 +236,26 @@ Arrow IPC stream per batch; JavaScript never reconstructs a dynamic schema or wa
 Batch pulls have timeouts and AbortSignal cancellation and dropping the Rust execution stream aborts
 unfinished work.
 
-**Current gaps:** only the binding-owned failure classes, typed DataFusion failures, scan/SQL-pull
-interruption, and writer contention have stable machine-readable codes; backup/restore and recovery
+**Current gaps:** binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption,
+writer contention, and backup/restore failures have stable machine-readable codes; manifest recovery
 controls and prebuilt artifact selection are not exposed yet. SQL planning is not yet interruptible,
 and per-query memory pools do not impose an aggregate cap across concurrent snapshot queries. The
 package is a tested source prototype and must not be described as a production distribution.
 
 The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
 overload, closed handles, typed scan/SQL-pull interruption, typed DataFusion invalid-input,
-unsupported, resource-exhaustion and I/O variants, and writer contention. Contention is a typed
+unsupported, resource-exhaustion and I/O variants, writer contention, and typed backup destination,
+corruption, unsupported-platform, not-found, and filesystem failures. Contention is a typed
 `WriterLocked` condition in the Rust core; consumers do not match its message. Unknown core failures
-deliberately remain `INTERNAL` until their engine error variants exist. `NOT_FOUND`, `CORRUPTION`, and
-broader `IO` use are reserved in the Node union but must not be assigned through message heuristics.
+deliberately remain `INTERNAL` until their engine error variants exist.
 
 Writer lifecycle commands are serialized with ingest. `compact`, `verify`, `punch`, and `refold`
 first sync and flush earlier writes, then operate on the resulting published cut. Verification covers
 the retained manifest hash chain and part pins, every live part section, and every fold frame; it is
 not a backup. `erase(ids)` invokes the engine's strong erasure composition and purges retained history.
 Its boundary remains this store: previously written packs, backups, replicas, and consumer exports are
-not affected. Backup/restore, manifest recovery, preflight space estimates, resumable maintenance, and
-cancellation remain current gaps.
+not affected. Online backup and validated no-overlay restore are exposed in Rust and Node; manifest
+recovery, preflight space estimates, resumable maintenance, and cancellation remain current gaps.
 
 `Store::health` and the Node `health()` method are constant-work operational snapshots. They report
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged

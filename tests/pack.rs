@@ -123,14 +123,14 @@ fn a_pack_refuses_what_it_must() {
     let dir = root.join("store");
     build_store(&dir);
 
-    // Uncommitted records must refuse the pack, not silently vanish from it.
+    // A directory packer must not race an already-open writer.
     {
         let mut s = Store::open(&dir, cfg()).unwrap();
         s.put("unflushed", &[Span::Lit(b"x")], vec![]).unwrap();
         s.sync().unwrap();
         assert!(
             turndb::pack::write(&dir, &root.join("no.turndb")).is_err(),
-            "a non-empty WAL must refuse packing"
+            "a live writer must refuse a second writer role"
         );
         s.flush().unwrap();
     }
@@ -170,5 +170,110 @@ fn a_pack_refuses_what_it_must() {
         Ok(_) => panic!("must refuse"),
     };
     assert!(err.contains("reserved"), "non-zero reserved bytes must refuse, got: {err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn directory_backup_recovers_and_includes_a_durable_wal() {
+    let root = tmp("durable-wal");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("store");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        store
+            .put("wal-record", &[Span::Piece(b"durable but not explicitly flushed")], vec![])
+            .unwrap();
+        store.sync().unwrap();
+    }
+
+    let artifact = root.join("snapshot.turndb");
+    turndb::pack::write(&dir, &artifact).unwrap();
+    let snapshot = turndb::store::open_read_pack(&artifact, cfg()).unwrap();
+    assert_eq!(
+        snapshot.reconstruct("wal-record").unwrap().unwrap(),
+        b"durable but not explicitly flushed"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn online_backup_is_an_exact_settled_cut_and_restore_is_writable() {
+    let root = tmp("online-backup");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("store");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    store
+        .put("before", &[Span::Piece(b"accepted before backup and not explicitly synced")], vec![])
+        .unwrap();
+
+    let artifact = root.join("snapshot.turndb");
+    let backed_up = store.backup(&artifact).unwrap();
+    assert!(backed_up.files >= 3);
+    assert_eq!(backed_up.bytes, std::fs::metadata(&artifact).unwrap().len());
+    assert_eq!(backed_up.commit, store.manifest().commit);
+
+    store.put("after", &[Span::Lit(b"later")], vec![]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let restored_dir = root.join("restored");
+    let restored = turndb::pack::restore(&artifact, &restored_dir).unwrap();
+    assert_eq!(restored.files, backed_up.files);
+    assert_eq!(restored.bytes, backed_up.bytes);
+    assert_eq!(restored.commit, backed_up.commit);
+
+    let mut reopened = Store::open(&restored_dir, cfg()).unwrap();
+    assert!(reopened.reconstruct("before").unwrap().is_some());
+    assert!(
+        reopened.reconstruct("after").unwrap().is_none(),
+        "backup must remain an immutable cut"
+    );
+    reopened.put("restored-write", &[Span::Lit(b"works")], vec![]).unwrap();
+    reopened.sync().unwrap();
+    reopened.flush().unwrap();
+    assert!(reopened.reconstruct("restored-write").unwrap().is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn backup_and_restore_never_replace_destinations_or_publish_corruption() {
+    let root = tmp("safe-destinations");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("store");
+    build_store(&dir);
+
+    let artifact = root.join("snapshot.turndb");
+    std::fs::write(&artifact, b"belongs to the caller").unwrap();
+    let before = std::fs::read(&artifact).unwrap();
+    let error = turndb::pack::write(&dir, &artifact).unwrap_err();
+    assert!(error.downcast_ref::<turndb::pack::BackupError>().is_some());
+    assert_eq!(std::fs::read(&artifact).unwrap(), before);
+
+    std::fs::remove_file(&artifact).unwrap();
+    turndb::pack::write(&dir, &artifact).unwrap();
+    let existing = root.join("existing");
+    std::fs::create_dir(&existing).unwrap();
+    let marker = existing.join("keep");
+    std::fs::write(&marker, b"untouched").unwrap();
+    let error = turndb::pack::restore(&artifact, &existing).unwrap_err();
+    assert!(error.downcast_ref::<turndb::pack::BackupError>().is_some());
+    assert_eq!(std::fs::read(&marker).unwrap(), b"untouched");
+
+    let mut corrupt = std::fs::read(&artifact).unwrap();
+    corrupt[0] ^= 1;
+    let corrupt_path = root.join("corrupt.turndb");
+    std::fs::write(&corrupt_path, corrupt).unwrap();
+    let absent = root.join("must-remain-absent");
+    let error = turndb::pack::restore(&corrupt_path, &absent).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<turndb::pack::BackupError>(),
+        Some(turndb::pack::BackupError::InvalidBackup { .. })
+    ));
+    assert!(!absent.exists());
+    assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("turndb-restore")));
     std::fs::remove_dir_all(&root).ok();
 }

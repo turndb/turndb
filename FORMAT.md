@@ -779,8 +779,8 @@ format-compatible, a writer may not omit it.
 The committed snapshot, exactly as a reader sees one: `MANIFEST` (verbatim, checksum trailer and
 all), every part it names, and the live fold generation's segments — plus their advisory sidecars
 and any dictionary files, so a pack opens as fast as the directory did. Deliberately absent:
-the WAL (a pack holds committed state; a packer must refuse a store with uncommitted records
-rather than silently drop them), the retained commit log (snapshots of an immutable artifact are
+the WAL (a pack holds committed state; a packer must take the writer role and settle it, or refuse
+rather than silently drop records), the retained commit log (snapshots of an immutable artifact are
 meaningless), and the writer lock (no writer, ever).
 
 Names are paths, which is the multi-store door: a future pack may carry several stores under
@@ -790,8 +790,9 @@ reads single-store packs.
 ### Unpacking
 
 Extraction is byte copying — every inner file lands exactly as it was, and the directory opens as
-an ordinary store, writer role available again. Both crossings are mechanical; nothing is
-reinterpreted in either direction.
+an ordinary store, writer role available again. The safe restore API verifies all member checksums,
+extracts and opens a staged store, then atomically publishes it with a no-replace rename. Both
+crossings are mechanical; nothing is reinterpreted in either direction.
 
 ---
 

@@ -8,16 +8,48 @@
 
 use crate::readat::{ReadAt, Slice};
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const MAGIC: &[u8; 8] = b"TURNPACK";
 pub const FOOTER_LEN: u64 = 40;
 /// The pack layout this build writes, and the highest it will read. Reject-forward, like the part.
 pub const PACK_VERSION: u8 = 1;
+/// Whether this target has an atomic rename primitive that refuses replacement.
+pub const ATOMIC_RESTORE: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", target_os = "ios"));
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A safe backup/restore refusal that callers can classify without parsing prose.
+#[derive(Debug)]
+pub enum BackupError {
+    DestinationExists(PathBuf),
+    InvalidBackup { path: PathBuf, reason: String },
+    Unsupported(String),
+}
+
+impl std::fmt::Display for BackupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackupError::DestinationExists(path) => {
+                write!(f, "destination {} already exists; refusing to replace it", path.display())
+            }
+            BackupError::InvalidBackup { path, reason } => {
+                write!(f, "backup {} is invalid: {reason}", path.display())
+            }
+            BackupError::Unsupported(reason) => {
+                write!(f, "backup operation is unsupported: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackupError {}
 
 /// One inner file: `(offset, length, crc32 of its bytes)`.
 type Entry = (u64, u64, u32);
@@ -154,10 +186,21 @@ impl Pack {
 
 /// Pack the committed snapshot of the store at `dir` into one file at `out`.
 ///
-/// Refuses a store with uncommitted records: a pack silently missing acked data would be a lie
-/// with a checksum on it. Written tmp + fsync + rename, so a crash leaves no half-pack under the
-/// final name.
+/// Takes the store's writer role, recovers and settles its WAL, and then writes the exact published
+/// cut. A live writer therefore causes ordinary writer contention instead of a racing export. The
+/// completed temporary artifact is fully verified, then hard-linked under the final name. That
+/// publication is atomic and refuses an existing destination.
 pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
+    ensure_destination_available(out)?;
+    // Taking the writer role makes the public directory-based operation safe alongside other
+    // processes and also replays and includes a durable WAL instead of refusing or omitting it.
+    let mut store = crate::store::Store::open(dir, crate::fold::FoldCfg::default())?;
+    let stats = store.backup(out)?;
+    Ok(PackStats { files: stats.files, bytes: stats.bytes })
+}
+
+/// Write a snapshot while the caller owns the store's writer role and has settled its WAL.
+pub(crate) fn write_committed(dir: &Path, out: &Path) -> Result<PackStats> {
     let manifest_bytes = std::fs::read(dir.join("MANIFEST"))
         .with_context(|| format!("read MANIFEST at {} — is this a store?", dir.display()))?;
     let manifest = crate::store::manifest_from_bytes(&manifest_bytes)?;
@@ -199,8 +242,9 @@ pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
     fold_files.sort();
     names.extend(fold_files);
 
-    let tmp = out.with_extension("pack.tmp");
-    let f = crate::vfs::create(&tmp)?;
+    ensure_destination_available(out)?;
+    let (tmp, f) = create_temp_file(out, "pack")?;
+    let mut cleanup = Cleanup::file(tmp.clone());
     let mut off = 0u64;
     let mut entries: Vec<(String, Entry)> = Vec::with_capacity(names.len());
     let mut buf = vec![0u8; 1 << 20];
@@ -253,29 +297,124 @@ pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
     crate::vfs::write_all_at(&f, &tmp, &foot, off)?;
     crate::vfs::sync_file(&f, &tmp)?;
     drop(f);
-    crate::vfs::rename(&tmp, out)?;
-    if let Some(parent) = out.parent() {
-        let _ = crate::vfs::sync_dir(parent);
-    }
+    let staged = Pack::open(&tmp).context("open completed backup before publication")?;
+    staged.verify().context("verify completed backup before publication")?;
+    drop(staged);
+    crate::vfs::link(&tmp, out).map_err(|error| destination_error(out, error))?;
+    crate::vfs::unlink(&tmp)?;
+    cleanup.disarm();
+    crate::vfs::sync_dir(parent_dir(out))?;
     Ok(PackStats { files: entries.len(), bytes: off + FOOTER_LEN })
 }
 
 /// Extract every inner file into `out_dir`, byte for byte — after which the directory is an
-/// ordinary store, writer role available again. Both crossings are mechanical.
+/// ordinary store, writer role available again. This is the safe restore operation: it verifies
+/// the complete pack first, stages and validates the store beside the destination, then atomically
+/// publishes it without replacing any existing filesystem object.
 pub fn unpack(pack_path: &Path, out_dir: &Path) -> Result<usize> {
-    let pack = Pack::open(pack_path)?;
-    let names: Vec<String> = pack.names().map(String::from).collect();
-    for name in &names {
-        if name.contains("..") || name.starts_with('/') {
-            bail!("pack names a path outside its own root: {name:?}");
+    Ok(restore(pack_path, out_dir)?.files)
+}
+
+/// Restore a verified pack to a new ordinary store directory.
+pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
+    if !ATOMIC_RESTORE {
+        return Err(BackupError::Unsupported(
+            "this platform has no atomic no-replace directory rename".into(),
+        )
+        .into());
+    }
+    ensure_destination_available(out_dir)?;
+    let pack = Pack::open(pack_path).map_err(|error| {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            error
+        } else {
+            invalid_backup(pack_path, error)
         }
+    })?;
+    let files = pack.verify().map_err(|error| invalid_backup(pack_path, error))?;
+    let manifest = crate::store::manifest_from_bytes(
+        &pack.read_file("MANIFEST").map_err(|error| invalid_backup(pack_path, error))?,
+    )
+    .map_err(|error| invalid_backup(pack_path, error))?;
+    for part in &manifest.parts {
+        if !safe_relative_name(&part.file) {
+            return Err(invalid_backup(
+                pack_path,
+                format!("manifest names a part outside its own root: {:?}", part.file),
+            ));
+        }
+    }
+    for name in pack.names() {
+        if !safe_relative_name(name) {
+            return Err(invalid_backup(
+                pack_path,
+                format!("pack names a path outside its own root: {name:?}"),
+            ));
+        }
+    }
+
+    let stage = create_temp_dir(out_dir, "restore")?;
+    let mut cleanup = Cleanup::dir(stage.clone());
+    extract_into(&pack, &stage).context("extract verified TurnDB backup")?;
+    crate::store::Store::open_read(&stage, crate::fold::FoldCfg::default())
+        .map_err(|error| invalid_backup(pack_path, error))?;
+
+    crate::vfs::rename_noreplace(&stage, out_dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Unsupported {
+            BackupError::Unsupported(error.to_string()).into()
+        } else {
+            destination_error(out_dir, error)
+        }
+    })?;
+    cleanup.disarm();
+    crate::vfs::sync_dir(parent_dir(out_dir))?;
+    Ok(RestoreStats { files, bytes: std::fs::metadata(pack_path)?.len(), commit: manifest.commit })
+}
+
+fn extract_into(pack: &Pack, out_dir: &Path) -> Result<()> {
+    let names: Vec<String> = pack.names().map(String::from).collect();
+    let mut dirs = BTreeSet::new();
+    dirs.insert(out_dir.to_path_buf());
+    for name in &names {
         let dst = out_dir.join(name);
         if let Some(parent) = dst.parent() {
             crate::vfs::mkdir_all(parent)?;
+            let mut ancestor = Some(parent);
+            while let Some(dir) = ancestor {
+                if !dir.starts_with(out_dir) {
+                    break;
+                }
+                dirs.insert(dir.to_path_buf());
+                if dir == out_dir {
+                    break;
+                }
+                ancestor = dir.parent();
+            }
         }
-        crate::vfs::write_file(&dst, &pack.read_file(name)?)?;
+        let source = pack.file(name).ok_or_else(|| anyhow::anyhow!("pack lost file {name}"))?;
+        let file = crate::vfs::create_new(&dst)?;
+        let len = source.len()?;
+        let mut at = 0u64;
+        let mut buf = vec![0u8; (1 << 20).min(len.max(1)) as usize];
+        while at < len {
+            let take = buf.len().min((len - at) as usize);
+            source.read_exact_at(&mut buf[..take], at)?;
+            crate::vfs::write_all_at(&file, &dst, &buf[..take], at)?;
+            at += take as u64;
+        }
+        crate::vfs::sync_file(&file, &dst)?;
     }
-    Ok(names.len())
+    // Child directory entries before their parents: after the final directory rename, a crash
+    // sees either no destination or the complete tree, never a published tree with missing files.
+    let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in dirs {
+        crate::vfs::sync_dir(&dir)?;
+    }
+    Ok(())
 }
 
 /// What a pack write did.
@@ -283,4 +422,125 @@ pub fn unpack(pack_path: &Path, out_dir: &Path) -> Result<usize> {
 pub struct PackStats {
     pub files: usize,
     pub bytes: u64,
+}
+
+/// What a safe online writer backup did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackupStats {
+    pub files: usize,
+    pub bytes: u64,
+    pub commit: u64,
+}
+
+/// What a safe restore published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreStats {
+    pub files: usize,
+    pub bytes: u64,
+    pub commit: u64,
+}
+
+fn safe_relative_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('\\')
+        && Path::new(name).components().all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))
+}
+
+pub(crate) fn ensure_destination_available(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(BackupError::DestinationExists(path.to_path_buf()).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect destination {}", path.display())),
+    }
+}
+
+fn destination_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        BackupError::DestinationExists(path.to_path_buf()).into()
+    } else {
+        anyhow::Error::new(error).context(format!("publish destination {}", path.display()))
+    }
+}
+
+fn invalid_backup(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+    BackupError::InvalidBackup { path: path.to_path_buf(), reason: error.to_string() }.into()
+}
+
+fn temp_path(target: &Path, tag: &str) -> Result<PathBuf> {
+    let name = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("destination {} has no file name", target.display()))?
+        .to_string_lossy();
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(parent_dir(target)
+        .join(format!(".{name}.turndb-{tag}-{}-{sequence}.tmp", std::process::id())))
+}
+
+fn create_temp_file(target: &Path, tag: &str) -> Result<(PathBuf, File)> {
+    for _ in 0..128 {
+        let path = temp_path(target, tag)?;
+        match crate::vfs::create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("could not reserve a unique staging file beside {}", target.display())
+}
+
+fn create_temp_dir(target: &Path, tag: &str) -> Result<PathBuf> {
+    for _ in 0..128 {
+        let path = temp_path(target, tag)?;
+        match crate::vfs::mkdir_new(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("could not reserve a unique staging directory beside {}", target.display())
+}
+
+enum CleanupKind {
+    File,
+    Dir,
+}
+
+struct Cleanup {
+    path: PathBuf,
+    kind: CleanupKind,
+    armed: bool,
+}
+
+impl Cleanup {
+    fn file(path: PathBuf) -> Cleanup {
+        Cleanup { path, kind: CleanupKind::File, armed: true }
+    }
+
+    fn dir(path: PathBuf) -> Cleanup {
+        Cleanup { path, kind: CleanupKind::Dir, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.kind {
+            CleanupKind::File => {
+                let _ = crate::vfs::unlink(&self.path);
+            }
+            CleanupKind::Dir => {
+                let _ = crate::vfs::remove_tree(&self.path);
+            }
+        }
+    }
 }

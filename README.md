@@ -53,6 +53,7 @@ head -4000 traces.jsonl | ./target/release/turndb import mystore -
 ./target/release/turndb query   mystore "SELECT model, count(*) FROM t GROUP BY model"
 ./target/release/turndb pack    mystore snap.turndb
 ./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"   # SQL over one file
+./target/release/turndb unpack  snap.turndb restored                   # validated, no overlay
 ```
 
 As a library:
@@ -76,6 +77,10 @@ s.flush()?;                                   // seal into an immutable part
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
 | **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
+
+The pack command takes the writer role, settles a recovered WAL, fully verifies its staged artifact,
+and refuses to replace an output path. Restore likewise verifies before extraction and atomically
+publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
 
 The query layers are independently selectable: `--features columnar --no-default-features` provides
 the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same

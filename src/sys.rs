@@ -23,6 +23,7 @@
 
 use std::fs::File;
 use std::io;
+use std::path::Path;
 
 // ── Positioned I/O ──────────────────────────────────────────────────────────
 //
@@ -168,4 +169,63 @@ pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
             "hole punching needs fallocate(FALLOC_FL_PUNCH_HOLE), which this platform lacks",
         ))
     }
+}
+
+// ── Exclusive rename ──────────────────────────────────────────────────────
+
+/// Atomically rename `from` to `to` while refusing to replace any existing filesystem object.
+///
+/// This is stronger than `exists()` followed by `std::fs::rename`: ordinary POSIX rename may
+/// replace an empty directory created between those calls. Backup restoration uses this as its
+/// final publication point, so a concurrent creator can make restoration fail but cannot lose its
+/// destination.
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+pub(crate) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
 }

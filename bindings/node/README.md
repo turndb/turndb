@@ -37,6 +37,12 @@ silently.
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
+- `backup(path)` settles earlier actor commands, writes and fully verifies an immutable pack, and
+  atomically publishes it without replacing an existing destination. `restoreBackup(pack, dir)`
+  verifies every member, extracts with bounded memory, validates the staged store, and atomically
+  publishes a new writable directory without overlaying any filesystem object. Safe restore reports
+  `UNSUPPORTED` on a platform without an OS no-replace directory rename; the capability is exposed
+  as `backupRestore`.
 - `querySql()` is the richer immutable query plane. The native package deliberately includes the
   Arrow/DataFusion dependency: Rust binds typed `$1` parameters, refuses DDL/DML/session statements,
   enforces a configurable execution-memory pool (256 MiB by default), and returns a
@@ -72,7 +78,7 @@ silently.
   the result because metadata-only discovery can conservatively include a field that exists only in
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
-The current slice does not yet expose backup/restore and recovery controls, cancellation for
-long-running lifecycle operations or SQL planning, aggregate budgets across concurrent snapshot
-queries, or the complete engine error taxonomy. Those remain explicit Phase 3/4 work rather than
-being simulated in JavaScript.
+The current slice does not yet expose manifest recovery controls, cancellation for long-running
+lifecycle operations or SQL planning, aggregate budgets across concurrent snapshot queries, or the
+complete engine error taxonomy. Those remain explicit Phase 3/4 work rather than being simulated in
+JavaScript.

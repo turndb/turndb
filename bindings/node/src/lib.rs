@@ -48,6 +48,28 @@ fn scan_failure(context: &str, error: anyhow::Error) -> Error {
     }
 }
 
+fn backup_failure(context: &str, error: anyhow::Error) -> Error {
+    let code = if let Some(error) = error.downcast_ref::<turndb::pack::BackupError>() {
+        match error {
+            turndb::pack::BackupError::DestinationExists(_) => "INVALID_ARGUMENT",
+            turndb::pack::BackupError::InvalidBackup { .. } => "CORRUPTION",
+            turndb::pack::BackupError::Unsupported(_) => "UNSUPPORTED",
+        }
+    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => "NOT_FOUND",
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::InvalidInput => {
+                "INVALID_ARGUMENT"
+            }
+            std::io::ErrorKind::Unsupported => "UNSUPPORTED",
+            _ => "IO",
+        }
+    } else {
+        "INTERNAL"
+    };
+    coded_failure(code, format!("{context}: {error:#}"))
+}
+
 #[cfg(feature = "sql")]
 fn sql_failure(context: &str, error: anyhow::Error) -> Error {
     let code = match classify_sql_error(&error) {
@@ -224,6 +246,7 @@ pub struct NativeCapabilities {
     pub command_queue_capacity_max: u32,
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
+    pub backup_restore: bool,
     pub health_snapshots: bool,
     pub schema_discovery: bool,
     pub scan_cancellation: bool,
@@ -261,6 +284,7 @@ pub fn capabilities() -> NativeCapabilities {
         command_queue_capacity_max: MAX_QUEUE_CAPACITY as u32,
         immutable_snapshots: true,
         lifecycle_operations: true,
+        backup_restore: turndb::pack::ATOMIC_RESTORE,
         health_snapshots: true,
         schema_discovery: true,
         scan_cancellation: true,
@@ -315,6 +339,13 @@ pub struct NativeVerifyResult {
     pub fold_blocks: BigInt,
     pub fold_bytes: BigInt,
     pub trailing_uncommitted_bytes: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeBackupResult {
+    pub files: BigInt,
+    pub bytes: BigInt,
+    pub commit: BigInt,
 }
 
 #[napi(object)]
@@ -688,6 +719,31 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
         .map_err(|error| failure("list retained TurnDB commits", error))
 }
 
+/// Validate and restore one immutable backup into a destination that must not exist.
+#[napi]
+pub async fn restore_backup(
+    backup_path: String,
+    destination_path: String,
+) -> Result<NativeBackupResult> {
+    if backup_path.is_empty() || destination_path.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "backup and destination paths must not be empty",
+        ));
+    }
+    napi::tokio::task::spawn_blocking(move || {
+        turndb::pack::restore(&PathBuf::from(backup_path), &PathBuf::from(destination_path))
+    })
+    .await
+    .map_err(|error| failure("join TurnDB backup restore", error))?
+    .map(|stats| NativeBackupResult {
+        files: BigInt::from(stats.files as u64),
+        bytes: BigInt::from(stats.bytes),
+        commit: BigInt::from(stats.commit),
+    })
+    .map_err(|error| backup_failure("restore TurnDB backup", error))
+}
+
 /// A native writer handle. All operations are asynchronous and serialized by its Rust actor.
 #[napi]
 pub struct NativeStore {
@@ -806,6 +862,23 @@ impl NativeStore {
             .await
             .map(encode_verify)
             .map_err(|error| failure("verify TurnDB store", error))
+    }
+
+    /// Settle earlier writes and publish a verified backup without replacing an existing path.
+    #[napi]
+    pub async fn backup(&self, path: String) -> Result<NativeBackupResult> {
+        if path.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "backup path must not be empty"));
+        }
+        self.actor
+            .backup(PathBuf::from(path))
+            .await
+            .map(|stats| NativeBackupResult {
+                files: BigInt::from(stats.files as u64),
+                bytes: BigInt::from(stats.bytes),
+                commit: BigInt::from(stats.commit),
+            })
+            .map_err(|error| backup_failure("backup TurnDB store", error))
     }
 
     /// Physically erase ids from this store, including retained history. External copies are out of scope.
