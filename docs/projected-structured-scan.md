@@ -56,9 +56,14 @@ the Rust query contract rather than in a binding.
 
 ## Remaining cost gap
 
-The pager still obtains bounded candidate ids and point-locates each committed id across live parts.
-It no longer decodes whole records, but it is not yet a batched physical column range scan. Query
-statistics now report exact operation-local distinct sections and fold blocks, cache access counts,
-and stored/raw bytes. See [structured scan I/O statistics](structured-scan-io.md). Batched physical
-range execution remains the next Phase-2 opportunity; the selective read primitive can support it
-without creating a second index or changing the format.
+The pager now retains the authoritative part and row found by its bounded k-way id-range merge. It
+projects that row directly and reuses an already projected content program during reconstruction,
+rather than point-locating the id and decoding the program again. See
+[resolved-row structured paging](resolved-row-paging.md).
+
+It is not yet vectorized physical column execution: globally ordered candidates still invoke
+selected-column decoders one row at a time rather than being gathered by part and decoded as a
+batch. Query statistics report exact operation-local distinct sections and fold blocks, cache access
+counts, and stored/raw bytes. See [structured scan I/O statistics](structured-scan-io.md). A grouped
+physical batch primitive remains the next Phase-2 opportunity and requires no second index or format
+change.

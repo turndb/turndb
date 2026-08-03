@@ -1153,17 +1153,29 @@ impl Part {
         let Some(ops) = self.content(r, name)? else {
             return Ok(None);
         };
+        let mut content = Content::new(name, ops);
+        content.identity = self.content_identity(r, name)?;
+        Ok(Some(self.reconstruct_projected_content(&content, fold)?))
+    }
+
+    /// Reconstruct a content value whose program and identity were already projected from this
+    /// part. Structured scans use this to avoid decoding the selected content column a second time.
+    pub(crate) fn reconstruct_projected_content(
+        &self,
+        content: &Content,
+        fold: &Fold,
+    ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        for op in ops {
+        for op in &content.ops {
             match op {
-                BodyOp::Lit(bytes) => out.extend_from_slice(&bytes),
+                BodyOp::Lit(bytes) => out.extend_from_slice(bytes),
                 BodyOp::Piece { hash, len } => {
-                    let mut loc = self.lookup_piece(&hash)?;
+                    let mut loc = self.lookup_piece(hash)?;
                     if loc.is_none() {
                         // Revision-0 parts may predate the optional hash-sorted dictionary index.
                         for i in 0..self.piece_count()? {
                             let (candidate_loc, candidate_hash) = self.piece(i)?;
-                            if candidate_hash == hash {
+                            if candidate_hash == *hash {
                                 loc = Some(candidate_loc);
                                 break;
                             }
@@ -1172,20 +1184,23 @@ impl Part {
                     let loc = loc.ok_or_else(|| {
                         anyhow::anyhow!("piece {hash} is not in the part dictionary")
                     })?;
-                    if loc.raw != len {
+                    if loc.raw != *len {
                         bail!("piece {hash} is {} bytes but the program says {len}", loc.raw);
                     }
-                    fold.read_verified_into(loc, hash, &mut out)?;
+                    fold.read_verified_into(loc, *hash, &mut out)?;
                 }
             }
         }
-        if let Some(expected) = self.content_identity(r, name)? {
+        if let Some(expected) = content.identity {
             let got = ContentHash::of(&out);
             if got != expected {
-                bail!("content {name:?} reconstructed as {got} but its identity is {expected}");
+                bail!(
+                    "content {:?} reconstructed as {got} but its identity is {expected}",
+                    content.name
+                );
             }
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
     /// Reconstruct by id.

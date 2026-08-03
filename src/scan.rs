@@ -188,70 +188,93 @@ pub struct ScanPage {
     pub stats: ScanStats,
 }
 
+/// A live row whose newest-wins origin was settled by the bounded range merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScanCandidate {
+    Committed(crate::store::read::RowRef),
+    Memtable(String),
+}
+
+impl ScanCandidate {
+    pub(crate) fn id(&self) -> &str {
+        match self {
+            ScanCandidate::Committed(row) => &row.id,
+            ScanCandidate::Memtable(id) => id,
+        }
+    }
+
+    pub(crate) fn into_id(self) -> String {
+        match self {
+            ScanCandidate::Committed(row) => row.id,
+            ScanCandidate::Memtable(id) => id,
+        }
+    }
+}
+
 trait Source {
-    fn scan_ids(
+    fn scan_candidates(
         &self,
         from: Option<&str>,
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<String>>;
+    ) -> Result<Vec<ScanCandidate>>;
     fn project(
         &self,
-        id: &str,
+        candidate: &ScanCandidate,
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Option<Record>>;
-    fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>>;
+    ) -> Result<Record>;
+    fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>>;
 }
 
 impl Source for Store {
-    fn scan_ids(
+    fn scan_candidates(
         &self,
         from: Option<&str>,
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<String>> {
-        Store::scan_ids(self, from, to, limit, reverse)
+    ) -> Result<Vec<ScanCandidate>> {
+        Store::scan_candidates(self, from, to, limit, reverse)
     }
 
     fn project(
         &self,
-        id: &str,
+        candidate: &ScanCandidate,
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Option<Record>> {
-        Store::project(self, id, attrs, contents)
+    ) -> Result<Record> {
+        Store::project_candidate(self, candidate, attrs, contents)
     }
 
-    fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        Store::reconstruct_content(self, id, name)
+    fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>> {
+        Store::reconstruct_candidate_content(self, candidate, content)
     }
 }
 
 impl Source for ReadStore {
-    fn scan_ids(
+    fn scan_candidates(
         &self,
         from: Option<&str>,
         to: Option<&str>,
         limit: usize,
         reverse: bool,
-    ) -> Result<Vec<String>> {
-        ReadStore::scan_ids(self, from, to, limit, reverse)
+    ) -> Result<Vec<ScanCandidate>> {
+        ReadStore::scan_candidates(self, from, to, limit, reverse)
     }
 
     fn project(
         &self,
-        id: &str,
+        candidate: &ScanCandidate,
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Option<Record>> {
-        ReadStore::project(self, id, attrs, contents)
+    ) -> Result<Record> {
+        ReadStore::project_candidate(self, candidate, attrs, contents)
     }
 
-    fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        ReadStore::reconstruct_content(self, id, name)
+    fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>> {
+        ReadStore::reconstruct_candidate_content(self, candidate, content)
     }
 }
 
@@ -324,32 +347,34 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         check_interruption(request)?;
         let remaining = request.max_examined - stats.examined;
         let ask = remaining.min((request.limit - rows.len()).max(64));
-        let ids = source.scan_ids(
+        let candidates = source.scan_candidates(
             from.as_deref(),
             to.as_deref(),
             ask,
             request.direction == Direction::Reverse,
         )?;
         check_interruption(request)?;
-        if ids.is_empty() {
+        if candidates.is_empty() {
             has_more = false;
             break;
         }
-        let fetched = ids.len();
+        let fetched = candidates.len();
         let mut processed = 0usize;
-        for id in ids {
+        for candidate in candidates {
             check_interruption(request)?;
             processed += 1;
             stats.examined += 1;
             let record = if needs_record {
-                Some(source.project(&id, &attr_needed, &content_needed)?.ok_or_else(|| {
-                    anyhow::anyhow!("id {id:?} disappeared from an immutable scan view")
-                })?)
+                Some(source.project(&candidate, &attr_needed, &content_needed)?)
             } else {
                 None
             };
-            if !request.predicates.iter().all(|p| matches_predicate(&id, record.as_ref(), p)) {
-                last_consumed = Some(id);
+            if !request
+                .predicates
+                .iter()
+                .all(|p| matches_predicate(candidate.id(), record.as_ref(), p))
+            {
+                last_consumed = Some(candidate.into_id());
                 continue;
             }
             let row_reconstructed_bytes = projected_reconstructed_bytes(record.as_ref(), request)?;
@@ -379,14 +404,8 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             for selected in &request.contents {
                 check_interruption(request)?;
                 let content = record.as_ref().and_then(|r| r.content(&selected.name));
-                let bytes = if content.is_some() && selected.mode == ContentMode::Bytes {
-                    let value =
-                        source.reconstruct_content(&id, &selected.name)?.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "content {:?} disappeared from record {id:?}",
-                                selected.name
-                            )
-                        })?;
+                let bytes = if let (Some(content), ContentMode::Bytes) = (content, selected.mode) {
+                    let value = source.reconstruct_content(&candidate, content)?;
                     check_interruption(request)?;
                     stats.content_values_reconstructed += 1;
                     stats.reconstructed_bytes = stats
@@ -399,7 +418,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
                 };
                 contents.push(project_content(&selected.name, content, bytes));
             }
-            rows.push(ScanRow { id, attrs, contents });
+            rows.push(ScanRow { id: candidate.into_id(), attrs, contents });
             last_consumed = Some(rows.last().expect("row was just pushed").id.clone());
             if rows.len() == request.limit {
                 has_more = processed < fetched || fetched == ask;
@@ -762,29 +781,34 @@ mod tests {
     }
 
     impl Source for CancelsAfterFirstRead {
-        fn scan_ids(
+        fn scan_candidates(
             &self,
             _from: Option<&str>,
             _to: Option<&str>,
             _limit: usize,
             _reverse: bool,
-        ) -> Result<Vec<String>> {
-            Ok(vec!["a".into(), "b".into()])
+        ) -> Result<Vec<ScanCandidate>> {
+            Ok(vec![ScanCandidate::Memtable("a".into()), ScanCandidate::Memtable("b".into())])
         }
 
         fn project(
             &self,
-            id: &str,
+            candidate: &ScanCandidate,
             _attrs: &HashSet<&str>,
             _contents: &HashSet<&str>,
-        ) -> Result<Option<Record>> {
+        ) -> Result<Record> {
+            let id = candidate.id();
             if id == "a" {
                 self.cancellation.cancel();
             }
-            Ok(Some(Record::new(id, vec![], vec![("selected".into(), AttrValue::Bool(true))])?))
+            Record::new(id, vec![], vec![("selected".into(), AttrValue::Bool(true))])
         }
 
-        fn reconstruct_content(&self, _id: &str, _name: &str) -> Result<Option<Vec<u8>>> {
+        fn reconstruct_content(
+            &self,
+            _candidate: &ScanCandidate,
+            _content: &Content,
+        ) -> Result<Vec<u8>> {
             unreachable!("the interruption test projects no content")
         }
     }

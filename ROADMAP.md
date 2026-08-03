@@ -94,7 +94,11 @@ content model right before compatibility turns today's choices into permanent pr
   than filtering a fully decoded record. Each successful structured page now also reports exact
   operation-local part-section and fold-block touches, cache access counts, stored bytes requested,
   and raw bytes decoded. Instrumentation sits below shared caches rather than subtracting global
-  counters, so concurrent snapshots cannot contaminate one another's evidence.
+  counters, so concurrent snapshots cannot contaminate one another's evidence. The bounded k-way
+  range merge now carries each live committed candidate's authoritative part/row into projection and
+  reconstruction; neither phase point-searches the id again, and byte projection reuses its decoded
+  content program and identity. Writer memtable origins use the same candidate pipeline. Per-row
+  selected-column decoding remains to be replaced by grouped physical gathers.
 
 ## Product boundary
 
