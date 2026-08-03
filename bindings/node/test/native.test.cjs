@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { capabilities, NativeSnapshot, NativeStore, retainedCommits } = require('..');
+const { capabilities, NativeSnapshot, NativeStore, retainedCommits, TurnDbError } = require('..');
 
 function temporaryStore(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-'));
@@ -50,6 +50,7 @@ test('refuses a missing native artifact instead of silently loading WASM', () =>
 
 test('round-trips exact typed fields and independently named content', async (t) => {
   const store = await NativeStore.open(temporaryStore(t));
+  assert(store instanceof NativeStore);
   t.after(async () => {
     try { await store.close(); } catch {}
   });
@@ -149,6 +150,7 @@ test('publishes exact immutable cuts and reopens retained commits', async (t) =>
 
   await store.write([{ kind: 'put', id: 'r1' }]);
   const first = await store.snapshot();
+  assert(first instanceof NativeSnapshot);
   t.after(async () => {
     try { await first.close(); } catch {}
   });
@@ -185,7 +187,12 @@ test('validates exact values and lifecycle at the boundary', async (t) => {
       id: 'bad',
       attrs: [{ name: 'wide', kind: 'int', intValue: 9223372036854775808n }],
     }]),
-    /outside the signed i64 range/
+    (error) => {
+      assert(error instanceof TurnDbError);
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /outside the signed i64 range/);
+      return true;
+    }
   );
   await assert.rejects(
     store.write([{
@@ -196,6 +203,25 @@ test('validates exact values and lifecycle at the boundary', async (t) => {
     /exactly one typed value/
   );
   await store.close(false);
-  await assert.rejects(store.scan(), /closed/);
-  await assert.rejects(store.close(), /already closed/);
+  await assert.rejects(store.scan(), (error) => {
+    assert(error instanceof TurnDbError);
+    assert.equal(error.code, 'CLOSED');
+    return true;
+  });
+  await assert.rejects(store.close(), (error) => {
+    assert.equal(error.code, 'CLOSED');
+    return true;
+  });
+});
+
+test('classifies writer contention without parsing prose in the consumer', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  await assert.rejects(NativeStore.open(dir), (error) => {
+    assert(error instanceof TurnDbError);
+    assert.equal(error.code, 'CONTENTION');
+    assert(error.cause instanceof Error);
+    return true;
+  });
+  await store.close();
 });

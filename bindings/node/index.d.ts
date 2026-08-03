@@ -71,6 +71,21 @@ export interface Capabilities {
   immutableSnapshots: true;
 }
 
+export type TurnDbErrorCode =
+  | 'INVALID_ARGUMENT'
+  | 'BUSY'
+  | 'CLOSED'
+  | 'CONTENTION'
+  | 'NOT_FOUND'
+  | 'CORRUPTION'
+  | 'IO'
+  | 'INTERNAL';
+
+export declare class TurnDbError extends Error {
+  readonly code: TurnDbErrorCode;
+  readonly cause?: unknown;
+}
+
 export declare function capabilities(): Capabilities;
 export declare function retainedCommits(path: string): Promise<bigint[]>;
 

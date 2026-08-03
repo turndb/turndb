@@ -29,8 +29,9 @@ content model right before compatibility turns today's choices into permanent pr
   Rust store actor per writer, Promise operations, atomic batches with explicit durability, native
   buffers and bigint, the Rust structured pager, explicit capability reporting, and no silent WASM
   fallback. Writer-created immutable cuts and independently opened live/retained reader snapshots now
-  carry stable multi-page reads without taking a writer lock. It is a source prototype, not yet a
-  production prebuild matrix.
+  carry stable multi-page reads without taking a writer lock. `TurnDbError` classifies binding
+  validation, overload, closed handles, and typed writer contention without consumer-side prose
+  matching. It is a source prototype, not yet a production prebuild matrix.
 
 ## Product boundary
 
@@ -303,8 +304,8 @@ profile is useful while the additional query-engine dependency is affordable whe
 are actually exposed.
 
 Remaining Phase-3 gaps are prebuilt platform artifacts, Arrow IPC and SQL, cancellation/deadlines,
-configurable queue limits, structured error codes, lifecycle maintenance, and measured event-loop/query
-overhead under a representative mixed workload.
+configurable queue limits, a complete typed engine error taxonomy, lifecycle maintenance, and measured
+event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 

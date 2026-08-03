@@ -25,6 +25,10 @@ fn failure(context: &str, error: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, format!("{context}: {error:#}"))
 }
 
+fn coded_failure(code: &str, reason: impl std::fmt::Display) -> Error {
+    Error::new(Status::GenericFailure, format!("[TURNDB_CODE:{code}] {reason}"))
+}
+
 #[napi(object)]
 pub struct NativeAttr {
     pub name: String,
@@ -176,18 +180,18 @@ impl SnapshotState {
     fn get(&self) -> Result<Arc<ReadStore>> {
         self.store
             .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "TurnDB snapshot state is poisoned"))?
+            .map_err(|_| coded_failure("INTERNAL", "TurnDB snapshot state is poisoned"))?
             .clone()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "TurnDB snapshot is closed"))
+            .ok_or_else(|| coded_failure("CLOSED", "TurnDB snapshot is closed"))
     }
 
     fn close(&self) -> Result<()> {
         let mut store = self
             .store
             .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "TurnDB snapshot state is poisoned"))?;
+            .map_err(|_| coded_failure("INTERNAL", "TurnDB snapshot state is poisoned"))?;
         if store.take().is_none() {
-            return Err(Error::new(Status::GenericFailure, "TurnDB snapshot is already closed"));
+            return Err(coded_failure("CLOSED", "TurnDB snapshot is already closed"));
         }
         Ok(())
     }
