@@ -1,0 +1,195 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const child = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const { NativeStore } = require('..');
+const { putRecord } = require('../qualification/record-adapter.cjs');
+const { buildPipeline, linkedTelemetry } = require('../qualification/workloads.cjs');
+
+function temporaryRoot(t, prefix = 'turndb-qualification-') {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return root;
+}
+
+function attrPredicate(field) {
+  const value = putRecord({ id: 'predicate', fields: [field] }).attrs[0];
+  return { kind: 'attr', op: 'eq', value };
+}
+
+async function qualifyWorkload(t, fixture) {
+  const dir = path.join(temporaryRoot(t), 'store');
+  let store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  // One call is one ordered atomic source batch. `durable` is the acknowledgement boundary.
+  await store.write(fixture.records.map(putRecord), true);
+  assert.equal(await store.flush(), true);
+
+  const schema = await store.schema();
+  const expectedAttributeTypes = new Map();
+  for (const record of fixture.records) {
+    for (const field of record.fields ?? []) {
+      if (!expectedAttributeTypes.has(field.name)) expectedAttributeTypes.set(field.name, new Set());
+      expectedAttributeTypes.get(field.name).add(field.type);
+    }
+  }
+  const canonicalAttributes = (attributes) => attributes
+    .map(({ name, types }) => ({ name, types: [...types].sort() }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  assert.deepEqual(
+    canonicalAttributes(schema.attributes),
+    canonicalAttributes([...expectedAttributeTypes].map(([name, types]) => ({ name, types }))),
+  );
+  const expectedContentNames = [...new Set(fixture.records.flatMap(
+    (record) => (record.contents ?? []).map(({ name }) => name),
+  ))].sort();
+  assert.deepEqual(schema.contents, expectedContentNames);
+
+  const attributeNames = [...expectedAttributeTypes.keys()].sort();
+  const completeMetadata = await store.scan({ attrs: attributeNames });
+  const expectedRecords = [...fixture.records].sort((left, right) => left.id.localeCompare(right.id));
+  assert.deepEqual(
+    completeMetadata.rows.map(({ id, attrs }) => ({ id, attrs })),
+    expectedRecords.map((record) => {
+      const { id, attrs } = putRecord(record);
+      return { id, attrs };
+    }),
+  );
+  assert.equal(completeMetadata.stats.io.foldBlocksTouched, 0n);
+
+  const correlated = await store.scan({
+    attrs: ['record.family', fixture.correlation.name],
+    predicates: [attrPredicate(fixture.correlation)],
+  });
+  assert.deepEqual(correlated.rows.map(({ id }) => id), fixture.expectedCorrelatedIds);
+  assert.equal(correlated.stats.io.foldBlocksTouched, 0n);
+  assert(correlated.rows.every(({ contents }) => contents.length === 0));
+
+  const sharedRows = [];
+  for (const shared of fixture.shared) {
+    const page = await store.scan({
+      from: shared.id,
+      to: `${shared.id}\0`,
+      contents: [{ name: shared.content, mode: 'metadata' }],
+    });
+    assert.equal(page.stats.io.foldBlocksTouched, 0n);
+    assert.equal(page.rows.length, 1);
+    assert.equal(page.rows[0].contents.length, 1);
+    assert.equal(page.rows[0].contents[0].present, true);
+    assert.equal(page.rows[0].contents[0].bytes, undefined);
+    sharedRows.push(page.rows[0].contents[0]);
+  }
+  assert.match(sharedRows[0].identity, /^[0-9a-f]{64}$/);
+  assert.equal(sharedRows[1].identity, sharedRows[0].identity);
+  assert.equal(sharedRows[1].len, sharedRows[0].len);
+
+  const selected = await store.scan({
+    from: fixture.selected.id,
+    to: `${fixture.selected.id}\0`,
+    contents: [{ name: fixture.selected.name, mode: 'bytes' }],
+  });
+  assert.equal(selected.rows.length, 1);
+  assert.equal(selected.rows[0].contents.length, 1);
+  assert.deepEqual(selected.rows[0].contents[0].bytes, fixture.selected.bytes);
+
+  const expectedIds = expectedRecords.map(({ id }) => id);
+  await store.close(false);
+  store = await NativeStore.open(dir);
+  assert.deepEqual((await store.scan()).rows.map(({ id }) => id), expectedIds);
+}
+
+for (const fixture of [linkedTelemetry, buildPipeline]) {
+  test(`qualifies a self-described ${fixture.name} consumer`, async (t) => {
+    await qualifyWorkload(t, fixture);
+  });
+}
+
+test('defines live cursor and late-arrival behavior without a trace-specific timeline API', async (t) => {
+  const dir = path.join(temporaryRoot(t), 'store');
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  const record = (id, occurredAt) => putRecord({
+    id,
+    fields: [
+      { name: 'stream.key', type: 'string', value: 'stream-a' },
+      { name: 'occurred_at', type: 'timestamp_ns', value: occurredAt },
+    ],
+  });
+  await store.write([
+    record('stream-a/0001', 1000n),
+    record('stream-a/0003', 3000n),
+    record('stream-a/0005', 5000n),
+  ], true);
+
+  const request = { from: 'stream-a/', to: 'stream-a0', limit: 1, attrs: ['occurred_at'] };
+  const first = await store.scan(request);
+  assert.deepEqual(first.rows.map(({ id }) => id), ['stream-a/0001']);
+
+  // A live cursor is a checked keyset continuation, not a snapshot: new keys after it are visible;
+  // new keys before it are not replayed. Consumers wanting a stable cut use snapshot().
+  await store.write([
+    record('stream-a/0000-late', 500n),
+    record('stream-a/0002-late', 750n),
+    record('stream-a/0004-late', 250n),
+  ], true);
+  const ids = [...first.rows.map(({ id }) => id)];
+  let cursor = first.next;
+  while (cursor) {
+    const page = await store.scan({ ...request, cursor });
+    ids.push(...page.rows.map(({ id }) => id));
+    cursor = page.next;
+  }
+  assert.deepEqual(ids, [
+    'stream-a/0001',
+    'stream-a/0002-late',
+    'stream-a/0003',
+    'stream-a/0004-late',
+    'stream-a/0005',
+  ]);
+
+  const complete = await store.scan({ ...request, limit: 100 });
+  assert.deepEqual(complete.rows.map(({ id }) => id), [
+    'stream-a/0000-late',
+    'stream-a/0001',
+    'stream-a/0002-late',
+    'stream-a/0003',
+    'stream-a/0004-late',
+    'stream-a/0005',
+  ]);
+  assert.equal(complete.rows[0].attrs[0].timestampNsValue, 500n);
+  assert.equal(complete.rows[4].attrs[0].timestampNsValue, 250n);
+});
+
+test('recovers an atomically acknowledged consumer batch after process exit', async (t) => {
+  const dir = path.join(temporaryRoot(t, 'turndb-qualification-crash-'), 'store');
+  const writer = path.resolve(__dirname, '../qualification/crash-writer.cjs');
+  const exited = child.spawnSync(process.execPath, [writer, dir], {
+    env: process.env,
+    encoding: 'utf8',
+  });
+  assert.equal(exited.status, 0, exited.stderr);
+
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  const page = await store.scan({
+    attrs: ['batch.key'],
+    contents: [{ name: 'payload', mode: 'bytes' }],
+  });
+  assert.deepEqual(page.rows.map(({ id }) => id), ['crash/0001/first', 'crash/0002/second']);
+  assert(page.rows.every(({ attrs }) => attrs[0].stringValue === 'atomic-1'));
+  assert.deepEqual(
+    page.rows.map(({ contents }) => contents[0].bytes.toString()),
+    ['first durable value', 'second durable value'],
+  );
+});

@@ -1,6 +1,7 @@
 'use strict';
 
 const child = require('node:child_process');
+const fs = require('node:fs');
 const path = require('node:path');
 
 const workspace = path.resolve(__dirname, '../../..');
@@ -20,7 +21,13 @@ const library = path.join(
       : 'libturndb_node.so'
 );
 
-child.execFileSync(process.execPath, ['--test', 'test/native.test.cjs'], {
+const testDir = path.resolve(__dirname, '../test');
+const tests = fs.readdirSync(testDir)
+  .filter((name) => name.endsWith('.test.cjs'))
+  .sort()
+  .map((name) => path.join('test', name));
+
+child.execFileSync(process.execPath, ['--test', ...tests], {
   cwd: path.resolve(__dirname, '..'),
   env: { ...process.env, TURNDB_NATIVE_PATH: library },
   stdio: 'inherit',

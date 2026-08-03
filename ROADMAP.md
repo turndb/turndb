@@ -550,6 +550,13 @@ An OpenTelemetry adapter is a useful reference, but it must live outside the sto
 deliberately non-OTel workload should also pass the same qualification suite so generality is
 demonstrated rather than asserted.
 
+**Qualification slice implemented:** an external native-Node adapter and executable fixtures exercise
+linked application/AI telemetry and a deliberately non-telemetry build pipeline through the same
+self-described envelope. The suite currently proves mixed families, arbitrary typed correlations,
+shared named content identity, metadata-only timelines, selective reconstruction, live keyset paging,
+late arrival, atomic durable acknowledgement, restart, and process-exit WAL recovery. Sustained
+retention/compaction, erasure, backup/restore, and old-format upgrade remain before this phase's gate.
+
 ### Maturity gate
 
 A consumer can replace its trace-specific persistence machinery with TurnDB without:
