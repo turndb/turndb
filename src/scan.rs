@@ -252,12 +252,12 @@ trait Source {
         max_resolution_entries: usize,
         allow_oversized_group: bool,
     ) -> Result<CandidateBatch>;
-    fn project(
+    fn project_batch(
         &self,
-        candidate: &ScanCandidate,
+        candidates: &[ScanCandidate],
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Record>;
+    ) -> Result<Vec<Record>>;
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>>;
 }
 
@@ -282,13 +282,13 @@ impl Source for Store {
         )
     }
 
-    fn project(
+    fn project_batch(
         &self,
-        candidate: &ScanCandidate,
+        candidates: &[ScanCandidate],
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Record> {
-        Store::project_candidate(self, candidate, attrs, contents)
+    ) -> Result<Vec<Record>> {
+        Store::project_candidates(self, candidates, attrs, contents)
     }
 
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>> {
@@ -317,13 +317,13 @@ impl Source for ReadStore {
         )
     }
 
-    fn project(
+    fn project_batch(
         &self,
-        candidate: &ScanCandidate,
+        candidates: &[ScanCandidate],
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Record> {
-        ReadStore::project_candidate(self, candidate, attrs, contents)
+    ) -> Result<Vec<Record>> {
+        ReadStore::project_candidates(self, candidates, attrs, contents)
     }
 
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>> {
@@ -451,69 +451,79 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         }
         let fetched = candidates.len();
         let mut processed = 0usize;
-        for candidate in candidates {
+        // Never project beyond remaining output demand. Every gathered candidate will therefore be
+        // semantically examined before a full page can stop; corruption or cancellation cannot leak
+        // in from a read-ahead row that the page otherwise would not have reached. Rejections cause
+        // another bounded gather rather than speculative decoder work.
+        let projection_batch_size = (request.limit - rows.len()).clamp(1, 64);
+        'candidate_batches: for candidate_batch in candidates.chunks(projection_batch_size) {
             check_interruption(request)?;
-            processed += 1;
-            stats.examined += 1;
-            let record = if needs_record {
-                Some(source.project(&candidate, &attr_needed, &content_needed)?)
+            let projected = if needs_record {
+                Some(source.project_batch(candidate_batch, &attr_needed, &content_needed)?)
             } else {
                 None
             };
-            if !request
-                .predicates
-                .iter()
-                .all(|p| matches_predicate(candidate.id(), record.as_ref(), p))
-            {
-                last_consumed = Some(candidate.into_id());
-                continue;
+            if projected.as_ref().is_some_and(|records| records.len() != candidate_batch.len()) {
+                bail!("scan source returned the wrong number of projected rows");
             }
-            let row_reconstructed_bytes = projected_reconstructed_bytes(record.as_ref(), request)?;
-            if !rows.is_empty()
-                && row_reconstructed_bytes
-                    > request.max_reconstructed_bytes.saturating_sub(stats.reconstructed_bytes)
-            {
-                // Do not consume `id`: the continuation must resume at this matching row. The row
-                // was examined, so it still counts against max_examined for this call.
-                stats.reconstruction_budget_exhausted = true;
-                has_more = true;
-                budget_stopped = true;
-                break;
-            }
-            let mut attrs = Vec::new();
-            if let Some(record) = &record {
-                attrs.extend(
-                    record
-                        .attrs
-                        .iter()
-                        .filter(|(name, _)| attr_select.contains(name.as_str()))
-                        .cloned(),
-                );
-                stats.shadowed_attr_occurrences += shadowed_attrs(&attrs);
-            }
-            let mut contents = Vec::with_capacity(request.contents.len());
-            for selected in &request.contents {
+            for (candidate_index, candidate) in candidate_batch.iter().enumerate() {
                 check_interruption(request)?;
-                let content = record.as_ref().and_then(|r| r.content(&selected.name));
-                let bytes = if let (Some(content), ContentMode::Bytes) = (content, selected.mode) {
-                    let value = source.reconstruct_content(&candidate, content)?;
+                processed += 1;
+                stats.examined += 1;
+                let record = projected.as_ref().map(|records| &records[candidate_index]);
+                if !request.predicates.iter().all(|p| matches_predicate(candidate.id(), record, p))
+                {
+                    last_consumed = Some(candidate.id().to_string());
+                    continue;
+                }
+                let row_reconstructed_bytes = projected_reconstructed_bytes(record, request)?;
+                if !rows.is_empty()
+                    && row_reconstructed_bytes
+                        > request.max_reconstructed_bytes.saturating_sub(stats.reconstructed_bytes)
+                {
+                    // Do not consume `id`: the continuation must resume at this matching row. The
+                    // row was examined, so it still counts against max_examined for this call.
+                    stats.reconstruction_budget_exhausted = true;
+                    has_more = true;
+                    budget_stopped = true;
+                    break 'candidate_batches;
+                }
+                let mut attrs = Vec::new();
+                if let Some(record) = record {
+                    attrs.extend(
+                        record
+                            .attrs
+                            .iter()
+                            .filter(|(name, _)| attr_select.contains(name.as_str()))
+                            .cloned(),
+                    );
+                    stats.shadowed_attr_occurrences += shadowed_attrs(&attrs);
+                }
+                let mut contents = Vec::with_capacity(request.contents.len());
+                for selected in &request.contents {
                     check_interruption(request)?;
-                    stats.content_values_reconstructed += 1;
-                    stats.reconstructed_bytes = stats
-                        .reconstructed_bytes
-                        .checked_add(value.len() as u64)
-                        .context("structured scan reconstructed-byte counter overflow")?;
-                    Some(value)
-                } else {
-                    None
-                };
-                contents.push(project_content(&selected.name, content, bytes));
-            }
-            rows.push(ScanRow { id: candidate.into_id(), attrs, contents });
-            last_consumed = Some(rows.last().expect("row was just pushed").id.clone());
-            if rows.len() == request.limit {
-                has_more = processed < fetched || batch_has_more;
-                break;
+                    let content = record.and_then(|r| r.content(&selected.name));
+                    let bytes =
+                        if let (Some(content), ContentMode::Bytes) = (content, selected.mode) {
+                            let value = source.reconstruct_content(candidate, content)?;
+                            check_interruption(request)?;
+                            stats.content_values_reconstructed += 1;
+                            stats.reconstructed_bytes = stats
+                                .reconstructed_bytes
+                                .checked_add(value.len() as u64)
+                                .context("structured scan reconstructed-byte counter overflow")?;
+                            Some(value)
+                        } else {
+                            None
+                        };
+                    contents.push(project_content(&selected.name, content, bytes));
+                }
+                rows.push(ScanRow { id: candidate.id().to_string(), attrs, contents });
+                last_consumed = Some(rows.last().expect("row was just pushed").id.clone());
+                if rows.len() == request.limit {
+                    has_more = processed < fetched || batch_has_more;
+                    break 'candidate_batches;
+                }
             }
         }
         if processed == fetched && !budget_stopped {
@@ -905,17 +915,22 @@ mod tests {
             })
         }
 
-        fn project(
+        fn project_batch(
             &self,
-            candidate: &ScanCandidate,
+            candidates: &[ScanCandidate],
             _attrs: &HashSet<&str>,
             _contents: &HashSet<&str>,
-        ) -> Result<Record> {
-            let id = candidate.id();
-            if id == "a" {
-                self.cancellation.cancel();
-            }
-            Record::new(id, vec![], vec![("selected".into(), AttrValue::Bool(true))])
+        ) -> Result<Vec<Record>> {
+            candidates
+                .iter()
+                .map(|candidate| {
+                    let id = candidate.id();
+                    if id == "a" {
+                        self.cancellation.cancel();
+                    }
+                    Record::new(id, vec![], vec![("selected".into(), AttrValue::Bool(true))])
+                })
+                .collect()
         }
 
         fn reconstruct_content(

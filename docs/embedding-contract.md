@@ -183,6 +183,12 @@ projection and the writer's memtable remains an in-memory newest overlay. Shared
 sections are necessary, but sibling value/dictionary/program sections stay unopened. See
 `docs/projected-structured-scan.md` and `docs/resolved-row-paging.md`.
 
+Resolved immutable rows are grouped by part in bounded projection chunks. Each selected physical
+attribute or content decoder is opened once per part gather and results are restored to global id
+order; duplicate fields and sparse content presence remain exact. This is a storage gather seam, not
+a claim that semantic predicates use SIMD or encoded-column execution. See
+`docs/grouped-column-gather.md`.
+
 Each successful page now carries exact operation-local `stats.io` evidence: distinct raw part
 sections and fold blocks touched, cache hit/miss access counts, backing-reader stored bytes, and raw
 bytes decoded. The collector is scoped below shared caches, so concurrent snapshots cannot
@@ -198,9 +204,10 @@ The cursor can advance through a fully consumed tombstone-only group, so a bound
 legitimately carry a continuation without rescanning or skipping history. The Node spelling is
 `maxResolutionEntries` and `stats.resolution.budgetExhausted` reports when this ceiling stopped work.
 
-**Current gap:** resolved candidates still invoke selected-column decoders per row rather than being
-grouped by part for vectorized physical gathers. Range initialization still visits every live part;
-`max_examined` separately counts live records evaluated against predicates.
+**Current gap:** range initialization still visits every live part, sparse row occurrences are
+directly indexed per requested row, and predicates evaluate partial semantic records rather than an
+encoded/vector expression batch. `max_examined` separately counts live records evaluated against
+predicates.
 
 ## 5. Platform capabilities
 

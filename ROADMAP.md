@@ -24,7 +24,8 @@ content model right before compatibility turns today's choices into permanent pr
 - The columnar lens is separated from DataFusion as the first Phase-2 seam. Writer memtable visibility
   is now available through a feature-independent structured pager with checked Rust-owned cursors,
   exact typed predicates, bounded live-record examination, reverse paging, and opt-in named-content
-  reconstruction. Pushing that API down into selected physical columns is the next query-core step.
+  reconstruction. Projection now reaches selected physical columns through bounded per-part gathers;
+  predicate evaluation remains semantic and row-oriented above that physical seam.
 - The first Phase-3 native Node slice lives in `bindings/node`: a stable N-API 6 addon, one bounded
   Rust store actor per writer, Promise operations, atomic batches with explicit durability, native
   buffers and bigint, the Rust structured pager, explicit capability reporting, and no silent WASM
@@ -97,8 +98,12 @@ content model right before compatibility turns today's choices into permanent pr
   counters, so concurrent snapshots cannot contaminate one another's evidence. The bounded k-way
   range merge now carries each live committed candidate's authoritative part/row into projection and
   reconstruction; neither phase point-searches the id again, and byte projection reuses its decoded
-  content program and identity. Writer memtable origins use the same candidate pipeline. Per-row
-  selected-column decoding remains to be replaced by grouped physical gathers. Structured-page
+  content program and identity. Writer memtable origins use the same candidate pipeline. Resolved
+  immutable candidates are now gathered by part in bounded chunks: shared attribute layout/metadata
+  is parsed once, selected rid/value/dictionary sections are opened once, selected content metadata,
+  rid/program/offset/identity sections are opened once, and results are restored to global id order.
+  Duplicate attribute occurrence order and sparse content presence remain exact in both directions;
+  scans do not project past their remaining output demand. Structured-page
   resolution statistics now distinguish immutable physical occurrences, superseded occurrences,
   deciding tombstones, and inspected memtable entries from live candidates examined by predicates;
   this exposes amplification without mislabeling it as predicate work. A configurable per-page hard

@@ -29,7 +29,7 @@ use crate::fold::Fold;
 use crate::part::Part;
 use crate::types::Record;
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 /// The live row ordinals in every part, under the store's newest-wins rule.
@@ -122,32 +122,50 @@ pub fn get(parts: &[Arc<Part>], id: &str) -> Result<Option<Record>> {
     }
 }
 
-/// Column-selective projection from an already resolved live row.
-pub(crate) fn project_row(
+/// Column-selective projection for already resolved immutable rows.
+///
+/// Rows are grouped by physical part for decoder sharing, then restored to caller order. This is
+/// deliberately below both `Store` and `ReadStore`, so writer-backed and immutable snapshots cannot
+/// drift into different physical scan behavior.
+pub(crate) fn project_rows(
     parts: &[Arc<Part>],
-    resolved: &RowRef,
+    resolved: &[&RowRef],
     attrs: &HashSet<&str>,
     contents: &HashSet<&str>,
-) -> Result<Record> {
-    let RowOrigin::Part { part: part_index, row } = resolved.origin else {
-        anyhow::bail!("committed projection received a memtable row")
-    };
-    let part = parts.get(part_index).ok_or_else(|| {
-        anyhow::anyhow!("resolved part {part_index} is outside the immutable snapshot")
-    })?;
-    if row >= part.len() {
-        anyhow::bail!(
-            "resolved row {} is outside part {} with {} rows",
-            row,
-            part_index,
-            part.len()
-        );
+) -> Result<Vec<Record>> {
+    let mut grouped: BTreeMap<usize, Vec<(usize, usize, &RowRef)>> = BTreeMap::new();
+    for (output, resolved) in resolved.iter().enumerate() {
+        let RowOrigin::Part { part, row } = resolved.origin else {
+            anyhow::bail!("committed projection received a memtable row")
+        };
+        grouped.entry(part).or_default().push((output, row, resolved));
     }
-    Ok(Record {
-        id: resolved.id.clone(),
-        contents: part.contents_selected(row, contents)?,
-        attrs: part.attrs_selected(row, attrs)?,
-    })
+
+    let mut out: Vec<Option<Record>> = vec![None; resolved.len()];
+    for (part_index, group) in grouped {
+        let part = parts.get(part_index).ok_or_else(|| {
+            anyhow::anyhow!("resolved part {part_index} is outside the immutable snapshot")
+        })?;
+        let rows: Vec<usize> = group.iter().map(|(_, row, _)| *row).collect();
+        for &row in &rows {
+            if row >= part.len() {
+                anyhow::bail!(
+                    "resolved row {row} is outside part {part_index} with {} rows",
+                    part.len()
+                );
+            }
+        }
+        let projected_attrs = part.attrs_selected_many(&rows, attrs)?;
+        let projected_contents = part.contents_selected_many(&rows, contents)?;
+        for (((output, _, resolved), attrs), contents) in
+            group.into_iter().zip(projected_attrs).zip(projected_contents)
+        {
+            out[output] = Some(Record { id: resolved.id.clone(), contents, attrs });
+        }
+    }
+    out.into_iter()
+        .map(|record| record.ok_or_else(|| anyhow::anyhow!("projected row was not produced")))
+        .collect()
 }
 
 /// Byte-exact content for `id`, or `None` if it is absent or deleted.

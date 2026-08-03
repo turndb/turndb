@@ -563,6 +563,122 @@ pub fn read_row_selected(
     read_row_filtered(part, r, Some(names))
 }
 
+/// Selected attributes for several rows, in the caller's row order.
+///
+/// Unlike repeated [`read_row_selected`] calls, this parses the shared layout offsets and column
+/// directory once, and opens each selected rid/value/dictionary section once for the whole gather.
+/// Each row still follows its layout, so duplicate fields and their original interleaving survive.
+pub fn read_rows_selected(
+    part: &Part,
+    rows: &[usize],
+    names: &HashSet<&str>,
+) -> Result<Vec<Vec<(String, AttrValue)>>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if names.is_empty() || !part.section_present("colmeta") {
+        return Ok(vec![Vec::new(); rows.len()]);
+    }
+
+    let layout = part.section_bytes("layout")?;
+    let offs = part.nums("layout.off", 8)?;
+    let meta = read_meta(part)?;
+    let selected: Vec<bool> =
+        meta.iter().map(|(key, _, _, _)| names.contains(key.as_str())).collect();
+
+    // Decode the selected column ordinals per row first. This is both the row's output ordering and
+    // the exact multiplicity against which the sparse rid column is checked below.
+    let mut row_layouts = Vec::with_capacity(rows.len());
+    let mut used_columns = std::collections::BTreeSet::new();
+    for &r in rows {
+        if r >= offs.len().saturating_sub(1) {
+            bail!("row {r} out of range for the layout");
+        }
+        let mut at = usize::try_from(offs[r])
+            .map_err(|_| anyhow::anyhow!("row {r} layout offset exceeds this platform"))?;
+        let n = get_varint(&layout, &mut at)? as usize;
+        let mut columns = Vec::with_capacity(n.min(layout.len()));
+        for _ in 0..n {
+            let c = get_varint(&layout, &mut at)? as usize;
+            if c >= meta.len() {
+                bail!("layout names column {c} which does not exist");
+            }
+            if selected[c] {
+                columns.push(c);
+                used_columns.insert(c);
+            }
+        }
+        row_layouts.push(columns);
+    }
+
+    struct Decoder {
+        key: String,
+        tag: u8,
+        rids: std::sync::Arc<Vec<u32>>,
+        values: std::sync::Arc<Vec<u8>>,
+        dict: std::sync::Arc<Vec<String>>,
+        binary_dict: std::sync::Arc<Vec<Vec<u8>>>,
+    }
+
+    let mut decoders = std::collections::HashMap::with_capacity(used_columns.len());
+    for c in used_columns {
+        let (key, tag, occ, kind) = &meta[c];
+        decoders.insert(
+            c,
+            Decoder {
+                key: key.clone(),
+                tag: *tag,
+                rids: rids(part, c, *occ, *kind)?,
+                values: part.section_bytes(&format!("col.val.{c}"))?,
+                dict: if *tag == 0 { read_dict(part, c)? } else { Default::default() },
+                binary_dict: if *tag == 5 {
+                    read_binary_dict(part, c)?
+                } else {
+                    Default::default()
+                },
+            },
+        );
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (&r, columns) in rows.iter().zip(row_layouts) {
+        let mut row = Vec::with_capacity(columns.len());
+        let mut cursors = std::collections::HashMap::<usize, (usize, usize)>::new();
+        for c in columns {
+            let decoder = &decoders[&c];
+            let (first, used) = match cursors.get(&c).copied() {
+                Some(cursor) => cursor,
+                None => {
+                    let first = decoder.rids.partition_point(|&candidate| (candidate as usize) < r);
+                    if first >= decoder.rids.len() || decoder.rids[first] as usize != r {
+                        bail!("row {r} names column {c} but has no occurrence in it");
+                    }
+                    (first, 0)
+                }
+            };
+            let occurrence = first
+                .checked_add(used)
+                .ok_or_else(|| anyhow::anyhow!("row {r} column {c} occurrence overflows"))?;
+            if decoder.rids.get(occurrence).copied().map(|row| row as usize) != Some(r) {
+                bail!("row {r} names more occurrences of column {c} than its row ids contain");
+            }
+            row.push((
+                decoder.key.clone(),
+                value_at(
+                    decoder.tag,
+                    &decoder.values,
+                    occurrence,
+                    &decoder.dict,
+                    &decoder.binary_dict,
+                )?,
+            ));
+            cursors.insert(c, (first, used + 1));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
 fn read_row_filtered(
     part: &Part,
     r: usize,

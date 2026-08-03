@@ -2077,38 +2077,56 @@ impl Store {
         read::get(&self.parts, id)
     }
 
-    /// Project a row whose newest-wins origin was already settled by the range merge.
-    pub(crate) fn project_candidate(
+    /// Batch projection used by structured scans. Immutable rows share part-level decoders while
+    /// memtable records retain their in-memory projection path.
+    pub(crate) fn project_candidates(
         &self,
-        candidate: &crate::scan::ScanCandidate,
+        candidates: &[crate::scan::ScanCandidate],
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Record> {
-        match candidate {
-            crate::scan::ScanCandidate::Committed(row) => {
-                read::project_row(&self.parts, row, attrs, contents)
-            }
-            crate::scan::ScanCandidate::Memtable(id) => {
-                let record = self.mem.get(id).and_then(Option::as_ref).ok_or_else(|| {
-                    anyhow::anyhow!("resolved memtable row {id:?} is no longer live")
-                })?;
-                Ok(Record {
-                    id: record.id.clone(),
-                    contents: record
-                        .contents
-                        .iter()
-                        .filter(|content| contents.contains(content.name.as_str()))
-                        .cloned()
-                        .collect(),
-                    attrs: record
-                        .attrs
-                        .iter()
-                        .filter(|(name, _)| attrs.contains(name.as_str()))
-                        .cloned()
-                        .collect(),
-                })
+    ) -> Result<Vec<Record>> {
+        let mut committed = Vec::new();
+        let mut committed_outputs = Vec::new();
+        let mut out: Vec<Option<Record>> = vec![None; candidates.len()];
+        for (output, candidate) in candidates.iter().enumerate() {
+            match candidate {
+                crate::scan::ScanCandidate::Committed(row) => {
+                    committed.push(row);
+                    committed_outputs.push(output);
+                }
+                crate::scan::ScanCandidate::Memtable(id) => {
+                    let record = self.mem.get(id).and_then(Option::as_ref).ok_or_else(|| {
+                        anyhow::anyhow!("resolved memtable row {id:?} is no longer live")
+                    })?;
+                    out[output] = Some(Record {
+                        id: record.id.clone(),
+                        contents: record
+                            .contents
+                            .iter()
+                            .filter(|content| contents.contains(content.name.as_str()))
+                            .cloned()
+                            .collect(),
+                        attrs: record
+                            .attrs
+                            .iter()
+                            .filter(|(name, _)| attrs.contains(name.as_str()))
+                            .cloned()
+                            .collect(),
+                    });
+                }
             }
         }
+        for (output, record) in committed_outputs.into_iter().zip(read::project_rows(
+            &self.parts,
+            &committed,
+            attrs,
+            contents,
+        )?) {
+            out[output] = Some(record);
+        }
+        out.into_iter()
+            .map(|record| record.ok_or_else(|| anyhow::anyhow!("projected row was not produced")))
+            .collect()
     }
 
     /// Reconstruct selected content without re-locating an already resolved scan row.
@@ -2778,20 +2796,22 @@ impl ReadStore {
         read::get(&self.parts, id)
     }
 
-    pub(crate) fn project_candidate(
+    pub(crate) fn project_candidates(
         &self,
-        candidate: &crate::scan::ScanCandidate,
+        candidates: &[crate::scan::ScanCandidate],
         attrs: &HashSet<&str>,
         contents: &HashSet<&str>,
-    ) -> Result<Record> {
-        match candidate {
-            crate::scan::ScanCandidate::Committed(row) => {
-                read::project_row(&self.parts, row, attrs, contents)
-            }
-            crate::scan::ScanCandidate::Memtable(id) => {
-                bail!("immutable snapshot received memtable row {id:?}")
-            }
-        }
+    ) -> Result<Vec<Record>> {
+        let committed: Result<Vec<_>> = candidates
+            .iter()
+            .map(|candidate| match candidate {
+                crate::scan::ScanCandidate::Committed(row) => Ok(row),
+                crate::scan::ScanCandidate::Memtable(id) => {
+                    bail!("immutable snapshot received memtable row {id:?}")
+                }
+            })
+            .collect();
+        read::project_rows(&self.parts, &committed?, attrs, contents)
     }
 
     pub(crate) fn reconstruct_candidate_content(

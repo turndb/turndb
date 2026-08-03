@@ -193,6 +193,158 @@ fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
 }
 
 #[test]
+fn grouped_projection_restores_cross_part_order_and_exact_row_shape() {
+    let dir = tmp("grouped-projection");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    store
+        .put_record(
+            "a",
+            &[ContentSpans::new("request", vec![Span::Lit(b"a-request")])],
+            vec![
+                ("x".into(), AttrValue::Int(1)),
+                ("y".into(), AttrValue::Bool(true)),
+                ("x".into(), AttrValue::Int(2)),
+            ],
+        )
+        .unwrap();
+    store
+        .put_record(
+            "c",
+            &[ContentSpans::new("response", vec![Span::Lit(b"old-c")])],
+            vec![("x".into(), AttrValue::Int(3))],
+        )
+        .unwrap();
+    store.put_body("e", b"ignored", vec![("y".into(), AttrValue::Bool(false))]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    store
+        .put_record(
+            "b",
+            &[
+                ContentSpans::new("request", vec![Span::Lit(b"b-request")]),
+                ContentSpans::new("response", vec![Span::Lit(b"b-response")]),
+            ],
+            vec![("y".into(), AttrValue::Bool(false)), ("x".into(), AttrValue::Int(4))],
+        )
+        .unwrap();
+    store
+        .put_record(
+            "c",
+            &[ContentSpans::new("response", vec![Span::Lit(b"new-c")])],
+            vec![
+                ("x".into(), AttrValue::Int(5)),
+                ("x".into(), AttrValue::Int(6)),
+                ("y".into(), AttrValue::Bool(true)),
+            ],
+        )
+        .unwrap();
+    store
+        .put_record(
+            "d",
+            &[ContentSpans::new("request", vec![Span::Lit(b"d-request")])],
+            vec![("x".into(), AttrValue::Int(7))],
+        )
+        .unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let request = ScanRequest {
+        attrs: vec!["x".into(), "y".into()],
+        contents: vec![
+            ContentSelect { name: "request".into(), mode: ContentMode::Metadata },
+            ContentSelect { name: "response".into(), mode: ContentMode::Metadata },
+        ],
+        ..ScanRequest::default()
+    };
+    let forward = reader.scan(&request).unwrap();
+    assert_eq!(
+        forward.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["a", "b", "c", "d", "e"]
+    );
+    assert_eq!(
+        forward.rows[0].attrs,
+        [
+            ("x".into(), AttrValue::Int(1)),
+            ("y".into(), AttrValue::Bool(true)),
+            ("x".into(), AttrValue::Int(2)),
+        ]
+    );
+    assert_eq!(
+        forward.rows[2].attrs,
+        [
+            ("x".into(), AttrValue::Int(5)),
+            ("x".into(), AttrValue::Int(6)),
+            ("y".into(), AttrValue::Bool(true)),
+        ],
+        "newest row and duplicate occurrence order must survive per-part grouping"
+    );
+    assert_eq!(
+        forward
+            .rows
+            .iter()
+            .map(|row| row.contents.iter().map(|value| value.present).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [
+            vec![true, false],
+            vec![true, true],
+            vec![false, true],
+            vec![true, false],
+            vec![false, false],
+        ]
+    );
+
+    let mut reverse_request = request;
+    reverse_request.direction = Direction::Reverse;
+    let reverse = reader.scan(&reverse_request).unwrap();
+    assert_eq!(
+        reverse.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["e", "d", "c", "b", "a"]
+    );
+    assert_eq!(reverse.rows[2].attrs, forward.rows[2].attrs);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn grouped_projection_does_not_decode_past_a_full_page() {
+    let dir = tmp("grouped-projection-demand");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        store.put_body("a", b"", vec![("x".into(), AttrValue::Int(1))]).unwrap();
+        store
+            .put_body(
+                "b",
+                b"",
+                vec![("x".into(), AttrValue::Str("damaged later type".repeat(200)))],
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+
+    // `(name, type)` columns sort strings before integers. The first page needs only integer col 1;
+    // a gather that speculatively included b would open the damaged string dictionary in col 0.
+    corrupt_sections(&part_path(&dir), &["col.dict.0"]);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let first = reader
+        .scan(&ScanRequest { attrs: vec!["x".into()], limit: 1, ..ScanRequest::default() })
+        .unwrap();
+    assert_eq!(first.rows[0].id, "a");
+    assert_eq!(first.rows[0].attrs, [("x".into(), AttrValue::Int(1))]);
+
+    reader
+        .scan(&ScanRequest {
+            attrs: vec!["x".into()],
+            limit: 1,
+            cursor: first.next,
+            ..ScanRequest::default()
+        })
+        .unwrap_err();
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn page_io_stats_are_operation_local_and_distinguish_cold_from_cached_reads() {
     let dir = tmp("io-stats");
     let cfg = FoldCfg { block_target: 4 << 10, ..cfg() };
