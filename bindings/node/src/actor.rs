@@ -111,6 +111,9 @@ enum Command {
     Refold {
         reply: oneshot::Sender<Result<turndb::store::refold::RefoldStats>>,
     },
+    Health {
+        reply: oneshot::Sender<Result<turndb::store::StoreHealth>>,
+    },
     Close {
         durable: bool,
         reply: oneshot::Sender<Result<()>>,
@@ -228,6 +231,10 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Refold { reply })?).await
     }
 
+    pub async fn health(&self) -> Result<turndb::store::StoreHealth> {
+        Self::receive(self.submit(|reply| Command::Health { reply })?).await
+    }
+
     pub async fn close(&self, durable: bool) -> Result<()> {
         if self
             .inner
@@ -300,6 +307,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
             Command::Refold { reply } => {
                 let result = settle(&mut store).and_then(|_| store.refold());
                 let _ = reply.send(result);
+            }
+            Command::Health { reply } => {
+                let _ = reply.send(Ok(store.health()));
             }
             Command::Close { durable, reply } => {
                 let result = if durable { store.sync() } else { Ok(()) };

@@ -137,6 +137,7 @@ pub struct NativeCapabilities {
     pub command_queue_capacity: u32,
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
+    pub health_snapshots: bool,
 }
 
 #[napi]
@@ -165,6 +166,7 @@ pub fn capabilities() -> NativeCapabilities {
         command_queue_capacity: 64,
         immutable_snapshots: true,
         lifecycle_operations: true,
+        health_snapshots: true,
     }
 }
 
@@ -227,6 +229,26 @@ pub struct NativeEraseResult {
     pub tombstoned: BigInt,
     pub absent: BigInt,
     pub refold: Option<NativeRefoldResult>,
+}
+
+#[napi(object)]
+pub struct NativeHealth {
+    pub commit: BigInt,
+    pub fold_generation: u32,
+    pub parts: BigInt,
+    pub part_rows: BigInt,
+    pub memtable_entries: BigInt,
+    pub memtable_bytes: BigInt,
+    pub wal_bytes: BigInt,
+    pub fold_disk_bytes: BigInt,
+    pub fold_segments: u32,
+    pub fold_cache_hits: BigInt,
+    pub fold_cache_misses: BigInt,
+    pub part_cache_bytes: BigInt,
+    pub part_cache_budget: BigInt,
+    pub dedup_window_entries: BigInt,
+    pub retained_commits: BigInt,
+    pub punched_blocks: BigInt,
 }
 
 struct SnapshotState {
@@ -479,6 +501,16 @@ impl NativeStore {
             .await
             .map(encode_refold)
             .map_err(|error| failure("refold TurnDB store", error))
+    }
+
+    /// Return cheap operational counters without decoding records or content.
+    #[napi]
+    pub async fn health(&self) -> Result<NativeHealth> {
+        self.actor
+            .health()
+            .await
+            .map(encode_health)
+            .map_err(|error| failure("read TurnDB health", error))
     }
 
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
@@ -784,5 +816,26 @@ fn encode_refold(stats: turndb::store::refold::RefoldStats) -> NativeRefoldResul
         fold_bytes_after: BigInt::from(stats.fold_bytes_after),
         bytes_reclaimed: BigInt::from(stats.bytes_reclaimed()),
         stale_generation_left: stats.stale_generation_left,
+    }
+}
+
+fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
+    NativeHealth {
+        commit: BigInt::from(health.commit),
+        fold_generation: health.fold_generation,
+        parts: BigInt::from(health.parts as u64),
+        part_rows: BigInt::from(health.part_rows),
+        memtable_entries: BigInt::from(health.memtable_entries as u64),
+        memtable_bytes: BigInt::from(health.memtable_bytes as u64),
+        wal_bytes: BigInt::from(health.wal_bytes),
+        fold_disk_bytes: BigInt::from(health.fold_disk_bytes),
+        fold_segments: health.fold_segments,
+        fold_cache_hits: BigInt::from(health.fold_cache_hits),
+        fold_cache_misses: BigInt::from(health.fold_cache_misses),
+        part_cache_bytes: BigInt::from(health.part_cache_bytes as u64),
+        part_cache_budget: BigInt::from(health.part_cache_budget as u64),
+        dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
+        retained_commits: BigInt::from(health.retained_commits as u64),
+        punched_blocks: BigInt::from(health.punched_blocks),
     }
 }

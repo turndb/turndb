@@ -1965,3 +1965,39 @@ fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn health_is_cheap_complete_and_tracks_publication() {
+    let dir = tmp("health");
+    let config = cfg();
+    let mut s = Store::open(&dir, config).unwrap();
+    let empty = s.health();
+    assert_eq!(empty.parts, 0);
+    assert_eq!(empty.part_rows, 0);
+    assert_eq!(empty.memtable_entries, 0);
+    assert_eq!(empty.wal_bytes, 0);
+    assert!(empty.part_cache_budget > 0);
+
+    put(&mut s, "health/1", b"payload that becomes one folded piece");
+    let staged = s.health();
+    assert_eq!(staged.memtable_entries, 1);
+    assert!(staged.memtable_bytes > 0);
+    assert!(staged.wal_bytes > 0);
+    assert_eq!(staged.dedup_window_entries, 3);
+    assert_eq!(staged.parts, 0);
+
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let published = s.health();
+    assert!(published.commit > empty.commit);
+    assert_eq!(published.parts, 1);
+    assert_eq!(published.part_rows, 1);
+    assert_eq!(published.memtable_entries, 0);
+    assert_eq!(published.memtable_bytes, 0);
+    assert_eq!(published.wal_bytes, 0);
+    assert_eq!(published.dedup_window_entries, 0);
+    assert_eq!(published.retained_commits, 1);
+    assert!(published.fold_disk_bytes > 0);
+    assert_eq!(published.fold_segments, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}

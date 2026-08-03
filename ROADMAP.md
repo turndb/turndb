@@ -32,8 +32,9 @@ content model right before compatibility turns today's choices into permanent pr
   carry stable multi-page reads without taking a writer lock. `TurnDbError` classifies binding
   validation, overload, closed handles, and typed writer contention without consumer-side prose
   matching. Compaction, whole-store verification, in-place reclamation, refold, and physical record
-  erasure are actor operations rather than CLI dependencies. It is a source prototype, not yet a
-  production prebuild matrix.
+  erasure are actor operations rather than CLI dependencies. A constant-work generic health snapshot
+  now exposes write-state, part/fold growth, cache, retention, and reclamation facts without choosing
+  a telemetry backend. It is a source prototype, not yet a production prebuild matrix.
 
 ## Product boundary
 
