@@ -260,10 +260,14 @@ fn a_piece_larger_than_seg_max_gets_its_own_segment() {
 fn second_writer_is_refused() {
     let dir = tmp("lock");
     let _f = Fold::open(&dir, FoldCfg::default()).unwrap();
-    assert!(
-        Fold::open(&dir, FoldCfg::default()).is_err(),
-        "the single-writer invariant must be enforced, not merely documented"
-    );
+    let error = match Fold::open(&dir, FoldCfg::default()) {
+        Ok(_) => panic!("the single-writer invariant must be enforced, not merely documented"),
+        Err(error) => error,
+    };
+    let locked = error
+        .downcast_ref::<turndb::fold::WriterLocked>()
+        .expect("contention must be typed so bindings do not parse prose");
+    assert_eq!(locked.path, dir);
     std::fs::remove_dir_all(&dir).ok();
 }
 

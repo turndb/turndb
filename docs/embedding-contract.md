@@ -200,10 +200,16 @@ pool and remain stable across later writer activity. A read-only process can ope
 manifest directly or request a commit still present in the bounded retained-manifest window; neither
 path takes the writer lock or replays an unflushed WAL.
 
-**Current gaps:** queue depth is fixed; overload and other failures retain full contextual messages
-but not stable machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, lifecycle
+**Current gaps:** queue depth is fixed; only the binding-owned failure classes and writer contention
+have stable machine-readable codes; AbortSignal/deadline cancellation, Arrow IPC, SQL, lifecycle
 maintenance, and prebuilt artifact selection are not exposed yet. The package is a tested source
 prototype and must not be described as a production distribution.
+
+The package-level `TurnDbError` currently gives stable codes to boundary validation, bounded-queue
+overload, closed handles, and writer contention. Contention is a typed `WriterLocked` condition in the
+Rust core; consumers do not match its message. Unknown core failures deliberately remain `INTERNAL`
+until their engine error variants exist. `NOT_FOUND`, `CORRUPTION`, and `IO` are reserved in the Node
+union but must not be assigned through message heuristics.
 
 ## 7. Compatibility policy
 

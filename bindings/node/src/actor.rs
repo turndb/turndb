@@ -21,6 +21,30 @@ const OPEN: u8 = 0;
 const CLOSING_OR_CLOSED: u8 = 1;
 
 #[derive(Debug)]
+enum ActorFault {
+    Busy,
+    Closed,
+    WorkerExited,
+}
+
+impl std::fmt::Display for ActorFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActorFault::Busy => write!(
+                f,
+                "[TURNDB_CODE:BUSY] store command queue is full (capacity {QUEUE_CAPACITY}); retry after pending operations settle"
+            ),
+            ActorFault::Closed => write!(f, "[TURNDB_CODE:CLOSED] store is closed"),
+            ActorFault::WorkerExited => {
+                write!(f, "[TURNDB_CODE:INTERNAL] store worker has exited")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ActorFault {}
+
+#[derive(Debug)]
 pub(crate) struct OwnedContent {
     pub name: String,
     pub bytes: Vec<u8>,
@@ -33,13 +57,38 @@ pub(crate) enum WriteOp {
 }
 
 enum Command {
-    Write { ops: Vec<WriteOp>, durable: bool, reply: oneshot::Sender<Result<()>> },
-    Sync { reply: oneshot::Sender<Result<()>> },
-    Flush { reply: oneshot::Sender<Result<bool>> },
-    Scan { request: ScanRequest, reply: oneshot::Sender<Result<ScanPage>> },
-    ReadContent { id: String, name: String, reply: oneshot::Sender<Result<Option<Vec<u8>>>> },
-    Snapshot { reply: oneshot::Sender<Result<ReadStore>> },
-    Close { durable: bool, reply: oneshot::Sender<Result<()>> },
+    Write {
+        ops: Vec<WriteOp>,
+        durable: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Sync {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Flush {
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    Scan {
+        request: ScanRequest,
+        reply: oneshot::Sender<Result<ScanPage>>,
+    },
+    ReadContent {
+        id: String,
+        name: String,
+        reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
+    Snapshot {
+        reply: oneshot::Sender<Result<ReadStore>>,
+    },
+    Close {
+        durable: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    #[cfg(test)]
+    Hold {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    },
 }
 
 struct Inner {
@@ -65,7 +114,15 @@ impl Actor {
                     run(store, &path, rx);
                 }
                 Err(error) => {
-                    let _ = ready_tx.send(Err(format!("{error:#}")));
+                    let contention = error.chain().any(|cause| {
+                        cause.downcast_ref::<turndb::fold::WriterLocked>().is_some()
+                            || cause
+                                .downcast_ref::<std::io::Error>()
+                                .map(|io| io.kind() == std::io::ErrorKind::WouldBlock)
+                                .unwrap_or(false)
+                    });
+                    let marker = if contention { "[TURNDB_CODE:CONTENTION] " } else { "" };
+                    let _ = ready_tx.send(Err(format!("{marker}{error:#}")));
                 }
             })
             .context("spawn TurnDB store thread")?;
@@ -80,14 +137,14 @@ impl Actor {
         make: impl FnOnce(oneshot::Sender<Result<R>>) -> Command,
     ) -> Result<oneshot::Receiver<Result<R>>> {
         if self.inner.state.load(Ordering::Acquire) != OPEN {
-            return Err(anyhow!("TurnDB store is closed"));
+            return Err(ActorFault::Closed.into());
         }
         let (reply, receive) = oneshot::channel();
-        self.inner.tx.try_send(make(reply)).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => anyhow!(
-                "TurnDB store command queue is full (capacity {QUEUE_CAPACITY}); retry after pending operations settle"
-            ),
-            mpsc::TrySendError::Disconnected(_) => anyhow!("TurnDB store thread has exited"),
+        self.inner.tx.try_send(make(reply)).map_err(|error| -> anyhow::Error {
+            match error {
+                mpsc::TrySendError::Full(_) => ActorFault::Busy.into(),
+                mpsc::TrySendError::Disconnected(_) => ActorFault::WorkerExited.into(),
+            }
         })?;
         Ok(receive)
     }
@@ -127,7 +184,7 @@ impl Actor {
             .compare_exchange(OPEN, CLOSING_OR_CLOSED, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(anyhow!("TurnDB store is already closed"));
+            return Err(ActorFault::Closed.into());
         }
         let (reply, receive) = oneshot::channel();
         let tx = self.inner.tx.clone();
@@ -139,7 +196,7 @@ impl Actor {
         .await
         .context("join TurnDB close submission")?;
         if disconnected {
-            return Err(anyhow!("TurnDB store thread has exited"));
+            return Err(ActorFault::WorkerExited.into());
         }
         Self::receive(receive).await
     }
@@ -178,6 +235,11 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = if durable { store.sync() } else { Ok(()) };
                 let _ = reply.send(result);
                 break;
+            }
+            #[cfg(test)]
+            Command::Hold { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
             }
         }
     }
@@ -264,5 +326,29 @@ mod tests {
             actor.close(true).await.unwrap();
             std::fs::remove_dir_all(dir).unwrap();
         });
+    }
+
+    #[test]
+    fn bounded_queue_refuses_the_first_command_beyond_capacity() {
+        let dir = temp();
+        let actor = Actor::open(&dir).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
+        entered_rx.recv().unwrap();
+
+        let mut queued = Vec::new();
+        for _ in 0..QUEUE_CAPACITY {
+            queued.push(actor.submit(|reply| Command::Sync { reply }).unwrap());
+        }
+        let error = actor.submit(|reply| Command::Sync { reply }).unwrap_err();
+        assert!(error.downcast_ref::<ActorFault>().is_some_and(|fault| {
+            matches!(fault, ActorFault::Busy) && fault.to_string().contains("[TURNDB_CODE:BUSY]")
+        }));
+
+        release_tx.send(()).unwrap();
+        drop(queued);
+        napi::tokio::runtime::Runtime::new().unwrap().block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

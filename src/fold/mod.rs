@@ -43,6 +43,24 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Another writer currently owns this fold's OS lock.
+///
+/// This is a typed operational condition rather than prose so bindings can expose stable contention
+/// handling without matching an error message. It says nothing about WASI, where the platform lacks
+/// an advisory lock and the embedder owns exclusion.
+#[derive(Debug)]
+pub struct WriterLocked {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for WriterLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fold at {} is already open by another writer", self.path.display())
+    }
+}
+
+impl std::error::Error for WriterLocked {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FoldCfg {
     /// Roll threshold. Bounded by [`SEG_MAX_LIMIT`] because `Loc.block_off` is a u32.
@@ -1120,7 +1138,7 @@ fn acquire_writer_lock(dir: &Path) -> Result<File> {
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
     if !crate::sys::lock_exclusive(&f).with_context(|| format!("locking {}", path.display()))? {
-        bail!("fold at {} is already open by another writer", dir.display());
+        return Err(WriterLocked { path: dir.to_path_buf() }.into());
     }
     Ok(f)
 }

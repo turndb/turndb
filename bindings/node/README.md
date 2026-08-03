@@ -32,7 +32,12 @@ silently.
 - `close()` syncs by default. Passing `false` is an explicit no-sync close.
 - Calls made after close refuse. When 64 operations are already queued, ordinary operations refuse
   with an overload error rather than creating an unbounded backlog.
+- Rejections use `TurnDbError` with a stable `code`. The initial binding-owned classes distinguish
+  `INVALID_ARGUMENT`, `BUSY`, `CLOSED`, `CONTENTION`, and `INTERNAL`; the original native error is
+  retained as `cause` and the full contextual message remains available. The declared code union
+  reserves `NOT_FOUND`, `CORRUPTION`, and `IO` while typed engine errors are added—unclassified core
+  failures report `INTERNAL` rather than being guessed from prose.
 
 The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, lifecycle maintenance,
-configurable queue depth, or structured error codes. Those remain explicit Phase 3/4 work rather than
-being simulated in JavaScript.
+configurable queue depth, or the complete engine error taxonomy. Those remain explicit Phase 3/4 work
+rather than being simulated in JavaScript.
