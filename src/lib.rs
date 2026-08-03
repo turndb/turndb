@@ -46,6 +46,7 @@
 
 pub mod capabilities;
 pub mod carve;
+pub mod control;
 pub mod fold;
 pub mod pack;
 pub mod part;

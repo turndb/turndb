@@ -99,6 +99,12 @@ Named-content metadata includes the BLAKE3 identity of the exact whole value wit
 for revision-3 records. Writer scans include the memtable;
 `ReadStore::scan` remains pinned to its manifest snapshot.
 
+Long-running compaction, verification, punching, and refold operations accept reusable Rust
+cancellation tokens and absolute deadlines through their controlled variants. The native Node methods
+map these to queue-inclusive `timeoutMs` and `AbortSignal` options while preserving each operation's
+publication and restart invariants; see
+[lifecycle cancellation and deadlines](docs/lifecycle-control.md).
+
 With `sql` enabled, `query::sql::SqlQuery` runs positional-parameter SQL against the generic
 `records` table under a configurable DataFusion execution-memory ceiling. DDL, DML, and session
 statements are refused. Results are pulled one bounded batch at a time as complete Arrow IPC streams;

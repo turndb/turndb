@@ -66,7 +66,13 @@ content model right before compatibility turns today's choices into permanent pr
   every part, section, visible content program, piece identity, and available whole-value identity,
   and requires explicit authorization before abandoning a newer retained commit. Rust, CLI, and Node
   expose the same evidence report and typed refusal classes; the earlier parse-only promotion helper
-  is private to the narrowly recognizable first-commit crash window.
+  is private to the narrowly recognizable first-commit crash window. A reusable core operation
+  control now gives compaction, verification, punching, and refold absolute deadlines plus shared
+  cancellation tokens. Node exposes queue-inclusive `timeoutMs`/`AbortSignal` options and a declared
+  capability. Cancellation removes unpublished compaction/refold artifacts, while punching records
+  safe progress first and now correctly retries declared-but-unpunched blocks after cancellation or
+  crash. Strong erasure stops only in its read-only planning phase and becomes intentionally
+  non-interruptible once tombstones make completion mandatory.
 
 ## Product boundary
 
@@ -344,10 +350,10 @@ exposes SQL and Arrow IPC; the structured no-feature build remains useful for em
 explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
 profile rather than misreporting the ordinary release artifact.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts, cancellation/deadlines for long-running
-lifecycle operations, offline recovery, and SQL planning (batch pulls are cancellable), a complete
-typed engine error taxonomy, and measured event-loop/query overhead under a representative mixed
-workload.
+Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for backup, restore,
+offline recovery, SQL planning, sync, and flush (batch pulls and major maintenance loops are
+cancellable); a complete typed engine error taxonomy; and measured event-loop/query overhead under a
+representative mixed workload.
 
 ### Maturity gate
 

@@ -121,6 +121,24 @@ pub fn merge_opts(
     level: i32,
     drop_tombstones: bool,
 ) -> Result<(PartMeta, MergeStats)> {
+    merge_opts_with_control(
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        &crate::control::OperationControl::default(),
+    )
+}
+
+/// [`merge_opts`] with cooperative checkpoints while gathering and streaming rows.
+pub fn merge_opts_with_control(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+) -> Result<(PartMeta, MergeStats)> {
+    control.check("part compaction")?;
     if inputs.is_empty() {
         bail!("merge needs at least one input part");
     }
@@ -149,6 +167,7 @@ pub fn merge_opts(
     let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
     for p in &parts {
         for i in 0..p.piece_count()? {
+            control.check("part compaction")?;
             let (loc, hash) = p.piece(i)?;
             locs.entry(hash).or_insert(loc);
         }
@@ -169,6 +188,7 @@ pub fn merge_opts(
     let mut tombs_dropped = 0usize;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((_, pi, row, shadowed)) = kway.next_group()? {
+        control.check("part compaction")?;
         superseded += shadowed;
         if parts[pi].is_tombstone(row)? {
             if drop_tombstones {
@@ -211,6 +231,7 @@ pub fn merge_opts(
     )?;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((id, pi, row, _)) = kway.next_group()? {
+        control.check("part compaction")?;
         if parts[pi].is_tombstone(row)? {
             if !drop_tombstones {
                 b.push(&id, true, &[], &[])?;
@@ -219,6 +240,7 @@ pub fn merge_opts(
         }
         b.push(&id, false, &parts[pi].contents(row)?, &parts[pi].attrs(row)?)?;
     }
+    control.check("part compaction")?;
     let meta = b.finish(seq_lo, seq_hi)?;
 
     let stats = MergeStats {

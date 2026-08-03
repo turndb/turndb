@@ -992,8 +992,18 @@ impl Fold {
     /// is skipped rather than errored — this is reclamation, and a block it cannot account for is
     /// a block it leaves alone.
     pub fn punch_blocks(&mut self, dead: &[u32]) -> Result<Vec<u32>> {
+        self.punch_blocks_with_control(dead, &crate::control::OperationControl::default())
+    }
+
+    /// [`Fold::punch_blocks`] with a safe checkpoint before each independently reclaimable block.
+    pub fn punch_blocks_with_control(
+        &mut self,
+        dead: &[u32],
+        control: &crate::control::OperationControl,
+    ) -> Result<Vec<u32>> {
         let mut done = Vec::new();
         for &id in dead {
+            control.check("fold punch")?;
             let Some(Some((seg, off))) = self.blockdir.get(id as usize).copied() else { continue };
             let mut hb = [0u8; block::BLOCK_HDR_LEN];
             if self.readers[seg as usize].read_exact_at(&mut hb, off as u64).is_err() {
@@ -1036,10 +1046,25 @@ impl Fold {
     /// trailing invalid region (uncommitted writes a crash abandoned), which is reported, not
     /// condemned.
     pub fn scrub(&self) -> Result<FoldScrub> {
+        self.scrub_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Fold::scrub`] with cooperative checks between segments and complete frames.
+    pub fn scrub_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<FoldScrub> {
         let mut report = FoldScrub::default();
         for (i, h) in self.headers.iter().enumerate() {
+            control.check("fold verification")?;
             let len = self.readers[i].len()?;
-            let (end, entries) = segment::scan_tail(&self.readers[i], len, h.has_dict())?;
+            let (end, entries) = segment::scan_tail_controlled(
+                &self.readers[i],
+                len,
+                h.has_dict(),
+                control,
+                "fold verification",
+            )?;
             report.segments += 1;
             report.blocks += entries.len();
             report.bytes += end.saturating_sub(segment::SEG_HDR_LEN);

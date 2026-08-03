@@ -9,9 +9,9 @@ use crate::types::{AttrValue, Content, ContentHash, Record};
 use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::Arc;
 use std::time::Instant;
+
+pub use crate::control::{CancellationToken, InterruptionReason as ScanInterruptionReason};
 
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_FINGERPRINT: usize = 16;
@@ -21,30 +21,6 @@ pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_EXAMINED: usize = 1_000_000;
 /// Default ceiling for content bytes materialized into one structured page.
 pub const DEFAULT_MAX_RECONSTRUCTED_BYTES: u64 = 32 << 20;
-
-/// A cheap cooperative cancellation target shared by a scan and its caller.
-#[derive(Clone, Debug, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
-
-impl CancellationToken {
-    pub fn new() -> CancellationToken {
-        CancellationToken::default()
-    }
-
-    pub fn cancel(&self) {
-        self.0.store(true, AtomicOrdering::Release);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(AtomicOrdering::Acquire)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanInterruptionReason {
-    Cancelled,
-    DeadlineExceeded,
-}
 
 /// A scan stopped by its cooperative token or absolute deadline. No partial page is returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,11 +387,10 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
 }
 
 fn check_interruption(request: &ScanRequest) -> Result<()> {
-    if request.cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
-        return Err(ScanInterrupted { reason: ScanInterruptionReason::Cancelled }.into());
-    }
-    if request.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(ScanInterrupted { reason: ScanInterruptionReason::DeadlineExceeded }.into());
+    if let Some(reason) =
+        crate::control::interruption_reason(request.deadline, request.cancellation.as_ref())
+    {
+        return Err(ScanInterrupted { reason }.into());
     }
     Ok(())
 }

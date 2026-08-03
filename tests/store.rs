@@ -1563,6 +1563,110 @@ fn refold_refuses_with_a_dirty_memtable() {
 }
 
 #[test]
+fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_generation() {
+    let dir = tmp("refold-cancel");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for i in 0..24u32 {
+        let bytes = blob(20_000 + i);
+        let id = format!("cancel-{i:02}");
+        store.put(&id, &[Span::Piece(&bytes)], vec![]).unwrap();
+        want.push((id, bytes));
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let generation = store.manifest().fold_gen;
+    let staged = turndb::store::refold::fold_dir(&dir, generation + 1);
+    let cancellation = turndb::control::CancellationToken::new();
+    let cancel = cancellation.clone();
+    let staged_watch = staged.clone();
+    let watcher = std::thread::spawn(move || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !staged_watch.exists() {
+            assert!(
+                std::time::Instant::now() < until,
+                "refold never created its staged generation"
+            );
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+    });
+    let error = store
+        .refold_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    watcher.join().unwrap();
+    assert!(error
+        .downcast_ref::<turndb::control::OperationInterrupted>()
+        .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
+    assert_eq!(store.manifest().fold_gen, generation);
+    assert!(!staged.exists(), "an unpublished cancelled fold generation must be removed");
+    assert!(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("part-r")),
+        "cancelled rebuilt parts must be removed"
+    );
+    for (id, bytes) in want {
+        assert_eq!(store.reconstruct(&id).unwrap().unwrap(), bytes);
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
+    let dir = tmp("compact-cancel");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for part in 0..3u32 {
+        for row in 0..2_000u32 {
+            let id = format!("compact-{part}-{row:04}");
+            store
+                .put(&id, &[Span::Lit(b"small")], vec![("n".into(), AttrValue::Int(row.into()))])
+                .unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+    let commit = store.manifest().commit;
+    let parts = store.part_count();
+    let output = dir.join(format!(
+        "part-{:08}-{:08}.part",
+        store.manifest().parts.first().unwrap().seq_lo,
+        store.manifest().parts.last().unwrap().seq_hi
+    ));
+    let cancellation = turndb::control::CancellationToken::new();
+    let cancel = cancellation.clone();
+    let output_watch = output.clone();
+    let watcher = std::thread::spawn(move || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !output_watch.exists() {
+            assert!(std::time::Instant::now() < until, "compaction never created its output part");
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+    });
+    let error = store
+        .merge_range_with_control(
+            0,
+            parts,
+            &turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) },
+        )
+        .unwrap_err();
+    watcher.join().unwrap();
+    assert!(error
+        .downcast_ref::<turndb::control::OperationInterrupted>()
+        .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
+    assert_eq!(store.manifest().commit, commit);
+    assert_eq!(store.part_count(), parts);
+    assert!(!output.exists(), "a cancelled unpublished part must be removed");
+    assert_eq!(store.ids().unwrap().len(), 6_000);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn a_crashed_refold_leaves_the_store_exactly_as_it_was() {
     // A refold writes a new fold generation and new parts BEFORE the manifest names either. A crash in
     // that window must leave nothing but orphans, and the store must open on the old generation as

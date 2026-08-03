@@ -68,6 +68,17 @@ function guarded(fn, operation) {
         throw new TurnDbError('CANCELLED', 'next was cancelled before submission');
       });
     }
+    const lifecycleOptions = operation === 'compact' || operation === 'erase'
+      ? args[1]
+      : ['verify', 'punch', 'refold'].includes(operation)
+        ? args[0]
+        : undefined;
+    if (lifecycleOptions?.signal?.aborted) {
+      return Promise.reject(new TurnDbError(
+        'CANCELLED',
+        `${operation} was cancelled before submission`,
+      ));
+    }
     try {
       return Promise.resolve(fn.apply(this, args)).catch((error) => {
         throw normalizeError(error);

@@ -39,6 +39,7 @@ test('reports the native capability profile without a portable fallback', () => 
     healthSnapshots: true,
     schemaDiscovery: true,
     scanCancellation: true,
+    lifecycleCancellation: true,
     scanReconstructionBudget: true,
     scanReconstructedBytesDefault: 33554432n,
     arrowIpc: true,
@@ -602,6 +603,33 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.equal(refolded.recordsKept, 2n);
   assert.equal(typeof refolded.bytesReclaimed, 'bigint');
   assert.equal((await store.verify()).parts, 1n);
+});
+
+test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([{
+    kind: 'put',
+    id: 'still-present',
+    contents: [{ name: 'payload', bytes: Buffer.from('must survive refusal') }],
+  }]);
+
+  const cancelled = (promise) => assert.rejects(
+    promise,
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  await cancelled(store.compact(true, { timeoutMs: 0 }));
+  await cancelled(store.verify({ timeoutMs: 0 }));
+  await cancelled(store.punch({ timeoutMs: 0 }));
+  await cancelled(store.refold({ timeoutMs: 0 }));
+  await cancelled(store.erase(['still-present'], { timeoutMs: 0 }));
+
+  const aborted = new AbortController();
+  aborted.abort();
+  await cancelled(store.verify({ signal: aborted.signal }));
+  assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['still-present']);
 });
 
 test('reports cheap health across staging and publication', async (t) => {

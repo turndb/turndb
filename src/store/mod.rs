@@ -527,6 +527,19 @@ fn sweep_unreachable(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_refold_stage(dir: &Path, generation: u32, built: &[refold::RefoldedPart]) {
+    let fold = refold::fold_dir(dir, generation);
+    if fold.exists() {
+        let _ = crate::vfs::remove_tree(&fold);
+    }
+    for (file, ..) in built {
+        let path = dir.join(file);
+        if path.exists() {
+            let _ = crate::vfs::unlink(&path);
+        }
+    }
+}
+
 /// What [`verify_chain`] checked.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChainReport {
@@ -546,10 +559,19 @@ pub struct ChainReport {
 /// consistent and only the chain notices. Verifiable across the retained window; silent about
 /// commits whose bytes have been pruned.
 pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
+    verify_chain_with_control(dir, &crate::control::OperationControl::default())
+}
+
+/// [`verify_chain`] with cooperative checks between retained manifests and part digests.
+pub fn verify_chain_with_control(
+    dir: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<ChainReport> {
     let mut report = ChainReport::default();
     let commits = list_retained(dir);
     let mut prev_bytes: Option<Vec<u8>> = None;
     for &c in &commits {
+        control.check("manifest verification")?;
         let bytes = std::fs::read(retained_path(dir, c))?;
         let m =
             Manifest::parse(&bytes).with_context(|| format!("retained manifest {c} is corrupt"))?;
@@ -561,6 +583,7 @@ pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
             report.links += 1;
         }
         for p in &m.parts {
+            control.check("manifest verification")?;
             match &p.b3 {
                 Some(want) => {
                     let got = blake3::hash(
@@ -1475,6 +1498,17 @@ impl Store {
         lo: usize,
         len: usize,
     ) -> Result<Option<crate::part::merge::MergeStats>> {
+        self.merge_range_with_control(lo, len, &crate::control::OperationControl::default())
+    }
+
+    /// [`Store::merge_range`] with cooperative checkpoints before its manifest publication.
+    pub fn merge_range_with_control(
+        &mut self,
+        lo: usize,
+        len: usize,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<crate::part::merge::MergeStats>> {
+        control.check("part compaction")?;
         if len < 2 || lo + len > self.parts.len() {
             return Ok(None);
         }
@@ -1494,13 +1528,41 @@ impl Store {
         // part outside the run could still hold an older version of the deleted id, and dropping the
         // tombstone would resurrect it.
         let total = lo == 0 && len == self.parts.len();
-        let (meta, stats) = crate::part::merge::merge_opts(&path, &inputs, self.cfg.level, total)?;
+        let (meta, stats) = match crate::part::merge::merge_opts_with_control(
+            &path,
+            &inputs,
+            self.cfg.level,
+            total,
+            control,
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error);
+            }
+        };
 
         // Publish: the merged part is durable (part::build fsyncs) before the manifest names it, and
         // the manifest swap is the single linearization point. A crash before it leaves the merged
         // file as an unreachable orphan. The INPUTS are not deleted here: retained manifests still
         // name them, so a reader inside the retention window keeps a complete snapshot on disk.
         // They fall to the sweep when the window prunes past their last naming manifest.
+        // Every fallible preparation step and the final cancellation checkpoint happen before
+        // commit is attempted. Once commit starts, its ordinary crash protocol—not cancellation—
+        // decides the outcome, and the output must remain available to any retained manifest that
+        // may have landed.
+        let digest =
+            match std::fs::read(&path).map(|bytes| blake3::hash(&bytes).to_hex().to_string()) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    let _ = crate::vfs::unlink(&path);
+                    return Err(error.into());
+                }
+            };
+        if let Err(error) = control.check("part compaction") {
+            let _ = crate::vfs::unlink(&path);
+            return Err(error.into());
+        }
         let mut m = self.manifest.clone();
         m.parts.splice(
             lo..lo + len,
@@ -1509,7 +1571,7 @@ impl Store {
                 seq_lo: meta.seq_lo,
                 seq_hi: meta.seq_hi,
                 records: meta.n_records,
-                b3: Some(blake3::hash(&std::fs::read(&path)?).to_hex().to_string()),
+                b3: Some(digest),
             }],
         );
         m.commit(&self.dir)?;
@@ -1556,10 +1618,19 @@ impl Store {
     /// beyond current scale; when it arrives, `maybe_compact` is the young tier's tool and this
     /// policy becomes the old tier's slow beat.
     pub fn auto_compact(&mut self) -> Result<Option<crate::part::merge::MergeStats>> {
+        self.auto_compact_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::auto_compact`] with cooperative checkpoints.
+    pub fn auto_compact_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<crate::part::merge::MergeStats>> {
+        control.check("part compaction")?;
         if self.parts.len() < Self::AUTO_COMPACT_K {
             return Ok(None);
         }
-        self.merge_range(0, self.parts.len())
+        self.merge_range_with_control(0, self.parts.len(), control)
     }
 
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.
@@ -1742,11 +1813,29 @@ impl Store {
     /// Ids that do not exist are counted, not errored: a DSAR naming already-gone data is a
     /// normal outcome, and the record should say so rather than fail.
     pub fn erase_ids(&mut self, ids: &[String]) -> Result<ErasureStats> {
+        self.erase_ids_with_control(ids, &crate::control::OperationControl::default())
+    }
+
+    /// [`Store::erase_ids`] with cancellation during its read-only planning phase.
+    ///
+    /// Once the atomic tombstone batch is applied, interruption is deliberately deferred until the
+    /// total merge and re-fold finish. Returning `cancelled` after logical deletion but before
+    /// physical erasure would make a retry mistake the ids for previously absent records and falsely
+    /// report completion. Erasure therefore either stops before mutation or drives its full safety
+    /// protocol to completion.
+    pub fn erase_ids_with_control(
+        &mut self,
+        ids: &[String],
+        control: &crate::control::OperationControl,
+    ) -> Result<ErasureStats> {
         let mut tombstoned = 0usize;
         let mut absent = 0usize;
+        let mut delete = Vec::new();
+        let mut seen = HashSet::new();
         for id in ids {
-            if self.get(id)?.is_some() {
-                self.delete(id)?;
+            control.check("record erasure")?;
+            if seen.insert(id) && self.get(id)?.is_some() {
+                delete.push(id);
                 tombstoned += 1;
             } else {
                 absent += 1;
@@ -1755,6 +1844,12 @@ impl Store {
         if tombstoned == 0 {
             return Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: None });
         }
+        control.check("record erasure")?;
+        let mut batch = Batch::new();
+        for id in delete {
+            batch.delete(id);
+        }
+        self.apply(batch)?;
         self.sync()?;
         self.flush()?;
         if self.parts.len() > 1 {
@@ -1781,6 +1876,19 @@ impl Store {
     /// Requires a flushed memtable, for the same reason a re-fold does: staged records reference
     /// content this would otherwise consider unreachable.
     pub fn punch_unreferenced(&mut self) -> Result<PunchStats> {
+        self.punch_unreferenced_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::punch_unreferenced`] with cooperative, resumable block checkpoints.
+    ///
+    /// Cancellation after the manifest declaration may leave some dead blocks declared but not yet
+    /// deallocated. That is a safe, durable partial state: reads already treat the blocks as erased,
+    /// and a later call retries every still-present declared block.
+    pub fn punch_unreferenced_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<PunchStats> {
+        control.check("content punching")?;
         if !self.mem.is_empty() {
             bail!("punching requires a flushed memtable; call sync() and flush() first");
         }
@@ -1789,6 +1897,7 @@ impl Store {
         let mut live_blocks: HashSet<u32> = HashSet::new();
         for (pi, rows) in visible.rows.iter().enumerate() {
             for &row in rows {
+                control.check("content punching")?;
                 for content in self.parts[pi].record(row)?.contents {
                     for op in content.ops {
                         let BodyOp::Piece { hash, .. } = op else { continue };
@@ -1805,23 +1914,27 @@ impl Store {
         dead.sort_unstable();
         let already: HashSet<u32> =
             self.manifest.punched.iter().flat_map(|&(lo, hi)| lo..=hi).collect();
-        dead.retain(|b| !already.contains(b));
         if dead.is_empty() {
             return Ok(PunchStats::default());
         }
 
-        // Record first, punch second.
-        let mut m = self.manifest.clone();
-        let mut all: Vec<u32> = already.into_iter().chain(dead.iter().copied()).collect();
-        all.sort_unstable();
-        m.punched = to_ranges(&all);
-        m.commit(&self.dir)?;
-        self.manifest = m;
+        // Record first, punch second. Already-declared blocks stay in `dead`: a crash or
+        // cancellation can land after this authority is durable but before every hole is punched,
+        // and retrying those blocks is how the operation actually resumes.
+        if dead.iter().any(|block| !already.contains(block)) {
+            control.check("content punching")?;
+            let mut m = self.manifest.clone();
+            let mut all: Vec<u32> = already.into_iter().chain(dead.iter().copied()).collect();
+            all.sort_unstable();
+            m.punched = to_ranges(&all);
+            m.commit(&self.dir)?;
+            self.manifest = m;
+        }
         // Declare before destroying, the same order the manifest write follows and for the same
         // reason: at no point may a block's bytes be gone while this fold still calls it content.
         self.fold.declare_punched(&self.manifest.punched);
 
-        let punched = self.fold.punch_blocks(&dead)?;
+        let punched = self.fold.punch_blocks_with_control(&dead, control)?;
         Ok(PunchStats { blocks_punched: punched.len(), blocks_examined: dead.len() })
     }
 
@@ -1833,6 +1946,19 @@ impl Store {
     /// Requires a flushed memtable — staged records reference the old fold, and rebuilding parts under
     /// them would leave their pieces unresolvable.
     pub fn refold(&mut self) -> Result<refold::RefoldStats> {
+        self.refold_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::refold`] with cooperative checkpoints before the generation swap.
+    ///
+    /// Cancellation removes the unpublished generation and rebuilt parts. Once manifest commit is
+    /// attempted, cancellation is no longer observed: the crash-safe commit protocol and mandatory
+    /// handle/retention cleanup must run to a definite result.
+    pub fn refold_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<refold::RefoldStats> {
+        control.check("content refold")?;
         if !self.mem.is_empty() {
             bail!("refold requires a flushed memtable; call sync() and flush() first");
         }
@@ -1841,49 +1967,57 @@ impl Store {
         }
         let seqs: Vec<(u64, u64)> =
             self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
-        let (new_gen, built, mut stats) = refold::refold(
+        let (new_gen, built, mut stats) = refold::refold_with_control(
             &self.dir,
             &self.parts,
             &seqs,
             &self.fold,
             self.manifest.fold_gen,
             self.cfg,
+            control,
         )?;
 
         // Data before pointers, exactly as everywhere else: the new fold and the new parts are durable
         // before the manifest names either, and the manifest swap is the instant it takes effect.
-        let mut m = self.manifest.clone();
-        m.parts = built
-            .iter()
-            .map(|(file, lo, hi, n)| {
-                Ok(PartRef {
-                    file: file.clone(),
-                    seq_lo: *lo,
-                    seq_hi: *hi,
-                    records: *n,
-                    b3: Some(
-                        blake3::hash(&std::fs::read(self.dir.join(file))?).to_hex().to_string(),
-                    ),
-                })
-            })
-            .collect::<Result<_>>()?;
-        m.fold_gen = new_gen;
-        // Block ids are PER GENERATION and the new fold's restart at 0, so a punched range carried
-        // over from the old generation names live blocks in the new one. Nothing reads `punched`
-        // today, which is the only reason this was survivable; the moment a reader consults it to
-        // tell erasure from corruption, a stale range reports live content as erased. Clearing it
-        // is not bookkeeping — the new fold was rewritten WITHOUT the erased content, so it has no
-        // holes to declare.
-        m.punched.clear();
-        // The new fold starts empty of history, so the committed tail is its own.
         let new_dir = refold::fold_dir(&self.dir, new_gen);
-        {
+        let prepared = (|| -> Result<Manifest> {
+            let mut m = self.manifest.clone();
+            m.parts = built
+                .iter()
+                .map(|(file, lo, hi, n)| {
+                    control.check("content refold")?;
+                    Ok(PartRef {
+                        file: file.clone(),
+                        seq_lo: *lo,
+                        seq_hi: *hi,
+                        records: *n,
+                        b3: Some(
+                            blake3::hash(&std::fs::read(self.dir.join(file))?).to_hex().to_string(),
+                        ),
+                    })
+                })
+                .collect::<Result<_>>()?;
+            m.fold_gen = new_gen;
+            // Block ids are PER GENERATION. The new fold was rewritten without erased content and
+            // therefore has no holes inherited from the old generation.
+            m.punched.clear();
             let f = Fold::open(&new_dir, self.cfg)?;
             let t = f.tail();
             m.fold_seg = t.seg;
             m.fold_off = t.off;
-        }
-        m.commit(&self.dir)?; // <- the linearization point
+            control.check("content refold")?;
+            Ok(m)
+        })();
+        let mut m = match prepared {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                cleanup_refold_stage(&self.dir, new_gen, &built);
+                return Err(error);
+            }
+        };
+        // No cancellation checkpoint after this call begins. A failed commit can have durably
+        // written its retained copy, so staged files must remain for ordinary recovery.
+        m.commit(&self.dir)?;
 
         // Everything past here is cleanup: a crash leaves orphans, which open() sweeps.
         let old_gen = self.manifest.fold_gen;
@@ -2237,6 +2371,44 @@ mod tests {
         assert_eq!(got.next_seq, 9);
         assert_eq!(got.commit, 1, "commit() must advance the commit counter");
         assert!(!d.join("MANIFEST.tmp").exists(), "staging file must not survive a commit");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn punching_retries_blocks_already_declared_before_a_crash() {
+        let d = std::env::temp_dir().join(format!(
+            "turndb-punch-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let cfg = crate::fold::FoldCfg { block_target: 1, ..Default::default() };
+        let mut store = super::Store::open(&d, cfg).unwrap();
+        let old = vec![0x41; 64 * 1024];
+        let live = vec![0x42; 64 * 1024];
+        store.put("k", &[super::Span::Piece(&old)], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.put("k", &[super::Span::Piece(&live)], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+
+        let live_block = store.locate(&crate::PieceHash::of(&live)).unwrap().unwrap().block_id;
+        let dead: Vec<u32> =
+            store.fold.block_ids().into_iter().filter(|&block| block != live_block).collect();
+        assert!(!dead.is_empty());
+
+        // The durable state left by a crash immediately after "record first, punch second".
+        let mut manifest = store.manifest.clone();
+        manifest.punched = super::to_ranges(&dead);
+        manifest.commit(&d).unwrap();
+        store.manifest = manifest;
+        store.fold.declare_punched(&store.manifest.punched);
+
+        let stats = store.punch_unreferenced().unwrap();
+        assert_eq!(stats.blocks_examined, dead.len());
+        assert_eq!(stats.blocks_punched, dead.len(), "declared blocks must be retried");
+        assert_eq!(store.reconstruct("k").unwrap().unwrap(), live);
         std::fs::remove_dir_all(&d).ok();
     }
 }
