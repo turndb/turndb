@@ -70,6 +70,7 @@ export interface Capabilities {
   commandQueueCapacity: number;
   immutableSnapshots: true;
   lifecycleOperations: true;
+  healthSnapshots: true;
 }
 
 export interface MergeStats {
@@ -156,5 +157,23 @@ export declare class NativeStore {
   }>;
   punch(): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
   refold(): Promise<RefoldResult>;
+  health(): Promise<{
+    commit: bigint;
+    foldGeneration: number;
+    parts: bigint;
+    partRows: bigint;
+    memtableEntries: bigint;
+    memtableBytes: bigint;
+    walBytes: bigint;
+    foldDiskBytes: bigint;
+    foldSegments: number;
+    foldCacheHits: bigint;
+    foldCacheMisses: bigint;
+    partCacheBytes: bigint;
+    partCacheBudget: bigint;
+    dedupWindowEntries: bigint;
+    retainedCommits: bigint;
+    punchedBlocks: bigint;
+  }>;
   close(durable?: boolean): Promise<void>;
 }

@@ -219,6 +219,13 @@ Its boundary remains this store: previously written packs, backups, replicas, an
 not affected. Backup/restore, manifest recovery, preflight space estimates, resumable maintenance, and
 cancellation remain current gaps.
 
+`Store::health` and the Node `health()` method are constant-work operational snapshots. They report
+the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
+memtable entries and bytes, WAL and fold disk bytes, fold and part cache counters/budgets, Tier-0 dedup
+window entries, retained commits, and punched blocks. No record or content is decoded. Latency
+histograms, slow-query events, query section/block I/O, dedup ratios, reclaimable-byte estimation, and
+export hooks remain Phase-5 work; consumers may poll this generic value into their telemetry system.
+
 ## 7. Compatibility policy
 
 TurnDB is pre-1.0 and the format is not frozen, but every accepted revision follows these rules:

@@ -30,6 +30,7 @@ test('reports the native capability profile without a portable fallback', () => 
     commandQueueCapacity: 64,
     immutableSnapshots: true,
     lifecycleOperations: true,
+    healthSnapshots: true,
   });
 });
 
@@ -271,4 +272,38 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.equal(refolded.recordsKept, 2n);
   assert.equal(typeof refolded.bytesReclaimed, 'bigint');
   assert.equal((await store.verify()).parts, 1n);
+});
+
+test('reports cheap health across staging and publication', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  const empty = await store.health();
+  assert.equal(empty.parts, 0n);
+  assert.equal(empty.memtableEntries, 0n);
+  assert.equal(empty.walBytes, 0n);
+
+  await store.write([{
+    kind: 'put',
+    id: 'health/1',
+    contents: [{ name: 'payload', bytes: Buffer.from('health payload') }],
+  }]);
+  const staged = await store.health();
+  assert.equal(staged.memtableEntries, 1n);
+  assert(staged.memtableBytes > 0n);
+  assert(staged.walBytes > 0n);
+  assert.equal(staged.dedupWindowEntries, 1n);
+
+  await store.flush();
+  const published = await store.health();
+  assert(published.commit > empty.commit);
+  assert.equal(published.parts, 1n);
+  assert.equal(published.partRows, 1n);
+  assert.equal(published.memtableEntries, 0n);
+  assert.equal(published.walBytes, 0n);
+  assert(published.foldDiskBytes > 0n);
+  assert.equal(published.retainedCommits, 1n);
+  assert.equal(typeof published.foldCacheHits, 'bigint');
+  assert.equal(typeof published.partCacheBudget, 'bigint');
 });

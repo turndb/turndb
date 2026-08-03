@@ -44,6 +44,10 @@ silently.
 - `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
   content, and purges retained manifests so this store has no snapshot path back to the erased rows.
   It cannot erase packs, backups, replicas, or any other external copy.
+- `health()` is a cheap engine snapshot suitable for an embedding application's health/metrics
+  endpoint: commit and fold generation, part pressure, staged entries and bytes, WAL/fold bytes,
+  cache counters and budgets, dedup-window size, retained commits, and punched blocks. It decodes no
+  records or content and therefore does not claim an exact live-row count.
 
 The current slice does not yet expose cancellation/deadlines, Arrow IPC, SQL, backup/restore and
 recovery controls, configurable queue depth, or the complete engine error taxonomy. Those remain

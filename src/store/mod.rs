@@ -649,6 +649,31 @@ pub struct Store {
     pcache: Arc<SectionCache>,
 }
 
+/// Cheap operational state for an embedder's health and metrics endpoint.
+///
+/// This reports engine facts, not a telemetry format or consumer policy. Counters that require a
+/// full visibility walk (for example exact live-record count) are deliberately absent from this
+/// cheap snapshot rather than hidden behind a surprisingly expensive getter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreHealth {
+    pub commit: u64,
+    pub fold_generation: u32,
+    pub parts: usize,
+    pub part_rows: u64,
+    pub memtable_entries: usize,
+    pub memtable_bytes: usize,
+    pub wal_bytes: u64,
+    pub fold_disk_bytes: u64,
+    pub fold_segments: u32,
+    pub fold_cache_hits: u64,
+    pub fold_cache_misses: u64,
+    pub part_cache_bytes: usize,
+    pub part_cache_budget: usize,
+    pub dedup_window_entries: usize,
+    pub retained_commits: usize,
+    pub punched_blocks: u64,
+}
+
 /// Refuse an inverted scan range before it reaches `BTreeMap::range`, which PANICS on
 /// `start > end` rather than returning empty.
 ///
@@ -1656,6 +1681,32 @@ impl Store {
     }
     pub fn wal_bytes(&self) -> u64 {
         self.wal.bytes()
+    }
+
+    /// A constant-work snapshot of operational state. No records or content are decoded.
+    pub fn health(&self) -> StoreHealth {
+        let fold_cache = self.fold.cache_stats();
+        let (part_cache_bytes, part_cache_budget) = self.part_cache_bytes();
+        let punched_blocks =
+            self.manifest.punched.iter().map(|&(lo, hi)| u64::from(hi) - u64::from(lo) + 1).sum();
+        StoreHealth {
+            commit: self.manifest.commit,
+            fold_generation: self.manifest.fold_gen,
+            parts: self.parts.len(),
+            part_rows: self.manifest.parts.iter().map(|part| u64::from(part.records)).sum(),
+            memtable_entries: self.mem.len(),
+            memtable_bytes: self.mem_bytes,
+            wal_bytes: self.wal.bytes(),
+            fold_disk_bytes: self.fold.disk_bytes(),
+            fold_segments: self.fold.segment_count(),
+            fold_cache_hits: fold_cache.hits,
+            fold_cache_misses: fold_cache.misses,
+            part_cache_bytes,
+            part_cache_budget,
+            dedup_window_entries: self.fold.window_len(),
+            retained_commits: retained_commits(&self.dir).len(),
+            punched_blocks,
+        }
     }
 }
 
