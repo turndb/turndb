@@ -45,16 +45,21 @@ pub(crate) struct Visibility {
     pub tombstones: usize,
 }
 
-/// A live committed row resolved by the range merge.
+/// A live row resolved by the range merge, from an immutable part or its newer memtable overlay.
 ///
-/// The part index is stable for the lifetime of the `Store`/`ReadStore` borrow that produced it.
-/// Carrying it into projection avoids repeating a newest-first point lookup for every candidate and
-/// again for every reconstructed content value.
+/// An immutable part index is stable for the lifetime of the `Store`/`ReadStore` borrow that produced
+/// it. Carrying the origin into projection avoids repeating a newest-first point lookup for every
+/// candidate and again for every reconstructed content value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowOrigin {
+    Part { part: usize, row: usize },
+    Memtable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RowRef {
     pub id: String,
-    pub part: usize,
-    pub row: usize,
+    pub origin: RowOrigin,
 }
 
 /// Work performed by one committed range-resolution call.
@@ -67,6 +72,24 @@ pub(crate) struct RowBatch {
     pub superseded_rows: usize,
     /// Deciding occurrences that were tombstones and produced no live candidate.
     pub tombstones: usize,
+    /// Newer memtable occurrences consumed by the merge.
+    pub memtable_entries: usize,
+    /// Last complete id group consumed, including a group decided by a tombstone.
+    pub resolved_through: Option<String>,
+    /// At least one source still has an id beyond `resolved_through` in the requested direction.
+    pub has_more: bool,
+    /// Resolution stopped because admitting the next complete id group would cross its work ceiling.
+    pub budget_exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowScan<'a> {
+    pub from: Option<&'a str>,
+    pub to: Option<&'a str>,
+    pub limit: usize,
+    pub reverse: bool,
+    pub max_resolution_entries: usize,
+    pub allow_oversized_group: bool,
 }
 
 pub(crate) fn visibility(parts: &[Arc<Part>]) -> Result<Visibility> {
@@ -106,21 +129,24 @@ pub(crate) fn project_row(
     attrs: &HashSet<&str>,
     contents: &HashSet<&str>,
 ) -> Result<Record> {
-    let part = parts.get(resolved.part).ok_or_else(|| {
-        anyhow::anyhow!("resolved part {} is outside the immutable snapshot", resolved.part)
+    let RowOrigin::Part { part: part_index, row } = resolved.origin else {
+        anyhow::bail!("committed projection received a memtable row")
+    };
+    let part = parts.get(part_index).ok_or_else(|| {
+        anyhow::anyhow!("resolved part {part_index} is outside the immutable snapshot")
     })?;
-    if resolved.row >= part.len() {
+    if row >= part.len() {
         anyhow::bail!(
             "resolved row {} is outside part {} with {} rows",
-            resolved.row,
-            resolved.part,
+            row,
+            part_index,
             part.len()
         );
     }
     Ok(Record {
         id: resolved.id.clone(),
-        contents: part.contents_selected(resolved.row, contents)?,
-        attrs: part.attrs_selected(resolved.row, attrs)?,
+        contents: part.contents_selected(row, contents)?,
+        attrs: part.attrs_selected(row, attrs)?,
     })
 }
 
@@ -149,14 +175,17 @@ pub(crate) fn reconstruct_projected_content(
     resolved: &RowRef,
     content: &crate::types::Content,
 ) -> Result<Vec<u8>> {
-    let part = parts.get(resolved.part).ok_or_else(|| {
-        anyhow::anyhow!("resolved part {} is outside the immutable snapshot", resolved.part)
+    let RowOrigin::Part { part: part_index, row } = resolved.origin else {
+        anyhow::bail!("committed reconstruction received a memtable row")
+    };
+    let part = parts.get(part_index).ok_or_else(|| {
+        anyhow::anyhow!("resolved part {part_index} is outside the immutable snapshot")
     })?;
-    if resolved.row >= part.len() {
+    if row >= part.len() {
         anyhow::bail!(
             "resolved row {} is outside part {} with {} rows",
-            resolved.row,
-            resolved.part,
+            row,
+            part_index,
             part.len()
         );
     }
@@ -202,14 +231,15 @@ fn locate<'a>(parts: &'a [Arc<Part>], id: &str) -> Result<Option<(&'a Arc<Part>,
 /// Because ids sort lexicographically, a caller who designs ids with the query in mind — a
 /// `member/timestamp/...` prefix, say — gets member-then-time paging out of this with no secondary
 /// index at all. `reverse` walks the same run backwards, which is what a newest-first UI wants.
-pub(crate) fn scan_rows(
+pub(crate) fn scan_rows<'a, I>(
     parts: &[Arc<Part>],
-    from: Option<&str>,
-    to: Option<&str>,
-    limit: usize,
-    reverse: bool,
-) -> Result<RowBatch> {
-    if limit == 0 || parts.is_empty() {
+    mut overlay: I,
+    request: RowScan<'_>,
+) -> Result<RowBatch>
+where
+    I: Iterator<Item = (&'a str, bool)>,
+{
+    if request.limit == 0 {
         return Ok(RowBatch::default());
     }
     struct Walk {
@@ -220,48 +250,93 @@ pub(crate) fn scan_rows(
 
     let mut walks = Vec::with_capacity(parts.len());
     for part in parts {
-        let range = part.rows_in_range(from, to)?;
-        let row = if reverse { range.end.saturating_sub(1) } else { range.start };
+        let range = part.rows_in_range(request.from, request.to)?;
+        let row = if request.reverse { range.end.saturating_sub(1) } else { range.start };
         let current = if range.is_empty() { None } else { Some(part.id(row)?) };
         walks.push(Walk { range, row, current });
     }
 
-    // K-way walk over the already-sorted ranges. Equal ids are resolved as one group; the newest
-    // part in that group decides, including when it is a tombstone. Crucially, the walk stops once
-    // `limit` live ids are found instead of materialising every candidate in the requested range.
-    let mut batch = RowBatch { rows: Vec::with_capacity(limit), ..RowBatch::default() };
-    while batch.rows.len() < limit {
-        let best = walks
+    let mut overlay_current = overlay.next();
+
+    // K-way walk over the already-sorted ranges plus the optional newer overlay. Equal ids are
+    // resolved as one atomic group; the overlay decides when present, otherwise the newest part does.
+    // Crucially, the walk stops once `limit` live ids are found instead of materialising the range.
+    let mut batch = RowBatch { rows: Vec::with_capacity(request.limit), ..RowBatch::default() };
+    while batch.rows.len() < request.limit {
+        let part_best = walks
             .iter()
             .filter_map(|walk| walk.current.as_ref())
-            .min_by(|a, b| if reverse { b.cmp(a) } else { a.cmp(b) })
+            .min_by(|a, b| if request.reverse { b.cmp(a) } else { a.cmp(b) })
             .cloned();
-        let Some(best) = best else { break };
+        let best = match (part_best, overlay_current.as_ref().map(|(id, _)| *id)) {
+            (Some(part), Some(overlay)) => {
+                let overlay_wins =
+                    if request.reverse { overlay > part.as_str() } else { overlay < part.as_str() };
+                if overlay_wins {
+                    overlay.to_owned()
+                } else {
+                    part
+                }
+            }
+            (Some(part), None) => part,
+            (None, Some(overlay)) => overlay.to_owned(),
+            (None, None) => break,
+        };
         let matching: Vec<usize> = walks
             .iter()
             .enumerate()
             .filter_map(|(pi, walk)| (walk.current.as_deref() == Some(best.as_str())).then_some(pi))
             .collect();
+        let overlay_matches = overlay_current.is_some_and(|(id, _)| id == best);
+        let group_entries = matching.len() + usize::from(overlay_matches);
+        let used = batch
+            .physical_rows
+            .checked_add(batch.memtable_entries)
+            .ok_or_else(|| anyhow::anyhow!("total row-resolution counter overflow"))?;
+        if group_entries > request.max_resolution_entries.saturating_sub(used)
+            && (used > 0 || !request.allow_oversized_group)
+        {
+            batch.has_more = true;
+            batch.budget_exhausted = true;
+            break;
+        }
         batch.physical_rows = batch
             .physical_rows
             .checked_add(matching.len())
             .ok_or_else(|| anyhow::anyhow!("physical row-resolution counter overflow"))?;
-        batch.superseded_rows = batch
-            .superseded_rows
-            .checked_add(matching.len().saturating_sub(1))
-            .ok_or_else(|| anyhow::anyhow!("superseded row-resolution counter overflow"))?;
-        let newest = *matching.last().expect("the selected id has at least one source part");
-        if !parts[newest].is_tombstone(walks[newest].row)? {
-            batch.rows.push(RowRef { id: best, part: newest, row: walks[newest].row });
-        } else {
-            batch.tombstones = batch
-                .tombstones
+        if overlay_matches {
+            batch.memtable_entries = batch
+                .memtable_entries
                 .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("tombstone row-resolution counter overflow"))?;
+                .ok_or_else(|| anyhow::anyhow!("memtable row-resolution counter overflow"))?;
+            batch.superseded_rows = batch
+                .superseded_rows
+                .checked_add(matching.len())
+                .ok_or_else(|| anyhow::anyhow!("superseded row-resolution counter overflow"))?;
+            if overlay_current.expect("the overlay id matched").1 {
+                batch.rows.push(RowRef { id: best.clone(), origin: RowOrigin::Memtable });
+            }
+        } else {
+            batch.superseded_rows = batch
+                .superseded_rows
+                .checked_add(matching.len().saturating_sub(1))
+                .ok_or_else(|| anyhow::anyhow!("superseded row-resolution counter overflow"))?;
+            let newest = *matching.last().expect("the selected id has at least one source part");
+            if !parts[newest].is_tombstone(walks[newest].row)? {
+                batch.rows.push(RowRef {
+                    id: best.clone(),
+                    origin: RowOrigin::Part { part: newest, row: walks[newest].row },
+                });
+            } else {
+                batch.tombstones = batch
+                    .tombstones
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("tombstone row-resolution counter overflow"))?;
+            }
         }
         for pi in matching {
             let walk = &mut walks[pi];
-            if reverse {
+            if request.reverse {
                 if walk.row == walk.range.start {
                     walk.current = None;
                 } else {
@@ -277,6 +352,25 @@ pub(crate) fn scan_rows(
                 }
             }
         }
+        if overlay_matches {
+            overlay_current = overlay.next();
+        }
+        batch.resolved_through = Some(best);
+        let sources_remain =
+            overlay_current.is_some() || walks.iter().any(|walk| walk.current.is_some());
+        let used = batch
+            .physical_rows
+            .checked_add(batch.memtable_entries)
+            .ok_or_else(|| anyhow::anyhow!("total row-resolution counter overflow"))?;
+        if sources_remain && used >= request.max_resolution_entries {
+            batch.has_more = true;
+            batch.budget_exhausted = true;
+            break;
+        }
+    }
+    if !batch.has_more {
+        batch.has_more =
+            overlay_current.is_some() || walks.iter().any(|walk| walk.current.is_some());
     }
     Ok(batch)
 }
@@ -289,7 +383,22 @@ pub fn scan_ids(
     limit: usize,
     reverse: bool,
 ) -> Result<Vec<String>> {
-    Ok(scan_rows(parts, from, to, limit, reverse)?.rows.into_iter().map(|row| row.id).collect())
+    Ok(scan_rows(
+        parts,
+        std::iter::empty::<(&str, bool)>(),
+        RowScan {
+            from,
+            to,
+            limit,
+            reverse,
+            max_resolution_entries: usize::MAX,
+            allow_oversized_group: true,
+        },
+    )?
+    .rows
+    .into_iter()
+    .map(|row| row.id)
+    .collect())
 }
 
 pub fn ids(parts: &[Arc<Part>]) -> Result<Vec<String>> {

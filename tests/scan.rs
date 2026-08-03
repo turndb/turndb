@@ -633,3 +633,95 @@ fn resolved_candidates_project_and_reconstruct_the_authoritative_part_rows() {
     assert_eq!(page.stats.resolution.memtable_entries, 0);
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn resolution_budget_advances_across_tombstone_only_groups_in_both_directions() {
+    let dir = tmp("resolution-budget");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store.put_body(id, id.as_bytes(), vec![]).unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+
+        store.delete("a").unwrap();
+        store.delete("b").unwrap();
+        store.put_body("c", b"c1", vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+
+        store.delete("c").unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    for direction in [Direction::Forward, Direction::Reverse] {
+        let mut request =
+            ScanRequest { direction, max_resolution_entries: 2, ..ScanRequest::default() };
+        let mut rows = Vec::new();
+        let mut physical = Vec::new();
+        let mut empty_pages = 0;
+        for _ in 0..8 {
+            let page = reader.scan(&request).unwrap();
+            physical.push(page.stats.resolution.physical_rows);
+            empty_pages += usize::from(page.rows.is_empty());
+            rows.extend(page.rows.into_iter().map(|row| row.id));
+            let Some(next) = page.next else { break };
+            assert!(page.stats.resolution.budget_exhausted);
+            request.cursor = Some(next);
+        }
+        assert_eq!(rows, ["d"]);
+        assert!(empty_pages >= 3, "tombstone-only progress must be representable");
+        assert!(
+            physical.contains(&3),
+            "one three-version id group must be admitted whole despite a budget of two"
+        );
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resolution_budget_counts_the_writer_overlay_in_the_same_id_group() {
+    let dir = tmp("resolution-overlay");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    store.put_body("a", b"committed-a", vec![]).unwrap();
+    store.put_body("b", b"committed-b", vec![]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.delete("a").unwrap();
+    store.put_body("c", b"staged-c", vec![]).unwrap();
+
+    let mut request = ScanRequest { max_resolution_entries: 1, ..ScanRequest::default() };
+    let first = store.scan(&request).unwrap();
+    assert!(first.rows.is_empty());
+    assert_eq!(first.stats.resolution.physical_rows, 1);
+    assert_eq!(first.stats.resolution.memtable_entries, 1);
+    assert_eq!(first.stats.resolution.superseded_rows, 1);
+    assert!(first.stats.resolution.budget_exhausted);
+
+    request.cursor = first.next;
+    let second = store.scan(&request).unwrap();
+    assert_eq!(second.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["b"]);
+    assert!(second.stats.resolution.budget_exhausted);
+
+    request.cursor = second.next;
+    let third = store.scan(&request).unwrap();
+    assert_eq!(third.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["c"]);
+    assert!(!third.stats.resolution.budget_exhausted);
+    assert!(third.next.is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn invalid_resolution_budgets_are_refused_before_range_work() {
+    let dir = tmp("resolution-budget-validation");
+    let store = Store::open(&dir, cfg()).unwrap();
+    for value in [0, turndb::scan::MAX_RESOLUTION_ENTRIES + 1] {
+        assert!(store
+            .scan(&ScanRequest { max_resolution_entries: value, ..ScanRequest::default() })
+            .is_err());
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

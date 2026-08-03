@@ -48,6 +48,9 @@ test('reports the native capability profile without a portable fallback', () => 
     boundedCompaction: true,
     scanReconstructionBudget: true,
     scanReconstructedBytesDefault: 33554432n,
+    scanResolutionBudget: true,
+    scanResolutionEntriesDefault: 1000000,
+    scanResolutionEntriesMax: 10000000,
     arrowIpc: true,
     parameterizedSql: true,
     sqlMemoryBytesDefault: 268435456n,
@@ -237,10 +240,17 @@ test('round-trips exact typed fields and independently named content', async (t)
   assert.equal(page.rows[0].contents[3].identity, undefined);
   assert.equal(page.rows[0].contents[3].bytes, undefined);
   assert(Object.values(page.stats.io).every((value) => typeof value === 'bigint'));
-  assert(Object.values(page.stats.resolution).every((value) => typeof value === 'bigint'));
+  assert(Object.entries(page.stats.resolution)
+    .filter(([name]) => name !== 'budgetExhausted')
+    .every(([, value]) => typeof value === 'bigint'));
+  assert.equal(typeof page.stats.resolution.budgetExhausted, 'boolean');
   assert(page.stats.io.foldBlocksTouched >= 1n);
   assert.equal((await store.readContent('trace/1', 'request')).toString(), 'shared');
   assert.equal(await store.readContent('trace/1', 'absent'), null);
+  await assert.rejects(
+    store.scan({ maxResolutionEntries: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
 });
 
 test('pages and filters in Rust and refuses cursor misuse', async (t) => {

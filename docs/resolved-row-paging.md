@@ -53,12 +53,36 @@ Every successful page reports exact pre-predicate work in `stats.resolution`:
 - `superseded_rows`: older occurrences hidden by the deciding occurrence for the same id;
 - `tombstones`: deciding immutable tombstones that yielded no live candidate;
 - `memtable_entries`: ordered writer-overlay entries inspected in the requested range.
+- `budget_exhausted`: resolution stopped at a complete id-group boundary because the configured
+  ceiling was reached while more source entries remained.
 
 These are operation-local counters, not estimates derived from part metadata. They include resolver
 over-fetch even when the scan later stops on a result limit or predicate budget, because that work
 actually occurred. `stats.examined` remains the number of resolved live candidates evaluated against
 predicates; it deliberately does not pretend to measure physical version-resolution work. Native Node
-uses `bigint` for all four counters.
+uses `bigint` for all four counters and a boolean exhaustion flag.
+
+## Hard resolution bound
+
+`ScanRequest::max_resolution_entries` bounds the sum of immutable part-row occurrences and memtable
+entries consumed by one page before predicate evaluation. It defaults to 1,000,000 and is accepted in
+`1..=10,000,000`. Native Node exposes the same option as `maxResolutionEntries: number` and publishes
+the compiled default and maximum in capabilities.
+
+An equal-id group is atomic because every occurrence must be considered before newest-wins can be
+decided. TurnDB stops before a group that would cross the remaining ceiling. As with the content-byte
+budget, the first group is admitted whole even when it alone exceeds the ceiling, so an id repeated
+across many parts cannot deadlock pagination.
+
+The resolver returns the last complete id group it consumed independently of whether that group
+produced a live row. The ordinary opaque cursor uses that id boundary. Consequently, a page may be
+empty and still carry `next`: it made real, bounded progress across tombstone-only groups. Forward and
+reverse traversal use the same rule, and changing the resolution ceiling between pages does not
+invalidate the cursor.
+
+The writer memtable participates as the newest ordered source in the same k-way merge. A staged put
+or delete costs one resolution entry, is decided atomically with every immutable occurrence of that
+id, and no longer requires materializing the complete requested memtable range before paging.
 
 ## What remains
 
@@ -67,12 +91,7 @@ order across parts and each row currently invokes the selected-column decoders s
 decoders share section and decoded-column caches, but a future physical batch primitive can group
 resolved ordinals by part, decode/gather selected columns once, and restore global result order.
 
-Range setup still visits every live part, and the writer overlay currently counts staged deletions in
-the requested range before choosing committed over-fetch. Secondary indexes, alternate sort orders,
+Range setup still visits every live part to find its `[from, to)` bounds, and globally ordered
+candidates still invoke selected-column decoders per row. Secondary indexes, alternate sort orders,
 logical query plans, and SQL execution are separate roadmap work. This slice changes no on-disk
 format and adds no consumer-specific semantics.
-
-The resolver reports amplification but does not yet impose a hard physical-row or memtable-entry
-ceiling. A future budget needs a continuation for a completely consumed id group—even when that group
-produces no live row—so stopping among tombstone-heavy history cannot rescan forever or skip a newer
-version. That cursor rule should be implemented before advertising a hard resolution bound.
