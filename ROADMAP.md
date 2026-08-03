@@ -490,7 +490,9 @@ that evidence is sent.
   - Live, dead, and reclaimable content. **Implemented:** an exact, cancellable settled-snapshot
     inventory separates unique live piece bytes, dead bytes stranded in mixed compressed blocks,
     and wholly unreferenced raw/compressed block payload eligible for punch or refold.
-  - Verification and corruption failures.
+  - Verification and corruption failures. **Implemented:** complete committed-store verification
+    has typed monotonic outcomes plus a dedicated corruption-failure counter at the integrity
+    boundary; cancellations and ordinary I/O remain distinct.
 - Structured lifecycle and health events.
 - Slow-query reporting and query plans suitable for diagnosis.
 - Configurable resource budgets and overload behavior.

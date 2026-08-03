@@ -52,6 +52,8 @@ pub struct StoreMetrics {
     pub flush: OperationMetrics,
     pub compaction: OperationMetrics,
     pub backup: OperationMetrics,
+    pub verification: OperationMetrics,
+    pub verification_corruption_failures: u64,
     pub punch: OperationMetrics,
     pub refold: OperationMetrics,
     pub format_migration: OperationMetrics,

@@ -12,12 +12,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
 use turndb::control::OperationControl;
-use turndb::error::{classify, ErrorClass, IntegrityError};
 use turndb::fold::FoldCfg;
 use turndb::scan::{ScanExplanation, ScanPage, ScanRequest};
 use turndb::store::{
-    Batch, BoundedCompaction, ChainReport, CompactionBudget, ContentSpans, ErasureStats,
-    PunchStats, ReadStore, Store, WriteLimits,
+    Batch, BoundedCompaction, CompactionBudget, ContentSpans, ErasureStats, PunchStats, ReadStore,
+    Store, WriteLimits,
 };
 use turndb::types::AttrValue;
 
@@ -56,12 +55,7 @@ pub(crate) struct FormatMigrationStepResult {
     pub step: Option<turndb::store::FormatMigrationStep>,
 }
 
-pub(crate) struct VerifyResult {
-    pub chain: ChainReport,
-    pub fold: turndb::fold::FoldScrub,
-    pub parts: usize,
-    pub part_sections: usize,
-}
+pub(crate) type VerifyResult = turndb::store::StoreVerification;
 
 pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 64;
 pub(crate) const MAX_QUEUE_CAPACITY: usize = 65_536;
@@ -520,7 +514,7 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let _ = reply.send(result);
             }
             Command::Verify { control, reply } => {
-                let result = verify(&mut store, path, &control);
+                let result = verify(&mut store, &control);
                 let _ = reply.send(result);
             }
             Command::Backup { path, control, reply } => {
@@ -685,36 +679,13 @@ fn migrate_format_step(
     Ok(FormatMigrationStepResult { flushed, step })
 }
 
-fn verify(store: &mut Store, path: &Path, control: &OperationControl) -> Result<VerifyResult> {
+fn verify(store: &mut Store, control: &OperationControl) -> Result<VerifyResult> {
     // Settling makes the report cover every operation accepted before this command, and actor
     // serialization prevents a new manifest from racing the chain walk.
     control.check("store verification")?;
     settle(store, control)?;
     control.check("store verification")?;
-    let chain = integrity(
-        "verify retained manifest chain",
-        turndb::store::verify_chain_with_control(path, control),
-    )?;
-    let fold = integrity("verify fold frames", store.fold().scrub_with_control(control))?;
-    let mut part_sections = 0usize;
-    for part in store.parts() {
-        control.check("store verification")?;
-        part_sections += integrity(
-            "verify immutable part sections",
-            part.verify_sections_with_control(control),
-        )?;
-    }
-    Ok(VerifyResult { chain, fold, parts: store.part_count(), part_sections })
-}
-
-fn integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
-    result.map_err(|error| {
-        if classify(&error) == ErrorClass::Internal {
-            IntegrityError::new(context, error).into()
-        } else {
-            error
-        }
-    })
+    store.verify_with_control(control)
 }
 
 #[cfg(test)]

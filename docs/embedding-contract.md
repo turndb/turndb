@@ -348,7 +348,8 @@ this generic value into their telemetry system. The separate
 disjoint live, retained-only, and unclassified storage categories. Structured pages separately expose
 exact section/block I/O attributable to that operation.
 `Store::metrics` and Node `metrics()` separately report process-local monotonic lifecycle outcomes and
-nanosecond totals plus exact folded-piece dedup counters. The cancellable `part_distribution` /
+nanosecond totals plus exact folded-piece dedup counters. Verification outcomes additionally separate
+typed corruption failures from cancellation and I/O. The cancellable `part_distribution` /
 `partDistribution` snapshot reports live part byte/row order statistics. These surfaces are pull-based
 so consumer exporters never execute on the storage thread; see `docs/operation-metrics.md`.
 The cancellable `content_liveness` / `contentLiveness` inventory requires a settled memtable and

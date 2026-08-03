@@ -864,6 +864,15 @@ pub struct ChainReport {
     pub undigested: usize,
 }
 
+/// Evidence returned by a complete committed-store verification pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreVerification {
+    pub chain: ChainReport,
+    pub fold: crate::fold::FoldScrub,
+    pub parts: usize,
+    pub part_sections: usize,
+}
+
 /// Verify the manifest hash chain and every part pin it carries, across the retained window.
 ///
 /// Catches what the per-section checksums cannot: a part swapped for another valid part, a
@@ -923,6 +932,16 @@ pub fn verify_chain_with_control(
         report.links += 1;
     }
     Ok(report)
+}
+
+fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if crate::error::classify(&error) == crate::error::ErrorClass::Internal {
+            crate::error::IntegrityError::new(context, error).into()
+        } else {
+            error
+        }
+    })
 }
 
 /// Complete the one narrowly recognizable first-commit crash window.
@@ -1508,6 +1527,57 @@ impl Store {
     /// Monotonic, process-lifetime operation metrics for this writer handle.
     pub fn metrics(&self) -> crate::observability::StoreMetrics {
         self.metrics
+    }
+
+    /// Verify the retained manifest chain, all live immutable-part sections, and every fold frame.
+    ///
+    /// This covers the committed snapshot only. A writer that wants the report to include staged
+    /// work must sync and flush first. Failures are classified at this integrity boundary and
+    /// recorded in [`Store::metrics`].
+    pub fn verify(&mut self) -> Result<StoreVerification> {
+        self.verify_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Store::verify`] with cooperative checkpoints between bounded verification units.
+    pub fn verify_with_control(
+        &mut self,
+        control: &crate::control::OperationControl,
+    ) -> Result<StoreVerification> {
+        let started = std::time::Instant::now();
+        let result = self.verify_inner_with_control(control);
+        self.metrics.verification.observe(started.elapsed(), &result);
+        if result.as_ref().err().is_some_and(|error| {
+            crate::error::classify(error) == crate::error::ErrorClass::Corruption
+        }) {
+            self.metrics.verification_corruption_failures =
+                self.metrics.verification_corruption_failures.saturating_add(1);
+        }
+        result
+    }
+
+    fn verify_inner_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<StoreVerification> {
+        control.check("store verification")?;
+        let chain = verification_integrity(
+            "verify retained manifest chain",
+            verify_chain_with_control(&self.dir, control),
+        )?;
+        let fold =
+            verification_integrity("verify fold frames", self.fold.scrub_with_control(control))?;
+        let mut part_sections = 0usize;
+        for part in &self.parts {
+            control.check("store verification")?;
+            let sections = verification_integrity(
+                "verify immutable part sections",
+                part.verify_sections_with_control(control),
+            )?;
+            part_sections = part_sections
+                .checked_add(sections)
+                .ok_or_else(|| anyhow::anyhow!("verified part section count overflow"))?;
+        }
+        Ok(StoreVerification { chain, fold, parts: self.parts.len(), part_sections })
     }
 
     /// Exact file-size and physical-row distribution for the current live immutable parts.

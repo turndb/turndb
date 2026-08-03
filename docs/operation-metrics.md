@@ -13,10 +13,15 @@ The outcome classes are disjoint: `attempts == succeeded + failed + cancelled`. 
 are cancellations because they retain TurnDB's stable typed cause. Counters and time totals saturate
 at `u64::MAX` rather than wrapping. Node transports every value as `bigint`.
 
-The initial operation classes are successful open/recovery, sync, flush, compaction, backup, content
-punching, refold, and format migration. `recoveredWalFrames` records the frames replayed by this
+The initial operation classes are successful open/recovery, sync, flush, compaction, backup, complete
+store verification, content punching, refold, and format migration. `recoveredWalFrames` records the frames replayed by this
 handle's successful open. A failed open returns no handle, so its error is the evidence; the snapshot
 does not fabricate a failed recovery counter it has nowhere to store.
+
+`verificationCorruptionFailures` is the subset of failed verification attempts classified as
+`CORRUPTION` at the explicit integrity boundary. Typed cancellations and ordinary filesystem errors
+remain separate rather than inflating a corruption alarm. Rust `Store::verify()` verifies the current
+committed snapshot; the Node actor first settles accepted writes so `store.verify()` covers them.
 
 Metrics are process- and handle-local, not persisted. An operation invoked internally is still real:
 for example a Node maintenance call settles earlier writes through sync/flush, and those operations

@@ -2544,6 +2544,46 @@ fn content_liveness_separates_stranded_dead_bytes_from_whole_reclaimable_blocks(
 }
 
 #[test]
+fn verification_metrics_preserve_typed_cancellation_and_corruption_outcomes() {
+    let dir = tmp("verification-metrics");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "verified", b"content whose immutable part will later drift");
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let report = store.verify().unwrap();
+    assert_eq!(report.parts, 1);
+    assert!(report.part_sections > 0);
+    assert!(report.chain.part_digests > 0);
+
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let cancelled = store
+        .verify_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert_eq!(turndb::error::classify(&cancelled), turndb::error::ErrorClass::Cancelled);
+
+    let part_path = dir.join(&store.manifest().parts[0].file);
+    let mut bytes = std::fs::read(&part_path).unwrap();
+    bytes[2] ^= 0xff;
+    std::fs::write(&part_path, bytes).unwrap();
+    let corrupt = store.verify().unwrap_err();
+    assert_eq!(turndb::error::classify(&corrupt), turndb::error::ErrorClass::Corruption);
+
+    let metrics = store.metrics();
+    assert_eq!(metrics.verification.attempts, 3);
+    assert_eq!(metrics.verification.succeeded, 1);
+    assert_eq!(metrics.verification.cancelled, 1);
+    assert_eq!(metrics.verification.failed, 1);
+    assert_eq!(metrics.verification_corruption_failures, 1);
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     let dir = tmp("lifecycle-metrics");
     {
