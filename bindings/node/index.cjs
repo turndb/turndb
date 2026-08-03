@@ -72,11 +72,16 @@ function guarded(fn, operation) {
       });
     }
     let lifecycleOptions;
-    if (['compact', 'compactBounded', 'erase', 'backup', 'recoverManifest'].includes(operation)) {
+    if ([
+      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup',
+      'recoverManifest',
+    ].includes(operation)) {
       lifecycleOptions = args[1];
     } else if (['restoreBackup', 'querySql'].includes(operation)) {
       lifecycleOptions = args[2];
-    } else if (['sync', 'flush', 'verify', 'punch', 'refold'].includes(operation)) {
+    } else if ([
+      'sync', 'flush', 'verify', 'punch', 'refold', 'estimateRefoldSpace', 'spaceUsage',
+    ].includes(operation)) {
       lifecycleOptions = args[0];
     }
     if (lifecycleOptions?.signal?.aborted) {
@@ -98,8 +103,9 @@ function guarded(fn, operation) {
 for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSqlQuery].filter(Boolean)) {
   for (const name of [
     'write', 'sync', 'flush', 'scan', 'explainScan', 'readContent', 'snapshot',
-    'querySql', 'next', 'stats', 'compact', 'compactBounded', 'verify', 'erase', 'punch', 'refold',
-    'backup', 'health', 'schema', 'close',
+    'querySql', 'next', 'stats', 'compact', 'compactBounded', 'estimateCompactionSpace',
+    'verify', 'erase', 'punch', 'refold', 'estimateRefoldSpace',
+    'backup', 'health', 'spaceUsage', 'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
       Class.prototype[name] = guarded(Class.prototype[name], name);

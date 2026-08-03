@@ -8,8 +8,8 @@
 mod actor;
 
 use actor::{
-    Actor, ActorFault, BoundedCompactResult, CompactResult, OwnedContent, VerifyResult, WriteOp,
-    DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
+    Actor, ActorFault, BoundedCompactResult, CompactResult, CompactionSpaceResult, OwnedContent,
+    RefoldSpaceResult, VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
 };
 use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
 use napi::{Env, Error, Result, Status};
@@ -296,6 +296,8 @@ pub struct NativeCapabilities {
     pub command_queue_capacity: u32,
     pub command_queue_capacity_max: u32,
     pub write_admission_limits: bool,
+    pub store_space_usage: bool,
+    pub allocated_space_usage: bool,
     pub max_record_bytes_default: BigInt,
     pub max_batch_bytes_default: BigInt,
     pub max_batch_records_default: u32,
@@ -347,6 +349,8 @@ pub fn capabilities() -> NativeCapabilities {
         command_queue_capacity: DEFAULT_QUEUE_CAPACITY as u32,
         command_queue_capacity_max: MAX_QUEUE_CAPACITY as u32,
         write_admission_limits: c.write_admission_limits,
+        store_space_usage: c.store_space_usage,
+        allocated_space_usage: c.allocated_space_usage,
         max_record_bytes_default: BigInt::from(c.max_record_bytes_default),
         max_batch_bytes_default: BigInt::from(c.max_batch_bytes_default),
         max_batch_records_default: c.max_batch_records_default as u32,
@@ -441,6 +445,41 @@ pub struct NativeCompactionPlan {
     pub input_rows: BigInt,
     pub input_bytes: BigInt,
     pub drops_tombstones: bool,
+}
+
+#[napi(object)]
+pub struct NativeCompactionSpaceEstimate {
+    pub plan: NativeCompactionPlan,
+    pub input_sections: BigInt,
+    pub input_raw_section_bytes: BigInt,
+    pub estimated_stage_bytes: BigInt,
+    pub estimate_is_hard_bound: bool,
+    pub retained_input_bytes_after_commit: BigInt,
+    pub filesystem_available_bytes: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct NativeCompactionSpaceResult {
+    pub flushed: bool,
+    pub estimate: Option<NativeCompactionSpaceEstimate>,
+}
+
+#[napi(object)]
+pub struct NativeRefoldSpaceEstimate {
+    pub source_fold_logical_bytes: BigInt,
+    pub source_part_bytes: BigInt,
+    pub source_part_sections: BigInt,
+    pub source_part_raw_section_bytes: BigInt,
+    pub retained_only_bytes_before: BigInt,
+    pub estimated_stage_bytes: BigInt,
+    pub estimate_is_hard_bound: bool,
+    pub filesystem_available_bytes: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct NativeRefoldSpaceResult {
+    pub flushed: bool,
+    pub estimate: Option<NativeRefoldSpaceEstimate>,
 }
 
 #[napi(object)]
@@ -541,6 +580,22 @@ pub struct NativeHealth {
     pub dedup_window_entries: BigInt,
     pub retained_commits: BigInt,
     pub punched_blocks: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeSpaceAmount {
+    pub files: BigInt,
+    pub logical_bytes: BigInt,
+    pub allocated_bytes: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct NativeStoreSpaceUsage {
+    pub live: NativeSpaceAmount,
+    pub retained_only: NativeSpaceAmount,
+    pub unclassified: NativeSpaceAmount,
+    pub total: NativeSpaceAmount,
+    pub filesystem_available_bytes: Option<BigInt>,
 }
 
 #[napi(object)]
@@ -1242,6 +1297,26 @@ impl NativeStore {
         })
     }
 
+    /// Settle earlier writes and estimate temporary space for the selected compaction plan.
+    #[napi]
+    pub fn estimate_compaction_space<'env>(
+        &self,
+        env: &'env Env,
+        budget: NativeCompactionBudget,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeCompactionSpaceResult>> {
+        let budget = decode_compaction_budget(budget)?;
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .estimate_compaction_space(budget, control)
+                .await
+                .map(encode_compaction_space)
+                .map_err(|error| engine_failure("estimate TurnDB compaction space", error))
+        })
+    }
+
     /// Settle earlier writes, then verify manifest pins, every part section, and every fold frame.
     #[napi]
     pub fn verify<'env>(
@@ -1349,6 +1424,24 @@ impl NativeStore {
         })
     }
 
+    /// Settle earlier writes and estimate duplicate-generation space for refold.
+    #[napi]
+    pub fn estimate_refold_space<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeRefoldSpaceResult>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .estimate_refold_space(control)
+                .await
+                .map(encode_refold_space)
+                .map_err(|error| engine_failure("estimate TurnDB refold space", error))
+        })
+    }
+
     /// Return cheap operational counters without decoding records or content.
     #[napi]
     pub async fn health(&self) -> Result<NativeHealth> {
@@ -1357,6 +1450,24 @@ impl NativeStore {
             .await
             .map(encode_health)
             .map_err(|error| engine_failure("read TurnDB health", error))
+    }
+
+    /// Traverse and classify store files for maintenance-space preflight.
+    #[napi]
+    pub fn space_usage<'env>(
+        &self,
+        env: &'env Env,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeStoreSpaceUsage>> {
+        let actor = self.actor.clone();
+        let control = decode_lifecycle(options);
+        env.spawn_future(async move {
+            actor
+                .space_usage(control)
+                .await
+                .map(encode_space_usage)
+                .map_err(|error| engine_failure("measure TurnDB store space", error))
+        })
     }
 
     /// Discover the part field universe plus accepted writer-memtable fields.
@@ -2099,16 +2210,37 @@ fn encode_compact(result: CompactResult) -> NativeCompactResult {
     }
 }
 
+fn encode_compaction_plan(plan: turndb::store::CompactionPlan) -> NativeCompactionPlan {
+    NativeCompactionPlan {
+        start_part: BigInt::from(plan.start_part as u64),
+        input_parts: BigInt::from(plan.input_parts as u64),
+        input_rows: BigInt::from(plan.input_rows),
+        input_bytes: BigInt::from(plan.input_bytes),
+        drops_tombstones: plan.drops_tombstones,
+    }
+}
+
+fn encode_compaction_space(result: CompactionSpaceResult) -> NativeCompactionSpaceResult {
+    NativeCompactionSpaceResult {
+        flushed: result.flushed,
+        estimate: result.estimate.map(|estimate| NativeCompactionSpaceEstimate {
+            plan: encode_compaction_plan(estimate.plan),
+            input_sections: BigInt::from(estimate.input_sections as u64),
+            input_raw_section_bytes: BigInt::from(estimate.input_raw_section_bytes),
+            estimated_stage_bytes: BigInt::from(estimate.estimated_stage_bytes),
+            estimate_is_hard_bound: estimate.estimate_is_hard_bound,
+            retained_input_bytes_after_commit: BigInt::from(
+                estimate.retained_input_bytes_after_commit,
+            ),
+            filesystem_available_bytes: estimate.filesystem_available_bytes.map(BigInt::from),
+        }),
+    }
+}
+
 fn encode_bounded_compact(result: BoundedCompactResult) -> NativeBoundedCompactResult {
     let (plan, output_bytes, merge) = match result.compaction {
         Some(compaction) => (
-            Some(NativeCompactionPlan {
-                start_part: BigInt::from(compaction.plan.start_part as u64),
-                input_parts: BigInt::from(compaction.plan.input_parts as u64),
-                input_rows: BigInt::from(compaction.plan.input_rows),
-                input_bytes: BigInt::from(compaction.plan.input_bytes),
-                drops_tombstones: compaction.plan.drops_tombstones,
-            }),
+            Some(encode_compaction_plan(compaction.plan)),
             Some(BigInt::from(compaction.output_bytes)),
             Some(encode_merge(compaction.merge)),
         ),
@@ -2154,6 +2286,22 @@ fn encode_refold(stats: turndb::store::refold::RefoldStats) -> NativeRefoldResul
     }
 }
 
+fn encode_refold_space(result: RefoldSpaceResult) -> NativeRefoldSpaceResult {
+    NativeRefoldSpaceResult {
+        flushed: result.flushed,
+        estimate: result.estimate.map(|estimate| NativeRefoldSpaceEstimate {
+            source_fold_logical_bytes: BigInt::from(estimate.source_fold_logical_bytes),
+            source_part_bytes: BigInt::from(estimate.source_part_bytes),
+            source_part_sections: BigInt::from(estimate.source_part_sections as u64),
+            source_part_raw_section_bytes: BigInt::from(estimate.source_part_raw_section_bytes),
+            retained_only_bytes_before: BigInt::from(estimate.retained_only_bytes_before),
+            estimated_stage_bytes: BigInt::from(estimate.estimated_stage_bytes),
+            estimate_is_hard_bound: estimate.estimate_is_hard_bound,
+            filesystem_available_bytes: estimate.filesystem_available_bytes.map(BigInt::from),
+        }),
+    }
+}
+
 fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
     NativeHealth {
         commit: BigInt::from(health.commit),
@@ -2172,6 +2320,24 @@ fn encode_health(health: turndb::store::StoreHealth) -> NativeHealth {
         dedup_window_entries: BigInt::from(health.dedup_window_entries as u64),
         retained_commits: BigInt::from(health.retained_commits as u64),
         punched_blocks: BigInt::from(health.punched_blocks),
+    }
+}
+
+fn encode_space_amount(amount: turndb::store::SpaceAmount) -> NativeSpaceAmount {
+    NativeSpaceAmount {
+        files: BigInt::from(amount.files as u64),
+        logical_bytes: BigInt::from(amount.logical_bytes),
+        allocated_bytes: amount.allocated_bytes.map(BigInt::from),
+    }
+}
+
+fn encode_space_usage(usage: turndb::store::StoreSpaceUsage) -> NativeStoreSpaceUsage {
+    NativeStoreSpaceUsage {
+        live: encode_space_amount(usage.live),
+        retained_only: encode_space_amount(usage.retained_only),
+        unclassified: encode_space_amount(usage.unclassified),
+        total: encode_space_amount(usage.total),
+        filesystem_available_bytes: usage.filesystem_available_bytes.map(BigInt::from),
     }
 }
 

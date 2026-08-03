@@ -39,6 +39,8 @@ pub struct Capabilities {
     pub sql: bool,
     pub portable_wasm: bool,
     pub write_admission_limits: bool,
+    pub store_space_usage: bool,
+    pub allocated_space_usage: bool,
     pub max_record_bytes_default: u64,
     pub max_batch_bytes_default: u64,
     pub max_batch_records_default: usize,
@@ -66,6 +68,8 @@ pub const fn capabilities() -> Capabilities {
         sql: cfg!(feature = "sql"),
         portable_wasm: cfg!(target_arch = "wasm32"),
         write_admission_limits: true,
+        store_space_usage: true,
+        allocated_space_usage: cfg!(unix),
         max_record_bytes_default: crate::store::DEFAULT_MAX_RECORD_BYTES,
         max_batch_bytes_default: crate::store::DEFAULT_MAX_BATCH_BYTES,
         max_batch_records_default: crate::store::DEFAULT_MAX_BATCH_RECORDS,
@@ -83,5 +87,7 @@ mod tests {
         assert_eq!(c.part_format_write, crate::part::PART_VERSION);
         assert!(!c.sql || c.columnar, "SQL is an adapter over the columnar lens");
         assert_eq!(c.portable_wasm, cfg!(target_arch = "wasm32"));
+        assert!(c.store_space_usage);
+        assert_eq!(c.allocated_space_usage, cfg!(unix));
     }
 }

@@ -33,6 +33,8 @@ test('reports the native capability profile without a portable fallback', () => 
     commandQueueCapacity: 64,
     commandQueueCapacityMax: 65536,
     writeAdmissionLimits: true,
+    storeSpaceUsage: true,
+    allocatedSpaceUsage: process.platform !== 'win32',
     maxRecordBytesDefault: 67108864n,
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
@@ -847,6 +849,14 @@ test('runs compaction verification and physical erasure through the actor', asyn
   const punched = await store.punch();
   assert.equal(typeof punched.blocksExamined, 'bigint');
   assert.equal(typeof punched.blocksPunched, 'bigint');
+  const refoldPreflight = await store.estimateRefoldSpace();
+  assert.equal(refoldPreflight.flushed, false);
+  assert(refoldPreflight.estimate.sourceFoldLogicalBytes > 0n);
+  assert(refoldPreflight.estimate.sourcePartBytes > 0n);
+  assert(refoldPreflight.estimate.sourcePartSections > 0n);
+  assert(refoldPreflight.estimate.sourcePartRawSectionBytes > 0n);
+  assert.equal(refoldPreflight.estimate.estimateIsHardBound, false);
+  assert.equal(typeof refoldPreflight.estimate.filesystemAvailableBytes, 'bigint');
   const refolded = await store.refold();
   assert.equal(refolded.recordsKept, 2n);
   assert.equal(typeof refolded.bytesReclaimed, 'bigint');
@@ -867,11 +877,24 @@ test('compacts one exact bounded work unit and classifies budgets for schedulers
     await store.flush();
   }
 
-  const result = await store.compactBounded({
+  const budget = {
     maxInputParts: 2,
     maxInputRows: 2n,
     maxInputBytes: 1n << 40n,
-  });
+  };
+  const preflight = await store.estimateCompactionSpace(budget);
+  assert.equal(preflight.flushed, false);
+  assert(preflight.estimate.inputSections > 0n);
+  assert(preflight.estimate.inputRawSectionBytes > 0n);
+  assert(preflight.estimate.estimatedStageBytes > preflight.estimate.inputRawSectionBytes);
+  assert.equal(preflight.estimate.estimateIsHardBound, false);
+  assert.equal(
+    preflight.estimate.retainedInputBytesAfterCommit,
+    preflight.estimate.plan.inputBytes,
+  );
+  assert.equal(typeof preflight.estimate.filesystemAvailableBytes, 'bigint');
+
+  const result = await store.compactBounded(budget);
   assert.equal(result.partsBefore, 3n);
   assert.equal(result.partsAfter, 2n);
   assert.deepEqual(result.plan, {
@@ -883,6 +906,7 @@ test('compacts one exact bounded work unit and classifies budgets for schedulers
   });
   assert(result.plan.inputBytes > 0n);
   assert(result.outputBytes > 0n);
+  assert(result.outputBytes <= preflight.estimate.estimatedStageBytes);
   assert.equal(result.merge.inputs, 2n);
 
   await assert.rejects(
@@ -984,7 +1008,8 @@ test('classifies verified persisted-byte damage as corruption', async (t) => {
 });
 
 test('reports cheap health across staging and publication', async (t) => {
-  const store = await NativeStore.open(temporaryStore(t));
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
   t.after(async () => {
     try { await store.close(); } catch {}
   });
@@ -1015,6 +1040,36 @@ test('reports cheap health across staging and publication', async (t) => {
   assert.equal(published.retainedCommits, 1n);
   assert.equal(typeof published.foldCacheHits, 'bigint');
   assert.equal(typeof published.partCacheBudget, 'bigint');
+
+  fs.writeFileSync(path.join(dir, 'operator-note'), 'not owned by TurnDB');
+  const space = await store.spaceUsage();
+  assert(space.live.files > 0n);
+  assert(space.retainedOnly.files > 0n);
+  assert(space.unclassified.logicalBytes >= BigInt(Buffer.byteLength('not owned by TurnDB')));
+  assert.equal(
+    space.total.files,
+    space.live.files + space.retainedOnly.files + space.unclassified.files,
+  );
+  assert.equal(
+    space.total.logicalBytes,
+    space.live.logicalBytes
+      + space.retainedOnly.logicalBytes
+      + space.unclassified.logicalBytes,
+  );
+  if (capabilities().allocatedSpaceUsage) {
+    assert.equal(typeof space.total.allocatedBytes, 'bigint');
+    assert.equal(typeof space.filesystemAvailableBytes, 'bigint');
+  } else {
+    assert.equal(space.total.allocatedBytes, undefined);
+    assert.equal(space.filesystemAvailableBytes, undefined);
+  }
+
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(
+    store.spaceUsage({ signal: cancelled.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
 });
 
 test('discovers typed field and content namespaces without reading values', async (t) => {

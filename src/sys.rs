@@ -25,6 +25,41 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+/// Physical bytes currently allocated to a regular file, where the platform exposes that fact.
+///
+/// Logical length is not a substitute: punched fold blocks remain inside the file's length while
+/// consuming no blocks. `None` is an explicit capability absence rather than a fabricated value.
+#[cfg(unix)]
+pub(crate) fn allocated_bytes(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().checked_mul(512)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn allocated_bytes(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Bytes available to the current user on the filesystem containing `path`.
+#[cfg(unix)]
+pub(crate) fn filesystem_available_bytes(path: &Path) -> io::Result<Option<u64>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.checked_mul(stats.f_frsize))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn filesystem_available_bytes(_path: &Path) -> io::Result<Option<u64>> {
+    Ok(None)
+}
+
 // ── Positioned I/O ──────────────────────────────────────────────────────────
 //
 // The same `pread`/`pwrite` on both platforms. Unix reaches them through the stable `FileExt`;

@@ -441,7 +441,8 @@ through years of writes, deletes, crashes, upgrades, and changing retention deci
 
 - Bounded incremental compaction with a measurable work budget. **Implemented:** one work unit is
   bounded by exact physical input parts, rows, and file bytes, with controlled cancellation and
-  Rust/Node result evidence. Temporary-space preflight remains separate work below.
+  Rust/Node result evidence. Reachability-aware inventory and advisory operation preflight now expose
+  exact source/retention facts without pretending output compression is a hard space guarantee.
 - Explicit full compaction for controlled maintenance windows.
 - Physical erasure of unreferenced content.
 - Refold fallback where hole punching is unsupported.
@@ -452,6 +453,8 @@ through years of writes, deletes, crashes, upgrades, and changing retention deci
 - Corruption localization by WAL frame, manifest, part, section, fold block, and content object.
 - Recovery behavior that refuses ambiguity rather than silently discarding data.
 - Disk-space estimation before maintenance operations that may temporarily duplicate data.
+  **Implemented for compaction and refold:** Rust and Node report exact source facts, retained-only
+  pinning, filesystem availability where supported, and estimates explicitly marked as non-binding.
 - Format migration tooling with resumability and preflight checks.
 - Generic deletion and erasure primitives that accept records selected by the consumer. TurnDB may
   execute a retention decision, but it should not invent the consumer's retention policy.

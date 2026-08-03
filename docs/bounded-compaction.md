@@ -77,9 +77,10 @@ The capability profile reports `boundedCompaction: true`. A consumer can impleme
 load-aware, or disk-pressure-aware scheduling above this primitive. TurnDB intentionally does not
 choose that policy or attach OpenTelemetry, trace, tenant, or retention semantics to it.
 
-## Known limit
+## Space preflight
 
-The input-byte limit is exact and useful, but it is not yet a preflight temporary-space guarantee.
-A future lifecycle slice should estimate output and retained-snapshot pinning before maintenance that
-may temporarily duplicate metadata. Until then, an operator must leave disk headroom beyond the
-input budget, especially when manifest retention keeps replaced inputs alive.
+`Store::estimate_compaction_space` and Node `estimateCompactionSpace` expose the exact selected
+input plan, compressed and raw section bytes, retained-snapshot pinning, and filesystem availability.
+They also report an explicitly advisory stage estimate; compression and rebuilt index layout prevent
+it from being a hard admission bound. See [maintenance space accounting and preflight](maintenance-space.md)
+for the inventory categories, estimate basis, and consumer policy boundary.

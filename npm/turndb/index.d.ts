@@ -103,6 +103,8 @@ export interface Capabilities {
   sql: boolean;
   portable_wasm: boolean;
   write_admission_limits: true;
+  store_space_usage: true;
+  allocated_space_usage: boolean;
   max_record_bytes_default: number;
   max_batch_bytes_default: number;
   max_batch_records_default: number;

@@ -127,6 +127,9 @@ preserving each operation's publication and restart invariants; see
 Incremental compaction accepts simultaneous exact physical input-part, row, and file-byte limits,
 reports the executed plan and output bytes, and refuses rather than exceeding an insufficient budget;
 see [bounded incremental compaction](docs/bounded-compaction.md).
+Reachability-aware storage inventory separates live, retained-only, and unclassified files, while
+compaction and refold expose exact source facts plus explicitly advisory staging estimates; see
+[maintenance space accounting and preflight](docs/maintenance-space.md).
 
 With `sql` enabled, `query::sql::SqlQuery` runs positional-parameter SQL against the generic
 `records` table under a configurable DataFusion execution-memory ceiling. DDL, DML, and session

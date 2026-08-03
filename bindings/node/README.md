@@ -117,6 +117,12 @@ silently.
   and merge statistics; an insufficient budget is `RESOURCE_EXHAUSTED`, never an implicit overrun.
   Only a total-live-list step drops tombstones. See
   [bounded incremental compaction](../../docs/bounded-compaction.md).
+- `spaceUsage(options)` classifies every regular store file exactly once as live, retained-only, or
+  unclassified, with logical bytes everywhere and allocated/free bytes where the platform can prove
+  them. `estimateCompactionSpace(budget, options)` and `estimateRefoldSpace(options)` add exact source
+  facts and explicitly non-binding stage estimates. TurnDB supplies evidence; the embedding
+  application chooses admission and reserve policy. See
+  [maintenance space accounting and preflight](../../docs/maintenance-space.md).
 - `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
   content, and purges retained manifests so this store has no snapshot path back to the erased rows.
   It accepts cancellation during read-only planning, then deliberately defers it once tombstones are

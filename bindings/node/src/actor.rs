@@ -35,6 +35,16 @@ pub(crate) struct BoundedCompactResult {
     pub compaction: Option<BoundedCompaction>,
 }
 
+pub(crate) struct CompactionSpaceResult {
+    pub flushed: bool,
+    pub estimate: Option<turndb::store::CompactionSpaceEstimate>,
+}
+
+pub(crate) struct RefoldSpaceResult {
+    pub flushed: bool,
+    pub estimate: Option<turndb::store::RefoldSpaceEstimate>,
+}
+
 pub(crate) struct VerifyResult {
     pub chain: ChainReport,
     pub fold: turndb::fold::FoldScrub,
@@ -121,6 +131,11 @@ enum Command {
         control: OperationControl,
         reply: oneshot::Sender<Result<BoundedCompactResult>>,
     },
+    EstimateCompactionSpace {
+        budget: CompactionBudget,
+        control: OperationControl,
+        reply: oneshot::Sender<Result<CompactionSpaceResult>>,
+    },
     Verify {
         control: OperationControl,
         reply: oneshot::Sender<Result<VerifyResult>>,
@@ -143,8 +158,16 @@ enum Command {
         control: OperationControl,
         reply: oneshot::Sender<Result<turndb::store::refold::RefoldStats>>,
     },
+    EstimateRefoldSpace {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<RefoldSpaceResult>>,
+    },
     Health {
         reply: oneshot::Sender<Result<turndb::store::StoreHealth>>,
+    },
+    SpaceUsage {
+        control: OperationControl,
+        reply: oneshot::Sender<Result<turndb::store::StoreSpaceUsage>>,
     },
     Schema {
         reply: oneshot::Sender<Result<turndb::schema::Schema>>,
@@ -278,6 +301,19 @@ impl Actor {
             .await
     }
 
+    pub async fn estimate_compaction_space(
+        &self,
+        budget: CompactionBudget,
+        control: OperationControl,
+    ) -> Result<CompactionSpaceResult> {
+        Self::receive(self.submit(|reply| Command::EstimateCompactionSpace {
+            budget,
+            control,
+            reply,
+        })?)
+        .await
+    }
+
     pub async fn verify(&self, control: OperationControl) -> Result<VerifyResult> {
         Self::receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
@@ -305,8 +341,22 @@ impl Actor {
         Self::receive(self.submit(|reply| Command::Refold { control, reply })?).await
     }
 
+    pub async fn estimate_refold_space(
+        &self,
+        control: OperationControl,
+    ) -> Result<RefoldSpaceResult> {
+        Self::receive(self.submit(|reply| Command::EstimateRefoldSpace { control, reply })?).await
+    }
+
     pub async fn health(&self) -> Result<turndb::store::StoreHealth> {
         Self::receive(self.submit(|reply| Command::Health { reply })?).await
+    }
+
+    pub async fn space_usage(
+        &self,
+        control: OperationControl,
+    ) -> Result<turndb::store::StoreSpaceUsage> {
+        Self::receive(self.submit(|reply| Command::SpaceUsage { control, reply })?).await
     }
 
     pub async fn schema(&self) -> Result<turndb::schema::Schema> {
@@ -378,6 +428,10 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = compact_bounded(&mut store, budget, &control);
                 let _ = reply.send(result);
             }
+            Command::EstimateCompactionSpace { budget, control, reply } => {
+                let result = estimate_compaction_space(&mut store, budget, &control);
+                let _ = reply.send(result);
+            }
             Command::Verify { control, reply } => {
                 let result = verify(&mut store, path, &control);
                 let _ = reply.send(result);
@@ -394,7 +448,7 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = control
                     .check("content punching")
                     .map_err(anyhow::Error::from)
-                    .and_then(|_| settle(&mut store))
+                    .and_then(|_| settle(&mut store, &control))
                     .and_then(|_| store.punch_unreferenced_with_control(&control));
                 let _ = reply.send(result);
             }
@@ -402,12 +456,19 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = control
                     .check("content refold")
                     .map_err(anyhow::Error::from)
-                    .and_then(|_| settle(&mut store))
+                    .and_then(|_| settle(&mut store, &control))
                     .and_then(|_| store.refold_with_control(&control));
+                let _ = reply.send(result);
+            }
+            Command::EstimateRefoldSpace { control, reply } => {
+                let result = estimate_refold_space(&mut store, &control);
                 let _ = reply.send(result);
             }
             Command::Health { reply } => {
                 let _ = reply.send(Ok(store.health()));
+            }
+            Command::SpaceUsage { control, reply } => {
+                let _ = reply.send(store.space_usage_with_control(&control));
             }
             Command::Schema { reply } => {
                 let _ = reply.send(store.schema());
@@ -451,14 +512,14 @@ fn apply(store: &mut Store, ops: Vec<WriteOp>, durable: bool) -> Result<()> {
     Ok(())
 }
 
-fn settle(store: &mut Store) -> Result<bool> {
-    store.sync()?;
-    Ok(store.flush()?.is_some())
+fn settle(store: &mut Store, control: &OperationControl) -> Result<bool> {
+    store.sync_with_control(control)?;
+    Ok(store.flush_with_control(control)?.is_some())
 }
 
 fn compact(store: &mut Store, full: bool, control: &OperationControl) -> Result<CompactResult> {
     control.check("part compaction")?;
-    let flushed = settle(store)?;
+    let flushed = settle(store, control)?;
     control.check("part compaction")?;
     let parts_before = store.part_count();
     let merge = if full {
@@ -475,18 +536,41 @@ fn compact_bounded(
     control: &OperationControl,
 ) -> Result<BoundedCompactResult> {
     control.check("bounded compaction")?;
-    let flushed = settle(store)?;
+    let flushed = settle(store, control)?;
     control.check("bounded compaction")?;
     let parts_before = store.part_count();
     let compaction = store.compact_bounded_with_control(budget, control)?;
     Ok(BoundedCompactResult { flushed, parts_before, parts_after: store.part_count(), compaction })
 }
 
+fn estimate_compaction_space(
+    store: &mut Store,
+    budget: CompactionBudget,
+    control: &OperationControl,
+) -> Result<CompactionSpaceResult> {
+    control.check("compaction space preflight")?;
+    let flushed = settle(store, control)?;
+    control.check("compaction space preflight")?;
+    let estimate = store.estimate_compaction_space_with_control(budget, control)?;
+    Ok(CompactionSpaceResult { flushed, estimate })
+}
+
+fn estimate_refold_space(
+    store: &mut Store,
+    control: &OperationControl,
+) -> Result<RefoldSpaceResult> {
+    control.check("refold space preflight")?;
+    let flushed = settle(store, control)?;
+    control.check("refold space preflight")?;
+    let estimate = store.estimate_refold_space_with_control(control)?;
+    Ok(RefoldSpaceResult { flushed, estimate })
+}
+
 fn verify(store: &mut Store, path: &Path, control: &OperationControl) -> Result<VerifyResult> {
     // Settling makes the report cover every operation accepted before this command, and actor
     // serialization prevents a new manifest from racing the chain walk.
     control.check("store verification")?;
-    settle(store)?;
+    settle(store, control)?;
     control.check("store verification")?;
     let chain = integrity(
         "verify retained manifest chain",
