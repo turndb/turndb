@@ -174,10 +174,12 @@ remaining production gaps.
 
 It also builds for **`wasm32-wasip1`**, which is what the [`turndb` npm package](npm/turndb)
 ships: one `.wasm`, no native addon, no prebuild matrix, no postinstall. A store written by either
-build is readable by the other, byte for byte. That target gives up three things, and the first is
-the one that matters: **no advisory locking** (see above), no `punch` (`refold` reclaims the same
-space by rewriting), and no threads, so compression runs inline. `src/sys.rs` is the single place
-that states what turndb needs from an operating system and what happens where it isn't there.
+build is readable by the other, byte for byte; the two-way executable proof is documented under
+[cross-runtime compatibility](docs/cross-runtime-compatibility.md). That target gives up three things,
+and the first is the one that matters: **no advisory locking** (see above), no `punch` (`refold`
+reclaims the same space by rewriting), and no threads, so compression runs inline. `src/sys.rs` is
+the single place that states what turndb needs from an operating system and what happens where it
+isn't there.
 
 ## Testing
 
