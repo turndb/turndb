@@ -25,6 +25,10 @@ content model right before compatibility turns today's choices into permanent pr
   is now available through a feature-independent structured pager with checked Rust-owned cursors,
   exact typed predicates, bounded live-record examination, reverse paging, and opt-in named-content
   reconstruction. Pushing that API down into selected physical columns is the next query-core step.
+- The first Phase-3 native Node slice lives in `bindings/node`: a stable N-API 6 addon, one bounded
+  Rust store actor per writer, Promise operations, atomic batches with explicit durability, native
+  buffers and bigint, the Rust structured pager, explicit capability reporting, and no silent WASM
+  fallback. It is a source prototype, not yet a production prebuild matrix.
 
 ## Product boundary
 
@@ -273,6 +277,31 @@ The WASM interface should have an explicit package or entry point and a tested c
 production writer must never silently fall back from native OS locking to WASI's unenforced
 single-writer convention. The same applies to threads, hole punching, and any future platform
 facility.
+
+### Current prototype evidence
+
+The first native slice implements open, atomic ordered write/delete batches, sync, flush, structured
+scan, named-content reconstruction, and close. One dedicated Rust thread owns the writer; a bounded
+64-command queue refuses overload rather than accumulating unbounded Promises. Node integration tests
+load the addon and cover exact `i64::MIN` bigint, NaN, ordered duplicate attributes, named and empty
+content, projection, predicates, paging/cursor misuse, deletion, and close refusal.
+
+Measured on Linux x86-64 from the 2026-08-02 tree with the workspace release profile and GNU `strip`:
+
+| native build | stripped addon | gzip -9 |
+|---|---:|---:|
+| structured core, no Arrow/DataFusion | 2,947,024 bytes | 1,211,755 bytes |
+| compiled with `turndb-node/sql` | 7,818,112 bytes | 3,181,197 bytes |
+
+The full feature build therefore adds 4,871,088 installed bytes and 1,969,442 gzip bytes on this
+host. This measurement does **not** prove a SQL API—the prototype does not expose one yet—and does
+not include npm metadata or per-platform duplication. It does show that keeping the structured core
+profile is useful while the additional query-engine dependency is affordable when its capabilities
+are actually exposed.
+
+Remaining Phase-3 gaps are prebuilt platform artifacts, immutable read handles, Arrow IPC and SQL,
+cancellation/deadlines, configurable queue limits, structured error codes, lifecycle maintenance,
+and measured event-loop/query overhead under a representative mixed workload.
 
 ### Maturity gate
 
