@@ -685,8 +685,20 @@ test('recovers only a fully validated retained manifest under writer exclusion',
     const bytes = Buffer.from(fs.readFileSync(manifestPath));
     bytes[10] ^= 0xff;
     fs.writeFileSync(manifestPath, bytes);
+    return bytes;
   };
-  damageManifest();
+  const damagedManifest = damageManifest();
+  await assert.rejects(
+    recoverManifest(dir, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  const abort = new AbortController();
+  abort.abort();
+  await assert.rejects(
+    recoverManifest(dir, { signal: abort.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  assert.deepEqual(fs.readFileSync(manifestPath), damagedManifest);
   const report = await recoverManifest(dir);
   assert.equal(report.rollbackCommits, 0n);
   assert.equal(report.records, 1n);

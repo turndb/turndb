@@ -75,7 +75,9 @@ function guarded(fn, operation) {
       ? args[1]
       : operation === 'restoreBackup'
         ? args[2]
-        : ['verify', 'punch', 'refold'].includes(operation)
+        : operation === 'recoverManifest'
+          ? args[1]
+          : ['verify', 'punch', 'refold'].includes(operation)
           ? args[0]
           : undefined;
     if (lifecycleOptions?.signal?.aborted) {
@@ -126,6 +128,6 @@ module.exports = {
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
   restoreBackup: guarded(native.restoreBackup, 'restoreBackup'),
-  recoverManifest: guarded(native.recoverManifest),
+  recoverManifest: guarded(native.recoverManifest, 'recoverManifest'),
   TurnDbError,
 };

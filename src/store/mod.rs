@@ -1009,7 +1009,23 @@ pub fn recover_manifest(
     cfg: FoldCfg,
     options: RecoveryOptions,
 ) -> Result<RecoveryReport> {
-    let _locks = recovery_locks(dir)?;
+    recover_manifest_with_control(dir, cfg, options, &crate::control::OperationControl::default())
+}
+
+/// [`recover_manifest`] with cooperative cancellation before manifest promotion.
+///
+/// Candidate discovery and complete validation are read-only. The last cancellation checkpoint is
+/// immediately before `promote_manifest`; once promotion begins, its crash-safe protocol owns the
+/// outcome and recovery will not report cancellation after changing the live commit point.
+pub fn recover_manifest_with_control(
+    dir: &Path,
+    cfg: FoldCfg,
+    options: RecoveryOptions,
+    control: &crate::control::OperationControl,
+) -> Result<RecoveryReport> {
+    control.check("manifest recovery")?;
+    let _locks = recovery_locks(dir, control)?;
+    control.check("manifest recovery")?;
     if Manifest::load(dir).is_ok() {
         return Err(RecoveryError::Healthy(dir.to_path_buf()).into());
     }
@@ -1018,6 +1034,7 @@ pub fn recover_manifest(
     let mut examined = 0usize;
     let mut last_reason = "no retained manifests exist".to_string();
     for c in commits.into_iter().rev() {
+        control.check("manifest recovery validation")?;
         examined += 1;
         let manifest = match load_retained(dir, c) {
             Ok(manifest) => manifest,
@@ -1026,7 +1043,7 @@ pub fn recover_manifest(
                 continue;
             }
         };
-        match validate_recovery_candidate(dir, cfg, manifest) {
+        match validate_recovery_candidate(dir, cfg, manifest, control) {
             Ok(mut report) => {
                 let rollback_commits = newest.saturating_sub(c);
                 if rollback_commits > options.max_rollback_commits {
@@ -1037,23 +1054,32 @@ pub fn recover_manifest(
                     .into());
                 }
                 let bytes = std::fs::read(retained_path(dir, c))?;
+                // No cancellation checkpoint after this point. Promotion can change MANIFEST and
+                // prune newer retained manifests, so its actual outcome must be reported.
+                control.check("manifest recovery publication")?;
                 promote_manifest(dir, c, &bytes)?;
                 report.commit = c;
                 report.rollback_commits = rollback_commits;
                 return Ok(report);
             }
-            Err(error) => last_reason = error.to_string(),
+            Err(error) => {
+                if crate::error::classify(&error) == crate::error::ErrorClass::Cancelled {
+                    return Err(error);
+                }
+                last_reason = error.to_string();
+            }
         }
     }
     Err(RecoveryError::NoUsableCandidate { examined, reason: last_reason }.into())
 }
 
-fn recovery_locks(dir: &Path) -> Result<Vec<File>> {
+fn recovery_locks(dir: &Path, control: &crate::control::OperationControl) -> Result<Vec<File>> {
     let mut folds = Vec::new();
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("read store directory {} for recovery", dir.display()))?
         .flatten()
     {
+        control.check("manifest recovery locking")?;
         if entry.path().is_dir()
             && refold::parse_fold_gen(&entry.file_name().to_string_lossy()).is_some()
         {
@@ -1061,28 +1087,37 @@ fn recovery_locks(dir: &Path) -> Result<Vec<File>> {
         }
     }
     folds.sort();
-    folds.into_iter().map(|path| crate::fold::acquire_writer_lock(&path)).collect()
+    folds
+        .into_iter()
+        .map(|path| {
+            control.check("manifest recovery locking")?;
+            crate::fold::acquire_writer_lock(&path)
+        })
+        .collect()
 }
 
 fn validate_recovery_candidate(
     dir: &Path,
     cfg: FoldCfg,
     manifest: Manifest,
+    control: &crate::control::OperationControl,
 ) -> Result<RecoveryReport> {
+    control.check("manifest recovery validation")?;
     let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
     let mut fold = match manifest.fold_tail() {
         Some(tail) => Fold::open_read_at(&fold_dir, cfg, tail)?,
         None => Fold::open_read(&fold_dir, cfg)?,
     };
     fold.declare_punched(&manifest.punched);
-    let scrub = fold.scrub()?;
+    let scrub = fold.scrub_with_control(control)?;
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     let mut part_sections = 0usize;
     for part_ref in &manifest.parts {
+        control.check("manifest recovery validation")?;
         let path = dir.join(&part_ref.file);
         if let Some(want) = &part_ref.b3 {
-            let got = blake3::hash(&std::fs::read(&path)?).to_hex().to_string();
+            let got = hash_file_with_control(&path, control)?.to_hex().to_string();
             if &got != want {
                 bail!(
                     "candidate commit {} names part {} with the wrong digest",
@@ -1092,17 +1127,20 @@ fn validate_recovery_candidate(
             }
         }
         let part = Arc::new(Part::open_in(&path, pcache.clone())?);
-        part_sections += part.verify_sections()?;
+        part_sections += part.verify_sections_with_control(control)?;
         parts.push(part);
     }
     let reader = ReadStore { fold: Arc::new(fold), parts, manifest };
     let ids = reader.ids()?;
     let mut content_values = 0usize;
     for id in &ids {
+        control.check("manifest recovery validation")?;
         let record = reader.get(id)?.expect("ids returns visible records");
         for content in record.contents {
+            control.check("manifest recovery validation")?;
             let mut identity = blake3::Hasher::new();
             for op in content.ops {
+                control.check("manifest recovery validation")?;
                 match op {
                     BodyOp::Lit(bytes) => {
                         identity.update(&bytes);
@@ -1153,6 +1191,26 @@ fn validate_recovery_candidate(
         fold_bytes: scrub.bytes,
         ..RecoveryReport::default()
     })
+}
+
+fn hash_file_with_control(
+    path: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<blake3::Hash> {
+    use std::io::Read;
+
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        control.check("manifest recovery validation")?;
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize())
 }
 
 fn promote_manifest(dir: &Path, commit: u64, bytes: &[u8]) -> Result<()> {

@@ -711,7 +711,7 @@ impl Part {
         self.verify_sections_with_control(&crate::control::OperationControl::default())
     }
 
-    /// [`Part::verify_sections`] with a cooperative checkpoint before each section read.
+    /// [`Part::verify_sections`] with cooperative checkpoints during bounded section reads.
     pub fn verify_sections_with_control(
         &self,
         control: &crate::control::OperationControl,
@@ -722,9 +722,19 @@ impl Part {
         }
         for (name, s) in &self.toc {
             control.check("part verification")?;
-            let mut buf = vec![0u8; s.stored as usize];
-            self.f.read_exact_at(&mut buf, s.off)?;
-            let got = crc32fast::hash(&buf);
+            let mut remaining = u64::from(s.stored);
+            let mut offset = s.off;
+            let mut hasher = crc32fast::Hasher::new();
+            let mut buf = vec![0u8; (1 << 20).min(remaining.max(1) as usize)];
+            while remaining > 0 {
+                control.check("part verification")?;
+                let take = buf.len().min(remaining as usize);
+                self.f.read_exact_at(&mut buf[..take], offset)?;
+                hasher.update(&buf[..take]);
+                offset += take as u64;
+                remaining -= take as u64;
+            }
+            let got = hasher.finalize();
             if got != s.xsum {
                 bail!("section {name} fails its checksum ({got:#010x} != {:#010x})", s.xsum);
             }

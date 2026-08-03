@@ -67,9 +67,12 @@ content model right before compatibility turns today's choices into permanent pr
   every part, section, visible content program, piece identity, and available whole-value identity,
   and requires explicit authorization before abandoning a newer retained commit. Rust, CLI, and Node
   expose the same evidence report and typed refusal classes; the earlier parse-only promotion helper
-  is private to the narrowly recognizable first-commit crash window. A reusable core operation
-  control now gives compaction, verification, punching, and refold absolute deadlines plus shared
-  cancellation tokens. Node exposes queue-inclusive `timeoutMs`/`AbortSignal` options and a declared
+  is private to the narrowly recognizable first-commit crash window. Recovery candidate discovery,
+  bounded part hashing, fold/section scrubbing, and content validation now accept cooperative
+  cancellation and deadlines while manifest promotion remains the final uninterruptible boundary.
+  A reusable core operation control now gives compaction, verification, punching, refold, backup,
+  restore, and recovery absolute deadlines plus shared cancellation tokens. Node exposes
+  submission-inclusive `timeoutMs`/`AbortSignal` options and a declared
   capability. Cancellation removes unpublished compaction/refold artifacts, while punching records
   safe progress first and now correctly retries declared-but-unpunched blocks after cancellation or
   crash. Strong erasure stops only in its read-only planning phase and becomes intentionally
@@ -409,8 +412,8 @@ exposes SQL and Arrow IPC; the structured no-feature build remains useful for em
 explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
 profile rather than misreporting the ordinary release artifact.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for offline recovery,
-SQL planning, sync, and flush (batch pulls and major maintenance loops are
+Remaining Phase-3 gaps are prebuilt platform artifacts; cancellation/deadlines for SQL planning,
+sync, and flush (batch pulls and major maintenance loops are
 cancellable); typed corruption/invariant markers for low-level paths that still conservatively
 classify as `INTERNAL`; and measured event-loop/query overhead under a representative mixed workload.
 

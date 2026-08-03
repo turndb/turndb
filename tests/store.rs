@@ -999,6 +999,18 @@ fn a_corrupt_manifest_recovers_from_the_commit_log() {
     std::fs::write(&man, &b).unwrap();
 
     assert!(Store::open(&dir, cfg()).is_err(), "a corrupt manifest must refuse, not open empty");
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = turndb::store::recover_manifest_with_control(
+        &dir,
+        cfg(),
+        turndb::store::RecoveryOptions::default(),
+        &turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) },
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    assert_eq!(std::fs::read(&man).unwrap(), b, "cancelled recovery promoted a manifest");
+
     let recovered =
         turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
             .unwrap();

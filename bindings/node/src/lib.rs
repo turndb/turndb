@@ -470,9 +470,12 @@ pub struct NativeBackupResult {
     pub commit: BigInt,
 }
 
-#[napi(object)]
+#[napi(object, object_to_js = false)]
 pub struct NativeRecoveryOptions {
     pub max_rollback_commits: Option<BigInt>,
+    /// Milliseconds from submission; worker-scheduling time is included.
+    pub timeout_ms: Option<u32>,
+    pub signal: Option<AbortSignal>,
 }
 
 #[napi(object)]
@@ -964,39 +967,52 @@ pub fn restore_backup<'env>(
 
 /// Exclusively validate and promote a retained manifest over a damaged live commit point.
 #[napi]
-pub async fn recover_manifest(
+pub fn recover_manifest<'env>(
+    env: &'env Env,
     path: String,
     options: Option<NativeRecoveryOptions>,
-) -> Result<NativeRecoveryResult> {
+) -> Result<PromiseRaw<'env, NativeRecoveryResult>> {
     if path.is_empty() {
         return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
     }
-    let max_rollback_commits = options
-        .and_then(|options| options.max_rollback_commits)
-        .map(|value| decode_u64(value, "maxRollbackCommits"))
-        .transpose()?
-        .unwrap_or(0);
-    napi::tokio::task::spawn_blocking(move || {
-        turndb::store::recover_manifest(
-            &PathBuf::from(path),
-            FoldCfg::default(),
-            turndb::store::RecoveryOptions { max_rollback_commits },
-        )
+    let (max_rollback_commits, control) = match options {
+        Some(options) => (
+            options
+                .max_rollback_commits
+                .map(|value| decode_u64(value, "maxRollbackCommits"))
+                .transpose()?
+                .unwrap_or(0),
+            decode_lifecycle(Some(NativeLifecycleOptions {
+                timeout_ms: options.timeout_ms,
+                signal: options.signal,
+            })),
+        ),
+        None => (0, OperationControl::default()),
+    };
+    env.spawn_future(async move {
+        napi::tokio::task::spawn_blocking(move || {
+            turndb::store::recover_manifest_with_control(
+                &PathBuf::from(path),
+                FoldCfg::default(),
+                turndb::store::RecoveryOptions { max_rollback_commits },
+                &control,
+            )
+        })
+        .await
+        .map_err(|error| failure("join TurnDB manifest recovery", error))?
+        .map(|report| NativeRecoveryResult {
+            commit: BigInt::from(report.commit),
+            rollback_commits: BigInt::from(report.rollback_commits),
+            records: BigInt::from(report.records as u64),
+            content_values: BigInt::from(report.content_values as u64),
+            parts: BigInt::from(report.parts as u64),
+            part_sections: BigInt::from(report.part_sections as u64),
+            fold_segments: report.fold_segments,
+            fold_blocks: BigInt::from(report.fold_blocks as u64),
+            fold_bytes: BigInt::from(report.fold_bytes),
+        })
+        .map_err(|error| engine_failure("recover TurnDB manifest", error))
     })
-    .await
-    .map_err(|error| failure("join TurnDB manifest recovery", error))?
-    .map(|report| NativeRecoveryResult {
-        commit: BigInt::from(report.commit),
-        rollback_commits: BigInt::from(report.rollback_commits),
-        records: BigInt::from(report.records as u64),
-        content_values: BigInt::from(report.content_values as u64),
-        parts: BigInt::from(report.parts as u64),
-        part_sections: BigInt::from(report.part_sections as u64),
-        fold_segments: report.fold_segments,
-        fold_blocks: BigInt::from(report.fold_blocks as u64),
-        fold_bytes: BigInt::from(report.fold_bytes),
-    })
-    .map_err(|error| engine_failure("recover TurnDB manifest", error))
 }
 
 /// A native writer handle. All operations are asynchronous and serialized by its Rust actor.

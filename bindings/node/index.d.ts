@@ -297,9 +297,13 @@ export declare class TurnDbError extends Error {
 
 export declare function capabilities(): Capabilities;
 export declare function retainedCommits(path: string): Promise<bigint[]>;
+export interface RecoveryOptions extends LifecycleOptions {
+  /** Maximum number of newer retained commits that recovery may abandon; defaults to zero. */
+  maxRollbackCommits?: bigint;
+}
 export declare function recoverManifest(
   path: string,
-  options?: { maxRollbackCommits?: bigint },
+  options?: RecoveryOptions,
 ): Promise<{
   commit: bigint;
   rollbackCommits: bigint;
