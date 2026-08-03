@@ -597,7 +597,11 @@ This phase turns demonstrated behavior into promises that downstream projects ca
 - Upgrade fixtures containing stores written by older versions. **Implemented for revision 3:** the
   public Node seam restores and migrates the retained pack byte/identity-exact across restart.
 - Property, fuzz, corruption, and deterministic crash testing for the generalized record model.
-- Differential tests between point reads, structured scans, and DataFusion queries.
+- Differential tests between point reads, structured scans, and DataFusion queries. **Initial
+  generalized-record gate implemented:** one independently maintained live-state model spans eight
+  immutable mutation layers, overwrites, tombstones, every scalar representation, duplicate fields,
+  and two named content values. Point reads anchor exact records/content; bounded forward/reverse
+  structured pages and DataFusion projections/predicates must return the same newest-wins view.
 - Cross-runtime tests proving native and WASM implementations read the same stores byte-exactly where
   their capability sets overlap. **Implemented in both directions:** CI has portable-WASI write/native
   read and native write/portable-WASI read compare exact ids, content, and every scalar/duplicate-key
