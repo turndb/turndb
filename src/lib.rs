@@ -59,4 +59,6 @@ mod sys;
 pub mod types;
 pub mod vfs;
 
-pub use types::{AttrValue, BodyOp, Content, ContentOp, PieceHash, Record, BODY_CONTENT};
+pub use types::{
+    AttrValue, BodyOp, Content, ContentHash, ContentOp, PieceHash, Record, BODY_CONTENT,
+};

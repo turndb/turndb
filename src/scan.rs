@@ -5,7 +5,7 @@
 //! ordering is record id; additional orderings need indexes rather than JavaScript-side sorting.
 
 use crate::store::{ReadStore, Store};
-use crate::types::{AttrValue, Content, Record};
+use crate::types::{AttrValue, Content, ContentHash, Record};
 use anyhow::{bail, Context, Result};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -96,6 +96,9 @@ pub struct ProjectedContent {
     pub present: bool,
     pub len: Option<u64>,
     pub pieces: Option<usize>,
+    /// BLAKE3 of the exact reconstructed bytes when carried by the record's format. This remains
+    /// unavailable for legacy values rather than substituting a program or piece identity.
+    pub identity: Option<ContentHash>,
     /// `Some` only for a present value selected with [`ContentMode::Bytes`].
     pub bytes: Option<Vec<u8>>,
 }
@@ -365,6 +368,7 @@ fn project_content(
         pieces: content.map(|c| {
             c.ops.iter().filter(|op| matches!(op, crate::types::ContentOp::Piece { .. })).count()
         }),
+        identity: content.and_then(|content| content.identity),
         bytes,
     }
 }

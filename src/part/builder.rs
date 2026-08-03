@@ -81,6 +81,7 @@ struct ContentCol {
     prog: Spool,
     off: Spool,
     rid: Spool,
+    identity: Spool,
     prog_len: u64,
 }
 
@@ -176,6 +177,7 @@ impl StreamBuilder {
                 prog: spool(path)?,
                 off: spool(path)?,
                 rid: spool(path)?,
+                identity: spool(path)?,
                 prog_len: 0,
             });
         }
@@ -260,6 +262,9 @@ impl StreamBuilder {
             let mut p = Vec::new();
             super::content::encode_program(&mut p, &content.ops, &self.dict_index)?;
             col.prog.append(&p)?;
+            let mut identity = Vec::with_capacity(33);
+            super::content::encode_identity(&mut identity, content);
+            col.identity.append(&identity)?;
             col.prog_len += p.len() as u64;
             col.occurrences += 1;
         }
@@ -336,6 +341,7 @@ impl StreamBuilder {
             c.off.append(&c.prog_len.to_le_bytes())?;
             self.w.section(&format!("con.prog.{i}"), &c.prog.take()?)?;
             self.w.section(&format!("con.off.{i}"), &c.off.take()?)?;
+            self.w.section(&format!("con.id.{i}"), &c.identity.take()?)?;
             let rid = c.rid.take()?;
             if !(c.dense && c.occurrences == n) {
                 self.w.section(&format!("con.rid.{i}"), &rid)?;

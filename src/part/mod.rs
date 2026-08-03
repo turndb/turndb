@@ -43,7 +43,7 @@ pub mod merge;
 
 use crate::fold::{Fold, Loc};
 use crate::readat::ReadAt;
-use crate::types::{AttrValue, BodyOp, Content, PieceHash, Record, BODY_CONTENT};
+use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use cache::{Held, Kind, SectionCache};
 use idcol::{get_varint, put_varint, IdCol};
@@ -64,7 +64,7 @@ pub const FOOTER_LEN: u64 = 56;
 ///
 /// This claims one of the footer's padding bytes, which cost nothing because they were already
 /// zero-filled: a part written before this existed reads as version 0, which is exactly what it is.
-pub const PART_VERSION: u8 = 2;
+pub const PART_VERSION: u8 = 3;
 
 /// Content-program op tags, packed into the low bit of a varint.
 pub(crate) const OP_LIT: u64 = 0;
@@ -236,6 +236,7 @@ pub fn build_full(
     for (i, c) in content.cols.iter().enumerate() {
         w.section(&format!("con.prog.{i}"), &c.prog)?;
         w.section(&format!("con.off.{i}"), &u64s(&c.offsets))?;
+        w.section(&format!("con.id.{i}"), &c.identities)?;
         if !c.dense {
             w.section(&format!("con.rid.{i}"), &c.rid)?;
         }
@@ -562,7 +563,7 @@ impl Part {
                 None => bail!("part is missing its required prog.off section"),
             }
         } else if !toc.contains_key("cmeta") {
-            bail!("revision-2 part is missing its required cmeta section");
+            bail!("revision-2-or-later part is missing its required cmeta section");
         }
         Ok(Part {
             f,
@@ -867,6 +868,7 @@ impl Part {
             let prog = format!("con.prog.{i}");
             let off = format!("con.off.{i}");
             let rid = format!("con.rid.{i}");
+            let identity = format!("con.id.{i}");
             if !self.has(&prog) || !self.has(&off) {
                 bail!("content {name:?} is missing its program or offset section");
             }
@@ -878,6 +880,17 @@ impl Part {
             }
             if !dense && !self.has(&rid) {
                 bail!("sparse content {name:?} is missing its row-id section");
+            }
+            if self.version >= 3 {
+                if !self.has(&identity) {
+                    bail!("content {name:?} is missing its identity section");
+                }
+                let expected = (occurrences as u64)
+                    .checked_mul(33)
+                    .ok_or_else(|| anyhow::anyhow!("content identity section size overflows"))?;
+                if self.toc[&identity].raw as u64 != expected {
+                    bail!("content {name:?} has an identity count inconsistent with cmeta");
+                }
             }
             out.push(ContentMeta { name, occurrences, dense });
         }
@@ -1001,12 +1014,55 @@ impl Part {
         Ok(Some(self.program(&format!("con.prog.{col}"), &format!("con.off.{col}"), occurrence)?))
     }
 
+    /// Exact reconstructed-byte identity for one named value, when its format carried one.
+    ///
+    /// `None` means either the value is absent or it came from a legacy/unidentified record; callers
+    /// that need to distinguish those states first ask [`Part::content`]. No program or fold block is
+    /// read.
+    pub fn content_identity(&self, r: usize, name: &str) -> Result<Option<ContentHash>> {
+        if r >= self.len() {
+            bail!("row {r} out of range");
+        }
+        if self.version <= 2 {
+            return Ok(None);
+        }
+        let columns = self.content_meta()?;
+        let Ok(col) = columns.binary_search_by(|c| c.name.as_bytes().cmp(name.as_bytes())) else {
+            return Ok(None);
+        };
+        let Some(occurrence) = self.content_occurrence(col, &columns[col], r)? else {
+            return Ok(None);
+        };
+        let identities = self.sect(&format!("con.id.{col}"))?;
+        let at = occurrence
+            .checked_mul(33)
+            .ok_or_else(|| anyhow::anyhow!("content identity offset overflows"))?;
+        let end = at
+            .checked_add(33)
+            .ok_or_else(|| anyhow::anyhow!("content identity end offset overflows"))?;
+        let encoded = identities
+            .get(at..end)
+            .ok_or_else(|| anyhow::anyhow!("content identity occurrence is truncated"))?;
+        match encoded[0] {
+            0 => {
+                if encoded[1..].iter().any(|&byte| byte != 0) {
+                    bail!("unavailable content identity has a nonzero digest");
+                }
+                Ok(None)
+            }
+            1 => Ok(Some(ContentHash(encoded[1..].try_into().unwrap()))),
+            marker => bail!("content identity has unknown availability marker {marker}"),
+        }
+    }
+
     /// Every named content value at row `r`, in canonical name order.
     pub fn contents(&self, r: usize) -> Result<Vec<Content>> {
         let mut out = Vec::new();
         for meta in self.content_meta()?.iter() {
             if let Some(ops) = self.content(r, &meta.name)? {
-                out.push(Content::new(&meta.name, ops));
+                let mut content = Content::new(&meta.name, ops);
+                content.identity = self.content_identity(r, &meta.name)?;
+                out.push(content);
             }
         }
         Ok(out)
@@ -1080,6 +1136,12 @@ impl Part {
                     }
                     fold.read_verified_into(loc, hash, &mut out)?;
                 }
+            }
+        }
+        if let Some(expected) = self.content_identity(r, name)? {
+            let got = ContentHash::of(&out);
+            if got != expected {
+                bail!("content {name:?} reconstructed as {got} but its identity is {expected}");
             }
         }
         Ok(Some(out))
@@ -1210,5 +1272,43 @@ mod compatibility_tests {
             Some(b"legacy".to_vec())
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_revision_two_named_value_reports_whole_identity_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "turndb-part-v2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy-named.part");
+        let (ids, restarts) = idcol::build(&["legacy".to_string()]).unwrap();
+        let mut cmeta = Vec::new();
+        put_varint(&mut cmeta, 1);
+        put_varint(&mut cmeta, 7);
+        cmeta.extend_from_slice(b"payload");
+        put_varint(&mut cmeta, 1);
+        cmeta.push(content::RID_DENSE);
+        let mut prog = Vec::new();
+        put_varint(&mut prog, 1);
+        put_varint(&mut prog, (6u64 << 1) | OP_LIT);
+        prog.extend_from_slice(b"legacy");
+
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("ids", &ids).unwrap();
+        writer.section("ids.restart", &u32s(&restarts)).unwrap();
+        writer.section("cmeta", &cmeta).unwrap();
+        writer.section("con.prog.0", &prog).unwrap();
+        writer.section("con.off.0", &u64s(&[0, prog.len() as u64])).unwrap();
+        writer.section("pdict.loc", &[]).unwrap();
+        writer.section("pdict.hash", &[]).unwrap();
+        writer.finish_version(PartMeta { n_records: 1, seq_lo: 1, seq_hi: 1 }, 2).unwrap();
+
+        let part = Part::open(&path).unwrap();
+        assert_eq!(part.content(0, "payload").unwrap().unwrap(), [BodyOp::Lit(b"legacy".to_vec())]);
+        assert_eq!(part.content_identity(0, "payload").unwrap(), None);
+        assert_eq!(part.record(0).unwrap().contents[0].identity, None);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

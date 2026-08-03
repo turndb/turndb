@@ -14,7 +14,7 @@
 //! ```
 
 use crate::part::idcol::{get_varint, put_varint};
-use crate::types::{AttrValue, BodyOp, Content, PieceHash, Record, BODY_CONTENT};
+use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::path::Path;
@@ -46,6 +46,10 @@ pub const BATCH_TOMB_TAG: u8 = 0x5B;
 pub const RECORD_V2_TAG: u8 = 0x5C;
 /// [`RECORD_V2_TAG`], inside a batch.
 pub const BATCH_RECORD_V2_TAG: u8 = 0x5D;
+/// A general record carrying exact whole-value identities for its named content.
+pub const RECORD_V3_TAG: u8 = 0x5E;
+/// [`RECORD_V3_TAG`], inside a batch.
+pub const BATCH_RECORD_V3_TAG: u8 = 0x5F;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
@@ -182,12 +186,35 @@ fn get_novel(b: &[u8], at: &mut usize) -> Result<Vec<(PieceHash, Vec<u8>)>> {
     Ok(novel)
 }
 
-/// Encode the general record payload written by revision 2.
+/// Encode the general record payload written by revision 3.
 pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
     crate::types::validate_contents(&r.contents)?;
     if r.id.is_empty() {
         bail!("record id must not be empty");
     }
+    put_bytes(out, r.id.as_bytes());
+    put_varint(out, r.contents.len() as u64);
+    let mut contents: Vec<&Content> = r.contents.iter().collect();
+    contents.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    for content in contents {
+        put_bytes(out, content.name.as_bytes());
+        match content.identity {
+            Some(identity) => {
+                out.push(1);
+                out.extend_from_slice(&identity.0);
+            }
+            None => out.push(0),
+        }
+        put_ops(out, &content.ops);
+    }
+    put_attrs(out, &r.attrs);
+    put_novel(out, novel);
+    Ok(())
+}
+
+#[cfg(test)]
+fn encode_record_v2(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
+    crate::types::validate_contents(&r.contents)?;
     put_bytes(out, r.id.as_bytes());
     put_varint(out, r.contents.len() as u64);
     let mut contents: Vec<&Content> = r.contents.iter().collect();
@@ -221,12 +248,44 @@ pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
     let mut contents = Vec::with_capacity(n_contents.min(b.len()));
     for _ in 0..n_contents {
         let name = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
-        contents.push(Content::new(name, get_ops(b, &mut at)?));
+        let marker =
+            *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: content identity marker is missing"))?;
+        at += 1;
+        let identity = match marker {
+            0 => None,
+            1 => {
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(take(b, &mut at, 32)?);
+                Some(ContentHash(digest))
+            }
+            marker => bail!("wal: unknown content identity marker {marker}"),
+        };
+        let mut content = Content::new(name, get_ops(b, &mut at)?);
+        content.identity = identity;
+        contents.push(content);
     }
     let attrs = get_attrs(b, &mut at)?;
     let novel = get_novel(b, &mut at)?;
     if at != b.len() {
         bail!("wal: record has {} trailing bytes", b.len() - at);
+    }
+    Ok((Record::new(id, contents, attrs)?, novel))
+}
+
+fn decode_record_v2(b: &[u8]) -> Result<CarvedRecord> {
+    let mut at = 0usize;
+    let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
+    let n_contents = usize::try_from(get_varint(b, &mut at)?)
+        .context("wal: content count exceeds this platform's address space")?;
+    let mut contents = Vec::with_capacity(n_contents.min(b.len()));
+    for _ in 0..n_contents {
+        let name = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
+        contents.push(Content::new(name, get_ops(b, &mut at)?));
+    }
+    let attrs = get_attrs(b, &mut at)?;
+    let novel = get_novel(b, &mut at)?;
+    if at != b.len() {
+        bail!("wal: revision-2 record has {} trailing bytes", b.len() - at);
     }
     Ok((Record::new(id, contents, attrs)?, novel))
 }
@@ -332,7 +391,7 @@ impl Wal {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         let encoded = encode_record(&mut scratch, r, novel);
-        let res = encoded.and_then(|()| self.append_frame(RECORD_V2_TAG, seq, &scratch));
+        let res = encoded.and_then(|()| self.append_frame(RECORD_V3_TAG, seq, &scratch));
         self.scratch = scratch;
         res
     }
@@ -351,7 +410,7 @@ impl Wal {
                 BATCH_TOMB_TAG
             } else {
                 encode_record(&mut scratch, r, novel)?;
-                BATCH_RECORD_V2_TAG
+                BATCH_RECORD_V3_TAG
             };
             let res = self.append_frame(tag, seq, &scratch);
             self.scratch = scratch;
@@ -423,6 +482,8 @@ impl Wal {
                     | BATCH_TOMB_TAG
                     | RECORD_V2_TAG
                     | BATCH_RECORD_V2_TAG
+                    | RECORD_V3_TAG
+                    | BATCH_RECORD_V3_TAG
             );
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
@@ -491,16 +552,22 @@ impl Wal {
                         out.push(fr);
                     }
                 }
-                FRAME_TAG | BATCH_FRAME_TAG | RECORD_V2_TAG | BATCH_RECORD_V2_TAG => {
+                FRAME_TAG | BATCH_FRAME_TAG | RECORD_V2_TAG | BATCH_RECORD_V2_TAG
+                | RECORD_V3_TAG | BATCH_RECORD_V3_TAG => {
                     let decoded = if matches!(hdr[0], FRAME_TAG | BATCH_FRAME_TAG) {
                         decode_record_v1(&payload)
+                    } else if matches!(hdr[0], RECORD_V2_TAG | BATCH_RECORD_V2_TAG) {
+                        decode_record_v2(&payload)
                     } else {
                         decode_record(&payload)
                     };
                     match decoded {
                         Ok((record, novel)) => {
                             let fr = Frame { seq, tomb: false, record, novel };
-                            if matches!(hdr[0], BATCH_FRAME_TAG | BATCH_RECORD_V2_TAG) {
+                            if matches!(
+                                hdr[0],
+                                BATCH_FRAME_TAG | BATCH_RECORD_V2_TAG | BATCH_RECORD_V3_TAG
+                            ) {
                                 pending.push(fr);
                             } else {
                                 pending.clear();
@@ -567,17 +634,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_named_content_frames_replay_together() {
+    fn three_record_revisions_replay_together() {
         let d = std::env::temp_dir().join(format!("turndb-wal-mixed-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("wal");
         let (legacy, novel) = rec();
-        let named = Record::new(
-            "new",
+        let revision_two = Record::new(
+            "v2",
             vec![
                 Content::new("request", vec![BodyOp::Lit(b"in".to_vec())]),
                 Content::new("response", vec![BodyOp::Lit(b"out".to_vec())]),
             ],
+            vec![],
+        )
+        .unwrap();
+        let revision_three = Record::new(
+            "v3",
+            vec![Content::identified(
+                "response",
+                vec![BodyOp::Lit(b"identified".to_vec())],
+                ContentHash::of(b"identified"),
+            )],
             vec![],
         )
         .unwrap();
@@ -586,14 +663,19 @@ mod tests {
             let mut old_payload = Vec::new();
             encode_record_v1(&mut old_payload, &legacy, &novel);
             w.append_frame(FRAME_TAG, 1, &old_payload).unwrap();
-            w.append(1, &named, &[]).unwrap();
+            let mut v2_payload = Vec::new();
+            encode_record_v2(&mut v2_payload, &revision_two, &[]).unwrap();
+            w.append_frame(RECORD_V2_TAG, 1, &v2_payload).unwrap();
+            w.append(1, &revision_three, &[]).unwrap();
             w.sync().unwrap();
         }
         let replay = Wal::replay(&p).unwrap();
-        assert_eq!(replay.len(), 2);
+        assert_eq!(replay.len(), 3);
         assert_eq!(replay[0].record.contents, legacy.contents);
         assert_eq!(replay[0].record.contents[0].name, BODY_CONTENT);
-        assert_eq!(replay[1].record, named);
+        assert_eq!(replay[1].record, revision_two);
+        assert_eq!(replay[1].record.contents[0].identity, None);
+        assert_eq!(replay[2].record, revision_three);
         std::fs::remove_dir_all(&d).ok();
     }
 

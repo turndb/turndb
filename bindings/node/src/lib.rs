@@ -95,6 +95,7 @@ pub struct NativeProjectedContent {
     pub present: bool,
     pub len: Option<BigInt>,
     pub pieces: Option<u32>,
+    pub identity: Option<String>,
     pub bytes: Option<Buffer>,
 }
 
@@ -778,6 +779,7 @@ fn encode_content(content: ProjectedContent) -> NativeProjectedContent {
         present: content.present,
         len: content.len.map(BigInt::from),
         pieces: content.pieces.map(|pieces| pieces as u32),
+        identity: content.identity.map(|identity| identity.to_hex()),
         bytes: content.bytes.map(Buffer::from),
     }
 }

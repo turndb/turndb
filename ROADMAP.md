@@ -38,7 +38,11 @@ content model right before compatibility turns today's choices into permanent pr
   and named-content namespaces from part metadata plus the live writer memtable, preserving observed
   scalar types without reading values or fold blocks. Its explicit conservative-result flag admits
   when shadowed physical rows may contribute names. The Node binding exposes the same structured
-  contract. It is a source prototype, not yet a production prebuild matrix.
+  contract. Revision-3 WAL and parts now persist exact whole-value BLAKE3 identities computed during
+  ingest, expose them through metadata-only structured scans and Node, preserve them through replay
+  and streaming compaction, and report them unavailable for legacy values instead of confusing piece
+  or program hashes with byte identity. The Node package remains a source prototype, not yet a
+  production prebuild matrix.
 
 ## Product boundary
 

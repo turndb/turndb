@@ -16,8 +16,8 @@ function temporaryStore(t) {
 
 test('reports the native capability profile without a portable fallback', () => {
   assert.deepEqual(capabilities(), {
-    partFormatWrite: 2,
-    partFormatReadMax: 2,
+    partFormatWrite: 3,
+    partFormatReadMax: 3,
     writerExclusion: 'os_enforced',
     physicalErasure: process.platform === 'linux' ? 'punch_or_refold' : 'refold_only',
     positionedIo: true,
@@ -95,10 +95,15 @@ test('round-trips exact typed fields and independently named content', async (t)
   assert(Number.isNaN(page.rows[0].attrs[3].floatValue));
   assert.equal(page.rows[0].contents[0].bytes, undefined);
   assert.equal(page.rows[0].contents[0].len, 6n);
+  assert.match(page.rows[0].contents[0].identity, /^[0-9a-f]{64}$/);
   assert.equal(page.rows[0].contents[1].bytes.toString(), 'shared');
+  assert.equal(page.rows[0].contents[1].identity, page.rows[0].contents[0].identity);
   assert.equal(page.rows[0].contents[2].present, true);
   assert.equal(page.rows[0].contents[2].bytes.length, 0);
+  assert.match(page.rows[0].contents[2].identity, /^[0-9a-f]{64}$/);
+  assert.notEqual(page.rows[0].contents[2].identity, page.rows[0].contents[0].identity);
   assert.equal(page.rows[0].contents[3].present, false);
+  assert.equal(page.rows[0].contents[3].identity, undefined);
   assert.equal(page.rows[0].contents[3].bytes, undefined);
   assert.equal((await store.readContent('trace/1', 'request')).toString(), 'shared');
   assert.equal(await store.readContent('trace/1', 'absent'), null);
