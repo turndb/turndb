@@ -129,6 +129,30 @@ pub fn refold_with_control(
     cfg: FoldCfg,
     control: &crate::control::OperationControl,
 ) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
+    refold_with_control_and_limits(
+        dir,
+        parts,
+        seqs,
+        old_fold,
+        old_gen,
+        cfg,
+        control,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// [`refold_with_control`] with atomic-frame admission on the replacement generation.
+#[allow(clippy::too_many_arguments)]
+pub fn refold_with_control_and_limits(
+    dir: &Path,
+    parts: &[Arc<Part>],
+    seqs: &[(u64, u64)],
+    old_fold: &Fold,
+    old_gen: u32,
+    cfg: FoldCfg,
+    control: &crate::control::OperationControl,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
     control.check("content refold")?;
     if parts.len() != seqs.len() {
         bail!("every part needs its committed sequence range");
@@ -190,7 +214,7 @@ pub fn refold_with_control(
 
     let mut remap: HashMap<PieceHash, Loc> = HashMap::with_capacity(order.len());
     {
-        let mut nf = Fold::open(&new_dir, cfg)?;
+        let mut nf = Fold::open_with_limits(&new_dir, cfg, read_limits)?;
         for (loc, hash) in &order {
             control.check("content refold")?;
             // read_verified, not read: a re-fold is exactly when to re-check that content still hashes
@@ -216,7 +240,7 @@ pub fn refold_with_control(
         let recs: Vec<Record> = rows.iter().map(|&r| parts[pi].record(r)).collect::<Result<_>>()?;
         let (lo, hi) = seqs[pi];
         let file = format!("part-r{new_gen:04}-{lo:08}-{hi:08}.part");
-        let meta = part::build_full(
+        let meta = part::build_full_with_limits(
             &dir.join(&file),
             &recs,
             &[],
@@ -225,6 +249,7 @@ pub fn refold_with_control(
             cfg.level,
             |h| remap.get(h).copied(),
             &HashMap::new(),
+            read_limits,
         )?;
         out.push((file, lo, hi, meta.n_records));
     }

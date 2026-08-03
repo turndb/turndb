@@ -614,7 +614,9 @@ This phase turns demonstrated behavior into promises that downstream projects ca
   **Initial review implemented and published:** manifest authority is semantically validated and
   allocation-bounded; backup source paths are canonical and symlink-free; pack metadata has
   configurable pre-allocation admission; advisory sidecars and dictionary candidates are bounded;
-  parser, native, and portable boundaries plus residual data-plane frame risks are documented.
+  atomic WAL/part/fold stored and decoded frames now have configurable per-open admission across
+  Rust, native Node, and portable WASI, including writer-side output checks and fold progress;
+  parser, native, and portable boundaries plus remaining object-count/CPU risks are documented.
 
 ### 1.0 gate
 

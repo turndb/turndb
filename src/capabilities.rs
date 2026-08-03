@@ -39,6 +39,7 @@ pub struct Capabilities {
     pub sql: bool,
     pub portable_wasm: bool,
     pub write_admission_limits: bool,
+    pub read_admission_limits: bool,
     pub store_space_usage: bool,
     pub allocated_space_usage: bool,
     pub format_migration: bool,
@@ -53,6 +54,8 @@ pub struct Capabilities {
     pub max_batch_bytes_default: u64,
     pub max_batch_records_default: usize,
     pub max_identifier_bytes_default: usize,
+    pub max_stored_frame_bytes_default: u64,
+    pub max_decoded_frame_bytes_default: u64,
 }
 
 /// Report what this build can actually guarantee.
@@ -76,6 +79,7 @@ pub const fn capabilities() -> Capabilities {
         sql: cfg!(feature = "sql"),
         portable_wasm: cfg!(target_arch = "wasm32"),
         write_admission_limits: true,
+        read_admission_limits: true,
         store_space_usage: true,
         allocated_space_usage: cfg!(unix),
         format_migration: true,
@@ -90,6 +94,8 @@ pub const fn capabilities() -> Capabilities {
         max_batch_bytes_default: crate::store::DEFAULT_MAX_BATCH_BYTES,
         max_batch_records_default: crate::store::DEFAULT_MAX_BATCH_RECORDS,
         max_identifier_bytes_default: crate::store::DEFAULT_MAX_IDENTIFIER_BYTES,
+        max_stored_frame_bytes_default: crate::read_limits::DEFAULT_MAX_STORED_FRAME_BYTES,
+        max_decoded_frame_bytes_default: crate::read_limits::DEFAULT_MAX_DECODED_FRAME_BYTES,
     }
 }
 
@@ -104,6 +110,15 @@ mod tests {
         assert!(!c.sql || c.columnar, "SQL is an adapter over the columnar lens");
         assert_eq!(c.portable_wasm, cfg!(target_arch = "wasm32"));
         assert!(c.store_space_usage);
+        assert!(c.read_admission_limits);
+        assert_eq!(
+            c.max_stored_frame_bytes_default,
+            crate::read_limits::DEFAULT_MAX_STORED_FRAME_BYTES
+        );
+        assert_eq!(
+            c.max_decoded_frame_bytes_default,
+            crate::read_limits::DEFAULT_MAX_DECODED_FRAME_BYTES
+        );
         assert_eq!(c.allocated_space_usage, cfg!(unix));
         assert!(c.format_migration);
         assert!(c.operation_metrics);

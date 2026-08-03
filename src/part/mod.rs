@@ -179,8 +179,34 @@ pub fn build_full(
     seq_lo: u64,
     seq_hi: u64,
     level: i32,
+    resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+    retain: &HashMap<PieceHash, Loc>,
+) -> Result<PartMeta> {
+    build_full_with_limits(
+        path,
+        records,
+        tombs,
+        seq_lo,
+        seq_hi,
+        level,
+        resolve,
+        retain,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// [`build_full`] with a policy that prevents publishing atomic frames this profile cannot read.
+#[allow(clippy::too_many_arguments)]
+pub fn build_full_with_limits(
+    path: &Path,
+    records: &[Record],
+    tombs: &[bool],
+    seq_lo: u64,
+    seq_hi: u64,
+    level: i32,
     mut resolve: impl FnMut(&PieceHash) -> Option<Loc>,
     retain: &HashMap<PieceHash, Loc>,
+    read_limits: crate::read_limits::ReadLimits,
 ) -> Result<PartMeta> {
     if !tombs.is_empty() && tombs.len() != records.len() {
         bail!("tombstone flags ({}) must be parallel to records ({})", tombs.len(), records.len());
@@ -229,7 +255,7 @@ pub fn build_full(
     let (id_stream, id_restarts) = idcol::build(&ids)?;
 
     // ---- lay the sections down, in a fixed order (determinism) ----
-    let mut w = Writer::new(path, level)?;
+    let mut w = Writer::new_with_limits(path, level, read_limits)?;
     w.section("ids", &id_stream)?;
     w.section("ids.restart", &u32s(&id_restarts))?;
     w.section("cmeta", &content.meta)?;
@@ -310,13 +336,24 @@ pub(crate) struct Writer {
     off: u64,
     toc: Vec<(String, Section)>,
     level: i32,
+    read_limits: crate::read_limits::ReadLimits,
 }
 
 impl Writer {
+    #[cfg(test)]
     pub(crate) fn new(path: &Path, level: i32) -> Result<Writer> {
+        Self::new_with_limits(path, level, crate::read_limits::ReadLimits::default())
+    }
+
+    pub(crate) fn new_with_limits(
+        path: &Path,
+        level: i32,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Writer> {
+        let read_limits = read_limits.validate()?;
         let f =
             crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
-        Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level })
+        Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level, read_limits })
     }
 
     pub(crate) fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
@@ -326,7 +363,10 @@ impl Writer {
         if raw.len() as u64 > u32::MAX as u64 {
             bail!("section {name} is {} bytes; the format caps a section at 4 GiB", raw.len());
         }
+        self.read_limits.admit_decoded(format!("new part section {name:?}"), raw.len() as u64)?;
         let (codec, payload) = crate::fold::codec::encode(raw, None, self.level)?;
+        self.read_limits
+            .admit_stored(format!("new part section {name:?}"), payload.len() as u64)?;
         crate::vfs::write_all_at(&self.f, &self.path, &payload, self.off)?;
         self.toc.push((
             name.to_string(),
@@ -350,6 +390,13 @@ impl Writer {
         if version > PART_VERSION {
             bail!("cannot write unsupported part version {version}");
         }
+        if meta.seq_lo > meta.seq_hi {
+            bail!(
+                "cannot write a part with inverted sequence range {}..{}",
+                meta.seq_lo,
+                meta.seq_hi
+            );
+        }
         let mut toc = Vec::new();
         put_varint(&mut toc, self.toc.len() as u64);
         for (name, s) in &self.toc {
@@ -370,6 +417,14 @@ impl Writer {
             toc.extend_from_slice(&s.xsum.to_le_bytes());
         }
         let (toc_codec, toc_payload) = crate::fold::codec::encode(&toc, None, self.level)?;
+        if toc.len() as u64 > u32::MAX as u64 || toc_payload.len() as u64 > u32::MAX as u64 {
+            bail!(
+                "part TOC is {} raw / {} stored bytes; the format caps each at 4 GiB",
+                toc.len(),
+                toc_payload.len()
+            );
+        }
+        self.read_limits.admit("new part TOC", toc_payload.len() as u64, toc.len() as u64)?;
         let toc_off = self.off;
         crate::vfs::write_all_at(&self.f, &self.path, &toc_payload, toc_off)?;
 
@@ -424,6 +479,8 @@ pub struct Part {
     /// 8x50k records). Unbounded, they pinned 9.5x a part's on-disk size and never let go. Bounded and
     /// shared, the asymptotics hold and the memory does not grow with part count.
     cache: Arc<SectionCache>,
+    /// Admission checked before materializing any atomic TOC or section frame.
+    read_limits: crate::read_limits::ReadLimits,
 }
 
 impl Drop for Part {
@@ -441,18 +498,45 @@ impl Part {
     /// part count, which is the thing the budget exists to stop. Use [`Part::open_in`] to account a
     /// group of parts separately, as a `Store` does.
     pub fn open(path: &Path) -> Result<Part> {
-        Part::open_in(path, SectionCache::global())
+        Part::open_with_limits(path, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open with an explicit atomic-frame admission policy.
+    pub fn open_with_limits(
+        path: &Path,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Part> {
+        Part::open_in_with_limits(path, SectionCache::global(), read_limits)
     }
 
     /// Open sharing `cache` with other parts.
     pub fn open_in(path: &Path, cache: Arc<SectionCache>) -> Result<Part> {
+        Part::open_in_with_limits(path, cache, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open sharing `cache` and enforcing `read_limits` before atomic frame allocations.
+    pub fn open_in_with_limits(
+        path: &Path,
+        cache: Arc<SectionCache>,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Part> {
         let f = File::open(path).with_context(|| format!("open part {}", path.display()))?;
-        Part::open_reader(Box::new(f), cache)
+        Part::open_reader_with_limits(Box::new(f), cache, read_limits)
     }
 
     /// Open from any [`ReadAt`] — a plain file, an extent of a pack, a remote range. The format is
     /// footer-addressed precisely so that THIS is the only entry a backend needs.
     pub fn open_reader(f: Box<dyn ReadAt>, cache: Arc<SectionCache>) -> Result<Part> {
+        Part::open_reader_with_limits(f, cache, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open any range-readable part with explicit atomic-frame admission.
+    pub fn open_reader_with_limits(
+        f: Box<dyn ReadAt>,
+        cache: Arc<SectionCache>,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Part> {
+        let read_limits = read_limits.validate()?;
         let len = f.len()?;
         if len < FOOTER_LEN {
             bail!("part of {len} bytes is too short to hold a footer");
@@ -472,6 +556,9 @@ impl Part {
         let n_records = u32::from_le_bytes(foot[24..28].try_into().unwrap());
         let seq_lo = u64::from_le_bytes(foot[28..36].try_into().unwrap());
         let seq_hi = u64::from_le_bytes(foot[36..44].try_into().unwrap());
+        if seq_lo > seq_hi {
+            bail!("part footer has inverted sequence range {seq_lo}..{seq_hi}");
+        }
         let toc_codec = foot[44];
         // The reject-forward lever, matching the fold's `flags`. A part from a newer writer is refused
         // rather than misparsed at offsets that may no longer mean what they did.
@@ -494,6 +581,7 @@ impl Part {
         if toc_off.saturating_add(toc_stored as u64) > len - FOOTER_LEN {
             bail!("part TOC runs past where the footer says the sections end");
         }
+        read_limits.admit("part TOC", u64::from(toc_stored), u64::from(toc_raw))?;
         let mut tbuf = vec![0u8; toc_stored as usize];
         f.read_exact_at(&mut tbuf, toc_off)?;
         if version >= 1 && crc32fast::hash(&tbuf) != toc_xsum {
@@ -504,13 +592,16 @@ impl Part {
         let toc_bytes = crate::fold::codec::decode(toc_codec, &tbuf, toc_raw, None)?;
 
         let mut at = 0usize;
-        let n = get_varint(&toc_bytes, &mut at)? as usize;
+        let n = usize::try_from(get_varint(&toc_bytes, &mut at)?)
+            .map_err(|_| anyhow::anyhow!("part TOC entry count exceeds this address space"))?;
         // An entry costs several bytes, so the byte count bounds the entry count — checked before
         // the count sizes an allocation, because `n` is exactly as trustworthy as the TOC carrying
         // it, and on a version-0 part the TOC has no checksum at all.
         let mut toc = HashMap::with_capacity(n.min(toc_bytes.len()));
         for _ in 0..n {
-            let nl = get_varint(&toc_bytes, &mut at)? as usize;
+            let nl = usize::try_from(get_varint(&toc_bytes, &mut at)?).map_err(|_| {
+                anyhow::anyhow!("part TOC entry name length exceeds this address space")
+            })?;
             // `nl > len - at`, never `at + nl > len`: the sum overflows on a hostile length.
             if nl > toc_bytes.len() - at {
                 bail!("part TOC entry name runs past the end of the TOC");
@@ -518,8 +609,10 @@ impl Part {
             let name = String::from_utf8(toc_bytes[at..at + nl].to_vec())?;
             at += nl;
             let off = get_varint(&toc_bytes, &mut at)?;
-            let stored = get_varint(&toc_bytes, &mut at)? as u32;
-            let raw = get_varint(&toc_bytes, &mut at)? as u32;
+            let stored = u32::try_from(get_varint(&toc_bytes, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("part TOC stored length exceeds its u32 field"))?;
+            let raw = u32::try_from(get_varint(&toc_bytes, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("part TOC raw length exceeds its u32 field"))?;
             if at >= toc_bytes.len() {
                 bail!("part TOC entry {name} is truncated before its codec");
             }
@@ -540,10 +633,12 @@ impl Part {
             // A corrupt-but-plausible TOC would otherwise send `sect` to allocate `stored` bytes and
             // read at an arbitrary offset. The footer is checksummed; the TOC is not, so every entry
             // is range-checked against the file it claims to live in.
-            if off.saturating_add(stored as u64) > len {
-                bail!("part TOC entry {name} runs past the end of the file");
+            if off.saturating_add(stored as u64) > toc_off {
+                bail!("part TOC entry {name} overlaps the TOC or footer");
             }
-            toc.insert(name, Section { off, stored, raw, codec, xsum });
+            if toc.insert(name.clone(), Section { off, stored, raw, codec, xsum }).is_some() {
+                bail!("part TOC names section {name:?} more than once");
+            }
         }
         if at != toc_bytes.len() {
             bail!("part TOC has {} trailing bytes after its last entry", toc_bytes.len() - at);
@@ -572,6 +667,7 @@ impl Part {
             meta: PartMeta { n_records, seq_lo, seq_hi },
             id: cache::next_part_id(),
             cache,
+            read_limits,
         })
     }
 
@@ -604,6 +700,11 @@ impl Part {
             crate::io_trace::part_section(self.id, name, true, s.stored, s.raw);
             return Ok(v);
         }
+        self.read_limits.admit(
+            format!("part section {name:?}"),
+            u64::from(s.stored),
+            u64::from(s.raw),
+        )?;
         let mut buf = vec![0u8; s.stored as usize];
         self.f.read_exact_at(&mut buf, s.off)?;
         let raw = crate::fold::codec::decode(s.codec, &buf, s.raw, None)?;
@@ -1484,6 +1585,47 @@ pub(crate) fn build_revision_three_fixture(
 mod compatibility_tests {
     use super::*;
     use crate::fold::FoldCfg;
+
+    fn temp_part(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "turndb-part-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fixture.part");
+        (dir, path)
+    }
+
+    #[test]
+    fn duplicate_section_names_are_refused_instead_of_overwritten() {
+        let (dir, path) = temp_part("duplicate-section");
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        let error = match Part::open(&path) {
+            Ok(_) => panic!("duplicate TOC names must refuse"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("more than once"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn section_extents_must_end_before_the_toc() {
+        let (dir, path) = temp_part("section-overlap");
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.toc[0].1.off = writer.off;
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        let error = match Part::open(&path) {
+            Ok(_) => panic!("a section overlapping the TOC must refuse"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("overlaps the TOC"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn a_revision_one_body_reads_as_named_content() {

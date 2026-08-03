@@ -285,11 +285,13 @@ export class Store {
   #handle;
   #enc = new TextEncoder();
   #dec = new TextDecoder();
+  #readLimits;
 
-  constructor(runtime, handle) {
+  constructor(runtime, handle, readLimits) {
     this.#runtime = runtime;
     this.#exports = runtime.instance.exports;
     this.#handle = handle;
+    this.#readLimits = readLimits;
     storeFinalizer.register(this, { runtime, handle }, this);
   }
 
@@ -301,6 +303,12 @@ export class Store {
   capabilities() {
     this.#alive();
     return readCapabilities(this.#runtime);
+  }
+
+  /** Exact atomic persisted-frame admission configured for this handle. */
+  readLimits() {
+    this.#alive();
+    return { ...this.#readLimits };
   }
 
   #mem() {
@@ -676,7 +684,8 @@ async function acquireRuntime(hostDir) {
  *
  * @param {string} dir  Host directory. Created if absent.
  * @param {{blockTarget?: number, level?: number, maxRecordBytes?: number,
- *   maxBatchBytes?: number, maxBatchRecords?: number, maxIdentifierBytes?: number}} [opts]
+ *   maxBatchBytes?: number, maxBatchRecords?: number, maxIdentifierBytes?: number,
+ *   maxStoredFrameBytes?: number, maxDecodedFrameBytes?: number}} [opts]
  *   `blockTarget` is the bytes gathered before a block seals (default 4 MiB) — bigger compresses
  *   harder and costs more per read. `level` is the zstd level — **this package defaults it to 3,
  *   not the engine's 19**, because this build is single-threaded: the block seal compresses on the
@@ -694,6 +703,8 @@ export async function open(dir, opts = {}) {
   const maxBatchBytes = openLimit(opts.maxBatchBytes, 'maxBatchBytes');
   const maxBatchRecords = openLimit(opts.maxBatchRecords, 'maxBatchRecords');
   const maxIdentifierBytes = openLimit(opts.maxIdentifierBytes, 'maxIdentifierBytes');
+  const maxStoredFrameBytes = openLimit(opts.maxStoredFrameBytes, 'maxStoredFrameBytes');
+  const maxDecodedFrameBytes = openLimit(opts.maxDecodedFrameBytes, 'maxDecodedFrameBytes');
   const hostDir = resolve(dir);
   const runtime = await acquireRuntime(hostDir);
   const { instance } = runtime;
@@ -705,7 +716,7 @@ export async function open(dir, opts = {}) {
     const ptr = instance.exports.tdb_alloc(path.length);
     new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
     try {
-      handle = instance.exports.tdb_open(
+      handle = instance.exports.tdb_open_v2(
         ptr,
         path.length,
         opts.blockTarget ?? 0,
@@ -714,6 +725,8 @@ export async function open(dir, opts = {}) {
         maxBatchBytes,
         maxBatchRecords,
         maxIdentifierBytes,
+        maxStoredFrameBytes,
+        maxDecodedFrameBytes,
       );
     } finally {
       instance.exports.tdb_free(ptr, path.length);
@@ -733,7 +746,11 @@ export async function open(dir, opts = {}) {
     }
     throw e;
   }
-  return new Store(runtime, handle);
+  const profile = readCapabilities(runtime);
+  return new Store(runtime, handle, {
+    maxStoredFrameBytes: maxStoredFrameBytes || profile.max_stored_frame_bytes_default,
+    maxDecodedFrameBytes: maxDecodedFrameBytes || profile.max_decoded_frame_bytes_default,
+  });
 }
 
 export default { open, capabilities, Store, TurndbError };

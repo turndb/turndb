@@ -166,12 +166,23 @@ pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
 /// of good data — during a tail scan a bad frame is a boundary, not an error.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
-    scan_tail_controlled(
+    scan_tail_with_limits(f, file_len, has_dict, crate::read_limits::ReadLimits::default())
+}
+
+/// [`scan_tail`] with explicit admission before its reusable frame buffer grows.
+pub fn scan_tail_with_limits(
+    f: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_controlled_with_limits(
         f,
         file_len,
         has_dict,
         &crate::control::OperationControl::default(),
         "fold scan",
+        read_limits,
     )
 }
 
@@ -183,6 +194,26 @@ pub fn scan_tail_controlled(
     control: &crate::control::OperationControl,
     operation: &'static str,
 ) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_controlled_with_limits(
+        f,
+        file_len,
+        has_dict,
+        control,
+        operation,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// Controlled tail scan with explicit atomic-frame admission.
+pub fn scan_tail_controlled_with_limits(
+    f: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, Vec<(u32, u32)>)> {
+    let read_limits = read_limits.validate()?;
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
@@ -201,6 +232,14 @@ pub fn scan_tail_controlled(
             Ok(h) => h,
             Err(_) => break,
         };
+        // Unlike checksum damage, a valid header outside runtime policy is not a crash-tail
+        // boundary. Surface the typed refusal so writer recovery never truncates a valid committed
+        // block merely because this process was opened with a smaller budget.
+        read_limits.admit(
+            format!("fold block {}", h.block_id),
+            u64::from(h.stored),
+            u64::from(h.raw),
+        )?;
         let end =
             match off.checked_add(BLOCK_HDR_LEN as u64 + h.stored as u64 + BLOCK_XSUM_LEN as u64) {
                 Some(e) => e,

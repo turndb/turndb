@@ -22,6 +22,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.sql, false);
   assert.equal(c.part_format_write, 4);
   assert.equal(c.write_admission_limits, true);
+  assert.equal(c.read_admission_limits, true);
   assert.equal(c.store_space_usage, true);
   assert.equal(c.allocated_space_usage, false);
   assert.equal(c.format_migration, true);
@@ -36,6 +37,8 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.max_batch_bytes_default, 256 << 20);
   assert.equal(c.max_batch_records_default, 4096);
   assert.equal(c.max_identifier_bytes_default, 4096);
+  assert.equal(c.max_stored_frame_bytes_default, 512 << 20);
+  assert.equal(c.max_decoded_frame_bytes_default, 512 << 20);
 
   await withStore((s) => assert.deepEqual(s.capabilities(), c));
 });
@@ -51,6 +54,19 @@ test('a record round-trips byte-exact, including non-UTF8 bytes', async () => {
     s.flush();
     assert.deepEqual(s.get('bin/1'), body, 'must survive the flush into the columnar plane');
   });
+});
+
+test('portable open applies and reports atomic frame admission', async () => {
+  await withStore((s) => {
+    assert.deepEqual(s.readLimits(), {
+      maxStoredFrameBytes: 64,
+      maxDecodedFrameBytes: 64,
+    });
+    assert.throws(
+      () => s.putBody('large-piece', new Uint8Array(256).fill(0x5a)),
+      /new fold block/,
+    );
+  }, { maxStoredFrameBytes: 64, maxDecodedFrameBytes: 64 });
 });
 
 test('the writer sees its own unflushed writes', async () => {

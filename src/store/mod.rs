@@ -38,6 +38,7 @@ pub mod wal;
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
+use crate::read_limits::ReadLimits;
 use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,8 @@ impl Default for WriteLimits {
 pub struct StoreOptions {
     pub fold: FoldCfg,
     pub write_limits: WriteLimits,
+    /// Admission applied before atomic persisted frame input/output allocations.
+    pub read_limits: ReadLimits,
     /// One decompressed-section cache budget shared by every immutable part in this handle.
     pub part_cache_bytes: usize,
 }
@@ -102,6 +105,7 @@ impl Default for StoreOptions {
         StoreOptions {
             fold: FoldCfg::default(),
             write_limits: WriteLimits::default(),
+            read_limits: ReadLimits::default(),
             part_cache_bytes: crate::part::cache::BUDGET_DEFAULT,
         }
     }
@@ -380,6 +384,7 @@ fn input_record_admission_bytes(
     contents: &[ContentSpans<'_>],
     attrs: &[(String, AttrValue)],
     limits: WriteLimits,
+    read_limits: ReadLimits,
     item: Option<usize>,
 ) -> Result<u64> {
     validate_identifier("record id", id, limits, item)?;
@@ -408,6 +413,7 @@ fn input_record_admission_bytes(
                     add_size(&mut size, 1u64.saturating_add(bytes_field_size(bytes.len())))
                 }
                 Span::Piece(bytes) => {
+                    read_limits.admit("new fold block", bytes.len() as u64, bytes.len() as u64)?;
                     add_size(
                         &mut size,
                         1u64.saturating_add(32).saturating_add(varint_bytes(bytes.len() as u64)),
@@ -437,6 +443,7 @@ fn input_record_admission_bytes(
         }
         .into());
     }
+    read_limits.admit("new WAL frame", size, size)?;
     Ok(size)
 }
 
@@ -480,6 +487,7 @@ fn owned_record_admission_bytes(
     contents: &[OwnedContent],
     attrs: &[(String, AttrValue)],
     limits: WriteLimits,
+    read_limits: ReadLimits,
     item: Option<usize>,
 ) -> Result<u64> {
     validate_identifier("record id", id, limits, item)?;
@@ -508,6 +516,7 @@ fn owned_record_admission_bytes(
                     add_size(&mut size, 1u64.saturating_add(bytes_field_size(bytes.len())))
                 }
                 OwnedSpan::Piece(bytes) => {
+                    read_limits.admit("new fold block", bytes.len() as u64, bytes.len() as u64)?;
                     u32::try_from(bytes.len())
                         .context("one folded piece exceeds the format's u32 length")?;
                     piece_count = piece_count.saturating_add(1);
@@ -534,10 +543,16 @@ fn owned_record_admission_bytes(
         }
         .into());
     }
+    read_limits.admit("new WAL frame", size, size)?;
     Ok(size)
 }
 
-fn delete_admission_bytes(id: &str, limits: WriteLimits, item: Option<usize>) -> Result<u64> {
+fn delete_admission_bytes(
+    id: &str,
+    limits: WriteLimits,
+    read_limits: ReadLimits,
+    item: Option<usize>,
+) -> Result<u64> {
     validate_identifier("record id", id, limits, item)?;
     let size = WAL_FRAME_OVERHEAD.saturating_add(id.len() as u64);
     if size > limits.max_record_bytes {
@@ -548,6 +563,7 @@ fn delete_admission_bytes(id: &str, limits: WriteLimits, item: Option<usize>) ->
         }
         .into());
     }
+    read_limits.admit("new WAL frame", size, size)?;
     Ok(size)
 }
 
@@ -869,6 +885,16 @@ pub(crate) fn manifest_from_bytes(b: &[u8]) -> Result<Manifest> {
 /// immutable by definition — and no retry loop to need, because nothing can sweep files out from
 /// under an open handle on an immutable artifact.
 pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
+    open_read_pack_with_limits(path, cfg, ReadLimits::default())
+}
+
+/// Open a packed reader with explicit atomic data-plane admission.
+pub fn open_read_pack_with_limits(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    let read_limits = read_limits.validate()?;
     let pack = crate::pack::Pack::open(path)?;
     let manifest = Manifest::parse(&pack.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
 
@@ -899,7 +925,7 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
             dict_files.push(pack.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
         }
     }
-    let fold = Fold::open_read_from(segs, dict_files, cfg, path)?;
+    let fold = Fold::open_read_from_with_limits(segs, dict_files, cfg, path, read_limits)?;
 
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -907,9 +933,13 @@ pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
         let ext = pack.file(&p.file).ok_or_else(|| {
             anyhow::anyhow!("pack manifest names {} but the pack does not hold it", p.file)
         })?;
-        parts.push(Arc::new(Part::open_reader(Box::new(ext), pcache.clone())?));
+        parts.push(Arc::new(Part::open_reader_with_limits(
+            Box::new(ext),
+            pcache.clone(),
+            read_limits,
+        )?));
     }
-    Ok(ReadStore { fold: Arc::new(fold), parts, manifest })
+    Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
@@ -1160,6 +1190,18 @@ pub fn recover_manifest_with_control(
     options: RecoveryOptions,
     control: &crate::control::OperationControl,
 ) -> Result<RecoveryReport> {
+    recover_manifest_with_limits_and_control(dir, cfg, options, ReadLimits::default(), control)
+}
+
+/// [`recover_manifest_with_control`] with explicit atomic-frame admission during validation.
+pub fn recover_manifest_with_limits_and_control(
+    dir: &Path,
+    cfg: FoldCfg,
+    options: RecoveryOptions,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<RecoveryReport> {
+    let read_limits = read_limits.validate()?;
     control.check("manifest recovery")?;
     let _locks = recovery_locks(dir, control)?;
     control.check("manifest recovery")?;
@@ -1180,7 +1222,7 @@ pub fn recover_manifest_with_control(
                 continue;
             }
         };
-        match validate_recovery_candidate(dir, cfg, manifest, control) {
+        match validate_recovery_candidate(dir, cfg, manifest, read_limits, control) {
             Ok(mut report) => {
                 let rollback_commits = newest.saturating_sub(c);
                 if rollback_commits > options.max_rollback_commits {
@@ -1200,7 +1242,11 @@ pub fn recover_manifest_with_control(
                 return Ok(report);
             }
             Err(error) => {
-                if crate::error::classify(&error) == crate::error::ErrorClass::Cancelled {
+                if matches!(
+                    crate::error::classify(&error),
+                    crate::error::ErrorClass::Cancelled
+                        | crate::error::ErrorClass::ResourceExhausted
+                ) {
                     return Err(error);
                 }
                 last_reason = error.to_string();
@@ -1237,13 +1283,14 @@ fn validate_recovery_candidate(
     dir: &Path,
     cfg: FoldCfg,
     manifest: Manifest,
+    read_limits: ReadLimits,
     control: &crate::control::OperationControl,
 ) -> Result<RecoveryReport> {
     control.check("manifest recovery validation")?;
     let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
     let mut fold = match manifest.fold_tail() {
-        Some(tail) => Fold::open_read_at(&fold_dir, cfg, tail)?,
-        None => Fold::open_read(&fold_dir, cfg)?,
+        Some(tail) => Fold::open_read_at_with_limits(&fold_dir, cfg, tail, read_limits)?,
+        None => Fold::open_read_with_limits(&fold_dir, cfg, read_limits)?,
     };
     fold.declare_punched(&manifest.punched);
     let scrub = fold.scrub_with_control(control)?;
@@ -1265,11 +1312,11 @@ fn validate_recovery_candidate(
                 );
             }
         }
-        let part = Arc::new(Part::open_in(&path, pcache.clone())?);
+        let part = Arc::new(Part::open_in_with_limits(&path, pcache.clone(), read_limits)?);
         part_sections += part.verify_sections_with_control(control)?;
         parts.push(part);
     }
-    let reader = ReadStore { fold: Arc::new(fold), parts, manifest };
+    let reader = ReadStore { fold: Arc::new(fold), parts, manifest, read_limits };
     let ids = reader.ids()?;
     let mut content_values = 0usize;
     for id in &ids {
@@ -1382,6 +1429,7 @@ pub struct Store {
     wal: Wal,
     cfg: FoldCfg,
     write_limits: WriteLimits,
+    read_limits: ReadLimits,
     /// ONE budget for every part in this store, not one per part. Section caches are what make a
     /// whole-part walk linear, so they cannot be removed — but unbounded they pinned 9.5x each part's
     /// on-disk size, which is a per-part cost that multiplies by part count.
@@ -1416,6 +1464,8 @@ pub struct StoreHealth {
     pub fold_compression_threads: usize,
     pub part_cache_bytes: usize,
     pub part_cache_budget: usize,
+    pub max_stored_frame_bytes: u64,
+    pub max_decoded_frame_bytes: u64,
     pub dedup_window_entries: usize,
     pub retained_commits: usize,
     pub punched_blocks: u64,
@@ -1555,8 +1605,9 @@ impl Store {
     /// Open a writer with explicit storage, cache, and admission configuration.
     pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
         let recovery_started = std::time::Instant::now();
-        let StoreOptions { fold: cfg, write_limits, part_cache_bytes } = options;
+        let StoreOptions { fold: cfg, write_limits, read_limits, part_cache_bytes } = options;
         let write_limits = write_limits.validate()?;
+        let read_limits = read_limits.validate()?;
         if part_cache_bytes < crate::part::cache::BUDGET_MIN {
             bail!("part_cache_bytes must be at least {}", crate::part::cache::BUDGET_MIN);
         }
@@ -1589,14 +1640,22 @@ impl Store {
 
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
         // is discarded, and the log regenerates it.
-        let mut fold =
-            Fold::open_at(&refold::fold_dir(dir, manifest.fold_gen), cfg, manifest.fold_tail())?;
+        let mut fold = Fold::open_at_with_limits(
+            &refold::fold_dir(dir, manifest.fold_gen),
+            cfg,
+            manifest.fold_tail(),
+            read_limits,
+        )?;
         fold.declare_punched(&manifest.punched);
 
         let pcache = Arc::new(SectionCache::new(part_cache_bytes));
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
+            parts.push(Arc::new(Part::open_in_with_limits(
+                &dir.join(&p.file),
+                pcache.clone(),
+                read_limits,
+            )?));
         }
 
         // A part file or fold generation no manifest names was written by a flush, merge, or
@@ -1616,7 +1675,7 @@ impl Store {
         }
 
         let wal_path = dir.join("WAL");
-        let frames = Wal::replay(&wal_path)?;
+        let frames = Wal::replay_with_limits(&wal_path, read_limits)?;
         let recovered_wal_frames = u64::try_from(frames.len()).unwrap_or(u64::MAX);
         let mut mem: BTreeMap<String, Option<Record>> = BTreeMap::new();
         let mut mem_bytes = 0usize;
@@ -1659,6 +1718,7 @@ impl Store {
             wal,
             cfg,
             write_limits,
+            read_limits,
             pcache,
             metrics,
             events,
@@ -1668,6 +1728,11 @@ impl Store {
     /// The policy governing future writes through this handle.
     pub fn write_limits(&self) -> WriteLimits {
         self.write_limits
+    }
+
+    /// Atomic persisted-frame admission governing this handle.
+    pub fn read_limits(&self) -> ReadLimits {
+        self.read_limits
     }
 
     /// Monotonic, process-lifetime operation metrics for this writer handle.
@@ -1904,6 +1969,16 @@ impl Store {
     /// invisible, which is the correct snapshot. Safe alongside a live writer because parts are
     /// immutable and the fold is append-only.
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<ReadStore> {
+        Self::open_read_with_limits(dir, cfg, ReadLimits::default())
+    }
+
+    /// Open the published snapshot with explicit atomic data-plane admission.
+    pub fn open_read_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        read_limits: ReadLimits,
+    ) -> Result<ReadStore> {
+        let read_limits = read_limits.validate()?;
         // Reading the manifest and opening the fold generation plus parts it names is not atomic. A
         // writer may commit a merge or re-fold and unlink the replaced files in between, or commit a
         // flush whose new part names fold blocks a reader scanned just before they landed. The
@@ -1918,8 +1993,8 @@ impl Store {
             let manifest = Manifest::load(dir)?;
             let fold_path = refold::fold_dir(dir, manifest.fold_gen);
             let fold = match manifest.fold_tail().map_or_else(
-                || Fold::open_read(&fold_path, cfg),
-                |tail| Fold::open_read_at(&fold_path, cfg, tail),
+                || Fold::open_read_with_limits(&fold_path, cfg, read_limits),
+                |tail| Fold::open_read_at_with_limits(&fold_path, cfg, tail, read_limits),
             ) {
                 Ok(mut fold) => {
                     // A live record never references a punched block — `punch_unreferenced` walks
@@ -1945,7 +2020,7 @@ impl Store {
             let mut parts = Vec::with_capacity(manifest.parts.len());
             let mut missed = false;
             for p in &manifest.parts {
-                match Part::open_in(&dir.join(&p.file), pcache.clone()) {
+                match Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits) {
                     Ok(part) => parts.push(Arc::new(part)),
                     Err(e) => {
                         let gone = e
@@ -1972,7 +2047,7 @@ impl Store {
                     ));
                     continue;
                 }
-                return Ok(ReadStore { fold: Arc::new(fold), parts, manifest });
+                return Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits });
             }
         }
         Err(last.unwrap_or_else(|| {
@@ -1990,11 +2065,22 @@ impl Store {
     /// its manifest, and the one way they vanish is the window advancing past it — a real error,
     /// reported as one.
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
+        Self::open_read_at_with_limits(dir, cfg, commit, ReadLimits::default())
+    }
+
+    /// Open a retained snapshot with explicit atomic data-plane admission.
+    pub fn open_read_at_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        commit: u64,
+        read_limits: ReadLimits,
+    ) -> Result<ReadStore> {
+        let read_limits = read_limits.validate()?;
         let manifest = load_retained(dir, commit)?;
         let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
         let mut fold = match manifest.fold_tail() {
-            Some(tail) => Fold::open_read_at(&fold_dir, cfg, tail)?,
-            None => Fold::open_read(&fold_dir, cfg)?,
+            Some(tail) => Fold::open_read_at_with_limits(&fold_dir, cfg, tail, read_limits)?,
+            None => Fold::open_read_with_limits(&fold_dir, cfg, read_limits)?,
         };
         // Erasure is declared by the LIVE manifest, not by this one. Punching commits a new manifest,
         // so a retained copy predates every punch that followed it and declares nothing — which is
@@ -2031,9 +2117,13 @@ impl Store {
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(Part::open_in(&dir.join(&p.file), pcache.clone())?));
+            parts.push(Arc::new(Part::open_in_with_limits(
+                &dir.join(&p.file),
+                pcache.clone(),
+                read_limits,
+            )?));
         }
-        Ok(ReadStore { fold: Arc::new(fold), parts, manifest })
+        Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
     }
 
     /// Resolve one piece of content to a location, consulting both dedup tiers before appending.
@@ -2070,7 +2160,14 @@ impl Store {
     /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
         let input = [ContentSpans::new(BODY_CONTENT, spans.to_vec())];
-        input_record_admission_bytes(id, &input, &attrs, self.write_limits, None)?;
+        input_record_admission_bytes(
+            id,
+            &input,
+            &attrs,
+            self.write_limits,
+            self.read_limits,
+            None,
+        )?;
         let mut novel = Vec::new();
         let body = self.fold_spans(BODY_CONTENT, spans, &mut novel)?;
         let rec = Record::new(id, vec![body], attrs)?;
@@ -2085,7 +2182,14 @@ impl Store {
         attrs: Vec<(String, AttrValue)>,
     ) -> Result<()> {
         // Validate and meter the whole map before `fold_spans` can append anything to the fold.
-        input_record_admission_bytes(id, contents, &attrs, self.write_limits, None)?;
+        input_record_admission_bytes(
+            id,
+            contents,
+            &attrs,
+            self.write_limits,
+            self.read_limits,
+            None,
+        )?;
         let mut novel = Vec::new();
         let mut carved = Vec::with_capacity(contents.len());
         for content in contents {
@@ -2186,10 +2290,11 @@ impl Store {
                     contents,
                     attrs,
                     self.write_limits,
+                    self.read_limits,
                     Some(index),
                 )?,
                 BatchItem::Delete { id } => {
-                    delete_admission_bytes(id, self.write_limits, Some(index))?
+                    delete_admission_bytes(id, self.write_limits, self.read_limits, Some(index))?
                 }
             };
             add_size(&mut batch_bytes, item_bytes);
@@ -2265,7 +2370,7 @@ impl Store {
     /// separate, deliberate operation, because the fold is shared and the same bytes may be referenced
     /// by records that are still live.
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        delete_admission_bytes(id, self.write_limits, None)?;
+        delete_admission_bytes(id, self.write_limits, self.read_limits, None)?;
         self.wal.append_tomb(self.manifest.next_seq, id)?;
         self.mem_bytes += id.len() + 32;
         self.mem.insert(id.to_string(), None);
@@ -2426,7 +2531,7 @@ impl Store {
                 }
             }
         }
-        let meta = match part::build_full(
+        let meta = match part::build_full_with_limits(
             &path,
             &recs,
             &tombs,
@@ -2435,6 +2540,7 @@ impl Store {
             self.cfg.level,
             |h| locs.get(h).copied(),
             &HashMap::new(),
+            self.read_limits,
         ) {
             Ok(meta) => meta,
             Err(error) => {
@@ -2472,7 +2578,11 @@ impl Store {
         }
         m.commit(&self.dir)?; // <- the linearization point
 
-        self.parts.push(Arc::new(Part::open_in(&path, self.pcache.clone())?));
+        self.parts.push(Arc::new(Part::open_in_with_limits(
+            &path,
+            self.pcache.clone(),
+            self.read_limits,
+        )?));
         self.manifest = m;
         // The commit may have pruned a retained manifest; whatever only it named is now sweepable.
         sweep_unreachable(&self.dir)?;
@@ -2544,12 +2654,13 @@ impl Store {
         // part outside the run could still hold an older version of the deleted id, and dropping the
         // tombstone would resurrect it.
         let total = lo == 0 && len == self.parts.len();
-        let (meta, stats) = match crate::part::merge::merge_opts_with_control(
+        let (meta, stats) = match crate::part::merge::merge_opts_with_control_and_limits(
             &path,
             &inputs,
             self.cfg.level,
             total,
             control,
+            self.read_limits,
         ) {
             Ok(built) => built,
             Err(error) => {
@@ -2567,14 +2678,15 @@ impl Store {
         // commit is attempted. Once commit starts, its ordinary crash protocol—not cancellation—
         // decides the outcome, and the output must remain available to any retained manifest that
         // may have landed.
-        let digest =
-            match std::fs::read(&path).map(|bytes| blake3::hash(&bytes).to_hex().to_string()) {
-                Ok(digest) => digest,
-                Err(error) => {
-                    let _ = crate::vfs::unlink(&path);
-                    return Err(error.into());
-                }
-            };
+        let digest = match hash_file_with_control(&path, control, "part compaction output hashing")
+            .map(|hash| hash.to_hex().to_string())
+        {
+            Ok(digest) => digest,
+            Err(error) => {
+                let _ = crate::vfs::unlink(&path);
+                return Err(error);
+            }
+        };
         if let Err(error) = control.check("part compaction") {
             let _ = crate::vfs::unlink(&path);
             return Err(error.into());
@@ -2592,7 +2704,10 @@ impl Store {
         );
         m.commit(&self.dir)?;
 
-        self.parts.splice(lo..lo + len, [Arc::new(Part::open_in(&path, self.pcache.clone())?)]);
+        self.parts.splice(
+            lo..lo + len,
+            [Arc::new(Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?)],
+        );
         self.manifest = m;
         sweep_unreachable(&self.dir)?;
         Ok(Some(stats))
@@ -2864,7 +2979,7 @@ impl Store {
                     continue;
                 }
                 let path = self.dir.join(&part_ref.file);
-                let part = Part::open_in(&path, self.pcache.clone())?;
+                let part = Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
                 if part.format_version() == crate::part::PART_VERSION {
                     continue;
                 }
@@ -3003,6 +3118,7 @@ impl Store {
             false,
             control,
             "format migration",
+            self.read_limits,
         ) {
             Ok(built) => built,
             Err(error) => {
@@ -3037,7 +3153,8 @@ impl Store {
             b3: Some(digest),
         };
         manifest.commit(&self.dir)?;
-        self.parts[plan.part_index] = Arc::new(Part::open_in(&path, self.pcache.clone())?);
+        self.parts[plan.part_index] =
+            Arc::new(Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?);
         self.manifest = manifest;
         sweep_unreachable(&self.dir)?;
         let remaining_legacy_parts = self
@@ -3642,7 +3759,7 @@ impl Store {
         }
         let seqs: Vec<(u64, u64)> =
             self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
-        let (new_gen, built, mut stats) = refold::refold_with_control(
+        let (new_gen, built, mut stats) = refold::refold_with_control_and_limits(
             &self.dir,
             &self.parts,
             &seqs,
@@ -3650,6 +3767,7 @@ impl Store {
             self.manifest.fold_gen,
             self.cfg,
             control,
+            self.read_limits,
         )?;
 
         // Data before pointers, exactly as everywhere else: the new fold and the new parts are durable
@@ -3667,7 +3785,13 @@ impl Store {
                         seq_hi: *hi,
                         records: *n,
                         b3: Some(
-                            blake3::hash(&std::fs::read(self.dir.join(file))?).to_hex().to_string(),
+                            hash_file_with_control(
+                                &self.dir.join(file),
+                                control,
+                                "content refold output hashing",
+                            )?
+                            .to_hex()
+                            .to_string(),
                         ),
                     })
                 })
@@ -3676,7 +3800,7 @@ impl Store {
             // Block ids are PER GENERATION. The new fold was rewritten without erased content and
             // therefore has no holes inherited from the old generation.
             m.punched.clear();
-            let f = Fold::open(&new_dir, self.cfg)?;
+            let f = Fold::open_with_limits(&new_dir, self.cfg, self.read_limits)?;
             let t = f.tail();
             m.fold_seg = t.seg;
             m.fold_off = t.off;
@@ -3710,9 +3834,18 @@ impl Store {
         self.pcache = Arc::new(SectionCache::new(part_cache_budget));
         self.parts.clear();
         for p in &self.manifest.parts {
-            self.parts.push(Arc::new(Part::open_in(&self.dir.join(&p.file), self.pcache.clone())?));
+            self.parts.push(Arc::new(Part::open_in_with_limits(
+                &self.dir.join(&p.file),
+                self.pcache.clone(),
+                self.read_limits,
+            )?));
         }
-        self.fold = Fold::open_at(&new_dir, self.cfg, self.manifest.fold_tail())?;
+        self.fold = Fold::open_at_with_limits(
+            &new_dir,
+            self.cfg,
+            self.manifest.fold_tail(),
+            self.read_limits,
+        )?;
         sweep_unreachable(&self.dir)?;
         // Reported, not swallowed. Claiming `bytes_reclaimed()` while the old generation still
         // occupies the disk would be a stat that says the opposite of the truth. The re-fold itself
@@ -3768,6 +3901,8 @@ impl Store {
             fold_compression_threads: self.cfg.compress_threads,
             part_cache_bytes,
             part_cache_budget,
+            max_stored_frame_bytes: self.read_limits.max_stored_frame_bytes,
+            max_decoded_frame_bytes: self.read_limits.max_decoded_frame_bytes,
             dedup_window_entries: self.fold.window_len(),
             retained_commits: retained_commits(&self.dir).len(),
             punched_blocks,
@@ -4060,11 +4195,17 @@ pub struct ReadStore {
     fold: Arc<Fold>,
     parts: Vec<Arc<Part>>,
     manifest: Manifest,
+    read_limits: ReadLimits,
 }
 
 /// A read-only store IS the committed read core, with nothing layered on top — so every method here
 /// is a direct delegation, and there is no second implementation to keep in step.
 impl ReadStore {
+    /// Atomic persisted-frame admission governing this immutable handle.
+    pub fn read_limits(&self) -> ReadLimits {
+        self.read_limits
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
         read::get(&self.parts, id)
     }

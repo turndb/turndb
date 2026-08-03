@@ -79,6 +79,18 @@ pub fn classify(error: &anyhow::Error) -> ErrorClass {
     if error.chain().any(|cause| cause.downcast_ref::<IntegrityError>().is_some()) {
         return ErrorClass::Corruption;
     }
+    if let Some(admission) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::read_limits::ReadAdmissionError>())
+    {
+        return match admission {
+            crate::read_limits::ReadAdmissionError::InvalidLimits(_) => ErrorClass::InvalidArgument,
+            crate::read_limits::ReadAdmissionError::StoredFrameTooLarge { .. }
+            | crate::read_limits::ReadAdmissionError::DecodedFrameTooLarge { .. } => {
+                ErrorClass::ResourceExhausted
+            }
+        };
+    }
     if error.chain().any(|cause| cause.downcast_ref::<crate::fold::WriterLocked>().is_some()) {
         return ErrorClass::Contention;
     }

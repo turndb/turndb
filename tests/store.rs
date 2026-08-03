@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
+use turndb::read_limits::ReadLimits;
 use turndb::store::{
     CompactionBudget, CompactionError, ContentSpans, Manifest, PartRef, Span, Store, StoreOptions,
 };
@@ -89,6 +90,10 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
             compress_threads: 1,
         },
         part_cache_bytes: 4 << 20,
+        read_limits: ReadLimits {
+            max_stored_frame_bytes: 2 << 20,
+            max_decoded_frame_bytes: 3 << 20,
+        },
         ..StoreOptions::default()
     };
     let mut store = Store::open_with_options(&dir, options).unwrap();
@@ -96,6 +101,8 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
     assert_eq!(health.fold_block_target_bytes, 4096);
     assert_eq!(health.fold_cache_budget, 2 << 20);
     assert_eq!(health.part_cache_budget, 4 << 20);
+    assert_eq!(health.max_stored_frame_bytes, 2 << 20);
+    assert_eq!(health.max_decoded_frame_bytes, 3 << 20);
     assert_eq!(health.fold_segment_max_bytes, 1 << 20);
     assert_eq!(health.fold_compression_level, 3);
     assert_eq!(health.fold_compression_threads, 1);
@@ -104,6 +111,7 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
     store.flush().unwrap();
     store.refold().unwrap();
     assert_eq!(store.health().part_cache_budget, 4 << 20);
+    assert_eq!(store.health().max_decoded_frame_bytes, 3 << 20);
     drop(store);
 
     // Reopening with other runtime policy reads the same format without migration.

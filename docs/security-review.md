@@ -78,6 +78,31 @@ Candidate zstd dictionaries are admitted under a 64 MiB ceiling for both directo
 Evidence: `manifest_size_is_refused_before_reading_a_sparse_body` and
 `advisory_sidecar_size_is_bounded_by_the_segment_it_describes`.
 
+### SR-04: atomic data-plane frames could exceed cache budgets — fixed
+
+Cache ceilings bounded retained residency but necessarily admitted one complete entry, so a selected
+part section or fold block could request the full u32 stored/decoded length first. WAL replay and fold
+tail scanning had equivalent stored-frame allocations. `ReadLimits` now checks both dimensions before
+input/output allocation, defaults each to 512 MiB, and is configurable per Rust, native Node, and
+portable WASI open. Valid policy refusals are typed `RESOURCE_EXHAUSTED`; malformed policies are
+`INVALID_ARGUMENT`.
+
+Tail scanning propagates an over-budget valid header instead of treating it as a torn boundary, so a
+strict writer recovery cannot truncate committed bytes. Writers apply the same policy: fold blocks
+seal early for small-record progress, one oversized piece fails before mutation, and part flush,
+merge, refold, and migration outputs fail before their footer publication marker. Lazy part reads
+charge only the selected section. Whole-batch piece preflight precedes the first fold mutation.
+
+Evidence: `part_toc_and_selected_sections_are_admitted_before_decode`,
+`part_writer_refuses_an_unreopenable_section_before_footer_publication`,
+`strict_fold_profile_splits_for_progress_and_refuses_one_oversized_piece_before_mutation`,
+`a_late_oversized_batch_piece_is_refused_before_any_fold_or_wal_mutation`,
+`aggregate_wal_frame_admission_precedes_fold_mutation`,
+`strict_tail_scan_refuses_without_truncating_valid_large_frames`, and
+`replay_admits_a_complete_frame_before_payload_allocation`,
+`restore_preserves_frame_budget_refusal_instead_of_calling_the_backup_invalid`, plus
+native/portable binding tests.
+
 ## Existing controls reviewed
 
 File formats reject unknown future versions/flags rather than guessing. Footer-to-TOC-to-section
@@ -108,35 +133,29 @@ enforce the single-writer lock, which is a capability reduction rather than a pa
 
 ## Residual risks and required follow-up
 
-1. **Atomic data-plane frames can still be large.** Part section and fold block headers use u32 raw
-   and stored lengths. TOCs range-check them, and cache budgets bound retained residency, but touching
-   one selected frame currently materializes it whole and admits one cache entry even when it exceeds
-   the cache budget. A hostile but structurally consistent store can therefore request up to the
-   format ceiling. Before 1.0, add configurable per-open decoded-frame admission or a streaming
-   section/block codec, thread it through Rust/native/portable capability reporting, and retain a
-   progress rule for legitimate oversized records.
-2. **Object-count admission is incomplete for directory stores.** Pack metadata is bounded and a
+1. **Object-count admission is incomplete for directory stores.** Pack metadata is bounded and a
    manifest byte ceiling indirectly limits parts, but directory enumeration of segments,
-   dictionaries, and retained files has no explicit count budget. Add a per-open filesystem-object
-   ceiling with a typed resource refusal.
-3. **Concurrent hostile filesystem mutation is not contained.** Canonical backup checks protect an
+   dictionaries, and retained files has no explicit count budget. Fold directory reconstruction can
+   also resize its block-id index from a checksummed but adversarially sparse id. Add per-open
+   filesystem-object, WAL-frame, and fold-directory-entry ceilings with typed resource refusal.
+2. **Concurrent hostile filesystem mutation is not contained.** Canonical backup checks protect an
    offline supplied store but are not an `openat2(RESOLVE_BENEATH)` sandbox. Applications must not
    grant untrusted writers access to an actively opened store directory. A future hardened Linux
    profile may use directory descriptors and no-follow/beneath resolution throughout.
-4. **Dependency and supply-chain review remains external.** Rust/Node lockfiles pin the resolved
+3. **Dependency and supply-chain review remains external.** Rust/Node lockfiles pin the resolved
    graph and CI builds all feature profiles, but this review did not independently audit DataFusion,
    Arrow, zstd, napi-rs, or the npm publication chain. Release automation should add vulnerability,
    license, provenance, and reproducible-artifact gates rather than treating source review as a
    substitute.
-5. **CPU budgets are cooperative, not preemptive.** Cancellation checkpoints surround bounded work,
+4. **CPU budgets are cooperative, not preemptive.** Cancellation checkpoints surround bounded work,
    but one zstd frame decode/encode and one part encoding unit are intentionally uninterruptible.
    Admission limits and worker isolation remain the protection against a single expensive atomic
    codec operation.
 
 These are tracked as open hardening work, not hidden behind a blanket “untrusted input safe” claim.
-Until the data-plane admission item is closed, deployments that accept arbitrary third-party store
-files should validate/restore them in a resource-limited helper process before opening them in the
-serving process.
+Deployments accepting arbitrary third-party stores should still validate them in a resource-limited
+helper process when stronger containment is required: configured allocation ceilings do not make
+codec CPU preemptive or defend against a malicious peer concurrently replacing filesystem objects.
 
 ## Review checklist for future changes
 

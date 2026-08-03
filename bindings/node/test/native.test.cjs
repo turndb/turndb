@@ -33,6 +33,7 @@ test('reports the native capability profile without a portable fallback', () => 
     commandQueueCapacity: 64,
     commandQueueCapacityMax: 65536,
     writeAdmissionLimits: true,
+    readAdmissionLimits: true,
     storeSpaceUsage: true,
     allocatedSpaceUsage: process.platform !== 'win32',
     formatMigration: true,
@@ -48,6 +49,8 @@ test('reports the native capability profile without a portable fallback', () => 
     maxBatchBytesDefault: 268435456n,
     maxBatchRecordsDefault: 4096,
     maxIdentifierBytesDefault: 4096,
+    maxStoredFrameBytesDefault: 512n << 20n,
+    maxDecodedFrameBytesDefault: 512n << 20n,
     immutableSnapshots: true,
     lifecycleOperations: true,
     backupRestore: true,
@@ -96,6 +99,8 @@ test('passes storage and cache policy through the native open seam', async (t) =
     blockTargetBytes: 8192n,
     foldCacheBytes: 2n << 20n,
     partCacheBytes: 4n << 20n,
+    maxStoredFrameBytes: 2n << 20n,
+    maxDecodedFrameBytes: 3n << 20n,
     segmentMaxBytes: 1n << 20n,
     compressionLevel: 3,
     compressionThreads: 1,
@@ -104,9 +109,15 @@ test('passes storage and cache policy through the native open seam', async (t) =
   assert.equal(health.foldBlockTargetBytes, 8192n);
   assert.equal(health.foldCacheBudget, 2n << 20n);
   assert.equal(health.partCacheBudget, 4n << 20n);
+  assert.equal(health.maxStoredFrameBytes, 2n << 20n);
+  assert.equal(health.maxDecodedFrameBytes, 3n << 20n);
   assert.equal(health.foldSegmentMaxBytes, 1n << 20n);
   assert.equal(health.foldCompressionLevel, 3);
   assert.equal(health.foldCompressionThreads, 1n);
+  const inherited = await store.snapshot();
+  assert.equal(inherited.maxStoredFrameBytes, 2n << 20n);
+  assert.equal(inherited.maxDecodedFrameBytes, 3n << 20n);
+  await inherited.close();
   await store.close();
 
   for (const options of [
@@ -115,12 +126,46 @@ test('passes storage and cache policy through the native open seam', async (t) =
     { partCacheBytes: (1n << 20n) - 1n },
     { segmentMaxBytes: 1n << 32n },
     { compressionLevel: 0 },
+    { maxStoredFrameBytes: 0n },
+    { maxDecodedFrameBytes: 0n },
   ]) {
     await assert.rejects(
       NativeStore.open(temporaryStore(t), options),
       (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
     );
   }
+});
+
+test('classifies atomic frame admission at the native storage boundary', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir, {
+    maxStoredFrameBytes: 64n,
+    maxDecodedFrameBytes: 64n,
+  });
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'large-piece',
+      contents: [{ name: 'payload', bytes: Buffer.alloc(256, 0x5a) }],
+    }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /new fold block/.test(error.message),
+  );
+  await store.close(false);
+
+  const snapshot = await NativeSnapshot.open(dir, {
+    maxStoredFrameBytes: 96n,
+    maxDecodedFrameBytes: 128n,
+  });
+  assert.equal(snapshot.maxStoredFrameBytes, 96n);
+  assert.equal(snapshot.maxDecodedFrameBytes, 128n);
+  await snapshot.close();
+
+  await assert.rejects(
+    NativeSnapshot.open(temporaryStore(t), { maxDecodedFrameBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
 });
 
 test('enforces configurable write admission with stable error classes', async (t) => {

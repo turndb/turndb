@@ -119,6 +119,12 @@ batch, batch member count, and UTF-8 identifier/name bytes. Defaults are 64 MiB,
 charged before the first fold mutation, and charging is independent of dedup history. See
 [write admission limits](docs/write-admission.md).
 
+Reads independently admit every atomic WAL, part-TOC/section, and fold-block frame before stored or
+decoded allocation. Both ceilings default to 512 MiB, are configurable per Rust/native/portable
+handle, classify refusal as `RESOURCE_EXHAUSTED`, and are distinct from cache residency. Writers seal
+fold blocks early under strict profiles and refuse oversized part outputs before publication; see
+[atomic frame read admission](docs/read-admission.md).
+
 Long-running compaction, verification, punching, refold, backup, and restore operations accept
 reusable Rust cancellation tokens and absolute deadlines through their controlled variants. The
 native Node methods map these to submission-inclusive `timeoutMs` and `AbortSignal` options while
