@@ -111,6 +111,7 @@ export interface Capabilities {
   immutableSnapshots: true;
   lifecycleOperations: true;
   backupRestore: boolean;
+  recoveryControls: true;
   healthSnapshots: true;
   schemaDiscovery: true;
   scanCancellation: true;
@@ -185,6 +186,20 @@ export declare class TurnDbError extends Error {
 
 export declare function capabilities(): Capabilities;
 export declare function retainedCommits(path: string): Promise<bigint[]>;
+export declare function recoverManifest(
+  path: string,
+  options?: { maxRollbackCommits?: bigint },
+): Promise<{
+  commit: bigint;
+  rollbackCommits: bigint;
+  records: bigint;
+  contentValues: bigint;
+  parts: bigint;
+  partSections: bigint;
+  foldSegments: number;
+  foldBlocks: bigint;
+  foldBytes: bigint;
+}>;
 export declare function restoreBackup(
   backupPath: string,
   destinationPath: string,

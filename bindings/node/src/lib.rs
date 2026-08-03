@@ -70,6 +70,30 @@ fn backup_failure(context: &str, error: anyhow::Error) -> Error {
     coded_failure(code, format!("{context}: {error:#}"))
 }
 
+fn recovery_failure(context: &str, error: anyhow::Error) -> Error {
+    let code = if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<turndb::fold::WriterLocked>().is_some())
+    {
+        "CONTENTION"
+    } else if let Some(error) = error.downcast_ref::<turndb::store::RecoveryError>() {
+        match error {
+            turndb::store::RecoveryError::Healthy(_)
+            | turndb::store::RecoveryError::RollbackLimit { .. } => "INVALID_ARGUMENT",
+            turndb::store::RecoveryError::NoUsableCandidate { .. } => "CORRUPTION",
+        }
+    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "NOT_FOUND"
+        } else {
+            "IO"
+        }
+    } else {
+        "INTERNAL"
+    };
+    coded_failure(code, format!("{context}: {error:#}"))
+}
+
 #[cfg(feature = "sql")]
 fn sql_failure(context: &str, error: anyhow::Error) -> Error {
     let code = match classify_sql_error(&error) {
@@ -247,6 +271,7 @@ pub struct NativeCapabilities {
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub backup_restore: bool,
+    pub recovery_controls: bool,
     pub health_snapshots: bool,
     pub schema_discovery: bool,
     pub scan_cancellation: bool,
@@ -286,6 +311,7 @@ pub fn capabilities() -> NativeCapabilities {
         immutable_snapshots: true,
         lifecycle_operations: true,
         backup_restore: turndb::pack::ATOMIC_RESTORE,
+        recovery_controls: true,
         health_snapshots: true,
         schema_discovery: true,
         scan_cancellation: true,
@@ -362,6 +388,24 @@ pub struct NativeBackupResult {
     pub files: BigInt,
     pub bytes: BigInt,
     pub commit: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeRecoveryOptions {
+    pub max_rollback_commits: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct NativeRecoveryResult {
+    pub commit: BigInt,
+    pub rollback_commits: BigInt,
+    pub records: BigInt,
+    pub content_values: BigInt,
+    pub parts: BigInt,
+    pub part_sections: BigInt,
+    pub fold_segments: u32,
+    pub fold_blocks: BigInt,
+    pub fold_bytes: BigInt,
 }
 
 #[napi(object)]
@@ -807,6 +851,43 @@ pub async fn restore_backup(
         commit: BigInt::from(stats.commit),
     })
     .map_err(|error| backup_failure("restore TurnDB backup", error))
+}
+
+/// Exclusively validate and promote a retained manifest over a damaged live commit point.
+#[napi]
+pub async fn recover_manifest(
+    path: String,
+    options: Option<NativeRecoveryOptions>,
+) -> Result<NativeRecoveryResult> {
+    if path.is_empty() {
+        return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
+    }
+    let max_rollback_commits = options
+        .and_then(|options| options.max_rollback_commits)
+        .map(|value| decode_u64(value, "maxRollbackCommits"))
+        .transpose()?
+        .unwrap_or(0);
+    napi::tokio::task::spawn_blocking(move || {
+        turndb::store::recover_manifest(
+            &PathBuf::from(path),
+            FoldCfg::default(),
+            turndb::store::RecoveryOptions { max_rollback_commits },
+        )
+    })
+    .await
+    .map_err(|error| failure("join TurnDB manifest recovery", error))?
+    .map(|report| NativeRecoveryResult {
+        commit: BigInt::from(report.commit),
+        rollback_commits: BigInt::from(report.rollback_commits),
+        records: BigInt::from(report.records as u64),
+        content_values: BigInt::from(report.content_values as u64),
+        parts: BigInt::from(report.parts as u64),
+        part_sections: BigInt::from(report.part_sections as u64),
+        fold_segments: report.fold_segments,
+        fold_blocks: BigInt::from(report.fold_blocks as u64),
+        fold_bytes: BigInt::from(report.fold_bytes),
+    })
+    .map_err(|error| recovery_failure("recover TurnDB manifest", error))
 }
 
 /// A native writer handle. All operations are asynchronous and serialized by its Rust actor.

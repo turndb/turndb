@@ -32,7 +32,7 @@ pub mod segment;
 pub use block::{Loc, BLOCK_TARGET_DEFAULT, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 pub use segment::FoldTail;
 
-use crate::readat::ReadAt;
+use crate::readat::{ReadAt, Slice};
 use crate::types::PieceHash;
 use anyhow::{bail, Context, Result};
 use dedup::DedupTable;
@@ -542,6 +542,51 @@ impl Fold {
         Fold::open_read_from(segs, dict_files, cfg, dir)
     }
 
+    /// Open only the durable prefix named by a manifest, ignoring later append residue.
+    pub fn open_read_at(dir: &Path, cfg: FoldCfg, committed: FoldTail) -> Result<Fold> {
+        let mut nums = list_segments(dir)?;
+        nums.retain(|segment| *segment <= committed.seg);
+        nums.sort_unstable();
+        if nums.last().copied() != Some(committed.seg) {
+            bail!(
+                "committed fold tail names segment {} but it is absent under {}",
+                committed.seg,
+                dir.display()
+            );
+        }
+        let mut segs = Vec::with_capacity(nums.len());
+        for &segment in &nums {
+            let file = Arc::new(segment::open_read(dir, segment)?);
+            let physical = file.metadata()?.len();
+            let len = if segment == committed.seg { committed.off as u64 } else { physical };
+            if len > physical {
+                bail!(
+                    "committed fold tail is {} bytes into segment {segment}, which holds only {physical}",
+                    committed.off
+                );
+            }
+            segs.push(SegmentInput {
+                seg: segment,
+                reader: Arc::new(Slice::new(file, 0, len)) as Arc<dyn ReadAt>,
+                // The committed segment may have been sealed before a later generation became
+                // active, and punched blocks can only be located through its sidecar. The parser
+                // below accepts it only when its embedded tail equals this bounded reader's length,
+                // so a sidecar describing a newer suffix remains safely advisory.
+                sidecar: std::fs::read(segment::dir_path(dir, segment)).ok(),
+            });
+        }
+        let mut dict_files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("zdict-") && name.ends_with(".zd") {
+                    dict_files.push(std::fs::read(entry.path())?);
+                }
+            }
+        }
+        Fold::open_read_from(segs, dict_files, cfg, dir)
+    }
+
     /// Open read-only from prepared inputs — the entry every SOURCE uses. A directory hands in
     /// files; a pack hands in extents; a remote store would hand in range readers. Nothing below
     /// this knows or cares which.
@@ -592,22 +637,17 @@ impl Fold {
         // The directory is rebuilt from the ids the frames carry — the same sidecar-or-scan rule
         // the writer applies, except a reader NEVER writes a missing sidecar back: a reader must
         // not mutate a store it does not own, and a slower open is the whole cost.
-        let last = segs.last().unwrap().seg;
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
-            let entries = if h.seg != last {
-                match segs[i]
-                    .sidecar
-                    .as_ref()
-                    .and_then(|b| segment::parse_dir_sidecar(b, h.seg, len))
-                {
-                    Some((_, e)) => e,
-                    None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
-                }
-            } else {
-                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+            let entries = match segs[i]
+                .sidecar
+                .as_ref()
+                .and_then(|b| segment::parse_dir_sidecar(b, h.seg, len))
+            {
+                Some((_, entries)) => entries,
+                None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
             };
             for (id, off) in entries {
                 if blockdir.len() <= id as usize {
@@ -624,7 +664,7 @@ impl Fold {
             headers,
             readers,
             dicts,
-            active: last,
+            active: segs.last().unwrap().seg,
             cur_off,
             active_f: None,
             open_block: Vec::new(),
@@ -1129,7 +1169,7 @@ fn list_segments(dir: &Path) -> Result<Vec<u32>> {
 /// Enforced by the OS *on Unix*. On `wasm32-wasip1` `sys::lock_exclusive` succeeds unconditionally,
 /// so this creates the file and gates nothing: there the invariant IS convention, and it is the
 /// embedder's to keep.
-fn acquire_writer_lock(dir: &Path) -> Result<File> {
+pub(crate) fn acquire_writer_lock(dir: &Path) -> Result<File> {
     let path = dir.join("WRITER.lock");
     let f = std::fs::OpenOptions::new()
         .create(true)

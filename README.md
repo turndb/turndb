@@ -54,6 +54,8 @@ head -4000 traces.jsonl | ./target/release/turndb import mystore -
 ./target/release/turndb pack    mystore snap.turndb
 ./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"   # SQL over one file
 ./target/release/turndb unpack  snap.turndb restored                   # validated, no overlay
+# If MANIFEST is damaged: validates the newest retained commit and permits no rollback by default
+./target/release/turndb recover mystore
 ```
 
 As a library:
@@ -81,6 +83,9 @@ s.flush()?;                                   // seal into an immutable part
 The pack command takes the writer role, settles a recovered WAL, fully verifies its staged artifact,
 and refuses to replace an output path. Restore likewise verifies before extraction and atomically
 publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
+Manifest recovery is likewise exclusive and validates the complete candidate before publication;
+rollback past the newest retained commit requires explicit authorization. See
+[manifest recovery](docs/recovery.md).
 
 The query layers are independently selectable: `--features columnar --no-default-features` provides
 the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same

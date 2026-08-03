@@ -43,6 +43,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
@@ -589,23 +590,12 @@ pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
     Ok(report)
 }
 
-/// Promote the newest intact retained manifest over a damaged `MANIFEST`.
+/// Complete the one narrowly recognizable first-commit crash window.
 ///
-/// EXPLICITLY an operator action, never automatic. In the common case — bit rot in `MANIFEST`
-/// itself — the newest retained copy carries the very same commit, and promotion loses nothing.
-/// Only when the newest copies are also damaged does promotion become a ROLLBACK to an older
-/// commit, discarding acknowledged flushes; an `open()` that silently fell back would make that
-/// loss invisible, which is why open refuses and this function exists to be called on purpose.
-///
-/// Promoting a copy whose rename never landed (a crash inside `commit`) is safe by the same rule
-/// as everything else here: data before pointers — everything a manifest names was durable before
-/// the manifest was written, so completing the commit is indistinguishable from the crash having
-/// happened a moment later.
-///
-/// Refuses when `MANIFEST` is intact, and when nothing intact remains to promote. Retained copies
-/// NEWER than the promoted commit necessarily failed to parse (an intact one would have been
-/// promoted instead) and are removed, so the log ends at the commit the store resumes from.
-pub fn recover_manifest(dir: &Path) -> Result<u64> {
+/// This intentionally checks only manifest syntax because it runs before the ordinary writer open
+/// performs the same fold/part validation it would perform had the rename landed. It is private so
+/// operator recovery cannot bypass [`recover_manifest`]'s exclusive whole-candidate validation.
+fn complete_first_commit(dir: &Path) -> Result<u64> {
     if Manifest::load(dir).is_ok() {
         bail!("MANIFEST at {} is intact — refusing to roll back a healthy store", dir.display());
     }
@@ -614,21 +604,236 @@ pub fn recover_manifest(dir: &Path) -> Result<u64> {
             continue;
         }
         let bytes = std::fs::read(retained_path(dir, c))?;
-        let tmp = dir.join("MANIFEST.tmp");
-        let f = crate::vfs::create(&tmp)?;
-        crate::vfs::write_all_at(&f, &tmp, &bytes, 0)?;
-        crate::vfs::sync_file(&f, &tmp)?;
-        drop(f);
-        crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
-        crate::vfs::sync_dir(dir)?;
-        for n in list_retained(dir) {
-            if n > c {
-                let _ = crate::vfs::unlink(&retained_path(dir, n));
-            }
-        }
+        promote_manifest(dir, c, &bytes)?;
         return Ok(c);
     }
     bail!("MANIFEST at {} is damaged and no retained manifest is intact", dir.display());
+}
+
+/// Explicit bounds for checked operator recovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryOptions {
+    /// Maximum number of newer retained commits that may be abandoned. Zero repairs only to the
+    /// newest retained commit and is the safe default.
+    pub max_rollback_commits: u64,
+}
+
+/// Evidence returned after checked manifest recovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub commit: u64,
+    pub rollback_commits: u64,
+    pub records: usize,
+    pub content_values: usize,
+    pub parts: usize,
+    pub part_sections: usize,
+    pub fold_segments: u32,
+    pub fold_blocks: usize,
+    pub fold_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum RecoveryError {
+    Healthy(PathBuf),
+    RollbackLimit { needed: u64, allowed: u64 },
+    NoUsableCandidate { examined: usize, reason: String },
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryError::Healthy(path) => write!(
+                f,
+                "MANIFEST at {} is intact; refusing recovery of a healthy store",
+                path.display()
+            ),
+            RecoveryError::RollbackLimit { needed, allowed } => write!(
+                f,
+                "recovery needs to abandon {needed} newer retained commits but only {allowed} were authorized"
+            ),
+            RecoveryError::NoUsableCandidate { examined, reason } => write!(
+                f,
+                "none of {examined} retained manifests is a fully readable recovery candidate: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
+/// Recover a damaged manifest only after excluding writers and validating the complete candidate.
+///
+/// This is an explicit offline operator action, never an automatic fallback. In the common case,
+/// the newest retained copy carries the same commit as the damaged live manifest and no data is
+/// abandoned. Falling back farther requires an explicit [`RecoveryOptions::max_rollback_commits`]
+/// allowance. Before publication, TurnDB validates the candidate's exact committed fold prefix,
+/// every named part and section, every visible content program, and every available whole-value
+/// identity. A healthy store and a concurrently open writer are both refused.
+pub fn recover_manifest(
+    dir: &Path,
+    cfg: FoldCfg,
+    options: RecoveryOptions,
+) -> Result<RecoveryReport> {
+    let _locks = recovery_locks(dir)?;
+    if Manifest::load(dir).is_ok() {
+        return Err(RecoveryError::Healthy(dir.to_path_buf()).into());
+    }
+    let commits = list_retained(dir);
+    let newest = commits.last().copied().unwrap_or(0);
+    let mut examined = 0usize;
+    let mut last_reason = "no retained manifests exist".to_string();
+    for c in commits.into_iter().rev() {
+        examined += 1;
+        let manifest = match load_retained(dir, c) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                last_reason = error.to_string();
+                continue;
+            }
+        };
+        match validate_recovery_candidate(dir, cfg, manifest) {
+            Ok(mut report) => {
+                let rollback_commits = newest.saturating_sub(c);
+                if rollback_commits > options.max_rollback_commits {
+                    return Err(RecoveryError::RollbackLimit {
+                        needed: rollback_commits,
+                        allowed: options.max_rollback_commits,
+                    }
+                    .into());
+                }
+                let bytes = std::fs::read(retained_path(dir, c))?;
+                promote_manifest(dir, c, &bytes)?;
+                report.commit = c;
+                report.rollback_commits = rollback_commits;
+                return Ok(report);
+            }
+            Err(error) => last_reason = error.to_string(),
+        }
+    }
+    Err(RecoveryError::NoUsableCandidate { examined, reason: last_reason }.into())
+}
+
+fn recovery_locks(dir: &Path) -> Result<Vec<File>> {
+    let mut folds = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read store directory {} for recovery", dir.display()))?
+        .flatten()
+    {
+        if entry.path().is_dir()
+            && refold::parse_fold_gen(&entry.file_name().to_string_lossy()).is_some()
+        {
+            folds.push(entry.path());
+        }
+    }
+    folds.sort();
+    folds.into_iter().map(|path| crate::fold::acquire_writer_lock(&path)).collect()
+}
+
+fn validate_recovery_candidate(
+    dir: &Path,
+    cfg: FoldCfg,
+    manifest: Manifest,
+) -> Result<RecoveryReport> {
+    let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
+    let mut fold = match manifest.fold_tail() {
+        Some(tail) => Fold::open_read_at(&fold_dir, cfg, tail)?,
+        None => Fold::open_read(&fold_dir, cfg)?,
+    };
+    fold.declare_punched(&manifest.punched);
+    let scrub = fold.scrub()?;
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    let mut part_sections = 0usize;
+    for part_ref in &manifest.parts {
+        let path = dir.join(&part_ref.file);
+        if let Some(want) = &part_ref.b3 {
+            let got = blake3::hash(&std::fs::read(&path)?).to_hex().to_string();
+            if &got != want {
+                bail!(
+                    "candidate commit {} names part {} with the wrong digest",
+                    manifest.commit,
+                    part_ref.file
+                );
+            }
+        }
+        let part = Arc::new(Part::open_in(&path, pcache.clone())?);
+        part_sections += part.verify_sections()?;
+        parts.push(part);
+    }
+    let reader = ReadStore { fold: Arc::new(fold), parts, manifest };
+    let ids = reader.ids()?;
+    let mut content_values = 0usize;
+    for id in &ids {
+        let record = reader.get(id)?.expect("ids returns visible records");
+        for content in record.contents {
+            let mut identity = blake3::Hasher::new();
+            for op in content.ops {
+                match op {
+                    BodyOp::Lit(bytes) => {
+                        identity.update(&bytes);
+                    }
+                    BodyOp::Piece { hash, len } => {
+                        let mut loc = None;
+                        for part in reader.parts.iter().rev() {
+                            if let Some(found) = part.lookup_piece(&hash)? {
+                                loc = Some(found);
+                                break;
+                            }
+                        }
+                        let loc = loc.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "candidate record {id:?} references absent piece {hash}"
+                            )
+                        })?;
+                        let bytes = reader.fold.read_verified(loc, hash)?;
+                        if bytes.len() != len as usize {
+                            bail!(
+                                "candidate record {id:?} says piece {hash} is {len} bytes but it is {}",
+                                bytes.len()
+                            );
+                        }
+                        identity.update(&bytes);
+                    }
+                }
+            }
+            if let Some(want) = content.identity {
+                let got = ContentHash(identity.finalize().into());
+                if got != want {
+                    bail!(
+                        "candidate record {id:?} content {:?} has identity {got}, expected {want}",
+                        content.name
+                    );
+                }
+            }
+            content_values += 1;
+        }
+    }
+    Ok(RecoveryReport {
+        records: ids.len(),
+        content_values,
+        parts: reader.parts.len(),
+        part_sections,
+        fold_segments: scrub.segments,
+        fold_blocks: scrub.blocks,
+        fold_bytes: scrub.bytes,
+        ..RecoveryReport::default()
+    })
+}
+
+fn promote_manifest(dir: &Path, commit: u64, bytes: &[u8]) -> Result<()> {
+    let tmp = dir.join("MANIFEST.tmp");
+    let f = crate::vfs::create(&tmp)?;
+    crate::vfs::write_all_at(&f, &tmp, bytes, 0)?;
+    crate::vfs::sync_file(&f, &tmp)?;
+    drop(f);
+    crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
+    crate::vfs::sync_dir(dir)?;
+    for retained in list_retained(dir) {
+        if retained > commit {
+            let _ = crate::vfs::unlink(&retained_path(dir, retained));
+        }
+    }
+    Ok(())
 }
 
 pub struct Store {
@@ -719,7 +924,7 @@ impl Store {
                 let retained = list_retained(dir);
                 if !dir.join("MANIFEST").exists() && retained == [1] {
                     if load_retained(dir, 1).is_ok() {
-                        recover_manifest(dir)?;
+                        complete_first_commit(dir)?;
                     } else {
                         crate::vfs::unlink(&retained_path(dir, 1))?;
                         crate::vfs::sync_dir(dir)?;
@@ -811,7 +1016,10 @@ impl Store {
         for _ in 0..8 {
             let manifest = Manifest::load(dir)?;
             let fold_path = refold::fold_dir(dir, manifest.fold_gen);
-            let fold = match Fold::open_read(&fold_path, cfg) {
+            let fold = match manifest.fold_tail().map_or_else(
+                || Fold::open_read(&fold_path, cfg),
+                |tail| Fold::open_read_at(&fold_path, cfg, tail),
+            ) {
                 Ok(mut fold) => {
                     // A live record never references a punched block — `punch_unreferenced` walks
                     // live visibility to decide. Declared anyway so that if a stale `Loc` ever does
@@ -882,7 +1090,11 @@ impl Store {
     /// reported as one.
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
         let manifest = load_retained(dir, commit)?;
-        let mut fold = Fold::open_read(&refold::fold_dir(dir, manifest.fold_gen), cfg)?;
+        let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
+        let mut fold = match manifest.fold_tail() {
+            Some(tail) => Fold::open_read_at(&fold_dir, cfg, tail)?,
+            None => Fold::open_read(&fold_dir, cfg)?,
+        };
         // Erasure is declared by the LIVE manifest, not by this one. Punching commits a new manifest,
         // so a retained copy predates every punch that followed it and declares nothing — which is
         // exactly how a deliberate erasure came to be reported as a checksum failure. `punched` is
@@ -1969,7 +2181,7 @@ mod tests {
         b[10] ^= 0xFF;
         std::fs::write(d.join("MANIFEST"), &b).unwrap();
         assert!(super::Manifest::load(&d).is_err());
-        assert_eq!(super::recover_manifest(&d).unwrap(), 6);
+        assert_eq!(super::complete_first_commit(&d).unwrap(), 6);
         assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 600);
 
         // MANIFEST *and* the newest copies damaged: recovery rolls back to the newest intact one
@@ -1979,17 +2191,20 @@ mod tests {
         std::fs::write(d.join("MANIFEST"), &b).unwrap();
         std::fs::write(super::retained_path(&d, 6), b"garbage").unwrap();
         std::fs::write(super::retained_path(&d, 5), b"garbage").unwrap();
-        assert_eq!(super::recover_manifest(&d).unwrap(), 4);
+        assert_eq!(super::complete_first_commit(&d).unwrap(), 4);
         assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 400);
         assert_eq!(super::list_retained(&d), vec![3, 4], "the abandoned timeline is cleared");
 
         // An intact store refuses rollback.
-        assert!(super::recover_manifest(&d).is_err(), "recovery of a healthy store must refuse");
+        assert!(
+            super::complete_first_commit(&d).is_err(),
+            "recovery of a healthy store must refuse"
+        );
 
         // A MISSING manifest beside a commit log is damage, not a new store.
         std::fs::remove_file(d.join("MANIFEST")).unwrap();
         assert!(super::Manifest::load(&d).is_err(), "missing MANIFEST + commit log must refuse");
-        assert_eq!(super::recover_manifest(&d).unwrap(), 4);
+        assert_eq!(super::complete_first_commit(&d).unwrap(), 4);
         assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 400);
         std::fs::remove_dir_all(&d).ok();
     }

@@ -61,7 +61,12 @@ content model right before compatibility turns today's choices into permanent pr
   mutation, extracts with bounded memory, validates a staged ordinary store, and uses an OS
   no-replace rename so an existing destination cannot be overlaid. The Rust and Node APIs return
   commit/file/byte facts and typed operational failures; backup scheduling, cancellation, remote
-  transfer, and retention policy remain intentionally outside this slice.
+  transfer, and retention policy remain intentionally outside this slice. Offline manifest recovery
+  now excludes live writers, refuses healthy stores, validates an exact committed fold prefix plus
+  every part, section, visible content program, piece identity, and available whole-value identity,
+  and requires explicit authorization before abandoning a newer retained commit. Rust, CLI, and Node
+  expose the same evidence report and typed refusal classes; the earlier parse-only promotion helper
+  is private to the narrowly recognizable first-commit crash window.
 
 ## Product boundary
 
@@ -340,9 +345,9 @@ explicitly choose the smaller capability set. Prebuild work should evaluate a de
 profile rather than misreporting the ordinary release artifact.
 
 Remaining Phase-3 gaps are prebuilt platform artifacts, cancellation/deadlines for long-running
-lifecycle operations and SQL planning (batch pulls are cancellable), a complete typed engine error
-taxonomy, manifest recovery controls, and measured event-loop/query overhead under a representative
-mixed workload.
+lifecycle operations, offline recovery, and SQL planning (batch pulls are cancellable), a complete
+typed engine error taxonomy, and measured event-loop/query overhead under a representative mixed
+workload.
 
 ### Maturity gate
 
