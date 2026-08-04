@@ -57,15 +57,22 @@ jobs:
         # link step died SIGBUS, then rustc reported "No space left on device" outright. The
         # preinstalled toolchains this job never uses are the reclaimable margin (~30 GiB).
         run: |
+          # set -e, so a failed step FAILS: the first swap attempt died on 'Text file busy' —
+          # /swapfile is the runner's own 3 GiB swap — and the step still reported success
+          # because its last command was `free`. A green that came from the wrong process.
+          set -euxo pipefail
           df -h / | tail -1
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h / | tail -1
-          # The SIGBUS outlived the disk margin, serial links, and a toolchain pin — one lld link
-          # of a DataFusion-static release test binary simply exceeds the runner's 7 GB RAM, and a
-          # mapped page under that pressure faults as SIGBUS on a swapless host. Swap converts
-          # that into a slow link that completes.
-          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
-          sudo mkswap /swapfile && sudo swapon /swapfile
+          # One lld link of a DataFusion-static release test binary exceeds 7.8 GiB RAM plus the
+          # runner's stock 3 GiB swap; mapped pages under that pressure fault as SIGBUS. Replace
+          # the stock swapfile with a 16 GiB one so the worst single link completes.
+          sudo swapoff /swapfile
+          sudo rm /swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           free -h | tail -2
       # Pinned, not @stable: current stable (1.97.1) ships an lld that crashes SIGBUS linking this
       # crate's release test binaries — reproduced across serial links and a 32 GiB disk margin,
