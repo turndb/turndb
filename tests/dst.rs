@@ -11,9 +11,14 @@
 //!   * opening NEVER panics, and never refuses — every reachable crash state is a documented
 //!     recovery, not an error;
 //!   * every record ACKed (its `sync()` returned) before the crash point is present and
-//!     byte-exact, and every acked delete stays deleted;
+//!     byte-exact — every named content, every attribute bit, NaN payloads included — and every
+//!     acked delete stays deleted;
 //!   * whatever else is present is byte-exact too — a half-applied batch, a resurrected record,
 //!     or drifted content is a failure even if no ack covered it.
+//!
+//! Beyond the write path, each PUBLICATION PROTOCOL gets its own crash sweep: backup, restore,
+//! manifest recovery promotion, hole punching, and format migration each run once for real, and
+//! then every op prefix × durability variant is replayed against protocol-specific invariants.
 //!
 //! Run with: `cargo test --features dst --test dst`
 #![cfg(feature = "dst")]
@@ -22,8 +27,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
-use turndb::store::{Batch, Span, Store};
+use turndb::store::{Batch, ContentSpans, RecoveryOptions, Span, Store};
 use turndb::vfs::record::{self, Op};
+use turndb::{AttrValue, BODY_CONTENT};
 
 fn tmp(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -80,6 +86,30 @@ impl Fs {
         i
     }
 
+    /// Snapshot an on-disk tree as the fully DURABLE starting state: every file fsynced, every
+    /// dirent promoted. Protocol sweeps start from a healthy committed store, so the recording
+    /// does not have to reach back through the store's construction — the main workload test
+    /// already covers those crash points.
+    fn seed_durable(&mut self, dir: &Path) {
+        let i = self.new_inode(Kind::Dir);
+        self.volatile_ns.insert(dir.to_path_buf(), i);
+        self.durable_ns.insert(dir.to_path_buf(), i);
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                self.seed_durable(&p);
+            } else {
+                let content = std::fs::read(&p).unwrap();
+                let i = self.new_inode(Kind::File);
+                self.inodes[i].durable = content.clone();
+                self.inodes[i].volatile = content;
+                self.volatile_ns.insert(p.clone(), i);
+                self.durable_ns.insert(p, i);
+            }
+        }
+    }
+
     fn apply(&mut self, op: &Op) {
         match op {
             Op::Create { path } => {
@@ -110,6 +140,19 @@ impl Fs {
                 // model truncation as a pending "rewrite to this image" so torn variants stay sane
                 node.pending.push((u64::MAX, node.volatile.clone()));
             }
+            Op::PunchHole { path, off, len } => {
+                // Deallocation reads back as zeros, so it is a data write of zeros for the model:
+                // volatile until the file's fsync, and torn variants may land only part of it —
+                // fallocate is per-extent, so a crash mid-punch genuinely can half-zero a range.
+                let i = self.touch(path);
+                let node = &mut self.inodes[i];
+                let end = (*off + *len) as usize;
+                if node.volatile.len() < end {
+                    node.volatile.resize(end, 0);
+                }
+                node.volatile[*off as usize..end].fill(0);
+                node.pending.push((*off, vec![0u8; *len as usize]));
+            }
             Op::SyncFile { path } => {
                 if let Some(&i) = self.volatile_ns.get(path) {
                     let node = &mut self.inodes[i];
@@ -136,6 +179,31 @@ impl Fs {
             }
             Op::Rename { from, to } => {
                 if let Some(i) = self.volatile_ns.remove(from) {
+                    if self.kinds[i] == Kind::Dir {
+                        // Renaming a DIRECTORY: a real filesystem keys children inside the moved
+                        // inode, so they follow it for free; this model keys them by path and must
+                        // rebase them — in BOTH namespaces, because child dirents were made
+                        // durable by the child directories' own fsyncs and are path-independent.
+                        // What stays gated on the parent's fsync is the top-level name: a crash in
+                        // which the rename never landed is the preceding op prefix (source tree
+                        // intact, destination absent), and one in which it landed is this one.
+                        let rebase = |ns: &mut BTreeMap<PathBuf, usize>| {
+                            let moved: Vec<(PathBuf, usize)> = ns
+                                .iter()
+                                .filter(|(p, _)| p.starts_with(from))
+                                .map(|(p, i)| (p.clone(), *i))
+                                .collect();
+                            for (p, _) in &moved {
+                                ns.remove(p);
+                            }
+                            for (p, i) in moved {
+                                let rel = p.strip_prefix(from).unwrap().to_path_buf();
+                                ns.insert(to.join(rel), i);
+                            }
+                        };
+                        rebase(&mut self.volatile_ns);
+                        rebase(&mut self.durable_ns);
+                    }
                     self.volatile_ns.insert(to.clone(), i);
                 }
             }
@@ -279,9 +347,24 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
 // The workload
 // ---------------------------------------------------------------------------------------------
 
+/// What one acked record must read back as: every named content byte-exact, every attribute
+/// bit-exact and in order. `AttrValue` equality compares floats by bit pattern, which is what
+/// makes the NaN-payload attr below an assertion instead of a tautology.
+#[derive(Clone, PartialEq)]
+struct Expect {
+    contents: Vec<(String, Vec<u8>)>,
+    attrs: Vec<(String, AttrValue)>,
+}
+
+impl Expect {
+    fn body(bytes: Vec<u8>) -> Expect {
+        Expect { contents: vec![(BODY_CONTENT.to_string(), bytes)], attrs: Vec::new() }
+    }
+}
+
 /// One issued logical write: `(group, id, value)`. Writes in the same group (a batch's members)
 /// commit atomically — a valid recovery may not split them.
-type Issued = (usize, String, Option<Vec<u8>>);
+type Issued = (usize, String, Option<Expect>);
 
 /// `(ops recorded when the ack returned, issued entries covered by the ack)`.
 type Ack = (usize, usize);
@@ -294,6 +377,19 @@ fn body_for(i: usize) -> Vec<u8> {
         "x".repeat(64)
     )
     .into_bytes()
+}
+
+/// The scalar-attr corners: the extremes the columnar attr encodings must round-trip exactly.
+fn corner_attrs() -> Vec<(String, AttrValue)> {
+    vec![
+        ("max".into(), AttrValue::UInt(u64::MAX)),
+        ("bin".into(), AttrValue::Bytes(vec![0x00, 0xFF, 0x00, 0x10, 0xFF])),
+        ("born".into(), AttrValue::TimestampNs(i64::MIN)),
+        ("gone".into(), AttrValue::Null),
+        // A quiet NaN with a NONSTANDARD payload. Value equality calls every NaN the same;
+        // bit equality is the store's contract, and this payload is what proves it held.
+        ("nan".into(), AttrValue::Float(f64::from_bits(0x7FF8_DEAD_BEEF_F00D))),
+    ]
 }
 
 /// A deterministic mixed workload. Returns the op log, the issued-write timeline, and the acks.
@@ -317,7 +413,38 @@ fn run_workload(dir: &Path) -> (Vec<Op>, Vec<Issued>, Vec<Ack>) {
                 want.extend_from_slice(&body);
                 want.extend_from_slice(b"]");
                 group += 1;
-                issued.push((group, id, Some(want)));
+                issued.push((group, id, Some(Expect::body(want))));
+            }
+            // One record per round with TWO named contents and the scalar-attr corners — the
+            // part of the record model the single-content puts above never reach.
+            {
+                let id = format!("m{round}");
+                let req = body_for(round * 10 + 7);
+                let resp = body_for(round * 10 + 8);
+                s.put_record(
+                    &id,
+                    &[
+                        ContentSpans::new(
+                            "req",
+                            vec![Span::Lit(b"<"), Span::Piece(&req), Span::Lit(b">")],
+                        ),
+                        ContentSpans::new("resp", vec![Span::Piece(&resp)]),
+                    ],
+                    corner_attrs(),
+                )
+                .unwrap();
+                let mut want_req = b"<".to_vec();
+                want_req.extend_from_slice(&req);
+                want_req.extend_from_slice(b">");
+                group += 1;
+                issued.push((
+                    group,
+                    id,
+                    Some(Expect {
+                        contents: vec![("req".into(), want_req), ("resp".into(), resp)],
+                        attrs: corner_attrs(),
+                    }),
+                ));
             }
             if round == 1 {
                 s.delete("r0:0").unwrap();
@@ -329,7 +456,7 @@ fn run_workload(dir: &Path) -> (Vec<Op>, Vec<Issued>, Vec<Ack>) {
                 bt.delete("r0:1");
                 s.apply(bt).unwrap();
                 group += 1; // one group, two members: atomic
-                issued.push((group, "batch:a".into(), Some(bb)));
+                issued.push((group, "batch:a".into(), Some(Expect::body(bb))));
                 issued.push((group, "r0:1".into(), None));
             }
             s.sync().unwrap();
@@ -351,18 +478,33 @@ fn run_workload(dir: &Path) -> (Vec<Op>, Vec<Issued>, Vec<Ack>) {
         s.sync().unwrap();
         acks.push((record::len(), issued.len()));
         s.flush().unwrap();
-        // A refold — the one content rewrite, with its generation swap and log purge.
-        s.refold().unwrap();
+        // ERASURE — which is also the workload's one content rewrite. `erase_ids` composes the
+        // tombstone batch, a total merge, and the re-fold with its generation swap, retained-log
+        // purge, and log truncation: everything the standalone refold() here used to exercise,
+        // now with content genuinely dropped and the erasure protocol wrapped around it.
+        let erased = s.erase_ids(&["r1:2".into(), "never-existed".into()]).unwrap();
+        assert_eq!(
+            (erased.tombstoned, erased.absent),
+            (1, 1),
+            "the erase must hit exactly one live id and record the absent one"
+        );
+        group += 1;
+        issued.push((group, "r1:2".into(), None));
+        acks.push((record::len(), issued.len()));
         // a final unsynced tail: put but never sync — allowed to vanish
         s.put("unsynced", &[Span::Piece(b"never acked, may vanish")], vec![]).unwrap();
         group += 1;
-        issued.push((group, "unsynced".into(), Some(b"never acked, may vanish".to_vec())));
+        issued.push((
+            group,
+            "unsynced".into(),
+            Some(Expect::body(b"never acked, may vanish".to_vec())),
+        ));
     }
     (record::disarm(), issued, acks)
 }
 
 /// The id -> value map after the first `p` issued entries.
-fn state_after(issued: &[Issued], p: usize) -> BTreeMap<String, Option<Vec<u8>>> {
+fn state_after(issued: &[Issued], p: usize) -> BTreeMap<String, Option<Expect>> {
     let mut m = BTreeMap::new();
     for (_, id, v) in &issued[..p] {
         m.insert(id.clone(), v.clone());
@@ -439,6 +581,9 @@ fn op_summary(op: &Op) -> String {
         }
         Op::SetLen { path, len } => format!("SetLen      {} len={len}", short(path)),
         Op::WriteFile { path, data } => format!("WriteFile   {} len={}", short(path), data.len()),
+        Op::PunchHole { path, off, len } => {
+            format!("PunchHole   {} off={off} len={len}", short(path))
+        }
         Op::SyncFile { path } => format!("SyncFile    {}", short(path)),
         Op::SyncDir { path } => format!("SyncDir     {}", short(path)),
         Op::Rename { from, to } => format!("Rename      {} -> {}", short(from), short(to)),
@@ -467,7 +612,11 @@ fn check_state(
         if let Ok(rs) = Store::open_read(stage, cfg) {
             let _ = rs.ids().map(|ids| {
                 for id in ids.iter().take(64) {
-                    let _ = rs.reconstruct(id);
+                    if let Ok(Some(rec)) = rs.get(id) {
+                        for c in &rec.contents {
+                            let _ = rs.reconstruct_content(id, &c.name);
+                        }
+                    }
                 }
             });
         }
@@ -478,31 +627,49 @@ fn check_state(
             panic!("crash point {k} {variant:?}: open REFUSED a reachable crash state: {e:#}")
         }
     };
-    // Read the whole recovered logical state.
+    // Read the whole recovered logical state: every named content of every record, plus attrs.
     let ids =
         store.ids().unwrap_or_else(|e| panic!("crash point {k} {variant:?}: ids() failed: {e:#}"));
-    let mut recovered: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+    let mut recovered: BTreeMap<String, Expect> = BTreeMap::new();
     for id in ids {
-        let v = store
-            .reconstruct(&id)
+        let rec = store
+            .get(&id)
             .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: {id} unreadable: {e:#}"));
-        recovered.insert(id, v);
-    }
-    // ids() must never list an id that then reads as absent.
-    for (id, v) in &recovered {
-        assert!(v.is_some(), "crash point {k} {variant:?}: ids() listed {id} but it reads absent");
+        // ids() must never list an id that then reads as absent.
+        let Some(rec) = rec else {
+            panic!("crash point {k} {variant:?}: ids() listed {id} but it reads absent")
+        };
+        let mut contents = Vec::new();
+        for c in &rec.contents {
+            let bytes = store
+                .reconstruct_content(&id, &c.name)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "crash point {k} {variant:?}: {id} content {:?} unreadable: {e:#}",
+                        c.name
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "crash point {k} {variant:?}: {id} lists content {:?} but it reads absent",
+                        c.name
+                    )
+                });
+            contents.push((c.name.clone(), bytes));
+        }
+        recovered.insert(id, Expect { contents, attrs: rec.attrs });
     }
 
     // PREFIX CONSISTENCY: the recovered state must equal the state after some group-boundary
     // prefix of the issued sequence, at or beyond the acked floor. This subsumes every softer
     // check — acked data present (prefix >= floor), no resurrections or holes (it is a prefix),
-    // batch atomicity (boundaries only), byte-exactness (equality).
+    // batch atomicity (boundaries only), byte-exactness (equality — now spanning every named
+    // content and every attribute bit, NaN payload included).
     let matches = boundaries.iter().filter(|&&p| p >= floor).any(|&p| {
         let want = state_after(issued, p);
-        let want_present: BTreeMap<&String, &Vec<u8>> =
-            want.iter().filter_map(|(id, v)| v.as_ref().map(|b| (id, b))).collect();
-        let got_present: BTreeMap<&String, &Vec<u8>> =
-            recovered.iter().filter_map(|(id, v)| v.as_ref().map(|b| (id, b))).collect();
+        let want_present: BTreeMap<&String, &Expect> =
+            want.iter().filter_map(|(id, v)| v.as_ref().map(|e| (id, e))).collect();
+        let got_present: BTreeMap<&String, &Expect> = recovered.iter().collect();
         want_present == got_present
     });
     assert!(
@@ -511,6 +678,501 @@ fn check_state(
          ({floor}); recovered ids: {:?}",
         recovered.keys().collect::<Vec<_>>()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Publication-protocol crash sweeps
+// ---------------------------------------------------------------------------------------------
+
+/// Replay every op prefix × variant of one recorded protocol run on top of a durable baseline,
+/// materializing each crash state under `stage` and handing it to `check`. Returns the number of
+/// states checked. Every prefix and every variant is checked — nothing is subsampled.
+fn replay_recorded(
+    tag: &str,
+    base: &Fs,
+    root: &Path,
+    ops: &[Op],
+    stage: &Path,
+    mut check: impl FnMut(&Path, usize, Variant),
+) -> usize {
+    let mut checked = 0usize;
+    for k in 0..=ops.len() {
+        let mut fs = base.clone();
+        for op in &ops[..k] {
+            fs.apply(op);
+        }
+        for &variant in VARIANTS {
+            materialize(&fs, variant, root, stage);
+            let r = catch_unwind(AssertUnwindSafe(|| check(stage, k, variant)));
+            if r.is_err() {
+                eprintln!("--- {tag}: op trace up to crash point {k} ---");
+                for (i, op) in ops[..k].iter().enumerate() {
+                    eprintln!("{i:4}: {}", op_summary(op));
+                }
+                panic!("{tag}: FAILED at crash point {k} variant {variant:?}");
+            }
+            checked += 1;
+        }
+    }
+    checked
+}
+
+/// A small settled store under `dir`, closed cleanly, plus the id -> body map it must serve.
+fn build_settled_store(dir: &Path, cfg: FoldCfg, tag: usize) -> BTreeMap<String, Vec<u8>> {
+    let mut want = BTreeMap::new();
+    let mut s = Store::open(dir, cfg).unwrap();
+    // Two commits, so the snapshot spans two parts and its manifest carries a chain link.
+    for (lo, hi) in [(0usize, 5usize), (5, 8)] {
+        for i in lo..hi {
+            let id = format!("b:{i}");
+            let body = body_for(tag + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            want.insert(id, body);
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    want
+}
+
+#[test]
+fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing() {
+    let root = tmp("backup");
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.join("store");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let want = build_settled_store(&work, cfg, 200);
+
+    let out = root.join("backup.turndb");
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        // The real protocol: writer open (its recovery included), then the staged, verified,
+        // hard-linked-no-replace publication.
+        let mut s = Store::open(&work, cfg).unwrap();
+        s.backup(&out).unwrap();
+    }
+    let ops = record::disarm();
+    // Measured at 18 ops: a settled writer open is nearly silent (empty WAL, nothing to sweep),
+    // so the stream is the pack protocol itself — staging writes, fsync, link, unlink, sync-dir.
+    assert!(ops.len() > 12, "the backup must exercise a real op stream, got {}", ops.len());
+
+    let stage = tmp("backup-stage");
+    let checked = replay_recorded("backup", &base, &root, &ops, &stage, |stage, k, variant| {
+        // The SOURCE reopens consistent no matter where the export died: backup is read-only
+        // with respect to the store's logical state.
+        let src = Store::open(&stage.join("store"), cfg).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: source store refused to open: {e:#}")
+        });
+        for (id, body) in &want {
+            assert_eq!(
+                src.reconstruct(id).unwrap().as_deref(),
+                Some(body.as_slice()),
+                "crash point {k} {variant:?}: source record {id} drifted"
+            );
+        }
+        assert_eq!(
+            src.ids().unwrap().len(),
+            want.len(),
+            "crash point {k} {variant:?}: source store gained or lost records"
+        );
+        drop(src);
+        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete pack that
+        // verifies and serves every record byte-exact. A torn file at the final name is a
+        // failure even though no acknowledgement covered it. (Staging litter beside it is
+        // allowed — the writer sweep collects it inside a store; here it is inert bytes.)
+        let dst = stage.join("backup.turndb");
+        if dst.exists() {
+            let pack = turndb::pack::Pack::open(&dst).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: a torn pack sits at the FINAL name: {e:#}")
+            });
+            pack.verify().unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: published pack fails verification: {e:#}")
+            });
+            let rs = turndb::store::open_read_pack(&dst, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: published pack refuses a reader: {e:#}")
+            });
+            for (id, body) in &want {
+                assert_eq!(
+                    rs.reconstruct(id).unwrap().as_deref(),
+                    Some(body.as_slice()),
+                    "crash point {k} {variant:?}: pack record {id} drifted"
+                );
+            }
+        }
+    });
+    println!("dst backup: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+#[test]
+fn every_restore_crash_leaves_the_destination_all_or_nothing() {
+    let root = tmp("restore");
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // The source store lives OUTSIDE the modeled root: only the pack and the restore protocol
+    // itself are under test here.
+    let srcdir = tmp("restore-src");
+    let want = build_settled_store(&srcdir, cfg, 400);
+    let pack_path = root.join("origin.turndb");
+    turndb::pack::write(&srcdir, &pack_path).unwrap();
+    std::fs::remove_dir_all(&srcdir).ok();
+
+    let dest = root.join("restored");
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    turndb::pack::restore(&pack_path, &dest).unwrap();
+    let ops = record::disarm();
+    assert!(ops.len() > 20, "the restore must exercise a real op stream, got {}", ops.len());
+
+    let stage = tmp("restore-stage");
+    let checked = replay_recorded("restore", &base, &root, &ops, &stage, |stage, k, variant| {
+        let dst = stage.join("restored");
+        if dst.exists() {
+            // Published means COMPLETE: the final name only ever appears via the no-replace
+            // rename of a fully extracted, fully fsynced, validated staging tree.
+            let mut s = Store::open(&dst, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: a partial store sits at the FINAL name: {e:#}")
+            });
+            for (id, body) in &want {
+                assert_eq!(
+                    s.reconstruct(id).unwrap().as_deref(),
+                    Some(body.as_slice()),
+                    "crash point {k} {variant:?}: restored record {id} drifted"
+                );
+            }
+            assert_eq!(s.ids().unwrap().len(), want.len());
+            s.verify().unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: restored store fails verification: {e:#}")
+            });
+        } else {
+            // No destination: the crash must be recoverable by simply RE-RUNNING the restore.
+            // Staging-directory litter is allowed to remain and must not block the retry.
+            turndb::pack::restore(&stage.join("origin.turndb"), &dst).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: restore cannot be re-run: {e:#}")
+            });
+            let s = Store::open_read(&dst, cfg).unwrap();
+            for (id, body) in &want {
+                assert_eq!(s.reconstruct(id).unwrap().as_deref(), Some(body.as_slice()));
+            }
+        }
+    });
+    println!("dst restore: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+#[test]
+fn every_recovery_crash_converges_on_the_promoted_timeline() {
+    let root = tmp("recover");
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.join("store");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // Four commits, tracking the exact logical state at each, so "the promoted prefix" is a
+    // concrete map rather than a mood.
+    let mut per_commit: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
+    {
+        let mut s = Store::open(&work, cfg).unwrap();
+        let mut now: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for c in 1usize..=4 {
+            for i in 0..3usize {
+                let id = format!("c{c}:{i}");
+                let body = body_for(300 + c * 10 + i);
+                s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                now.insert(id, body);
+            }
+            s.sync().unwrap();
+            s.flush().unwrap();
+            per_commit.push(now.clone());
+        }
+    }
+    // Damage the live commit pointer AND the two newest retained copies — the shape checked
+    // recovery exists for. The damage is the operator's starting point, not a protocol step, so
+    // it is baseline state rather than recorded ops: what gets crash-swept is recovery itself.
+    for name in ["MANIFEST", "MANIFEST.00000004", "MANIFEST.00000003"] {
+        let p = work.join(name);
+        let mut b = std::fs::read(&p).unwrap();
+        let mid = b.len() / 2;
+        b[mid] ^= 0x40;
+        std::fs::write(&p, b).unwrap();
+    }
+    let promoted_bytes = std::fs::read(work.join("MANIFEST.00000002")).unwrap();
+    let want = per_commit[1].clone(); // the state commit 2 acknowledged
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    let report =
+        turndb::store::recover_manifest(&work, cfg, RecoveryOptions { max_rollback_commits: 2 })
+            .unwrap();
+    let ops = record::disarm();
+    assert_eq!((report.commit, report.rollback_commits), (2, 2));
+    assert!(ops.len() > 5, "the promotion must exercise a real op stream, got {}", ops.len());
+
+    let stage = tmp("recover-stage");
+    let checked = replay_recorded("recovery", &base, &root, &ops, &stage, |stage, k, variant| {
+        let dir = stage.join("store");
+        // The f0f59ad invariant: the two timelines are NEVER both on disk. Once the promoted
+        // manifest is live, every abandoned newer retained name must already be durably gone —
+        // otherwise a re-run of recovery could resurrect the abandoned history, and the next
+        // flush would truncate a part those manifests still pin.
+        if std::fs::read(dir.join("MANIFEST")).ok().as_deref() == Some(promoted_bytes.as_slice()) {
+            for c in [3u64, 4] {
+                assert!(
+                    !dir.join(format!("MANIFEST.{c:08}")).exists(),
+                    "crash point {k} {variant:?}: promoted MANIFEST and abandoned retained \
+                     commit {c} are BOTH durable"
+                );
+            }
+        }
+        // Reopen. Refusal is legitimate only while the damaged manifest is still live — and from
+        // that state, RE-RUNNING recovery must converge on the same target, never a different
+        // history.
+        let store = match Store::open(&dir, cfg) {
+            Ok(s) => s,
+            Err(_) => {
+                let r = turndb::store::recover_manifest(
+                    &dir,
+                    cfg,
+                    RecoveryOptions { max_rollback_commits: 2 },
+                )
+                .unwrap_or_else(|e| {
+                    panic!("crash point {k} {variant:?}: recovery cannot resume: {e:#}")
+                });
+                assert_eq!(
+                    r.commit, 2,
+                    "crash point {k} {variant:?}: re-run recovery promoted a DIFFERENT commit"
+                );
+                Store::open(&dir, cfg).unwrap_or_else(|e| {
+                    panic!("crash point {k} {variant:?}: open refused after recovery: {e:#}")
+                })
+            }
+        };
+        // Whichever path got here: the live commit is the promoted one, nothing retained
+        // exceeds it, the chain verifies, and the logical state is exactly the promoted prefix.
+        assert_eq!(store.manifest().commit, 2, "crash point {k} {variant:?}");
+        let retained = turndb::store::retained_commits(&dir).unwrap();
+        assert!(
+            retained.iter().all(|&c| c <= 2),
+            "crash point {k} {variant:?}: retained commit newer than live survives: {retained:?}"
+        );
+        turndb::store::verify_chain(&dir).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: chain verification failed: {e:#}")
+        });
+        let ids = store.ids().unwrap();
+        assert_eq!(
+            ids,
+            want.keys().cloned().collect::<Vec<_>>(),
+            "crash point {k} {variant:?}: recovered ids are not the promoted prefix"
+        );
+        for (id, body) in &want {
+            assert_eq!(
+                store.reconstruct(id).unwrap().as_deref(),
+                Some(body.as_slice()),
+                "crash point {k} {variant:?}: promoted record {id} drifted"
+            );
+        }
+    });
+    println!("dst recovery: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// Hole punching needs `fallocate(PUNCH_HOLE)`, which only Linux provides — the same gate the
+/// operation itself lives behind. Elsewhere the punch path is unreachable, so there is nothing
+/// to crash-sweep; the declare-then-deallocate MANIFEST commit it shares with every other commit
+/// is covered by the sweeps above.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_punch_crash_leaves_declared_blocks_retryable() {
+    let root = tmp("punch");
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.join("store");
+    // A tiny block target so the superseded piece occupies its own punchable block, and
+    // INCOMPRESSIBLE content so the punched range is extent-scale (~32 KiB stored) — the size a
+    // real deallocation tears at — rather than an 18-byte zstd run.
+    let cfg = FoldCfg { block_target: 1, ..Default::default() };
+    let mut x = 0x243F_6A88_85A3_08D3u64;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    let old = noise(32 * 1024);
+    let live = noise(32 * 1024);
+    {
+        let mut s = Store::open(&work, cfg).unwrap();
+        s.put("k", &[Span::Piece(&old)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.put("k", &[Span::Piece(&live)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    let stats = {
+        let mut s = Store::open(&work, cfg).unwrap();
+        s.punch_unreferenced().unwrap()
+    };
+    let ops = record::disarm();
+    assert!(stats.blocks_punched > 0, "the workload must actually punch, got {stats:?}");
+    assert!(
+        ops.iter().any(|op| matches!(op, Op::PunchHole { .. })),
+        "the recording must see the punches — the vfs seam is the crash-safety argument"
+    );
+
+    let stage = tmp("punch-stage");
+    let checked = replay_recorded("punch", &base, &root, &ops, &stage, |stage, k, variant| {
+        let dir = stage.join("store");
+        // Erasure-in-place never endangers opening: declare-before-deallocate means every hole
+        // the crash left behind is already accounted for by the manifest. The sharpest state is
+        // the TORN punch — fallocate landed on only part of the range before power loss, so the
+        // declared block's payload is neither intact nor all zeros — and recovery must step over
+        // that frame exactly as it steps over a fully-zeroed one, because the manifest's punched
+        // declaration, not the payload's content, is the erasure authority.
+        let mut s = Store::open(&dir, cfg).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: open refused after a punch crash: {e:#}")
+        });
+        assert_eq!(
+            s.reconstruct("k").unwrap().as_deref(),
+            Some(live.as_slice()),
+            "crash point {k} {variant:?}: live record damaged by punching dead blocks"
+        );
+        // A later call retries whatever was declared but not yet (or only partially)
+        // deallocated; afterwards the declaration must stand and verification must pass over
+        // the punched fold.
+        s.punch_unreferenced()
+            .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: punch cannot resume: {e:#}"));
+        assert!(
+            !s.manifest().punched.is_empty(),
+            "crash point {k} {variant:?}: resumed punch lost the punched declaration"
+        );
+        s.verify().unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: verification failed after resumed punch: {e:#}")
+        });
+        assert_eq!(s.reconstruct("k").unwrap().as_deref(), Some(live.as_slice()));
+    });
+    println!("dst punch: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// Decode the checked-in hex dump of the version-one consumer artifact.
+fn revision_one_pack_bytes() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
+    let hex = std::fs::read_to_string(&path).unwrap();
+    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+    assert_eq!(digits.len() % 2, 0, "fixture hex must hold whole bytes");
+    digits
+        .chunks(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                .expect("fixture holds only hex digits")
+        })
+        .collect()
+}
+
+#[test]
+fn every_format_migration_crash_preserves_contents_and_resumes() {
+    let root = tmp("migrate");
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.join("store");
+    // Materialize the REAL version-1 artifact — not a synthetic fixture — and restore it into
+    // the modeled root. The restore protocol has its own sweep above; here it is baseline.
+    let pack_path = tmp("migrate-pack");
+    std::fs::write(&pack_path, revision_one_pack_bytes()).unwrap();
+    turndb::pack::restore(&pack_path, &work).unwrap();
+    std::fs::remove_file(&pack_path).ok();
+    let cfg = FoldCfg::default();
+    let want: [(&str, &[u8]); 2] =
+        [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open(&work, cfg).unwrap();
+        assert_eq!(s.format_migration_status().unwrap().legacy_parts, 2, "fixture shape moved");
+        // One legacy part rewritten and atomically published per step, twice, to completion.
+        assert!(s.migrate_format_step().unwrap().is_some());
+        assert!(s.migrate_format_step().unwrap().is_some());
+        assert!(s.migrate_format_step().unwrap().is_none());
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 20, "the migration must exercise a real op stream, got {}", ops.len());
+
+    let stage = tmp("migrate-stage");
+    let checked = replay_recorded("migration", &base, &root, &ops, &stage, |stage, k, variant| {
+        let dir = stage.join("store");
+        // Migration is commit-protocol work throughout: no crash point may leave a store that
+        // refuses to open.
+        let mut s = Store::open(&dir, cfg).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: open refused mid-migration: {e:#}")
+        });
+        let check_contents = |s: &Store, when: &str| {
+            for (id, bytes) in &want {
+                assert_eq!(
+                    s.reconstruct_content(id, BODY_CONTENT).unwrap().as_deref(),
+                    Some(*bytes),
+                    "crash point {k} {variant:?}: {id} drifted {when}"
+                );
+                let rec = s.get(id).unwrap().unwrap();
+                assert_eq!(rec.contents.len(), 1, "crash point {k} {variant:?}");
+                // Version-1 values carry no whole-value identity; neither migration nor crash
+                // recovery may invent one — an identity is computed at ingest over the original
+                // bytes or it does not exist.
+                assert!(
+                    rec.contents[0].identity.is_none(),
+                    "crash point {k} {variant:?}: identity invented for {id} {when}"
+                );
+                let n = if *id == "legacy/0001" { 1 } else { 2 };
+                assert_eq!(
+                    rec.attrs,
+                    vec![
+                        ("source".to_string(), AttrValue::Str("qualification".into())),
+                        ("n".to_string(), AttrValue::Int(n)),
+                    ],
+                    "crash point {k} {variant:?}: attrs drifted for {id} {when}"
+                );
+            }
+        };
+        check_contents(&s, "after reopen");
+        // Resume to completion. Each step retires one legacy part, so the loop is bounded by
+        // the fixture's part count; completion is proven by the status report, not by the loop
+        // merely ending.
+        let mut steps = 0usize;
+        while s
+            .migrate_format_step()
+            .unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: migration cannot resume: {e:#}")
+            })
+            .is_some()
+        {
+            steps += 1;
+            assert!(steps <= 2, "crash point {k} {variant:?}: more steps than legacy parts");
+        }
+        let status = s.format_migration_status().unwrap();
+        assert_eq!(
+            (status.legacy_parts, status.current_parts),
+            (0, 2),
+            "crash point {k} {variant:?}: migration did not complete"
+        );
+        check_contents(&s, "after completed migration");
+    });
+    println!("dst migration: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
 }
 
 /// A HashMap is deliberately not used for the namespaces: iteration order feeds materialization,

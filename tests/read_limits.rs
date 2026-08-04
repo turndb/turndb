@@ -152,7 +152,7 @@ fn strict_fold_profile_splits_for_progress_and_refuses_one_oversized_piece_befor
     fold.sync().unwrap();
     drop(fold);
 
-    let reopened = Fold::open_read_with_limits(&dir, cfg, strict).unwrap();
+    let reopened = Fold::open_read_with_limits(&dir, cfg, &[], strict).unwrap();
     assert_eq!(reopened.read_verified(pa.loc, pa.hash).unwrap(), a);
     assert_eq!(reopened.read_verified(pb.loc, pb.hash).unwrap(), b);
 }

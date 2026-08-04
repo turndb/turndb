@@ -65,6 +65,14 @@ pub mod record {
         Unlink {
             path: PathBuf,
         },
+        /// `fallocate(PUNCH_HOLE)`: deallocate a range in place. The file keeps its length and the
+        /// range reads back as zeros — the one operation that destroys committed bytes without
+        /// moving a name, which is exactly why the simulator must see it.
+        PunchHole {
+            path: PathBuf,
+            off: u64,
+            len: u64,
+        },
         Mkdir {
             path: PathBuf,
         },
@@ -220,6 +228,19 @@ pub(crate) fn unlink(path: &Path) -> Result<()> {
     std::fs::remove_file(path)?;
     #[cfg(feature = "dst")]
     push(Op::Unlink { path: path.to_path_buf() });
+    Ok(())
+}
+
+/// Deallocate `len` bytes at `off` in place (`fallocate(PUNCH_HOLE)` where the platform has it).
+/// Volatile until the file's fsync, like any other data mutation — a crash may leave the range
+/// intact, fully zeroed, or partially zeroed, and the simulator models all three.
+#[inline]
+pub(crate) fn punch_hole(f: &File, path: &Path, off: u64, len: u64) -> Result<()> {
+    crate::sys::punch_hole(f, off, len)?;
+    #[cfg(feature = "dst")]
+    push(Op::PunchHole { path: path.to_path_buf(), off, len });
+    #[cfg(not(feature = "dst"))]
+    let _ = path;
     Ok(())
 }
 

@@ -183,7 +183,7 @@ fn sparse_persisted_block_id_is_refused_before_block_directory_resize() {
     file[checksum_at..checksum_at + block::BLOCK_XSUM_LEN].copy_from_slice(&checksum);
     std::fs::write(&path, file).unwrap();
 
-    let error = match Fold::open_read_with_limits(&dir, cfg, with_counts(100, 100, 4)) {
+    let error = match Fold::open_read_with_limits(&dir, cfg, &[], with_counts(100, 100, 4)) {
         Ok(_) => panic!("a sparse hostile block id must not size the directory"),
         Err(error) => error,
     };
