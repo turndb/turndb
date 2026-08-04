@@ -47,7 +47,7 @@ commands, artifact measurements, the glibc floor, and first-release gates.
 - Attributes are an ordered array, not an object. Duplicate names and exact scalar types survive.
   Signed/unsigned integers and UTC nanosecond timestamps enter and leave as JavaScript `bigint`;
   binary metadata and content use `Buffer`; explicit null carries its own `kind`. See
-  [the revision-4 scalar contract](../../docs/field-types-v4.md).
+  [the version-2 scalar contract](../../docs/field-types-v4.md).
 - `scan()` is the Rust structured pager. Rust owns visibility, filtering, ordering, work bounds, and
   opaque cursor validation. The writer view includes accepted unflushed writes. Content metadata
   includes `identity`, the lowercase BLAKE3 hex digest of the complete reconstructed value, when its

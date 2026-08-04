@@ -64,7 +64,7 @@ pub const FOOTER_LEN: u64 = 56;
 ///
 /// This claims one of the footer's padding bytes, which cost nothing because they were already
 /// zero-filled: a part written before this existed reads as version 0, which is exactly what it is.
-pub const PART_VERSION: u8 = 4;
+pub const PART_VERSION: u8 = 2;
 
 /// Content-program op tags, packed into the low bit of a varint.
 pub(crate) const OP_LIT: u64 = 0;
@@ -1008,7 +1008,7 @@ impl Part {
             if !dense && !self.has(&rid) {
                 bail!("sparse content {name:?} is missing its row-id section");
             }
-            if self.version >= 3 {
+            if self.version >= 2 {
                 if !self.has(&identity) {
                     bail!("content {name:?} is missing its identity section");
                 }
@@ -1153,7 +1153,7 @@ impl Part {
         if r >= self.len() {
             bail!("row {r} out of range");
         }
-        if self.version <= 2 {
+        if self.version <= 1 {
             return Ok(None);
         }
         let columns = self.content_meta()?;
@@ -1254,7 +1254,7 @@ impl Part {
             let prog = self.sect(&prog_name)?;
             let offs = self.nums(&off_name, 8)?;
             let identities =
-                if self.version >= 3 { Some(self.sect(&format!("con.id.{col}"))?) } else { None };
+                if self.version >= 2 { Some(self.sect(&format!("con.id.{col}"))?) } else { None };
 
             for (output, &row) in rows.iter().enumerate() {
                 let occurrence = if meta.dense {
@@ -1518,15 +1518,12 @@ impl Part {
     }
 }
 
+/// Hand-encode a genuine version-1 part: one body-centric program per row, no `cmeta`, no
+/// `con.*` sections. The migration tests need real legacy bytes produced independently of the
+/// current writer, which can no longer emit this layout.
 #[cfg(test)]
-pub(crate) fn build_revision_two_fixture(path: &Path, seq: u64, id: &str) -> Result<PartMeta> {
+pub(crate) fn build_revision_one_fixture(path: &Path, seq: u64, id: &str) -> Result<PartMeta> {
     let (ids, restarts) = idcol::build(&[id.to_string()])?;
-    let mut cmeta = Vec::new();
-    put_varint(&mut cmeta, 1);
-    put_varint(&mut cmeta, 7);
-    cmeta.extend_from_slice(b"payload");
-    put_varint(&mut cmeta, 1);
-    cmeta.push(content::RID_DENSE);
     let mut prog = Vec::new();
     put_varint(&mut prog, 1);
     put_varint(&mut prog, (6u64 << 1) | OP_LIT);
@@ -1536,48 +1533,11 @@ pub(crate) fn build_revision_two_fixture(path: &Path, seq: u64, id: &str) -> Res
     let mut writer = Writer::new(path, 3)?;
     writer.section("ids", &ids)?;
     writer.section("ids.restart", &u32s(&restarts))?;
-    writer.section("cmeta", &cmeta)?;
-    writer.section("con.prog.0", &prog)?;
-    writer.section("con.off.0", &u64s(&[0, prog.len() as u64]))?;
+    writer.section("prog", &prog)?;
+    writer.section("prog.off", &u64s(&[0, prog.len() as u64]))?;
     writer.section("pdict.loc", &[])?;
     writer.section("pdict.hash", &[])?;
-    writer.finish_version(meta, 2)?;
-    Ok(meta)
-}
-
-#[cfg(test)]
-pub(crate) fn build_revision_three_fixture(
-    path: &Path,
-    seq: u64,
-    id: &str,
-    payload: &[u8],
-) -> Result<PartMeta> {
-    let (ids, restarts) = idcol::build(&[id.to_string()])?;
-    let mut cmeta = Vec::new();
-    put_varint(&mut cmeta, 1);
-    put_varint(&mut cmeta, 7);
-    cmeta.extend_from_slice(b"payload");
-    put_varint(&mut cmeta, 1);
-    cmeta.push(content::RID_DENSE);
-    let mut prog = Vec::new();
-    put_varint(&mut prog, 1);
-    put_varint(&mut prog, ((payload.len() as u64) << 1) | OP_LIT);
-    prog.extend_from_slice(payload);
-    let mut identity = Vec::with_capacity(33);
-    identity.push(1);
-    identity.extend_from_slice(blake3::hash(payload).as_bytes());
-
-    let meta = PartMeta { n_records: 1, seq_lo: seq, seq_hi: seq };
-    let mut writer = Writer::new(path, 3)?;
-    writer.section("ids", &ids)?;
-    writer.section("ids.restart", &u32s(&restarts))?;
-    writer.section("cmeta", &cmeta)?;
-    writer.section("con.prog.0", &prog)?;
-    writer.section("con.off.0", &u64s(&[0, prog.len() as u64]))?;
-    writer.section("con.id.0", &identity)?;
-    writer.section("pdict.loc", &[])?;
-    writer.section("pdict.hash", &[])?;
-    writer.finish_version(meta, 3)?;
+    writer.finish_version(meta, 1)?;
     Ok(meta)
 }
 
@@ -1636,20 +1596,7 @@ mod compatibility_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.part");
-        let (ids, restarts) = idcol::build(&["legacy".to_string()]).unwrap();
-        let mut prog = Vec::new();
-        put_varint(&mut prog, 1);
-        put_varint(&mut prog, (6u64 << 1) | OP_LIT);
-        prog.extend_from_slice(b"legacy");
-
-        let mut writer = Writer::new(&path, 3).unwrap();
-        writer.section("ids", &ids).unwrap();
-        writer.section("ids.restart", &u32s(&restarts)).unwrap();
-        writer.section("prog", &prog).unwrap();
-        writer.section("prog.off", &u64s(&[0, prog.len() as u64])).unwrap();
-        writer.section("pdict.loc", &[]).unwrap();
-        writer.section("pdict.hash", &[]).unwrap();
-        writer.finish_version(PartMeta { n_records: 1, seq_lo: 1, seq_hi: 1 }, 1).unwrap();
+        build_revision_one_fixture(&path, 1, "legacy").unwrap();
 
         let part = Part::open(&path).unwrap();
         assert_eq!(
@@ -1661,29 +1608,12 @@ mod compatibility_tests {
             record.contents,
             vec![Content::new(BODY_CONTENT, vec![BodyOp::Lit(b"legacy".to_vec())])]
         );
+        assert_eq!(part.content_identity(0, BODY_CONTENT).unwrap(), None);
         let fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
         assert_eq!(
             part.reconstruct_content(0, BODY_CONTENT, &fold).unwrap(),
             Some(b"legacy".to_vec())
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_revision_two_named_value_reports_whole_identity_unavailable() {
-        let dir = std::env::temp_dir().join(format!(
-            "turndb-part-v2-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("legacy-named.part");
-        build_revision_two_fixture(&path, 1, "legacy").unwrap();
-
-        let part = Part::open(&path).unwrap();
-        assert_eq!(part.content(0, "payload").unwrap().unwrap(), [BodyOp::Lit(b"legacy".to_vec())]);
-        assert_eq!(part.content_identity(0, "payload").unwrap(), None);
-        assert_eq!(part.record(0).unwrap().contents[0].identity, None);
-        std::fs::remove_dir_all(dir).ok();
     }
 }

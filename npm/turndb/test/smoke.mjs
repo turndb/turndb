@@ -20,7 +20,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.threads, false);
   assert.equal(c.columnar, false);
   assert.equal(c.sql, false);
-  assert.equal(c.part_format_write, 4);
+  assert.equal(c.part_format_write, 2);
   assert.equal(c.write_admission_limits, true);
   assert.equal(c.read_admission_limits, true);
   assert.equal(c.object_count_admission, true);

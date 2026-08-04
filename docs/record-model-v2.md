@@ -1,14 +1,15 @@
-# General records and named content: format revision 2
+# General records and named content: format version 2
 
-Revision 3 retains this named-column model and adds exact whole-value identities in parallel
-`con.id.N` sections. See [`content-identity-v3.md`](content-identity-v3.md); this document remains the
-design and compatibility record for the revision-2 generalization.
+On-disk version 2 also carries exact whole-value identities in parallel `con.id.N` sections and the
+complete scalar attribute tag set. See [`content-identity-v3.md`](content-identity-v3.md) and
+[`field-types-v4.md`](field-types-v4.md); this document remains the design and compatibility record
+for the version-2 generalization of the record model.
 
 Status: accepted for implementation on `codex/turn-maturity`.
 
 This decision is the first format-bearing step in the roadmap. It describes the logical record model,
 the compatibility boundary, and the physical direction. `FORMAT.md` remains normative for every format
-the code actually writes; this document becomes historical design rationale once revision 2 is fully
+the code actually writes; this document becomes historical design rationale once version 2 is fully
 specified there.
 
 ## Decision
@@ -62,9 +63,9 @@ program whose piece references address the shared fold. The fold remains involve
 This is the property that a general columnar database with a hash column does not acquire merely by
 storing the same fields.
 
-## Part revision 2
+## Part version 2
 
-Revision 2 replaces the singular per-row `prog`/`prog.off` pair with sparse, named content columns.
+Version 2 replaces the singular per-row `prog`/`prog.off` pair with sparse, named content columns.
 Content columns are assigned ordinals by sorted content name, independent of input order.
 
 `cmeta` contains:
@@ -92,12 +93,12 @@ columnar plane. Reading `content.response` must not decompress programs for `con
 less reconstruct either value from the fold. The cost is two or three small sections per distinct
 content name, which is bounded by the content-column universe rather than record count.
 
-`cmeta` is required in revision 2 even when it declares zero columns. Every declared content column
+`cmeta` is required in version 2 even when it declares zero columns. Every declared content column
 requires its program and offset sections. Its row-id section is required exactly when the column is
 sparse. Duplicate names, unsorted names, invalid row ids, inconsistent occurrence counts, bad offsets,
 and trailing metadata are corruption and are refused.
 
-Revision 2 no longer requires `prog` or `prog.off`. Revision-0 and revision-1 parts retain their existing
+Version 2 no longer requires `prog` or `prog.off`. Version-0 and version-1 parts retain their existing
 requirements and interpretation. The footer part version moves to 2, so older readers refuse new parts
 before applying the old required-section rules.
 
@@ -107,7 +108,8 @@ The WAL has no payload version byte, so a new record payload cannot reuse the cu
 new standalone record tag and a new in-batch record tag introduce the generalized payload. Existing
 record and tombstone tags retain their exact interpretation.
 
-The revision-2 record payload is:
+The generalized record payload, as first designed (whole-value identities were added to the same
+on-disk version before any release), is:
 
 ```text
 varint  id_len
@@ -131,7 +133,7 @@ Novel piece bytes remain a record-level set. The same piece referenced from seve
 carried once when new and not at all when already durable.
 
 A reader that predates these tags verifies their frame checksums and refuses them as unknown rather
-than dropping acknowledged records. A revision-2 reader replays both old and new record tags, adapting
+than dropping acknowledged records. A version-2 reader replays both old and new record tags, adapting
 the old singular body to named content in memory.
 
 ## Query model
@@ -166,18 +168,18 @@ contract; requiring a flush for query visibility is not acceptable for live cons
 
 ## Migration
 
-TurnDB promises to read the immediately preceding format revision and refold it forward. The revision-2
+TurnDB promises to read the immediately preceding format revision and refold it forward. The version-2
 implementation therefore:
 
 1. reads revision-0 and revision-1 parts through the logical `body` content adapter;
 2. replays both old and new WAL frames;
-3. writes revision-2 parts for every new flush, merge, and refold; and
-4. rewrites old parts as revision 2 during ordinary merge or explicit refold.
+3. writes version-2 parts for every new flush, merge, and refold; and
+4. rewrites old parts as version 2 during ordinary merge or explicit refold.
 
-A store may temporarily contain revision-1 and revision-2 parts. Version resolution operates on their
+A store may temporarily contain version-1 and version-2 parts. Version resolution operates on their
 logical records and is independent of their physical content layout.
 
-Downgrading after the first revision-2 part is published is refused by the old reader's existing part
+Downgrading after the first version-2 part is published is refused by the old reader's existing part
 version check. No manifest flag is required to make that refusal safe.
 
 ## Initial scope

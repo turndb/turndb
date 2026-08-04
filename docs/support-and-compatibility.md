@@ -95,15 +95,15 @@ durability, validation, erasure, or byte-exact reconstruction.
 ## On-disk versions
 
 Package semver and format versions are independent. `FORMAT.md` is normative and the current writer
-emits part version 4. The compatibility promise is operational:
+emits part version 2. The compatibility promise is operational:
 
 - a build reads the immediately preceding format revision and can migrate it forward;
 - newer readers refuse unknown future layouts unless an explicitly optional section can be ignored;
 - older readers may refuse a newer store; downgrade writing is not promised;
 - migration is explicit, preflighted, part-sized, restartable, and does not invent missing content
   identities;
-- format fixtures are immutable evidence. The revision-3 reference pack is rebuilt by private test
-  machinery and migrated through the public Node API; release fixtures remain after newer fixtures
+- format fixtures are immutable evidence. The legacy reference pack carries real version-1 bytes
+  and is migrated through the public Node API; release fixtures remain after newer fixtures
   are added.
 
 Advancing the writer format is a minor-or-major package change, never a patch. A release must add the

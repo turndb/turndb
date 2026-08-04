@@ -43,8 +43,8 @@ concepts are ordinary consumer-selected field/content names rather than core sch
 
 ## Compatibility
 
-The writer emits format revision 4. This release reads revision 3 and can migrate it incrementally;
-the retained revision-3 fixture is exercised through the public Node API. Native and portable WASI
+The writer emits format version 2. This release reads version 1 and can migrate it incrementally;
+the retained legacy fixture is exercised through the public Node API. Native and portable WASI
 builds have bidirectional byte-exact store interoperability where capabilities overlap.
 
 Package and format versions are independent. During `0.x`, a minor release may advance the writer

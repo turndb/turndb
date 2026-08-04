@@ -149,7 +149,7 @@ inputs are accepted only inside JavaScript's safe range; use `bigint` for the fu
 Unsigned u64 and UTC nanosecond timestamps use `{ u: bigint }` and
 `{ timestampNs: bigint }` wrappers so a read-modify-write cycle retains their type. `Uint8Array`
 stores binary metadata and `null` stores explicit null; missing remains absence of the key. See
-[the revision-4 scalar contract](../../docs/field-types-v4.md).
+[the version-2 scalar contract](../../docs/field-types-v4.md).
 The JSON-only WASM boundary carries those values as decimal text internally, never through a float.
 Non-finite f64 values also use explicit text spellings rather than JSON `null`.
 
