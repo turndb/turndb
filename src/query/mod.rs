@@ -723,12 +723,16 @@ impl PartScan {
             let lo = self.row;
             let cap = (lo + BATCH_ROWS).min(end);
             let take = self.select(lo, cap);
-            let first = self.visible.partition_point(|&row| row < lo);
-            let last = self.visible.partition_point(|&row| row < cap);
-            let visible = last - first;
-            self.stats.rows_hidden += (cap - lo) - visible;
-            self.stats.rows_filtered += visible - take.len();
             if take.is_empty() {
+                // A skipped window is consumed whole, so its accounting is final here. A window
+                // that produces a batch is NOT: fetch and byte ceilings can close the batch early,
+                // and rows past the last consumed one are re-examined by the next call — counting
+                // them now would double-count them then. Their accounting waits until the close
+                // point is known.
+                let first = self.visible.partition_point(|&row| row < lo);
+                let visible = self.visible.partition_point(|&row| row < cap) - first;
+                self.stats.rows_hidden += (cap - lo) - visible;
+                self.stats.rows_filtered += visible;
                 self.stats.batches_skipped += 1;
                 self.row = cap;
                 continue;
@@ -778,6 +782,14 @@ impl PartScan {
         // Resume after the last row consumed, not after the last row examined.
         let hi = lo + take.last().copied().map_or(0, |r| r + 1);
         let len = take.len();
+        // Deferred window accounting, over exactly [lo, hi): what this batch consumed. Selected
+        // rows past `hi` were examined but will be selected again next call; hidden and filtered
+        // rows past `hi` will be re-derived then. Counting to `cap` here made both counters drift
+        // upward whenever fetch or the byte ceiling closed a batch early.
+        let first = self.visible.partition_point(|&row| row < lo);
+        let consumed_visible = self.visible.partition_point(|&row| row < hi) - first;
+        self.stats.rows_hidden += (hi - lo) - consumed_visible;
+        self.stats.rows_filtered += consumed_visible - len;
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len());
 
         for (column, values) in self.cols.iter().zip(&content_values) {

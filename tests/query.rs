@@ -18,7 +18,7 @@ use turndb::query::{
     collect,
     sql::{classify_error, SqlBudget, SqlErrorClass, SqlOptions, SqlQuery, SqlValue},
     table::TurndbTable,
-    Lens,
+    Cmp, Lens, Pred,
 };
 use turndb::scan::{
     Compare, ContentMode, ContentSelect, Direction, Predicate, ScanRequest, ScanRow,
@@ -1448,6 +1448,73 @@ async fn a_filtered_body_query_reconstructs_only_matching_rows() {
     );
     assert!(st.rows_filtered >= 500, "the scan should have excluded most rows itself");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Hidden/filtered accounting must cover exactly the rows a batch CONSUMED. When a fetch closes a
+/// batch early, the rows past the close point are either re-examined by the next call or never
+/// reached at all — counting the whole examined window inflated both counters on every early
+/// close. Driven through the lens directly so the fetch demonstrably reaches the scan.
+#[test]
+fn early_batch_close_does_not_inflate_window_accounting() {
+    let dir = ScopedDir::new("early-close-stats");
+    let mut s = Store::open(dir.path(), cfg()).unwrap();
+    for (id, x) in [("a", 0), ("b", 1), ("c", 0), ("d", 1)] {
+        s.put(id, &[Span::Lit(b"v")], vec![("x".into(), AttrValue::Int(x))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(dir.path(), cfg()).unwrap();
+    let (_fold, parts) = store.into_parts();
+    let lens = Lens::new(&parts).unwrap();
+    let proj = lens.project(&["id"]).unwrap();
+    let x = lens.project(&["x"]).unwrap()[0];
+    let preds = [Pred { field: x, op: Cmp::Eq, val: AttrValue::Int(1) }];
+    let mut scan = lens.scan(&parts[0], None, &proj, &preds).unwrap().with_fetch(Some(1));
+    let batch = scan.next_batch().unwrap().expect("b matches");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "b");
+    assert!(scan.next_batch().unwrap().is_none());
+
+    let st = scan.stats();
+    assert_eq!(st.rows, 1);
+    // The fetch closes the batch at `b`, so only `a` was consumed as filtered; `c` was examined
+    // but not consumed, and counting it (the old behavior reported 2 here) claims filter work
+    // the returned rows never depended on.
+    assert_eq!(st.rows_filtered, 1, "filtered must count only the consumed window");
+    assert_eq!(st.rows_hidden, 0);
+}
+
+/// A full drain has no early closes, so the totals must be EXACT: every physical row is consumed
+/// exactly once as returned, filtered, or hidden — across both the batch path and the
+/// skipped-window path, and whichever order the per-part partitions ran in.
+#[tokio::test]
+async fn a_full_drain_accounts_for_every_physical_row_exactly_once() {
+    let dir = ScopedDir::new("full-drain-stats");
+    let mut s = Store::open(dir.path(), cfg()).unwrap();
+    for (id, x) in [("a", 0), ("b", 1), ("c", 0), ("d", 1), ("zz", 0)] {
+        s.put(id, &[Span::Lit(b"v")], vec![("x".into(), AttrValue::Int(x))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    // A second part whose tombstone hides `zz` in the first: one hidden row in part one (the
+    // shadowed `zz`) and one physical non-visible row in part two (the tombstone itself).
+    s.delete("zz").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(dir.path(), cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    table.reset_stats();
+    let batches = ctx.sql("SELECT id FROM t WHERE x = 1").await.unwrap().collect().await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "b and d");
+
+    let st = table.stats();
+    assert_eq!(st.rows, 2);
+    assert_eq!(st.rows_filtered, 2, "a and c, exactly once each");
+    assert_eq!(st.rows_hidden, 2, "the shadowed zz and the tombstone row");
 }
 
 #[tokio::test]
