@@ -1,6 +1,6 @@
 # turndb on-disk format
 
-**Status: format version 1. Not frozen.** See [Compatibility](#compatibility) for what is
+**Status: format version 2. Not frozen.** See [Compatibility](#compatibility) for what is
 promised and what is not.
 
 This is the one document in this repository, and the only place mechanics are written down twice. It
@@ -163,7 +163,7 @@ offset  size  field
     28     8  seq_lo        inclusive sequence range this part covers
     36     8  seq_hi
     44     1  toc_codec
-    45     1  version       format version; 0 predates this field
+    45     1  version       format version; this revision writes 2; 0 predates this field
     46     4  toc_xsum      crc32 of the STORED TOC payload      (version >= 1)
     50     2  reserved, zero
     52     4  xsum          first 4 bytes of BLAKE3 over footer[0..52]
@@ -228,8 +228,7 @@ Absence is meaningful, but it does **not** mean "anything may be missing". Three
 |---|---|
 | `ids` | front-coded id column, strictly increasing |
 | `ids.restart` | u32 stream offsets, one every `RESTART` = 16 ids |
-| `prog` | body programs, one per row |
-| `prog.off` | u64 offsets into `prog`, `n_records + 1` of them |
+| `cmeta` | named content-column metadata; required even when it declares zero columns (version ≥ 2) |
 | `pdict.loc` | piece dictionary `Loc`s, 12 bytes each, sorted in FOLD order |
 | `pdict.hash` | piece hashes, 32 bytes each, parallel to `pdict.loc` |
 
@@ -240,10 +239,13 @@ dictionary's size.
 
 | name | required when |
 |---|---|
+| `con.prog.N`, `con.off.N` | content column *N* exists in `cmeta` |
+| `con.id.N` | content column *N* exists in `cmeta` (version ≥ 2) |
+| `con.rid.N` | content column *N* is sparse; absent and **elided** when dense |
 | `layout`, `layout.off`, `colmeta` | any record carries an attribute |
 | `col.val.N` | column *N* exists in `colmeta` |
 | `col.rid.N` | column *N*'s `rid_kind` is 1 (delta); absent and **elided** when dense |
-| `col.dict.N` | column *N*'s tag is 0 (string) |
+| `col.dict.N` | column *N*'s tag is 0 (string) or 5 (binary) |
 
 **Optional / advisory.** A reader may ignore these entirely and remain correct, only slower or less
 strict. A writer at this version always emits all of them except `tomb`.
@@ -257,6 +259,12 @@ strict. A writer at this version always emits all of them except `tomb`.
 
 Unknown section names must be ignored, not rejected: that is what lets a later version add one without
 moving `version`.
+
+Version-0 and version-1 parts predate named content. They require `prog` and `prog.off`, holding one
+body program per row, instead of `cmeta` and `con.*`; a current reader presents that physical body as
+a dense content column named `body`. Version 2 is the single successor of version 1: it introduces
+named content columns, whole-value identities (`con.id.N`), and the complete scalar attribute tag
+set 4 through 7, and it never writes the legacy sections.
 
 **The piece dictionary is sorted in fold order, not hash order**, and `pdict.hsort` carries hash order
 separately. Two orders over one dictionary rather than two dictionaries: fold order keeps `pdict.loc`
@@ -301,14 +309,14 @@ repeated n_tombstones times:
 
 #### col.dict.N
 
-Sorted and distinct, which is what lets a reader binary-search it for a value and compare ordinals
-instead of strings.
+Sorted and distinct, which is what lets a reader binary-search it for a value and compare ordinals.
+Entries are UTF-8 for tag 0 and arbitrary bytes for tag 5.
 
 ```
 varint   n_entries
 repeated n_entries times:
   varint  len
-  bytes   utf8
+  bytes   utf8 for tag 0, arbitrary bytes for tag 5
 ```
 
 #### layout
@@ -324,9 +332,31 @@ repeated n_attrs times:
 
 Reconstruction walks this sequence and draws the next unconsumed value from each named column.
 
-#### Body programs
+#### Named content columns
 
-Per row, in `prog` at `prog.off[row]`:
+Content names are unique within a record and sorted by their UTF-8 bytes into physical column
+ordinals. `cmeta` is:
+
+```
+varint  n_content_columns
+repeated n_content_columns times:
+  varint  name_len
+  bytes   utf8_name
+  varint  occurrences
+  u8      rid_kind       0 dense, 1 ascending delta row ids
+```
+
+Each column *N* has `con.prog.N`, containing programs in occurrence order, and `con.off.N`, containing
+`occurrences + 1` little-endian u64 offsets. Version 2 also has `con.id.N`, exactly 33 bytes per
+occurrence in the same order: one availability byte followed by a 32-byte digest. Availability `1`
+means the digest is BLAKE3 of the exact reconstructed value; availability `0` requires an all-zero
+digest and represents a value carried forward from an older or explicitly unidentified source. No
+other availability value is valid. A sparse column also has `con.rid.N`, an ascending delta-varint
+sequence of row ids; a dense column occurs exactly once on every row and elides that section. Content
+names must be non-empty, unique, and strictly sorted. Row ids must be unique and in range. Any
+disagreement among `cmeta`, offsets, identities, row ids, and section presence is corruption.
+
+An occurrence's program is:
 
 ```
 varint  n_ops
@@ -336,9 +366,11 @@ repeated n_ops times:
   op 1 (piece):    payload is a dictionary ordinal, followed by a varint length
 ```
 
-Concatenating the ops in order reproduces the record's body **byte for byte**. That is the format's
-central promise, and it has exactly one exception: content erased for privacy or retention reasons
-cannot be reproduced, by definition. See [Erasure](#erasure) for what a reader gets instead.
+Concatenating the ops in order reproduces that named content value **byte for byte**. An empty program
+is a present empty value; a missing row id is absence. Every content column uses the same part-wide
+piece dictionary, so identical bytes deduplicate across content names and records. The byte-exact
+promise has one exception: content erased for privacy or retention reasons cannot be reproduced, by
+definition. See [Erasure](#erasure) for what a reader gets instead.
 
 `tagged == 0` is **RESERVED**. It would encode a zero-length literal, which contributes nothing; a
 writer must not emit one, and a reader must refuse it. A future revision may define it as an escape
@@ -373,10 +405,10 @@ repeated n_columns times:
   if 1:  8 bytes min, 8 bytes max
 ```
 
-Min and max encode in the column's own width rules: i64 little-endian, f64 as **bits** (compared
-as floats by the reader), bool widened to 8 bytes as 0 or 1. Three deliberate absences: a string
-column never carries a zone, because its sorted-distinct dictionary already bounds it and bytes
-repeating that would say nothing; a float column that ever saw a **NaN** declares itself
+Min and max encode in the column's own width rules: i64/timestamp and u64 little-endian, f64 as
+**bits** (compared as floats by the reader), bool widened to 8 bytes as 0 or 1. Deliberate absences:
+string and binary columns use their sorted-distinct dictionaries as bounds; explicit null is
+unordered; a float column that ever saw a **NaN** declares itself
 unprunable, because NaN is unordered and any range claiming to cover it would prune wrongly; and a
 column with no occurrences has nothing to bound. A reader resolves **every** doubt — absent
 section, damaged entry, out-of-range ordinal — to "no pruning": a zone map may only ever widen
@@ -393,6 +425,10 @@ homogeneous columns rather than one that can mis-decode. Type tags and value wid
 | 1 | i64 | 8 | |
 | 2 | f64 | 8 | stored as **bits**, so -0.0 and NaN payloads round-trip exactly |
 | 3 | bool | 1 | |
+| 4 | u64 | 8 | full unsigned range; never rounded through i64 |
+| 5 | binary | 4 | u32 ordinal into a byte-sorted `col.dict.N` |
+| 6 | timestamp | 8 | signed Unix nanoseconds, UTC |
+| 7 | explicit null | 0 | occurrence lives entirely in `rid` and `layout` |
 
 A column is a sparse pair of parallel arrays: `rid` (ascending row indices) and `val`. `col.rid.N` is
 encoded per `colmeta`: kind 0 (`RID_DENSE`) means the array is exactly `0..n` and is **elided** — it
@@ -437,11 +473,13 @@ a reader to act on.
 
 | tag | meaning | payload |
 |---|---|---|
-| 0x57 | record | see below |
+| 0x57 | legacy version-1 body record | legacy payload below |
 | 0x58 | tombstone | the id alone, UTF-8, no framing |
-| 0x5A | record, **inside a batch** | as 0x57 |
+| 0x5A | legacy version-1 body record, **inside a batch** | as 0x57 |
 | 0x5B | tombstone, inside a batch | as 0x58 |
 | 0x59 | **batch commit** | varint member count |
+| 0x5C | version-2 record: named content, whole-value identities, the complete scalar attribute tags | current payload below |
+| 0x5D | version-2 record, **inside a batch** | as 0x5C |
 
 A batch is a group of writes that replays **all or none** — the unit an ingest source actually
 sent, kept whole across a crash. Its members are ordinary record and tombstone payloads under the
@@ -454,25 +492,39 @@ the frame chain is unbroken back to the last commit point, so the log is not wha
 down — and the reader must refuse. The marker's count is one byte of redundancy that keeps a batch
 from being quietly shrunk.
 
-A build predating batches refuses these tags by the unknown-tag rule below, which is the safe
-direction; a log without them replays exactly as before.
+Writer admission ceilings are deliberately absent from this format. They are per-open runtime policy:
+a reader and recovery must accept any frame valid under the format even when the current writer would
+decline to create it under lower configured limits. The deterministic charging unit and defaults are
+specified in `docs/write-admission.md`.
 
-A record payload is:
+A build predating named content refuses the 0x5C and 0x5D tags by the unknown-tag rule below, which
+is the safe direction. A current reader accepts the old record tags, presents version-1 body programs
+as content named `body`, and reports whole-value identity unavailable for version-1 records.
+
+A current record payload is:
 
 ```
 varint   id_len
 bytes    id
-varint   n_ops
-repeated n_ops times:
-  u8      op               0 literal, 1 piece
-  op 0:   varint len, then len bytes
-  op 1:   32 bytes piece hash, then varint len
+varint   n_contents
+repeated n_contents times, in UTF-8 name order:
+  varint  name_len
+  bytes   utf8_name
+  u8      identity_present  0 unavailable, 1 followed by 32-byte BLAKE3
+  bytes   identity          present only when identity_present is 1
+  varint  n_ops
+  repeated n_ops times:
+    u8      op               0 literal, 1 piece
+    op 0:   varint len, then len bytes
+    op 1:   32 bytes piece hash, then varint len
 varint   n_attrs
 repeated n_attrs times:
   varint  key_len
   bytes   key
-  u8      tag              0 string, 1 i64, 2 f64 bits, 3 bool
-  value   tag 0: varint len + utf8;  1: 8 bytes i64;  2: 8 bytes f64 BITS;  3: 1 byte
+  u8      tag              0 string, 1 i64, 2 f64 bits, 3 bool, 4 u64,
+                           5 binary, 6 UTC Unix nanoseconds, 7 explicit null
+  value   tag 0: varint len + utf8; 1: 8 bytes i64; 2: 8 bytes f64 BITS; 3: 1 byte;
+          4: 8 bytes u64; 5: varint len + bytes; 6: 8 bytes i64; 7: no bytes
 varint   n_novel
 repeated n_novel times:
   32 bytes hash
@@ -480,7 +532,11 @@ repeated n_novel times:
   bytes    piece content
 ```
 
-Two differences from a part's `prog`, both deliberate and neither incidental:
+The legacy 0x57/0x5A payload places one `n_ops` program directly after the id, followed by the
+original attribute encoding — tags 0 through 3 only — and the novel-piece encoding. It has no
+content count or name.
+
+Two differences from a part's `con.prog.N`, both deliberate and neither incidental:
 
 * the op tag is a **plain u8**, not the `(payload << 1) | op` varint packing a part uses — the packing
   buys density in a section read millions of times, and the log is written once and discarded;
@@ -536,6 +592,13 @@ JSON on purpose: it is small, written once per flush, and self-describing, so a 
 without a version lever — **provided the new field has a documented default**, since older writers will
 keep omitting it. `fold_gen` was added exactly that way and absent means 0, and `commit` likewise. A
 field without a default is a breaking change that JSON merely fails to announce.
+
+Syntax and checksum are not the end of manifest validation. A part `file` is exactly one non-empty
+store-local path component; absolute paths, parent traversal, nested paths, backslash separators,
+and duplicate names are refused before filesystem access. Sequence ranges cannot be inverted,
+optional BLAKE3 values are exactly 32-byte hex digests, and `punched` ranges must be ascending and
+disjoint. A valid checksum authenticates none of these meanings—it only proves the bytes did not
+drift—so semantic validation is mandatory.
 
 `punched` is a field of that kind, and it is **normative for erasure**: an array of inclusive
 `[lo, hi]` block-id ranges, ascending and disjoint, naming blocks whose payload bytes were
@@ -732,8 +795,8 @@ format-compatible, a writer may not omit it.
 The committed snapshot, exactly as a reader sees one: `MANIFEST` (verbatim, checksum trailer and
 all), every part it names, and the live fold generation's segments — plus their advisory sidecars
 and any dictionary files, so a pack opens as fast as the directory did. Deliberately absent:
-the WAL (a pack holds committed state; a packer must refuse a store with uncommitted records
-rather than silently drop them), the retained commit log (snapshots of an immutable artifact are
+the WAL (a pack holds committed state; a packer must take the writer role and settle it, or refuse
+rather than silently drop records), the retained commit log (snapshots of an immutable artifact are
 meaningless), and the writer lock (no writer, ever).
 
 Names are paths, which is the multi-store door: a future pack may carry several stores under
@@ -743,15 +806,16 @@ reads single-store packs.
 ### Unpacking
 
 Extraction is byte copying — every inner file lands exactly as it was, and the directory opens as
-an ordinary store, writer role available again. Both crossings are mechanical; nothing is
-reinterpreted in either direction.
+an ordinary store, writer role available again. The safe restore API verifies all member checksums,
+extracts and opens a staged store, then atomically publishes it with a no-replace rename. Both
+crossings are mechanical; nothing is reinterpreted in either direction.
 
 ---
 
 ## Limits
 
 Enforced, not assumed. Each refuses rather than truncating, because a store that cannot be written is
-recoverable and one that lies is not.
+recoverable and one that lies is not. The first table contains representational format bounds.
 
 All are checked at the point of writing, and each refuses rather than truncating.
 
@@ -767,6 +831,38 @@ All are checked at the point of writing, and each refuses rather than truncating
 
 `block_target` is bounded well below 4 GiB at open, because a block is admitted into a fresh segment
 however large it is — so it, not `seg_max`, is what can overflow the segment append point.
+
+Readers additionally apply admission policy before allocating parser metadata. These defaults do
+not narrow the on-disk integer fields: pack limits are configurable through `PackLimits`, while the
+manifest and candidate-dictionary ceilings define this reader's supported profile.
+
+| reader admission | default | behavior |
+|---|---:|---|
+| manifest bytes | 64 MiB | checked from file metadata and again during a bounded read |
+| pack TOC stored bytes | 64 MiB | refused before reading/allocating; configurable |
+| pack TOC decoded bytes | 64 MiB | refused before decompression; configurable |
+| pack file entries | 100,000 | refused before iterating the TOC; configurable |
+| pack entry-name bytes | 16 KiB | refused before allocating the name; configurable |
+| candidate zstd dictionary | 64 MiB | refused before whole-file read |
+| segment sidecar | derived from segment length | impossible advisory sizes are ignored; the segment is scanned |
+| atomic frame stored bytes | 512 MiB | checked before WAL/part/fold input allocation; configurable per open |
+| atomic frame decoded bytes | 512 MiB | checked before part/fold codec output allocation; configurable per open |
+| filesystem directory entries | 100,000 | checked before enumeration-driven collection growth; configurable per open |
+| physical WAL frames | 100,000 | checked during replay and before writer/batch append; configurable per open |
+| fold blocks / block-id span | 1,000,000 | checked before sidecar/scan vectors and sparse-directory resize; configurable per open |
+
+The atomic-frame defaults are `ReadLimits`, not narrower format fields. A caller can raise them to
+open an older legitimate large-frame store or lower them for a stricter deployment. Tail scanning
+surfaces an over-budget valid frame as resource exhaustion rather than treating it as torn residue.
+Writers seal fold blocks early under the effective ceiling and check part sections/TOCs before the
+footer completeness marker, so they do not publish frames the same handle refuses to read.
+The object-count fields share the same runtime-only `ReadLimits`: they do not narrow any on-disk
+integer. Writer output reserves directory names, WAL frames, and fold block ids before mutation so a
+handle does not deliberately create structures it cannot later admit.
+
+Backup additionally resolves every source against the canonical store root and accepts only the
+ordinary file at that exact path. A symlinked part, fold directory, segment, sidecar, dictionary, or
+manifest is refused rather than followed into the backup artifact.
 
 ---
 
@@ -784,9 +880,9 @@ damaged member is to restore it. Adding an erasure-coding dependency to duplicat
 layer already provides would read as thorough and be surface. Where belt-and-braces is wanted,
 external PAR2 over a sealed pack is an operations recipe and needs nothing from this format.
 
-**A second content hash.** BLAKE3 identifies content, and one identity function is the whole point
-of content addressing. Where a cheaper check is wanted for a hot path, `r16` and the frame
-checksums already provide it; neither ever concludes identity.
+**A second identity algorithm.** BLAKE3 identifies both individual fold pieces and complete named
+values; the scopes differ, the identity function does not. Where a cheaper check is wanted for a hot
+path, `r16` and the frame checksums already provide it; neither ever concludes identity.
 
 ## Compatibility
 
@@ -796,12 +892,16 @@ the useful promise much weaker than permanence:
 
 > **A build will read the immediately preceding on-disk format revision, and re-fold it forward.**
 
+The operational mechanism is documented in [resumable format migration](docs/format-migration.md):
+live parts advance one manifest-published unit at a time, while retained history remains visible and
+ages out under the ordinary snapshot window.
+
 "Revision" here means a format version, not a *fold generation* — the two are unrelated, and a store
 may sit at fold generation 40 while never having changed format revision at all.
 
 What that requires of a change:
 
-* a change a version-1 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
+* a change a version-2 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
 * note what these levers do **not** cover: they guard against misparsing, not against a conformant
   writer violating a privacy or retention invariant. A part that parses perfectly can still carry

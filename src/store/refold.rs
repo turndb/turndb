@@ -108,6 +108,52 @@ pub fn refold(
     old_gen: u32,
     cfg: FoldCfg,
 ) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
+    refold_with_control(
+        dir,
+        parts,
+        seqs,
+        old_fold,
+        old_gen,
+        cfg,
+        &crate::control::OperationControl::default(),
+    )
+}
+
+/// [`refold`] with cooperative checkpoints throughout its unpublished generation build.
+pub fn refold_with_control(
+    dir: &Path,
+    parts: &[Arc<Part>],
+    seqs: &[(u64, u64)],
+    old_fold: &Fold,
+    old_gen: u32,
+    cfg: FoldCfg,
+    control: &crate::control::OperationControl,
+) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
+    refold_with_control_and_limits(
+        dir,
+        parts,
+        seqs,
+        old_fold,
+        old_gen,
+        cfg,
+        control,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// [`refold_with_control`] with frame and object-count admission on the replacement generation.
+#[allow(clippy::too_many_arguments)]
+pub fn refold_with_control_and_limits(
+    dir: &Path,
+    parts: &[Arc<Part>],
+    seqs: &[(u64, u64)],
+    old_fold: &Fold,
+    old_gen: u32,
+    cfg: FoldCfg,
+    control: &crate::control::OperationControl,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u32, Vec<RefoldedPart>, RefoldStats)> {
+    control.check("content refold")?;
     if parts.len() != seqs.len() {
         bail!("every part needs its committed sequence range");
     }
@@ -116,9 +162,10 @@ pub fn refold(
     if new_dir.exists() {
         crate::vfs::remove_tree(&new_dir)?;
     }
+    let mut cleanup = StagedRefold::new(dir, new_gen, seqs);
 
     let mut st = RefoldStats { parts_in: parts.len(), ..Default::default() };
-    st.fold_bytes_before = dir_bytes(&fold_dir(dir, old_gen));
+    st.fold_bytes_before = dir_bytes(&fold_dir(dir, old_gen), read_limits)?;
 
     let visible = super::read::visibility(parts)?;
     let live = visible.rows;
@@ -130,15 +177,20 @@ pub fn refold(
     let mut wanted: HashMap<PieceHash, Loc> = HashMap::new();
     for (pi, rows) in live.iter().enumerate() {
         for &row in rows {
-            for op in parts[pi].body(row)? {
-                let BodyOp::Piece { hash, .. } = op else { continue };
-                if wanted.contains_key(&hash) {
-                    continue;
+            control.check("content refold")?;
+            for content in parts[pi].record(row)?.contents {
+                for op in content.ops {
+                    let BodyOp::Piece { hash, .. } = op else { continue };
+                    if wanted.contains_key(&hash) {
+                        continue;
+                    }
+                    let loc = parts[pi].lookup_piece(&hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "live record references piece {hash}, which no part locates"
+                        )
+                    })?;
+                    wanted.insert(hash, loc);
                 }
-                let loc = parts[pi].lookup_piece(&hash)?.ok_or_else(|| {
-                    anyhow::anyhow!("live record references piece {hash}, which no part locates")
-                })?;
-                wanted.insert(hash, loc);
             }
         }
     }
@@ -146,6 +198,7 @@ pub fn refold(
         let mut all = HashSet::new();
         for p in parts {
             for i in 0..p.piece_count()? {
+                control.check("content refold")?;
                 all.insert(p.piece(i)?.1);
             }
         }
@@ -161,30 +214,33 @@ pub fn refold(
 
     let mut remap: HashMap<PieceHash, Loc> = HashMap::with_capacity(order.len());
     {
-        let mut nf = Fold::open(&new_dir, cfg)?;
+        let mut nf = Fold::open_with_limits(&new_dir, cfg, read_limits)?;
         for (loc, hash) in &order {
+            control.check("content refold")?;
             // read_verified, not read: a re-fold is exactly when to re-check that content still hashes
             // to the identity claiming it, since everything downstream is about to trust the copy.
             let bytes = old_fold.read_verified(*loc, *hash)?;
             let put = nf.put_hashed(&bytes, *hash)?;
             remap.insert(*hash, put.loc);
         }
+        control.check("content refold")?;
         nf.sync()?;
     }
-    st.fold_bytes_after = dir_bytes(&new_dir);
+    st.fold_bytes_after = dir_bytes(&new_dir, read_limits)?;
 
     // Rebuild each part against the new fold, keeping only live rows and no tombstones. `retain` is
     // deliberately EMPTY: carrying dictionary entries forward is right for an ordinary merge, where the
     // content still exists, and wrong here, where it has just been dropped.
     let mut out = Vec::new();
     for (pi, rows) in live.iter().enumerate() {
+        control.check("content refold")?;
         if rows.is_empty() {
             continue; // every record in this part was deleted or superseded
         }
         let recs: Vec<Record> = rows.iter().map(|&r| parts[pi].record(r)).collect::<Result<_>>()?;
         let (lo, hi) = seqs[pi];
         let file = format!("part-r{new_gen:04}-{lo:08}-{hi:08}.part");
-        let meta = part::build_full(
+        let meta = part::build_full_with_limits(
             &dir.join(&file),
             &recs,
             &[],
@@ -193,21 +249,91 @@ pub fn refold(
             cfg.level,
             |h| remap.get(h).copied(),
             &HashMap::new(),
+            read_limits,
         )?;
         out.push((file, lo, hi, meta.n_records));
     }
+    control.check("content refold")?;
     st.parts_out = out.len();
+    cleanup.disarm();
     Ok((new_gen, out, st))
 }
 
-fn dir_bytes(d: &Path) -> u64 {
-    std::fs::read_dir(d)
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| e.metadata().ok())
-                .filter(|m| m.is_file())
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
+struct StagedRefold {
+    fold: PathBuf,
+    parts: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl StagedRefold {
+    fn new(dir: &Path, generation: u32, seqs: &[(u64, u64)]) -> StagedRefold {
+        StagedRefold {
+            fold: fold_dir(dir, generation),
+            parts: seqs
+                .iter()
+                .map(|&(lo, hi)| dir.join(format!("part-r{generation:04}-{lo:08}-{hi:08}.part")))
+                .collect(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedRefold {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.fold.exists() {
+            let _ = crate::vfs::remove_tree(&self.fold);
+        }
+        for part in &self.parts {
+            if part.exists() {
+                let _ = crate::vfs::unlink(part);
+            }
+        }
+    }
+}
+
+fn dir_bytes(d: &Path, read_limits: crate::read_limits::ReadLimits) -> Result<u64> {
+    let mut bytes = 0u64;
+    let mut visited = 0u64;
+    for entry in std::fs::read_dir(d)? {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("refold directory", visited)?;
+        let metadata = entry?.metadata()?;
+        if metadata.is_file() {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_stage_guard_removes_every_unpublished_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "turndb-refold-stage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let seqs = [(1, 2), (3, 4)];
+        let stage = StagedRefold::new(&root, 7, &seqs);
+        std::fs::create_dir_all(fold_dir(&root, 7)).unwrap();
+        std::fs::write(fold_dir(&root, 7).join("partial"), b"partial").unwrap();
+        for path in &stage.parts {
+            std::fs::write(path, b"partial").unwrap();
+        }
+        drop(stage);
+        assert!(!fold_dir(&root, 7).exists());
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
 }

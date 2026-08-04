@@ -260,10 +260,14 @@ fn a_piece_larger_than_seg_max_gets_its_own_segment() {
 fn second_writer_is_refused() {
     let dir = tmp("lock");
     let _f = Fold::open(&dir, FoldCfg::default()).unwrap();
-    assert!(
-        Fold::open(&dir, FoldCfg::default()).is_err(),
-        "the single-writer invariant must be enforced, not merely documented"
-    );
+    let error = match Fold::open(&dir, FoldCfg::default()) {
+        Ok(_) => panic!("the single-writer invariant must be enforced, not merely documented"),
+        Err(error) => error,
+    };
+    let locked = error
+        .downcast_ref::<turndb::fold::WriterLocked>()
+        .expect("contention must be typed so bindings do not parse prose");
+    assert_eq!(locked.path, dir);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -278,7 +282,7 @@ fn committed_tail_beyond_the_last_good_frame_refuses() {
     // A commit authority claiming durability past what the fold actually holds means the disk broke a
     // promise. Serving that store would silently lose data.
     let bogus = FoldTail { seg: 0, off: 10_000_000 };
-    assert!(Fold::open_at(&dir, FoldCfg::default(), Some(bogus)).is_err());
+    assert!(Fold::open_at(&dir, FoldCfg::default(), Some(bogus), &[]).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -295,9 +299,50 @@ fn committed_tail_discards_uncommitted_frames() {
         f.put(b"uncommitted two").unwrap();
         (l, t)
     };
-    let f = Fold::open_at(&dir, FoldCfg::default(), Some(tail)).unwrap();
+    let f = Fold::open_at(&dir, FoldCfg::default(), Some(tail), &[]).unwrap();
     assert_eq!(f.read(loc).unwrap(), keep);
     assert_eq!(f.tail(), tail, "the fold must resume exactly at the committed tail");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_only_committed_prefix_ignores_damaged_later_bytes() {
+    let dir = tmp("read-prefix");
+    let keep = b"content named by the retained manifest".to_vec();
+    let (keep_loc, committed, later_loc) = {
+        let mut fold = Fold::open(&dir, FoldCfg::default()).unwrap();
+        let keep_loc = fold.put(&keep).unwrap().loc;
+        let committed = fold.sync().unwrap();
+        let later_loc = fold.put(b"append residue from a newer commit").unwrap().loc;
+        fold.sync().unwrap();
+        (keep_loc, committed, later_loc)
+    };
+
+    // Damage only the suffix beyond the retained manifest's authority. Recovery of that older
+    // candidate must neither trust nor reject bytes the candidate does not name.
+    {
+        use std::os::unix::fs::FileExt;
+        let path = dir.join(format!("seg-{:08}.fold", committed.seg));
+        let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, committed.off as u64 + 20).unwrap();
+        byte[0] ^= 0xff;
+        file.write_all_at(&byte, committed.off as u64 + 20).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let fold = Fold::open_read_at(&dir, FoldCfg::default(), committed).unwrap();
+    assert_eq!(fold.read(keep_loc).unwrap(), keep);
+    assert!(fold.read(later_loc).is_err(), "the bounded reader must not expose a newer suffix");
+    assert_eq!(fold.scrub().unwrap().trailing_uncommitted, 0);
+
+    let physical =
+        std::fs::metadata(dir.join(format!("seg-{:08}.fold", committed.seg))).unwrap().len();
+    let beyond = FoldTail { seg: committed.seg, off: u32::try_from(physical + 1).unwrap() };
+    assert!(
+        Fold::open_read_at(&dir, FoldCfg::default(), beyond).is_err(),
+        "a retained manifest cannot claim bytes that do not exist"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -441,7 +486,7 @@ fn recovery_rolls_back_across_segment_boundaries() {
     };
 
     // Recover to the committed tail: segments above it must go, and everything at or below must read.
-    let f = Fold::open_at(&d, cfg, Some(committed)).unwrap();
+    let f = Fold::open_at(&d, cfg, Some(committed), &[]).unwrap();
     assert_eq!(
         f.segment_count(),
         committed.seg + 1,
@@ -469,7 +514,7 @@ fn a_committed_tail_beyond_the_data_is_refused() {
     }
     let beyond = FoldTail { seg: 99, off: 4096 };
     assert!(
-        Fold::open_at(&d, cfg, Some(beyond)).is_err(),
+        Fold::open_at(&d, cfg, Some(beyond), &[]).is_err(),
         "a committed tail past the last good block must refuse, not truncate to it"
     );
     std::fs::remove_dir_all(&d).ok();

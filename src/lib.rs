@@ -44,16 +44,26 @@
 // backticked identifier. The remainder is a separate problem and is not closed by this.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod capabilities;
 pub mod carve;
+pub mod control;
+pub mod error;
 pub mod fold;
+mod io_trace;
+pub mod observability;
 pub mod pack;
 pub mod part;
-#[cfg(feature = "sql")]
+#[cfg(feature = "columnar")]
 pub mod query;
+pub mod read_limits;
 pub mod readat;
+pub mod scan;
+pub mod schema;
 pub mod store;
 mod sys;
 pub mod types;
 pub mod vfs;
 
-pub use types::{AttrValue, BodyOp, PieceHash, Record};
+pub use types::{
+    AttrValue, BodyOp, Content, ContentHash, ContentOp, PieceHash, Record, BODY_CONTENT,
+};

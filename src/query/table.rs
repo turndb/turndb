@@ -7,13 +7,13 @@
 //! One partition per part, so parts scan in parallel and a merged part simply becomes one bigger
 //! partition.
 
-use super::{Cmp, Lens, Pred, ScanStats, F_BODY};
+use super::{Cmp, Lens, Pred, ScanStats};
 use crate::fold::Fold;
 use crate::part::Part;
 use crate::store::ReadStore;
 use crate::types::AttrValue;
 use anyhow::Result;
-use datafusion::arrow::datatypes::SchemaRef;
+use arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
 use datafusion::datasource::TableType;
@@ -56,11 +56,22 @@ impl TurndbTable {
 
     /// Register a read-only store as table `name` in a fresh session.
     pub fn context(store: ReadStore, name: &str) -> Result<(SessionContext, Arc<TurndbTable>)> {
+        let ctx = SessionContext::new();
+        let table = TurndbTable::register(store, &ctx, name)?;
+        Ok((ctx, table))
+    }
+
+    /// Register a read-only store in a caller-configured session. The caller can therefore set
+    /// execution memory and concurrency policy without reimplementing TurnDB's table adapter.
+    pub fn register(
+        store: ReadStore,
+        ctx: &SessionContext,
+        name: &str,
+    ) -> Result<Arc<TurndbTable>> {
         let (fold, parts) = store.into_parts();
         let t = Arc::new(TurndbTable::new(parts, fold)?);
-        let ctx = SessionContext::new();
         ctx.register_table(name, t.clone())?;
-        Ok((ctx, t))
+        Ok(t)
     }
 
     /// What every scan through this table has touched so far.
@@ -161,6 +172,11 @@ fn scalar_to_attr(v: &ScalarValue) -> Option<AttrValue> {
         ScalarValue::Int16(Some(i)) => AttrValue::Int(*i as i64),
         ScalarValue::Int8(Some(i)) => AttrValue::Int(*i as i64),
         ScalarValue::UInt32(Some(i)) => AttrValue::Int(*i as i64),
+        ScalarValue::UInt64(Some(i)) => AttrValue::UInt(*i),
+        ScalarValue::Binary(Some(bytes)) | ScalarValue::LargeBinary(Some(bytes)) => {
+            AttrValue::Bytes(bytes.clone())
+        }
+        ScalarValue::TimestampNanosecond(Some(ns), _) => AttrValue::TimestampNs(*ns),
         ScalarValue::Float64(Some(f)) => AttrValue::Float(*f),
         ScalarValue::Float32(Some(f)) => AttrValue::Float(*f as f64),
         ScalarValue::Boolean(Some(b)) => AttrValue::Bool(*b),
@@ -209,7 +225,7 @@ impl TurndbExec {
     ) -> DfResult<TurndbExec> {
         let full = lens.schema();
         let fields: Vec<_> = projection.iter().map(|&i| full.field(i).clone()).collect();
-        let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(fields));
         let props = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(parts.len().max(1)),
@@ -295,10 +311,10 @@ impl ExecutionPlan for TurndbExec {
         let Some(part) = self.parts.get(partition) else {
             return Ok(Box::pin(MemoryStream::try_new(vec![], self.schema.clone(), None)?));
         };
-        // The fold is handed over only when `body` is in the projection, so an attribute-only query
-        // cannot reach content even by mistake.
-        let wants_body = self.schema.fields().iter().any(|f| f.name() == F_BODY);
-        let fold = wants_body.then_some(&self.fold);
+        // The fold is handed over only when named content is in the projection, so an attribute-only
+        // query cannot reach content even by mistake.
+        let wants_content = self.lens.projection_reads_content(&self.projection);
+        let fold = wants_content.then_some(&self.fold);
 
         let scan = self
             .lens

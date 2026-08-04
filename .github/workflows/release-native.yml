@@ -1,0 +1,112 @@
+name: Release native Node package
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Exact annotated tag to release (native-vX.Y.Z)
+        required: true
+        type: string
+
+concurrency:
+  group: release-native-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build release candidate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - name: verify exact release tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+          case "$RELEASE_REF" in native-v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
+      - name: install locked packaging tools
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
+      - name: type-check public ESM/CommonJS declarations
+        run: npm run test:types --prefix bindings/node
+      - name: install pinned license-report generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: verify native third-party licenses
+        run: bash scripts/check-third-party-licenses.sh
+      - name: create and build platform package
+        run: |
+          npm run package:create --prefix bindings/node
+          npm run prebuild:linux-x64-gnu:cross --prefix bindings/node
+          npm run package:collect --prefix bindings/node
+      - name: pack audited release artifacts
+        env:
+          TURNDB_MAX_GLIBC: '2.17'
+        run: npm run package:pack:release --prefix bindings/node
+      - name: exercise packed install on build host
+        run: npm run test:prebuild --prefix bindings/node
+      - name: verify publish guards and embedded manifests
+        run: npm run test:release --prefix bindings/node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turndb-native-${{ inputs.release_ref }}
+          path: bindings/node/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  install:
+    name: install release candidate (node ${{ matrix.node }})
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-native-${{ inputs.release_ref }}
+          path: bindings/node/dist/
+      - name: install and exercise exact release tarballs
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
+
+  publish:
+    name: publish to npm
+    needs: [build, install]
+    runs-on: ubuntu-22.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: install trusted-publishing npm
+        run: npm install --global npm@11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-native-${{ inputs.release_ref }}
+          path: bindings/node/dist/
+      - name: publish platform package, then selector package
+        env:
+          TURNDB_RELEASE_APPROVED: 'true'
+        run: node bindings/node/scripts/publish-prebuild.cjs bindings/node/dist

@@ -4,6 +4,7 @@ use super::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
 use crate::readat::ReadAt;
 use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Segment header length. The first block begins here, so a `Loc.block_off` below it is invalid.
@@ -26,6 +27,12 @@ pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
 
 /// Format bound. `Loc.block_off` is a `u32`, so a block start must fit in one.
 pub const SEG_MAX_LIMIT: u64 = 1 << 32;
+
+/// Block id and byte offset entries reconstructed for one segment.
+pub type BlockDirectory = Vec<(u32, u32)>;
+
+/// A sidecar's committed segment tail and its block directory.
+pub type DirectorySidecar = (u32, BlockDirectory);
 
 pub fn seg_name(n: u32) -> String {
     format!("seg-{n:08}.fold")
@@ -150,11 +157,13 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// silently orphan every block after it in the segment. Sixteen surviving header bytes carry no
 /// content — they carry the length that keeps the chain walkable, and the `block_id` that lets a
 /// scan report the erasure by name.
-pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
-    if let Err(e) = crate::sys::punch_hole(f, off, len) {
+pub fn punch(f: &File, path: &Path, off: u64, len: u64) -> Result<()> {
+    // Through the vfs seam, and `path` exists only to feed it: destroying committed bytes in
+    // place is precisely the kind of mutation the crash simulator must be able to replay.
+    if let Err(e) = crate::vfs::punch_hole(f, path, off, len) {
         bail!("punching {len} bytes at {off} failed ({e}) — this filesystem may not support hole punching; re-fold instead");
     }
-    f.sync_all()?;
+    crate::vfs::sync_file(f, path)?;
     Ok(())
 }
 
@@ -163,8 +172,67 @@ pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
 ///
 /// This is how the fold finds its own last good byte with no external length authority. It never
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
-/// of good data — during a tail scan a bad frame is a boundary, not an error.
+/// of good data — during a tail scan a bad frame is a boundary, not an error — except a frame the
+/// manifest declares PUNCHED, which the `punched` parameter of the `_with_limits` variants lets the
+/// walk step over. This convenience wrapper has no manifest in hand and passes no declaration.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_with_limits(f, file_len, has_dict, &[], crate::read_limits::ReadLimits::default())
+}
+
+/// [`scan_tail`] with explicit admission before its reusable frame buffer grows, and with the
+/// manifest's declared-punched block ranges (inclusive `[lo, hi]`) — empty when the caller holds
+/// no manifest.
+pub fn scan_tail_with_limits(
+    f: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    punched: &[(u32, u32)],
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_controlled_with_limits(
+        f,
+        file_len,
+        has_dict,
+        punched,
+        &crate::control::OperationControl::default(),
+        "fold scan",
+        read_limits,
+    )
+}
+
+/// [`scan_tail`] with cooperative checks between complete frames. No manifest in hand, so no
+/// punched declaration reaches the walk.
+pub fn scan_tail_controlled(
+    f: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_tail_controlled_with_limits(
+        f,
+        file_len,
+        has_dict,
+        &[],
+        control,
+        operation,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// Controlled tail scan with explicit frame-byte and block-count admission. `punched` carries the
+/// manifest's declared-erased block-id ranges so the walk can step over a punched frame whatever
+/// residue a crash left in its payload.
+pub fn scan_tail_controlled_with_limits(
+    f: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    punched: &[(u32, u32)],
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, Vec<(u32, u32)>)> {
+    let read_limits = read_limits.validate()?;
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
@@ -172,6 +240,7 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
     // rebuilt from the ids the frames carry.
     let mut dir: Vec<(u32, u32)> = Vec::new();
     loop {
+        control.check(operation)?;
         if off + (block::BLOCK_OVERHEAD as u64) > file_len {
             break; // cannot hold even an empty block
         }
@@ -182,6 +251,14 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
             Ok(h) => h,
             Err(_) => break,
         };
+        // Unlike checksum damage, a valid header outside runtime policy is not a crash-tail
+        // boundary. Surface the typed refusal so writer recovery never truncates a valid committed
+        // block merely because this process was opened with a smaller budget.
+        read_limits.admit(
+            format!("fold block {}", h.block_id),
+            u64::from(h.stored),
+            u64::from(h.raw),
+        )?;
         let end =
             match off.checked_add(BLOCK_HDR_LEN as u64 + h.stored as u64 + BLOCK_XSUM_LEN as u64) {
                 Some(e) => e,
@@ -196,18 +273,36 @@ pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, 
         if f.read_exact_at(&mut payload[..span], off).is_err() {
             break;
         }
+        control.check(operation)?;
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
-            // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
-            // it (that is what keeping the header buys) and the block is left OUT of the
-            // directory, so nothing can resolve a Loc into erased bytes. Anything else that fails
-            // here is a torn write, and ends the segment's valid span.
+            // A PUNCHED block: header intact (punch never touches it — that is what keeps the
+            // chain walkable), payload deallocated. The deallocation is volatile until its fsync,
+            // so a crash can leave the payload in any of THREE residues: fully readable (the
+            // fallocate never landed — the frame still verifies and never reaches this branch),
+            // fully zeroed (it completed), or PARTIALLY zeroed (fallocate is per-extent, so power
+            // loss mid-punch genuinely half-zeroes a range). The manifest's punched declaration is
+            // the erasure AUTHORITY — it is committed before any byte is destroyed — so a declared
+            // frame is stepped over whatever its payload holds, and its location is retained so a
+            // later read reports ERASED by name instead of resolving into damage.
+            //
+            // The all-zero test survives beside the declaration because a historical committed
+            // prefix can predate the declaration reaching this open. It is deliberately not
+            // widened: an UNDECLARED checksum-failing frame with nonzero payload bytes is damage,
+            // and damage still ends the walk — the skip is authorized by the declaration, never
+            // guessed from the payload.
+            let declared = punched.iter().any(|&(lo, hi)| (lo..=hi).contains(&h.block_id));
             let body = &payload[BLOCK_HDR_LEN..span - BLOCK_XSUM_LEN];
-            if h.stored > 0 && body.iter().all(|&b| b == 0) {
+            if declared || (h.stored > 0 && body.iter().all(|&b| b == 0)) {
+                read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
+                read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
+                dir.push((h.block_id, off as u32));
                 off = end;
                 continue;
             }
             break;
         }
+        read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
+        read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
         dir.push((h.block_id, off as u32));
         off = end;
     }
@@ -270,25 +365,102 @@ pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) 
 /// segment back into being the active one, and its leftover sidecar then describes blocks past
 /// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
 /// means the sidecar and the segment parted ways.
-pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
-    parse_dir_sidecar(&std::fs::read(dir_path(dir, n)).ok()?, n, file_len)
+pub fn read_dir_sidecar(dir: &Path, n: u32, file_len: u64) -> Option<DirectorySidecar> {
+    read_dir_sidecar_with_limits(dir, n, file_len, crate::read_limits::ReadLimits::default())
+        .ok()
+        .flatten()
+}
+
+/// Read and parse advisory directory metadata with explicit byte and object admission.
+pub fn read_dir_sidecar_with_limits(
+    dir: &Path,
+    n: u32,
+    file_len: u64,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Option<DirectorySidecar>> {
+    let Some(bytes) = read_dir_sidecar_bytes_with_limits(dir, n, file_len, read_limits)? else {
+        return Ok(None);
+    };
+    parse_dir_sidecar_with_limits(&bytes, n, file_len, read_limits)
+}
+
+/// Largest structurally possible sidecar for a segment extent. Every indexed block consumes at
+/// least one frame overhead in the segment, so advisory metadata cannot legitimately outgrow this.
+pub fn max_dir_sidecar_bytes(file_len: u64) -> u64 {
+    let frames = file_len.saturating_sub(SEG_HDR_LEN).div_ceil(super::block::BLOCK_OVERHEAD as u64);
+    24u64.saturating_add(frames.saturating_mul(8))
+}
+
+/// Read advisory bytes only after their filesystem length fits what the segment could describe.
+/// `None` is intentionally the only failure: callers rescan the authoritative segment.
+pub fn read_dir_sidecar_bytes(dir: &Path, n: u32, file_len: u64) -> Option<Vec<u8>> {
+    read_dir_sidecar_bytes_with_limits(dir, n, file_len, crate::read_limits::ReadLimits::default())
+        .ok()
+        .flatten()
+}
+
+/// Read advisory sidecar bytes after both structural and runtime byte admission.
+pub fn read_dir_sidecar_bytes_with_limits(
+    dir: &Path,
+    n: u32,
+    file_len: u64,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Option<Vec<u8>>> {
+    let file = match File::open(dir_path(dir, n)) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let max = max_dir_sidecar_bytes(file_len);
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Ok(None),
+    };
+    if len > max {
+        return Ok(None);
+    }
+    read_limits.admit_stored(format!("fold segment {n} directory sidecar"), len)?;
+    let capacity = match usize::try_from(len) {
+        Ok(capacity) => capacity,
+        Err(_) => return Ok(None),
+    };
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(capacity).is_err()
+        || file.take(max.saturating_add(1)).read_to_end(&mut bytes).is_err()
+    {
+        return Ok(None);
+    }
+    Ok((bytes.len() as u64 <= max).then_some(bytes))
 }
 
 /// [`read_dir_sidecar`]'s validation core, over bytes from ANY source — a directory or a pack.
-pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<(u32, Vec<(u32, u32)>)> {
+pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<DirectorySidecar> {
+    parse_dir_sidecar_with_limits(b, n, file_len, crate::read_limits::ReadLimits::default())
+        .ok()
+        .flatten()
+}
+
+/// Parse advisory directory bytes with object admission before allocating the entry vector.
+pub fn parse_dir_sidecar_with_limits(
+    b: &[u8],
+    n: u32,
+    file_len: u64,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Option<DirectorySidecar>> {
     if b.len() < 24 || &b[0..8] != DIR_MAGIC {
-        return None;
+        return Ok(None);
     }
     let crc = u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap());
     if crc32fast::hash(&b[..b.len() - 4]) != crc {
-        return None;
+        return Ok(None);
     }
     let seg = u32::from_le_bytes(b[8..12].try_into().unwrap());
     let tail = u32::from_le_bytes(b[12..16].try_into().unwrap());
     let n_entries = u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize;
-    if seg != n || tail as u64 != file_len || b.len() != 24 + n_entries * 8 {
-        return None;
+    let expected_len = n_entries.checked_mul(8).and_then(|bytes| 24usize.checked_add(bytes));
+    if seg != n || tail as u64 != file_len || expected_len != Some(b.len()) {
+        return Ok(None);
     }
+    read_limits.admit_fold_blocks(n_entries as u64)?;
     let mut entries = Vec::with_capacity(n_entries);
     for i in 0..n_entries {
         let at = 20 + i * 8;
@@ -297,7 +469,7 @@ pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<(u32, Vec<(u
             u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()),
         ));
     }
-    Some((tail, entries))
+    Ok(Some((tail, entries)))
 }
 
 /// The full path of a segment, for callers that need it (tests, introspection).
@@ -344,5 +516,17 @@ mod tests {
         let mut future = b;
         future[13] = 0x04;
         assert!(SegHeader::decode(&future, 5).is_err(), "unknown flags must refuse");
+    }
+
+    #[test]
+    fn advisory_sidecar_size_is_bounded_by_the_segment_it_describes() {
+        let dir = std::env::temp_dir().join(format!("turndb-sidecar-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_len = SEG_HDR_LEN + crate::fold::block::BLOCK_OVERHEAD as u64;
+        let max = max_dir_sidecar_bytes(file_len);
+        std::fs::File::create(dir_path(&dir, 0)).unwrap().set_len(max + 1).unwrap();
+        let got = read_dir_sidecar_bytes(&dir, 0, file_len);
+        std::fs::remove_dir_all(dir).ok();
+        assert!(got.is_none(), "an impossible sparse sidecar must be ignored before allocation");
     }
 }

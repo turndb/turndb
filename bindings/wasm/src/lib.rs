@@ -20,7 +20,8 @@
 //!
 //! turndb preserves attribute ORDER and DUPLICATE KEYS, because byte-exact reconstruction depends
 //! on it. A JSON object can represent neither. So attributes cross as
-//! `[[key, tag, value], ...]` with `tag` one of `s`/`i`/`f`/`b` — ordered, duplicate-tolerant, and
+//! `[[key, tag, value], ...]` with scalar tags `s`/`i`/`f`/`b`/`u`/`x`/`t`/`n` — ordered,
+//! duplicate-tolerant, and
 //! explicit about int-vs-float, which a bare JSON number cannot be. The JS wrapper builds this from
 //! the friendlier shapes a caller actually wants to write.
 //!
@@ -42,7 +43,8 @@
 use std::cell::RefCell;
 use std::path::Path;
 use turndb::fold::FoldCfg;
-use turndb::store::Store;
+use turndb::read_limits::ReadLimits;
+use turndb::store::{Store, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
 
 thread_local! {
@@ -169,14 +171,52 @@ fn decode_attrs(json: &[u8]) -> Result<Vec<(String, AttrValue)>, String> {
                 val.as_str().ok_or_else(|| format!("attribute {key} is not a string"))?.to_string(),
             ),
             "i" => AttrValue::Int(
-                val.as_i64().ok_or_else(|| format!("attribute {key} is not an i64"))?,
+                match val {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not an i64"))?,
             ),
             "f" => AttrValue::Float(
-                val.as_f64().ok_or_else(|| format!("attribute {key} is not a number"))?,
+                match val {
+                    serde_json::Value::Number(n) => n.as_f64(),
+                    serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not an f64"))?,
             ),
             "b" => AttrValue::Bool(
                 val.as_bool().ok_or_else(|| format!("attribute {key} is not a boolean"))?,
             ),
+            "u" => AttrValue::UInt(
+                match val {
+                    serde_json::Value::Number(n) => n.as_u64(),
+                    serde_json::Value::String(s) => s.parse::<u64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not a u64"))?,
+            ),
+            "x" => AttrValue::Bytes(
+                val.as_array()
+                    .ok_or_else(|| format!("attribute {key} binary value is not a byte array"))?
+                    .iter()
+                    .map(|byte| {
+                        byte.as_u64()
+                            .and_then(|byte| u8::try_from(byte).ok())
+                            .ok_or_else(|| format!("attribute {key} contains a non-byte value"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            "t" => AttrValue::TimestampNs(
+                match val {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("attribute {key} is not a signed nanosecond timestamp"))?,
+            ),
+            "n" if val.is_null() => AttrValue::Null,
             other => return Err(format!("attribute {key} has unknown tag {other:?}")),
         };
         out.push((key.to_string(), av));
@@ -191,7 +231,9 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
             .map(|(k, v)| {
                 let (tag, val) = match v {
                     AttrValue::Str(s) => ("s", serde_json::Value::from(s.clone())),
-                    AttrValue::Int(i) => ("i", serde_json::Value::from(*i)),
+                    // JSON numbers cross JavaScript as f64 and cannot represent every i64. Decimal
+                    // text keeps the portable ABI exact; the JS wrapper returns a BigInt.
+                    AttrValue::Int(i) => ("i", serde_json::Value::from(i.to_string())),
                     // A non-finite float has no JSON spelling. Carrying it across as a string
                     // keeps the value visible rather than silently turning it into null.
                     AttrValue::Float(f) => (
@@ -201,6 +243,15 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
                             .unwrap_or_else(|| serde_json::Value::from(f.to_string())),
                     ),
                     AttrValue::Bool(b) => ("b", serde_json::Value::from(*b)),
+                    AttrValue::UInt(i) => ("u", serde_json::Value::from(i.to_string())),
+                    AttrValue::Bytes(bytes) => (
+                        "x",
+                        serde_json::Value::Array(
+                            bytes.iter().map(|byte| serde_json::Value::from(*byte)).collect(),
+                        ),
+                    ),
+                    AttrValue::TimestampNs(ns) => ("t", serde_json::Value::from(ns.to_string())),
+                    AttrValue::Null => ("n", serde_json::Value::Null),
                 };
                 serde_json::json!([k, tag, val])
             })
@@ -210,9 +261,22 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
+/// Machine-readable guarantees of this compiled WASI core.
+#[no_mangle]
+pub extern "C" fn tdb_capabilities() -> i32 {
+    clear_err();
+    match serde_json::to_vec(&turndb::capabilities::capabilities()) {
+        Ok(v) => {
+            set_out(&v);
+            0
+        }
+        Err(e) => fail(format!("encode capability profile: {e}")),
+    }
+}
+
 /// Open (or create) a store. Returns a handle, or -1.
 ///
-/// `block_target` and `level` are 0 for the engine defaults.
+/// Numeric options are 0 for the engine defaults.
 ///
 /// # Safety
 /// `dir` must be valid UTF-8 of `dir_len` bytes.
@@ -222,6 +286,84 @@ pub unsafe extern "C" fn tdb_open(
     dir_len: u32,
     block_target: u32,
     level: i32,
+    max_record_bytes: u32,
+    max_batch_bytes: u32,
+    max_batch_records: u32,
+    max_identifier_bytes: u32,
+) -> i32 {
+    // Keep the original ABI for direct embedders. New readers use `tdb_open_v3`; zero selects the
+    // same compiled defaults here.
+    unsafe {
+        tdb_open_v2(
+            dir,
+            dir_len,
+            block_target,
+            level,
+            max_record_bytes,
+            max_batch_bytes,
+            max_batch_records,
+            max_identifier_bytes,
+            0,
+            0,
+        )
+    }
+}
+
+/// Open with explicit atomic persisted-frame admission. Numeric options are 0 for defaults.
+///
+/// # Safety
+/// `dir` must be valid UTF-8 of `dir_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_open_v2(
+    dir: *const u8,
+    dir_len: u32,
+    block_target: u32,
+    level: i32,
+    max_record_bytes: u32,
+    max_batch_bytes: u32,
+    max_batch_records: u32,
+    max_identifier_bytes: u32,
+    max_stored_frame_bytes: u32,
+    max_decoded_frame_bytes: u32,
+) -> i32 {
+    unsafe {
+        tdb_open_v3(
+            dir,
+            dir_len,
+            block_target,
+            level,
+            max_record_bytes,
+            max_batch_bytes,
+            max_batch_records,
+            max_identifier_bytes,
+            max_stored_frame_bytes,
+            max_decoded_frame_bytes,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// Open with explicit atomic-frame and object-count admission. Numeric options are 0 for defaults.
+///
+/// # Safety
+/// `dir` must be valid UTF-8 of `dir_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_open_v3(
+    dir: *const u8,
+    dir_len: u32,
+    block_target: u32,
+    level: i32,
+    max_record_bytes: u32,
+    max_batch_bytes: u32,
+    max_batch_records: u32,
+    max_identifier_bytes: u32,
+    max_stored_frame_bytes: u32,
+    max_decoded_frame_bytes: u32,
+    max_directory_entries: u32,
+    max_wal_frames: u32,
+    max_fold_blocks: u32,
 ) -> i32 {
     clear_err();
     let dir = match text(dir, dir_len) {
@@ -235,7 +377,61 @@ pub unsafe extern "C" fn tdb_open(
     if level != 0 {
         cfg.level = level;
     }
-    match Store::open(Path::new(dir), cfg) {
+    let defaults = WriteLimits::default();
+    let limits = WriteLimits {
+        max_record_bytes: if max_record_bytes == 0 {
+            defaults.max_record_bytes
+        } else {
+            u64::from(max_record_bytes)
+        },
+        max_batch_bytes: if max_batch_bytes == 0 {
+            defaults.max_batch_bytes
+        } else {
+            u64::from(max_batch_bytes)
+        },
+        max_batch_records: if max_batch_records == 0 {
+            defaults.max_batch_records
+        } else {
+            max_batch_records as usize
+        },
+        max_identifier_bytes: if max_identifier_bytes == 0 {
+            defaults.max_identifier_bytes
+        } else {
+            max_identifier_bytes as usize
+        },
+    };
+    let read_defaults = ReadLimits::default();
+    let read_limits = ReadLimits {
+        max_stored_frame_bytes: if max_stored_frame_bytes == 0 {
+            read_defaults.max_stored_frame_bytes
+        } else {
+            u64::from(max_stored_frame_bytes)
+        },
+        max_decoded_frame_bytes: if max_decoded_frame_bytes == 0 {
+            read_defaults.max_decoded_frame_bytes
+        } else {
+            u64::from(max_decoded_frame_bytes)
+        },
+        max_directory_entries: if max_directory_entries == 0 {
+            read_defaults.max_directory_entries
+        } else {
+            u64::from(max_directory_entries)
+        },
+        max_wal_frames: if max_wal_frames == 0 {
+            read_defaults.max_wal_frames
+        } else {
+            u64::from(max_wal_frames)
+        },
+        max_fold_blocks: if max_fold_blocks == 0 {
+            read_defaults.max_fold_blocks
+        } else {
+            u64::from(max_fold_blocks)
+        },
+    };
+    match Store::open_with_options(
+        Path::new(dir),
+        StoreOptions { fold: cfg, write_limits: limits, read_limits, ..StoreOptions::default() },
+    ) {
         Ok(s) => STORES.with(|slot| {
             let mut slot = slot.borrow_mut();
             // Reuse a closed slot before growing, so a long-lived process that opens and closes
@@ -614,10 +810,9 @@ mod tests {
     fn attrs_keep_order_and_duplicate_keys() {
         // The property the tagged-array encoding exists for: a JSON object would silently collapse
         // these two `k` entries and reorder the rest, and reconstruction would stop being exact.
-        let json =
-            br#"[["k","s","first"],["z","i",-5],["k","s","second"],["f","f",1.5],["b","b",true]]"#;
+        let json = br#"[["k","s","first"],["z","i",-5],["k","s","second"],["f","f",1.5],["b","b",true],["u","u","18446744073709551615"],["x","x",[0,255,128]],["t","t","-9223372036854775808"],["n","n",null]]"#;
         let got = decode_attrs(json).unwrap();
-        assert_eq!(got.len(), 5);
+        assert_eq!(got.len(), 9);
         assert_eq!(got[0].0, "k");
         assert_eq!(got[2].0, "k");
         assert!(matches!(&got[0].1, AttrValue::Str(s) if s == "first"));
@@ -625,6 +820,10 @@ mod tests {
         assert!(matches!(got[1].1, AttrValue::Int(-5)));
         assert!(matches!(got[3].1, AttrValue::Float(f) if f == 1.5));
         assert!(matches!(got[4].1, AttrValue::Bool(true)));
+        assert!(matches!(got[5].1, AttrValue::UInt(u64::MAX)));
+        assert!(matches!(&got[6].1, AttrValue::Bytes(bytes) if bytes == &[0, 255, 128]));
+        assert!(matches!(got[7].1, AttrValue::TimestampNs(i64::MIN)));
+        assert!(matches!(got[8].1, AttrValue::Null));
         // and the encoding round-trips
         let back = decode_attrs(encode_attrs(&got).to_string().as_bytes()).unwrap();
         assert_eq!(back.len(), got.len());
@@ -645,5 +844,25 @@ mod tests {
             assert!(decode_attrs(bad).is_err(), "{:?} must be refused", std::str::from_utf8(bad));
         }
         assert!(decode_attrs(b"").unwrap().is_empty(), "empty means no attributes");
+    }
+
+    #[test]
+    fn json_boundary_keeps_i64_and_non_finite_f64_exact() {
+        let attrs = vec![
+            ("min".into(), AttrValue::Int(i64::MIN)),
+            ("max".into(), AttrValue::Int(i64::MAX)),
+            ("nan".into(), AttrValue::Float(f64::NAN)),
+            ("pos".into(), AttrValue::Float(f64::INFINITY)),
+            ("neg".into(), AttrValue::Float(f64::NEG_INFINITY)),
+        ];
+        let json = encode_attrs(&attrs);
+        assert_eq!(json[0][2], i64::MIN.to_string());
+        assert_eq!(json[1][2], i64::MAX.to_string());
+        let got = decode_attrs(json.to_string().as_bytes()).unwrap();
+        assert!(matches!(got[0].1, AttrValue::Int(i64::MIN)));
+        assert!(matches!(got[1].1, AttrValue::Int(i64::MAX)));
+        assert!(matches!(got[2].1, AttrValue::Float(v) if v.is_nan()));
+        assert!(matches!(got[3].1, AttrValue::Float(v) if v == f64::INFINITY));
+        assert!(matches!(got[4].1, AttrValue::Float(v) if v == f64::NEG_INFINITY));
     }
 }

@@ -30,7 +30,8 @@ usage: turndb <verb> [args]
     refold    <DIR>              rewrite the fold, dropping content no live record references
     punch     <DIR>              deallocate unreachable fold blocks IN PLACE — the cheap half of
                                  erasure; no offsets move, no parts are rebuilt
-    recover   <DIR>              promote the newest intact retained manifest over a damaged one
+    recover   <DIR> [--max-rollback N]
+                                 validate and promote a retained manifest; rollback defaults to 0
     snapshots <DIR>              list retained commits available to time travel
     erase     <DIR> (--id ID ... | --attr KEY=VALUE)
                                  tombstone, settle, and REWRITE until content and metadata are
@@ -142,12 +143,26 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "recover" => {
-            let c = turndb::store::recover_manifest(&arg(0, "DIR")?)?;
-            println!("promoted retained commit {c} to MANIFEST");
+            let max_rollback_commits = match rest.get(1..) {
+                Some(["--max-rollback", value]) => value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid --max-rollback value {value:?}"))?,
+                Some([]) | None => 0,
+                _ => bail!("recover accepts only --max-rollback N\n\n{USAGE}"),
+            };
+            let report = turndb::store::recover_manifest(
+                &arg(0, "DIR")?,
+                FoldCfg::default(),
+                turndb::store::RecoveryOptions { max_rollback_commits },
+            )?;
+            println!(
+                "promoted retained commit {} to MANIFEST (rollback {}, {} records, {} content values verified)",
+                report.commit, report.rollback_commits, report.records, report.content_values
+            );
             Ok(())
         }
         "snapshots" => {
-            for c in turndb::store::retained_commits(&arg(0, "DIR")?) {
+            for c in turndb::store::retained_commits(&arg(0, "DIR")?)? {
                 println!("{c}");
             }
             Ok(())
@@ -192,7 +207,7 @@ fn inspect(path: &Path) -> Result<()> {
     let ids = rs.ids()?;
     println!("live records: {}", ids.len());
     if !path.is_file() {
-        let snaps = turndb::store::retained_commits(path);
+        let snaps = turndb::store::retained_commits(path)?;
         if !snaps.is_empty() {
             println!(
                 "snapshots: {}",
@@ -327,6 +342,12 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
                             v.parse::<f64>().is_ok_and(|p| p.to_bits() == x.to_bits())
                         }
                         turndb::AttrValue::Bool(x) => v.parse::<bool>() == Ok(*x),
+                        turndb::AttrValue::UInt(x) => v.parse::<u64>() == Ok(*x),
+                        turndb::AttrValue::TimestampNs(x) => v.parse::<i64>() == Ok(*x),
+                        turndb::AttrValue::Null => v == "null",
+                        // The string-only CLI selector has no binary literal syntax. Use the Rust
+                        // or native structured API when exact binary selection is required.
+                        turndb::AttrValue::Bytes(_) => false,
                     }
             });
             if hit {
@@ -383,8 +404,10 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
     };
     let reader = std::io::BufReader::with_capacity(1 << 22, reader);
     let mut s = Store::open(dir, FoldCfg::default())?;
-    let mut batch = turndb::store::Batch::new();
-    let (mut n, mut skipped, mut logical) = (0u64, 0u64, 0u64);
+    let mut pending: Vec<PendingRecord> = Vec::new();
+    let mut est_bytes = 0u64;
+    let (mut n, mut applied, mut skipped, mut refused_oversize, mut logical) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let t = std::time::Instant::now();
     for line in reader.lines() {
         let line = line?;
@@ -432,27 +455,95 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
             }
         }
         logical += body.len() as u64;
-        batch.put_body(&id, body.as_bytes(), attrs);
-        n += 1;
-        if batch.len() >= 1000 {
-            s.apply(std::mem::take(&mut batch))?;
-            s.sync()?;
-            s.flush()?;
+        // A conservative per-record charge against the atomic-batch admission ceiling: body and
+        // attribute bytes plus generous framing slack. Batching here is a throughput vehicle, not
+        // a semantic transaction — each input line is independent — so the batch closes before
+        // its worst case could be refused, instead of importing real traces up to an arbitrary
+        // record count and aborting at the engine's (correct) refusal.
+        let record_est = (id.len() + body.len()) as u64
+            + attrs
+                .iter()
+                .map(|(k, v)| {
+                    k.len() as u64
+                        + match v {
+                            turndb::AttrValue::Str(s) => s.len() as u64,
+                            turndb::AttrValue::Bytes(b) => b.len() as u64,
+                            _ => 8,
+                        }
+                })
+                .sum::<u64>()
+            + 1024;
+        if !pending.is_empty() && (pending.len() >= 1000 || est_bytes + record_est > EST_CEILING) {
+            apply_pending(&mut s, &mut pending, &mut applied, &mut refused_oversize)?;
+            est_bytes = 0;
         }
+        est_bytes += record_est;
+        pending.push((id, body.as_bytes().to_vec(), attrs));
+        n += 1;
     }
-    if !batch.is_empty() {
-        s.apply(batch)?;
-        s.sync()?;
-        s.flush()?;
+    if !pending.is_empty() {
+        apply_pending(&mut s, &mut pending, &mut applied, &mut refused_oversize)?;
     }
     let el = t.elapsed().as_secs_f64();
     println!(
-        "imported {n} records ({skipped} skipped), {:.2} GiB logical, {:.1}s ({:.0} rec/s); parts: {}",
+        "imported {applied} of {n} records ({skipped} skipped, {refused_oversize} refused \
+         oversize), {:.2} GiB logical, {:.1}s ({:.0} rec/s); parts: {}",
         logical as f64 / (1u64 << 30) as f64,
         el,
-        n as f64 / el.max(0.001),
+        applied as f64 / el.max(0.001),
         s.part_count()
     );
+    Ok(())
+}
+
+const EST_CEILING: u64 = 128 << 20;
+
+type PendingRecord = (String, Vec<u8>, Vec<(String, turndb::AttrValue)>);
+
+/// Apply the pending records as one atomic batch; on an admission refusal, retry them singly so
+/// one oversized record costs itself rather than the import. Only RESOURCE_EXHAUSTED downgrades
+/// to a counted per-record refusal — any other failure aborts, because a disk or corruption error
+/// mid-import must stop the run, not be skipped past.
+fn apply_pending(
+    s: &mut Store,
+    pending: &mut Vec<PendingRecord>,
+    applied: &mut u64,
+    refused_oversize: &mut u64,
+) -> Result<()> {
+    let mut batch = turndb::store::Batch::new();
+    for (id, body, attrs) in pending.iter() {
+        batch.put_body(id, body, attrs.clone());
+    }
+    match s.apply(batch) {
+        Ok(()) => *applied += pending.len() as u64,
+        Err(error)
+            if turndb::error::classify(&error) == turndb::error::ErrorClass::ResourceExhausted =>
+        {
+            for (id, body, attrs) in pending.drain(..) {
+                let mut single = turndb::store::Batch::new();
+                let body_len = body.len();
+                single.put_body(&id, &body, attrs);
+                match s.apply(single) {
+                    Ok(()) => *applied += 1,
+                    Err(error)
+                        if turndb::error::classify(&error)
+                            == turndb::error::ErrorClass::ResourceExhausted =>
+                    {
+                        eprintln!(
+                            "refused oversize record ({body_len} body bytes) under the \
+                             configured write admission limits"
+                        );
+                        *refused_oversize += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    pending.clear();
+    s.sync()?;
+    s.flush()?;
     Ok(())
 }
 

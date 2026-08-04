@@ -3,7 +3,7 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
-**Status: pre-1.0, format version 1, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
+**Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
 ## What problem it solves
@@ -16,7 +16,8 @@ queryable.
 turndb splits the two planes:
 
 * the **fold** holds content, addressed by BLAKE3 of its bytes, written once and never rewritten;
-* **parts** hold record ids, body programs, and typed attribute columns — references, not bytes.
+* **parts** hold record ids, named content programs, and typed attribute columns — references, not
+  bytes.
 
 Because a part holds no content, **compaction never touches content**: merging rewrites references
 and columns, which on trace data is a small fraction of the bytes. That is what lets a trace store
@@ -35,8 +36,9 @@ became 1.56 MiB.
 
 ## The cardinal invariant
 
-**Byte-exact reconstruction.** Reading a record reproduces the original bytes exactly — attribute
-order, duplicate keys, NaN payloads, `-0.0`. Everything else is in service of it.
+**Byte-exact reconstruction.** Reading a record reproduces every named content value and attribute
+exactly — including content boundaries, attribute order, duplicate keys, NaN payloads, and `-0.0`.
+Everything else is in service of it.
 
 ## Try it
 
@@ -51,6 +53,9 @@ head -4000 traces.jsonl | ./target/release/turndb import mystore -
 ./target/release/turndb query   mystore "SELECT model, count(*) FROM t GROUP BY model"
 ./target/release/turndb pack    mystore snap.turndb
 ./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"   # SQL over one file
+./target/release/turndb unpack  snap.turndb restored                   # validated, no overlay
+# If MANIFEST is damaged: validates the newest retained commit and permits no rollback by default
+./target/release/turndb recover mystore
 ```
 
 As a library:
@@ -69,17 +74,95 @@ s.flush()?;                                   // seal into an immutable part
 | | |
 |---|---|
 | **Durability** | WAL with an explicit ACK point; batches replay all-or-nothing; one commit point (the manifest) with a checksummed commit log, snapshots, and explicit recovery |
-| **Query** | DataFusion lens over the columnar plane — `body` is a projectable column, so attribute queries open zero fold blocks (measured, not asserted) |
-| **Compaction** | Total merge at eight parts, chosen by benchmark; merges provably touch zero content bytes |
+| **Query** | Bounded structured paging with Rust-owned cursors plus an optional DataFusion lens and read-only SQL-to-Arrow stream — named content is independently projectable, and metadata queries open zero fold blocks |
+| **Compaction** | Total merge at eight parts plus exact input-part/row/byte-bounded work units; merges provably touch zero content bytes |
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
 | **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
+
+The pack command takes the writer role, settles a recovered WAL, fully verifies its staged artifact,
+and refuses to replace an output path. Restore likewise verifies before extraction and atomically
+publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
+Manifest recovery is likewise exclusive and validates the complete candidate before publication;
+rollback past the newest retained commit requires explicit authorization. See
+[manifest recovery](docs/recovery.md).
+
+The query layers are independently selectable: `--features columnar --no-default-features` provides
+the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same
+lens. Storage, visibility, and content semantics remain in TurnDB either way.
+
+`Store::scan` is available without either query feature. It provides id-ordered forward/reverse pages,
+typed predicates, selected attributes, named-content metadata or bytes, opaque checked cursors, and a
+per-call examination bound. Reconstructed pages default to a 32 MiB content ceiling, can override it
+per request, never split a row, and return a cursor before the row that would cross the ceiling.
+Named-content metadata includes the BLAKE3 identity of the exact whole value without reconstruction
+for version-2 records. Writer scans include the memtable;
+`ReadStore::scan` remains pinned to its manifest snapshot.
+Committed rows are projected from physical columns: sibling attribute value/dictionary and named
+content program sections remain unopened. See
+[projected structured scans](docs/projected-structured-scan.md).
+`Store::explain_scan` and `ReadStore::explain_scan` run the same request/cursor preparation and report
+required versus predicate-only fields, work ceilings, effective bounds, and exact physical rows in
+scope before visibility resolution. See [structured scan explanation](docs/scan-explanation.md).
+Rust embedders can classify rich error chains through the stable, domain-neutral
+[`ErrorClass`](docs/error-taxonomy.md); the native Node binding exposes the same engine codes through
+`TurnDbError` and adds only its actor-owned `BUSY`/`CLOSED` states.
+
+Format version 2 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
+timestamps, and explicit null to the existing scalar fields. Missing and null remain distinct, and
+bindings never route exact integers through JavaScript `number`; see
+[general scalar field types](docs/field-types-v4.md).
+
+Writer opens also carry generic admission policy: worst-case framed-WAL bytes per record and atomic
+batch, batch member count, and UTF-8 identifier/name bytes. Defaults are 64 MiB, 256 MiB, 4,096, and
+4 KiB respectively; Rust, native Node, and portable Node can override them. Complete batches are
+charged before the first fold mutation, and charging is independent of dedup history. See
+[write admission limits](docs/write-admission.md).
+
+Reads independently admit every atomic WAL, part-TOC/section, and fold-block frame before stored or
+decoded allocation. Both ceilings default to 512 MiB, are configurable per Rust/native/portable
+handle, classify refusal as `RESOURCE_EXHAUSTED`, and are distinct from cache residency. Writers seal
+fold blocks early under strict profiles and refuse oversized part outputs before publication; see
+[atomic frame read admission](docs/read-admission.md).
+
+Persistent collection growth is bounded separately within that same per-open profile: 100,000
+directory entries, 100,000 physical WAL frames, and 1,000,000 fold blocks by default. Checks precede
+directory/vector growth and future writer output, including atomic-batch member frames and sparse
+fold ids; see [persistent object-count admission](docs/object-admission.md).
+
+Long-running compaction, verification, punching, refold, backup, and restore operations accept
+reusable Rust cancellation tokens and absolute deadlines through their controlled variants. The
+native Node methods map these to submission-inclusive `timeoutMs` and `AbortSignal` options while
+preserving each operation's publication and restart invariants; see
+[lifecycle cancellation and deadlines](docs/lifecycle-control.md).
+Incremental compaction accepts simultaneous exact physical input-part, row, and file-byte limits,
+reports the executed plan and output bytes, and refuses rather than exceeding an insufficient budget;
+see [bounded incremental compaction](docs/bounded-compaction.md).
+Reachability-aware storage inventory separates live, retained-only, and unclassified files, while
+compaction and refold expose exact source facts plus explicitly advisory staging estimates; see
+[maintenance space accounting and preflight](docs/maintenance-space.md).
+Live immutable parts can be upgraded one atomic, restartable unit at a time, with retained-snapshot
+dependencies and advisory stage space reported separately; see
+[resumable format migration](docs/format-migration.md).
+Writer handles expose process-local, monotonic lifecycle outcomes and nanosecond totals through a
+telemetry-neutral polling surface; see [pull-based operation metrics](docs/operation-metrics.md).
+
+With `sql` enabled, `query::sql::SqlQuery` runs positional-parameter SQL against the generic
+`records` table under a configurable DataFusion execution-memory ceiling. DDL, DML, and session
+statements are refused. Results are pulled one bounded batch at a time as complete Arrow IPC streams;
+bindings therefore transport dynamic columnar results without translating them through JSON or
+JavaScript objects. The ownership, snapshot, cancellation, and memory semantics are detailed in
+[Read-only SQL and Arrow IPC streaming](docs/sql-arrow-stream.md).
+Point reads, storage-native structured scans, and DataFusion are held to one versioned-record
+reference model by the [three-path differential gate](docs/differential-query-testing.md).
 
 ## What it does not do
 
 No daemon, no network, no cluster, no consensus. Scale-out is more stores, not a bigger one. No
 encryption (the format reserves a flag bit and refuses it — see FORMAT.md). No parity/erasure
 coding: corruption is detected at every level and repair is the storage layer's job.
+The parser/binding threat model, completed hardening, and remaining availability risks are recorded
+in the [security review](docs/security-review.md); checksums are integrity evidence, not authentication.
 
 **One writer per store.** Readers need no lock and see a consistent committed snapshot. On Unix
 the engine enforces this with `flock`, which the kernel releases when the process dies — so a
@@ -91,15 +174,29 @@ is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
 
 ## Platforms
 
+The exact tested targets, Node majors, capability rules, semantic-version policy, and current
+prototype/publication status are defined in the
+[support and compatibility policy](docs/support-and-compatibility.md).
+
 The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
 Linux hole punching.
 
+`bindings/node` is the native server-side release candidate. Its `napi-rs` addon gives each open
+writer a dedicated Rust actor and bounded queue, exposes Promise-based batch/durability/scan/content
+operations with `Buffer` and exact `bigint`, and refuses to fall back to WASM when a native artifact
+is unavailable. The first prebuilt slice is Linux x86-64 glibc across Node 22, 24, and 26; its root
+and platform manifests remain private in source even when explicit release staging is approved. The
+[native prebuild contract](docs/native-prebuilds.md) states the exact artifact, install, provenance,
+and publication gates.
+
 It also builds for **`wasm32-wasip1`**, which is what the [`turndb` npm package](npm/turndb)
 ships: one `.wasm`, no native addon, no prebuild matrix, no postinstall. A store written by either
-build is readable by the other, byte for byte. That target gives up three things, and the first is
-the one that matters: **no advisory locking** (see above), no `punch` (`refold` reclaims the same
-space by rewriting), and no threads, so compression runs inline. `src/sys.rs` is the single place
-that states what turndb needs from an operating system and what happens where it isn't there.
+build is readable by the other, byte for byte; the two-way executable proof is documented under
+[cross-runtime compatibility](docs/cross-runtime-compatibility.md). That target gives up three things,
+and the first is the one that matters: **no advisory locking** (see above), no `punch` (`refold`
+reclaims the same space by rewriting), and no threads, so compression runs inline. `src/sys.rs` is
+the single place that states what turndb needs from an operating system and what happens where it
+isn't there.
 
 ## Testing
 
@@ -107,17 +204,21 @@ The engine is tested harder than its size suggests, because a storage engine tha
 worthless however elegant it is.
 
 ```sh
-cargo test                              # 12 suites
-cargo test --features dst --test dst    # 1,344 crash states, strict-POSIX durability model
+cargo test                              # the ordinary suites
+cargo test --features dst --test dst    # every crash state of six recorded protocols, strict POSIX
 cargo test --test corruption            # ~40k mutants across every parser
 STORM_XOR=$RANDOM cargo test --test corruption   # fresh mutant space
 ```
 
-The **deterministic simulation** harness records every write and fsync, then replays every crash
-point under a model where file content and directory entries become durable independently, and
-asserts the recovered store equals some prefix of the acknowledged writes. It found three real
-bugs in its first hour, including an ACK that was backed by a WAL whose directory entry was not
-yet durable.
+The **deterministic simulation** harness records every write, fsync, rename, link, unlink, and
+punch, then replays every crash point under a model where file content and directory entries
+become durable independently, and asserts the recovered store equals some prefix of the
+acknowledged writes. Six sweeps cover the write path and every publication protocol — backup,
+restore, manifest recovery with rollback, hole punching, and format migration — and each prints
+the exact number of crash states it checked, so the suite reports its own coverage instead of this
+paragraph carrying a number that rots. It found three real bugs in its first hours, including an
+ACK backed by a WAL whose directory entry was not yet durable, and a declared hole punch whose
+partially landed deallocation bricked writer recovery.
 
 The **corruption storm** mutates every on-disk structure and requires errors, never panics. It
 found five parser bug classes, including bounds checks of the form `at + n > len` that *overflow

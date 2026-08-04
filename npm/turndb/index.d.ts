@@ -6,8 +6,18 @@
  * either.
  */
 
-/** An attribute value. Pass `{i}`/`{f}` to force int-vs-float when it matters. */
-export type AttrValue = string | number | boolean | bigint | { i: number } | { f: number };
+/** An attribute value. Wrappers preserve distinctions JavaScript primitives cannot express. */
+export type AttrValue =
+  | string
+  | number
+  | boolean
+  | bigint
+  | Uint8Array
+  | null
+  | { i: number | bigint }
+  | { f: number }
+  | { u: number | bigint }
+  | { timestampNs: number | bigint };
 
 /**
  * Attributes as an object, or as pairs.
@@ -34,6 +44,24 @@ export interface OpenOptions {
    * only — a reader never needs to know it, so the choice is per-open, never a format commitment.
    */
   level?: number;
+  /** Worst-case complete WAL frame bytes admitted for one record; defaults to 64 MiB. */
+  maxRecordBytes?: number;
+  /** Member frames plus commit marker admitted for one atomic batch; defaults to 256 MiB. */
+  maxBatchBytes?: number;
+  /** Ordered members admitted in one atomic batch; defaults to 4,096. */
+  maxBatchRecords?: number;
+  /** UTF-8 bytes admitted in an id, attribute name, or content name; defaults to 4 KiB. */
+  maxIdentifierBytes?: number;
+  /** Stored input admitted for one WAL, part-TOC/section, or fold-block frame; defaults to 512 MiB. */
+  maxStoredFrameBytes?: number;
+  /** Decoded output admitted for one part-TOC/section or fold-block frame; defaults to 512 MiB. */
+  maxDecodedFrameBytes?: number;
+  /** Entries visited in one filesystem directory enumeration; defaults to 100,000. */
+  maxDirectoryEntries?: number;
+  /** Physical frames admitted in one unflushed WAL; defaults to 100,000. */
+  maxWalFrames?: number;
+  /** Content blocks admitted in one fold generation; defaults to 1,000,000. */
+  maxFoldBlocks?: number;
 }
 
 export interface ScanOptions {
@@ -66,12 +94,46 @@ export interface StoreRecord {
   id: string;
   body: Uint8Array;
   /** Order and duplicate keys preserved, exactly as stored. */
-  attrs: Array<[string, unknown]>;
+  attrs: Array<[string, AttrValue]>;
 }
 
 export interface Stats {
   records: number;
   parts: number;
+}
+
+export interface Capabilities {
+  part_format_write: number;
+  part_format_read_max: number;
+  writer_exclusion: 'os_enforced' | 'embedder_enforced';
+  physical_erasure: 'punch_or_refold' | 'refold_only';
+  positioned_io: boolean;
+  threads: boolean;
+  columnar: boolean;
+  sql: boolean;
+  portable_wasm: boolean;
+  write_admission_limits: true;
+  read_admission_limits: true;
+  object_count_admission: true;
+  store_space_usage: true;
+  allocated_space_usage: boolean;
+  format_migration: true;
+  operation_metrics: true;
+  part_distribution: true;
+  content_liveness: true;
+  lifecycle_event_journal: true;
+  lifecycle_event_capacity: number;
+  query_timings: true;
+  sql_explain: false;
+  max_record_bytes_default: number;
+  max_batch_bytes_default: number;
+  max_batch_records_default: number;
+  max_identifier_bytes_default: number;
+  max_stored_frame_bytes_default: number;
+  max_decoded_frame_bytes_default: number;
+  max_directory_entries_default: number;
+  max_wal_frames_default: number;
+  max_fold_blocks_default: number;
 }
 
 /** Every engine-reported failure, carrying the engine's own message. */
@@ -95,6 +157,16 @@ export declare class TurndbError extends Error {
 export declare class Store {
   /** True once {@link Store.close} has run. */
   readonly closed: boolean;
+  /** Guarantees of the compiled portable core. */
+  capabilities(): Capabilities;
+  /** Exact frame-byte and persistent object-count admission configured for this handle. */
+  readLimits(): {
+    maxStoredFrameBytes: number;
+    maxDecodedFrameBytes: number;
+    maxDirectoryEntries: number;
+    maxWalFrames: number;
+    maxFoldBlocks: number;
+  };
   /** Write one record. Not durable until {@link Store.sync}. */
   putBody(id: string, body: Uint8Array | string, attrs?: Attrs): void;
   /** Apply many records atomically — all-or-nothing, so a crash cannot commit half an export. */
@@ -165,6 +237,9 @@ export declare class Store {
  */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
 
+/** Guarantees of the compiled portable core, independent of the host OS running WASI. */
+export declare function capabilities(): Promise<Capabilities>;
+
 /**
  * The first id that cannot start with `prefix`, or `null` when the range is unbounded above.
  *
@@ -175,5 +250,10 @@ export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
  */
 export declare function prefixUpperBound(prefix: string): string | null;
 
-declare const _default: { open: typeof open; Store: typeof Store; TurndbError: typeof TurndbError };
+declare const _default: {
+  open: typeof open;
+  capabilities: typeof capabilities;
+  Store: typeof Store;
+  TurndbError: typeof TurndbError;
+};
 export default _default;

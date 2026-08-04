@@ -242,7 +242,11 @@ fn main() -> anyhow::Result<()> {
         if sample_this {
             samples.push((pending.len(), body));
         }
-        pending.push(Record { id, body: prog, attrs });
+        pending.push(Record {
+            id,
+            contents: vec![turndb::Content::new(turndb::BODY_CONTENT, prog)],
+            attrs,
+        });
 
         if pending.len() >= per_part {
             fold.sync()?;

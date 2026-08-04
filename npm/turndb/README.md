@@ -1,5 +1,10 @@
 # turndb
 
+This package declares Node `>=22 <27`; its required rebuild/test matrix is Node 22, 24, and 26. See the
+[support and compatibility policy](https://github.com/turndb/turndb/blob/main/docs/support-and-compatibility.md)
+for the distinction between the portable WASI profile, native source qualification, and published
+support.
+
 A content-addressed columnar store for AI traces. Byte-exact, embedded, single-writer — a store is
 a directory you can `tar`.
 
@@ -66,6 +71,30 @@ Call `close()` explicitly. A dropped handle is reclaimed when JavaScript eventua
 forgetting `close()` does not wedge the process forever, but collection has no timing guarantee and
 the next `open()` refuses while the old handle is still live.
 
+## Write admission
+
+`open` accepts `maxRecordBytes`, `maxBatchBytes`, `maxBatchRecords`, and `maxIdentifierBytes` as
+positive u32 numbers. Defaults are 64 MiB, 256 MiB, 4,096, and 4 KiB. The first two are not raw body
+limits: they count deterministic worst-case complete WAL frames, treating every folded piece as
+novel, so acceptance never depends on hidden dedup history. An atomic batch is completely charged and
+validated before any member mutates the fold or WAL. See
+[write admission limits](../../docs/write-admission.md) for the exact unit and native API.
+
+## Frame and persistent object admission
+
+`open` also accepts `maxStoredFrameBytes` and `maxDecodedFrameBytes`, positive u32 values defaulting
+to 512 MiB. They are checked before a WAL, part, or fold frame allocates stored or decoded linear
+memory. `maxDirectoryEntries`, `maxWalFrames`, and `maxFoldBlocks` are positive u32 object-count
+ceilings defaulting to 100,000, 100,000, and 1,000,000. They bound enumeration-driven collection
+growth, physical frames in an unflushed WAL, and blocks plus block-id span in one fold generation.
+`store.readLimits()` reports all five effective values.
+
+A strict frame profile seals fold blocks early so small records keep progressing; one indivisible
+oversized piece is refused before mutation, and an oversized part output is refused before
+publication. Batch WAL frames and future filesystem/block objects are likewise admitted before the
+associated mutation. See [atomic frame read admission](../../docs/read-admission.md) and
+[persistent object-count admission](../../docs/object-admission.md).
+
 ## When a write stalls, and by how much
 
 This build is single-threaded, so two operations run on **your** thread and nothing else's. Both
@@ -114,6 +143,21 @@ for convenience, or an array of pairs when it matters:
 ```js
 store.putBody(id, body, [['finishReason', 'end_turn'], ['finishReason', 'max_tokens']]);
 ```
+
+Stored integers return as JavaScript `bigint`, including small values. Integer-valued `number`
+inputs are accepted only inside JavaScript's safe range; use `bigint` for the full signed-i64 range.
+Unsigned u64 and UTC nanosecond timestamps use `{ u: bigint }` and
+`{ timestampNs: bigint }` wrappers so a read-modify-write cycle retains their type. `Uint8Array`
+stores binary metadata and `null` stores explicit null; missing remains absence of the key. See
+[the version-2 scalar contract](../../docs/field-types-v4.md).
+The JSON-only WASM boundary carries those values as decimal text internally, never through a float.
+Non-finite f64 values also use explicit text spellings rather than JSON `null`.
+
+## Capability profile
+
+`await capabilities()` (or `store.capabilities()`) reports the compiled core's actual guarantees.
+These describe the WASI guest, not the host OS: this package reports embedder-enforced writer
+exclusion, no threads, and refold-only physical reclamation even when Node itself runs on Linux.
 
 ## No SQL here, on purpose
 

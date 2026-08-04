@@ -3,7 +3,10 @@
 
 use std::path::PathBuf;
 use turndb::fold::FoldCfg;
-use turndb::store::{Manifest, PartRef, Span, Store};
+use turndb::read_limits::ReadLimits;
+use turndb::store::{
+    CompactionBudget, CompactionError, ContentSpans, Manifest, PartRef, Span, Store, StoreOptions,
+};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -76,6 +79,151 @@ fn put_flush_get_is_byte_exact() {
 }
 
 #[test]
+fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
+    let dir = tmp("store-options");
+    let options = StoreOptions {
+        fold: FoldCfg {
+            block_target: 4096,
+            cache_bytes: 2 << 20,
+            seg_max: 1 << 20,
+            level: 3,
+            compress_threads: 1,
+        },
+        part_cache_bytes: 4 << 20,
+        read_limits: ReadLimits {
+            max_stored_frame_bytes: 2 << 20,
+            max_decoded_frame_bytes: 3 << 20,
+            ..ReadLimits::default()
+        },
+        ..StoreOptions::default()
+    };
+    let mut store = Store::open_with_options(&dir, options).unwrap();
+    let health = store.health();
+    assert_eq!(health.fold_block_target_bytes, 4096);
+    assert_eq!(health.fold_cache_budget, 2 << 20);
+    assert_eq!(health.part_cache_budget, 4 << 20);
+    assert_eq!(health.max_stored_frame_bytes, 2 << 20);
+    assert_eq!(health.max_decoded_frame_bytes, 3 << 20);
+    assert_eq!(health.fold_segment_max_bytes, 1 << 20);
+    assert_eq!(health.fold_compression_level, 3);
+    assert_eq!(health.fold_compression_threads, 1);
+    put(&mut store, "configured", b"runtime policy survives a refold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.refold().unwrap();
+    assert_eq!(store.health().part_cache_budget, 4 << 20);
+    assert_eq!(store.health().max_decoded_frame_bytes, 3 << 20);
+    drop(store);
+
+    // Reopening with other runtime policy reads the same format without migration.
+    let reopened = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(reopened.health().fold_block_target_bytes, cfg().block_target);
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let invalid = tmp("store-options-invalid");
+    let error = Store::open_with_options(
+        &invalid,
+        StoreOptions { part_cache_bytes: 0, ..StoreOptions::default() },
+    )
+    .err()
+    .expect("invalid cache budget must refuse open");
+    assert!(error.to_string().contains("part_cache_bytes"));
+    std::fs::remove_dir_all(&invalid).ok();
+}
+
+#[test]
+fn named_content_is_independent_sparse_and_content_addressed() {
+    let dir = tmp("named-content");
+    let shared = b"the same large content appears under request and response";
+    let mut s = Store::open(&dir, cfg()).unwrap();
+
+    // Deliberately submit names out of order. The semantic record is a map and reads canonically.
+    let contents = vec![
+        ContentSpans::new("response", vec![Span::Piece(shared), Span::Lit(b"!")]),
+        ContentSpans::new("empty", vec![]),
+        ContentSpans::new("request", vec![Span::Piece(shared)]),
+    ];
+    s.put_record("mixed:1", &contents, vec![("kind".into(), AttrValue::Str("example".into()))])
+        .unwrap();
+
+    assert_eq!(s.dedup_window_len(), 1, "one shared piece is stored once across content names");
+    assert_eq!(s.reconstruct_content("mixed:1", "request").unwrap().unwrap(), shared);
+    assert_eq!(
+        s.reconstruct_content("mixed:1", "response").unwrap().unwrap(),
+        [shared.as_slice(), b"!"].concat()
+    );
+    assert_eq!(s.reconstruct_content("mixed:1", "empty").unwrap(), Some(Vec::new()));
+    assert_eq!(s.reconstruct_content("mixed:1", "absent").unwrap(), None);
+    assert_eq!(s.reconstruct("mixed:1").unwrap(), None, "body is conventional, not privileged");
+    assert_eq!(
+        s.get("mixed:1")
+            .unwrap()
+            .unwrap()
+            .contents
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["empty", "request", "response"]
+    );
+
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let second = [ContentSpans::new("raw", vec![Span::Piece(shared)])];
+    s.put_record("mixed:2", &second, vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.merge_range(0, 2).unwrap().unwrap();
+    assert_eq!(s.part_count(), 1);
+    assert_eq!(s.reconstruct_content("mixed:1", "request").unwrap().unwrap(), shared);
+    assert_eq!(s.reconstruct_content("mixed:2", "raw").unwrap().unwrap(), shared);
+
+    s.refold().unwrap();
+    drop(s);
+    let r = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(r.reconstruct_content("mixed:1", "empty").unwrap(), Some(Vec::new()));
+    assert_eq!(r.reconstruct_content("mixed:1", "absent").unwrap(), None);
+    assert_eq!(r.reconstruct_content("mixed:2", "raw").unwrap().unwrap(), shared);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_invalid_content_map_has_no_storage_side_effects() {
+    let dir = tmp("invalid-content-map");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let duplicate = [
+        ContentSpans::new("same", vec![Span::Piece(b"first")]),
+        ContentSpans::new("same", vec![Span::Piece(b"second")]),
+    ];
+    assert!(s.put_record("bad", &duplicate, vec![]).is_err());
+    assert_eq!(s.memtable_len(), 0);
+    assert_eq!(s.dedup_window_len(), 0);
+    assert_eq!(s.wal_bytes(), 0);
+
+    let empty_name = [ContentSpans::new("", vec![Span::Piece(b"bytes")])];
+    assert!(s.put_record("bad", &empty_name, vec![]).is_err());
+    assert_eq!(s.memtable_len(), 0);
+    assert_eq!(s.dedup_window_len(), 0);
+    assert_eq!(s.wal_bytes(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_invalid_late_batch_member_has_no_storage_side_effects() {
+    let dir = tmp("invalid-batch-record");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut batch = turndb::store::Batch::new();
+    batch.put("good", &[Span::Piece(b"must not reach the fold")], vec![]);
+    // The compatibility staging API cannot return an error, so apply preflights the entire batch.
+    batch.put("", &[Span::Piece(b"also must not reach the fold")], vec![]);
+    assert!(s.apply(batch).is_err());
+    assert_eq!(s.memtable_len(), 0);
+    assert_eq!(s.dedup_window_len(), 0);
+    assert_eq!(s.wal_bytes(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn crash_before_flush_recovers_from_the_log() {
     let dir = tmp("crashwal");
     let mut want = Vec::new();
@@ -127,6 +275,34 @@ fn crash_after_flush_keeps_the_part_and_empties_the_log() {
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cancelled_sync_and_flush_refuse_before_their_publication_boundaries() {
+    let dir = tmp("cancel-durability");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "pending", b"content waiting for controlled durability");
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let control =
+        turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) };
+
+    let error = store.sync_with_control(&control).unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    assert_eq!(std::fs::metadata(dir.join("WAL")).unwrap().len(), 0);
+
+    let error = store.flush_with_control(&control).unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    assert_eq!(store.ids().unwrap(), vec!["pending"]);
+    assert!(store.manifest().parts.is_empty());
+    assert!(!std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|extension| extension == "part")));
+
+    assert!(store.flush().unwrap().is_some());
+    assert_eq!(Store::open_read(&dir, cfg()).unwrap().ids().unwrap(), vec!["pending"]);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -362,6 +538,40 @@ fn merge_keeps_the_newest_version_of_a_reput_id() {
 }
 
 #[test]
+fn merge_preserves_every_extended_scalar_type() {
+    let dir = tmp("merge-scalars");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let attrs = vec![
+        ("u".into(), AttrValue::UInt(u64::MAX)),
+        ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 0x80])),
+        ("at".into(), AttrValue::TimestampNs(i64::MIN)),
+        ("nothing".into(), AttrValue::Null),
+    ];
+    s.put_body("a", b"a", attrs.clone()).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.put_body(
+        "b",
+        b"b",
+        vec![
+            ("u".into(), AttrValue::UInt(0)),
+            ("raw".into(), AttrValue::Bytes(vec![1, 2, 3])),
+            ("at".into(), AttrValue::TimestampNs(i64::MAX)),
+        ],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.merge_range(0, 2).unwrap().unwrap();
+    assert_eq!(s.get("a").unwrap().unwrap().attrs, attrs);
+    assert_eq!(s.part_count(), 1);
+    drop(s);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(reader.get("a").unwrap().unwrap().attrs, attrs);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
     // "Sweeps" now means AFTER the retention window: replaced inputs stay on disk while a retained
     // manifest still names them — that is what keeps a reader's snapshot whole — and fall to the
@@ -444,6 +654,153 @@ fn tiering_bounds_part_count_under_sustained_writes() {
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "tiering lost {id}");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
+    let dir = tmp("bounded-compact");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for batch in 0..5 {
+        for i in 0..10 {
+            let id = format!("b{batch}-{i:02}");
+            want.push((id.clone(), put(&mut s, &id, format!("payload {batch}/{i}").as_bytes())));
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+
+    let part_bytes: Vec<u64> = s
+        .manifest()
+        .parts
+        .iter()
+        .map(|part| std::fs::metadata(dir.join(&part.file)).unwrap().len())
+        .collect();
+    let first_two_bytes = part_bytes[0] + part_bytes[1];
+    let (smallest_start, smallest_pair_bytes) = part_bytes
+        .windows(2)
+        .enumerate()
+        .map(|(start, pair)| (start, pair[0] + pair[1]))
+        .min_by_key(|&(start, bytes)| (bytes, start))
+        .unwrap();
+    let exact_byte_plan = s
+        .plan_compaction(CompactionBudget {
+            max_input_parts: 2,
+            max_input_rows: u64::MAX,
+            max_input_bytes: smallest_pair_bytes,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact_byte_plan.start_part, smallest_start);
+    assert_eq!(exact_byte_plan.input_bytes, smallest_pair_bytes);
+    let error = s
+        .plan_compaction(CompactionBudget {
+            max_input_parts: 2,
+            max_input_rows: u64::MAX,
+            max_input_bytes: smallest_pair_bytes - 1,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CompactionError>(),
+        Some(CompactionError::BudgetTooSmall { input_bytes, .. })
+            if *input_bytes == smallest_pair_bytes
+    ));
+
+    let budget =
+        CompactionBudget { max_input_parts: 3, max_input_rows: 25, max_input_bytes: u64::MAX };
+    let plan = s.plan_compaction(budget).unwrap().unwrap();
+    assert_eq!(plan.start_part, 0, "equal-width plans prefer the oldest run");
+    assert_eq!(plan.input_parts, 2);
+    assert_eq!(plan.input_rows, 20);
+    assert_eq!(plan.input_bytes, first_two_bytes);
+    assert!(!plan.drops_tombstones, "a partial run must retain delete markers");
+    let estimate = s.estimate_compaction_space(budget).unwrap().unwrap();
+    assert_eq!(estimate.plan, plan);
+    assert!(estimate.input_sections > 0);
+    assert!(estimate.input_raw_section_bytes > 0);
+    assert!(estimate.estimated_stage_bytes > estimate.input_raw_section_bytes);
+    assert!(!estimate.estimate_is_hard_bound);
+    assert_eq!(estimate.retained_input_bytes_after_commit, plan.input_bytes);
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+
+    let result = s.compact_bounded(budget).unwrap().unwrap();
+    assert_eq!(result.plan, plan, "execution must honor the observed plan exactly");
+    assert_eq!(result.merge.inputs, 2);
+    assert_eq!(s.part_count(), 4);
+    let output = &s.manifest().parts[result.plan.start_part];
+    assert_eq!(result.output_bytes, std::fs::metadata(dir.join(&output.file)).unwrap().len());
+    assert!(result.output_bytes <= estimate.estimated_stage_bytes);
+    for (id, body) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "bounded merge lost {id}");
+    }
+
+    let manifest_before = std::fs::read(dir.join("MANIFEST")).unwrap();
+    let parts_before: Vec<_> = s.manifest().parts.iter().map(|part| part.file.clone()).collect();
+    let error = s
+        .compact_bounded(CompactionBudget {
+            max_input_parts: 2,
+            max_input_rows: 1,
+            max_input_bytes: u64::MAX,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CompactionError>(),
+        Some(CompactionError::BudgetTooSmall { .. })
+    ));
+    assert_eq!(
+        s.manifest().parts.iter().map(|part| part.file.clone()).collect::<Vec<_>>(),
+        parts_before,
+        "a rejected budget must not mutate live state"
+    );
+    assert_eq!(std::fs::read(dir.join("MANIFEST")).unwrap(), manifest_before);
+
+    let error = s
+        .plan_compaction(CompactionBudget {
+            max_input_parts: 1,
+            max_input_rows: u64::MAX,
+            max_input_bytes: u64::MAX,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<CompactionError>(),
+        Some(CompactionError::InvalidBudget(_))
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repeated_bounded_compaction_settles_tombstones_only_on_the_total_step() {
+    let dir = tmp("bounded-settle");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    put(&mut s, "gone", b"old");
+    put(&mut s, "keep-a", b"a");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.delete("gone").unwrap();
+    put(&mut s, "keep-b", b"b");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    put(&mut s, "keep-c", b"c");
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let budget = CompactionBudget {
+        max_input_parts: 2,
+        max_input_rows: u64::MAX,
+        max_input_bytes: u64::MAX,
+    };
+    let partial = s.compact_bounded(budget).unwrap().unwrap();
+    assert!(!partial.plan.drops_tombstones);
+    assert_eq!(partial.merge.tombstones_dropped, 0);
+    assert!(s.reconstruct("gone").unwrap().is_none());
+
+    let total = s.compact_bounded(budget).unwrap().unwrap();
+    assert!(total.plan.drops_tombstones);
+    assert_eq!(total.merge.tombstones_dropped, 1);
+    assert_eq!(s.part_count(), 1);
+    assert!(s.reconstruct("gone").unwrap().is_none());
+    assert!(s.plan_compaction(budget).unwrap().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -706,7 +1063,7 @@ fn a_retained_snapshot_reads_the_past() {
 
     // The snapshot at c1 is the first flush, exactly: the old version, and no `gone` — it did not
     // exist yet, rather than "was deleted".
-    assert!(turndb::store::retained_commits(&dir).contains(&c1));
+    assert!(turndb::store::retained_commits(&dir).unwrap().contains(&c1));
     let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
     assert_eq!(old.reconstruct("k").unwrap().unwrap(), v1);
     assert!(old.reconstruct("gone").unwrap().is_none());
@@ -734,8 +1091,25 @@ fn a_corrupt_manifest_recovers_from_the_commit_log() {
     std::fs::write(&man, &b).unwrap();
 
     assert!(Store::open(&dir, cfg()).is_err(), "a corrupt manifest must refuse, not open empty");
-    let c = turndb::store::recover_manifest(&dir).unwrap();
-    assert!(c > 0);
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = turndb::store::recover_manifest_with_control(
+        &dir,
+        cfg(),
+        turndb::store::RecoveryOptions::default(),
+        &turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) },
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    assert_eq!(std::fs::read(&man).unwrap(), b, "cancelled recovery promoted a manifest");
+
+    let recovered =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap();
+    assert!(recovered.commit > 0);
+    assert_eq!(recovered.rollback_commits, 0);
+    assert_eq!(recovered.records, want.len());
+    assert!(recovered.content_values >= want.len());
 
     // The newest retained copy carried the same commit, so recovery lost nothing — and the store
     // is a working store again, not merely a readable one.
@@ -747,6 +1121,251 @@ fn a_corrupt_manifest_recovers_from_the_commit_log() {
     s.sync().unwrap();
     s.flush().unwrap();
     assert_eq!(s.reconstruct("after").unwrap().unwrap(), after);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checked_recovery_excludes_a_live_writer_and_never_promotes_an_unreadable_candidate() {
+    let dir = tmp("checked-recovery");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "one", b"content large enough to live in the fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let manifest_path = dir.join("MANIFEST");
+    let mut damaged = std::fs::read(&manifest_path).unwrap();
+    damaged[10] ^= 0xff;
+    std::fs::write(&manifest_path, &damaged).unwrap();
+
+    let error =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap_err();
+    assert!(error.downcast_ref::<turndb::fold::WriterLocked>().is_some());
+    drop(store);
+
+    let part = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "part"))
+        .unwrap();
+    let mut bytes = std::fs::read(&part).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&part, bytes).unwrap();
+    let error =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<turndb::store::RecoveryError>(),
+        Some(turndb::store::RecoveryError::NoUsableCandidate { .. })
+    ));
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), damaged);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checked_recovery_requires_an_explicit_rollback_allowance() {
+    let dir = tmp("checked-rollback");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "first", b"first committed value long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let first_commit = store.manifest().commit;
+    put(&mut store, "second", b"second committed value long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let newest = store.manifest().commit;
+    drop(store);
+
+    let manifest_path = dir.join("MANIFEST");
+    let mut damaged = std::fs::read(&manifest_path).unwrap();
+    damaged[10] ^= 0xff;
+    std::fs::write(&manifest_path, &damaged).unwrap();
+    std::fs::write(dir.join(format!("MANIFEST.{newest:08}")), b"damaged retained copy").unwrap();
+
+    let error =
+        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+            .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<turndb::store::RecoveryError>(),
+        Some(turndb::store::RecoveryError::RollbackLimit { needed: 1, allowed: 0 })
+    ));
+    let report = turndb::store::recover_manifest(
+        &dir,
+        cfg(),
+        turndb::store::RecoveryOptions { max_rollback_commits: 1 },
+    )
+    .unwrap();
+    assert_eq!(report.commit, first_commit);
+    assert_eq!(report.rollback_commits, 1);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert!(reader.get("first").unwrap().is_some());
+    assert!(reader.get("second").unwrap().is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A rollback's abandoned timeline must not survive a crash. Recovery now durably prunes the
+/// abandoned retained manifests BEFORE publishing the rolled-back one, so the two timelines are
+/// never both durable — but a store recovered by a build predating that ordering (or restored from
+/// a backup taken mid-recovery) can still present resurrected residue. Writer open must remove it
+/// by NUMBER, without parsing: one resurrected copy here is valid bytes and one is damage, and both
+/// must go, because a retained commit newer than the live one is residue whatever its bytes say.
+/// The assertions are completeness-shaped: verification passes, the rolled-back record is byte-exact,
+/// and a fresh flush — which restarts part numbering below names the residue pinned — round-trips.
+#[test]
+fn a_crashed_rollbacks_resurrected_timeline_cannot_outlive_writer_open() {
+    let dir = tmp("resurrected-rollback");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let want_first = put(&mut store, "first", b"the surviving record, long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let first_commit = store.manifest().commit;
+    put(&mut store, "second", b"abandoned by rollback, long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let second_commit = store.manifest().commit;
+    put(&mut store, "third", b"also abandoned by rollback, long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let third_commit = store.manifest().commit;
+    drop(store);
+
+    let second_path = dir.join(format!("MANIFEST.{second_commit:08}"));
+    let third_path = dir.join(format!("MANIFEST.{third_commit:08}"));
+    let second_valid_bytes = std::fs::read(&second_path).unwrap();
+
+    // Damage the two newest retained copies and the live manifest, forcing a two-commit rollback.
+    for path in [&second_path, &third_path, &dir.join("MANIFEST")] {
+        let mut b = std::fs::read(path).unwrap();
+        b[10] ^= 0xff;
+        std::fs::write(path, &b).unwrap();
+    }
+    let third_damaged_bytes = std::fs::read(&third_path).unwrap();
+    let report = turndb::store::recover_manifest(
+        &dir,
+        cfg(),
+        turndb::store::RecoveryOptions { max_rollback_commits: 2 },
+    )
+    .unwrap();
+    assert_eq!(report.commit, first_commit);
+    assert!(!second_path.exists() && !third_path.exists(), "rollback must prune what it abandons");
+
+    // Resurrect the abandoned timeline: valid bytes at one commit, damage at the other.
+    std::fs::write(&second_path, &second_valid_bytes).unwrap();
+    std::fs::write(&third_path, &third_damaged_bytes).unwrap();
+
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    assert!(!second_path.exists(), "open must remove a resurrected VALID newer retained manifest");
+    assert!(!third_path.exists(), "open must remove a resurrected DAMAGED newer retained manifest");
+    assert_eq!(store.reconstruct("first").unwrap().unwrap(), want_first);
+    assert!(store.reconstruct("second").unwrap().is_none(), "rolled-back records stay rolled back");
+    let want_fourth = put(&mut store, "fourth", b"written after the reconciled open");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    drop(store);
+
+    turndb::store::verify_chain(&dir).unwrap();
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(reader.reconstruct("first").unwrap().unwrap(), want_first);
+    assert_eq!(reader.reconstruct("fourth").unwrap().unwrap(), want_fourth);
+    assert!(reader.reconstruct("third").unwrap().is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The commit protocol's own crash window: the retained copy of a commit lands before the rename
+/// that gives it authority, so a crash between the two leaves live = c, retained = {.., c+1}, the
+/// new part file durable, and the acknowledged records still in the WAL. Writer open must treat the
+/// newer retained name as residue — remove it durably, sweep the part it alone pinned, and replay
+/// the WAL — rather than leave a retained manifest whose pinned file the next flush rewrites in
+/// place. Both records must come back byte-exact and verification must pass after the re-flush
+/// reuses the crashed commit's part name.
+#[test]
+fn writer_open_completes_a_commits_crash_residue() {
+    let dir = tmp("commit-residue");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let want_first = put(&mut store, "first", b"committed before the crash window opens");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let live_commit = store.manifest().commit;
+    let manifest_live_bytes = std::fs::read(dir.join("MANIFEST")).unwrap();
+    let want_second = put(&mut store, "second", b"acknowledged, then caught in the crash window");
+    store.sync().unwrap();
+    let wal_bytes = std::fs::read(dir.join("WAL")).unwrap();
+    store.flush().unwrap();
+    let crashed_commit = store.manifest().commit;
+    drop(store);
+
+    // Wind the commit back to the moment before its rename: live manifest and WAL as they were,
+    // the retained copy and the part file as the crashed commit left them.
+    std::fs::write(dir.join("MANIFEST"), &manifest_live_bytes).unwrap();
+    std::fs::write(dir.join("WAL"), &wal_bytes).unwrap();
+    let residue_path = dir.join(format!("MANIFEST.{crashed_commit:08}"));
+    assert!(residue_path.exists(), "the construction must leave the crashed commit's residue");
+
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(store.manifest().commit, live_commit);
+    assert!(!residue_path.exists(), "open must durably remove the crashed commit's residue");
+    // The nearest VALID retained state — the live commit's own copy, same generation — must
+    // survive the same reconciliation untouched.
+    assert!(
+        dir.join(format!("MANIFEST.{live_commit:08}")).exists(),
+        "reconciliation must not remove retained manifests the live commit dominates"
+    );
+    assert_eq!(store.reconstruct("first").unwrap().unwrap(), want_first);
+    assert_eq!(
+        store.reconstruct("second").unwrap().unwrap(),
+        want_second,
+        "the acknowledged record must replay from the WAL, not depend on the residue"
+    );
+    store.flush().unwrap();
+    drop(store);
+
+    turndb::store::verify_chain(&dir).unwrap();
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(reader.reconstruct("first").unwrap().unwrap(), want_first);
+    assert_eq!(reader.reconstruct("second").unwrap().unwrap(), want_second);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A re-fold purges the retained log because erasure trumps snapshots — and that purge must hold
+/// across a crash. If a pre-purge retained manifest resurrects, it names the OLD fold generation:
+/// writer open must remove it durably (its erasure declarations do not exist in the new
+/// generation), time travel to it must refuse rather than serve erased content, and the surviving
+/// records must remain byte-exact.
+#[test]
+fn a_crashed_refold_purge_is_completed_at_writer_open() {
+    let dir = tmp("refold-purge-residue");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "erase-me", b"content that must be gone after the re-fold, and long");
+    let want_keep = put(&mut store, "keep", b"content that must survive the re-fold, and long");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let old_commit = store.manifest().commit;
+    put(&mut store, "keep-2", b"a second commit so the retained log has depth");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let old_retained_path = dir.join(format!("MANIFEST.{old_commit:08}"));
+    let old_retained_bytes = std::fs::read(&old_retained_path).unwrap();
+
+    let stats = store.erase_ids(&["erase-me".into()]).unwrap();
+    assert!(stats.refold.is_some(), "unique content existed, so the fold must be rewritten");
+    assert!(!old_retained_path.exists(), "the purge must have removed the pre-refold log");
+    drop(store);
+
+    // Resurrect the pre-refold retained manifest, as a crash between the purge's unlink and its
+    // directory fsync could.
+    std::fs::write(&old_retained_path, &old_retained_bytes).unwrap();
+
+    let store = Store::open(&dir, cfg()).unwrap();
+    assert!(!old_retained_path.exists(), "open must remove a resurrected old-generation manifest");
+    assert!(store.reconstruct("erase-me").unwrap().is_none(), "erased content stays erased");
+    assert_eq!(store.reconstruct("keep").unwrap().unwrap(), want_keep);
+    drop(store);
+
+    turndb::store::verify_chain(&dir).unwrap();
+    assert!(
+        Store::open_read_at(&dir, cfg(), old_commit).is_err(),
+        "time travel must not cross the re-fold through resurrected residue"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1264,11 +1883,27 @@ fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
     // Deleting reclaims nothing on its own — that is the whole reason this operation exists.
     assert_eq!(fold_gen_bytes(&dir), before, "a delete must not touch the fold");
 
+    let estimate = s.estimate_refold_space().unwrap().unwrap();
+    assert_eq!(estimate.source_fold_logical_bytes, before);
+    assert!(estimate.source_part_bytes > 0);
+    assert!(estimate.source_part_sections > 0);
+    assert!(estimate.source_part_raw_section_bytes > 0);
+    assert!(estimate.estimated_stage_bytes > estimate.source_fold_logical_bytes);
+    assert!(!estimate.estimate_is_hard_bound);
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+
     let st = s.refold().unwrap();
     assert_eq!(st.tombstones_dropped, 10);
     assert_eq!(st.records_kept, 10);
     assert_eq!(st.pieces_dropped, 10, "the deleted records' content must be dropped");
     let after = fold_gen_bytes(&dir);
+    let rebuilt_part_bytes: u64 = s
+        .manifest()
+        .parts
+        .iter()
+        .map(|part| std::fs::metadata(dir.join(&part.file)).unwrap().len())
+        .sum();
+    assert!(after + rebuilt_part_bytes <= estimate.estimated_stage_bytes);
     // Half the content was deleted, so about half should be gone — "about", because a segment carries
     // a header and each block a frame, and asserting an exact half would be asserting the framing.
     assert!(
@@ -1385,6 +2020,110 @@ fn refold_refuses_with_a_dirty_memtable() {
     put(&mut s, "b", b"y"); // staged, references the OLD fold
     assert!(s.refold().is_err(), "refolding under a dirty memtable must refuse");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_generation() {
+    let dir = tmp("refold-cancel");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut want = Vec::new();
+    for i in 0..24u32 {
+        let bytes = blob(20_000 + i);
+        let id = format!("cancel-{i:02}");
+        store.put(&id, &[Span::Piece(&bytes)], vec![]).unwrap();
+        want.push((id, bytes));
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let generation = store.manifest().fold_gen;
+    let staged = turndb::store::refold::fold_dir(&dir, generation + 1);
+    let cancellation = turndb::control::CancellationToken::new();
+    let cancel = cancellation.clone();
+    let staged_watch = staged.clone();
+    let watcher = std::thread::spawn(move || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !staged_watch.exists() {
+            assert!(
+                std::time::Instant::now() < until,
+                "refold never created its staged generation"
+            );
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+    });
+    let error = store
+        .refold_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    watcher.join().unwrap();
+    assert!(error
+        .downcast_ref::<turndb::control::OperationInterrupted>()
+        .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
+    assert_eq!(store.manifest().fold_gen, generation);
+    assert!(!staged.exists(), "an unpublished cancelled fold generation must be removed");
+    assert!(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("part-r")),
+        "cancelled rebuilt parts must be removed"
+    );
+    for (id, bytes) in want {
+        assert_eq!(store.reconstruct(&id).unwrap().unwrap(), bytes);
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
+    let dir = tmp("compact-cancel");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for part in 0..3u32 {
+        for row in 0..2_000u32 {
+            let id = format!("compact-{part}-{row:04}");
+            store
+                .put(&id, &[Span::Lit(b"small")], vec![("n".into(), AttrValue::Int(row.into()))])
+                .unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+    let commit = store.manifest().commit;
+    let parts = store.part_count();
+    let output = dir.join(format!(
+        "part-{:08}-{:08}.part",
+        store.manifest().parts.first().unwrap().seq_lo,
+        store.manifest().parts.last().unwrap().seq_hi
+    ));
+    let cancellation = turndb::control::CancellationToken::new();
+    let cancel = cancellation.clone();
+    let output_watch = output.clone();
+    let watcher = std::thread::spawn(move || {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !output_watch.exists() {
+            assert!(std::time::Instant::now() < until, "compaction never created its output part");
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+    });
+    let error = store
+        .merge_range_with_control(
+            0,
+            parts,
+            &turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) },
+        )
+        .unwrap_err();
+    watcher.join().unwrap();
+    assert!(error
+        .downcast_ref::<turndb::control::OperationInterrupted>()
+        .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
+    assert_eq!(store.manifest().commit, commit);
+    assert_eq!(store.part_count(), parts);
+    assert!(!output.exists(), "a cancelled unpublished part must be removed");
+    assert_eq!(store.ids().unwrap().len(), 6_000);
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -1520,7 +2259,7 @@ fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
     }
 
     // and TIME TRAVEL cannot resurrect it: the retained log was purged to the erasure's commit
-    let snaps = turndb::store::retained_commits(&dir);
+    let snaps = turndb::store::retained_commits(&dir).unwrap();
     assert_eq!(snaps.len(), 1, "erasure must purge every snapshot that could still serve the data");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1613,6 +2352,126 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
     }
     assert!(!s.manifest().punched.is_empty(), "the punched list must survive reopen");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A crash can land a punch PARTIALLY: fallocate deallocates per extent, so power loss mid-punch
+/// leaves a declared block's payload half zeros, half original bytes — neither of the two residues
+/// (intact, fully zeroed) the happy paths produce. The manifest's punched declaration, committed
+/// before any byte was destroyed, is the erasure authority: recovery must step over that frame.
+/// The identical damage WITHOUT the declaration is nothing but corruption and must still refuse.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_torn_punch_on_a_declared_block_recovers_and_undeclared_damage_refuses() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tmp("punch-torn");
+    let undeclared = tmp("punch-torn-undeclared");
+    // block_target 1 seals a block per piece, so the superseded piece owns a punchable block;
+    // incompressible bodies make the punched range extent-scale, the size a real fallocate tears.
+    let cfg = FoldCfg { block_target: 1, ..Default::default() };
+    let mut x = 0x243F_6A88_85A3_08D3u64;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    let old = noise(32 * 1024);
+    let live = noise(32 * 1024);
+    {
+        let mut s = Store::open(&dir, cfg).unwrap();
+        s.put("k", &[Span::Piece(&old)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.put("k", &[Span::Piece(&live)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    // The nearest-INVALID twin: byte-identical now, and it will never see the punch or its
+    // declaration — only the damage.
+    copy_tree(&dir, &undeclared);
+
+    let seg = dir.join("fold").join("seg-00000000.fold");
+    let before = std::fs::read(&seg).unwrap();
+    {
+        let mut s = Store::open(&dir, cfg).unwrap();
+        let stats = s.punch_unreferenced().unwrap();
+        assert!(stats.blocks_punched > 0, "the setup must actually punch, got {stats:?}");
+    }
+    // Reconstruct the torn crash state. The declaration is already durable (it commits before any
+    // deallocation), the punch zeroed exactly one payload; put the SECOND half of it back from the
+    // pre-punch image, leaving the first half zeros — the fallocate landed on only some extents.
+    let after = std::fs::read(&seg).unwrap();
+    assert_eq!(before.len(), after.len(), "punching must not change the segment length");
+    let lo = (0..before.len()).find(|&i| before[i] != after[i]).expect("a zeroed range");
+    let hi = (0..before.len()).rfind(|&i| before[i] != after[i]).unwrap() + 1;
+    let mid = lo + (hi - lo) / 2;
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        f.seek(SeekFrom::Start(mid as u64)).unwrap();
+        f.write_all(&before[mid..hi]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    {
+        // The writer reopens: the declaration authorizes stepping over the part-zeroed frame.
+        let mut s = Store::open(&dir, cfg).unwrap();
+        assert_eq!(s.reconstruct("k").unwrap().unwrap(), live);
+        s.verify().unwrap();
+        // The declaration stands, and through it the block reads as deliberate ERASURE — not as a
+        // failing disk — even while its payload still holds surviving bytes.
+        let &(punched_lo, _) =
+            s.manifest().punched.first().expect("the punched declaration must survive reopen");
+        let err = s
+            .fold()
+            .read(turndb::fold::Loc { block_id: punched_lo, in_off: 0, raw: 1 })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ERASED"),
+            "a declared block must read as erasure, got: {err:#}"
+        );
+        // A retry finishes what the crash interrupted: the declared block is re-punched.
+        let retry = s.punch_unreferenced().unwrap();
+        assert!(retry.blocks_punched > 0, "the declared block must be retried, got {retry:?}");
+        assert!(!s.manifest().punched.is_empty(), "the retry must not lose the declaration");
+        s.verify().unwrap();
+        assert_eq!(s.reconstruct("k").unwrap().unwrap(), live);
+    }
+
+    // The same partial damage with NO declaration: nothing authorizes stepping over nonzero bytes
+    // that fail their checksum, so the committed tail sits beyond the last good block and open
+    // refuses rather than serve a fold that lost durable bytes.
+    let twin_seg = undeclared.join("fold").join("seg-00000000.fold");
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&twin_seg).unwrap();
+        f.seek(SeekFrom::Start(lo as u64)).unwrap();
+        f.write_all(&vec![0u8; mid - lo]).unwrap();
+        f.sync_all().unwrap();
+    }
+    assert!(
+        Store::open(&undeclared, cfg).is_err(),
+        "undeclared partial damage must refuse at open, not be stepped over"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&undeclared).ok();
+}
+
+/// Recursively copy a store directory — a byte-level snapshot for crash-twin tests.
+#[cfg(target_os = "linux")]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dst = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dst);
+        } else {
+            std::fs::copy(e.path(), &dst).unwrap();
+        }
+    }
 }
 
 /// Blocks actually allocated on disk, in bytes — what punching changes (file LENGTH does not).
@@ -1872,5 +2731,289 @@ fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
         !page.contains(&"alice/1785000000029/r29".to_string()),
         "settled delete must stay gone"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn health_is_cheap_complete_and_tracks_publication() {
+    let dir = tmp("health");
+    let config = cfg();
+    let mut s = Store::open(&dir, config).unwrap();
+    let empty = s.health();
+    assert_eq!(empty.parts, 0);
+    assert_eq!(empty.part_rows, 0);
+    assert_eq!(empty.memtable_entries, 0);
+    assert_eq!(empty.wal_bytes, 0);
+    assert!(empty.part_cache_budget > 0);
+
+    put(&mut s, "health/1", b"payload that becomes one folded piece");
+    let staged = s.health();
+    assert_eq!(staged.memtable_entries, 1);
+    assert!(staged.memtable_bytes > 0);
+    assert!(staged.wal_bytes > 0);
+    assert_eq!(staged.dedup_window_entries, 3);
+    assert_eq!(staged.parts, 0);
+
+    s.sync().unwrap();
+    s.flush().unwrap();
+    let published = s.health();
+    assert!(published.commit > empty.commit);
+    assert_eq!(published.parts, 1);
+    assert_eq!(published.part_rows, 1);
+    assert_eq!(published.memtable_entries, 0);
+    assert_eq!(published.memtable_bytes, 0);
+    assert_eq!(published.wal_bytes, 0);
+    assert_eq!(published.dedup_window_entries, 0);
+    assert_eq!(published.retained_commits, 1);
+    assert!(published.fold_disk_bytes > 0);
+    assert_eq!(published.fold_segments, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn space_usage_separates_live_retained_and_unclassified_files_without_double_counting() {
+    let dir = tmp("space-usage");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "one", b"first retained value long enough to fold");
+    store.flush().unwrap();
+    put(&mut store, "two", b"second retained value long enough to fold");
+    store.flush().unwrap();
+    store.merge_range(0, 2).unwrap();
+
+    std::fs::write(dir.join("operator-note"), b"not owned by TurnDB").unwrap();
+    let usage = store.space_usage().unwrap();
+    assert!(usage.live.files > 0);
+    assert!(usage.retained_only.files > 0, "retained manifests and replaced parts are pinned");
+    assert!(usage.unclassified.logical_bytes >= b"not owned by TurnDB".len() as u64);
+    assert_eq!(
+        usage.total.files,
+        usage.live.files + usage.retained_only.files + usage.unclassified.files
+    );
+    assert_eq!(
+        usage.total.logical_bytes,
+        usage.live.logical_bytes
+            + usage.retained_only.logical_bytes
+            + usage.unclassified.logical_bytes
+    );
+    match (
+        usage.total.allocated_bytes,
+        usage.live.allocated_bytes,
+        usage.retained_only.allocated_bytes,
+        usage.unclassified.allocated_bytes,
+    ) {
+        (Some(total), Some(live), Some(retained), Some(unclassified)) => {
+            assert_eq!(total, live + retained + unclassified);
+            assert!(usage.filesystem_available_bytes.is_some());
+        }
+        (None, None, None, None) => assert!(usage.filesystem_available_bytes.is_none()),
+        other => panic!("space allocation capability was inconsistent: {other:?}"),
+    }
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .space_usage_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<turndb::control::OperationInterrupted>().is_some(),
+        "inventory cancellation must remain typed: {error:#}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn content_liveness_separates_stranded_dead_bytes_from_whole_reclaimable_blocks() {
+    let dir = tmp("content-liveness");
+    let mut store =
+        Store::open(&dir, FoldCfg { block_target: 8, compress_threads: 1, ..Default::default() })
+            .unwrap();
+    let a = b"aaaa";
+    let b = b"bbbb";
+    let c = b"cccc";
+    let d = b"dddd";
+    store.put("mixed", &[Span::Piece(a), Span::Piece(b)], Vec::new()).unwrap();
+    store.put("gone", &[Span::Piece(c), Span::Piece(d)], Vec::new()).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    // Keep one piece from the first block and remove the second block's only visible record.
+    store.put("mixed", &[Span::Piece(a)], Vec::new()).unwrap();
+    store.delete("gone").unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.merge_range(0, store.part_count()).unwrap().unwrap();
+
+    let liveness = store.content_liveness().unwrap();
+    assert_eq!(liveness.live_pieces, 1);
+    assert_eq!(liveness.live_logical_bytes, 4);
+    assert_eq!(liveness.live_blocks.blocks, 1);
+    assert_eq!(liveness.live_blocks.raw_bytes, 8);
+    assert!(liveness.live_blocks.stored_bytes > 0);
+    assert_eq!(liveness.stranded_dead_logical_bytes, 4);
+    assert_eq!(liveness.reclaimable_blocks.blocks, 1);
+    assert_eq!(liveness.reclaimable_blocks.raw_bytes, 8);
+    assert!(liveness.reclaimable_blocks.stored_bytes > 0);
+    assert_eq!(liveness.dead_logical_bytes, 12);
+
+    store.refold().unwrap();
+    let rewritten = store.content_liveness().unwrap();
+    assert_eq!(rewritten.live_pieces, 1);
+    assert_eq!(rewritten.live_logical_bytes, 4);
+    assert_eq!(rewritten.live_blocks.raw_bytes, 4);
+    assert_eq!(rewritten.dead_logical_bytes, 0);
+    assert_eq!(rewritten.stranded_dead_logical_bytes, 0);
+    assert_eq!(rewritten.reclaimable_blocks.blocks, 0);
+
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .content_liveness_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<turndb::control::OperationInterrupted>().is_some(),
+        "content inventory cancellation must remain typed: {error:#}"
+    );
+
+    store.put("unsettled", &[Span::Piece(b"eeee")], Vec::new()).unwrap();
+    assert!(store.content_liveness().unwrap_err().to_string().contains("flushed memtable"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn verification_metrics_preserve_typed_cancellation_and_corruption_outcomes() {
+    let dir = tmp("verification-metrics");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "verified", b"content whose immutable part will later drift");
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let report = store.verify().unwrap();
+    assert_eq!(report.parts, 1);
+    assert!(report.part_sections > 0);
+    assert!(report.chain.part_digests > 0);
+
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let cancelled = store
+        .verify_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert_eq!(turndb::error::classify(&cancelled), turndb::error::ErrorClass::Cancelled);
+
+    let part_path = dir.join(&store.manifest().parts[0].file);
+    let mut bytes = std::fs::read(&part_path).unwrap();
+    bytes[2] ^= 0xff;
+    std::fs::write(&part_path, bytes).unwrap();
+    let corrupt = store.verify().unwrap_err();
+    assert_eq!(turndb::error::classify(&corrupt), turndb::error::ErrorClass::Corruption);
+
+    let metrics = store.metrics();
+    assert_eq!(metrics.verification.attempts, 3);
+    assert_eq!(metrics.verification.succeeded, 1);
+    assert_eq!(metrics.verification.cancelled, 1);
+    assert_eq!(metrics.verification.failed, 1);
+    assert_eq!(metrics.verification_corruption_failures, 1);
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
+    let dir = tmp("lifecycle-metrics");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        put(&mut store, "replay", b"recover this frame");
+        store.sync().unwrap();
+        // The next handle's recovery counter starts at that handle rather than pretending metrics
+        // are persisted across opens.
+    }
+
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let opened = store.metrics();
+    assert_eq!(opened.open_recovery.attempts, 1);
+    assert_eq!(opened.open_recovery.succeeded, 1);
+    assert_eq!(opened.recovered_wal_frames, 1);
+    assert_eq!(opened.sync.attempts, 0);
+    assert_eq!(store.part_distribution().unwrap().parts, 0);
+
+    store.sync().unwrap();
+    store.flush().unwrap();
+    put(&mut store, "second", b"second metric part");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let two_parts = store.part_distribution().unwrap();
+    assert_eq!(two_parts.parts, 2);
+    assert_eq!(two_parts.total_rows, 2);
+    assert_eq!(two_parts.p95_bytes, two_parts.max_bytes);
+    store.merge_range(0, 2).unwrap().unwrap();
+
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    store
+        .sync_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+
+    let metrics = store.metrics();
+    assert_eq!(metrics.sync.attempts, 3);
+    assert_eq!(metrics.sync.succeeded, 2);
+    assert_eq!(metrics.sync.cancelled, 1);
+    assert_eq!(metrics.sync.failed, 0);
+    assert_eq!(metrics.flush.attempts, 2);
+    assert_eq!(metrics.flush.succeeded, 2);
+    assert_eq!(metrics.compaction.attempts, 1);
+    assert_eq!(metrics.compaction.succeeded, 1);
+    assert_eq!(metrics.folded_content.pieces, 3);
+    assert_eq!(metrics.folded_content.dedup_hits, 2);
+    assert_eq!(metrics.folded_content.novel_bytes, b"second metric part".len() as u64);
+    assert_eq!(
+        metrics.folded_content.logical_bytes,
+        (M1.len() + M2.len() + b"second metric part".len()) as u64
+    );
+    for operation in [metrics.open_recovery, metrics.sync, metrics.flush, metrics.compaction] {
+        assert_eq!(
+            operation.attempts,
+            operation.succeeded + operation.failed + operation.cancelled
+        );
+        assert!(operation.total_duration_ns >= operation.max_duration_ns);
+    }
+    let distribution = store.part_distribution().unwrap();
+    assert_eq!(distribution.parts, 1);
+    assert_eq!(distribution.total_rows, 2);
+    assert_eq!(distribution.min_bytes, distribution.max_bytes);
+    assert_eq!(distribution.p50_bytes, distribution.max_bytes);
+    assert_eq!(distribution.p95_rows, 2);
+    let cancellation = turndb::control::CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .part_distribution_with_control(&turndb::control::OperationControl {
+            deadline: None,
+            cancellation: Some(cancellation),
+        })
+        .unwrap_err();
+    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
+    let events = store.lifecycle_events_after(0, 100);
+    assert_eq!(events.events.len(), 7);
+    assert_eq!(events.events[0].sequence, 1);
+    assert_eq!(events.events[0].operation, turndb::observability::LifecycleOperation::OpenRecovery);
+    assert_eq!(events.events[0].outcome, turndb::observability::LifecycleOutcome::Succeeded);
+    let cancelled = events.events.last().unwrap();
+    assert_eq!(cancelled.operation, turndb::observability::LifecycleOperation::Sync);
+    assert_eq!(cancelled.outcome, turndb::observability::LifecycleOutcome::Cancelled);
+    assert_eq!(cancelled.error_class, Some(turndb::error::ErrorClass::Cancelled));
+    assert_eq!(events.latest_sequence, cancelled.sequence);
+    assert_eq!(events.dropped_events, 0);
+    assert!(!events.gap);
+    let tail = store.lifecycle_events_after(cancelled.sequence - 1, 1);
+    assert_eq!(tail.events, [*cancelled]);
     std::fs::remove_dir_all(&dir).ok();
 }

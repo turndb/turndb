@@ -8,7 +8,7 @@
   "types": "./index.d.ts",
   "exports": { ".": { "types": "./index.d.ts", "default": "./index.mjs" } },
   "files": ["index.mjs", "index.d.ts", "turndb.wasm", "LICENSE", "NOTICE", "README.md"],
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22 <27" },
   "keywords": ["storage", "content-addressed", "traces", "llm", "observability", "wasm"],
   "repository": { "type": "git", "url": "git+https://github.com/turndb/turndb.git" },
   "scripts": {

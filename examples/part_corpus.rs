@@ -222,7 +222,11 @@ fn main() -> anyhow::Result<()> {
         if pending.iter().any(|r| r.id == id) {
             continue;
         }
-        pending.push(Record { id, body: prog, attrs });
+        pending.push(Record {
+            id,
+            contents: vec![turndb::Content::new(turndb::BODY_CONTENT, prog)],
+            attrs,
+        });
         originals.push(body);
         if pending.len() >= PART_RECORDS {
             flush(&mut fold, &mut pending, &mut originals, &mut parts, &mut seq, &mut verified)?;
