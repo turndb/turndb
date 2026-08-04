@@ -78,6 +78,15 @@ jobs:
       - name: test (no default features)
         run: cargo test --no-default-features
 
+      - name: free debug artifacts before the release build
+        # Debug and release artifacts of a DataFusion-sized graph do not fit one hosted runner's
+        # disk together: rust-lld died with SIGBUS (a mapped output hitting ENOSPC) linking the
+        # release test binaries, deterministically across a rerun. The debug suites above are
+        # finished with their artifacts by this point.
+        run: |
+          df -h . | tail -1
+          rm -rf target/debug
+          df -h . | tail -1
       - name: test (release)
         run: cargo test --release
 
