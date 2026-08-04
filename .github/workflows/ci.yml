@@ -60,7 +60,11 @@ jobs:
           df -h / | tail -1
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h / | tail -1
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not @stable: current stable (1.97.1) ships an lld that crashes SIGBUS linking this
+      # crate's release test binaries — reproduced across serial links and a 32 GiB disk margin,
+      # with LLVM's own submit-a-bug-report stack dump. 1.95.0 is the toolchain the full local
+      # matrix passes on. Revisit the pin when a newer stable links this graph.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
