@@ -6,7 +6,7 @@ compatibility is therefore tested as behavior rather than inferred from shared R
 
 `npm/interop.sh` runs both directions over the overlap profile:
 
-1. the portable package writes a revision-4 store at its WASM compression default; a native Rust
+1. the portable package writes a version-2 store at its WASM compression default; a native Rust
    reader compares the complete ordered id set, every byte of content, and ordered typed attributes
    against an independent deterministic oracle;
 2. native Rust writes the same corpus with its native compression path; the portable package performs

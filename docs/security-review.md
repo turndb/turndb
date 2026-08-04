@@ -1,6 +1,6 @@
 # Security review
 
-This review covers TurnDB's revision-4 storage core, revision-1 pack, native Node binding, and
+This review covers TurnDB's version-2 storage core, version-1 pack, native Node binding, and
 portable WASI binding as of 2026-08-03. It is an engineering threat review, not a claim of formal
 verification or an independent third-party audit. Findings remain useful only if new format fields,
 parsers, and binding methods update both the review and their adversarial tests.

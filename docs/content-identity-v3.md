@@ -1,12 +1,13 @@
-# Exact named-content identity: format revision 3
+# Exact named-content identity: part of format version 2
 
-Revision 2 made independently named content a first-class columnar namespace, but a reference could
+The named-content generalization made independently named content a first-class columnar namespace,
+but at first a reference could
 only report presence, reconstructed length, and its piece count. Those facts described the reference
 program; none was the identity of the complete byte value. In particular, one piece hash is not the
 identity of a multi-piece value, and hashing an encoded reconstruction program would change when
 carving boundaries changed even if the bytes did not.
 
-Revision 3 persists one exact whole-value identity per content occurrence:
+Version 2 persists one exact whole-value identity per content occurrence:
 
 ```text
 identity = BLAKE3(literal bytes || piece bytes || ... in reconstruction order)
@@ -23,12 +24,12 @@ BLAKE3 but cover different byte scopes.
 
 ## WAL
 
-Standalone and in-batch revision-3 records use tags `0x5E` and `0x5F`. After each content name the
+Standalone and in-batch version-2 records use tags `0x5C` and `0x5D`. After each content name the
 payload stores an availability byte and, when available, the 32-byte digest before the reconstruction
 program. The availability marker keeps explicitly unidentified records representable and gives
-future migrations an honest way to carry revision-1/2 values without reconstructing every payload.
+future migrations an honest way to carry version-1 values without reconstructing every payload.
 
-Revision-1 and revision-2 tags retain their exact layouts and remain readable. Their values return no
+The version-1 tags retain their exact layout and remain readable. Their values return no
 whole-value identity.
 
 ## Parts
@@ -42,13 +43,13 @@ bytes  digest[32]      BLAKE3 when available; all zero when unavailable
 ```
 
 The section is therefore exactly `occurrences * 33` bytes. Its presence and size are required by a
-revision-3 reader; unknown markers and a nonzero unavailable digest are corruption. Fixed width lets
+version-2 reader; unknown markers and a nonzero unavailable digest are corruption. Fixed width lets
 an identity lookup select one digest by occurrence ordinal without decompressing its reconstruction
 program or opening a fold block. A value read additionally checks the reconstructed bytes against the
 whole-value identity after the ordinary per-piece verification.
 
-Streaming merge copies the semantic identity while rewriting rows. A revision-2 input remains
-unavailable in revision-3 output unless an explicit migration chooses to pay the I/O to reconstruct
+Streaming merge copies the semantic identity while rewriting rows. A legacy version-1 input remains
+unavailable in version-2 output unless an explicit migration chooses to pay the I/O to reconstruct
 and hash it. Ordinary compaction does not quietly turn a missing guarantee into an expensive content
 read.
 

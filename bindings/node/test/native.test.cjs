@@ -19,8 +19,8 @@ function temporaryStore(t) {
 
 test('reports the native capability profile without a portable fallback', () => {
   assert.deepEqual(capabilities(), {
-    partFormatWrite: 4,
-    partFormatReadMax: 4,
+    partFormatWrite: 2,
+    partFormatReadMax: 2,
     writerExclusion: 'os_enforced',
     physicalErasure: process.platform === 'linux' ? 'punch_or_refold' : 'refold_only',
     positionedIo: true,
@@ -1190,7 +1190,7 @@ test('reports cheap health across staging and publication', async (t) => {
 
   const migration = await store.formatMigrationStatus();
   assert.deepEqual(migration, {
-    targetPartVersion: 4,
+    targetPartVersion: 2,
     liveParts: 1n,
     currentParts: 1n,
     legacyParts: 0n,

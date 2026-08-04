@@ -1,6 +1,6 @@
 # turndb on-disk format
 
-**Status: format version 4. Not frozen.** See [Compatibility](#compatibility) for what is
+**Status: format version 2. Not frozen.** See [Compatibility](#compatibility) for what is
 promised and what is not.
 
 This is the one document in this repository, and the only place mechanics are written down twice. It
@@ -163,7 +163,7 @@ offset  size  field
     28     8  seq_lo        inclusive sequence range this part covers
     36     8  seq_hi
     44     1  toc_codec
-    45     1  version       format version; 0 predates this field
+    45     1  version       format version; this revision writes 2; 0 predates this field
     46     4  toc_xsum      crc32 of the STORED TOC payload      (version >= 1)
     50     2  reserved, zero
     52     4  xsum          first 4 bytes of BLAKE3 over footer[0..52]
@@ -240,7 +240,7 @@ dictionary's size.
 | name | required when |
 |---|---|
 | `con.prog.N`, `con.off.N` | content column *N* exists in `cmeta` |
-| `con.id.N` | content column *N* exists in `cmeta` (version ≥ 3) |
+| `con.id.N` | content column *N* exists in `cmeta` (version ≥ 2) |
 | `con.rid.N` | content column *N* is sparse; absent and **elided** when dense |
 | `layout`, `layout.off`, `colmeta` | any record carries an attribute |
 | `col.val.N` | column *N* exists in `colmeta` |
@@ -262,9 +262,9 @@ moving `version`.
 
 Version-0 and version-1 parts predate named content. They require `prog` and `prog.off`, holding one
 body program per row, instead of `cmeta` and `con.*`; a current reader presents that physical body as
-a dense content column named `body`. Version 2 introduced named content without whole-value
-identities. Version 3 adds `con.id.N`. Version 4 adds the extended attribute tags 4 through 7; it
-never writes the legacy sections.
+a dense content column named `body`. Version 2 is the single successor of version 1: it introduces
+named content columns, whole-value identities (`con.id.N`), and the complete scalar attribute tag
+set 4 through 7, and it never writes the legacy sections.
 
 **The piece dictionary is sorted in fold order, not hash order**, and `pdict.hsort` carries hash order
 separately. Two orders over one dictionary rather than two dictionaries: fold order keeps `pdict.loc`
@@ -347,7 +347,7 @@ repeated n_content_columns times:
 ```
 
 Each column *N* has `con.prog.N`, containing programs in occurrence order, and `con.off.N`, containing
-`occurrences + 1` little-endian u64 offsets. Version 3 also has `con.id.N`, exactly 33 bytes per
+`occurrences + 1` little-endian u64 offsets. Version 2 also has `con.id.N`, exactly 33 bytes per
 occurrence in the same order: one availability byte followed by a 32-byte digest. Availability `1`
 means the digest is BLAKE3 of the exact reconstructed value; availability `0` requires an all-zero
 digest and represents a value carried forward from an older or explicitly unidentified source. No
@@ -478,12 +478,8 @@ a reader to act on.
 | 0x5A | legacy version-1 body record, **inside a batch** | as 0x57 |
 | 0x5B | tombstone, inside a batch | as 0x58 |
 | 0x59 | **batch commit** | varint member count |
-| 0x5C | version-2 record with named content | current payload below, without identity fields |
+| 0x5C | version-2 record: named content, whole-value identities, the complete scalar attribute tags | current payload below |
 | 0x5D | version-2 record, **inside a batch** | as 0x5C |
-| 0x5E | version-3 record with whole-content identities | current payload below, attribute tags 0 through 3 only |
-| 0x5F | version-3 record, **inside a batch** | as 0x5E |
-| 0x60 | version-4 record with the complete scalar attribute tags | current payload below |
-| 0x61 | version-4 record, **inside a batch** | as 0x60 |
 
 A batch is a group of writes that replays **all or none** — the unit an ingest source actually
 sent, kept whole across a crash. Its members are ordinary record and tombstone payloads under the
@@ -501,10 +497,9 @@ a reader and recovery must accept any frame valid under the format even when the
 decline to create it under lower configured limits. The deterministic charging unit and defaults are
 specified in `docs/write-admission.md`.
 
-A build predating named content refuses 0x5C and later tags by the unknown-tag rule below, which is
-the safe direction. A current reader accepts the old record tags, presents version-1 body programs as
-content named `body`, and reports whole-value identity unavailable for version-1 and version-2
-records.
+A build predating named content refuses the 0x5C and 0x5D tags by the unknown-tag rule below, which
+is the safe direction. A current reader accepts the old record tags, presents version-1 body programs
+as content named `body`, and reports whole-value identity unavailable for version-1 records.
 
 A current record payload is:
 
@@ -537,10 +532,9 @@ repeated n_novel times:
   bytes    piece content
 ```
 
-The version-3 0x5E/0x5F payload has the same content layout but accepts only attribute tags 0 through
-3. Version 2 omits `identity_present` and `identity` and likewise accepts only those original tags.
 The legacy 0x57/0x5A payload places one `n_ops` program directly after the id, followed by the
-original attribute and novel-piece encodings. It has no content count or name.
+original attribute encoding — tags 0 through 3 only — and the novel-piece encoding. It has no
+content count or name.
 
 Two differences from a part's `con.prog.N`, both deliberate and neither incidental:
 
@@ -907,7 +901,7 @@ may sit at fold generation 40 while never having changed format revision at all.
 
 What that requires of a change:
 
-* a change a version-4 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
+* a change a version-2 reader could **misparse** must move `PART_VERSION`, or set a `flags` bit in the
   fold — silence is the failure mode this is designed to prevent;
 * note what these levers do **not** cover: they guard against misparsing, not against a conformant
   writer violating a privacy or retention invariant. A part that parses perfectly can still carry

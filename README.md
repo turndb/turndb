@@ -3,7 +3,7 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
-**Status: pre-1.0, format version 4, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
+**Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
 ## What problem it solves
@@ -96,7 +96,7 @@ typed predicates, selected attributes, named-content metadata or bytes, opaque c
 per-call examination bound. Reconstructed pages default to a 32 MiB content ceiling, can override it
 per request, never split a row, and return a cursor before the row that would cross the ceiling.
 Named-content metadata includes the BLAKE3 identity of the exact whole value without reconstruction
-for revision-3 records. Writer scans include the memtable;
+for version-2 records. Writer scans include the memtable;
 `ReadStore::scan` remains pinned to its manifest snapshot.
 Committed rows are projected from physical columns: sibling attribute value/dictionary and named
 content program sections remain unopened. See
@@ -108,7 +108,7 @@ Rust embedders can classify rich error chains through the stable, domain-neutral
 [`ErrorClass`](docs/error-taxonomy.md); the native Node binding exposes the same engine codes through
 `TurnDbError` and adds only its actor-owned `BUSY`/`CLOSED` states.
 
-Format revision 4 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
+Format version 2 adds exact unsigned u64, arbitrary binary metadata, UTC Unix-nanosecond
 timestamps, and explicit null to the existing scalar fields. Missing and null remain distinct, and
 bindings never route exact integers through JavaScript `number`; see
 [general scalar field types](docs/field-types-v4.md).

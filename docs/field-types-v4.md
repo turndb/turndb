@@ -1,6 +1,6 @@
-# General scalar field types: format revision 4
+# General scalar field types: part of format version 2
 
-Revision 4 completes TurnDB's initial self-described scalar field system without introducing a
+Version 2 completes TurnDB's initial self-described scalar field system without introducing a
 global schema or trace-specific vocabulary. A record still carries an ordered sequence of
 `(name, typed value)` attributes; duplicate names and their interleaving remain exact.
 
@@ -21,7 +21,7 @@ Binary attributes are intended for compact queryable identifiers, hashes, and pr
 Large opaque values still belong in named content, where content addressing, deduplication, lazy
 reconstruction, and physical erasure apply.
 
-Lists, maps, and other nested documents are deliberately not scalar attributes in revision 4. They
+Lists, maps, and other nested documents are deliberately not scalar attributes in version 2. They
 belong in named content under a consumer-chosen explicit encoding (for example canonical JSON, CBOR,
 or protobuf), with ordinary scalar fields carrying any encoding/version metadata the consumer needs
 to query. TurnDB never guesses that arbitrary bytes are JSON or normalizes a document during ingest.
@@ -87,8 +87,8 @@ does not silently turn either type into signed i64.
 
 ## Compatibility
 
-Part writers now emit revision 4. Readers continue to accept revisions 0 through 3; original tags
-have unchanged bytes. WAL writers use record tags `0x60`/`0x61`. The revision-3 tags `0x5E`/`0x5F`
-retain the same named-content identity layout but accept only attribute tags 0 through 3. Older
+Part writers now emit version 2. Readers continue to accept versions 0 and 1; original tags
+have unchanged bytes. WAL writers use record tags `0x5C`/`0x5D`. The legacy version-1 tags
+`0x57`/`0x5A` retain their layout but accept only attribute tags 0 through 3. Older
 binaries encounter either an unsupported part version or a checksummed unknown WAL frame and refuse
 rather than skipping or mis-decoding committed records.

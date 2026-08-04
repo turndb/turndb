@@ -26,7 +26,7 @@ open's limits, so an operator cannot make durable data unreadable by changing po
 
 ## The byte unit
 
-A record is charged as if TurnDB encoded its complete revision-4 WAL frame and every folded piece in
+A record is charged as if TurnDB encoded its complete version-2 WAL frame and every folded piece in
 the input were novel. The count includes:
 
 - the frame tag, sequence, payload length, and checksum;

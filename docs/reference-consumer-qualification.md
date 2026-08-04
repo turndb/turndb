@@ -30,11 +30,14 @@ restores a writable backup, then physically erases one record. It asserts that r
 history and leaves no dead or reclaimable content. It also asserts the deliberately narrower erasure
 scope: the backup created beforehand is an external copy and still contains the record.
 
-A checked revision-3 pack supplies real old bytes for upgrade qualification. A private Rust test
-reconstructs the pack and compares it byte-for-byte with the checked-in hexadecimal fixture, while
-the external harness can only restore it and use public Node methods. The workflow preflights and
-migrates one part, closes and reopens, resumes the second part, and verifies that record bytes and
-whole-content identities remain exact. Old parts pinned by retained snapshots stay reported
+A checked legacy pack supplies real version-1 bytes for upgrade qualification
+(`qualification/fixtures/revision-one.turndb.hex`): two records, one per part, written and packed
+by `main`'s own build at commit `2fdc779` — the actual version-1 writer, not a reconstruction —
+and deep-verified by that build before check-in. The external harness can only restore it and use
+public Node methods. The workflow preflights and migrates one part, closes and reopens, resumes
+the second part, and verifies that record bytes stay exact while whole-value identities are
+honestly reported unavailable — a version-1 value has none, and migration never invents one.
+Old parts pinned by retained snapshots stay reported
 separately from the current-format live parts.
 
 ## Sustained profile

@@ -47,17 +47,15 @@ Content remains structurally content-addressed: part programs reference the shar
 piece identities. Compaction rewrites programs and columns, not carved piece bytes. Identical pieces
 deduplicate across record ids, content names, record families, and consumers using the same store.
 
-Part format revision 2 and WAL tags `0x5C`/`0x5D` introduced named content. Revision 3 and WAL tags
-`0x5E`/`0x5F` additionally persist BLAKE3 of each complete reconstructed value. The digest is computed
+Part format version 2 and WAL tags `0x5C`/`0x5D` introduce named content and additionally persist
+BLAKE3 of each complete reconstructed value. The digest is computed
 over ingest spans without concatenating them, survives WAL replay and compaction, and is projected
 with presence, length, and piece count without reading fold blocks. Revision-0/1 parts and legacy WAL
-records are read as one dense content value named `body`; revision-0/1/2 values honestly report their
+records are read as one dense content value named `body`; revision-0/1 values honestly report their
 whole-value identity unavailable rather than substituting a program or piece hash. See
 `docs/record-model-v2.md`, `docs/content-identity-v3.md`, and `FORMAT.md`.
-Revision 4 and WAL tags `0x60`/`0x61` add the remaining scalar attribute types without changing named
-content identity or the original tag encodings.
 
-Revision 4 completes the initial scalar type system with unsigned u64, arbitrary binary metadata,
+Version 2 completes the initial scalar type system with unsigned u64, arbitrary binary metadata,
 signed Unix-nanosecond timestamps interpreted in UTC, and explicit null in addition to UTF-8 string,
 signed i64, bit-exact f64, and boolean. Missing means the key has no occurrence; explicit null is a
 real ordered attribute occurrence. Structured `attr_exists` and equality-to-null preserve the
@@ -241,7 +239,7 @@ must report the reduced profile.
 | in-place hole-punch erasure | Linux only | unavailable; refold only |
 | columnar lens | build feature | omitted from lightweight package |
 | SQL/DataFusion | optional build feature | omitted from lightweight package |
-| format interoperability | revision 4 | revision 4 |
+| format interoperability | version 2 | version 2 |
 | configurable write admission | u64 byte ceilings | positive u32 byte ceilings |
 | atomic frame/object admission | u64 ceilings within address/format spaces | positive u32 ceilings |
 

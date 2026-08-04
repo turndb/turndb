@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 use turndb::fold::{FoldCfg, Loc};
-use turndb::store::{Span, Store};
+use turndb::store::{Batch, ContentSpans, Span, Store};
 use turndb::types::ContentHash;
 use turndb::AttrValue;
 
@@ -72,6 +72,60 @@ fn part(dir: &std::path::Path) -> Vec<u8> {
         .find(|p| p.extension().map(|e| e == "part").unwrap_or(false))
         .expect("a flushed part");
     std::fs::read(&p).unwrap()
+}
+
+/// LEB128-style unsigned varint, decoded exactly as FORMAT.md states it — 7 bits per byte, low
+/// byte first — so the tests below share none of the library's own parsing.
+fn varint(b: &[u8], at: &mut usize) -> u64 {
+    let mut out = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = b[*at];
+        *at += 1;
+        out |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return out;
+        }
+        shift += 7;
+    }
+}
+
+fn decode_codec(codec: u8, stored: &[u8], raw: usize) -> Vec<u8> {
+    match codec {
+        0 => stored.to_vec(),
+        1 => zstd::bulk::decompress(stored, raw).unwrap(),
+        c => panic!("unexpected codec {c} in a dictionary-less part"),
+    }
+}
+
+/// A section's raw bytes, located by walking the footer and TOC exactly as FORMAT.md documents
+/// them — offsets and varints by hand, no turndb decoder involved.
+fn raw_section(part: &[u8], want: &str) -> Vec<u8> {
+    let f = part.len() - 56;
+    let version = part[f + 45];
+    let toc_off = le64(part, f + 8) as usize;
+    let toc_stored = le32(part, f + 16) as usize;
+    let toc_raw = le32(part, f + 20) as usize;
+    let toc = decode_codec(part[f + 44], &part[toc_off..toc_off + toc_stored], toc_raw);
+    let mut at = 0usize;
+    let n = varint(&toc, &mut at) as usize;
+    for _ in 0..n {
+        let name_len = varint(&toc, &mut at) as usize;
+        let name = std::str::from_utf8(&toc[at..at + name_len]).unwrap().to_string();
+        at += name_len;
+        let off = varint(&toc, &mut at) as usize;
+        let stored = varint(&toc, &mut at) as usize;
+        let raw = varint(&toc, &mut at) as usize;
+        let codec = toc[at];
+        at += 1;
+        if version >= 1 {
+            at += 4; // per-section xsum, present by version
+        }
+        if name == want {
+            return decode_codec(codec, &part[off..off + stored], raw);
+        }
+    }
+    panic!("part has no section {want}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -182,7 +236,8 @@ fn part_footer_matches_the_document() {
     // NOTE: this fixture has seq_lo == seq_hi, so it cannot distinguish the two fields on its own.
     // `merged_part_footer_distinguishes_seq_lo_from_seq_hi` is what pins their order.
     assert!(b[f + 44] <= 2, "toc_codec at footer+44");
-    assert_eq!(b[f + 45], turndb::part::PART_VERSION, "version at footer+45");
+    assert_eq!(b[f + 45], 2, "version at footer+45: this revision writes part version 2");
+    assert_eq!(turndb::part::PART_VERSION, 2, "and PART_VERSION agrees with the document");
     assert_eq!(&b[f + 50..f + 52], &[0u8; 2], "footer+50..52 is reserved and zero");
 
     let x = blake3::hash(&b[f..f + 52]);
@@ -288,7 +343,7 @@ fn wal_frame_matches_the_document() {
     s.sync().unwrap();
     let b = std::fs::read(dir.join("WAL")).unwrap();
 
-    assert_eq!(b[0], 0x60, "tag at 0 is 0x60 for a revision-4 record");
+    assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a version-2 record");
     assert_eq!(le64(&b, 1), 0, "seq at 1");
     let len = le32(&b, 9) as usize;
     assert_eq!(13 + len + 4, b.len(), "header 13 + payload + crc 4 is the whole frame");
@@ -306,6 +361,195 @@ fn wal_frame_matches_the_document() {
     let t = 13 + len + 4;
     assert_eq!(b[t], 0x58, "tag 0x58 for a tombstone");
     assert_eq!(&b[t + 13..t + 13 + 4], b"only", "a tombstone payload is the id alone");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wal_batch_frames_carry_the_documented_tags() {
+    let dir = tmp("walbatchtags");
+    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    s.put("seed", &[Span::Lit(b"z")], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap(); // truncates the WAL, so the batch frames start at offset 0
+
+    let mut batch = Batch::new();
+    batch.put("member", &[Span::Lit(b"m")], vec![]);
+    batch.delete("seed");
+    s.apply(batch).unwrap();
+    s.sync().unwrap();
+    drop(s);
+    let b = std::fs::read(dir.join("WAL")).unwrap();
+
+    assert_eq!(b[0], 0x5D, "tag at 0 is 0x5D for a version-2 record inside a batch");
+    let len0 = le32(&b, 9) as usize;
+    let t1 = 13 + len0 + 4;
+    assert_eq!(b[t1], 0x5B, "tag 0x5B for a tombstone inside a batch");
+    let len1 = le32(&b, t1 + 9) as usize;
+    assert_eq!(&b[t1 + 13..t1 + 13 + len1], b"seed", "a batch tombstone payload is the id alone");
+    let t2 = t1 + 13 + len1 + 4;
+    assert_eq!(b[t2], 0x59, "tag 0x59 is the batch commit marker");
+    assert_eq!(le32(&b, t2 + 9), 1, "the marker payload is one varint");
+    assert_eq!(b[t2 + 13], 2, "sealing exactly the two members before it");
+    assert_eq!(b.len(), t2 + 13 + 1 + 4, "nothing follows the commit marker");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wal_record_payload_matches_the_documented_layout() {
+    // FORMAT.md § The write-ahead log — the version-2 record payload, walked field by field at
+    // hand-computed offsets. Every expected byte below derives from the documented layout, not
+    // from calling the encoder: identity marker placement, the plain-u8 op tag, and the value
+    // widths of attribute tags 4 (u64), 5 (binary), 6 (timestamp), 7 (explicit null).
+    let dir = tmp("walpayload");
+    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    s.put(
+        "rec",
+        &[Span::Lit(b"xy")],
+        vec![
+            ("u".into(), AttrValue::UInt(u64::MAX)),
+            ("b".into(), AttrValue::Bytes(vec![0x00, 0xFF])),
+            ("t".into(), AttrValue::TimestampNs(-2)),
+            ("n".into(), AttrValue::Null),
+        ],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    drop(s);
+    let b = std::fs::read(dir.join("WAL")).unwrap();
+
+    assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a version-2 record");
+    let len = le32(&b, 9) as usize;
+    assert_eq!(len, 81, "the documented layout of this record is exactly 81 bytes");
+    assert_eq!(b.len(), 13 + 81 + 4, "one frame: header 13, payload, crc 4");
+    let p = &b[13..13 + len];
+
+    assert_eq!(p[0], 3, "varint id_len at payload+0");
+    assert_eq!(&p[1..4], b"rec", "id bytes at payload+1");
+    assert_eq!(p[4], 1, "varint n_contents at payload+4");
+    assert_eq!(p[5], 4, "varint name_len at payload+5");
+    assert_eq!(&p[6..10], b"body", "utf8 content name at payload+6");
+    assert_eq!(p[10], 1, "identity_present at payload+10");
+    assert_eq!(
+        &p[11..43],
+        blake3::hash(b"xy").as_bytes(),
+        "the 32-byte whole-value BLAKE3 immediately after the marker"
+    );
+    assert_eq!(p[43], 1, "varint n_ops at payload+43");
+    assert_eq!(p[44], 0, "op 0 (literal) is a PLAIN u8 in the log, unlike a part's packed varint");
+    assert_eq!(p[45], 2, "varint literal length");
+    assert_eq!(&p[46..48], b"xy", "literal bytes inline");
+    assert_eq!(p[48], 4, "varint n_attrs at payload+48");
+    // tag 4 (u64): 8 bytes, full unsigned range
+    assert_eq!(&p[49..52], &[1, b'u', 4], "key length, key, then type tag 4");
+    assert_eq!(&p[52..60], &[0xFF; 8], "u64::MAX as 8 little-endian bytes");
+    // tag 5 (binary): varint length then the bytes
+    assert_eq!(&p[60..63], &[1, b'b', 5], "key length, key, then type tag 5");
+    assert_eq!(&p[63..66], &[0x02, 0x00, 0xFF], "varint len 2 then the value bytes");
+    // tag 6 (timestamp): 8 bytes of signed UTC Unix nanoseconds
+    assert_eq!(&p[66..69], &[1, b't', 6], "key length, key, then type tag 6");
+    assert_eq!(&p[69..77], &(-2i64).to_le_bytes(), "signed nanoseconds, 8 bytes little-endian");
+    // tag 7 (explicit null): zero value bytes
+    assert_eq!(&p[77..80], &[1, b'n', 7], "key length, key, then type tag 7 — and no value");
+    assert_eq!(p[80], 0, "varint n_novel at payload+80: a literal introduces no pieces");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cmeta_bytes_match_the_documented_layout() {
+    // FORMAT.md § Named content columns: varint n_content_columns, then per column a varint
+    // name length, the UTF-8 name, a varint occurrence count, and a u8 rid_kind (0 dense).
+    let dir = built("cmeta");
+    let b = part(&dir);
+    let cmeta = raw_section(&b, "cmeta");
+    let mut expected = vec![0x01, 0x04]; // one column, 4-byte name
+    expected.extend_from_slice(b"body");
+    expected.push(30); // occurrences: every fixture row carries a body
+    expected.push(0x00); // rid_kind 0: dense, so con.rid.0 is elided
+    assert_eq!(cmeta, expected, "cmeta must be exactly the documented bytes");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn binary_attribute_dictionary_matches_the_documented_layout() {
+    // FORMAT.md § col.dict.N and the type table: a binary (tag 5) column stores a byte-sorted,
+    // distinct dictionary — varint count, then varint len + bytes per entry — and its value
+    // column is u32 ordinals into that dictionary, one per occurrence in row order.
+    let dir = tmp("bindict");
+    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    for (id, raw) in [("a", vec![0xBB]), ("b", vec![0xAA]), ("c", vec![0xBB])] {
+        s.put(id, &[Span::Lit(b"x")], vec![("raw".into(), AttrValue::Bytes(raw))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+    let b = part(&dir);
+
+    let dict = raw_section(&b, "col.dict.0");
+    assert_eq!(
+        dict,
+        vec![0x02, 0x01, 0xAA, 0x01, 0xBB],
+        "two distinct entries, byte-sorted, duplicates collapsed"
+    );
+    let val = raw_section(&b, "col.val.0");
+    let expected: Vec<u8> = [1u32, 0, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(val, expected, "u32 ordinals into the sorted dictionary, one per occurrence");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn con_off_matches_the_documented_layout_for_a_multi_content_record() {
+    // FORMAT.md § Named content columns: con.off.N holds occurrences + 1 little-endian u64
+    // offsets into con.prog.N, cumulative from 0, and columns are ordered by UTF-8 name.
+    let dir = tmp("conoff");
+    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    s.put_record(
+        "m0",
+        &[
+            ContentSpans::new("alpha", vec![Span::Lit(b"one")]),
+            ContentSpans::new("beta", vec![Span::Lit(b"four")]),
+        ],
+        vec![],
+    )
+    .unwrap();
+    s.put_record(
+        "m1",
+        &[
+            ContentSpans::new("alpha", vec![Span::Lit(b"seven77")]),
+            ContentSpans::new("beta", vec![Span::Lit(b"xy")]),
+        ],
+        vec![],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+    let b = part(&dir);
+
+    // cmeta names the columns in UTF-8 order: alpha is column 0, beta is column 1.
+    let cmeta = raw_section(&b, "cmeta");
+    let mut expected_cmeta = vec![0x02, 0x05];
+    expected_cmeta.extend_from_slice(b"alpha");
+    expected_cmeta.extend_from_slice(&[0x02, 0x00, 0x04]);
+    expected_cmeta.extend_from_slice(b"beta");
+    expected_cmeta.extend_from_slice(&[0x02, 0x00]);
+    assert_eq!(cmeta, expected_cmeta, "two dense columns, two occurrences each");
+
+    // A part program for a literal of length L is: varint n_ops = 1, varint (L << 1) | 0, then
+    // the bytes — so "one" costs 5 bytes and "seven77" costs 9, laid down in occurrence order.
+    let prog0 = raw_section(&b, "con.prog.0");
+    let mut expected_prog = vec![0x01, 0x06];
+    expected_prog.extend_from_slice(b"one");
+    expected_prog.extend_from_slice(&[0x01, 0x0E]);
+    expected_prog.extend_from_slice(b"seven77");
+    assert_eq!(prog0, expected_prog, "part programs pack (payload << 1) | op as one varint");
+
+    let off0 = raw_section(&b, "con.off.0");
+    let expected_off: Vec<u8> = [0u64, 5, 14].iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(off0, expected_off, "occurrences + 1 u64 offsets, cumulative over column 0");
+
+    let off1 = raw_section(&b, "con.off.1");
+    let expected_off: Vec<u8> = [0u64, 6, 10].iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(off1, expected_off, "beta's programs are 6 and 4 bytes");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -562,7 +806,7 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     let path = dir.join("WAL");
     let mut b = std::fs::read(&path).unwrap();
     let payload = b"a frame type this build does not know";
-    let mut hdr = vec![0x62u8];
+    let mut hdr = vec![0x5Eu8];
     hdr.extend_from_slice(&99u64.to_le_bytes());
     hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     let mut h = crc32fast::Hasher::new();
