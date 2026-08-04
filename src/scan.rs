@@ -668,12 +668,17 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         }
         let fetched = candidates.len();
         let mut processed = 0usize;
-        // Never project beyond remaining output demand. Every gathered candidate will therefore be
-        // semantically examined before a full page can stop; corruption or cancellation cannot leak
-        // in from a read-ahead row that the page otherwise would not have reached. Rejections cause
-        // another bounded gather rather than speculative decoder work.
-        let projection_batch_size = (request.limit - rows.len()).clamp(1, 64);
-        'candidate_batches: for candidate_batch in candidates.chunks(projection_batch_size) {
+        // Never project beyond remaining output demand, and recompute that demand PER CHUNK: a
+        // rejection in an earlier chunk shrinks what later chunks may decode ahead of, so a fixed
+        // chunk size would project rows a full page never examines. Sized this way, every gathered
+        // candidate is semantically examined before a full page can stop; corruption or
+        // cancellation cannot leak in from a read-ahead row that the page otherwise would not have
+        // reached. Rejections cause another bounded gather rather than speculative decoder work.
+        let mut pending = candidates.as_slice();
+        'candidate_batches: while !pending.is_empty() {
+            let chunk = (request.limit - rows.len()).clamp(1, 64).min(pending.len());
+            let (candidate_batch, rest) = pending.split_at(chunk);
+            pending = rest;
             check_interruption(request)?;
             let projected = if needs_record {
                 Some(source.project_batch(candidate_batch, &attr_needed, &content_needed)?)
