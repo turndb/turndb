@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use turndb::carve::Carve;
 use turndb::control::OperationControl;
-use turndb::fold::FoldCfg;
 use turndb::scan::{ScanExplanation, ScanPage, ScanRequest};
 use turndb::store::{
     Batch, BoundedCompaction, CompactionBudget, ContentSpans, ErasureStats, PunchStats, ReadStore,
