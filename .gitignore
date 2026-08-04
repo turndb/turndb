@@ -10,3 +10,13 @@ npm/turndb/turndb.wasm
 npm/turndb/LICENSE
 npm/turndb/NOTICE
 npm/turndb/*.tgz
+
+# Native package output is rebuilt and install-tested from source. Only package metadata belongs in
+# git; shared libraries, collected prebuilds, tarballs, and dependency trees do not.
+bindings/node/artifacts/
+bindings/node/dist/
+bindings/node/*.node
+bindings/node/npm/*/*.node
+bindings/node/*.tgz
+bindings/node/npm/*/*.tgz
+bindings/node/node_modules/

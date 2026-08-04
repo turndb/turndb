@@ -250,7 +250,7 @@ writer. Portable use must be an explicit package or entry point chosen by the ca
 
 ## 6. Binding seam
 
-The native Node source prototype uses `napi-rs` at N-API 6 for stable Node ABI compatibility. It may
+The native Node release candidate uses `napi-rs` at N-API 6 for stable Node ABI compatibility. It may
 carry several additional megabytes when those bytes replace bespoke scheduling, buffer, cancellation,
 and error machinery that TurnDB would otherwise have to build and maintain.
 
@@ -301,10 +301,10 @@ For a writer query, an already-expired deadline refuses before actor submission.
 submission does not retract an ordered snapshot sync/flush that the actor may already complete.
 
 **Current gaps:** binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption,
-writer contention, backup/restore, and manifest recovery have stable machine-readable codes; prebuilt
-artifact selection is not implemented yet, and the aggregate execution budget is not a total-process
-RSS limit. The package is a tested source
-prototype and must not be described as a production distribution.
+writer contention, backup/restore, and manifest recovery have stable machine-readable codes. The
+Linux x86-64 glibc loader/package path and same-artifact Node-major matrix are implemented, but no
+registry artifact is claimed until the owner-gated release completes; other platforms remain
+unqualified. The aggregate execution budget is not a total-process RSS limit.
 
 The package-level `TurnDbError` uses the same generic typed-cause classifier exposed to Rust
 embedders. It gives stable codes to boundary/scan/cursor validation, bounded-queue overload, closed

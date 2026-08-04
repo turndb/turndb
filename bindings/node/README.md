@@ -5,8 +5,15 @@ compatibility rather than one V8 or Node release. Each `NativeStore` owns a dedi
 a bounded command queue; filesystem, compression, scan, and sync work do not run on the JavaScript
 event loop.
 
-This package is currently a source prototype, not a published package. Build and exercise it from the
-workspace with:
+Version 0.1.0's first prebuilt distribution target is Linux x86-64 glibc, installed and exercised on
+Node 22, 24, and 26. Registry availability is an external fact; this README and a source build do not
+claim that publication occurred. On a supported host, install a published release with:
+
+```sh
+npm install @turndb/native
+```
+
+Build and exercise the source addon from the workspace with:
 
 ```sh
 npm run test:dev --prefix bindings/node
@@ -20,6 +27,12 @@ The package loader accepts `TURNDB_NATIVE_PATH` for development and otherwise lo
 platform prebuild. It intentionally does not fall back to `turndb-wasm`: native writer exclusion,
 threads, and physical reclamation are capabilities, not implementation details that may disappear
 silently.
+
+The root package is platform-neutral and selects `@turndb/native-linux-x64-gnu` as an optional
+dependency. The tracked manifests and ordinary candidate tarballs remain private. Explicit release
+staging produces publishable tarballs, and the owner-gated workflow is the supported publication
+path. See the [native prebuild and release contract](../../docs/native-prebuilds.md) for clean-install
+commands, artifact measurements, the glibc floor, and first-release gates.
 
 ## Semantics
 

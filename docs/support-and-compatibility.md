@@ -11,7 +11,7 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Rust core, default and SQL-off | stable Rust on GitHub's Linux x86-64 runner; debug and release tests, clippy, rustdoc, corruption suite | qualified development platform |
 | Rust crash model | nightly deterministic simulation on Linux x86-64 | qualified durability model when the scheduled gate is green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
-| Native Node | source-built Linux x86-64 addon; required CI matrix is Node 22, 24, and 26 | qualified source prototype after a green matrix; private package, no prebuild/shipping promise |
+| Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
 | Other Unix systems and architectures | code paths exist but no CI or packaged artifacts prove them | unqualified; no support claim |
 | Native Windows | the native core requires Unix positioned I/O and writer locking | unsupported |
 
@@ -28,6 +28,9 @@ until every declared major passes.
 
 N-API 6 decouples the addon from a particular V8 ABI. It does not prove OS/architecture prebuild
 availability or runtime correctness on every later Node release. Only the matrix above is evidence.
+The first package target is exactly Linux x86-64 glibc 2.17 or newer. macOS, musl, other
+architectures, and other native Unix systems remain unqualified even if a source build happens to
+work. See the [native prebuild contract](native-prebuilds.md).
 
 ## Capabilities are runtime facts
 
@@ -109,8 +112,9 @@ retained history; no compatibility promise resurrects erased content.
 
 ## Release status
 
-Green source tests do not create a published artifact. The native Node package remains `private` and
-has no prebuild matrix, signing, provenance, or installation contract. The portable package and Rust
-crate also remain subject to the publication checklist in `CONTRIBUTING.md`. A future production
-support claim requires published artifacts, platform installation tests, release notes, provenance,
-and an owner-approved release; this policy does not manufacture those facts from source readiness.
+Green source tests do not create a published artifact. The native package has a prebuild/install
+matrix and an owner-gated provenance-capable release workflow, but both tracked manifests remain
+`private` and no registry publication is claimed. The portable package and Rust crate also remain
+subject to the publication checklist in `CONTRIBUTING.md`. Native production support begins only
+after the exact tagged tarballs pass the release matrix and an owner approves their publication; this
+policy does not manufacture registry or CI facts from source readiness.

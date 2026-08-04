@@ -15,9 +15,9 @@ sql = ["columnar", "turndb/sql", "dep:tokio"]
 crate-type = ["cdylib"]
 
 [dependencies]
-# The native binding needs the structured store API, not Arrow or SQL. Keeping those out makes the
-# Rust/Node seam visible: richer planning can be added as a separate adapter without infecting the
-# embedded write and paging path.
+# The storage core stays feature-independent, while this crate's default `sql` feature deliberately
+# opts the production addon into the Arrow/DataFusion query plane. A no-default-features build keeps
+# the smaller structured-only embedding profile available and tested.
 turndb = { path = "../..", default-features = false }
 anyhow = "1"
 napi = { version = "3.12.0", default-features = false, features = ["napi6", "tokio_rt", "dyn-symbols"] }

@@ -143,6 +143,85 @@ jobs:
       - name: build and test native addon
         run: npm run test:dev --prefix bindings/node
 
+  native-prebuild:
+    # Build one Node-API artifact, package it as the declared optional platform dependency, and
+    # exercise a clean tarball install. `--use-napi-cross` pins the GNU symbol floor; package:pack
+    # independently inspects the resulting ELF and refuses anything newer than GLIBC_2.17.
+    name: native prebuild (linux x64 glibc)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-prebuild-linux-x64-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      - name: install locked packaging tools
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
+
+      - name: type-check the public package surface
+        run: npm run test:types --prefix bindings/node
+
+      - name: install pinned license-report generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: verify native third-party licenses
+        run: bash scripts/check-third-party-licenses.sh
+
+      - name: create platform package
+        run: npm run package:create --prefix bindings/node
+
+      - name: build linux x64 glibc prebuild
+        run: npm run prebuild:linux-x64-gnu:cross --prefix bindings/node
+
+      - name: collect prebuild
+        run: npm run package:collect --prefix bindings/node
+
+      - name: pack and audit prebuild
+        env:
+          TURNDB_MAX_GLIBC: '2.17'
+        run: npm run package:pack --prefix bindings/node
+
+      - name: test packed install on build host
+        run: npm run test:prebuild --prefix bindings/node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turndb-native-linux-x64-gnu
+          path: bindings/node/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  native-prebuild-install:
+    # The artifact is built once above. Loading that exact tarball on every declared Node major is
+    # the N-API compatibility proof; rebuilding separately on each major would test different bits.
+    name: native prebuild install (node ${{ matrix.node }})
+    if: github.event_name != 'schedule'
+    needs: native-prebuild
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-native-linux-x64-gnu
+          path: bindings/node/dist/
+
+      - name: install and exercise the same packed addon
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
+
   dst:
     name: deterministic simulation (nightly)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

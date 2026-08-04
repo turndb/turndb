@@ -105,6 +105,20 @@ structured-zstd = "=0.0.49"
 [profile.release]
 debug = true
 
+# The shipped native addon. Ordinary releases retain symbols because developers use them for
+# profiling and crash diagnosis; the npm prebuild is a distribution artifact, so it gets a named
+# profile whose size tradeoff is explicit and reproducible. Keep unwinding enabled: a panic in an
+# embedded addon must not deliberately turn into `abort()` for the entire Node process.
+[profile.native-release]
+inherits = "release"
+debug = false
+strip = "symbols"
+# Fat LTO spent more than nine minutes in the final DataFusion-heavy link on the 2026-08-03
+# development host without producing an addon. Thin LTO keeps cross-crate optimization while making
+# a clean prebuild a practical CI operation; artifact size is measured after packing below.
+lto = "thin"
+codegen-units = 1
+
 # The shipped .wasm. A workspace root's profiles win over a member's, so this has to live here even
 # though only `turndb-wasm` uses it. Optimised for SIZE because the artifact is downloaded by every
 # npm install, and debug info in a binding nobody debugs at the Rust level is dead weight.

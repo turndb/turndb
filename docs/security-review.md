@@ -166,9 +166,10 @@ enforce the single-writer lock, which is a capability reduction rather than a pa
    profile may use directory descriptors and no-follow/beneath resolution throughout.
 2. **Dependency and supply-chain review remains external.** Rust/Node lockfiles pin the resolved
    graph and CI builds all feature profiles, but this review did not independently audit DataFusion,
-   Arrow, zstd, napi-rs, or the npm publication chain. Release automation should add vulnerability,
-   license, provenance, and reproducible-artifact gates rather than treating source review as a
-   substitute.
+   Arrow, zstd, napi-rs, or the npm publication chain. Native release automation now verifies the
+   project and generated third-party legal payload, exact artifact hashes, same-artifact runtime
+   matrix, and npm provenance. The license report is reproduced from the locked release graph, but
+   this does not establish reproducible binaries or replace vulnerability review.
 3. **CPU budgets are cooperative, not preemptive.** Cancellation checkpoints surround bounded work,
    but one zstd frame decode/encode and one part encoding unit are intentionally uninterruptible.
    Admission limits and worker isolation remain the protection against a single expensive atomic
