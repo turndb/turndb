@@ -51,6 +51,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: reclaim runner disk for the release graph
+        # Debug plus release artifacts of every test target in a DataFusion-sized graph exceed the
+        # hosted runner's free disk even after dropping target/debug between suites: the release
+        # link step died SIGBUS, then rustc reported "No space left on device" outright. The
+        # preinstalled toolchains this job never uses are the reclaimable margin (~30 GiB).
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
