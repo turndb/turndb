@@ -362,6 +362,52 @@ fn grouped_projection_does_not_decode_past_a_full_page() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// The demand bound must be recomputed per chunk, not fixed when the gather returns. With limit 2,
+/// the first chunk is [a, b]; the predicate rejects b, so remaining demand is ONE row — a chunk
+/// still sized two would project [c, d] together and open d's damaged column for a page that c
+/// alone completes. A page the caller asked for must not fail on corruption in a row it never
+/// needed; the row IS still corrupt, so the page that genuinely needs d must fail.
+#[test]
+fn read_ahead_chunks_shrink_to_remaining_demand_after_rejections() {
+    let dir = tmp("shrinking-chunk-demand");
+    {
+        let mut store = Store::open(&dir, cfg()).unwrap();
+        store.put_body("a", b"", vec![("x".into(), AttrValue::Int(1))]).unwrap();
+        store.put_body("b", b"", vec![("x".into(), AttrValue::Int(2))]).unwrap();
+        store.put_body("c", b"", vec![("x".into(), AttrValue::Int(3))]).unwrap();
+        store
+            .put_body(
+                "d",
+                b"",
+                vec![("x".into(), AttrValue::Str("damaged later type".repeat(200)))],
+            )
+            .unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+
+    corrupt_sections(&part_path(&dir), &["col.dict.0"]);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let request = ScanRequest {
+        attrs: vec!["x".into()],
+        predicates: vec![Predicate::Attr {
+            name: "x".into(),
+            op: Compare::Ne,
+            value: AttrValue::Int(2),
+        }],
+        limit: 2,
+        ..ScanRequest::default()
+    };
+    let first = reader.scan(&request).unwrap();
+    assert_eq!(first.rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+    assert_eq!(first.rows[0].attrs, [("x".into(), AttrValue::Int(1))]);
+    assert_eq!(first.rows[1].attrs, [("x".into(), AttrValue::Int(3))]);
+    assert!(first.next.is_some(), "d is still in range, so the page must not claim completion");
+
+    reader.scan(&ScanRequest { cursor: first.next, ..request }).unwrap_err();
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn scan_explanation_shares_cursor_field_and_physical_scope_planning() {
     let dir = tmp("explain");
