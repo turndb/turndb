@@ -128,7 +128,13 @@ jobs:
         # a clean OOM kill. Serial linking trades minutes for a link that completes.
         env:
           CARGO_BUILD_JOBS: '1'
-        run: cargo test --release
+          # Off rust-lld for this step: the SIGBUS survived disk, serial links, a toolchain pin,
+          # a clean cache, and attached swap, which leaves lld's mmap-heavy linking itself; BFD
+          # streams instead. --tests drops the six example binaries that contain no tests but
+          # each carry a full DataFusion link — they and the doctests remain compile- and
+          # run-covered by clippy --all-targets --all-features and the debug suite above.
+          RUSTFLAGS: -C linker-features=-lld
+        run: cargo test --release --tests
 
   npm:
     # `package.json` declares `engines: { node: ">=22 <27" }`, so the matrix IS the claim. The first CI
