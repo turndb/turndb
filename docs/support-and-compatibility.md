@@ -8,7 +8,7 @@ line. Publication of a crate or package remains a separate owner-approved action
 
 | Surface | Current evidence | Status |
 |---|---|---|
-| Rust core, default and SQL-off | stable Rust on GitHub's Linux x86-64 runner; debug and release tests, clippy, rustdoc, corruption suite | qualified development platform |
+| Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, corruption suite run hosted. The release-profile suite exceeds the private free-tier runner class (SIGBUS/disk, documented in the CI workflow) and is verified on the local qualified platform until the repository is public, when the same job arms hosted on the larger free runner | qualified development platform; release-profile hosted evidence deferred to repository publication, and named here rather than implied |
 | Rust crash model | nightly deterministic simulation on Linux x86-64 | qualified durability model when the scheduled gate is green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
 | Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
