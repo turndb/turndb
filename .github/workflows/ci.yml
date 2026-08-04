@@ -97,6 +97,12 @@ jobs:
           rm -rf target/debug
           df -h . | tail -1
       - name: test (release)
+        # One build job, not the global two: the SIGBUS above survived a 32 GiB disk margin, which
+        # leaves memory — two parallel lld links of DataFusion-static release test binaries exceed
+        # the hosted runner's RAM, and mapped pages under that pressure die as SIGBUS rather than
+        # a clean OOM kill. Serial linking trades minutes for a link that completes.
+        env:
+          CARGO_BUILD_JOBS: '1'
         run: cargo test --release
 
   npm:
