@@ -644,7 +644,7 @@ fn writer_scan_is_live_projected_bounded_and_newest_first() {
     assert_eq!(second.rows[0].contents[0].bytes.as_deref(), Some(b"new request".as_slice()));
     assert_eq!(second.stats.content_values_reconstructed, 1);
     assert_eq!(second.stats.reconstructed_bytes, b"new request".len() as u64);
-    assert_eq!(second.stats.shadowed_attr_occurrences, 1);
+    assert_eq!(second.stats.duplicate_attr_occurrences, 1);
     assert_eq!(
         second.rows[0]
             .attrs
@@ -1056,5 +1056,77 @@ fn invalid_resolution_budgets_are_refused_before_range_work() {
             .downcast_ref::<ScanInputError>()
             .is_some());
     }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Both sides of the `limit` and `max_examined` ceilings. Refusal alone is half a test: a
+/// validator that also refuses the extremes it must accept passes every rejects-bad-input
+/// assertion, so the nearest VALID values — 1 and the exact maximum — must each return the
+/// complete correct page.
+#[test]
+fn limit_and_examination_ceilings_refuse_extremes_and_accept_the_nearest_valid() {
+    let dir = tmp("ceiling-validation");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        store.put_body(id, b"", vec![("x".into(), AttrValue::Int(1))]).unwrap();
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    for request in [
+        ScanRequest { limit: 0, ..ScanRequest::default() },
+        ScanRequest { limit: turndb::scan::MAX_LIMIT + 1, ..ScanRequest::default() },
+        ScanRequest { max_examined: 0, ..ScanRequest::default() },
+        ScanRequest { max_examined: turndb::scan::MAX_EXAMINED + 1, ..ScanRequest::default() },
+    ] {
+        assert!(store.scan(&request).unwrap_err().downcast_ref::<ScanInputError>().is_some());
+    }
+
+    for request in [
+        ScanRequest { limit: turndb::scan::MAX_LIMIT, ..ScanRequest::default() },
+        ScanRequest { max_examined: turndb::scan::MAX_EXAMINED, ..ScanRequest::default() },
+        ScanRequest { limit: 1, max_examined: 1, ..ScanRequest::default() },
+    ] {
+        let complete = request.limit >= 3;
+        let page = store.scan(&request).unwrap();
+        if complete {
+            assert_eq!(
+                page.rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["a", "b", "c"]
+            );
+            assert!(page.next.is_none(), "a complete page at a maximum ceiling carries no cursor");
+        } else {
+            assert_eq!(page.rows[0].id, "a");
+            assert!(page.next.is_some(), "limit 1 of 3 must offer a continuation");
+        }
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The nearest valid deadline: every deadline test elsewhere uses an already-expired instant, and
+/// an implementation that refused every deadline-bearing request would pass all of them. A
+/// generous deadline and a live, uncancelled token must admit a complete page.
+#[test]
+fn a_generous_deadline_and_an_uncancelled_token_admit_a_complete_page() {
+    let dir = tmp("generous-deadline");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    for id in ["a", "b", "c"] {
+        store.put_body(id, b"payload long enough to fold", vec![]).unwrap();
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let token = CancellationToken::new();
+    let page = store
+        .scan(&ScanRequest {
+            contents: vec![ContentSelect { name: "body".into(), mode: ContentMode::Bytes }],
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+            cancellation: Some(token),
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(page.rows.len(), 3);
+    assert!(page.rows.iter().all(|row| row.contents[0].bytes.is_some()));
+    assert!(page.next.is_none(), "the deadline must not shorten a page it never reached");
     std::fs::remove_dir_all(dir).ok();
 }

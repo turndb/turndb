@@ -23,11 +23,11 @@ quietly acquire different visibility rules.
 
 ## Writer overlay
 
-A writer overlays its ordered memtable after committed rows have been resolved. A staged record
-replaces any committed origin with a memtable origin; a staged deletion removes it. The existing
-bounded over-fetch accounts for committed ids hidden by staged deletions, and the merged result is
-then truncated in the requested direction. Projection of a memtable origin remains entirely in
-memory and preserves read-your-writes.
+A writer's ordered memtable participates as one more source in the same bounded k-way range merge
+as the immutable parts, so staged records and staged deletions resolve through the identical
+newest-wins pipeline — there is no separate overlay pass or materialized memtable range (the "Hard
+resolution bound" section below describes the merge this replaced it with). Projection of a
+memtable origin remains entirely in memory and preserves read-your-writes.
 
 The scan call holds an immutable borrow of the writer, so a resolved memtable origin cannot change
 between range resolution and projection. The native actor additionally serializes writer commands.

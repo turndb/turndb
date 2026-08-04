@@ -21,6 +21,12 @@ export type WriteOp =
 
 export type Compare = 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
 
+/**
+ * Float comparisons: `eq`/`ne` are BIT equality — they match the exact stored NaN payload and
+ * distinguish -0.0 from 0.0, honoring the store's byte-exactness promise. Ordering ops use IEEE
+ * partial order, so no NaN satisfies any inequality and -0.0 orders equal to 0.0; `eq` therefore
+ * does not imply `lte`. IEEE equality is expressible as `lte` && `gte`.
+ */
 export type Predicate =
   | { kind: 'id'; op: Compare; idValue: string }
   | { kind: 'attr'; op: Compare; value: Attr }
@@ -64,7 +70,7 @@ export interface ScanPage {
     durationNs: bigint;
     examined: number;
     returned: number;
-    shadowedAttrOccurrences: number;
+    duplicateAttrOccurrences: number;
     contentValuesReconstructed: number;
     reconstructedBytes: bigint;
     reconstructionBudgetExhausted: boolean;

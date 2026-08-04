@@ -741,6 +741,15 @@ test('enforces deterministic scan deadlines and pre-aborted signals', async (t) 
   // A core Source test cancels after its first record read and proves in-flight work discards its
   // partial page. An empty native scan may correctly finish before an abort issued after submission,
   // so the ABI test intentionally avoids asserting a scheduler race.
+
+  // The nearest VALID deadline: a generous timeout and a live signal must admit a complete page —
+  // an implementation refusing every deadline-bearing request passes the two rejections above.
+  await store.write([{ kind: 'put', id: 'row' }]);
+  const live = new AbortController();
+  const page = await store.scan({ timeoutMs: 3_600_000, signal: live.signal });
+  assert.equal(page.rows.length, 1);
+  assert.equal(page.rows[0].id, 'row');
+  assert.equal(page.next, undefined);
 });
 
 test('publishes exact immutable cuts and reopens retained commits', async (t) => {
@@ -1105,8 +1114,10 @@ test('compacts one exact bounded work unit and classifies budgets for schedulers
     store.compactBounded({ maxInputParts: 2, maxInputRows: 1n, maxInputBytes: 1n << 40n }),
     (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
   );
-  assert.throws(
-    () => store.compactBounded({ maxInputParts: 1, maxInputRows: 10n, maxInputBytes: 1n << 40n }),
+  // Invalid budgets reject like every other failure on this Promise surface — a `.then()`
+  // caller must not need a synchronous try/catch for exactly one method.
+  await assert.rejects(
+    store.compactBounded({ maxInputParts: 1, maxInputRows: 10n, maxInputBytes: 1n << 40n }),
     (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
   );
   await assert.rejects(
