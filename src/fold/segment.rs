@@ -157,11 +157,13 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// silently orphan every block after it in the segment. Sixteen surviving header bytes carry no
 /// content — they carry the length that keeps the chain walkable, and the `block_id` that lets a
 /// scan report the erasure by name.
-pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
-    if let Err(e) = crate::sys::punch_hole(f, off, len) {
+pub fn punch(f: &File, path: &Path, off: u64, len: u64) -> Result<()> {
+    // Through the vfs seam, and `path` exists only to feed it: destroying committed bytes in
+    // place is precisely the kind of mutation the crash simulator must be able to replay.
+    if let Err(e) = crate::vfs::punch_hole(f, path, off, len) {
         bail!("punching {len} bytes at {off} failed ({e}) — this filesystem may not support hole punching; re-fold instead");
     }
-    f.sync_all()?;
+    crate::vfs::sync_file(f, path)?;
     Ok(())
 }
 
@@ -170,29 +172,36 @@ pub fn punch(f: &File, off: u64, len: u64) -> Result<()> {
 ///
 /// This is how the fold finds its own last good byte with no external length authority. It never
 /// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
-/// of good data — during a tail scan a bad frame is a boundary, not an error.
+/// of good data — during a tail scan a bad frame is a boundary, not an error — except a frame the
+/// manifest declares PUNCHED, which the `punched` parameter of the `_with_limits` variants lets the
+/// walk step over. This convenience wrapper has no manifest in hand and passes no declaration.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
-    scan_tail_with_limits(f, file_len, has_dict, crate::read_limits::ReadLimits::default())
+    scan_tail_with_limits(f, file_len, has_dict, &[], crate::read_limits::ReadLimits::default())
 }
 
-/// [`scan_tail`] with explicit admission before its reusable frame buffer grows.
+/// [`scan_tail`] with explicit admission before its reusable frame buffer grows, and with the
+/// manifest's declared-punched block ranges (inclusive `[lo, hi]`) — empty when the caller holds
+/// no manifest.
 pub fn scan_tail_with_limits(
     f: &dyn ReadAt,
     file_len: u64,
     has_dict: bool,
+    punched: &[(u32, u32)],
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(u64, Vec<(u32, u32)>)> {
     scan_tail_controlled_with_limits(
         f,
         file_len,
         has_dict,
+        punched,
         &crate::control::OperationControl::default(),
         "fold scan",
         read_limits,
     )
 }
 
-/// [`scan_tail`] with cooperative checks between complete frames.
+/// [`scan_tail`] with cooperative checks between complete frames. No manifest in hand, so no
+/// punched declaration reaches the walk.
 pub fn scan_tail_controlled(
     f: &dyn ReadAt,
     file_len: u64,
@@ -204,17 +213,21 @@ pub fn scan_tail_controlled(
         f,
         file_len,
         has_dict,
+        &[],
         control,
         operation,
         crate::read_limits::ReadLimits::default(),
     )
 }
 
-/// Controlled tail scan with explicit frame-byte and block-count admission.
+/// Controlled tail scan with explicit frame-byte and block-count admission. `punched` carries the
+/// manifest's declared-erased block-id ranges so the walk can step over a punched frame whatever
+/// residue a crash left in its payload.
 pub fn scan_tail_controlled_with_limits(
     f: &dyn ReadAt,
     file_len: u64,
     has_dict: bool,
+    punched: &[(u32, u32)],
     control: &crate::control::OperationControl,
     operation: &'static str,
     read_limits: crate::read_limits::ReadLimits,
@@ -262,14 +275,24 @@ pub fn scan_tail_controlled_with_limits(
         }
         control.check(operation)?;
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
-            // A PUNCHED block: header intact, payload deallocated to zeros. The chain steps over
-            // it (that is what keeping the header buys) and retains its location. The manifest's
-            // punched declaration—not directory omission—is the authority that makes a later read
-            // report ERASED. Without that declaration, resolving this entry still fails checksum
-            // verification and cannot expose bytes. Retaining it is essential when a historical
-            // committed prefix predates the sidecar written after this segment was sealed.
+            // A PUNCHED block: header intact (punch never touches it — that is what keeps the
+            // chain walkable), payload deallocated. The deallocation is volatile until its fsync,
+            // so a crash can leave the payload in any of THREE residues: fully readable (the
+            // fallocate never landed — the frame still verifies and never reaches this branch),
+            // fully zeroed (it completed), or PARTIALLY zeroed (fallocate is per-extent, so power
+            // loss mid-punch genuinely half-zeroes a range). The manifest's punched declaration is
+            // the erasure AUTHORITY — it is committed before any byte is destroyed — so a declared
+            // frame is stepped over whatever its payload holds, and its location is retained so a
+            // later read reports ERASED by name instead of resolving into damage.
+            //
+            // The all-zero test survives beside the declaration because a historical committed
+            // prefix can predate the declaration reaching this open. It is deliberately not
+            // widened: an UNDECLARED checksum-failing frame with nonzero payload bytes is damage,
+            // and damage still ends the walk — the skip is authorized by the declaration, never
+            // guessed from the payload.
+            let declared = punched.iter().any(|&(lo, hi)| (lo..=hi).contains(&h.block_id));
             let body = &payload[BLOCK_HDR_LEN..span - BLOCK_XSUM_LEN];
-            if h.stored > 0 && body.iter().all(|&b| b == 0) {
+            if declared || (h.stored > 0 && body.iter().all(|&b| b == 0)) {
                 read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
                 read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
                 dir.push((h.block_id, off as u32));

@@ -289,7 +289,8 @@ impl Fold {
         cfg: FoldCfg,
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
-        Fold::open_at_with_limits(dir, cfg, None, read_limits)
+        // No committed tail means no manifest in hand — and therefore no punched declaration.
+        Fold::open_at_with_limits(dir, cfg, None, &[], read_limits)
     }
 
     /// Open, recovering to `committed`: the tail some higher layer durably recorded.
@@ -298,8 +299,24 @@ impl Fold {
     /// stop being valid?"*. The committed tail answers *"where did the store promise it stopped?"*. A
     /// committed tail **beyond** the last good block means the disk broke an fsync promise, and we
     /// refuse rather than serve a fold that silently lost durable bytes.
-    pub fn open_at(dir: &Path, cfg: FoldCfg, committed: Option<FoldTail>) -> Result<Fold> {
-        Fold::open_at_with_limits(dir, cfg, committed, crate::read_limits::ReadLimits::default())
+    ///
+    /// `punched` is the same manifest's declared-erased block ranges. The tail scan needs it at
+    /// open, not merely after: a crash mid-punch can leave a DECLARED block's payload partially
+    /// zeroed, and only the declaration authorizes stepping over that frame instead of reading the
+    /// committed tail as beyond the last good block.
+    pub fn open_at(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: Option<FoldTail>,
+        punched: &[(u32, u32)],
+    ) -> Result<Fold> {
+        Fold::open_at_with_limits(
+            dir,
+            cfg,
+            committed,
+            punched,
+            crate::read_limits::ReadLimits::default(),
+        )
     }
 
     /// Open and recover a writer under explicit frame and object-count admission.
@@ -307,6 +324,7 @@ impl Fold {
         dir: &Path,
         cfg: FoldCfg,
         committed: Option<FoldTail>,
+        punched: &[(u32, u32)],
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
         let read_limits = read_limits.validate()?;
@@ -441,7 +459,7 @@ impl Fold {
                 inflight: HashMap::new(),
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
                 _lock: Some(lock),
-                punched: Vec::new(),
+                punched: punched.to_vec(),
                 read_limits,
             });
         }
@@ -469,7 +487,7 @@ impl Fold {
         let has_dict = headers[active as usize].has_dict();
 
         let (good_tail, _) =
-            segment::scan_tail_with_limits(&active_f, flen, has_dict, read_limits)?;
+            segment::scan_tail_with_limits(&active_f, flen, has_dict, punched, read_limits)?;
 
         let target = match committed {
             None => good_tail,
@@ -522,6 +540,7 @@ impl Fold {
                             &readers[i],
                             len,
                             h.has_dict(),
+                            punched,
                             read_limits,
                         )?;
                         // Regenerate so the next open finds it. Best-effort: advisory data must
@@ -531,7 +550,14 @@ impl Fold {
                     }
                 }
             } else {
-                segment::scan_tail_with_limits(&readers[i], len, h.has_dict(), read_limits)?.1
+                segment::scan_tail_with_limits(
+                    &readers[i],
+                    len,
+                    h.has_dict(),
+                    punched,
+                    read_limits,
+                )?
+                .1
             };
             for (id, off) in entries {
                 install_block_location(
@@ -564,16 +590,11 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
             _lock: Some(lock),
-            punched: Vec::new(),
+            punched: punched.to_vec(),
             read_limits,
         })
     }
 
-    /// Open WITHOUT the writer lock, read-only.
-    ///
-    /// Takes no lock, truncates nothing, sweeps nothing — a reader must never mutate a store another
-    /// process is writing. Safe concurrently with a live writer: segments are append-only and blocks
-    /// are immutable once written, so a reader sees a prefix that only ever grows.
     /// Tell this fold which blocks the manifest declares erased, as inclusive `[lo, hi]` ranges.
     ///
     /// The caller owes the right manifest, and for a RETAINED snapshot that is the LIVE one, not the
@@ -588,14 +609,22 @@ impl Fold {
         self.punched.iter().any(|&(lo, hi)| block_id >= lo && block_id <= hi)
     }
 
+    /// Open WITHOUT the writer lock, read-only.
+    ///
+    /// Takes no lock, truncates nothing, sweeps nothing — a reader must never mutate a store another
+    /// process is writing. Safe concurrently with a live writer: segments are append-only and blocks
+    /// are immutable once written, so a reader sees a prefix that only ever grows. No manifest in
+    /// hand, so no punched declaration reaches the scan.
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
-        Fold::open_read_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
+        Fold::open_read_with_limits(dir, cfg, &[], crate::read_limits::ReadLimits::default())
     }
 
-    /// Open an unlocked reader with explicit frame and object-count admission.
+    /// Open an unlocked reader with explicit frame and object-count admission, declaring the
+    /// manifest's punched block ranges so the scan can step over erased frames.
     pub fn open_read_with_limits(
         dir: &Path,
         cfg: FoldCfg,
+        punched: &[(u32, u32)],
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
         let read_limits = read_limits.validate()?;
@@ -627,24 +656,28 @@ impl Fold {
                 dict_files.push(read_bounded_candidate(&e.path(), MAX_DICTIONARY_BYTES)?);
             }
         }
-        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, read_limits)
+        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, punched, read_limits)
     }
 
-    /// Open only the durable prefix named by a manifest, ignoring later append residue.
+    /// Open only the durable prefix named by a manifest, ignoring later append residue. No
+    /// punched declaration in hand — a caller holding the manifest uses the `_with_limits` form.
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, committed: FoldTail) -> Result<Fold> {
         Fold::open_read_at_with_limits(
             dir,
             cfg,
             committed,
+            &[],
             crate::read_limits::ReadLimits::default(),
         )
     }
 
-    /// Open a committed read-only prefix with explicit frame and object-count admission.
+    /// Open a committed read-only prefix with explicit frame and object-count admission, plus the
+    /// manifest's punched declaration for the scan.
     pub fn open_read_at_with_limits(
         dir: &Path,
         cfg: FoldCfg,
         committed: FoldTail,
+        punched: &[(u32, u32)],
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
         let read_limits = read_limits.validate()?;
@@ -697,7 +730,7 @@ impl Fold {
                 dict_files.push(read_bounded_candidate(&entry.path(), MAX_DICTIONARY_BYTES)?);
             }
         }
-        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, read_limits)
+        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, punched, read_limits)
     }
 
     /// Open read-only from prepared inputs — the entry every SOURCE uses. A directory hands in
@@ -718,16 +751,21 @@ impl Fold {
             dict_files,
             cfg,
             label,
+            &[],
             crate::read_limits::ReadLimits::default(),
         )
     }
 
-    /// Backend-neutral read open with explicit frame and object-count admission.
+    /// Backend-neutral read open with explicit frame and object-count admission. `punched` is the
+    /// owning manifest's declared-erased block ranges: a source that has punched blocks may hold a
+    /// frame whose payload a crash left partially zeroed, and the declaration is what lets the
+    /// rebuild scan step over it.
     pub fn open_read_from_with_limits(
         mut segs: Vec<SegmentInput>,
         dict_files: Vec<Vec<u8>>,
         cfg: FoldCfg,
         label: &Path,
+        punched: &[(u32, u32)],
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
         let read_limits = read_limits.validate()?;
@@ -782,6 +820,7 @@ impl Fold {
                                 &readers[i],
                                 len,
                                 h.has_dict(),
+                                punched,
                                 read_limits,
                             )?
                             .1
@@ -789,7 +828,14 @@ impl Fold {
                     }
                 }
                 None => {
-                    segment::scan_tail_with_limits(&readers[i], len, h.has_dict(), read_limits)?.1
+                    segment::scan_tail_with_limits(
+                        &readers[i],
+                        len,
+                        h.has_dict(),
+                        punched,
+                        read_limits,
+                    )?
+                    .1
                 }
             };
             for (id, off) in entries {
@@ -823,7 +869,7 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(1, cfg.level, None),
             _lock: None,
-            punched: Vec::new(),
+            punched: punched.to_vec(),
             read_limits,
         })
     }
@@ -1203,7 +1249,8 @@ impl Fold {
             let f = segment::open_rw(&self.dir, seg)?;
             // The PAYLOAD only — the header stays so the frame chain remains walkable. See
             // `segment::punch`.
-            segment::punch(&f, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
+            let path = segment::seg_path(&self.dir, seg);
+            segment::punch(&f, &path, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
             // The block is gone as content: drop it from the directory so no Loc can resolve
             // into erased bytes, exactly as a reopened store's scan would.
             self.blockdir[id as usize] = None;
@@ -1244,10 +1291,14 @@ impl Fold {
         for (i, h) in self.headers.iter().enumerate() {
             control.check("fold verification")?;
             let len = self.readers[i].len()?;
+            // With this fold's punched declaration: verification runs against crash residue too,
+            // and a declared block mid-punch (payload part-zeroed, retry pending) is accounted
+            // for, not corrupt.
             let (end, entries) = segment::scan_tail_controlled_with_limits(
                 &self.readers[i],
                 len,
                 h.has_dict(),
+                &self.punched,
                 control,
                 "fold verification",
                 self.read_limits,

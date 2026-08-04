@@ -979,7 +979,14 @@ pub fn open_read_pack_with_limits(
             dict_files.push(pack.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
         }
     }
-    let fold = Fold::open_read_from_with_limits(segs, dict_files, cfg, path, read_limits)?;
+    let fold = Fold::open_read_from_with_limits(
+        segs,
+        dict_files,
+        cfg,
+        path,
+        &manifest.punched,
+        read_limits,
+    )?;
 
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -1368,11 +1375,12 @@ fn validate_recovery_candidate(
 ) -> Result<RecoveryReport> {
     control.check("manifest recovery validation")?;
     let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
-    let mut fold = match manifest.fold_tail() {
-        Some(tail) => Fold::open_read_at_with_limits(&fold_dir, cfg, tail, read_limits)?,
-        None => Fold::open_read_with_limits(&fold_dir, cfg, read_limits)?,
+    let fold = match manifest.fold_tail() {
+        Some(tail) => {
+            Fold::open_read_at_with_limits(&fold_dir, cfg, tail, &manifest.punched, read_limits)?
+        }
+        None => Fold::open_read_with_limits(&fold_dir, cfg, &manifest.punched, read_limits)?,
     };
-    fold.declare_punched(&manifest.punched);
     let scrub = fold.scrub_with_control(control)?;
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -1785,10 +1793,17 @@ impl Store {
         )?;
 
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
-        // is discarded, and the log regenerates it.
-        let mut fold =
-            Fold::open_at_with_limits(&fold_path, cfg, manifest.fold_tail(), read_limits)?;
-        fold.declare_punched(&manifest.punched);
+        // is discarded, and the log regenerates it. The punched declaration rides in with the tail
+        // because recovery needs it DURING the scan: a crash mid-punch can leave a declared block's
+        // payload partially zeroed, and without the declaration that frame reads as a torn write
+        // and the committed tail as lost durable bytes.
+        let mut fold = Fold::open_at_with_limits(
+            &fold_path,
+            cfg,
+            manifest.fold_tail(),
+            &manifest.punched,
+            read_limits,
+        )?;
 
         let pcache = Arc::new(SectionCache::new(part_cache_bytes));
         let mut parts = Vec::with_capacity(manifest.parts.len());
@@ -2157,17 +2172,24 @@ impl Store {
         for _ in 0..8 {
             let manifest = Manifest::load_with_limits(dir, read_limits)?;
             let fold_path = refold::fold_dir(dir, manifest.fold_gen);
+            // The manifest's punched ranges ride into the open. A live record never references a
+            // punched block — `punch_unreferenced` walks live visibility to decide — but the scan
+            // itself needs the declaration to step over a mid-punch frame a crash left behind, and
+            // if a stale `Loc` ever reaches one, it is then named as erasure rather than as a
+            // failing disk.
             let fold = match manifest.fold_tail().map_or_else(
-                || Fold::open_read_with_limits(&fold_path, cfg, read_limits),
-                |tail| Fold::open_read_at_with_limits(&fold_path, cfg, tail, read_limits),
+                || Fold::open_read_with_limits(&fold_path, cfg, &manifest.punched, read_limits),
+                |tail| {
+                    Fold::open_read_at_with_limits(
+                        &fold_path,
+                        cfg,
+                        tail,
+                        &manifest.punched,
+                        read_limits,
+                    )
+                },
             ) {
-                Ok(mut fold) => {
-                    // A live record never references a punched block — `punch_unreferenced` walks
-                    // live visibility to decide. Declared anyway so that if a stale `Loc` ever does
-                    // reach one, it is named as erasure rather than as a failing disk.
-                    fold.declare_punched(&manifest.punched);
-                    fold
-                }
+                Ok(fold) => fold,
                 Err(e) => {
                     let gone = e
                         .downcast_ref::<std::io::Error>()
@@ -2243,14 +2265,13 @@ impl Store {
         let read_limits = read_limits.validate()?;
         let manifest = load_retained(dir, commit)?;
         let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
-        let mut fold = match manifest.fold_tail() {
-            Some(tail) => Fold::open_read_at_with_limits(&fold_dir, cfg, tail, read_limits)?,
-            None => Fold::open_read_with_limits(&fold_dir, cfg, read_limits)?,
-        };
-        // Erasure is declared by the LIVE manifest, not by this one. Punching commits a new manifest,
-        // so a retained copy predates every punch that followed it and declares nothing — which is
-        // exactly how a deliberate erasure came to be reported as a checksum failure. `punched` is
-        // cumulative, so the live copy is the whole truth about what is gone.
+        // Erasure is declared by the LIVE manifest, not by the retained one. Punching commits a new
+        // manifest, so a retained copy predates every punch that followed it and declares nothing —
+        // which is exactly how a deliberate erasure came to be reported as a checksum failure.
+        // `punched` is cumulative, so the live copy is the whole truth about what is gone. Loaded
+        // BEFORE the fold opens, because the open's own scan is a consumer: a crash mid-punch can
+        // leave a declared block's payload partially zeroed, and only the declaration lets the scan
+        // step over it.
         //
         // The load is PROPAGATED, not tolerated. Treating an unreadable live manifest as "nothing
         // was erased" is the same false fallback this whole fix exists to remove: the reader would
@@ -2278,7 +2299,12 @@ impl Store {
                 live.fold_gen
             );
         }
-        fold.declare_punched(&live.punched);
+        let fold = match manifest.fold_tail() {
+            Some(tail) => {
+                Fold::open_read_at_with_limits(&fold_dir, cfg, tail, &live.punched, read_limits)?
+            }
+            None => Fold::open_read_with_limits(&fold_dir, cfg, &live.punched, read_limits)?,
+        };
         let pcache = SectionCache::shared();
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
@@ -4037,6 +4063,9 @@ impl Store {
             &new_dir,
             self.cfg,
             self.manifest.fold_tail(),
+            // Empty by construction — a new generation has no punched declaration, which is what
+            // `m.punched.clear()` above committed.
+            &self.manifest.punched,
             self.read_limits,
         )?;
         sweep_unreachable_with_limits(&self.dir, self.read_limits)?;

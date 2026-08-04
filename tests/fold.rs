@@ -282,7 +282,7 @@ fn committed_tail_beyond_the_last_good_frame_refuses() {
     // A commit authority claiming durability past what the fold actually holds means the disk broke a
     // promise. Serving that store would silently lose data.
     let bogus = FoldTail { seg: 0, off: 10_000_000 };
-    assert!(Fold::open_at(&dir, FoldCfg::default(), Some(bogus)).is_err());
+    assert!(Fold::open_at(&dir, FoldCfg::default(), Some(bogus), &[]).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -299,7 +299,7 @@ fn committed_tail_discards_uncommitted_frames() {
         f.put(b"uncommitted two").unwrap();
         (l, t)
     };
-    let f = Fold::open_at(&dir, FoldCfg::default(), Some(tail)).unwrap();
+    let f = Fold::open_at(&dir, FoldCfg::default(), Some(tail), &[]).unwrap();
     assert_eq!(f.read(loc).unwrap(), keep);
     assert_eq!(f.tail(), tail, "the fold must resume exactly at the committed tail");
     std::fs::remove_dir_all(&dir).ok();
@@ -486,7 +486,7 @@ fn recovery_rolls_back_across_segment_boundaries() {
     };
 
     // Recover to the committed tail: segments above it must go, and everything at or below must read.
-    let f = Fold::open_at(&d, cfg, Some(committed)).unwrap();
+    let f = Fold::open_at(&d, cfg, Some(committed), &[]).unwrap();
     assert_eq!(
         f.segment_count(),
         committed.seg + 1,
@@ -514,7 +514,7 @@ fn a_committed_tail_beyond_the_data_is_refused() {
     }
     let beyond = FoldTail { seg: 99, off: 4096 };
     assert!(
-        Fold::open_at(&d, cfg, Some(beyond)).is_err(),
+        Fold::open_at(&d, cfg, Some(beyond), &[]).is_err(),
         "a committed tail past the last good block must refuse, not truncate to it"
     );
     std::fs::remove_dir_all(&d).ok();

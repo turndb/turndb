@@ -2354,6 +2354,126 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A crash can land a punch PARTIALLY: fallocate deallocates per extent, so power loss mid-punch
+/// leaves a declared block's payload half zeros, half original bytes — neither of the two residues
+/// (intact, fully zeroed) the happy paths produce. The manifest's punched declaration, committed
+/// before any byte was destroyed, is the erasure authority: recovery must step over that frame.
+/// The identical damage WITHOUT the declaration is nothing but corruption and must still refuse.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_torn_punch_on_a_declared_block_recovers_and_undeclared_damage_refuses() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tmp("punch-torn");
+    let undeclared = tmp("punch-torn-undeclared");
+    // block_target 1 seals a block per piece, so the superseded piece owns a punchable block;
+    // incompressible bodies make the punched range extent-scale, the size a real fallocate tears.
+    let cfg = FoldCfg { block_target: 1, ..Default::default() };
+    let mut x = 0x243F_6A88_85A3_08D3u64;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
+    let old = noise(32 * 1024);
+    let live = noise(32 * 1024);
+    {
+        let mut s = Store::open(&dir, cfg).unwrap();
+        s.put("k", &[Span::Piece(&old)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.put("k", &[Span::Piece(&live)], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    // The nearest-INVALID twin: byte-identical now, and it will never see the punch or its
+    // declaration — only the damage.
+    copy_tree(&dir, &undeclared);
+
+    let seg = dir.join("fold").join("seg-00000000.fold");
+    let before = std::fs::read(&seg).unwrap();
+    {
+        let mut s = Store::open(&dir, cfg).unwrap();
+        let stats = s.punch_unreferenced().unwrap();
+        assert!(stats.blocks_punched > 0, "the setup must actually punch, got {stats:?}");
+    }
+    // Reconstruct the torn crash state. The declaration is already durable (it commits before any
+    // deallocation), the punch zeroed exactly one payload; put the SECOND half of it back from the
+    // pre-punch image, leaving the first half zeros — the fallocate landed on only some extents.
+    let after = std::fs::read(&seg).unwrap();
+    assert_eq!(before.len(), after.len(), "punching must not change the segment length");
+    let lo = (0..before.len()).find(|&i| before[i] != after[i]).expect("a zeroed range");
+    let hi = (0..before.len()).rfind(|&i| before[i] != after[i]).unwrap() + 1;
+    let mid = lo + (hi - lo) / 2;
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        f.seek(SeekFrom::Start(mid as u64)).unwrap();
+        f.write_all(&before[mid..hi]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    {
+        // The writer reopens: the declaration authorizes stepping over the part-zeroed frame.
+        let mut s = Store::open(&dir, cfg).unwrap();
+        assert_eq!(s.reconstruct("k").unwrap().unwrap(), live);
+        s.verify().unwrap();
+        // The declaration stands, and through it the block reads as deliberate ERASURE — not as a
+        // failing disk — even while its payload still holds surviving bytes.
+        let &(punched_lo, _) =
+            s.manifest().punched.first().expect("the punched declaration must survive reopen");
+        let err = s
+            .fold()
+            .read(turndb::fold::Loc { block_id: punched_lo, in_off: 0, raw: 1 })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ERASED"),
+            "a declared block must read as erasure, got: {err:#}"
+        );
+        // A retry finishes what the crash interrupted: the declared block is re-punched.
+        let retry = s.punch_unreferenced().unwrap();
+        assert!(retry.blocks_punched > 0, "the declared block must be retried, got {retry:?}");
+        assert!(!s.manifest().punched.is_empty(), "the retry must not lose the declaration");
+        s.verify().unwrap();
+        assert_eq!(s.reconstruct("k").unwrap().unwrap(), live);
+    }
+
+    // The same partial damage with NO declaration: nothing authorizes stepping over nonzero bytes
+    // that fail their checksum, so the committed tail sits beyond the last good block and open
+    // refuses rather than serve a fold that lost durable bytes.
+    let twin_seg = undeclared.join("fold").join("seg-00000000.fold");
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&twin_seg).unwrap();
+        f.seek(SeekFrom::Start(lo as u64)).unwrap();
+        f.write_all(&vec![0u8; mid - lo]).unwrap();
+        f.sync_all().unwrap();
+    }
+    assert!(
+        Store::open(&undeclared, cfg).is_err(),
+        "undeclared partial damage must refuse at open, not be stepped over"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&undeclared).ok();
+}
+
+/// Recursively copy a store directory — a byte-level snapshot for crash-twin tests.
+#[cfg(target_os = "linux")]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dst = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dst);
+        } else {
+            std::fs::copy(e.path(), &dst).unwrap();
+        }
+    }
+}
+
 /// Blocks actually allocated on disk, in bytes — what punching changes (file LENGTH does not).
 fn allocated_bytes(d: &std::path::Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
