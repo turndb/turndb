@@ -75,6 +75,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # v2 busts a cache poisoned by this branch's first run, which died writing artifacts on
+          # a full disk. The truncated rlibs it saved were restored into every later run, and lld
+          # faults SIGBUS reading past the end of a truncated mmap'd input — which is why the
+          # crash survived a 32 GiB disk margin, serial links, a toolchain pin, and live swap
+          # with memory free. A poisoned cache reproduces exactly like a deterministic bug.
+          key: rust-gates-v2
 
       - name: fmt
         run: cargo fmt --check
