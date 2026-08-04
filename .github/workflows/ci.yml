@@ -60,6 +60,13 @@ jobs:
           df -h / | tail -1
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h / | tail -1
+          # The SIGBUS outlived the disk margin, serial links, and a toolchain pin — one lld link
+          # of a DataFusion-static release test binary simply exceeds the runner's 7 GB RAM, and a
+          # mapped page under that pressure faults as SIGBUS on a swapless host. Swap converts
+          # that into a slow link that completes.
+          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile
+          sudo mkswap /swapfile && sudo swapon /swapfile
+          free -h | tail -2
       # Pinned, not @stable: current stable (1.97.1) ships an lld that crashes SIGBUS linking this
       # crate's release test binaries — reproduced across serial links and a 32 GiB disk margin,
       # with LLVM's own submit-a-bug-report stack dump. 1.95.0 is the toolchain the full local
