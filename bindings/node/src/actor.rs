@@ -289,40 +289,51 @@ impl Actor {
         self.inner.capacity
     }
 
-    async fn receive<R>(receive: oneshot::Receiver<Result<R>>) -> Result<R> {
-        receive.await.context("TurnDB store thread exited before replying")?
+    async fn receive<R>(&self, receive: oneshot::Receiver<Result<R>>) -> Result<R> {
+        match receive.await {
+            Ok(result) => result,
+            // The sender was dropped without a reply. `submit` checks state before enqueueing, but
+            // it cannot check-and-enqueue atomically: a command can land behind Close in the queue
+            // and be dropped when the worker returns. That command failed because the store
+            // CLOSED, and must say so — "thread exited" is for a worker that actually died, which
+            // is the only way the sender drops while the state still reads OPEN.
+            Err(_) if self.inner.state.load(Ordering::Acquire) != OPEN => {
+                Err(ActorFault::Closed.into())
+            }
+            Err(error) => Err(error).context("TurnDB store thread exited before replying"),
+        }
     }
 
     pub async fn write(&self, ops: Vec<WriteOp>, durable: bool) -> Result<()> {
-        Self::receive(self.submit(|reply| Command::Write { ops, durable, reply })?).await
+        self.receive(self.submit(|reply| Command::Write { ops, durable, reply })?).await
     }
 
     pub async fn sync(&self, control: OperationControl) -> Result<()> {
-        Self::receive(self.submit(|reply| Command::Sync { control, reply })?).await
+        self.receive(self.submit(|reply| Command::Sync { control, reply })?).await
     }
 
     pub async fn flush(&self, control: OperationControl) -> Result<bool> {
-        Self::receive(self.submit(|reply| Command::Flush { control, reply })?).await
+        self.receive(self.submit(|reply| Command::Flush { control, reply })?).await
     }
 
     pub async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
-        Self::receive(self.submit(|reply| Command::Scan { request, reply })?).await
+        self.receive(self.submit(|reply| Command::Scan { request, reply })?).await
     }
 
     pub async fn explain_scan(&self, request: ScanRequest) -> Result<ScanExplanation> {
-        Self::receive(self.submit(|reply| Command::ExplainScan { request, reply })?).await
+        self.receive(self.submit(|reply| Command::ExplainScan { request, reply })?).await
     }
 
     pub async fn read_content(&self, id: String, name: String) -> Result<Option<Vec<u8>>> {
-        Self::receive(self.submit(|reply| Command::ReadContent { id, name, reply })?).await
+        self.receive(self.submit(|reply| Command::ReadContent { id, name, reply })?).await
     }
 
     pub async fn snapshot(&self) -> Result<ReadStore> {
-        Self::receive(self.submit(|reply| Command::Snapshot { reply })?).await
+        self.receive(self.submit(|reply| Command::Snapshot { reply })?).await
     }
 
     pub async fn compact(&self, full: bool, control: OperationControl) -> Result<CompactResult> {
-        Self::receive(self.submit(|reply| Command::Compact { full, control, reply })?).await
+        self.receive(self.submit(|reply| Command::Compact { full, control, reply })?).await
     }
 
     pub async fn compact_bounded(
@@ -330,8 +341,7 @@ impl Actor {
         budget: CompactionBudget,
         control: OperationControl,
     ) -> Result<BoundedCompactResult> {
-        Self::receive(self.submit(|reply| Command::CompactBounded { budget, control, reply })?)
-            .await
+        self.receive(self.submit(|reply| Command::CompactBounded { budget, control, reply })?).await
     }
 
     pub async fn estimate_compaction_space(
@@ -339,7 +349,7 @@ impl Actor {
         budget: CompactionBudget,
         control: OperationControl,
     ) -> Result<CompactionSpaceResult> {
-        Self::receive(self.submit(|reply| Command::EstimateCompactionSpace {
+        self.receive(self.submit(|reply| Command::EstimateCompactionSpace {
             budget,
             control,
             reply,
@@ -351,28 +361,26 @@ impl Actor {
         &self,
         control: OperationControl,
     ) -> Result<turndb::store::FormatMigrationStatus> {
-        Self::receive(self.submit(|reply| Command::FormatMigrationStatus { control, reply })?).await
+        self.receive(self.submit(|reply| Command::FormatMigrationStatus { control, reply })?).await
     }
 
     pub async fn estimate_format_migration_space(
         &self,
         control: OperationControl,
     ) -> Result<FormatMigrationPreflightResult> {
-        Self::receive(
-            self.submit(|reply| Command::EstimateFormatMigrationSpace { control, reply })?,
-        )
-        .await
+        self.receive(self.submit(|reply| Command::EstimateFormatMigrationSpace { control, reply })?)
+            .await
     }
 
     pub async fn migrate_format_step(
         &self,
         control: OperationControl,
     ) -> Result<FormatMigrationStepResult> {
-        Self::receive(self.submit(|reply| Command::MigrateFormatStep { control, reply })?).await
+        self.receive(self.submit(|reply| Command::MigrateFormatStep { control, reply })?).await
     }
 
     pub async fn verify(&self, control: OperationControl) -> Result<VerifyResult> {
-        Self::receive(self.submit(|reply| Command::Verify { control, reply })?).await
+        self.receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
 
     pub async fn backup(
@@ -380,37 +388,37 @@ impl Actor {
         path: std::path::PathBuf,
         control: OperationControl,
     ) -> Result<turndb::pack::BackupStats> {
-        Self::receive(self.submit(|reply| Command::Backup { path, control, reply })?).await
+        self.receive(self.submit(|reply| Command::Backup { path, control, reply })?).await
     }
 
     pub async fn erase(&self, ids: Vec<String>, control: OperationControl) -> Result<ErasureStats> {
-        Self::receive(self.submit(|reply| Command::Erase { ids, control, reply })?).await
+        self.receive(self.submit(|reply| Command::Erase { ids, control, reply })?).await
     }
 
     pub async fn punch(&self, control: OperationControl) -> Result<PunchStats> {
-        Self::receive(self.submit(|reply| Command::Punch { control, reply })?).await
+        self.receive(self.submit(|reply| Command::Punch { control, reply })?).await
     }
 
     pub async fn refold(
         &self,
         control: OperationControl,
     ) -> Result<turndb::store::refold::RefoldStats> {
-        Self::receive(self.submit(|reply| Command::Refold { control, reply })?).await
+        self.receive(self.submit(|reply| Command::Refold { control, reply })?).await
     }
 
     pub async fn estimate_refold_space(
         &self,
         control: OperationControl,
     ) -> Result<RefoldSpaceResult> {
-        Self::receive(self.submit(|reply| Command::EstimateRefoldSpace { control, reply })?).await
+        self.receive(self.submit(|reply| Command::EstimateRefoldSpace { control, reply })?).await
     }
 
     pub async fn health(&self) -> Result<turndb::store::StoreHealth> {
-        Self::receive(self.submit(|reply| Command::Health { reply })?).await
+        self.receive(self.submit(|reply| Command::Health { reply })?).await
     }
 
     pub async fn metrics(&self) -> Result<turndb::observability::StoreMetrics> {
-        Self::receive(self.submit(|reply| Command::Metrics { reply })?).await
+        self.receive(self.submit(|reply| Command::Metrics { reply })?).await
     }
 
     pub async fn lifecycle_events(
@@ -418,7 +426,7 @@ impl Actor {
         after_sequence: u64,
         limit: usize,
     ) -> Result<turndb::observability::LifecycleEventBatch> {
-        Self::receive(self.submit(|reply| Command::LifecycleEvents {
+        self.receive(self.submit(|reply| Command::LifecycleEvents {
             after_sequence,
             limit,
             reply,
@@ -430,25 +438,25 @@ impl Actor {
         &self,
         control: OperationControl,
     ) -> Result<turndb::observability::PartDistribution> {
-        Self::receive(self.submit(|reply| Command::PartDistribution { control, reply })?).await
+        self.receive(self.submit(|reply| Command::PartDistribution { control, reply })?).await
     }
 
     pub async fn content_liveness(
         &self,
         control: OperationControl,
     ) -> Result<turndb::observability::ContentLiveness> {
-        Self::receive(self.submit(|reply| Command::ContentLiveness { control, reply })?).await
+        self.receive(self.submit(|reply| Command::ContentLiveness { control, reply })?).await
     }
 
     pub async fn space_usage(
         &self,
         control: OperationControl,
     ) -> Result<turndb::store::StoreSpaceUsage> {
-        Self::receive(self.submit(|reply| Command::SpaceUsage { control, reply })?).await
+        self.receive(self.submit(|reply| Command::SpaceUsage { control, reply })?).await
     }
 
     pub async fn schema(&self) -> Result<turndb::schema::Schema> {
-        Self::receive(self.submit(|reply| Command::Schema { reply })?).await
+        self.receive(self.submit(|reply| Command::Schema { reply })?).await
     }
 
     pub async fn close(&self, durable: bool) -> Result<()> {
@@ -472,7 +480,10 @@ impl Actor {
         if disconnected {
             return Err(ActorFault::WorkerExited.into());
         }
-        Self::receive(receive).await
+        // NOT the state-aware `receive`: this handle just moved the state off OPEN itself, so a
+        // dropped reply here can only mean the worker died before processing Close — which is
+        // "worker exited", never "you called an already-closed store".
+        receive.await.context("TurnDB store thread exited before replying")?
     }
 }
 
@@ -803,6 +814,39 @@ mod tests {
         release_tx.send(()).unwrap();
         drop(queued);
         napi::tokio::runtime::Runtime::new().unwrap().block_on(actor.close(false)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `submit` checks state and enqueues non-atomically, so a command can pass the check while
+    /// OPEN and still land BEHIND a concurrent close's Close command; the worker exits at Close
+    /// and drops it unprocessed. That command failed because the store closed, and its promise
+    /// must say CLOSED — not report an internal worker failure for an orderly shutdown. This
+    /// constructs the exact losing interleaving: Close enqueued first, the straggler admitted
+    /// while the state still reads OPEN, then the state flipped as close() would have.
+    #[test]
+    fn a_command_racing_a_close_is_refused_as_closed_not_internal() {
+        let dir = temp();
+        let actor = Actor::open_with_capacity(&dir, 4).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        actor.inner.tx.send(Command::Hold { entered: entered_tx, release: release_rx }).unwrap();
+        entered_rx.recv().unwrap();
+
+        let (close_reply, close_receive) = oneshot::channel();
+        actor.inner.tx.send(Command::Close { durable: false, reply: close_reply }).unwrap();
+        let straggler = actor
+            .submit(|reply| Command::Sync { control: OperationControl::default(), reply })
+            .expect("the state still reads OPEN, so admission must succeed");
+        actor.inner.state.store(CLOSING_OR_CLOSED, Ordering::Release);
+
+        release_tx.send(()).unwrap();
+        let runtime = napi::tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(close_receive).unwrap().unwrap();
+        let error = runtime.block_on(actor.receive(straggler)).unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<ActorFault>(), Some(ActorFault::Closed)),
+            "a command dropped by an orderly close must classify as CLOSED, got: {error:#}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

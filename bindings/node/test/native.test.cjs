@@ -98,6 +98,56 @@ test('configures a bounded per-store command backlog without breaking the defaul
   );
 });
 
+test('refuses queue overload through the JavaScript boundary as BUSY', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t), { commandQueueCapacity: 1 });
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([
+    { kind: 'put', id: 'seed', contents: [{ name: 'payload', bytes: Buffer.alloc(4096, 7) }] },
+  ]);
+  // Submission order between concurrently created promises is not guaranteed (each op reaches the
+  // actor from the async pool), so no two-command interleaving is deterministic from JS. Five
+  // hundred concurrent syncs against a one-slot queue are: each accepted sync costs an fsync,
+  // orders of magnitude longer than issuing the remaining submissions, so overload is certain.
+  // The contract under overload is all-or-BUSY: every refusal carries the typed code and the
+  // capacity, no submission is silently dropped, and everything accepted completes.
+  const outcomes = await Promise.allSettled(Array.from({ length: 500 }, () => store.sync()));
+  const refused = outcomes.filter((o) => o.status === 'rejected');
+  assert.notEqual(refused.length, 0, 'a one-slot queue cannot absorb 500 concurrent syncs');
+  for (const { reason } of refused) {
+    assert.ok(reason instanceof TurnDbError, `refusals must be typed, got ${reason}`);
+    assert.equal(reason.code, 'BUSY');
+    assert.match(reason.message, /capacity 1/);
+  }
+  assert.notEqual(outcomes.filter((o) => o.status === 'fulfilled').length, 0);
+  // The nearest valid state: refusals harmed nothing already admitted.
+  const page = await store.scan({ contents: [{ name: 'payload', mode: 'metadata' }] });
+  assert.equal(page.rows.length, 1);
+  assert.equal(page.rows[0].contents[0].len, 4096n);
+});
+
+test('refuses a concurrent SQL pull through the JavaScript boundary as BUSY', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([{ kind: 'put', id: 'row' }]);
+  const query = await store.querySql('SELECT id FROM records');
+  const first = query.next();
+  // The single-pull guard trips synchronously: one in-flight pull per query, by contract.
+  assert.throws(
+    () => query.next(),
+    (error) => error instanceof TurnDbError
+      && error.code === 'BUSY'
+      && /already in progress/.test(error.message)
+  );
+  // The refused pull must not have damaged the in-flight one or the stream's completeness.
+  assert.notEqual(await first, null);
+  assert.equal(await query.next(), null);
+  await query.close();
+});
+
 test('passes storage and cache policy through the native open seam', async (t) => {
   const store = await NativeStore.open(temporaryStore(t), {
     blockTargetBytes: 8192n,
