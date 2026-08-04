@@ -1901,6 +1901,12 @@ impl Store {
         self.read_limits
     }
 
+    /// The fold configuration this writer was opened with, so an embedder deriving a reader from
+    /// a live writer inherits cache and block policy instead of silently reverting to defaults.
+    pub fn fold_cfg(&self) -> FoldCfg {
+        self.cfg
+    }
+
     fn note_manifest_commit(&mut self) {
         self.retained_commit_count =
             self.retained_commit_count.saturating_add(1).min(MANIFEST_RETAIN);
