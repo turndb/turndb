@@ -9,11 +9,14 @@ fi
 report_check="$(mktemp)"
 trap 'rm -f "$report_check"' EXIT
 
+# --locked, not --frozen: the lockfile stays authoritative (any drift fails), but the incidental
+# --offline half of --frozen made the check pass only on machines with a warm crates.io index
+# cache — a cold CI runner reported the first locked dependency as "no matching package".
 cargo about generate about.hbs \
   --manifest-path bindings/node/Cargo.toml \
   --all-features \
   --target x86_64-unknown-linux-gnu \
-  --frozen \
+  --locked \
   --fail \
   --output-file "$report_check"
 
