@@ -516,7 +516,9 @@ fn apply_pending(
     }
     match s.apply(batch) {
         Ok(()) => *applied += pending.len() as u64,
-        Err(error) if turndb::error::classify(&error) == turndb::error::ErrorClass::ResourceExhausted => {
+        Err(error)
+            if turndb::error::classify(&error) == turndb::error::ErrorClass::ResourceExhausted =>
+        {
             for (id, body, attrs) in pending.drain(..) {
                 let mut single = turndb::store::Batch::new();
                 let body_len = body.len();
