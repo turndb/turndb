@@ -1,0 +1,28 @@
+[package]
+name = "turndb-node"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native Node.js N-API binding for TurnDB."
+publish = false
+
+[features]
+default = ["sql"]
+columnar = ["turndb/columnar"]
+sql = ["columnar", "turndb/sql", "dep:tokio"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The storage core stays feature-independent, while this crate's default `sql` feature deliberately
+# opts the production addon into the Arrow/DataFusion query plane. A no-default-features build keeps
+# the smaller structured-only embedding profile available and tested.
+turndb = { path = "../..", default-features = false }
+anyhow = "1"
+napi = { version = "3.12.0", default-features = false, features = ["napi6", "tokio_rt", "dyn-symbols"] }
+napi-derive = "3.6.2"
+tokio = { version = "1", features = ["sync", "time"], optional = true }
+
+[build-dependencies]
+napi-build = "2.4.0"

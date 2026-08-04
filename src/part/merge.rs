@@ -121,6 +121,64 @@ pub fn merge_opts(
     level: i32,
     drop_tombstones: bool,
 ) -> Result<(PartMeta, MergeStats)> {
+    merge_opts_with_control(
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        &crate::control::OperationControl::default(),
+    )
+}
+
+/// [`merge_opts`] with cooperative checkpoints while gathering and streaming rows.
+pub fn merge_opts_with_control(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+) -> Result<(PartMeta, MergeStats)> {
+    merge_opts_with_control_and_limits(
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        control,
+        crate::read_limits::ReadLimits::default(),
+    )
+}
+
+/// [`merge_opts_with_control`] with atomic-frame admission on the output part.
+pub fn merge_opts_with_control_and_limits(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(PartMeta, MergeStats)> {
+    merge_opts_with_control_for_operation(
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        control,
+        "part compaction",
+        read_limits,
+    )
+}
+
+/// Shared rewrite engine for callers with different publication protocols.
+pub(crate) fn merge_opts_with_control_for_operation(
+    out: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(PartMeta, MergeStats)> {
+    control.check(operation)?;
     if inputs.is_empty() {
         bail!("merge needs at least one input part");
     }
@@ -149,6 +207,7 @@ pub fn merge_opts(
     let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
     for p in &parts {
         for i in 0..p.piece_count()? {
+            control.check(operation)?;
             let (loc, hash) = p.piece(i)?;
             locs.entry(hash).or_insert(loc);
         }
@@ -160,14 +219,16 @@ pub fn merge_opts(
     let records_in: usize = lens.iter().sum();
 
     // ---- pass A: winners, counts, and the exact column universe of SURVIVING rows ----
-    let mut columns: std::collections::BTreeMap<(String, u8), std::collections::BTreeSet<String>> =
+    let mut columns: std::collections::BTreeMap<(String, u8), std::collections::BTreeSet<Vec<u8>>> =
         Default::default();
+    let mut content_names = std::collections::BTreeSet::new();
     let mut records_out = 0usize;
     let mut superseded = 0usize;
     let mut tombs_kept = 0usize;
     let mut tombs_dropped = 0usize;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((_, pi, row, shadowed)) = kway.next_group()? {
+        control.check(operation)?;
         superseded += shadowed;
         if parts[pi].is_tombstone(row)? {
             if drop_tombstones {
@@ -179,14 +240,23 @@ pub fn merge_opts(
             continue;
         }
         records_out += 1;
+        for content in parts[pi].contents(row)? {
+            content_names.insert(content.name);
+        }
         for (k, v) in parts[pi].attrs(row)? {
             let e = columns.entry((k, v.type_tag())).or_default();
-            if let crate::types::AttrValue::Str(s) = v {
-                e.insert(s);
+            match v {
+                crate::types::AttrValue::Str(s) => {
+                    e.insert(s.into_bytes());
+                }
+                crate::types::AttrValue::Bytes(bytes) => {
+                    e.insert(bytes);
+                }
+                _ => {}
             }
         }
     }
-    let string_dicts: Vec<Vec<String>> =
+    let value_dicts: Vec<Vec<Vec<u8>>> =
         columns.values().map(|s| s.iter().cloned().collect()).collect();
     let columns: Vec<(String, u8)> = columns.into_keys().collect();
 
@@ -197,17 +267,27 @@ pub fn merge_opts(
     // stored and still worth deduping against — and a record staged but not yet flushed may have
     // matched against an entry that would otherwise stop being referenced here.
     let dict: Vec<(Loc, PieceHash)> = locs.iter().map(|(h, l)| (*l, *h)).collect();
-    let mut b = crate::part::builder::StreamBuilder::new(out, level, dict, columns, string_dicts)?;
+    let mut b = crate::part::builder::StreamBuilder::new_with_limits(
+        out,
+        level,
+        dict,
+        content_names.into_iter().collect(),
+        columns,
+        value_dicts,
+        read_limits,
+    )?;
     let mut kway = KWay::new(&streams, &lens)?;
     while let Some((id, pi, row, _)) = kway.next_group()? {
+        control.check(operation)?;
         if parts[pi].is_tombstone(row)? {
             if !drop_tombstones {
                 b.push(&id, true, &[], &[])?;
             }
             continue;
         }
-        b.push(&id, false, &parts[pi].body(row)?, &parts[pi].attrs(row)?)?;
+        b.push(&id, false, &parts[pi].contents(row)?, &parts[pi].attrs(row)?)?;
     }
+    control.check(operation)?;
     let meta = b.finish(seq_lo, seq_hi)?;
 
     let stats = MergeStats {
@@ -226,7 +306,7 @@ pub fn merge_opts(
 mod tests {
     use super::*;
     use crate::fold::{Fold, FoldCfg};
-    use crate::types::{AttrValue, BodyOp, Record};
+    use crate::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let n =
@@ -249,7 +329,10 @@ mod tests {
                 let p = fold.put(body.as_bytes()).unwrap();
                 Record {
                     id: (*id).to_string(),
-                    body: vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                    contents: vec![Content::new(
+                        BODY_CONTENT,
+                        vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                    )],
                     attrs: vec![("v".into(), AttrValue::Str((*body).to_string()))],
                 }
             })
@@ -315,7 +398,7 @@ mod tests {
         let a = part_of(&d, &mut fold, "a.part", 1, &[("k1", "one"), ("k2", "two")]);
         let b = part_of(&d, &mut fold, "b.part", 2, &[("k2", "TWO-NEW"), ("k3", "three")]);
         // a third part deleting k1 — a tombstone the merge must carry forward
-        let tomb_rec = Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() };
+        let tomb_rec = Record { id: "k1".into(), contents: Vec::new(), attrs: Vec::new() };
         let cp = d.join("c.part");
         super::super::build_full(&cp, &[tomb_rec], &[true], 3, 3, 3, |_| None, &HashMap::new())
             .unwrap();
@@ -335,7 +418,7 @@ mod tests {
             }
         }
         let recs = vec![
-            Record { id: "k1".into(), body: Vec::new(), attrs: Vec::new() },
+            Record { id: "k1".into(), contents: Vec::new(), attrs: Vec::new() },
             b.record(b.find("k2").unwrap().unwrap()).unwrap(),
             b.record(b.find("k3").unwrap().unwrap()).unwrap(),
         ];
@@ -366,7 +449,7 @@ mod tests {
     #[test]
     fn a_total_merge_of_only_tombstones_yields_a_valid_empty_part() {
         let d = tmpdir("allgone");
-        let r = Record { id: "x".into(), body: Vec::new(), attrs: Vec::new() };
+        let r = Record { id: "x".into(), contents: Vec::new(), attrs: Vec::new() };
         let p1 = d.join("a.part");
         super::super::build_full(&p1, &[r], &[true], 1, 1, 3, |_| None, &HashMap::new()).unwrap();
         let a = Arc::new(Part::open(&p1).unwrap());

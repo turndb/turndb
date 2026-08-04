@@ -1,18 +1,17 @@
 //! The query lens: parts, read a column at a time, as Arrow.
 //!
-//! Everything below this module addresses rows by index — `record(r)`, `attrs(r)`, `body(r)` — which is
-//! the wrong shape for the storage underneath it. A part keeps one section per column, independently
-//! compressed; asking for one column of a million rows should touch one section, and asking for no
-//! content should touch the fold zero times. That is what this module provides and what the row API
-//! cannot express.
+//! Everything below this module can address a whole row by index, which is the wrong shape for the
+//! storage underneath it. A part keeps one section per column, independently compressed; asking for
+//! one column of a million rows should touch one section, and asking for no content should touch the
+//! fold zero times. That is what this module provides and what the row API cannot express.
 //!
 //! # Projection is the whole point
 //!
-//! Body reconstruction is the expensive operation in this system — it resolves piece references,
+//! Content reconstruction is the expensive operation in this system — it resolves piece references,
 //! decompresses fold blocks, and concatenates. A query over attributes alone must never pay it. Here
-//! `body` is an ordinary projectable column, so `SELECT model, tokens FROM t WHERE ...` reads two
-//! attribute sections and **opens no fold block at all**. [`ScanStats::fold_reads`] records this so the
-//! claim is measured rather than asserted.
+//! `body` and `content.<name>` are ordinary projectable columns, so `SELECT model, tokens FROM t`
+//! reads two attribute sections and **opens no fold block at all**. [`ScanStats::fold_reads`] records
+//! this so the claim is measured rather than asserted.
 //!
 //! # Strings stay dictionary-encoded
 //!
@@ -33,18 +32,21 @@
 //! and a newest tombstone makes the id absent. In particular, a predicate that rejects the newest
 //! version can never fall through and reveal an older version that happens to match.
 
+#[cfg(feature = "sql")]
+pub mod sql;
+#[cfg(feature = "sql")]
 pub mod table;
 
 use crate::fold::Fold;
 use crate::part::{attrs, Part};
 use crate::types::AttrValue;
 use anyhow::{bail, Result};
-use datafusion::arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Array, Int64Builder, StringArray,
-    StringBuilder,
+use arrow::array::{
+    ArrayRef, BinaryArray, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Array, Int64Builder,
+    StringArray, StringBuilder, TimestampNanosecondBuilder, UInt64Builder,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -53,13 +55,13 @@ pub const BATCH_ROWS: usize = 8192;
 
 /// Byte ceiling for a batch's reconstructed content.
 ///
-/// Row count alone is the wrong bound for a `body` column: trace bodies here average ~97 KiB, so 8192
-/// of them is a 795 MiB batch. Records are unbounded in size and rows are not fungible, so a batch
-/// closes on whichever limit is reached first. Attribute-only scans never come near this.
-pub const BATCH_BYTES: usize = 32 << 20;
+/// Row count alone is the wrong bound for content columns: trace payloads here average ~97 KiB, so
+/// 8192 of them is a 795 MiB batch. Records are unbounded in size and rows are not fungible, so a
+/// batch closes on whichever limit is reached first. Attribute-only scans never come near this.
+pub const BATCH_BYTES: usize = crate::scan::DEFAULT_MAX_RECONSTRUCTED_BYTES as usize;
 
-/// The always-present columns. Both are synthesised rather than stored as attribute columns: `id` from
-/// the front-coded id section, `body` from the fold.
+/// Synthetic field names. `id` is always present; `body` appears only when at least one scanned part
+/// declares conventional content with that name.
 pub const F_ID: &str = "id";
 pub const F_BODY: &str = "body";
 
@@ -69,6 +71,10 @@ fn type_name(tag: u8) -> &'static str {
         1 => "int",
         2 => "float",
         3 => "bool",
+        4 => "uint",
+        5 => "binary",
+        6 => "timestamp_ns",
+        7 => "null",
         _ => "unknown",
     }
 }
@@ -79,6 +85,12 @@ fn arrow_type(tag: u8) -> DataType {
         1 => DataType::Int64,
         2 => DataType::Float64,
         3 => DataType::Boolean,
+        4 => DataType::UInt64,
+        5 => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary)),
+        6 => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        // An explicit-null column is a presence marker: true means the attribute occurred with a
+        // null value, Arrow null means it was missing. This preserves the distinction SQL needs.
+        7 => DataType::Boolean,
         _ => DataType::Null,
     }
 }
@@ -104,6 +116,8 @@ fn zone_disproves(op: Cmp, val: &AttrValue, zone: &(AttrValue, AttrValue)) -> bo
             (AttrValue::Int(x), AttrValue::Int(y)) => Some(x.cmp(y)),
             (AttrValue::Float(x), AttrValue::Float(y)) => x.partial_cmp(y),
             (AttrValue::Bool(x), AttrValue::Bool(y)) => Some(x.cmp(y)),
+            (AttrValue::UInt(x), AttrValue::UInt(y)) => Some(x.cmp(y)),
+            (AttrValue::TimestampNs(x), AttrValue::TimestampNs(y)) => Some(x.cmp(y)),
             _ => None,
         }
     }
@@ -137,13 +151,17 @@ pub struct Pred {
 /// What a scan actually touched. Exists so that "projection avoids the fold" is a measurement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
+    /// Successful SQL planning and execution-stream startup time.
+    pub planning_duration_ns: u64,
+    /// Cumulative time spent actively pulling and encoding result batches, excluding consumer idle.
+    pub execution_duration_ns: u64,
     pub rows: usize,
     pub batches: usize,
     /// Attribute column sections decoded. A projected scan should decode only what it projects.
     pub columns_decoded: usize,
-    /// Records whose body was reconstructed out of the fold. Zero unless `body` was projected.
+    /// Present content values reconstructed out of the fold. Zero unless content was projected.
     pub fold_reads: usize,
-    /// Rows a pushed-down predicate excluded before any array was built. The bodies among them were
+    /// Rows a pushed-down predicate excluded before any array was built. Content among them was
     /// never reconstructed, which is the entire point.
     pub rows_filtered: usize,
     /// Physical rows hidden by a newer version or tombstone. These are resolved before predicates, so
@@ -162,6 +180,8 @@ impl ScanStats {
     /// stops early (LIMIT, an error, a dropped stream) reports what it actually touched.
     pub fn since(&self, prev: ScanStats) -> ScanStats {
         ScanStats {
+            planning_duration_ns: self.planning_duration_ns - prev.planning_duration_ns,
+            execution_duration_ns: self.execution_duration_ns - prev.execution_duration_ns,
             rows: self.rows - prev.rows,
             batches: self.batches - prev.batches,
             columns_decoded: self.columns_decoded - prev.columns_decoded,
@@ -174,6 +194,10 @@ impl ScanStats {
     }
 
     pub fn add(&mut self, o: ScanStats) {
+        self.planning_duration_ns =
+            self.planning_duration_ns.saturating_add(o.planning_duration_ns);
+        self.execution_duration_ns =
+            self.execution_duration_ns.saturating_add(o.execution_duration_ns);
         self.rows += o.rows;
         self.batches += o.batches;
         self.columns_decoded += o.columns_decoded;
@@ -188,13 +212,28 @@ impl ScanStats {
 /// A stable row shape over a set of parts, and the machinery to read batches through it.
 pub struct Lens {
     schema: SchemaRef,
-    /// Per schema field beyond `id`/`body`: the `(key, tag)` it resolves to inside a part.
-    binding: Vec<Option<(String, u8)>>,
+    /// What each schema field means independently of its collision-safe display name.
+    binding: Vec<Binding>,
     /// The committed newest-wins rows for each part in this lens.
     ///
     /// The `Arc<Part>` is retained so a scan can identify its mask by pointer identity without adding
     /// storage-format identity to `Part`'s public API.
     visible: Vec<(Arc<Part>, Arc<Vec<usize>>)>,
+}
+
+#[derive(Clone)]
+enum Binding {
+    Id,
+    Content(String),
+    Attr(String, u8),
+}
+
+fn content_field(name: &str) -> String {
+    if name == crate::types::BODY_CONTENT {
+        F_BODY.to_string()
+    } else {
+        format!("content.{name}")
+    }
 }
 
 impl Lens {
@@ -213,11 +252,15 @@ impl Lens {
             }
         }
 
-        let mut fields = vec![
-            Field::new(F_ID, DataType::Utf8, false),
-            Field::new(F_BODY, DataType::Binary, true),
-        ];
-        let mut binding = vec![None, None];
+        let mut content_names = BTreeSet::new();
+        for p in parts {
+            for content in p.content_meta()?.iter() {
+                content_names.insert(content.name.clone());
+            }
+        }
+
+        let mut fields = vec![Field::new(F_ID, DataType::Utf8, false)];
+        let mut binding = vec![Binding::Id];
         // Field names must be UNIQUE, and nothing about the data guarantees it. An attribute literally
         // named `id` or `body` collides with the synthesised columns; a key literally named `a#str`
         // collides with the disambiguation of a multi-typed `a`. DataFusion rejects a duplicate at
@@ -228,12 +271,26 @@ impl Lens {
         // back to `key#type`, and only then to an ordinal. Renaming a column is a far smaller harm
         // than refusing to answer any query at all.
         let mut used: std::collections::HashSet<String> =
-            [F_ID, F_BODY].into_iter().map(String::from).collect();
+            [F_ID].into_iter().map(String::from).collect();
+        for name in content_names {
+            let field = content_field(&name);
+            // Content names are unique and namespaced, so this can collide only with the synthetic id
+            // when a future naming rule changes. Refuse internally rather than create an ambiguous
+            // schema; attribute collisions below are renamed because their source keys remain bound.
+            if !used.insert(field.clone()) {
+                bail!("content {name:?} maps to duplicate query field {field:?}");
+            }
+            fields.push(Field::new(&field, DataType::Binary, true));
+            binding.push(Binding::Content(name));
+        }
         for (key, ts) in &tags {
             for &t in ts {
                 // A key with one type keeps its name. A key with several is never silently merged.
-                let mut name =
-                    if ts.len() == 1 { key.clone() } else { format!("{key}#{}", type_name(t)) };
+                let mut name = if ts.len() == 1 && t != 7 {
+                    key.clone()
+                } else {
+                    format!("{key}#{}", type_name(t))
+                };
                 if used.contains(&name) {
                     name = format!("{key}#{}", type_name(t));
                 }
@@ -244,7 +301,7 @@ impl Lens {
                 }
                 used.insert(name.clone());
                 fields.push(Field::new(&name, arrow_type(t), true));
-                binding.push(Some((key.clone(), t)));
+                binding.push(Binding::Attr(key.clone(), t));
             }
         }
         let visible =
@@ -268,9 +325,13 @@ impl Lens {
             .collect()
     }
 
+    pub(crate) fn projection_reads_content(&self, projection: &[usize]) -> bool {
+        projection.iter().any(|&f| matches!(self.binding.get(f), Some(Binding::Content(_))))
+    }
+
     /// Stream `part` as batches under `projection` (field indices into [`Lens::schema`]).
     ///
-    /// `fold` is required only if the projection includes `body`; passing `None` otherwise makes it
+    /// `fold` is required only if the projection includes content; passing `None` otherwise makes it
     /// impossible for a scan to touch content by accident.
     pub fn scan(
         &self,
@@ -285,8 +346,8 @@ impl Lens {
                 bail!("projection names field {f}, past the end of the schema");
             }
         }
-        if proj.iter().any(|&f| self.schema.field(f).name() == F_BODY) && fold.is_none() {
-            bail!("the body column was projected but no fold was supplied to read it from");
+        if self.projection_reads_content(&proj) && fold.is_none() {
+            bail!("a content column was projected but no fold was supplied to read it from");
         }
         let fields: Vec<Field> = proj.iter().map(|&f| self.schema.field(f).clone()).collect();
         let out_schema = Arc::new(Schema::new(fields));
@@ -298,25 +359,33 @@ impl Lens {
         let mut cols: Vec<Col> = Vec::with_capacity(proj.len());
         let mut decoded = 0usize;
         for &f in &proj {
-            let name = self.schema.field(f).name().as_str();
-            if name == F_ID {
-                cols.push(Col::Id);
-            } else if name == F_BODY {
-                cols.push(Col::Body);
-            } else {
-                let want = self.binding[f].clone().expect("only id/body are unbound");
-                match meta.iter().position(|(k, t, _, _)| *k == want.0 && *t == want.1) {
-                    Some(c) => {
-                        let (_, tag, occ, kind) = meta[c].clone();
-                        decoded += 1;
-                        cols.push(Col::Attr {
-                            tag,
-                            rids: attrs::rids(part, c, occ, kind)?,
-                            val: part.column_values(c)?,
-                            dict: attrs::read_dict(part, c)?,
-                        });
+            match &self.binding[f] {
+                Binding::Id => cols.push(Col::Id),
+                Binding::Content(name) => cols.push(Col::Content(name.clone())),
+                Binding::Attr(key, tag) => {
+                    let want = (key.clone(), *tag);
+                    match meta.iter().position(|(k, t, _, _)| *k == want.0 && *t == want.1) {
+                        Some(c) => {
+                            let (_, tag, occ, kind) = meta[c].clone();
+                            decoded += 1;
+                            cols.push(Col::Attr {
+                                tag,
+                                rids: attrs::rids(part, c, occ, kind)?,
+                                val: part.column_values(c)?,
+                                dict: if tag == 0 {
+                                    attrs::read_dict(part, c)?
+                                } else {
+                                    Default::default()
+                                },
+                                binary_dict: if tag == 5 {
+                                    attrs::read_binary_dict(part, c)?
+                                } else {
+                                    Default::default()
+                                },
+                            });
+                        }
+                        None => cols.push(Col::Missing(self.schema.field(f).data_type().clone())),
                     }
-                    None => cols.push(Col::Missing(self.schema.field(f).data_type().clone())),
                 }
             }
         }
@@ -328,8 +397,8 @@ impl Lens {
         // the dictionary encoding earning its keep at exactly the point a query engine can use it.
         let mut tests: Vec<Test> = Vec::with_capacity(preds.len());
         for p_ in preds {
-            let Some((key, tag)) = self.binding.get(p_.field).cloned().flatten() else {
-                continue; // id/body: not evaluated here, the engine filters them
+            let Some(Binding::Attr(key, tag)) = self.binding.get(p_.field).cloned() else {
+                continue; // id/content: not evaluated here, the engine filters them
             };
             let Some(c) = meta.iter().position(|(k, t, _, _)| *k == key && *t == tag) else {
                 // this part has no such column, so every row is null and none can match
@@ -359,6 +428,16 @@ impl Lens {
                 (AttrValue::Int(v), 1) => Key::Int(*v),
                 (AttrValue::Float(v), 2) => Key::Float(*v),
                 (AttrValue::Bool(v), 3) => Key::Bool(*v),
+                (AttrValue::UInt(v), 4) => Key::UInt(*v),
+                (AttrValue::Bytes(v), 5) => {
+                    let dict = attrs::read_binary_dict(part, c)?;
+                    match dict.binary_search(v) {
+                        Ok(i) => Key::Ord { k: i as u32, exact: true },
+                        Err(i) => Key::Ord { k: i as u32, exact: false },
+                    }
+                }
+                (AttrValue::TimestampNs(v), 6) => Key::TimestampNs(*v),
+                (AttrValue::Null, 7) => Key::Null,
                 // Literal type does not match the column type. Keeping every row is the safe
                 // direction under Inexact.
                 _ => {
@@ -425,6 +504,9 @@ enum Key {
     Int(i64),
     Float(f64),
     Bool(bool),
+    UInt(u64),
+    TimestampNs(i64),
+    Null,
 }
 
 #[inline]
@@ -491,6 +573,30 @@ impl Test {
                                 *kk,
                             ),
                             (3, Key::Bool(kk)) => cmp_ok(*op, val[o] != 0, *kk),
+                            (4, Key::UInt(kk)) => cmp_ok(
+                                *op,
+                                u64::from_le_bytes(val[o..o + 8].try_into().unwrap()),
+                                *kk,
+                            ),
+                            (5, Key::Ord { k: kk, exact }) => {
+                                let v = u32::from_le_bytes(val[o..o + 4].try_into().unwrap());
+                                if *exact {
+                                    cmp_ok(*op, v, *kk)
+                                } else {
+                                    match op {
+                                        Cmp::Eq => false,
+                                        Cmp::Ne => true,
+                                        Cmp::Lt | Cmp::LtEq => v < *kk,
+                                        Cmp::Gt | Cmp::GtEq => v >= *kk,
+                                    }
+                                }
+                            }
+                            (6, Key::TimestampNs(kk)) => cmp_ok(
+                                *op,
+                                i64::from_le_bytes(val[o..o + 8].try_into().unwrap()),
+                                *kk,
+                            ),
+                            (7, Key::Null) => matches!(op, Cmp::Eq),
                             _ => true, // type mismatch: keep it
                         }
                     }
@@ -506,12 +612,13 @@ impl Test {
 
 enum Col {
     Id,
-    Body,
+    Content(String),
     Attr {
         tag: u8,
         rids: Arc<Vec<u32>>,
         val: Arc<Vec<u8>>,
         dict: Arc<Vec<String>>,
+        binary_dict: Arc<Vec<Vec<u8>>>,
     },
     /// This part has no such column; the batch contributes nulls of the right type.
     Missing(DataType),
@@ -616,12 +723,16 @@ impl PartScan {
             let lo = self.row;
             let cap = (lo + BATCH_ROWS).min(end);
             let take = self.select(lo, cap);
-            let first = self.visible.partition_point(|&row| row < lo);
-            let last = self.visible.partition_point(|&row| row < cap);
-            let visible = last - first;
-            self.stats.rows_hidden += (cap - lo) - visible;
-            self.stats.rows_filtered += visible - take.len();
             if take.is_empty() {
+                // A skipped window is consumed whole, so its accounting is final here. A window
+                // that produces a batch is NOT: fetch and byte ceilings can close the batch early,
+                // and rows past the last consumed one are re-examined by the next call — counting
+                // them now would double-count them then. Their accounting waits until the close
+                // point is known.
+                let first = self.visible.partition_point(|&row| row < lo);
+                let visible = self.visible.partition_point(|&row| row < cap) - first;
+                self.stats.rows_hidden += (cap - lo) - visible;
+                self.stats.rows_filtered += visible;
                 self.stats.batches_skipped += 1;
                 self.row = cap;
                 continue;
@@ -631,31 +742,35 @@ impl PartScan {
 
         // Content is reconstructed FIRST, because it is what decides how many rows this batch can hold
         // — and only for rows that survived the filter.
-        let mut bodies: Option<Vec<Vec<u8>>> = None;
+        let mut content_values: Vec<Option<Vec<Option<Vec<u8>>>>> =
+            self.cols.iter().map(|c| matches!(c, Col::Content(_)).then(Vec::new)).collect();
         let mut take = take;
         if let Some(fetch) = self.fetch {
             take.truncate(fetch - self.stats.rows);
         }
-        if self.cols.iter().any(|c| matches!(c, Col::Body)) {
+        if self.cols.iter().any(|c| matches!(c, Col::Content(_))) {
             let fold = self.fold.as_ref().expect("checked when the scan was built");
-            let mut v = Vec::new();
             let mut bytes = 0usize;
             for (i, &r) in take.iter().enumerate() {
-                let b = self.part.reconstruct(lo + r, fold)?;
-                // Arrow's Binary array indexes with i32 offsets, so 2 GiB is a hard ceiling on ONE
-                // array. BATCH_BYTES normally keeps a batch far below it, but a batch always admits at
-                // least one row however large, and that escape is the only way here. Refuse with the
-                // reason rather than let the builder overflow its offsets.
-                if b.len() > i32::MAX as usize {
-                    bail!(
-                        "record at row {} is {} bytes; an Arrow binary column cannot exceed 2 GiB. \
-                         Read it through Store::reconstruct instead of the query lens.",
-                        lo + r,
-                        b.len()
-                    );
+                for (c, values) in self.cols.iter().zip(&mut content_values) {
+                    let Col::Content(name) = c else { continue };
+                    let value = self.part.reconstruct_content(lo + r, name, fold)?;
+                    if let Some(b) = &value {
+                        // Arrow's Binary array indexes with i32 offsets, so 2 GiB is a hard ceiling
+                        // on one value. Refuse rather than overflow the builder's offsets.
+                        if b.len() > i32::MAX as usize {
+                            bail!(
+                                "content {name:?} at row {} is {} bytes; an Arrow binary column \
+                                 cannot exceed 2 GiB. Read it through Store::reconstruct_content.",
+                                lo + r,
+                                b.len()
+                            );
+                        }
+                        bytes += b.len();
+                        self.stats.fold_reads += 1;
+                    }
+                    values.as_mut().expect("content column allocated above").push(value);
                 }
-                bytes += b.len();
-                v.push(b);
                 // At least one row always lands, however large it is — otherwise a single record
                 // bigger than the ceiling could never be read at all.
                 if bytes >= BATCH_BYTES {
@@ -663,32 +778,42 @@ impl PartScan {
                     break;
                 }
             }
-            bodies = Some(v);
         }
         // Resume after the last row consumed, not after the last row examined.
         let hi = lo + take.last().copied().map_or(0, |r| r + 1);
         let len = take.len();
+        // Deferred window accounting, over exactly [lo, hi): what this batch consumed. Selected
+        // rows past `hi` were examined but will be selected again next call; hidden and filtered
+        // rows past `hi` will be re-derived then. Counting to `cap` here made both counters drift
+        // upward whenever fetch or the byte ceiling closed a batch early.
+        let first = self.visible.partition_point(|&row| row < lo);
+        let consumed_visible = self.visible.partition_point(|&row| row < hi) - first;
+        self.stats.rows_hidden += (hi - lo) - consumed_visible;
+        self.stats.rows_filtered += consumed_visible - len;
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cols.len());
 
-        for c in &self.cols {
-            arrays.push(match c {
+        for (column, values) in self.cols.iter().zip(&content_values) {
+            arrays.push(match column {
                 Col::Id => Arc::new(StringArray::from(
                     take.iter().map(|&r| self.ids[lo + r].as_str()).collect::<Vec<_>>(),
                 )) as ArrayRef,
-                Col::Body => {
+                Col::Content(_) => {
                     let mut b = BinaryBuilder::new();
-                    for v in bodies.as_ref().expect("built above when body is projected") {
-                        b.append_value(v);
+                    for value in values.as_ref().expect("built above when content is projected") {
+                        match value {
+                            Some(v) => b.append_value(v),
+                            None => b.append_null(),
+                        }
                     }
-                    self.stats.fold_reads += len;
                     Arc::new(b.finish()) as ArrayRef
                 }
-                Col::Missing(t) => datafusion::arrow::array::new_null_array(t, len),
-                Col::Attr { tag, rids, val, dict } => scatter(
+                Col::Missing(t) => arrow::array::new_null_array(t, len),
+                Col::Attr { tag, rids, val, dict, binary_dict } => scatter(
                     *tag,
                     rids,
                     val,
                     dict,
+                    binary_dict,
                     lo,
                     hi,
                     &take,
@@ -724,6 +849,7 @@ fn scatter(
     rids: &[u32],
     val: &[u8],
     dict: &[String],
+    binary_dict: &[Vec<u8>],
     lo: usize,
     hi: usize,
     take: &[usize],
@@ -774,7 +900,7 @@ fn scatter(
                 })
                 .collect();
             let values = StringArray::from(dict.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-            Arc::new(datafusion::arrow::array::DictionaryArray::try_new(
+            Arc::new(arrow::array::DictionaryArray::try_new(
                 Int32Array::from(keys),
                 Arc::new(values),
             )?) as ArrayRef
@@ -807,6 +933,53 @@ fn scatter(
             for t in &taken {
                 match *t {
                     Some(k) => b.append_value(at(k)?[0] != 0),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        4 => {
+            let mut b = UInt64Builder::with_capacity(len);
+            for t in &taken {
+                match *t {
+                    Some(k) => b.append_value(u64::from_le_bytes(at(k)?.try_into().unwrap())),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        5 => {
+            let keys: Vec<Option<i32>> = taken
+                .iter()
+                .map(|t| match *t {
+                    Some(k) => {
+                        let bytes = at(k).ok()?;
+                        Some(u32::from_le_bytes(bytes.try_into().ok()?) as i32)
+                    }
+                    None => None,
+                })
+                .collect();
+            let values = BinaryArray::from_iter_values(binary_dict.iter().map(Vec::as_slice));
+            Arc::new(arrow::array::DictionaryArray::try_new(
+                Int32Array::from(keys),
+                Arc::new(values),
+            )?)
+        }
+        6 => {
+            let mut b = TimestampNanosecondBuilder::with_capacity(len).with_timezone("UTC");
+            for t in &taken {
+                match *t {
+                    Some(k) => b.append_value(i64::from_le_bytes(at(k)?.try_into().unwrap())),
+                    None => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        7 => {
+            let mut b = BooleanBuilder::with_capacity(len);
+            for t in &taken {
+                match *t {
+                    Some(_) => b.append_value(true),
                     None => b.append_null(),
                 }
             }
@@ -849,10 +1022,10 @@ pub fn collect_where(
 
 /// A `StringBuilder`-based flat view of a dictionary column, for callers that want plain strings.
 pub fn flatten_strings(a: &ArrayRef) -> Result<ArrayRef> {
-    use datafusion::arrow::array::{Array, AsArray};
+    use arrow::array::{Array, AsArray};
     let d = a
         .as_any()
-        .downcast_ref::<datafusion::arrow::array::DictionaryArray<datafusion::arrow::datatypes::Int32Type>>()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
         .ok_or_else(|| anyhow::anyhow!("not a dictionary column"))?;
     let values = d.values().as_string::<i32>();
     let mut b = StringBuilder::new();

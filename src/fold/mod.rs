@@ -32,7 +32,7 @@ pub mod segment;
 pub use block::{Loc, BLOCK_TARGET_DEFAULT, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 pub use segment::FoldTail;
 
-use crate::readat::ReadAt;
+use crate::readat::{ReadAt, Slice};
 use crate::types::PieceHash;
 use anyhow::{bail, Context, Result};
 use dedup::DedupTable;
@@ -40,8 +40,52 @@ use segment::{SegHeader, SEG_HDR_LEN, SEG_MAX_DEFAULT, SEG_MAX_LIMIT};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+pub const SEGMENT_MAX_DEFAULT: u32 = SEG_MAX_DEFAULT;
+pub const SEGMENT_MAX_LIMIT: u64 = SEG_MAX_LIMIT;
+pub const BLOCK_TARGET_MAX: u64 = (u32::MAX as u64) / 2;
+/// Candidate dictionary bytes admitted during open. Zstd dictionaries are normally measured in
+/// KiB; this generous ceiling prevents an unrelated sparse file with a dictionary-shaped name from
+/// becoming an unbounded allocation.
+pub const MAX_DICTIONARY_BYTES: u64 = 64 << 20;
+
+fn read_bounded_candidate(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max {
+        bail!("candidate file {} is {len} bytes, exceeding the {max}-byte limit", path.display());
+    }
+    let capacity =
+        usize::try_from(len).context("candidate file length does not fit this platform")?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).context("reserve candidate file buffer")?;
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        bail!("candidate file {} grew past the {max}-byte limit while reading", path.display());
+    }
+    Ok(bytes)
+}
+
+/// Another writer currently owns this fold's OS lock.
+///
+/// This is a typed operational condition rather than prose so bindings can expose stable contention
+/// handling without matching an error message. It says nothing about WASI, where the platform lacks
+/// an advisory lock and the embedder owns exclusion.
+#[derive(Debug)]
+pub struct WriterLocked {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for WriterLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fold at {} is already open by another writer", self.path.display())
+    }
+}
+
+impl std::error::Error for WriterLocked {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct FoldCfg {
@@ -168,6 +212,8 @@ impl BlockCache {
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
+    pub bytes: usize,
+    pub budget: usize,
 }
 
 /// What [`Fold::scrub`] verified.
@@ -229,11 +275,22 @@ pub struct Fold {
     ///
     /// Empty for a fold nobody declared anything about, which reads exactly as it did before.
     punched: Vec<(u32, u32)>,
+    read_limits: crate::read_limits::ReadLimits,
 }
 
 impl Fold {
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
-        Fold::open_at(dir, cfg, None)
+        Fold::open_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open a writer with explicit frame and persistent object-count admission.
+    pub fn open_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        // No committed tail means no manifest in hand — and therefore no punched declaration.
+        Fold::open_at_with_limits(dir, cfg, None, &[], read_limits)
     }
 
     /// Open, recovering to `committed`: the tail some higher layer durably recorded.
@@ -242,7 +299,35 @@ impl Fold {
     /// stop being valid?"*. The committed tail answers *"where did the store promise it stopped?"*. A
     /// committed tail **beyond** the last good block means the disk broke an fsync promise, and we
     /// refuse rather than serve a fold that silently lost durable bytes.
-    pub fn open_at(dir: &Path, cfg: FoldCfg, committed: Option<FoldTail>) -> Result<Fold> {
+    ///
+    /// `punched` is the same manifest's declared-erased block ranges. The tail scan needs it at
+    /// open, not merely after: a crash mid-punch can leave a DECLARED block's payload partially
+    /// zeroed, and only the declaration authorizes stepping over that frame instead of reading the
+    /// committed tail as beyond the last good block.
+    pub fn open_at(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: Option<FoldTail>,
+        punched: &[(u32, u32)],
+    ) -> Result<Fold> {
+        Fold::open_at_with_limits(
+            dir,
+            cfg,
+            committed,
+            punched,
+            crate::read_limits::ReadLimits::default(),
+        )
+    }
+
+    /// Open and recover a writer under explicit frame and object-count admission.
+    pub fn open_at_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: Option<FoldTail>,
+        punched: &[(u32, u32)],
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
         if (cfg.seg_max as u64) > SEG_MAX_LIMIT {
             bail!(
                 "seg_max {} exceeds the {} format bound (Loc.block_off is u32)",
@@ -258,7 +343,7 @@ impl Fold {
         if cfg.block_target == 0 {
             bail!("block_target must be non-zero");
         }
-        if cfg.block_target as u64 > (u32::MAX as u64) / 2 {
+        if cfg.block_target as u64 > BLOCK_TARGET_MAX {
             bail!(
                 "block_target {} is too large; the segment append point and Loc.in_off are u32, so a \
                  block must stay well under 4 GiB",
@@ -273,17 +358,27 @@ impl Fold {
             bail!("zstd level {} is outside the 1..=22 range this fold accepts", cfg.level);
         }
         crate::vfs::mkdir_all(dir).with_context(|| format!("create fold dir {}", dir.display()))?;
+        let (entries, has_lock, has_segment) = fold_directory_shape(dir, read_limits)?;
+        let additions = u64::from(!has_lock) + u64::from(!has_segment);
+        read_limits.admit_directory_entries(
+            "fold directory during writer open",
+            entries.saturating_add(additions),
+        )?;
         let lock = acquire_writer_lock(dir)?;
 
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().ends_with(".tmp") {
-                    let _ = crate::vfs::unlink(&e.path());
-                }
+        let rd = std::fs::read_dir(dir)
+            .with_context(|| format!("read fold directory {} for cleanup", dir.display()))?;
+        let mut visited = 0u64;
+        for e in rd {
+            visited = visited.saturating_add(1);
+            read_limits.admit_directory_entries("fold directory", visited)?;
+            let e = e?;
+            if e.file_name().to_string_lossy().ends_with(".tmp") {
+                let _ = crate::vfs::unlink(&e.path());
             }
         }
 
-        let mut nums = list_segments(dir)?;
+        let mut nums = list_segments_with_limits(dir, read_limits)?;
         nums.sort_unstable();
         for (i, n) in nums.iter().enumerate() {
             if *n != i as u32 {
@@ -364,7 +459,8 @@ impl Fold {
                 inflight: HashMap::new(),
                 pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
                 _lock: Some(lock),
-                punched: Vec::new(),
+                punched: punched.to_vec(),
+                read_limits,
             });
         }
 
@@ -374,9 +470,10 @@ impl Fold {
                 continue;
             }
             let name = format!("zdict-{}.zd", PieceHash(h.dict_id).to_hex());
-            let bytes = std::fs::read(dir.join(&name)).with_context(|| {
-                format!("segment {} names dictionary {name} but it is unreadable", h.seg)
-            })?;
+            let bytes = read_bounded_candidate(&dir.join(&name), MAX_DICTIONARY_BYTES)
+                .with_context(|| {
+                    format!("segment {} names dictionary {name} but it is unreadable", h.seg)
+                })?;
             let got: [u8; 32] = blake3::hash(&bytes).into();
             if got != h.dict_id {
                 bail!("dictionary {name} content hash does not match the id naming it");
@@ -389,7 +486,8 @@ impl Fold {
         let flen = active_f.metadata()?.len();
         let has_dict = headers[active as usize].has_dict();
 
-        let (good_tail, _) = segment::scan_tail(&active_f, flen, has_dict)?;
+        let (good_tail, _) =
+            segment::scan_tail_with_limits(&active_f, flen, has_dict, punched, read_limits)?;
 
         let target = match committed {
             None => good_tail,
@@ -431,13 +529,20 @@ impl Fold {
         // regenerated) when they cannot.
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
+        let mut seen_blocks = 0u64;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
             let entries = if h.seg != active {
-                match segment::read_dir_sidecar(dir, h.seg, len) {
+                match segment::read_dir_sidecar_with_limits(dir, h.seg, len, read_limits)? {
                     Some((_, e)) => e,
                     None => {
-                        let (tail, e) = segment::scan_tail(&readers[i], len, h.has_dict())?;
+                        let (tail, e) = segment::scan_tail_with_limits(
+                            &readers[i],
+                            len,
+                            h.has_dict(),
+                            punched,
+                            read_limits,
+                        )?;
                         // Regenerate so the next open finds it. Best-effort: advisory data must
                         // never fail an open, only slow one down.
                         let _ = segment::write_dir_sidecar(dir, h.seg, tail as u32, &e);
@@ -445,14 +550,24 @@ impl Fold {
                     }
                 }
             } else {
-                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+                segment::scan_tail_with_limits(
+                    &readers[i],
+                    len,
+                    h.has_dict(),
+                    punched,
+                    read_limits,
+                )?
+                .1
             };
             for (id, off) in entries {
-                if blockdir.len() <= id as usize {
-                    blockdir.resize(id as usize + 1, None);
-                }
-                blockdir[id as usize] = Some((h.seg, off));
-                next_block = next_block.max(id + 1);
+                install_block_location(
+                    &mut blockdir,
+                    &mut next_block,
+                    &mut seen_blocks,
+                    id,
+                    (h.seg, off),
+                    read_limits,
+                )?;
             }
         }
 
@@ -475,15 +590,11 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
             _lock: Some(lock),
-            punched: Vec::new(),
+            punched: punched.to_vec(),
+            read_limits,
         })
     }
 
-    /// Open WITHOUT the writer lock, read-only.
-    ///
-    /// Takes no lock, truncates nothing, sweeps nothing — a reader must never mutate a store another
-    /// process is writing. Safe concurrently with a live writer: segments are append-only and blocks
-    /// are immutable once written, so a reader sees a prefix that only ever grows.
     /// Tell this fold which blocks the manifest declares erased, as inclusive `[lo, hi]` ranges.
     ///
     /// The caller owes the right manifest, and for a RETAINED snapshot that is the LIVE one, not the
@@ -498,30 +609,128 @@ impl Fold {
         self.punched.iter().any(|&(lo, hi)| block_id >= lo && block_id <= hi)
     }
 
+    /// Open WITHOUT the writer lock, read-only.
+    ///
+    /// Takes no lock, truncates nothing, sweeps nothing — a reader must never mutate a store another
+    /// process is writing. Safe concurrently with a live writer: segments are append-only and blocks
+    /// are immutable once written, so a reader sees a prefix that only ever grows. No manifest in
+    /// hand, so no punched declaration reaches the scan.
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
-        let mut nums = list_segments(dir)?;
+        Fold::open_read_with_limits(dir, cfg, &[], crate::read_limits::ReadLimits::default())
+    }
+
+    /// Open an unlocked reader with explicit frame and object-count admission, declaring the
+    /// manifest's punched block ranges so the scan can step over erased frames.
+    pub fn open_read_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        punched: &[(u32, u32)],
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
+        let mut nums = list_segments_with_limits(dir, read_limits)?;
         if nums.is_empty() {
             bail!("no fold segments under {}", dir.display());
         }
         nums.sort_unstable();
         let mut segs = Vec::with_capacity(nums.len());
         for &n in &nums {
+            let reader = Arc::new(segment::open_read(dir, n)?);
+            let len = reader.metadata()?.len();
             segs.push(SegmentInput {
                 seg: n,
-                reader: Arc::new(segment::open_read(dir, n)?) as Arc<dyn ReadAt>,
-                sidecar: std::fs::read(segment::dir_path(dir, n)).ok(),
+                reader: reader as Arc<dyn ReadAt>,
+                sidecar: segment::read_dir_sidecar_bytes_with_limits(dir, n, len, read_limits)?,
             });
         }
         let mut dict_files = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("zdict-") && n.ends_with(".zd") {
-                    dict_files.push(std::fs::read(e.path())?);
-                }
+        let rd = std::fs::read_dir(dir)
+            .with_context(|| format!("read fold directory {} for dictionaries", dir.display()))?;
+        let mut visited = 0u64;
+        for e in rd {
+            visited = visited.saturating_add(1);
+            read_limits.admit_directory_entries("fold directory", visited)?;
+            let e = e?;
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("zdict-") && n.ends_with(".zd") {
+                dict_files.push(read_bounded_candidate(&e.path(), MAX_DICTIONARY_BYTES)?);
             }
         }
-        Fold::open_read_from(segs, dict_files, cfg, dir)
+        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, punched, read_limits)
+    }
+
+    /// Open only the durable prefix named by a manifest, ignoring later append residue. No
+    /// punched declaration in hand — a caller holding the manifest uses the `_with_limits` form.
+    pub fn open_read_at(dir: &Path, cfg: FoldCfg, committed: FoldTail) -> Result<Fold> {
+        Fold::open_read_at_with_limits(
+            dir,
+            cfg,
+            committed,
+            &[],
+            crate::read_limits::ReadLimits::default(),
+        )
+    }
+
+    /// Open a committed read-only prefix with explicit frame and object-count admission, plus the
+    /// manifest's punched declaration for the scan.
+    pub fn open_read_at_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: FoldTail,
+        punched: &[(u32, u32)],
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
+        let mut nums = list_segments_with_limits(dir, read_limits)?;
+        nums.retain(|segment| *segment <= committed.seg);
+        nums.sort_unstable();
+        if nums.last().copied() != Some(committed.seg) {
+            bail!(
+                "committed fold tail names segment {} but it is absent under {}",
+                committed.seg,
+                dir.display()
+            );
+        }
+        let mut segs = Vec::with_capacity(nums.len());
+        for &segment in &nums {
+            let file = Arc::new(segment::open_read(dir, segment)?);
+            let physical = file.metadata()?.len();
+            let len = if segment == committed.seg { committed.off as u64 } else { physical };
+            if len > physical {
+                bail!(
+                    "committed fold tail is {} bytes into segment {segment}, which holds only {physical}",
+                    committed.off
+                );
+            }
+            segs.push(SegmentInput {
+                seg: segment,
+                reader: Arc::new(Slice::new(file, 0, len)) as Arc<dyn ReadAt>,
+                // The committed segment may have been sealed before a later generation became
+                // active, and punched blocks can only be located through its sidecar. The parser
+                // below accepts it only when its embedded tail equals this bounded reader's length,
+                // so a sidecar describing a newer suffix remains safely advisory.
+                sidecar: segment::read_dir_sidecar_bytes_with_limits(
+                    dir,
+                    segment,
+                    len,
+                    read_limits,
+                )?,
+            });
+        }
+        let mut dict_files = Vec::new();
+        let entries = std::fs::read_dir(dir)
+            .with_context(|| format!("read fold directory {} for dictionaries", dir.display()))?;
+        let mut visited = 0u64;
+        for entry in entries {
+            visited = visited.saturating_add(1);
+            read_limits.admit_directory_entries("fold directory", visited)?;
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("zdict-") && name.ends_with(".zd") {
+                dict_files.push(read_bounded_candidate(&entry.path(), MAX_DICTIONARY_BYTES)?);
+            }
+        }
+        Fold::open_read_from_with_limits(segs, dict_files, cfg, dir, punched, read_limits)
     }
 
     /// Open read-only from prepared inputs — the entry every SOURCE uses. A directory hands in
@@ -532,11 +741,34 @@ impl Fold {
     /// naming a dictionary no candidate hashes to is refused. `label` names the source in errors
     /// and [`Fold::dir`], and is never touched as a path.
     pub fn open_read_from(
-        mut segs: Vec<SegmentInput>,
+        segs: Vec<SegmentInput>,
         dict_files: Vec<Vec<u8>>,
         cfg: FoldCfg,
         label: &Path,
     ) -> Result<Fold> {
+        Fold::open_read_from_with_limits(
+            segs,
+            dict_files,
+            cfg,
+            label,
+            &[],
+            crate::read_limits::ReadLimits::default(),
+        )
+    }
+
+    /// Backend-neutral read open with explicit frame and object-count admission. `punched` is the
+    /// owning manifest's declared-erased block ranges: a source that has punched blocks may hold a
+    /// frame whose payload a crash left partially zeroed, and the declaration is what lets the
+    /// rebuild scan step over it.
+    pub fn open_read_from_with_limits(
+        mut segs: Vec<SegmentInput>,
+        dict_files: Vec<Vec<u8>>,
+        cfg: FoldCfg,
+        label: &Path,
+        punched: &[(u32, u32)],
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
         if segs.is_empty() {
             bail!("no fold segments under {}", label.display());
         }
@@ -574,29 +806,47 @@ impl Fold {
         // The directory is rebuilt from the ids the frames carry — the same sidecar-or-scan rule
         // the writer applies, except a reader NEVER writes a missing sidecar back: a reader must
         // not mutate a store it does not own, and a slower open is the whole cost.
-        let last = segs.last().unwrap().seg;
         let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
         let mut next_block = 0u32;
+        let mut seen_blocks = 0u64;
         for (i, h) in headers.iter().enumerate() {
             let len = readers[i].len()?;
-            let entries = if h.seg != last {
-                match segs[i]
-                    .sidecar
-                    .as_ref()
-                    .and_then(|b| segment::parse_dir_sidecar(b, h.seg, len))
-                {
-                    Some((_, e)) => e,
-                    None => segment::scan_tail(&readers[i], len, h.has_dict())?.1,
+            let entries = match segs[i].sidecar.as_ref() {
+                Some(bytes) => {
+                    match segment::parse_dir_sidecar_with_limits(bytes, h.seg, len, read_limits)? {
+                        Some((_, entries)) => entries,
+                        None => {
+                            segment::scan_tail_with_limits(
+                                &readers[i],
+                                len,
+                                h.has_dict(),
+                                punched,
+                                read_limits,
+                            )?
+                            .1
+                        }
+                    }
                 }
-            } else {
-                segment::scan_tail(&readers[i], len, h.has_dict())?.1
+                None => {
+                    segment::scan_tail_with_limits(
+                        &readers[i],
+                        len,
+                        h.has_dict(),
+                        punched,
+                        read_limits,
+                    )?
+                    .1
+                }
             };
             for (id, off) in entries {
-                if blockdir.len() <= id as usize {
-                    blockdir.resize(id as usize + 1, None);
-                }
-                blockdir[id as usize] = Some((h.seg, off));
-                next_block = next_block.max(id + 1);
+                install_block_location(
+                    &mut blockdir,
+                    &mut next_block,
+                    &mut seen_blocks,
+                    id,
+                    (h.seg, off),
+                    read_limits,
+                )?;
             }
         }
         let cur_off = readers.last().unwrap().len()? as u32;
@@ -606,7 +856,7 @@ impl Fold {
             headers,
             readers,
             dicts,
-            active: last,
+            active: segs.last().unwrap().seg,
             cur_off,
             active_f: None,
             open_block: Vec::new(),
@@ -619,7 +869,8 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(1, cfg.level, None),
             _lock: None,
-            punched: Vec::new(),
+            punched: punched.to_vec(),
+            read_limits,
         })
     }
 
@@ -654,6 +905,32 @@ impl Fold {
             return Ok(Put { hash, loc, deduped: true });
         }
 
+        // A limit smaller than the ordinary block target deliberately becomes the effective seal
+        // target. Seal BEFORE appending when needed, and refuse one indivisible piece before any
+        // fold mutation. This is the progress rule that lets strict profiles keep accepting small
+        // records without ever writing a block they cannot reopen.
+        let atomic =
+            self.read_limits.max_stored_frame_bytes.min(self.read_limits.max_decoded_frame_bytes);
+        self.read_limits.admit("new fold block", raw.len() as u64, raw.len() as u64)?;
+        let starts_new_block = self.open_block.is_empty()
+            || self.open_block.len() as u64 > atomic.saturating_sub(raw.len() as u64);
+        let proposed_block = if self.open_block.is_empty() {
+            self.next_block
+        } else if starts_new_block {
+            self.next_block
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("block id space exhausted"))?
+        } else {
+            self.next_block
+        };
+        if starts_new_block {
+            self.read_limits.admit_fold_blocks(u64::from(proposed_block) + 1)?;
+        }
+        if !self.open_block.is_empty() && starts_new_block {
+            self.seal_block()?;
+            self.write_ready(false)?;
+        }
+
         let loc = Loc {
             block_id: self.next_block,
             in_off: self.open_block.len() as u32,
@@ -674,6 +951,7 @@ impl Fold {
     /// pipeline, or a (cached) decompressed block — WITHOUT copying them anywhere first. Every
     /// read shape is a projection of this one.
     fn with_piece<T>(&self, loc: Loc, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        crate::io_trace::fold_block_touched(loc.block_id);
         let end = loc.in_off as u64 + loc.raw as u64;
         // still gathering — not yet sealed
         if loc.block_id == self.next_block {
@@ -742,6 +1020,7 @@ impl Fold {
     /// The decompressed bytes of the block holding `loc`, through the cache.
     fn block_bytes(&self, loc: Loc) -> Result<Arc<Vec<u8>>> {
         if let Some(v) = self.cache.lock().unwrap().get(loc.block_id) {
+            crate::io_trace::fold_block_cache_hit();
             return Ok(v);
         }
         let (seg, off) =
@@ -787,9 +1066,16 @@ impl Fold {
             bail!("directory sent block {} to a frame carrying id {}", loc.block_id, hdr.block_id);
         }
 
+        self.read_limits.admit(
+            format!("fold block {}", hdr.block_id),
+            u64::from(hdr.stored),
+            u64::from(hdr.raw),
+        )?;
+
         let span = hdr.frame_len() as usize;
         let mut buf = vec![0u8; span];
-        f.read_exact_at(&mut buf, off as u64)
+        buf[..block::BLOCK_HDR_LEN].copy_from_slice(&hb);
+        f.read_exact_at(&mut buf[block::BLOCK_HDR_LEN..], off as u64 + block::BLOCK_HDR_LEN as u64)
             .with_context(|| format!("read block at seg {seg} off {off}"))?;
         block::verify_frame_bytes(&buf, has_dict)?;
 
@@ -805,6 +1091,7 @@ impl Fold {
         }
         let arc = Arc::new(raw);
         self.cache.lock().unwrap().put(loc.block_id, arc.clone());
+        crate::io_trace::fold_block_cache_miss(span as u64, hdr.raw);
         Ok(arc)
     }
 
@@ -855,10 +1142,13 @@ impl Fold {
             self.poisoned = true;
             return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
         }
+        self.read_limits.admit_fold_blocks(u64::from(d.block_id) + 1)?;
         if self.blockdir.len() <= d.block_id as usize {
             self.blockdir.resize(d.block_id as usize + 1, None);
         }
-        self.blockdir[d.block_id as usize] = Some((self.active, self.cur_off));
+        if self.blockdir[d.block_id as usize].replace((self.active, self.cur_off)).is_some() {
+            bail!("fold block id {} was written more than once", d.block_id);
+        }
         self.cur_off += n as u32;
         match self.inflight.entry(d.block_id) {
             Entry::Occupied(e) => {
@@ -934,8 +1224,18 @@ impl Fold {
     /// is skipped rather than errored — this is reclamation, and a block it cannot account for is
     /// a block it leaves alone.
     pub fn punch_blocks(&mut self, dead: &[u32]) -> Result<Vec<u32>> {
+        self.punch_blocks_with_control(dead, &crate::control::OperationControl::default())
+    }
+
+    /// [`Fold::punch_blocks`] with a safe checkpoint before each independently reclaimable block.
+    pub fn punch_blocks_with_control(
+        &mut self,
+        dead: &[u32],
+        control: &crate::control::OperationControl,
+    ) -> Result<Vec<u32>> {
         let mut done = Vec::new();
         for &id in dead {
+            control.check("fold punch")?;
             let Some(Some((seg, off))) = self.blockdir.get(id as usize).copied() else { continue };
             let mut hb = [0u8; block::BLOCK_HDR_LEN];
             if self.readers[seg as usize].read_exact_at(&mut hb, off as u64).is_err() {
@@ -949,7 +1249,8 @@ impl Fold {
             let f = segment::open_rw(&self.dir, seg)?;
             // The PAYLOAD only — the header stays so the frame chain remains walkable. See
             // `segment::punch`.
-            segment::punch(&f, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
+            let path = segment::seg_path(&self.dir, seg);
+            segment::punch(&f, &path, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
             // The block is gone as content: drop it from the directory so no Loc can resolve
             // into erased bytes, exactly as a reopened store's scan would.
             self.blockdir[id as usize] = None;
@@ -978,10 +1279,30 @@ impl Fold {
     /// trailing invalid region (uncommitted writes a crash abandoned), which is reported, not
     /// condemned.
     pub fn scrub(&self) -> Result<FoldScrub> {
+        self.scrub_with_control(&crate::control::OperationControl::default())
+    }
+
+    /// [`Fold::scrub`] with cooperative checks between segments and complete frames.
+    pub fn scrub_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<FoldScrub> {
         let mut report = FoldScrub::default();
         for (i, h) in self.headers.iter().enumerate() {
+            control.check("fold verification")?;
             let len = self.readers[i].len()?;
-            let (end, entries) = segment::scan_tail(&self.readers[i], len, h.has_dict())?;
+            // With this fold's punched declaration: verification runs against crash residue too,
+            // and a declared block mid-punch (payload part-zeroed, retry pending) is accounted
+            // for, not corrupt.
+            let (end, entries) = segment::scan_tail_controlled_with_limits(
+                &self.readers[i],
+                len,
+                h.has_dict(),
+                &self.punched,
+                control,
+                "fold verification",
+                self.read_limits,
+            )?;
             report.segments += 1;
             report.blocks += entries.len();
             report.bytes += end.saturating_sub(segment::SEG_HDR_LEN);
@@ -1001,12 +1322,47 @@ impl Fold {
 
     pub fn cache_stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
-        CacheStats { hits: c.hits, misses: c.misses }
+        CacheStats { hits: c.hits, misses: c.misses, bytes: c.bytes, budget: c.budget }
     }
 
     /// Every block id the directory knows — the universe a reachability sweep works against.
     pub fn block_ids(&self) -> Vec<u32> {
         self.blockdir.iter().enumerate().filter_map(|(id, e)| e.map(|_| id as u32)).collect()
+    }
+
+    /// Read the framing facts for every block the current directory can address.
+    ///
+    /// This deliberately reads headers only: callers can classify compressed storage without
+    /// decompressing content or warming the block cache. Blocks declared punched may still appear
+    /// here after reopen because sealed-segment sidecars preserve their framing locations; the
+    /// store layer owns that manifest-level classification.
+    pub(crate) fn block_inventory_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<Vec<BlockStorage>> {
+        let mut inventory = Vec::new();
+        for (id, entry) in self.blockdir.iter().enumerate() {
+            control.check("fold block inventory")?;
+            let Some((seg, off)) = *entry else { continue };
+            let id = u32::try_from(id).map_err(|_| anyhow::anyhow!("block id exceeds u32"))?;
+            let reader = self.readers.get(seg as usize).ok_or_else(|| {
+                anyhow::anyhow!("block {id} names segment {seg} which does not exist")
+            })?;
+            let mut bytes = [0u8; block::BLOCK_HDR_LEN];
+            reader
+                .read_exact_at(&mut bytes, u64::from(off))
+                .with_context(|| format!("read block {id} header at seg {seg} off {off}"))?;
+            let header = block::parse_hdr(&bytes, self.headers[seg as usize].has_dict())?;
+            if header.block_id != id {
+                bail!("directory sent block {id} to a frame carrying id {}", header.block_id);
+            }
+            inventory.push(BlockStorage {
+                block_id: id,
+                raw_bytes: header.raw,
+                stored_bytes: header.stored,
+            });
+        }
+        Ok(inventory)
     }
 
     pub fn segment_count(&self) -> u32 {
@@ -1042,6 +1398,11 @@ impl Fold {
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
+        let entries = count_fold_directory_entries(&self.dir, self.read_limits)?;
+        self.read_limits.admit_directory_entries(
+            "fold directory during segment roll",
+            entries.saturating_add(2),
+        )?;
         let flags = self.headers[self.active as usize].flags;
         let f =
             self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
@@ -1078,6 +1439,13 @@ impl Fold {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockStorage {
+    pub block_id: u32,
+    pub raw_bytes: u32,
+    pub stored_bytes: u32,
+}
+
 /// Compression threads: 0 means one per core.
 fn nthreads(cfg: usize) -> usize {
     if cfg > 0 {
@@ -1096,9 +1464,16 @@ fn nthreads(cfg: usize) -> usize {
     }
 }
 
-fn list_segments(dir: &Path) -> Result<Vec<u32>> {
+fn list_segments_with_limits(
+    dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<Vec<u32>> {
     let mut out = Vec::new();
-    for e in std::fs::read_dir(dir)?.flatten() {
+    let mut visited = 0u64;
+    for e in std::fs::read_dir(dir)? {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("fold directory", visited)?;
+        let e = e?;
         if let Some(n) = segment::parse_seg_name(&e.file_name().to_string_lossy()) {
             out.push(n);
         }
@@ -1106,12 +1481,62 @@ fn list_segments(dir: &Path) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+fn count_fold_directory_entries(
+    dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<u64> {
+    Ok(fold_directory_shape(dir, read_limits)?.0)
+}
+
+fn fold_directory_shape(
+    dir: &Path,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, bool, bool)> {
+    let mut visited = 0u64;
+    let mut has_lock = false;
+    let mut has_segment = false;
+    for entry in std::fs::read_dir(dir)? {
+        visited = visited.saturating_add(1);
+        read_limits.admit_directory_entries("fold directory", visited)?;
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        has_lock |= name == "WRITER.lock";
+        has_segment |= segment::parse_seg_name(&name).is_some();
+    }
+    Ok((visited, has_lock, has_segment))
+}
+
+fn install_block_location(
+    blockdir: &mut Vec<Option<(u32, u32)>>,
+    next_block: &mut u32,
+    seen_blocks: &mut u64,
+    id: u32,
+    location: (u32, u32),
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<()> {
+    let required_ids = u64::from(id) + 1;
+    let required_entries = seen_blocks.saturating_add(1);
+    read_limits.admit_fold_blocks(required_ids)?;
+    read_limits.admit_fold_blocks(required_entries)?;
+    if blockdir.len() <= id as usize {
+        blockdir.resize(id as usize + 1, None);
+    }
+    if blockdir[id as usize].replace(location).is_some() {
+        bail!("fold block id {id} appears more than once in one generation");
+    }
+    *seen_blocks = required_entries;
+    *next_block = (*next_block)
+        .max(id.checked_add(1).ok_or_else(|| anyhow::anyhow!("fold block id space exhausted"))?);
+    Ok(())
+}
+
 /// Exclusive writer lock held for the fold's whole lifetime — the single-writer invariant.
 ///
 /// Enforced by the OS *on Unix*. On `wasm32-wasip1` `sys::lock_exclusive` succeeds unconditionally,
 /// so this creates the file and gates nothing: there the invariant IS convention, and it is the
 /// embedder's to keep.
-fn acquire_writer_lock(dir: &Path) -> Result<File> {
+pub(crate) fn acquire_writer_lock(dir: &Path) -> Result<File> {
     let path = dir.join("WRITER.lock");
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -1120,7 +1545,7 @@ fn acquire_writer_lock(dir: &Path) -> Result<File> {
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
     if !crate::sys::lock_exclusive(&f).with_context(|| format!("locking {}", path.display()))? {
-        bail!("fold at {} is already open by another writer", dir.display());
+        return Err(WriterLocked { path: dir.to_path_buf() }.into());
     }
     Ok(f)
 }

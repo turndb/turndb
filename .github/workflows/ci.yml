@@ -10,7 +10,8 @@
 # green tick that means less than it looks like:
 #
 #   every push and PR   fmt, clippy, rustdoc, `cargo test` x3 profiles, the example classifier,
-#                       and the npm package built from committed Rust
+#                       the portable npm package built from committed Rust, and the native N-API
+#                       addon across every Node major its package claims
 #   nightly + on demand the DST harness, which reconstructs crash states and is the one suite too
 #                       slow to sit in front of every push
 #
@@ -50,10 +51,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain the complete local matrix passes on. Whether current stable's lld
+      # crash was real or another face of the free-tier resource exhaustion was never separated;
+      # trial @stable here as its own change once this configuration is green.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # v3 starts clean on the larger runner: the free-tier keys hold artifacts written by
+          # runs that died on full disks, and a truncated cached rlib reproduces exactly like a
+          # deterministic linker bug.
+          key: rust-gates-v3
 
       - name: fmt
         run: cargo fmt --check
@@ -77,11 +86,27 @@ jobs:
       - name: test (no default features)
         run: cargo test --no-default-features
 
+      # The release-profile suite runs hosted only once the repository is public. On the private
+      # free tier this job's runner is 2 cores and 8 GB, and linking the DataFusion-static release
+      # test binaries exceeds that machine class outright — the commit trail from f78eddd through
+      # 2c9f723 documents SIGBUS and disk exhaustion under every workaround combination (disk
+      # reclaim, swapfile surgery, serial links, BFD, a toolchain pin, a clean cache). The same
+      # `ubuntu-latest` label serves a 4-vCPU/16 GB machine, free and unlimited, on public
+      # repositories, so this step arms itself the day the repo opens. Until then the release
+      # suite's evidence is local, named as such in docs/support-and-compatibility.md — a loud
+      # skip rather than a quiet green. --tests drops the six example binaries that carry full
+      # DataFusion links while containing no tests; they and the doctests remain compile- and
+      # run-covered by clippy --all-targets --all-features and the debug suite above.
       - name: test (release)
-        run: cargo test --release
+        if: ${{ !github.event.repository.private }}
+        run: cargo test --release --tests
+      - name: release suite deferred on the private free tier
+        if: ${{ github.event.repository.private }}
+        run: |
+          echo "::warning title=release-profile suite not run::exceeds the private free-tier runner class; verified locally on this source per docs/support-and-compatibility.md; arms automatically when the repository is public"
 
   npm:
-    # `package.json` declares `engines: { node: ">=20" }`, so the matrix IS the claim. The first CI
+    # `package.json` declares `engines: { node: ">=22 <27" }`, so the matrix IS the claim. The first CI
     # run pinned 22 and the suite died with SIGSEGV after its assertions passed — on a version the
     # package says it supports, while passing locally on 24. Testing one version would have made
     # that a property of whichever version someone picked.
@@ -91,7 +116,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22', '24']
+        node: ['22', '24', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,6 +134,117 @@ jobs:
       # generated; on a fresh checkout there is nothing stale to inherit.
       - name: build wasm from source and run the package suite
         run: bash npm/build.sh
+
+      # Format/codec interoperability is independent of Node major. Run it once: WASI writes and
+      # native reads, then native writes and WASI reads, each against an independent expected corpus.
+      - name: cross-runtime store compatibility
+        if: matrix.node == '24'
+        run: bash npm/interop.sh
+
+  native-node:
+    # This matrix is the native package's `engines.node` claim. N-API 6 is meant to decouple the
+    # addon from a single Node/V8 release; only loading and exercising the same Rust surface across
+    # the declared majors proves that seam. Platform prebuild coverage is a separate shipping gate.
+    name: native addon (node ${{ matrix.node }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-node
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # test:dev builds the default native profile (including Arrow/DataFusion), loads Cargo's
+      # shared library through process.dlopen, and runs the N-API contract suite against it.
+      - name: build and test native addon
+        run: npm run test:dev --prefix bindings/node
+
+  native-prebuild:
+    # Build one Node-API artifact, package it as the declared optional platform dependency, and
+    # exercise a clean tarball install. `--use-napi-cross` pins the GNU symbol floor; package:pack
+    # independently inspects the resulting ELF and refuses anything newer than GLIBC_2.17.
+    name: native prebuild (linux x64 glibc)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-prebuild-linux-x64-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      - name: install locked packaging tools
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
+
+      - name: type-check the public package surface
+        run: npm run test:types --prefix bindings/node
+
+      - name: install pinned license-report generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: verify native third-party licenses
+        run: bash scripts/check-third-party-licenses.sh
+
+      - name: create platform package
+        run: npm run package:create --prefix bindings/node
+
+      - name: build linux x64 glibc prebuild
+        run: npm run prebuild:linux-x64-gnu:cross --prefix bindings/node
+
+      - name: collect prebuild
+        run: npm run package:collect --prefix bindings/node
+
+      - name: pack and audit prebuild
+        env:
+          TURNDB_MAX_GLIBC: '2.17'
+        run: npm run package:pack --prefix bindings/node
+
+      - name: test packed install on build host
+        run: npm run test:prebuild --prefix bindings/node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turndb-native-linux-x64-gnu
+          path: bindings/node/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  native-prebuild-install:
+    # The artifact is built once above. Loading that exact tarball on every declared Node major is
+    # the N-API compatibility proof; rebuilding separately on each major would test different bits.
+    name: native prebuild install (node ${{ matrix.node }})
+    if: github.event_name != 'schedule'
+    needs: native-prebuild
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-native-linux-x64-gnu
+          path: bindings/node/dist/
+
+      - name: install and exercise the same packed addon
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
 
   dst:
     name: deterministic simulation (nightly)

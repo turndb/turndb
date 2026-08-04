@@ -4,13 +4,48 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import './_artifact.mjs';
-import { open, TurndbError } from '../index.mjs';
+import { open, capabilities, TurndbError } from '../index.mjs';
 
 async function withStore(fn, opts) {
   const dir = await mkdtemp(join(tmpdir(), 'turndb-test-'));
   const s = await open(dir, opts);
   try { return await fn(s, dir); } finally { try { s.close(); } catch {} await rm(dir, { recursive: true, force: true }); }
 }
+
+test('capabilities describe the WASI guest rather than its host', async () => {
+  const c = await capabilities();
+  assert.equal(c.portable_wasm, true);
+  assert.equal(c.writer_exclusion, 'embedder_enforced');
+  assert.equal(c.physical_erasure, 'refold_only');
+  assert.equal(c.threads, false);
+  assert.equal(c.columnar, false);
+  assert.equal(c.sql, false);
+  assert.equal(c.part_format_write, 2);
+  assert.equal(c.write_admission_limits, true);
+  assert.equal(c.read_admission_limits, true);
+  assert.equal(c.object_count_admission, true);
+  assert.equal(c.store_space_usage, true);
+  assert.equal(c.allocated_space_usage, false);
+  assert.equal(c.format_migration, true);
+  assert.equal(c.operation_metrics, true);
+  assert.equal(c.part_distribution, true);
+  assert.equal(c.content_liveness, true);
+  assert.equal(c.lifecycle_event_journal, true);
+  assert.equal(c.lifecycle_event_capacity, 256);
+  assert.equal(c.query_timings, true);
+  assert.equal(c.sql_explain, false);
+  assert.equal(c.max_record_bytes_default, 64 << 20);
+  assert.equal(c.max_batch_bytes_default, 256 << 20);
+  assert.equal(c.max_batch_records_default, 4096);
+  assert.equal(c.max_identifier_bytes_default, 4096);
+  assert.equal(c.max_stored_frame_bytes_default, 512 << 20);
+  assert.equal(c.max_decoded_frame_bytes_default, 512 << 20);
+  assert.equal(c.max_directory_entries_default, 100000);
+  assert.equal(c.max_wal_frames_default, 100000);
+  assert.equal(c.max_fold_blocks_default, 1000000);
+
+  await withStore((s) => assert.deepEqual(s.capabilities(), c));
+});
 
 test('a record round-trips byte-exact, including non-UTF8 bytes', async () => {
   await withStore((s) => {
@@ -23,6 +58,39 @@ test('a record round-trips byte-exact, including non-UTF8 bytes', async () => {
     s.flush();
     assert.deepEqual(s.get('bin/1'), body, 'must survive the flush into the columnar plane');
   });
+});
+
+test('portable open applies and reports atomic frame admission', async () => {
+  await withStore((s) => {
+    assert.deepEqual(s.readLimits(), {
+      maxStoredFrameBytes: 64,
+      maxDecodedFrameBytes: 64,
+      maxDirectoryEntries: 17,
+      maxWalFrames: 19,
+      maxFoldBlocks: 23,
+    });
+    assert.throws(
+      () => s.putBody('large-piece', new Uint8Array(256).fill(0x5a)),
+      /new fold block/,
+    );
+  }, {
+    maxStoredFrameBytes: 64,
+    maxDecodedFrameBytes: 64,
+    maxDirectoryEntries: 17,
+    maxWalFrames: 19,
+    maxFoldBlocks: 23,
+  });
+});
+
+test('portable writer bounds physical WAL frame accumulation', async () => {
+  await withStore((s) => {
+    s.putBody('one', '1');
+    s.putBody('two', '2');
+    assert.throws(() => s.putBody('three', '3'), /WAL frames/);
+    assert.equal(s.getText('one'), '1');
+    assert.equal(s.getText('two'), '2');
+    assert.equal(s.get('three'), null);
+  }, { maxWalFrames: 2 });
 });
 
 test('the writer sees its own unflushed writes', async () => {
@@ -44,10 +112,50 @@ test('attributes keep order and duplicate keys', async () => {
     assert.deepEqual(got.attrs.map(([k]) => k), ['k', 'n', 'k', 'f', 'ok']);
     assert.deepEqual(got.attrs[0], ['k', 'first']);
     assert.deepEqual(got.attrs[2], ['k', 'second']);
-    assert.equal(got.attrs[1][1], 42);
+    assert.equal(got.attrs[1][1], 42n);
     assert.equal(got.attrs[3][1], 1.5);
     assert.equal(got.attrs[4][1], true);
     assert.equal(Buffer.from(got.body).toString(), 'body');
+  });
+});
+
+test('i64 attributes never round through a JavaScript Number', async () => {
+  await withStore((s) => {
+    const min = -9223372036854775808n;
+    const max = 9223372036854775807n;
+    s.putBody('ints', 'body', [['min', min], ['max', max]]);
+    assert.deepEqual(s.getRecord('ints').attrs, [['min', min], ['max', max]]);
+    assert.throws(
+      () => s.putBody('unsafe', 'body', { n: Number.MAX_SAFE_INTEGER + 1 }),
+      /pass a BigInt/,
+    );
+  });
+});
+
+test('extended scalar attributes preserve their type and exact value', async () => {
+  await withStore((s) => {
+    const attrs = [
+      ['u', { u: 18446744073709551615n }],
+      ['raw', Uint8Array.from([0, 255, 128])],
+      ['at', { timestampNs: -9223372036854775808n }],
+      ['nothing', null],
+    ];
+    s.putBody('extended', 'body', attrs);
+    const got = Object.fromEntries(s.getRecord('extended').attrs);
+    assert.deepEqual(got.u, { u: 18446744073709551615n });
+    assert.deepEqual(got.raw, Uint8Array.from([0, 255, 128]));
+    assert.deepEqual(got.at, { timestampNs: -9223372036854775808n });
+    assert.equal(got.nothing, null);
+  });
+});
+
+test('non-finite floats cross the JSON-only portable ABI deliberately', async () => {
+  await withStore((s) => {
+    s.putBody('floats', 'body', [['nan', { f: NaN }], ['pos', { f: Infinity }], ['neg', { f: -Infinity }]]);
+    const attrs = Object.fromEntries(s.getRecord('floats').attrs);
+    assert.equal(Number.isNaN(attrs.nan), true);
+    assert.equal(attrs.pos, Infinity);
+    assert.equal(attrs.neg, -Infinity);
   });
 });
 
@@ -90,6 +198,32 @@ test('a batch applies atomically and delete shadows', async () => {
     assert.equal(s.get('b/1'), null, 'a tombstone must resolve to absence');
     assert.equal(s.getText('b/2'), 'two');
   });
+});
+
+test('portable writes honor the same configurable admission policy', async () => {
+  await withStore((s) => {
+    assert.throws(() => s.putBody('x', ''), /worst-case WAL frame/);
+    assert.equal(s.get('x'), null);
+  }, { maxRecordBytes: 1 });
+
+  await withStore((s) => {
+    assert.throws(
+      () => s.applyBatch([{ id: 'a', delete: true }, { id: 'b', delete: true }]),
+      /exceeding the configured limit of 1/,
+    );
+    assert.equal(s.get('a'), null, 'a refused oversized batch applies nothing');
+  }, { maxBatchRecords: 1 });
+
+  await withStore((s) => {
+    assert.throws(() => s.putBody('abcde', ''), /record id.*5 UTF-8 bytes/);
+  }, { maxIdentifierBytes: 4 });
+
+  const dir = await mkdtemp(join(tmpdir(), 'turndb-invalid-limits-'));
+  try {
+    await assert.rejects(open(dir, { maxBatchBytes: 0 }), /between 1 and 4294967295/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('errors carry the engine message, not a generic one', async () => {

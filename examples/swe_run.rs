@@ -115,7 +115,11 @@ fn main() -> anyhow::Result<()> {
         if nrec % verify_every as u64 == 0 {
             samples.push((pending.len(), body));
         }
-        pending.push(Record { id, body: prog, attrs });
+        pending.push(Record {
+            id,
+            contents: vec![turndb::Content::new(turndb::BODY_CONTENT, prog)],
+            attrs,
+        });
 
         if pending.len() >= per_part {
             fold.sync()?;

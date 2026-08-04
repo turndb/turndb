@@ -1,23 +1,54 @@
 //! The query lens: columnar reads, projection, and SQL over a real store.
 //!
-//! The load-bearing test here is `columnar_and_row_paths_agree_exactly`. Two independent decoders now
-//! read the same bytes — the row API walks the layout, the lens scatters columns — and a divergence
-//! between them is a silent wrong answer, the worst failure this system can have.
+//! The load-bearing gates here compare independent decoders and independent query interfaces. The
+//! row API walks the layout while the lens scatters columns; a versioned generalized-record corpus
+//! then compares point reads, structured paging, and DataFusion against one reference model. A
+//! divergence is a silent wrong answer, the worst failure this system can have.
 
 #![cfg(feature = "sql")]
 
 use datafusion::arrow::array::{Array, AsArray};
+use datafusion::catalog::TableProvider;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turndb::fold::FoldCfg;
 use turndb::part::Part;
-use turndb::query::{collect, table::TurndbTable, Lens};
-use turndb::store::{Span, Store};
+use turndb::query::{
+    collect,
+    sql::{classify_error, SqlBudget, SqlErrorClass, SqlOptions, SqlQuery, SqlValue},
+    table::TurndbTable,
+    Cmp, Lens, Pred,
+};
+use turndb::scan::{
+    Compare, ContentMode, ContentSelect, Direction, Predicate, ScanRequest, ScanRow,
+};
+use turndb::store::{ContentSpans, ReadStore, Span, Store};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     std::env::temp_dir().join(format!("turndb-query-{tag}-{}-{n}", std::process::id()))
+}
+
+/// Test corpora that exercise failures must not become persistent disk fixtures when an assertion
+/// trips. Existing tests predate this guard; new sustained/differential cases should use it.
+struct ScopedDir(PathBuf);
+
+impl ScopedDir {
+    fn new(tag: &str) -> ScopedDir {
+        ScopedDir(tmp(tag))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScopedDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
 }
 
 fn cfg() -> FoldCfg {
@@ -85,6 +116,97 @@ fn schema_names_columns_by_key_and_never_merges_two_types() {
         vec!["id", "body", "only", "v#str", "v#int"],
         "a single-typed key keeps its name; a multi-typed key is split, never merged"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn extended_scalar_columns_keep_exact_arrow_types_and_null_presence() {
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+    let dir = tmp("extended-scalars");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put(
+        "a",
+        &[Span::Lit(b"")],
+        vec![
+            ("u".into(), AttrValue::UInt(u64::MAX)),
+            ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 1])),
+            ("at".into(), AttrValue::TimestampNs(-1_234_567_890)),
+            ("nothing".into(), AttrValue::Null),
+        ],
+    )
+    .unwrap();
+    s.put(
+        "b",
+        &[Span::Lit(b"")],
+        vec![
+            ("u".into(), AttrValue::UInt(7)),
+            ("raw".into(), AttrValue::Bytes(vec![0, 1])),
+            ("at".into(), AttrValue::TimestampNs(i64::MAX)),
+        ],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let parts = parts_of(&dir);
+    let lens = Lens::new(&parts).unwrap();
+    let schema = lens.schema();
+    assert_eq!(schema.field_with_name("u").unwrap().data_type(), &DataType::UInt64);
+    assert_eq!(
+        schema.field_with_name("raw").unwrap().data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary))
+    );
+    assert_eq!(
+        schema.field_with_name("at").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+    );
+    assert_eq!(schema.field_with_name("nothing#null").unwrap().data_type(), &DataType::Boolean);
+
+    let projection = lens.project(&["id", "u", "raw", "at", "nothing#null"]).unwrap();
+    let (batches, _) = collect(&parts, None, &lens, &projection).unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2);
+    let null_presence = batch.column(4).as_boolean();
+    assert!(null_presence.value(0));
+    assert!(null_presence.is_null(1), "missing and explicit null must remain distinct");
+
+    for id in ["a", "b"] {
+        let row = s.get(id).unwrap().unwrap();
+        assert_eq!(
+            row.attrs,
+            if id == "a" {
+                vec![
+                    ("u".into(), AttrValue::UInt(u64::MAX)),
+                    ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 1])),
+                    ("at".into(), AttrValue::TimestampNs(-1_234_567_890)),
+                    ("nothing".into(), AttrValue::Null),
+                ]
+            } else {
+                vec![
+                    ("u".into(), AttrValue::UInt(7)),
+                    ("raw".into(), AttrValue::Bytes(vec![0, 1])),
+                    ("at".into(), AttrValue::TimestampNs(i64::MAX)),
+                ]
+            }
+        );
+    }
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let mut query = SqlQuery::open(
+        reader,
+        "SELECT id FROM records WHERE u = $1 AND raw = $2 AND at = $3",
+        vec![
+            SqlValue::UInt(u64::MAX),
+            SqlValue::Binary(vec![0, 0xff, 1]),
+            SqlValue::TimestampNs(-1_234_567_890),
+        ],
+        SqlOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(query.next().await.unwrap().unwrap().rows, 1);
+    assert!(query.next().await.unwrap().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -238,6 +360,386 @@ fn columnar_and_row_paths_agree_exactly() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DifferentialRecord {
+    attrs: Vec<(String, AttrValue)>,
+    body: Vec<u8>,
+    attachment: Option<Vec<u8>>,
+}
+
+fn differential_id(slot: usize) -> String {
+    format!("record/{slot:04}")
+}
+
+fn differential_record(slot: usize, revision: usize) -> DifferentialRecord {
+    let kind = ["activity", "generation", "build"][(slot + revision * 2) % 3];
+    let mut attrs = vec![
+        ("kind".into(), AttrValue::Str(kind.into())),
+        ("score".into(), AttrValue::Int(slot as i64 * 17 - revision as i64 * 29 - 200)),
+        ("ratio".into(), AttrValue::Float((slot as f64 - revision as f64) / 8.0)),
+        ("active".into(), AttrValue::Bool((slot + revision).is_multiple_of(2))),
+        ("epoch".into(), AttrValue::UInt(u64::MAX - (slot * 16 + revision) as u64)),
+        ("raw".into(), AttrValue::Bytes(vec![0, slot as u8, revision as u8, 255])),
+        (
+            "at".into(),
+            AttrValue::TimestampNs(-1_700_000_000_000_000_000 + (slot * 100 + revision) as i64),
+        ),
+    ];
+    if (slot + revision).is_multiple_of(4) {
+        attrs.push(("nil".into(), AttrValue::Null));
+    }
+    // The row API and structured projection retain both occurrences. The flat SQL view deliberately
+    // takes the first and reports the shadowed one in its execution statistics.
+    attrs.push(("tag".into(), AttrValue::Str(format!("first-{slot}"))));
+    attrs.push(("tag".into(), AttrValue::Str(format!("second-{revision}"))));
+
+    let body = format!(
+        "common content-addressed prefix {}|slot={slot}|revision={revision}|{}",
+        "shared ".repeat(32),
+        "tail".repeat((slot + revision) % 11)
+    )
+    .into_bytes();
+    let attachment = (!(slot + revision).is_multiple_of(3))
+        .then(|| format!("attachment/{slot:04}/{revision}:{}", "same".repeat(9)).into_bytes());
+    DifferentialRecord { attrs, body, attachment }
+}
+
+fn put_differential_record(
+    store: &mut Store,
+    expected: &mut BTreeMap<String, DifferentialRecord>,
+    slot: usize,
+    revision: usize,
+) {
+    let id = differential_id(slot);
+    let record = differential_record(slot, revision);
+    let mut contents = vec![ContentSpans::new("body", vec![Span::Piece(&record.body)])];
+    if let Some(attachment) = &record.attachment {
+        contents.push(ContentSpans::new("attachment", vec![Span::Piece(attachment)]));
+    }
+    store.put_record(&id, &contents, record.attrs.clone()).unwrap();
+    expected.insert(id, record);
+}
+
+#[derive(Default)]
+struct DifferentialScan {
+    rows: Vec<ScanRow>,
+    pages: usize,
+    empty_pages: usize,
+    physical_rows: usize,
+    superseded_rows: usize,
+    tombstones: usize,
+}
+
+fn differential_scan(store: &ReadStore, mut request: ScanRequest) -> DifferentialScan {
+    let mut result = DifferentialScan::default();
+    loop {
+        result.pages += 1;
+        assert!(result.pages < 1_000, "structured cursor failed to make bounded progress");
+        let page = store.scan(&request).unwrap();
+        result.empty_pages += usize::from(page.rows.is_empty());
+        result.physical_rows += page.stats.resolution.physical_rows;
+        result.superseded_rows += page.stats.resolution.superseded_rows;
+        result.tombstones += page.stats.resolution.tombstones;
+        result.rows.extend(page.rows);
+        let Some(next) = page.next else { break };
+        request.cursor = Some(next);
+    }
+    result
+}
+
+fn first_attr<'a>(record: &'a DifferentialRecord, name: &str) -> Option<&'a AttrValue> {
+    record.attrs.iter().find_map(|(key, value)| (key == name).then_some(value))
+}
+
+async fn differential_sql_ids(
+    context: &datafusion::prelude::SessionContext,
+    predicate: &str,
+) -> Vec<String> {
+    let sql = format!("SELECT id FROM records WHERE {predicate} ORDER BY id");
+    let batches = context.sql(&sql).await.unwrap().collect().await.unwrap();
+    let mut ids = Vec::new();
+    for batch in batches {
+        let column = batch.column(0).as_string::<i32>();
+        ids.extend((0..batch.num_rows()).map(|row| column.value(row).to_string()));
+    }
+    ids
+}
+
+async fn assert_differential_filter(
+    context: &datafusion::prelude::SessionContext,
+    store: &ReadStore,
+    expected: Vec<String>,
+    predicates: Vec<Predicate>,
+    sql_predicate: &str,
+) {
+    let scan = differential_scan(
+        store,
+        ScanRequest {
+            limit: 2,
+            max_examined: 3,
+            max_resolution_entries: 7,
+            predicates,
+            ..ScanRequest::default()
+        },
+    );
+    let scan_ids: Vec<String> = scan.rows.into_iter().map(|row| row.id).collect();
+    assert_eq!(scan_ids, expected, "structured predicate diverged from the reference model");
+    assert_eq!(
+        differential_sql_ids(context, sql_predicate).await,
+        expected,
+        "DataFusion predicate diverged from the point/structured reference model"
+    );
+}
+
+#[tokio::test]
+async fn point_structured_and_datafusion_paths_agree_on_versioned_general_records() {
+    let dir = ScopedDir::new("three-path-differential");
+    let mut writer = Store::open(dir.path(), cfg()).unwrap();
+    let mut expected = BTreeMap::new();
+
+    // Seed every key, then retain seven independently flushed mutation layers. The final view has
+    // overwritten rows, absent older rows, and live rows whose newest occurrence sits in every part.
+    for slot in 0usize..48 {
+        put_differential_record(&mut writer, &mut expected, slot, 0);
+    }
+    writer.sync().unwrap();
+    writer.flush().unwrap();
+    for revision in 1usize..=7 {
+        for slot in 0usize..48 {
+            let selector = slot * 31 + revision * 17;
+            if selector.is_multiple_of(5) {
+                continue;
+            }
+            let id = differential_id(slot);
+            if selector.is_multiple_of(13) {
+                writer.delete(&id).unwrap();
+                expected.remove(&id);
+            } else {
+                put_differential_record(&mut writer, &mut expected, slot, revision);
+            }
+        }
+        writer.sync().unwrap();
+        writer.flush().unwrap();
+    }
+    drop(writer);
+
+    let reader = Store::open_read(dir.path(), cfg()).unwrap();
+    assert!(expected.len() > 30, "the deterministic corpus unexpectedly lost most live rows");
+
+    // Point reads are checked against the independently maintained mutation model, including
+    // byte-exact named content. This anchors the two query paths to more than each other.
+    for slot in 0usize..48 {
+        let id = differential_id(slot);
+        match expected.get(&id) {
+            Some(want) => {
+                let got = reader.get(&id).unwrap().expect("reference says the row is live");
+                assert_eq!(got.attrs, want.attrs, "point metadata differs for {id}");
+                assert_eq!(
+                    reader.reconstruct_content(&id, "body").unwrap(),
+                    Some(want.body.clone())
+                );
+                assert_eq!(
+                    reader.reconstruct_content(&id, "attachment").unwrap(),
+                    want.attachment,
+                    "point named content differs for {id}"
+                );
+            }
+            None => {
+                assert!(reader.get(&id).unwrap().is_none(), "point read resurrected {id}");
+                assert!(reader.reconstruct(&id).unwrap().is_none());
+            }
+        }
+    }
+
+    let projection = ScanRequest {
+        direction: Direction::Forward,
+        limit: 3,
+        max_examined: 4,
+        max_resolution_entries: 7,
+        attrs: vec![
+            "kind".into(),
+            "score".into(),
+            "ratio".into(),
+            "active".into(),
+            "epoch".into(),
+            "raw".into(),
+            "at".into(),
+            "nil".into(),
+            "tag".into(),
+        ],
+        contents: vec![
+            ContentSelect { name: "body".into(), mode: ContentMode::Bytes },
+            ContentSelect { name: "attachment".into(), mode: ContentMode::Bytes },
+        ],
+        ..ScanRequest::default()
+    };
+    let forward = differential_scan(&reader, projection.clone());
+    assert!(forward.pages > 1, "the test must exercise real cursor continuation");
+    assert!(forward.physical_rows > forward.rows.len());
+    assert!(forward.superseded_rows > 0, "older physical versions were not exercised");
+    assert!(forward.tombstones > 0, "newest tombstones were not exercised");
+    assert!(forward.empty_pages > 0, "bounded tombstone-only progress was not exercised");
+    assert_eq!(forward.rows.len(), expected.len());
+    for (row, (id, want)) in forward.rows.iter().zip(&expected) {
+        assert_eq!(&row.id, id);
+        assert_eq!(row.attrs, want.attrs, "structured metadata differs for {id}");
+        assert_eq!(row.contents[0].name, "body");
+        assert_eq!(row.contents[0].bytes.as_deref(), Some(want.body.as_slice()));
+        assert_eq!(row.contents[1].name, "attachment");
+        assert_eq!(row.contents[1].present, want.attachment.is_some());
+        assert_eq!(row.contents[1].bytes.as_deref(), want.attachment.as_deref());
+    }
+
+    let mut reverse_request = projection;
+    reverse_request.direction = Direction::Reverse;
+    let reverse = differential_scan(&reader, reverse_request);
+    let reverse_ids: Vec<String> = reverse.rows.into_iter().map(|row| row.id).collect();
+    let mut expected_reverse: Vec<String> = expected.keys().cloned().collect();
+    expected_reverse.reverse();
+    assert_eq!(reverse_ids, expected_reverse, "reverse structured paging lost or repeated a row");
+
+    // The full SQL projection covers every scalar representation, explicit-null presence, the first
+    // duplicate occurrence, and both named content values.
+    let (context, table) = TurndbTable::context(reader.clone(), "records").unwrap();
+    let batches = context
+        .sql(
+            "SELECT id, kind, score, ratio, active, epoch, raw, at, \"nil#null\", tag, body, \
+             \"content.attachment\" FROM records ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected_rows: Vec<_> = expected.iter().collect();
+    let mut at = 0usize;
+    for batch in &batches {
+        let ids = batch.column(0).as_string::<i32>();
+        let kinds = batch.column(1).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
+        let kind_values = kinds.values().as_string::<i32>();
+        let scores = batch.column(2).as_primitive::<datafusion::arrow::datatypes::Int64Type>();
+        let ratios = batch.column(3).as_primitive::<datafusion::arrow::datatypes::Float64Type>();
+        let active = batch.column(4).as_boolean();
+        let epochs = batch.column(5).as_primitive::<datafusion::arrow::datatypes::UInt64Type>();
+        let raw = batch.column(6).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
+        let raw_values = raw.values().as_binary::<i32>();
+        let timestamps =
+            batch.column(7).as_primitive::<datafusion::arrow::datatypes::TimestampNanosecondType>();
+        let nil = batch.column(8).as_boolean();
+        let tags = batch.column(9).as_dictionary::<datafusion::arrow::datatypes::Int32Type>();
+        let tag_values = tags.values().as_string::<i32>();
+        let bodies = batch.column(10).as_binary::<i32>();
+        let attachments = batch.column(11).as_binary::<i32>();
+        for row in 0..batch.num_rows() {
+            let (id, want) = expected_rows[at];
+            assert_eq!(ids.value(row), id);
+            let AttrValue::Str(kind) = first_attr(want, "kind").unwrap() else { unreachable!() };
+            assert_eq!(kind_values.value(kinds.key(row).unwrap()), kind);
+            let AttrValue::Int(score) = first_attr(want, "score").unwrap() else { unreachable!() };
+            assert_eq!(scores.value(row), *score);
+            let AttrValue::Float(ratio) = first_attr(want, "ratio").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(ratios.value(row), *ratio);
+            let AttrValue::Bool(want_active) = first_attr(want, "active").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(active.value(row), *want_active);
+            let AttrValue::UInt(epoch) = first_attr(want, "epoch").unwrap() else { unreachable!() };
+            assert_eq!(epochs.value(row), *epoch);
+            let AttrValue::Bytes(want_raw) = first_attr(want, "raw").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(raw_values.value(raw.key(row).unwrap()), want_raw);
+            let AttrValue::TimestampNs(timestamp) = first_attr(want, "at").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(timestamps.value(row), *timestamp);
+            let has_explicit_null = first_attr(want, "nil") == Some(&AttrValue::Null);
+            assert_eq!(nil.is_valid(row), has_explicit_null);
+            if has_explicit_null {
+                assert!(nil.value(row));
+            }
+            let AttrValue::Str(first_tag) = first_attr(want, "tag").unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(tag_values.value(tags.key(row).unwrap()), first_tag);
+            assert_eq!(bodies.value(row), want.body);
+            assert_eq!(attachments.is_valid(row), want.attachment.is_some());
+            if let Some(attachment) = &want.attachment {
+                assert_eq!(attachments.value(row), attachment);
+            }
+            at += 1;
+        }
+    }
+    assert_eq!(at, expected.len(), "SQL projection returned the wrong live cardinality");
+
+    let expected_kind: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| {
+            matches!(first_attr(record, "kind"), Some(AttrValue::Str(kind)) if kind == "activity")
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_kind,
+        vec![Predicate::Attr {
+            name: "kind".into(),
+            op: Compare::Eq,
+            value: AttrValue::Str("activity".into()),
+        }],
+        "kind = 'activity'",
+    )
+    .await;
+    let expected_score: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| {
+            matches!(first_attr(record, "score"), Some(AttrValue::Int(score)) if *score >= 0)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_score,
+        vec![Predicate::Attr { name: "score".into(), op: Compare::GtEq, value: AttrValue::Int(0) }],
+        "score >= 0",
+    )
+    .await;
+    let expected_attachment: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| record.attachment.is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_attachment,
+        vec![Predicate::ContentExists { name: "attachment".into(), present: true }],
+        "\"content.attachment\" IS NOT NULL",
+    )
+    .await;
+    let expected_null: Vec<_> = expected
+        .iter()
+        .filter(|(_, record)| first_attr(record, "nil") == Some(&AttrValue::Null))
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_differential_filter(
+        &context,
+        &reader,
+        expected_null,
+        vec![Predicate::Attr { name: "nil".into(), op: Compare::Eq, value: AttrValue::Null }],
+        "\"nil#null\" = true",
+    )
+    .await;
+
+    let stats = table.stats();
+    assert!(stats.rows_hidden > 0, "SQL did not exercise newest-wins hiding");
+    assert!(stats.shadowed_occurrences > 0, "SQL did not exercise duplicate-field flattening");
+}
+
 #[test]
 fn the_body_column_is_byte_exact() {
     let dir = tmp("bodycol");
@@ -360,6 +862,159 @@ async fn sql_selects_filters_and_aggregates() {
 }
 
 #[tokio::test]
+async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
+    use datafusion::arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let dir = tmp("embedded-sql");
+    let mut writer = Store::open(&dir, cfg()).unwrap();
+    for (id, kind, tokens) in [("a", "keep", 1), ("b", "drop", 2), ("c", "keep", 3)] {
+        writer
+            .put_body(
+                id,
+                b"payload",
+                vec![
+                    ("kind".into(), AttrValue::Str(kind.into())),
+                    ("tokens".into(), AttrValue::Int(tokens)),
+                ],
+            )
+            .unwrap();
+    }
+    writer.sync().unwrap();
+    writer.flush().unwrap();
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+
+    // ReadStore clones retain the same immutable fold and parts rather than reopening files or
+    // moving the caller's snapshot into one query.
+    let mut query = SqlQuery::open(
+        reader.clone(),
+        "SELECT id, tokens FROM records WHERE kind = $1 AND tokens > $2 ORDER BY id",
+        vec![SqlValue::String("keep".into()), SqlValue::Int(1)],
+        SqlOptions { max_memory_bytes: 32 << 20 },
+    )
+    .await
+    .unwrap();
+    let schema = StreamReader::try_new(Cursor::new(query.schema_ipc()), None).unwrap();
+    assert_eq!(schema.schema().fields().len(), 2);
+    assert_eq!(schema.count(), 0, "schema IPC contains no invented result row");
+
+    let mut ids = Vec::new();
+    while let Some(batch) = query.next().await.unwrap() {
+        assert_eq!(batch.rows, 1);
+        let decoded = StreamReader::try_new(Cursor::new(batch.ipc), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(decoded.len(), 1, "each pull is one independently decodable IPC batch");
+        let column = decoded[0].column(0).as_string::<i32>();
+        ids.extend((0..decoded[0].num_rows()).map(|row| column.value(row).to_string()));
+    }
+    assert_eq!(ids, ["c"]);
+    assert!(query.is_finished());
+    assert!(query.next().await.unwrap().is_none(), "end of stream is stable");
+    let timing = query.stats();
+    assert!(timing.rows > 0);
+    assert!(timing.planning_duration_ns > 0);
+    assert!(timing.execution_duration_ns > 0);
+
+    let mut explanation = SqlQuery::open(
+        reader.clone(),
+        "EXPLAIN SELECT id FROM records WHERE tokens > 1",
+        vec![],
+        SqlOptions::default(),
+    )
+    .await
+    .unwrap();
+    let mut explanation_rows = 0;
+    while let Some(batch) = explanation.next().await.unwrap() {
+        explanation_rows += batch.rows;
+    }
+    assert!(explanation_rows > 0, "read-only SQL EXPLAIN must return DataFusion's plans");
+
+    let mut starved = SqlQuery::open(
+        reader.clone(),
+        "SELECT id FROM records ORDER BY id",
+        vec![],
+        SqlOptions { max_memory_bytes: 1 << 20 },
+    )
+    .await
+    .unwrap();
+    let error = starved.next().await.unwrap_err();
+    assert_eq!(classify_error(&error), SqlErrorClass::ResourceExhausted);
+    assert!(
+        error.to_string().contains("execute TurnDB SQL batch"),
+        "the configured execution pool must bound work rather than be advisory: {error:#}"
+    );
+
+    let error = SqlQuery::open(
+        reader.clone(),
+        "CREATE TABLE forbidden (value INT)",
+        vec![],
+        SqlOptions::default(),
+    )
+    .await
+    .err()
+    .expect("DDL must be rejected");
+    assert_eq!(classify_error(&error), SqlErrorClass::InvalidArgument);
+    assert!(error.to_string().contains("read-only"));
+
+    let error = SqlQuery::open(
+        reader,
+        "SELECT id FROM records",
+        vec![],
+        SqlOptions { max_memory_bytes: 0 },
+    )
+    .await
+    .err()
+    .expect("zero memory must be rejected");
+    assert!(error.to_string().contains("must be greater than zero"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn shared_sql_budget_bounds_concurrent_query_ceilings_and_releases_promptly() {
+    let dir = tmp("sql-aggregate-budget");
+    build(&dir, 1, 3);
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let budget = SqlBudget::new(48 << 20).unwrap();
+    let options = SqlOptions { max_memory_bytes: 32 << 20 };
+
+    let mut first = SqlQuery::open_with_budget(
+        reader.clone(),
+        "SELECT id FROM records",
+        vec![],
+        options,
+        &budget,
+    )
+    .await
+    .unwrap();
+    assert_eq!(budget.reserved(), 32 << 20);
+    let error = SqlQuery::open_with_budget(
+        reader.clone(),
+        "SELECT id FROM records",
+        vec![],
+        options,
+        &budget,
+    )
+    .await
+    .err()
+    .expect("the second ceiling exceeds the remaining aggregate budget");
+    assert_eq!(classify_error(&error), SqlErrorClass::ResourceExhausted);
+    assert_eq!(budget.reserved(), 32 << 20, "a failed reservation must consume nothing");
+
+    while first.next().await.unwrap().is_some() {}
+    assert_eq!(budget.reserved(), 0, "EOF releases before the query handle is dropped");
+    let second =
+        SqlQuery::open_with_budget(reader, "SELECT id FROM records", vec![], options, &budget)
+            .await
+            .unwrap();
+    assert_eq!(budget.reserved(), 32 << 20);
+    drop(second);
+    assert_eq!(budget.reserved(), 0, "drop/cancellation releases the reservation");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn sql_over_attributes_reads_no_content() {
     let dir = tmp("sqlproj");
     build(&dir, 3, 300);
@@ -401,6 +1056,70 @@ async fn sql_can_still_reach_content_when_it_asks_for_it() {
     let expect = &want.iter().find(|(i, _)| i == "t00-0007").unwrap().1;
     assert_eq!(body, expect.as_slice(), "SQL must return content byte-exactly");
     assert!(table.stats().fold_reads > 0, "this query genuinely did read the fold");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn named_content_columns_are_sparse_independent_and_lazy() {
+    let dir = tmp("named-content");
+    let mut s = Store::open(&dir, cfg()).unwrap();
+    s.put_record(
+        "a",
+        &[ContentSpans::new("request", vec![Span::Piece(b"request-a")])],
+        vec![("kind".into(), AttrValue::Str("one".into()))],
+    )
+    .unwrap();
+    s.put_record(
+        "b",
+        &[ContentSpans::new("response", vec![Span::Piece(b"response-b")])],
+        vec![("kind".into(), AttrValue::Str("two".into()))],
+    )
+    .unwrap();
+    s.put_record(
+        "c",
+        &[
+            ContentSpans::new("request", vec![Span::Piece(b"request-c")]),
+            ContentSpans::new("response", vec![Span::Piece(b"response-c")]),
+        ],
+        vec![("kind".into(), AttrValue::Str("three".into()))],
+    )
+    .unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(&dir, cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    let schema = table.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(names.contains(&"content.request"));
+    assert!(names.contains(&"content.response"));
+    assert!(!names.contains(&"body"), "body exists only when a record actually names it");
+
+    table.reset_stats();
+    let batches = ctx
+        .sql("SELECT id, \"content.request\" FROM t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let ids = batch.column(0).as_string::<i32>();
+    let requests = batch.column(1).as_binary::<i32>();
+    assert_eq!(ids.value(0), "a");
+    assert_eq!(requests.value(0), b"request-a");
+    assert!(requests.is_null(1), "a sparse content miss is NULL, not empty bytes");
+    assert_eq!(requests.value(2), b"request-c");
+    assert_eq!(
+        table.stats().fold_reads,
+        2,
+        "projecting request reconstructs its two values and no response values"
+    );
+
+    table.reset_stats();
+    ctx.sql("SELECT kind FROM t").await.unwrap().collect().await.unwrap();
+    assert_eq!(table.stats().fold_reads, 0, "metadata projection cannot reach any content column");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -729,6 +1448,73 @@ async fn a_filtered_body_query_reconstructs_only_matching_rows() {
     );
     assert!(st.rows_filtered >= 500, "the scan should have excluded most rows itself");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Hidden/filtered accounting must cover exactly the rows a batch CONSUMED. When a fetch closes a
+/// batch early, the rows past the close point are either re-examined by the next call or never
+/// reached at all — counting the whole examined window inflated both counters on every early
+/// close. Driven through the lens directly so the fetch demonstrably reaches the scan.
+#[test]
+fn early_batch_close_does_not_inflate_window_accounting() {
+    let dir = ScopedDir::new("early-close-stats");
+    let mut s = Store::open(dir.path(), cfg()).unwrap();
+    for (id, x) in [("a", 0), ("b", 1), ("c", 0), ("d", 1)] {
+        s.put(id, &[Span::Lit(b"v")], vec![("x".into(), AttrValue::Int(x))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(dir.path(), cfg()).unwrap();
+    let (_fold, parts) = store.into_parts();
+    let lens = Lens::new(&parts).unwrap();
+    let proj = lens.project(&["id"]).unwrap();
+    let x = lens.project(&["x"]).unwrap()[0];
+    let preds = [Pred { field: x, op: Cmp::Eq, val: AttrValue::Int(1) }];
+    let mut scan = lens.scan(&parts[0], None, &proj, &preds).unwrap().with_fetch(Some(1));
+    let batch = scan.next_batch().unwrap().expect("b matches");
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "b");
+    assert!(scan.next_batch().unwrap().is_none());
+
+    let st = scan.stats();
+    assert_eq!(st.rows, 1);
+    // The fetch closes the batch at `b`, so only `a` was consumed as filtered; `c` was examined
+    // but not consumed, and counting it (the old behavior reported 2 here) claims filter work
+    // the returned rows never depended on.
+    assert_eq!(st.rows_filtered, 1, "filtered must count only the consumed window");
+    assert_eq!(st.rows_hidden, 0);
+}
+
+/// A full drain has no early closes, so the totals must be EXACT: every physical row is consumed
+/// exactly once as returned, filtered, or hidden — across both the batch path and the
+/// skipped-window path, and whichever order the per-part partitions ran in.
+#[tokio::test]
+async fn a_full_drain_accounts_for_every_physical_row_exactly_once() {
+    let dir = ScopedDir::new("full-drain-stats");
+    let mut s = Store::open(dir.path(), cfg()).unwrap();
+    for (id, x) in [("a", 0), ("b", 1), ("c", 0), ("d", 1), ("zz", 0)] {
+        s.put(id, &[Span::Lit(b"v")], vec![("x".into(), AttrValue::Int(x))]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    // A second part whose tombstone hides `zz` in the first: one hidden row in part one (the
+    // shadowed `zz`) and one physical non-visible row in part two (the tombstone itself).
+    s.delete("zz").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let store = Store::open_read(dir.path(), cfg()).unwrap();
+    let (ctx, table) = TurndbTable::context(store, "t").unwrap();
+    table.reset_stats();
+    let batches = ctx.sql("SELECT id FROM t WHERE x = 1").await.unwrap().collect().await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2, "b and d");
+
+    let st = table.stats();
+    assert_eq!(st.rows, 2);
+    assert_eq!(st.rows_filtered, 2, "a and c, exactly once each");
+    assert_eq!(st.rows_hidden, 2, "the shadowed zz and the tombstone row");
 }
 
 #[tokio::test]

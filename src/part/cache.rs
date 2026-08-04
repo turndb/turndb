@@ -1,7 +1,7 @@
 //! A byte-budgeted LRU shared by every open part.
 //!
-//! Parts cached four things without limit: decompressed sections, decoded offset arrays, decoded row
-//! indices, and string dictionaries. Measured on a real store, a part pins **9.5x its on-disk size**
+//! Parts cached several decoded views without limit: decompressed sections, decoded offset arrays,
+//! row indices, and dictionaries. Measured on a real store, a part pins **9.5x its on-disk size**
 //! once fully read — 19.5 MiB for a 2 MiB part — so a hundred-part store costs about 2 GiB to read,
 //! and nothing ever released it.
 //!
@@ -41,8 +41,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::ContentMeta;
+
 /// Default budget across all parts sharing one cache. See the module note on why this is not small.
 pub const BUDGET_DEFAULT: usize = 512 << 20;
+/// Smallest effective shared cache budget.
+pub const BUDGET_MIN: usize = 1 << 20;
 
 /// Distinguishes the four caches within one part, so their keys cannot collide.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -53,8 +57,14 @@ pub enum Kind {
     Nums(String),
     /// A decoded row-index array, by column ordinal.
     Rids(usize),
+    /// A decoded named-content row-index array, by content-column ordinal.
+    ContentRids(usize),
+    /// The decoded named-content column directory.
+    ContentMeta,
     /// A decoded string dictionary, by column ordinal.
     Dict(usize),
+    /// A decoded binary dictionary, by column ordinal.
+    BinaryDict(usize),
     /// The decoded id column. Front-coded on disk, so every read of it reconstructs prefixes and
     /// validates UTF-8 — worth doing once.
     Ids,
@@ -66,6 +76,8 @@ pub enum Held {
     Nums(Arc<Vec<u64>>),
     Rids(Arc<Vec<u32>>),
     Strings(Arc<Vec<String>>),
+    ByteStrings(Arc<Vec<Vec<u8>>>),
+    ContentMeta(Arc<Vec<ContentMeta>>),
 }
 
 impl Held {
@@ -77,6 +89,12 @@ impl Held {
             // A String is a pointer, length and capacity beyond its bytes; ignoring that would
             // under-count a dictionary of short strings several times over.
             Held::Strings(v) => v.iter().map(|s| s.len() + std::mem::size_of::<String>()).sum(),
+            Held::ByteStrings(v) => {
+                v.iter().map(|s| s.len() + std::mem::size_of::<Vec<u8>>()).sum()
+            }
+            Held::ContentMeta(v) => {
+                v.iter().map(|m| m.name.len() + std::mem::size_of::<ContentMeta>()).sum()
+            }
         }
     }
 }
@@ -103,7 +121,7 @@ pub fn next_part_id() -> u64 {
 impl SectionCache {
     pub fn new(budget: usize) -> SectionCache {
         SectionCache {
-            budget: budget.max(1 << 20),
+            budget: budget.max(BUDGET_MIN),
             inner: Mutex::new(Inner { bytes: 0, clock: 0, map: HashMap::new() }),
         }
     }

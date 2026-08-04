@@ -1,0 +1,1421 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const child = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const {
+  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest, retainedCommits,
+  restoreBackup, TurnDbError,
+} = require('..');
+
+function temporaryStore(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+test('reports the native capability profile without a portable fallback', () => {
+  assert.deepEqual(capabilities(), {
+    partFormatWrite: 2,
+    partFormatReadMax: 2,
+    writerExclusion: 'os_enforced',
+    physicalErasure: process.platform === 'linux' ? 'punch_or_refold' : 'refold_only',
+    positionedIo: true,
+    threads: true,
+    columnar: true,
+    sql: true,
+    portableWasm: false,
+    nativeNode: true,
+    napiVersion: 6,
+    commandQueueCapacity: 64,
+    commandQueueCapacityMax: 65536,
+    writeAdmissionLimits: true,
+    readAdmissionLimits: true,
+    objectCountAdmission: true,
+    storeSpaceUsage: true,
+    allocatedSpaceUsage: process.platform !== 'win32',
+    formatMigration: true,
+    operationMetrics: true,
+    partDistribution: true,
+    contentLiveness: true,
+    lifecycleEventJournal: true,
+    lifecycleEventCapacity: 256,
+    queryTimings: true,
+    sqlExplain: true,
+    storageRuntimeOptions: true,
+    maxRecordBytesDefault: 67108864n,
+    maxBatchBytesDefault: 268435456n,
+    maxBatchRecordsDefault: 4096,
+    maxIdentifierBytesDefault: 4096,
+    maxStoredFrameBytesDefault: 512n << 20n,
+    maxDecodedFrameBytesDefault: 512n << 20n,
+    maxDirectoryEntriesDefault: 100000n,
+    maxWalFramesDefault: 100000n,
+    maxFoldBlocksDefault: 1000000n,
+    immutableSnapshots: true,
+    lifecycleOperations: true,
+    backupRestore: true,
+    recoveryControls: true,
+    healthSnapshots: true,
+    schemaDiscovery: true,
+    scanExplanation: true,
+    scanCancellation: true,
+    lifecycleCancellation: true,
+    boundedCompaction: true,
+    scanReconstructionBudget: true,
+    scanReconstructedBytesDefault: 33554432n,
+    scanResolutionBudget: true,
+    scanResolutionEntriesDefault: 1000000,
+    scanResolutionEntriesMax: 10000000,
+    arrowIpc: true,
+    parameterizedSql: true,
+    sqlMemoryBytesDefault: 268435456n,
+    sqlAggregateMemoryBytesDefault: 1073741824n,
+  });
+});
+
+test('configures a bounded per-store command backlog without breaking the default open call', async (t) => {
+  const defaultStore = await NativeStore.open(temporaryStore(t));
+  assert.equal(defaultStore.commandQueueCapacity, 64);
+  await defaultStore.close();
+
+  const configured = await NativeStore.open(temporaryStore(t), { commandQueueCapacity: 3 });
+  assert.equal(configured.commandQueueCapacity, 3);
+  await configured.close();
+
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { commandQueueCapacity: 0 }),
+    (error) => error instanceof TurnDbError
+      && error.code === 'INVALID_ARGUMENT'
+      && /between 1 and 65536/.test(error.message)
+  );
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { commandQueueCapacity: 65537 }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+});
+
+test('refuses queue overload through the JavaScript boundary as BUSY', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t), { commandQueueCapacity: 1 });
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([
+    { kind: 'put', id: 'seed', contents: [{ name: 'payload', bytes: Buffer.alloc(4096, 7) }] },
+  ]);
+  // Submission order between concurrently created promises is not guaranteed (each op reaches the
+  // actor from the async pool), so no two-command interleaving is deterministic from JS. Five
+  // hundred concurrent syncs against a one-slot queue are: each accepted sync costs an fsync,
+  // orders of magnitude longer than issuing the remaining submissions, so overload is certain.
+  // The contract under overload is all-or-BUSY: every refusal carries the typed code and the
+  // capacity, no submission is silently dropped, and everything accepted completes.
+  const outcomes = await Promise.allSettled(Array.from({ length: 500 }, () => store.sync()));
+  const refused = outcomes.filter((o) => o.status === 'rejected');
+  assert.notEqual(refused.length, 0, 'a one-slot queue cannot absorb 500 concurrent syncs');
+  for (const { reason } of refused) {
+    assert.ok(reason instanceof TurnDbError, `refusals must be typed, got ${reason}`);
+    assert.equal(reason.code, 'BUSY');
+    assert.match(reason.message, /capacity 1/);
+  }
+  assert.notEqual(outcomes.filter((o) => o.status === 'fulfilled').length, 0);
+  // The nearest valid state: refusals harmed nothing already admitted.
+  const page = await store.scan({ contents: [{ name: 'payload', mode: 'metadata' }] });
+  assert.equal(page.rows.length, 1);
+  assert.equal(page.rows[0].contents[0].len, 4096n);
+});
+
+test('refuses a concurrent SQL pull through the JavaScript boundary as BUSY', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([{ kind: 'put', id: 'row' }]);
+  // A single two-statement window races the pull's completion on the async pool — a fast pull can
+  // legitimately finish between the two calls, which hosted Node 26 demonstrated. Thirty-two
+  // fresh windows make at least one overlap certain in practice, and the contract under overlap
+  // is exact: every refusal is a synchronous typed BUSY, and no refusal damages the in-flight
+  // pull or the stream's completeness.
+  let refused = 0;
+  for (let i = 0; i < 32; i += 1) {
+    const query = await store.querySql('SELECT id FROM records');
+    const first = query.next();
+    try {
+      await query.next();
+    } catch (error) {
+      assert.ok(error instanceof TurnDbError, `guard refusals must be typed, got ${error}`);
+      assert.equal(error.code, 'BUSY');
+      assert.match(error.message, /already in progress/);
+      refused += 1;
+    }
+    assert.notEqual(await first, null);
+    assert.equal(await query.next(), null);
+    await query.close();
+  }
+  assert.notEqual(refused, 0, 'no double pull overlapped in 32 windows; the guard went untested');
+});
+
+test('passes storage and cache policy through the native open seam', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t), {
+    blockTargetBytes: 8192n,
+    foldCacheBytes: 2n << 20n,
+    partCacheBytes: 4n << 20n,
+    maxStoredFrameBytes: 2n << 20n,
+    maxDecodedFrameBytes: 3n << 20n,
+    maxDirectoryEntries: 2000n,
+    maxWalFrames: 3000n,
+    maxFoldBlocks: 4000n,
+    segmentMaxBytes: 1n << 20n,
+    compressionLevel: 3,
+    compressionThreads: 1,
+  });
+  const health = await store.health();
+  assert.equal(health.foldBlockTargetBytes, 8192n);
+  assert.equal(health.foldCacheBudget, 2n << 20n);
+  assert.equal(health.partCacheBudget, 4n << 20n);
+  assert.equal(health.maxStoredFrameBytes, 2n << 20n);
+  assert.equal(health.maxDecodedFrameBytes, 3n << 20n);
+  assert.equal(health.maxDirectoryEntries, 2000n);
+  assert.equal(health.maxWalFrames, 3000n);
+  assert.equal(health.maxFoldBlocks, 4000n);
+  assert.equal(health.foldSegmentMaxBytes, 1n << 20n);
+  assert.equal(health.foldCompressionLevel, 3);
+  assert.equal(health.foldCompressionThreads, 1n);
+  const inherited = await store.snapshot();
+  assert.equal(inherited.maxStoredFrameBytes, 2n << 20n);
+  assert.equal(inherited.maxDecodedFrameBytes, 3n << 20n);
+  assert.equal(inherited.maxDirectoryEntries, 2000n);
+  assert.equal(inherited.maxWalFrames, 3000n);
+  assert.equal(inherited.maxFoldBlocks, 4000n);
+  await inherited.close();
+  await store.close();
+
+  for (const options of [
+    { blockTargetBytes: 0n },
+    { foldCacheBytes: 0n },
+    { partCacheBytes: (1n << 20n) - 1n },
+    { segmentMaxBytes: 1n << 32n },
+    { compressionLevel: 0 },
+    { maxStoredFrameBytes: 0n },
+    { maxDecodedFrameBytes: 0n },
+    { maxDirectoryEntries: 0n },
+    { maxWalFrames: 0n },
+    { maxFoldBlocks: 0n },
+  ]) {
+    await assert.rejects(
+      NativeStore.open(temporaryStore(t), options),
+      (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+    );
+  }
+});
+
+test('classifies atomic frame admission at the native storage boundary', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir, {
+    maxStoredFrameBytes: 64n,
+    maxDecodedFrameBytes: 64n,
+  });
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'large-piece',
+      contents: [{ name: 'payload', bytes: Buffer.alloc(256, 0x5a) }],
+    }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /new fold block/.test(error.message),
+  );
+  await store.close(false);
+
+  const snapshot = await NativeSnapshot.open(dir, {
+    maxStoredFrameBytes: 96n,
+    maxDecodedFrameBytes: 128n,
+  });
+  assert.equal(snapshot.maxStoredFrameBytes, 96n);
+  assert.equal(snapshot.maxDecodedFrameBytes, 128n);
+  assert.equal(snapshot.maxDirectoryEntries, 100000n);
+  assert.equal(snapshot.maxWalFrames, 100000n);
+  assert.equal(snapshot.maxFoldBlocks, 1000000n);
+  await snapshot.close();
+
+  await assert.rejects(
+    NativeSnapshot.open(temporaryStore(t), { maxDecodedFrameBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+});
+
+test('bounds physical WAL frames through the native actor before mutation', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t), { maxWalFrames: 2n });
+  await store.write([{ kind: 'put', id: 'one' }]);
+  assert.equal((await store.health()).walFrames, 2n);
+  await assert.rejects(
+    store.write([{ kind: 'put', id: 'two' }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /WAL frames/.test(error.message),
+  );
+  assert.equal((await store.health()).walFrames, 2n);
+  await store.close(false);
+});
+
+test('enforces configurable write admission with stable error classes', async (t) => {
+  const recordBounded = await NativeStore.open(temporaryStore(t), {
+    maxRecordBytes: 22n,
+    maxBatchBytes: 100n,
+    maxBatchRecords: 2,
+    maxIdentifierBytes: 4,
+  });
+  await recordBounded.write([{ kind: 'put', id: 'x' }]);
+  await assert.rejects(
+    recordBounded.write([{ kind: 'put', id: 'xx' }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /worst-case WAL frame of 23 bytes/.test(error.message),
+  );
+  await assert.rejects(
+    recordBounded.write([{ kind: 'delete', id: 'abcde' }]),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    recordBounded.write([
+      { kind: 'delete', id: 'a' },
+      { kind: 'delete', id: 'b' },
+      { kind: 'delete', id: 'c' },
+    ]),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
+  );
+  await recordBounded.close();
+
+  const batchBounded = await NativeStore.open(temporaryStore(t), {
+    maxRecordBytes: 100n,
+    maxBatchBytes: 53n,
+  });
+  await assert.rejects(
+    batchBounded.write([{ kind: 'delete', id: 'a' }, { kind: 'delete', id: 'b' }]),
+    (error) => error instanceof TurnDbError
+      && error.code === 'RESOURCE_EXHAUSTED'
+      && /representation of 54 bytes/.test(error.message),
+  );
+  await batchBounded.close();
+
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { maxRecordBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+});
+
+test('bounds aggregate SQL reservations across a store and its snapshots', async (t) => {
+  const limit = 48n << 20n;
+  const perQuery = 32n << 20n;
+  const store = await NativeStore.open(temporaryStore(t), {
+    maxConcurrentSqlMemoryBytes: limit,
+  });
+  assert.equal(store.maxConcurrentSqlMemoryBytes, limit);
+  await store.write([{ kind: 'put', id: 'one' }]);
+  const snapshot = await store.snapshot();
+  assert.equal(snapshot.maxConcurrentSqlMemoryBytes, limit);
+
+  const first = await snapshot.querySql('SELECT id FROM records', undefined, {
+    maxMemoryBytes: perQuery,
+  });
+  assert.equal(store.reservedSqlMemoryBytes, perQuery);
+  assert.equal(snapshot.reservedSqlMemoryBytes, perQuery);
+  await assert.rejects(
+    store.querySql('SELECT id FROM records', undefined, { maxMemoryBytes: perQuery }),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
+  );
+  await first.close();
+  assert.equal(store.reservedSqlMemoryBytes, 0n);
+
+  const afterRelease = await store.querySql('SELECT id FROM records', undefined, {
+    maxMemoryBytes: perQuery,
+  });
+  await afterRelease.close();
+  await snapshot.close();
+  await store.close();
+
+  await assert.rejects(
+    NativeStore.open(temporaryStore(t), { maxConcurrentSqlMemoryBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+});
+
+test('refuses a missing native artifact instead of silently loading WASM', () => {
+  const env = { ...process.env };
+  delete env.TURNDB_NATIVE_PATH;
+  assert.throws(
+    () => child.execFileSync(process.execPath, ['-e', 'require(".")'], {
+      cwd: path.resolve(__dirname, '..'),
+      env,
+      stdio: 'pipe',
+    }),
+    (error) => {
+      assert.match(error.stderr.toString(), /does not silently fall back/);
+      return true;
+    }
+  );
+});
+
+test('round-trips exact typed fields and independently named content', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  assert(store instanceof NativeStore);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write(
+    [{
+      kind: 'put',
+      id: 'trace/1',
+      contents: [
+        { name: 'request', bytes: Buffer.from('shared') },
+        { name: 'response', bytes: Buffer.from('shared') },
+        { name: 'empty', bytes: Buffer.alloc(0) },
+      ],
+      attrs: [
+        { name: 'tag', kind: 'string', stringValue: 'first' },
+        { name: 'tag', kind: 'string', stringValue: 'second' },
+        { name: 'minimum', kind: 'int', intValue: -9223372036854775808n },
+        { name: 'nan', kind: 'float', floatValue: NaN },
+        { name: 'sampled', kind: 'bool', boolValue: true },
+        { name: 'unsigned', kind: 'uint', uintValue: 18446744073709551615n },
+        { name: 'binary', kind: 'binary', binaryValue: Buffer.from([0, 0xff, 0x80]) },
+        { name: 'at', kind: 'timestamp_ns', timestampNsValue: -9223372036854775808n },
+        { name: 'nothing', kind: 'null' },
+      ],
+    }],
+    true
+  );
+
+  const page = await store.scan({
+    attrs: ['tag', 'minimum', 'nan', 'sampled', 'unsigned', 'binary', 'at', 'nothing'],
+    contents: [
+      { name: 'request', mode: 'metadata' },
+      { name: 'response', mode: 'bytes' },
+      { name: 'empty', mode: 'bytes' },
+      { name: 'absent', mode: 'bytes' },
+    ],
+  });
+  assert.equal(page.rows.length, 1);
+  assert.deepEqual(page.rows[0].attrs.map(({ name }) => name), [
+    'tag', 'tag', 'minimum', 'nan', 'sampled', 'unsigned', 'binary', 'at', 'nothing',
+  ]);
+  assert.equal(page.rows[0].attrs[2].intValue, -9223372036854775808n);
+  assert(Number.isNaN(page.rows[0].attrs[3].floatValue));
+  assert.equal(page.rows[0].attrs[5].uintValue, 18446744073709551615n);
+  assert.deepEqual(page.rows[0].attrs[6].binaryValue, Buffer.from([0, 0xff, 0x80]));
+  assert.equal(page.rows[0].attrs[7].timestampNsValue, -9223372036854775808n);
+  assert.equal(page.rows[0].attrs[8].kind, 'null');
+  assert.equal(page.rows[0].contents[0].bytes, undefined);
+  assert.equal(page.rows[0].contents[0].len, 6n);
+  assert.match(page.rows[0].contents[0].identity, /^[0-9a-f]{64}$/);
+  assert.equal(page.rows[0].contents[1].bytes.toString(), 'shared');
+  assert.equal(page.rows[0].contents[1].identity, page.rows[0].contents[0].identity);
+  assert.equal(page.rows[0].contents[2].present, true);
+  assert.equal(page.rows[0].contents[2].bytes.length, 0);
+  assert.equal(typeof page.stats.durationNs, 'bigint');
+  assert.match(page.rows[0].contents[2].identity, /^[0-9a-f]{64}$/);
+  assert.notEqual(page.rows[0].contents[2].identity, page.rows[0].contents[0].identity);
+  assert.equal(page.rows[0].contents[3].present, false);
+  assert.equal(page.rows[0].contents[3].identity, undefined);
+  assert.equal(page.rows[0].contents[3].bytes, undefined);
+  assert(Object.values(page.stats.io).every((value) => typeof value === 'bigint'));
+  assert(Object.entries(page.stats.resolution)
+    .filter(([name]) => name !== 'budgetExhausted')
+    .every(([, value]) => typeof value === 'bigint'));
+  assert.equal(typeof page.stats.resolution.budgetExhausted, 'boolean');
+  assert(page.stats.io.foldBlocksTouched >= 1n);
+  assert.equal((await store.readContent('trace/1', 'request')).toString(), 'shared');
+  assert.equal(await store.readContent('trace/1', 'absent'), null);
+  await assert.rejects(
+    store.scan({ maxResolutionEntries: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+});
+
+test('pages and filters in Rust and refuses cursor misuse', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write(
+    Array.from({ length: 7 }, (_, i) => ({
+      kind: 'put',
+      id: `r${i}`,
+      attrs: [{ name: 'even', kind: 'bool', boolValue: i % 2 === 0 }],
+    })),
+    false
+  );
+
+  const request = {
+    limit: 2,
+    maxExamined: 3,
+    attrs: ['even'],
+    predicates: [{
+      kind: 'attr',
+      op: 'eq',
+      value: { name: 'even', kind: 'bool', boolValue: true },
+    }],
+  };
+  const ids = [];
+  let cursor;
+  do {
+    const page = await store.scan({ ...request, cursor });
+    ids.push(...page.rows.map(({ id }) => id));
+    cursor = page.next;
+  } while (cursor);
+  assert.deepEqual(ids, ['r0', 'r2', 'r4', 'r6']);
+
+  const first = await store.scan({ ...request, limit: 1 });
+  await assert.rejects(
+    store.scan({ ...request, from: 'r2', cursor: first.next }),
+    (error) => error instanceof TurnDbError
+      && error.code === 'INVALID_ARGUMENT'
+      && /cursor belongs to different bounds or predicates/.test(error.message),
+  );
+  await assert.rejects(
+    store.scan({ cursor: 'not-hex' }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+});
+
+test('explains structured fields, budgets, cursors, and exact physical scope', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([
+    {
+      kind: 'put', id: 'a',
+      contents: [{ name: 'payload', bytes: Buffer.from('a') }],
+      attrs: [{ name: 'projected', kind: 'bool', boolValue: true }],
+    },
+    { kind: 'put', id: 'b' },
+  ]);
+
+  const request = {
+    from: 'a',
+    to: 'z',
+    limit: 7,
+    maxExamined: 11,
+    maxResolutionEntries: 13,
+    maxReconstructedBytes: 17n,
+    attrs: ['projected'],
+    contents: [{ name: 'payload', mode: 'bytes' }],
+    predicates: [
+      { kind: 'attr_exists', name: 'predicate_only', present: false },
+      { kind: 'content_exists', name: 'request', present: false },
+    ],
+  };
+  const explanation = await store.explainScan(request);
+  assert.deepEqual(explanation, {
+    direction: 'forward',
+    usesCursor: false,
+    effectiveFrom: 'a',
+    effectiveTo: 'z',
+    emptyRange: false,
+    projectedAttrs: ['projected'],
+    requiredAttrs: ['predicate_only', 'projected'],
+    predicateOnlyAttrs: ['predicate_only'],
+    projectedContents: [{ name: 'payload', mode: 'bytes' }],
+    requiredContents: ['payload', 'request'],
+    predicateOnlyContents: ['request'],
+    reconstructedContents: ['payload'],
+    idPredicates: 0,
+    attrPredicates: 1,
+    contentPredicates: 1,
+    limit: 7,
+    maxExamined: 11,
+    maxResolutionEntries: 13,
+    maxReconstructedBytes: 17n,
+    physical: {
+      immutablePartsConsidered: 0n,
+      immutablePartsWithRows: 0n,
+      immutableRowsInBounds: 0n,
+      memtableEntriesInBounds: 2n,
+    },
+  });
+
+  const first = await store.scan({ from: 'a', to: 'z', limit: 1 });
+  const resumed = await store.explainScan({ from: 'a', to: 'z', cursor: first.next });
+  assert.equal(resumed.usesCursor, true);
+  assert.equal(resumed.effectiveFrom, 'a\0');
+  await assert.rejects(
+    store.explainScan({ from: 'b', to: 'z', cursor: first.next }),
+    (error) => error instanceof TurnDbError
+      && error.code === 'INVALID_ARGUMENT'
+      && /cursor belongs to different bounds or predicates/.test(error.message),
+  );
+  await assert.rejects(
+    store.explainScan({ limit: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(
+    store.explainScan({ signal: aborted.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+
+  const snapshot = await store.snapshot();
+  t.after(async () => {
+    try { await snapshot.close(); } catch {}
+  });
+  const immutable = await snapshot.explainScan({ from: 'a', to: 'z' });
+  assert.equal(immutable.physical.immutablePartsConsidered, 1n);
+  assert.equal(immutable.physical.immutablePartsWithRows, 1n);
+  assert.equal(immutable.physical.immutableRowsInBounds, 2n);
+  assert.equal(immutable.physical.memtableEntriesInBounds, 0n);
+});
+
+test('bounds reconstructed scan bytes without splitting or skipping rows', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write(
+    ['a', 'b', 'c'].map((id) => ({
+      kind: 'put',
+      id,
+      contents: [{ name: 'payload', bytes: Buffer.from('123456') }],
+    }))
+  );
+
+  const request = {
+    contents: [{ name: 'payload', mode: 'bytes' }],
+    maxReconstructedBytes: 10n,
+  };
+  const first = await store.scan(request);
+  assert.deepEqual(first.rows.map(({ id }) => id), ['a']);
+  assert.equal(first.stats.reconstructedBytes, 6n);
+  assert.equal(first.stats.reconstructionBudgetExhausted, true);
+  assert.equal(first.stats.examined, 2);
+
+  const second = await store.scan({ ...request, cursor: first.next });
+  assert.deepEqual(second.rows.map(({ id }) => id), ['b']);
+  assert.equal(second.stats.reconstructionBudgetExhausted, true);
+
+  const third = await store.scan({ ...request, cursor: second.next });
+  assert.deepEqual(third.rows.map(({ id }) => id), ['c']);
+  assert.equal(third.stats.reconstructionBudgetExhausted, false);
+  assert.equal(third.next, undefined);
+
+  await assert.rejects(
+    store.scan({ maxReconstructedBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+});
+
+test('streams bounded parameterized read-only SQL as Arrow IPC', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([
+    {
+      kind: 'put', id: 'a',
+      attrs: [
+        { name: 'kind', kind: 'string', stringValue: 'keep' },
+        { name: 'tokens', kind: 'int', intValue: 1n },
+      ],
+    },
+    {
+      kind: 'put', id: 'b',
+      attrs: [
+        { name: 'kind', kind: 'string', stringValue: 'drop' },
+        { name: 'tokens', kind: 'int', intValue: 2n },
+      ],
+    },
+    {
+      kind: 'put', id: 'c',
+      attrs: [
+        { name: 'kind', kind: 'string', stringValue: 'keep' },
+        { name: 'tokens', kind: 'int', intValue: 3n },
+        { name: 'u', kind: 'uint', uintValue: 18446744073709551615n },
+        { name: 'raw', kind: 'binary', binaryValue: Buffer.from([0, 255]) },
+        { name: 'at', kind: 'timestamp_ns', timestampNsValue: -1n },
+      ],
+    },
+  ]);
+
+  await assert.rejects(
+    store.querySql('SELECT id FROM records', undefined, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+  assert.equal((await store.health()).memtableEntries, 3n);
+  const planningAbort = new AbortController();
+  planningAbort.abort();
+  await assert.rejects(
+    store.querySql('SELECT id FROM records', undefined, { signal: planningAbort.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+  assert.equal((await store.health()).memtableEntries, 3n);
+
+  // Writer SQL takes and publishes an exact actor-ordered snapshot, so accepted unflushed rows are
+  // included and query execution no longer occupies the writer actor.
+  const query = await store.querySql(
+    'SELECT id, tokens FROM records WHERE kind = $1 AND tokens > $2 AND u = $3 AND raw = $4 AND at = $5 ORDER BY id',
+    [
+      { kind: 'string', stringValue: 'keep' },
+      { kind: 'int', intValue: 1n },
+      { kind: 'uint', uintValue: 18446744073709551615n },
+      { kind: 'binary', binaryValue: Buffer.from([0, 255]) },
+      { kind: 'timestamp_ns', timestampNsValue: -1n },
+    ],
+    { maxMemoryBytes: 32n << 20n }
+  );
+  assert(query instanceof NativeSqlQuery);
+  assert(Buffer.isBuffer(query.schemaIpc));
+  assert.equal(query.schemaIpc.readUInt32LE(0), 0xffffffff);
+  assert.equal((await store.health()).memtableEntries, 0n);
+
+  const batch = await query.next();
+  assert.equal(batch.rows, 1);
+  assert(Buffer.isBuffer(batch.ipc));
+  assert.equal(batch.ipc.readUInt32LE(0), 0xffffffff);
+  assert(batch.stats.rows > 0n);
+  assert(batch.stats.planningDurationNs > 0n);
+  assert(batch.stats.executionDurationNs > 0n);
+  assert.equal(await query.next(), null);
+  const finalStats = await query.stats();
+  assert.equal(finalStats.planningDurationNs, batch.stats.planningDurationNs);
+  assert(finalStats.executionDurationNs >= batch.stats.executionDurationNs);
+  assert.equal(finalStats.rows, batch.stats.rows);
+
+  const snapshot = await store.snapshot();
+  const forbidden = snapshot.querySql('CREATE TABLE forbidden (value INT)');
+  await assert.rejects(
+    forbidden,
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+
+  const starved = await snapshot.querySql(
+    'SELECT id FROM records ORDER BY id',
+    undefined,
+    { maxMemoryBytes: 1n << 20n }
+  );
+  await assert.rejects(
+    starved.next(),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED'
+  );
+
+  const timed = await snapshot.querySql('SELECT id FROM records');
+  await assert.rejects(
+    timed.next({ timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const cancelled = await snapshot.querySql('SELECT id FROM records');
+  await assert.rejects(
+    cancelled.next({ signal: preAborted.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+  assert.equal(await cancelled.next(), null);
+
+  await assert.rejects(
+    snapshot.querySql('SELECT id FROM records', undefined, { maxMemoryBytes: 0n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT'
+  );
+  const closed = await snapshot.querySql('SELECT id FROM records');
+  await closed.close();
+  assert.equal(await closed.next(), null);
+  await query.close();
+  await snapshot.close();
+});
+
+test('enforces deterministic scan deadlines and pre-aborted signals', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await assert.rejects(
+    store.scan({ timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError
+      && error.code === 'CANCELLED'
+      && /deadline exceeded/.test(error.message)
+  );
+
+  const alreadyAborted = new AbortController();
+  alreadyAborted.abort();
+  await assert.rejects(
+    store.scan({ signal: alreadyAborted.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED'
+  );
+
+  // A core Source test cancels after its first record read and proves in-flight work discards its
+  // partial page. An empty native scan may correctly finish before an abort issued after submission,
+  // so the ABI test intentionally avoids asserting a scheduler race.
+
+  // The nearest VALID deadline: a generous timeout and a live signal must admit a complete page —
+  // an implementation refusing every deadline-bearing request passes the two rejections above.
+  await store.write([{ kind: 'put', id: 'row' }]);
+  const live = new AbortController();
+  const page = await store.scan({ timeoutMs: 3_600_000, signal: live.signal });
+  assert.equal(page.rows.length, 1);
+  assert.equal(page.rows[0].id, 'row');
+  assert.equal(page.next, undefined);
+});
+
+test('publishes exact immutable cuts and reopens retained commits', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write([{ kind: 'put', id: 'r1' }]);
+  const first = await store.snapshot();
+  assert(first instanceof NativeSnapshot);
+  t.after(async () => {
+    try { await first.close(); } catch {}
+  });
+  assert(first.commit > 0n);
+  assert.deepEqual((await first.scan()).rows.map(({ id }) => id), ['r1']);
+
+  await store.write([{ kind: 'put', id: 'r2' }]);
+  assert.deepEqual((await first.scan()).rows.map(({ id }) => id), ['r1']);
+  // A separately opened reader sees only the manifest published by the first snapshot, not r2 in
+  // the writer's WAL/memtable.
+  const published = await NativeSnapshot.open(dir);
+  assert.deepEqual((await published.scan()).rows.map(({ id }) => id), ['r1']);
+  await published.close();
+
+  const second = await store.snapshot();
+  assert.deepEqual((await second.scan()).rows.map(({ id }) => id), ['r1', 'r2']);
+  const commits = await retainedCommits(dir);
+  assert(commits.includes(first.commit));
+  assert(commits.includes(second.commit));
+
+  const retained = await NativeSnapshot.openAt(dir, first.commit);
+  assert.equal(retained.commit, first.commit);
+  assert.deepEqual((await retained.scan()).rows.map(({ id }) => id), ['r1']);
+  await retained.close();
+  await assert.rejects(retained.scan(), /closed/);
+  await second.close();
+});
+
+test('backs up an actor-ordered cut and safely restores a writable store', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-backup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, 'store');
+  const artifact = path.join(root, 'snapshot.turndb');
+  const restoredDir = path.join(root, 'restored');
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write([{ kind: 'put', id: 'before' }]);
+  const cancelledArtifact = path.join(root, 'cancelled.turndb');
+  await assert.rejects(
+    store.backup(cancelledArtifact, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  assert.equal(fs.existsSync(cancelledArtifact), false);
+  const abortedBackup = new AbortController();
+  abortedBackup.abort();
+  await assert.rejects(
+    store.backup(cancelledArtifact, { signal: abortedBackup.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  const backup = await store.backup(artifact);
+  assert(backup.files >= 3n);
+  assert.equal(backup.bytes, BigInt(fs.statSync(artifact).size));
+  assert(backup.commit > 0n);
+
+  await store.write([{ kind: 'put', id: 'after' }], true);
+  const cancelledRestore = path.join(root, 'cancelled-restore');
+  await assert.rejects(
+    restoreBackup(artifact, cancelledRestore, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  assert.equal(fs.existsSync(cancelledRestore), false);
+  const abortedRestore = new AbortController();
+  abortedRestore.abort();
+  await assert.rejects(
+    restoreBackup(artifact, cancelledRestore, { signal: abortedRestore.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  const restored = await restoreBackup(artifact, restoredDir);
+  assert.deepEqual(restored, backup);
+  const restoredStore = await NativeStore.open(restoredDir);
+  assert.deepEqual((await restoredStore.scan()).rows.map(({ id }) => id), ['before']);
+  await restoredStore.write([{ kind: 'put', id: 'restored-write' }], true);
+  assert.deepEqual(
+    (await restoredStore.scan()).rows.map(({ id }) => id),
+    ['before', 'restored-write'],
+  );
+  await restoredStore.close();
+
+  await assert.rejects(
+    store.backup(artifact),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    restoreBackup(artifact, restoredDir),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+
+  const corrupt = Buffer.from(fs.readFileSync(artifact));
+  corrupt[0] ^= 1;
+  const corruptPath = path.join(root, 'corrupt.turndb');
+  const absent = path.join(root, 'corrupt-restore');
+  fs.writeFileSync(corruptPath, corrupt);
+  await assert.rejects(
+    restoreBackup(corruptPath, absent),
+    (error) => error instanceof TurnDbError && error.code === 'CORRUPTION',
+  );
+  assert.equal(fs.existsSync(absent), false);
+  await assert.rejects(
+    restoreBackup(path.join(root, 'missing.turndb'), absent),
+    (error) => error instanceof TurnDbError && error.code === 'NOT_FOUND',
+  );
+});
+
+test('recovers only a fully validated retained manifest under writer exclusion', async (t) => {
+  const dir = temporaryStore(t);
+  let store = await NativeStore.open(dir);
+  await store.write([{
+    kind: 'put',
+    id: 'survives',
+    contents: [{ name: 'payload', bytes: Buffer.from('content validated during recovery') }],
+  }]);
+  await store.flush();
+  await store.close();
+
+  const manifestPath = path.join(dir, 'MANIFEST');
+  const damageManifest = () => {
+    const bytes = Buffer.from(fs.readFileSync(manifestPath));
+    bytes[10] ^= 0xff;
+    fs.writeFileSync(manifestPath, bytes);
+    return bytes;
+  };
+  const damagedManifest = damageManifest();
+  await assert.rejects(
+    recoverManifest(dir, { timeoutMs: 0 }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  const abort = new AbortController();
+  abort.abort();
+  await assert.rejects(
+    recoverManifest(dir, { signal: abort.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  assert.deepEqual(fs.readFileSync(manifestPath), damagedManifest);
+  const report = await recoverManifest(dir);
+  assert.equal(report.rollbackCommits, 0n);
+  assert.equal(report.records, 1n);
+  assert.equal(report.contentValues, 1n);
+  assert(report.partSections > 0n);
+
+  const snapshot = await NativeSnapshot.open(dir);
+  assert.deepEqual((await snapshot.scan()).rows.map(({ id }) => id), ['survives']);
+  await snapshot.close();
+  await assert.rejects(
+    recoverManifest(dir),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+
+  store = await NativeStore.open(dir);
+  damageManifest();
+  await assert.rejects(
+    recoverManifest(dir),
+    (error) => error instanceof TurnDbError && error.code === 'CONTENTION',
+  );
+  await store.close(false);
+  await recoverManifest(dir);
+});
+
+test('validates exact values and lifecycle at the boundary', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad',
+      attrs: [{ name: 'wide', kind: 'int', intValue: 9223372036854775808n }],
+    }]),
+    (error) => {
+      assert(error instanceof TurnDbError);
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /outside the signed i64 range/);
+      return true;
+    }
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad-uint',
+      attrs: [{ name: 'wide', kind: 'uint', uintValue: 18446744073709551616n }],
+    }]),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad-time',
+      attrs: [{ name: 'at', kind: 'timestamp_ns', timestampNsValue: 9223372036854775808n }],
+    }]),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad-null',
+      attrs: [{ name: 'none', kind: 'null', boolValue: false }],
+    }]),
+    /except null carries none/,
+  );
+  await assert.rejects(
+    store.write([{
+      kind: 'put',
+      id: 'bad',
+      attrs: [{ name: 'mixed', kind: 'bool', boolValue: true, stringValue: 'also' }],
+    }]),
+    /exactly one typed value/
+  );
+  await store.close(false);
+  await assert.rejects(store.scan(), (error) => {
+    assert(error instanceof TurnDbError);
+    assert.equal(error.code, 'CLOSED');
+    return true;
+  });
+  await assert.rejects(store.close(), (error) => {
+    assert.equal(error.code, 'CLOSED');
+    return true;
+  });
+});
+
+test('classifies writer contention without parsing prose in the consumer', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  await assert.rejects(NativeStore.open(dir), (error) => {
+    assert(error instanceof TurnDbError);
+    assert.equal(error.code, 'CONTENTION');
+    assert(error.cause instanceof Error);
+    return true;
+  });
+  await store.close();
+});
+
+test('runs compaction verification and physical erasure through the actor', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  for (let part = 0; part < 3; part++) {
+    await store.write([{
+      kind: 'put',
+      id: `r${part}`,
+      contents: [{ name: 'payload', bytes: Buffer.from(`payload-${part}`) }],
+    }]);
+    assert.equal(await store.flush(), true);
+  }
+
+  const compact = await store.compact(true);
+  assert.equal(compact.partsBefore, 3n);
+  assert.equal(compact.partsAfter, 1n);
+  assert.equal(compact.merge.inputs, 3n);
+  assert.equal(compact.merge.recordsOut, 3n);
+  assert.equal(compact.merge.foldBytesTouched, 0n);
+
+  const verified = await store.verify();
+  assert.equal(verified.parts, 1n);
+  assert(verified.partSections > 0n);
+  assert(verified.partDigests > 0n);
+  assert(verified.foldBlocks > 0n);
+  assert.equal(verified.trailingUncommittedBytes, 0n);
+
+  const erased = await store.erase(['r1', 'never-existed']);
+  assert.equal(erased.requested, 2n);
+  assert.equal(erased.tombstoned, 1n);
+  assert.equal(erased.absent, 1n);
+  assert(erased.refold);
+  assert.equal(erased.refold.recordsKept, 2n);
+  assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['r0', 'r2']);
+  assert.equal(await store.readContent('r1', 'payload'), null);
+
+  const punched = await store.punch();
+  assert.equal(typeof punched.blocksExamined, 'bigint');
+  assert.equal(typeof punched.blocksPunched, 'bigint');
+  const refoldPreflight = await store.estimateRefoldSpace();
+  assert.equal(refoldPreflight.flushed, false);
+  assert(refoldPreflight.estimate.sourceFoldLogicalBytes > 0n);
+  assert(refoldPreflight.estimate.sourcePartBytes > 0n);
+  assert(refoldPreflight.estimate.sourcePartSections > 0n);
+  assert(refoldPreflight.estimate.sourcePartRawSectionBytes > 0n);
+  assert.equal(refoldPreflight.estimate.estimateIsHardBound, false);
+  assert.equal(typeof refoldPreflight.estimate.filesystemAvailableBytes, 'bigint');
+  const refolded = await store.refold();
+  assert.equal(refolded.recordsKept, 2n);
+  assert.equal(typeof refolded.bytesReclaimed, 'bigint');
+  assert.equal((await store.verify()).parts, 1n);
+  const metrics = await store.metrics();
+  assert.equal(metrics.verification.attempts, 2n);
+  assert.equal(metrics.verification.succeeded, 2n);
+  assert.equal(metrics.verification.failed, 0n);
+  assert.equal(metrics.verificationCorruptionFailures, 0n);
+  const events = await store.lifecycleEvents();
+  assert.equal(events.gap, false);
+  assert.equal(events.droppedEvents, 0n);
+  assert.equal(events.events[0].sequence, 1n);
+  assert.equal(events.events[0].operation, 'open_recovery');
+  assert.equal(events.events[0].outcome, 'succeeded');
+  assert.equal(events.events[0].errorClass, undefined);
+  assert.equal(events.latestSequence, events.events.at(-1).sequence);
+  assert.equal(events.events.filter(({ operation }) => operation === 'verification').length, 2);
+  const tail = await store.lifecycleEvents(events.events.at(-2).sequence, 1);
+  assert.equal(tail.events.length, 1);
+  assert.equal(tail.events[0].sequence, events.events.at(-1).sequence);
+});
+
+test('compacts one exact bounded work unit and classifies budgets for schedulers', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  for (let part = 0; part < 3; part++) {
+    await store.write([{
+      kind: 'put',
+      id: `bounded/${part}`,
+      contents: [{ name: 'payload', bytes: Buffer.from(`bounded payload ${part}`) }],
+    }]);
+    await store.flush();
+  }
+
+  const budget = {
+    maxInputParts: 2,
+    maxInputRows: 2n,
+    maxInputBytes: 1n << 40n,
+  };
+  const preflight = await store.estimateCompactionSpace(budget);
+  assert.equal(preflight.flushed, false);
+  assert(preflight.estimate.inputSections > 0n);
+  assert(preflight.estimate.inputRawSectionBytes > 0n);
+  assert(preflight.estimate.estimatedStageBytes > preflight.estimate.inputRawSectionBytes);
+  assert.equal(preflight.estimate.estimateIsHardBound, false);
+  assert.equal(
+    preflight.estimate.retainedInputBytesAfterCommit,
+    preflight.estimate.plan.inputBytes,
+  );
+  assert.equal(typeof preflight.estimate.filesystemAvailableBytes, 'bigint');
+
+  const result = await store.compactBounded(budget);
+  assert.equal(result.partsBefore, 3n);
+  assert.equal(result.partsAfter, 2n);
+  assert.deepEqual(result.plan, {
+    startPart: 0n,
+    inputParts: 2n,
+    inputRows: 2n,
+    inputBytes: result.plan.inputBytes,
+    dropsTombstones: false,
+  });
+  assert(result.plan.inputBytes > 0n);
+  assert(result.outputBytes > 0n);
+  assert(result.outputBytes <= preflight.estimate.estimatedStageBytes);
+  assert.equal(result.merge.inputs, 2n);
+
+  await assert.rejects(
+    store.compactBounded({ maxInputParts: 2, maxInputRows: 1n, maxInputBytes: 1n << 40n }),
+    (error) => error instanceof TurnDbError && error.code === 'RESOURCE_EXHAUSTED',
+  );
+  // Invalid budgets reject like every other failure on this Promise surface — a `.then()`
+  // caller must not need a synchronous try/catch for exactly one method.
+  await assert.rejects(
+    store.compactBounded({ maxInputParts: 1, maxInputRows: 10n, maxInputBytes: 1n << 40n }),
+    (error) => error instanceof TurnDbError && error.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    store.compactBounded(
+      { maxInputParts: 2, maxInputRows: 10n, maxInputBytes: 1n << 40n },
+      { timeoutMs: 0 },
+    ),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+
+  const settled = await store.compactBounded({
+    maxInputParts: 2,
+    maxInputRows: 10n,
+    maxInputBytes: 1n << 40n,
+  });
+  assert.equal(settled.partsAfter, 1n);
+  assert.equal(settled.plan.dropsTombstones, true);
+  const idle = await store.compactBounded({
+    maxInputParts: 2,
+    maxInputRows: 10n,
+    maxInputBytes: 1n << 40n,
+  });
+  assert.equal(idle.partsBefore, 1n);
+  assert.equal(idle.partsAfter, 1n);
+  assert.equal(idle.plan, undefined);
+  assert.equal(idle.outputBytes, undefined);
+  assert.equal(idle.merge, undefined);
+});
+
+test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', async (t) => {
+  const store = await NativeStore.open(temporaryStore(t));
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  await store.write([{
+    kind: 'put',
+    id: 'still-present',
+    contents: [{ name: 'payload', bytes: Buffer.from('must survive refusal') }],
+  }]);
+
+  const cancelled = (promise) => assert.rejects(
+    promise,
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  await cancelled(store.sync({ timeoutMs: 0 }));
+  await cancelled(store.flush({ timeoutMs: 0 }));
+  await cancelled(store.compact(true, { timeoutMs: 0 }));
+  await cancelled(store.verify({ timeoutMs: 0 }));
+  await cancelled(store.punch({ timeoutMs: 0 }));
+  await cancelled(store.refold({ timeoutMs: 0 }));
+  await cancelled(store.erase(['still-present'], { timeoutMs: 0 }));
+
+  const aborted = new AbortController();
+  aborted.abort();
+  await cancelled(store.sync({ signal: aborted.signal }));
+  await cancelled(store.flush({ signal: aborted.signal }));
+  await cancelled(store.verify({ signal: aborted.signal }));
+  const health = await store.health();
+  assert.equal(health.memtableEntries, 1n);
+  assert.equal(health.parts, 0n);
+  assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['still-present']);
+});
+
+test('classifies verified persisted-byte damage as corruption', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(false); } catch {}
+  });
+  await store.write([{ kind: 'put', id: 'damaged', attrs: [
+    { name: 'kind', kind: 'string', stringValue: 'test' },
+  ] }]);
+  await store.flush();
+
+  const part = fs.readdirSync(dir).find((name) => name.endsWith('.part'));
+  assert(part);
+  const partPath = path.join(dir, part);
+  const fd = fs.openSync(partPath, 'r+');
+  const byte = Buffer.alloc(1);
+  fs.readSync(fd, byte, 0, 1, 0);
+  byte[0] ^= 0xff;
+  fs.writeSync(fd, byte, 0, 1, 0);
+  fs.closeSync(fd);
+
+  await assert.rejects(
+    store.verify(),
+    (error) => error instanceof TurnDbError
+      && error.code === 'CORRUPTION'
+      && /verify retained manifest chain/.test(error.message),
+  );
+});
+
+test('reports cheap health across staging and publication', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+  const empty = await store.health();
+  assert.equal(empty.parts, 0n);
+  assert.equal(empty.memtableEntries, 0n);
+  assert.equal(empty.walBytes, 0n);
+
+  await store.write([{
+    kind: 'put',
+    id: 'health/1',
+    contents: [{ name: 'payload', bytes: Buffer.from('health payload') }],
+  }]);
+  const staged = await store.health();
+  assert.equal(staged.memtableEntries, 1n);
+  assert(staged.memtableBytes > 0n);
+  assert(staged.walBytes > 0n);
+  assert.equal(staged.dedupWindowEntries, 1n);
+
+  await store.flush();
+  const published = await store.health();
+  assert(published.commit > empty.commit);
+  assert.equal(published.parts, 1n);
+  assert.equal(published.partRows, 1n);
+  assert.equal(published.memtableEntries, 0n);
+  assert.equal(published.walBytes, 0n);
+  assert(published.foldDiskBytes > 0n);
+  assert.equal(published.retainedCommits, 1n);
+  assert.equal(typeof published.foldCacheHits, 'bigint');
+  assert.equal(published.foldCacheBudget, 64n << 20n);
+  assert.equal(published.partCacheBudget, 512n << 20n);
+  assert.equal(published.foldBlockTargetBytes, 4n << 20n);
+  assert.equal(published.foldSegmentMaxBytes, 1n << 30n);
+  assert.equal(published.foldCompressionLevel, 19);
+  assert.equal(typeof published.partCacheBudget, 'bigint');
+
+  const migration = await store.formatMigrationStatus();
+  assert.deepEqual(migration, {
+    targetPartVersion: 2,
+    liveParts: 1n,
+    currentParts: 1n,
+    legacyParts: 0n,
+    legacyRows: 0n,
+    legacyBytes: 0n,
+    retainedLegacyParts: 0n,
+    retainedLegacyRows: 0n,
+    retainedLegacyBytes: 0n,
+  });
+  const migrationPreflight = await store.estimateFormatMigrationSpace();
+  assert.equal(migrationPreflight.flushed, false);
+  assert.deepEqual(migrationPreflight.status, migration);
+  assert.equal(migrationPreflight.estimate, undefined);
+  const migrationStep = await store.migrateFormatStep();
+  assert.equal(migrationStep.flushed, false);
+  assert.equal(migrationStep.step, undefined);
+  const metrics = await store.metrics();
+  assert.equal(metrics.openRecovery.attempts, 1n);
+  assert.equal(metrics.openRecovery.succeeded, 1n);
+  assert.equal(metrics.formatMigration.attempts, 1n);
+  assert.equal(metrics.formatMigration.succeeded, 1n);
+  assert(metrics.flush.attempts >= 3n);
+  for (const operation of [metrics.openRecovery, metrics.sync, metrics.flush, metrics.formatMigration]) {
+    assert.equal(
+      operation.attempts,
+      operation.succeeded + operation.failed + operation.cancelled,
+    );
+    assert(operation.totalDurationNs >= operation.maxDurationNs);
+  }
+  assert.equal(metrics.foldedContent.pieces, 1n);
+  assert.equal(metrics.foldedContent.dedupHits, 0n);
+  assert(metrics.foldedContent.logicalBytes > 0n);
+  assert(metrics.foldedContent.novelBytes > 0n);
+  const distribution = await store.partDistribution();
+  assert.equal(distribution.parts, 1n);
+  assert.equal(distribution.totalRows, 1n);
+  assert(distribution.totalBytes > 0n);
+  assert.equal(distribution.minBytes, distribution.maxBytes);
+  assert.equal(distribution.p50Rows, 1n);
+  const liveness = await store.contentLiveness();
+  assert.equal(liveness.livePieces, 1n);
+  assert(liveness.liveLogicalBytes > 0n);
+  assert.equal(liveness.deadLogicalBytes, 0n);
+  assert.equal(liveness.strandedDeadLogicalBytes, 0n);
+  assert.equal(liveness.liveBlocks.blocks, 1n);
+  assert.equal(liveness.reclaimableBlocks.blocks, 0n);
+
+  fs.writeFileSync(path.join(dir, 'operator-note'), 'not owned by TurnDB');
+  const space = await store.spaceUsage();
+  assert(space.live.files > 0n);
+  assert(space.retainedOnly.files > 0n);
+  assert(space.unclassified.logicalBytes >= BigInt(Buffer.byteLength('not owned by TurnDB')));
+  assert.equal(
+    space.total.files,
+    space.live.files + space.retainedOnly.files + space.unclassified.files,
+  );
+  assert.equal(
+    space.total.logicalBytes,
+    space.live.logicalBytes
+      + space.retainedOnly.logicalBytes
+      + space.unclassified.logicalBytes,
+  );
+  if (capabilities().allocatedSpaceUsage) {
+    assert.equal(typeof space.total.allocatedBytes, 'bigint');
+    assert.equal(typeof space.filesystemAvailableBytes, 'bigint');
+  } else {
+    assert.equal(space.total.allocatedBytes, undefined);
+    assert.equal(space.filesystemAvailableBytes, undefined);
+  }
+
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(
+    store.spaceUsage({ signal: cancelled.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+  await assert.rejects(
+    store.contentLiveness({ signal: cancelled.signal }),
+    (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
+  );
+});
+
+test('discovers typed field and content namespaces without reading values', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  t.after(async () => {
+    try { await store.close(); } catch {}
+  });
+
+  await store.write([{
+    kind: 'put',
+    id: 'schema/1',
+    contents: [{ name: 'request', bytes: Buffer.from('request body') }],
+    attrs: [
+      { name: 'mixed', kind: 'string', stringValue: 'one' },
+      { name: 'unsigned', kind: 'uint', uintValue: 1n },
+      { name: 'binary', kind: 'binary', binaryValue: Buffer.from([1]) },
+      { name: 'at', kind: 'timestamp_ns', timestampNsValue: 2n },
+      { name: 'nothing', kind: 'null' },
+    ],
+  }]);
+  assert.deepEqual(await store.schema(), {
+    attributes: [
+      { name: 'at', types: ['timestamp_ns'] },
+      { name: 'binary', types: ['binary'] },
+      { name: 'mixed', types: ['string'] },
+      { name: 'nothing', types: ['null'] },
+      { name: 'unsigned', types: ['uint'] },
+    ],
+    contents: ['request'],
+    mayIncludeShadowedFields: false,
+  });
+  await store.flush();
+
+  await store.write([{
+    kind: 'put',
+    id: 'schema/2',
+    contents: [{ name: 'response', bytes: Buffer.from('response body') }],
+    attrs: [
+      { name: 'a', kind: 'bool', boolValue: true },
+      { name: 'mixed', kind: 'int', intValue: 2n },
+      { name: 'mixed', kind: 'float', floatValue: 3.5 },
+    ],
+  }]);
+
+  const healthBefore = await store.health();
+  assert.deepEqual(await store.schema(), {
+    attributes: [
+      { name: 'a', types: ['bool'] },
+      { name: 'at', types: ['timestamp_ns'] },
+      { name: 'binary', types: ['binary'] },
+      { name: 'mixed', types: ['string', 'int', 'float'] },
+      { name: 'nothing', types: ['null'] },
+      { name: 'unsigned', types: ['uint'] },
+    ],
+    contents: ['request', 'response'],
+    mayIncludeShadowedFields: true,
+  });
+  const healthAfter = await store.health();
+  assert.equal(healthAfter.foldCacheHits, healthBefore.foldCacheHits);
+  assert.equal(healthAfter.foldCacheMisses, healthBefore.foldCacheMisses);
+
+  const published = await NativeSnapshot.open(dir);
+  t.after(async () => {
+    try { await published.close(); } catch {}
+  });
+  assert.deepEqual(await published.schema(), {
+    attributes: [
+      { name: 'at', types: ['timestamp_ns'] },
+      { name: 'binary', types: ['binary'] },
+      { name: 'mixed', types: ['string'] },
+      { name: 'nothing', types: ['null'] },
+      { name: 'unsigned', types: ['uint'] },
+    ],
+    contents: ['request'],
+    mayIncludeShadowedFields: true,
+  });
+});

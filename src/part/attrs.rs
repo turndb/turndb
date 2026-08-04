@@ -17,6 +17,7 @@ use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, Record};
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 /// Bytes per value, by type tag. Fixed width keeps `val` directly indexable; zstd removes the slack.
 pub fn width(tag: u8) -> usize {
@@ -25,6 +26,10 @@ pub fn width(tag: u8) -> usize {
         1 => 8, // i64
         2 => 8, // f64 bits — preserves NaN payloads and -0.0 exactly
         3 => 1, // bool
+        4 => 8, // u64
+        5 => 4, // binary dictionary ordinal
+        6 => 8, // signed Unix nanoseconds
+        7 => 0, // explicit null: presence lives in rid/layout
         _ => 0,
     }
 }
@@ -143,6 +148,51 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
                     }
                 }
             }
+            4 => {
+                for v in &raw[c] {
+                    match v {
+                        AttrValue::UInt(x) => val.extend_from_slice(&x.to_le_bytes()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            5 => {
+                let mut distinct: Vec<&[u8]> = raw[c]
+                    .iter()
+                    .map(|v| match v {
+                        AttrValue::Bytes(bytes) => bytes.as_slice(),
+                        _ => unreachable!("column tag says binary"),
+                    })
+                    .collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                put_varint(&mut dict_bytes, distinct.len() as u64);
+                for bytes in &distinct {
+                    put_varint(&mut dict_bytes, bytes.len() as u64);
+                    dict_bytes.extend_from_slice(bytes);
+                }
+                for v in &raw[c] {
+                    let bytes = match v {
+                        AttrValue::Bytes(bytes) => bytes.as_slice(),
+                        _ => unreachable!(),
+                    };
+                    let ord = distinct
+                        .binary_search(&bytes)
+                        .expect("value must be in its own binary dictionary");
+                    val.extend_from_slice(&(ord as u32).to_le_bytes());
+                }
+            }
+            6 => {
+                for v in &raw[c] {
+                    match v {
+                        AttrValue::TimestampNs(x) => val.extend_from_slice(&x.to_le_bytes()),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            7 => {
+                debug_assert!(raw[c].iter().all(|v| matches!(v, AttrValue::Null)));
+            }
             t => bail!("unknown attribute type tag {t}"),
         }
 
@@ -197,6 +247,8 @@ pub struct ZoneAcc {
     poisoned: bool,
     min_i: i64,
     max_i: i64,
+    min_u: u64,
+    max_u: u64,
     min_f: f64,
     max_f: f64,
     min_b: u8,
@@ -208,9 +260,11 @@ impl ZoneAcc {
         ZoneAcc {
             tag,
             seen: false,
-            poisoned: tag == 0, // strings: the dictionary is the zone map
+            poisoned: matches!(tag, 0 | 5 | 7), // dictionaries/null carry no numeric zone
             min_i: i64::MAX,
             max_i: i64::MIN,
+            min_u: u64::MAX,
+            max_u: u64::MIN,
             min_f: f64::INFINITY,
             max_f: f64::NEG_INFINITY,
             min_b: 1,
@@ -238,6 +292,15 @@ impl ZoneAcc {
                 self.min_b = self.min_b.min(u8::from(*x));
                 self.max_b = self.max_b.max(u8::from(*x));
             }
+            AttrValue::UInt(x) => {
+                self.min_u = self.min_u.min(*x);
+                self.max_u = self.max_u.max(*x);
+            }
+            AttrValue::Bytes(_) | AttrValue::Null => self.poisoned = true,
+            AttrValue::TimestampNs(x) => {
+                self.min_i = self.min_i.min(*x);
+                self.max_i = self.max_i.max(*x);
+            }
         }
     }
 
@@ -249,7 +312,7 @@ impl ZoneAcc {
         }
         out.push(1);
         match self.tag {
-            1 => {
+            1 | 6 => {
                 out.extend_from_slice(&self.min_i.to_le_bytes());
                 out.extend_from_slice(&self.max_i.to_le_bytes());
             }
@@ -257,6 +320,10 @@ impl ZoneAcc {
                 // bit patterns, like the column itself — a reader compares as floats
                 out.extend_from_slice(&self.min_f.to_bits().to_le_bytes());
                 out.extend_from_slice(&self.max_f.to_bits().to_le_bytes());
+            }
+            4 => {
+                out.extend_from_slice(&self.min_u.to_le_bytes());
+                out.extend_from_slice(&self.max_u.to_le_bytes());
             }
             _ => {
                 out.extend_from_slice(&(self.min_b as i64).to_le_bytes());
@@ -314,6 +381,8 @@ pub fn read_zone(part: &Part, c: usize) -> Result<Option<(AttrValue, AttrValue)>
         1 => Some((AttrValue::Int(lo as i64), AttrValue::Int(hi as i64))),
         2 => Some((AttrValue::Float(f64::from_bits(lo)), AttrValue::Float(f64::from_bits(hi)))),
         3 => Some((AttrValue::Bool(lo != 0), AttrValue::Bool(hi != 0))),
+        4 => Some((AttrValue::UInt(lo), AttrValue::UInt(hi))),
+        6 => Some((AttrValue::TimestampNs(lo as i64), AttrValue::TimestampNs(hi as i64))),
         _ => None,
     })
 }
@@ -374,6 +443,30 @@ pub fn read_dict(part: &Part, c: usize) -> Result<std::sync::Arc<Vec<String>>> {
     Ok(part.dict_put(c, out))
 }
 
+/// A binary column's sorted distinct dictionary; empty for non-binary columns.
+pub fn read_binary_dict(part: &Part, c: usize) -> Result<std::sync::Arc<Vec<Vec<u8>>>> {
+    if let Some(v) = part.binary_dict_cached(c) {
+        return Ok(v);
+    }
+    let name = format!("col.dict.{c}");
+    if !part.section_present(&name) {
+        return Ok(part.binary_dict_put(c, Vec::new()));
+    }
+    let b = part.section_bytes(&name)?;
+    let mut at = 0usize;
+    let n = get_varint(&b, &mut at)? as usize;
+    let mut out = Vec::with_capacity(n.min(b.len()));
+    for _ in 0..n {
+        let l = get_varint(&b, &mut at)? as usize;
+        if l > b.len() - at {
+            bail!("binary column dictionary entry runs past the section");
+        }
+        out.push(b[at..at + l].to_vec());
+        at += l;
+    }
+    Ok(part.binary_dict_put(c, out))
+}
+
 /// A column's row indices, decoded. Dense columns are synthesised rather than read.
 pub fn rids(part: &Part, c: usize, occ: usize, kind: u8) -> Result<std::sync::Arc<Vec<u32>>> {
     if let Some(v) = part.rid_cached(c) {
@@ -409,7 +502,13 @@ pub fn rids(part: &Part, c: usize, occ: usize, kind: u8) -> Result<std::sync::Ar
     Ok(part.rid_cache_put(c, v))
 }
 
-fn value_at(tag: u8, val: &[u8], k: usize, dict: &[String]) -> Result<AttrValue> {
+fn value_at(
+    tag: u8,
+    val: &[u8],
+    k: usize,
+    dict: &[String],
+    binary_dict: &[Vec<u8>],
+) -> Result<AttrValue> {
     let w = width(tag);
     let at = k * w;
     if at + w > val.len() {
@@ -429,12 +528,162 @@ fn value_at(tag: u8, val: &[u8], k: usize, dict: &[String]) -> Result<AttrValue>
             val[at..at + 8].try_into().unwrap(),
         ))),
         3 => AttrValue::Bool(val[at] != 0),
+        4 => AttrValue::UInt(u64::from_le_bytes(val[at..at + 8].try_into().unwrap())),
+        5 => {
+            let ord = u32::from_le_bytes(val[at..at + 4].try_into().unwrap()) as usize;
+            AttrValue::Bytes(
+                binary_dict
+                    .get(ord)
+                    .ok_or_else(|| anyhow::anyhow!("binary dictionary ordinal {ord} out of range"))?
+                    .clone(),
+            )
+        }
+        6 => AttrValue::TimestampNs(i64::from_le_bytes(val[at..at + 8].try_into().unwrap())),
+        7 => AttrValue::Null,
         t => bail!("unknown attribute type tag {t}"),
     })
 }
 
 /// Row `r`'s attributes in their exact original order, duplicates included.
 pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
+    read_row_filtered(part, r, None)
+}
+
+/// Selected attributes at row `r`, preserving their relative order and duplicate occurrences.
+/// Layout and column metadata are shared structural sections; value/rid/dictionary sections are
+/// opened only for columns whose name appears in `names`.
+pub fn read_row_selected(
+    part: &Part,
+    r: usize,
+    names: &HashSet<&str>,
+) -> Result<Vec<(String, AttrValue)>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    read_row_filtered(part, r, Some(names))
+}
+
+/// Selected attributes for several rows, in the caller's row order.
+///
+/// Unlike repeated [`read_row_selected`] calls, this parses the shared layout offsets and column
+/// directory once, and opens each selected rid/value/dictionary section once for the whole gather.
+/// Each row still follows its layout, so duplicate fields and their original interleaving survive.
+pub fn read_rows_selected(
+    part: &Part,
+    rows: &[usize],
+    names: &HashSet<&str>,
+) -> Result<Vec<Vec<(String, AttrValue)>>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if names.is_empty() || !part.section_present("colmeta") {
+        return Ok(vec![Vec::new(); rows.len()]);
+    }
+
+    let layout = part.section_bytes("layout")?;
+    let offs = part.nums("layout.off", 8)?;
+    let meta = read_meta(part)?;
+    let selected: Vec<bool> =
+        meta.iter().map(|(key, _, _, _)| names.contains(key.as_str())).collect();
+
+    // Decode the selected column ordinals per row first. This is both the row's output ordering and
+    // the exact multiplicity against which the sparse rid column is checked below.
+    let mut row_layouts = Vec::with_capacity(rows.len());
+    let mut used_columns = std::collections::BTreeSet::new();
+    for &r in rows {
+        if r >= offs.len().saturating_sub(1) {
+            bail!("row {r} out of range for the layout");
+        }
+        let mut at = usize::try_from(offs[r])
+            .map_err(|_| anyhow::anyhow!("row {r} layout offset exceeds this platform"))?;
+        let n = get_varint(&layout, &mut at)? as usize;
+        let mut columns = Vec::with_capacity(n.min(layout.len()));
+        for _ in 0..n {
+            let c = get_varint(&layout, &mut at)? as usize;
+            if c >= meta.len() {
+                bail!("layout names column {c} which does not exist");
+            }
+            if selected[c] {
+                columns.push(c);
+                used_columns.insert(c);
+            }
+        }
+        row_layouts.push(columns);
+    }
+
+    struct Decoder {
+        key: String,
+        tag: u8,
+        rids: std::sync::Arc<Vec<u32>>,
+        values: std::sync::Arc<Vec<u8>>,
+        dict: std::sync::Arc<Vec<String>>,
+        binary_dict: std::sync::Arc<Vec<Vec<u8>>>,
+    }
+
+    let mut decoders = std::collections::HashMap::with_capacity(used_columns.len());
+    for c in used_columns {
+        let (key, tag, occ, kind) = &meta[c];
+        decoders.insert(
+            c,
+            Decoder {
+                key: key.clone(),
+                tag: *tag,
+                rids: rids(part, c, *occ, *kind)?,
+                values: part.section_bytes(&format!("col.val.{c}"))?,
+                dict: if *tag == 0 { read_dict(part, c)? } else { Default::default() },
+                binary_dict: if *tag == 5 {
+                    read_binary_dict(part, c)?
+                } else {
+                    Default::default()
+                },
+            },
+        );
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (&r, columns) in rows.iter().zip(row_layouts) {
+        let mut row = Vec::with_capacity(columns.len());
+        let mut cursors = std::collections::HashMap::<usize, (usize, usize)>::new();
+        for c in columns {
+            let decoder = &decoders[&c];
+            let (first, used) = match cursors.get(&c).copied() {
+                Some(cursor) => cursor,
+                None => {
+                    let first = decoder.rids.partition_point(|&candidate| (candidate as usize) < r);
+                    if first >= decoder.rids.len() || decoder.rids[first] as usize != r {
+                        bail!("row {r} names column {c} but has no occurrence in it");
+                    }
+                    (first, 0)
+                }
+            };
+            let occurrence = first
+                .checked_add(used)
+                .ok_or_else(|| anyhow::anyhow!("row {r} column {c} occurrence overflows"))?;
+            if decoder.rids.get(occurrence).copied().map(|row| row as usize) != Some(r) {
+                bail!("row {r} names more occurrences of column {c} than its row ids contain");
+            }
+            row.push((
+                decoder.key.clone(),
+                value_at(
+                    decoder.tag,
+                    &decoder.values,
+                    occurrence,
+                    &decoder.dict,
+                    &decoder.binary_dict,
+                )?,
+            ));
+            cursors.insert(c, (first, used + 1));
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn read_row_filtered(
+    part: &Part,
+    r: usize,
+    names: Option<&HashSet<&str>>,
+) -> Result<Vec<(String, AttrValue)>> {
     if !part.section_present("colmeta") {
         return Ok(Vec::new());
     }
@@ -459,6 +708,9 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
         let (key, tag, occ, kind) = meta
             .get(c)
             .ok_or_else(|| anyhow::anyhow!("layout names column {c} which does not exist"))?;
+        if names.is_some_and(|names| !names.contains(key.as_str())) {
+            continue;
+        }
         let entry = match cursor.get(&c) {
             Some(e) => *e,
             None => {
@@ -474,9 +726,10 @@ pub fn read_row(part: &Part, r: usize) -> Result<Vec<(String, AttrValue)>> {
             }
         };
         let (first, used) = entry;
-        let dict = read_dict(part, c)?;
+        let dict = if *tag == 0 { read_dict(part, c)? } else { Default::default() };
+        let binary_dict = if *tag == 5 { read_binary_dict(part, c)? } else { Default::default() };
         let val = part.section_bytes(&format!("col.val.{c}"))?;
-        out.push((key.clone(), value_at(*tag, &val, first + used, &dict)?));
+        out.push((key.clone(), value_at(*tag, &val, first + used, &dict, &binary_dict)?));
         cursor.insert(c, (first, used + 1));
     }
     Ok(out)

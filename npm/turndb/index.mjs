@@ -98,6 +98,14 @@ function assertId(id, what = 'id') {
   return assertEncodable(id, what);
 }
 
+function openLimit(value, name) {
+  if (value === undefined) return 0;
+  if (!Number.isInteger(value) || value < 1 || value > 0xffff_ffff) {
+    throw new TurndbError(`${name} must be an integer between 1 and 4294967295`);
+  }
+  return value;
+}
+
 /**
  * The first id that cannot start with `prefix` — the exclusive upper bound of its range — or
  * `null` when no such id exists and the range is therefore unbounded above.
@@ -130,6 +138,40 @@ export function prefixUpperBound(prefix) {
   return null;
 }
 
+function readCapabilities(runtime) {
+  const e = runtime.instance.exports;
+  const code = e.tdb_capabilities();
+  const mem = new Uint8Array(e.memory.buffer);
+  if (code < 0) {
+    const message = new TextDecoder().decode(
+      mem.subarray(e.tdb_err_ptr(), e.tdb_err_ptr() + e.tdb_err_len()),
+    );
+    throw new TurndbError(message);
+  }
+  const json = new TextDecoder().decode(
+    mem.subarray(e.tdb_out_ptr(), e.tdb_out_ptr() + e.tdb_out_len()),
+  );
+  return JSON.parse(json);
+}
+
+/**
+ * Guarantees of the compiled portable core. They describe the WASI guest, not the host OS.
+ */
+export async function capabilities() {
+  // An existing store already owns the one runtime. Reading the immutable build profile does not
+  // need another directory capability and must remain available while that store is open.
+  if (runtimePromise != null) {
+    const runtime = await runtimePromise;
+    if (runtime.active) return readCapabilities(runtime);
+  }
+  const runtime = await acquireRuntime(process.cwd());
+  try {
+    return readCapabilities(runtime);
+  } finally {
+    releaseRuntime(runtime);
+  }
+}
+
 /**
  * Encode attributes into the ABI's tagged form: `[[key, tag, value], ...]`.
  *
@@ -151,20 +193,77 @@ function encodeAttrs(attrs) {
     assertEncodable(k, 'attribute key');
     if (typeof v === 'string') out.push([k, 's', assertEncodable(v, `attribute ${k}`)]);
     else if (typeof v === 'boolean') out.push([k, 'b', v]);
-    else if (typeof v === 'bigint') out.push([k, 'i', Number(v)]);
+    else if (typeof v === 'bigint') out.push([k, 'i', v.toString()]);
+    else if (v === null) out.push([k, 'n', null]);
+    else if (v instanceof Uint8Array) out.push([k, 'x', Array.from(v)]);
     else if (typeof v === 'number') {
       // Integer-valued floats are stored as ints, which is almost always what a caller means.
       // Pass a BigInt, or `{ f: n }`, when the distinction matters the other way.
-      out.push(Number.isInteger(v) ? [k, 'i', v] : [k, 'f', v]);
-    } else if (v && typeof v === 'object' && 'f' in v) out.push([k, 'f', Number(v.f)]);
-    else if (v && typeof v === 'object' && 'i' in v) out.push([k, 'i', Number(v.i)]);
+      if (Number.isInteger(v)) {
+        if (!Number.isSafeInteger(v)) {
+          throw new TypeError(
+            `integer attribute ${k} is outside JavaScript's exact Number range; pass a BigInt`,
+          );
+        }
+        out.push([k, 'i', v.toString()]);
+      } else out.push([k, 'f', encodeFloat(v)]);
+    } else if (v && typeof v === 'object' && 'f' in v) {
+      out.push([k, 'f', encodeFloat(Number(v.f))]);
+    }
+    else if (v && typeof v === 'object' && 'i' in v) {
+      const i = v.i;
+      if (typeof i === 'bigint') out.push([k, 'i', i.toString()]);
+      else if (typeof i === 'number' && Number.isSafeInteger(i)) out.push([k, 'i', i.toString()]);
+      else throw new TypeError(`integer attribute ${k} must be a safe integer or BigInt`);
+    }
+    else if (v && typeof v === 'object' && 'u' in v) {
+      const u = v.u;
+      if (typeof u === 'bigint' && u >= 0n && u <= 18446744073709551615n) {
+        out.push([k, 'u', u.toString()]);
+      } else if (typeof u === 'number' && Number.isSafeInteger(u) && u >= 0) {
+        out.push([k, 'u', u.toString()]);
+      } else throw new TypeError(`unsigned attribute ${k} must be a non-negative u64`);
+    }
+    else if (v && typeof v === 'object' && 'timestampNs' in v) {
+      const timestamp = v.timestampNs;
+      if (typeof timestamp === 'bigint') out.push([k, 't', timestamp.toString()]);
+      else if (typeof timestamp === 'number' && Number.isSafeInteger(timestamp)) {
+        out.push([k, 't', timestamp.toString()]);
+      } else throw new TypeError(`timestamp attribute ${k} must be a signed i64 BigInt`);
+    }
     else throw new TypeError(`attribute ${k} has unsupported type ${typeof v}`);
   }
   return JSON.stringify(out);
 }
 
+function encodeFloat(v) {
+  if (Number.isNaN(v)) return 'NaN';
+  if (v === Infinity) return 'inf';
+  if (v === -Infinity) return '-inf';
+  return v;
+}
+
 function decodeAttrs(tagged) {
-  return tagged.map(([k, tag, v]) => [k, tag === 'i' || tag === 'f' ? Number(v) : v]);
+  return tagged.map(([k, tag, v]) => [
+    k,
+    tag === 'i'
+      ? BigInt(v)
+      : tag === 'u'
+        ? { u: BigInt(v) }
+        : tag === 't'
+          ? { timestampNs: BigInt(v) }
+      : tag === 'f'
+        ? decodeFloat(v)
+        : tag === 'x'
+          ? Uint8Array.from(v)
+          : v,
+  ]);
+}
+
+function decodeFloat(v) {
+  if (v === 'inf') return Infinity;
+  if (v === '-inf') return -Infinity;
+  return Number(v);
 }
 
 const storeFinalizer = new FinalizationRegistry(({ runtime, handle }) => {
@@ -186,16 +285,30 @@ export class Store {
   #handle;
   #enc = new TextEncoder();
   #dec = new TextDecoder();
+  #readLimits;
 
-  constructor(runtime, handle) {
+  constructor(runtime, handle, readLimits) {
     this.#runtime = runtime;
     this.#exports = runtime.instance.exports;
     this.#handle = handle;
+    this.#readLimits = readLimits;
     storeFinalizer.register(this, { runtime, handle }, this);
   }
 
   get closed() {
     return this.#handle < 0;
+  }
+
+  /** Guarantees of the compiled portable core. */
+  capabilities() {
+    this.#alive();
+    return readCapabilities(this.#runtime);
+  }
+
+  /** Exact frame-byte and persistent object-count admission configured for this handle. */
+  readLimits() {
+    this.#alive();
+    return { ...this.#readLimits };
   }
 
   #mem() {
@@ -570,7 +683,10 @@ async function acquireRuntime(hostDir) {
  * Open (or create) a store at `dir`.
  *
  * @param {string} dir  Host directory. Created if absent.
- * @param {{blockTarget?: number, level?: number}} [opts]
+ * @param {{blockTarget?: number, level?: number, maxRecordBytes?: number,
+ *   maxBatchBytes?: number, maxBatchRecords?: number, maxIdentifierBytes?: number,
+ *   maxStoredFrameBytes?: number, maxDecodedFrameBytes?: number,
+ *   maxDirectoryEntries?: number, maxWalFrames?: number, maxFoldBlocks?: number}} [opts]
  *   `blockTarget` is the bytes gathered before a block seals (default 4 MiB) — bigger compresses
  *   harder and costs more per read. `level` is the zstd level — **this package defaults it to 3,
  *   not the engine's 19**, because this build is single-threaded: the block seal compresses on the
@@ -584,6 +700,15 @@ async function acquireRuntime(hostDir) {
  * @returns {Promise<Store>}
  */
 export async function open(dir, opts = {}) {
+  const maxRecordBytes = openLimit(opts.maxRecordBytes, 'maxRecordBytes');
+  const maxBatchBytes = openLimit(opts.maxBatchBytes, 'maxBatchBytes');
+  const maxBatchRecords = openLimit(opts.maxBatchRecords, 'maxBatchRecords');
+  const maxIdentifierBytes = openLimit(opts.maxIdentifierBytes, 'maxIdentifierBytes');
+  const maxStoredFrameBytes = openLimit(opts.maxStoredFrameBytes, 'maxStoredFrameBytes');
+  const maxDecodedFrameBytes = openLimit(opts.maxDecodedFrameBytes, 'maxDecodedFrameBytes');
+  const maxDirectoryEntries = openLimit(opts.maxDirectoryEntries, 'maxDirectoryEntries');
+  const maxWalFrames = openLimit(opts.maxWalFrames, 'maxWalFrames');
+  const maxFoldBlocks = openLimit(opts.maxFoldBlocks, 'maxFoldBlocks');
   const hostDir = resolve(dir);
   const runtime = await acquireRuntime(hostDir);
   const { instance } = runtime;
@@ -595,7 +720,21 @@ export async function open(dir, opts = {}) {
     const ptr = instance.exports.tdb_alloc(path.length);
     new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
     try {
-      handle = instance.exports.tdb_open(ptr, path.length, opts.blockTarget ?? 0, opts.level ?? 3);
+      handle = instance.exports.tdb_open_v3(
+        ptr,
+        path.length,
+        opts.blockTarget ?? 0,
+        opts.level ?? 3,
+        maxRecordBytes,
+        maxBatchBytes,
+        maxBatchRecords,
+        maxIdentifierBytes,
+        maxStoredFrameBytes,
+        maxDecodedFrameBytes,
+        maxDirectoryEntries,
+        maxWalFrames,
+        maxFoldBlocks,
+      );
     } finally {
       instance.exports.tdb_free(ptr, path.length);
     }
@@ -614,7 +753,14 @@ export async function open(dir, opts = {}) {
     }
     throw e;
   }
-  return new Store(runtime, handle);
+  const profile = readCapabilities(runtime);
+  return new Store(runtime, handle, {
+    maxStoredFrameBytes: maxStoredFrameBytes || profile.max_stored_frame_bytes_default,
+    maxDecodedFrameBytes: maxDecodedFrameBytes || profile.max_decoded_frame_bytes_default,
+    maxDirectoryEntries: maxDirectoryEntries || profile.max_directory_entries_default,
+    maxWalFrames: maxWalFrames || profile.max_wal_frames_default,
+    maxFoldBlocks: maxFoldBlocks || profile.max_fold_blocks_default,
+  });
 }
 
-export default { open, Store, TurndbError };
+export default { open, capabilities, Store, TurndbError };

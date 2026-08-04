@@ -56,8 +56,22 @@ pub mod record {
             from: PathBuf,
             to: PathBuf,
         },
+        /// `hard_link`: atomically publish another name for an already durable file. Unlike
+        /// rename, this refuses when `to` exists, which is the pack writer's no-overwrite gate.
+        Link {
+            from: PathBuf,
+            to: PathBuf,
+        },
         Unlink {
             path: PathBuf,
+        },
+        /// `fallocate(PUNCH_HOLE)`: deallocate a range in place. The file keeps its length and the
+        /// range reads back as zeros — the one operation that destroys committed bytes without
+        /// moving a name, which is exactly why the simulator must see it.
+        PunchHole {
+            path: PathBuf,
+            off: u64,
+            len: u64,
         },
         Mkdir {
             path: PathBuf,
@@ -191,6 +205,24 @@ pub(crate) fn rename(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Atomic rename that refuses to replace `to`.
+#[inline]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
+    crate::sys::rename_noreplace(from, to)?;
+    #[cfg(feature = "dst")]
+    push(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+    Ok(())
+}
+
+/// Atomically install a second name for a file, refusing an existing destination.
+#[inline]
+pub(crate) fn link(from: &Path, to: &Path) -> Result<()> {
+    std::fs::hard_link(from, to)?;
+    #[cfg(feature = "dst")]
+    push(Op::Link { from: from.to_path_buf(), to: to.to_path_buf() });
+    Ok(())
+}
+
 #[inline]
 pub(crate) fn unlink(path: &Path) -> Result<()> {
     std::fs::remove_file(path)?;
@@ -199,9 +231,31 @@ pub(crate) fn unlink(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Deallocate `len` bytes at `off` in place (`fallocate(PUNCH_HOLE)` where the platform has it).
+/// Volatile until the file's fsync, like any other data mutation — a crash may leave the range
+/// intact, fully zeroed, or partially zeroed, and the simulator models all three.
+#[inline]
+pub(crate) fn punch_hole(f: &File, path: &Path, off: u64, len: u64) -> Result<()> {
+    crate::sys::punch_hole(f, off, len)?;
+    #[cfg(feature = "dst")]
+    push(Op::PunchHole { path: path.to_path_buf(), off, len });
+    #[cfg(not(feature = "dst"))]
+    let _ = path;
+    Ok(())
+}
+
 #[inline]
 pub(crate) fn mkdir_all(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
+    #[cfg(feature = "dst")]
+    push(Op::Mkdir { path: path.to_path_buf() });
+    Ok(())
+}
+
+/// Create exactly one directory and refuse if that name already exists.
+#[inline]
+pub(crate) fn mkdir_new(path: &Path) -> Result<()> {
+    std::fs::create_dir(path)?;
     #[cfg(feature = "dst")]
     push(Op::Mkdir { path: path.to_path_buf() });
     Ok(())
