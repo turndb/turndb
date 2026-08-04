@@ -265,7 +265,10 @@ pub struct ScanStats {
     pub duration_ns: u64,
     pub examined: usize,
     pub returned: usize,
-    pub shadowed_attr_occurrences: usize,
+    /// Repeat `(name, type)` occurrences beyond each first, across returned rows. Every occurrence
+    /// is PRESERVED in its row — nothing is shadowed or dropped; this only surfaces how much
+    /// duplication a consumer flattening rows into unique-key maps would silently lose.
+    pub duplicate_attr_occurrences: usize,
     pub content_values_reconstructed: usize,
     pub reconstructed_bytes: u64,
     /// A matching row was deliberately left for the next page because adding all of its selected
@@ -719,7 +722,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
                             .filter(|(name, _)| attr_select.contains(name.as_str()))
                             .cloned(),
                     );
-                    stats.shadowed_attr_occurrences += shadowed_attrs(&attrs);
+                    stats.duplicate_attr_occurrences += duplicate_attrs(&attrs);
                 }
                 let mut contents = Vec::with_capacity(request.contents.len());
                 for selected in &request.contents {
@@ -900,7 +903,7 @@ fn project_content(
     }
 }
 
-fn shadowed_attrs(attrs: &[(String, AttrValue)]) -> usize {
+fn duplicate_attrs(attrs: &[(String, AttrValue)]) -> usize {
     let mut seen = HashSet::new();
     attrs.iter().filter(|(name, value)| !seen.insert((name.as_str(), value.type_tag()))).count()
 }
@@ -933,6 +936,12 @@ fn compare_attr(a: &AttrValue, b: &AttrValue, op: Compare) -> bool {
         (AttrValue::Bytes(a), AttrValue::Bytes(b)) => compare_order(a.cmp(b), op),
         (AttrValue::TimestampNs(a), AttrValue::TimestampNs(b)) => compare_order(a.cmp(b), op),
         (AttrValue::Null, AttrValue::Null) => op == Compare::Eq,
+        // Float equality is BIT equality, because byte-exactness is what this store promises:
+        // Eq matches the NaN payload a caller stored and distinguishes -0.0 from 0.0. Ordering is
+        // IEEE partial order, under which no NaN satisfies any inequality and -0.0 == 0.0 — so
+        // Eq(-0.0, 0.0) is false while LtEq and GtEq are both true, and Eq does not imply LtEq.
+        // Deliberate, documented in the scan doc; a caller wanting IEEE equality can express it as
+        // LtEq && GtEq.
         (AttrValue::Float(a), AttrValue::Float(b)) => match op {
             Compare::Eq => a.to_bits() == b.to_bits(),
             Compare::Ne => a.to_bits() != b.to_bits(),

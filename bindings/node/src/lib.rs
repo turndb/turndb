@@ -177,7 +177,7 @@ pub struct NativeScanStats {
     pub duration_ns: BigInt,
     pub examined: u32,
     pub returned: u32,
-    pub shadowed_attr_occurrences: u32,
+    pub duplicate_attr_occurrences: u32,
     pub content_values_reconstructed: u32,
     pub reconstructed_bytes: BigInt,
     pub reconstruction_budget_exhausted: bool,
@@ -233,7 +233,7 @@ pub struct NativeScanExplanation {
 #[cfg(feature = "sql")]
 #[napi(object)]
 pub struct NativeSqlParam {
-    /// `null`, `string`, `int`, `float`, `bool`, or `binary`.
+    /// `null`, `string`, `int`, `uint`, `float`, `bool`, `binary`, or `timestamp_ns`.
     pub kind: String,
     pub string_value: Option<String>,
     pub int_value: Option<BigInt>,
@@ -1585,12 +1585,14 @@ impl NativeStore {
         budget: NativeCompactionBudget,
         options: Option<NativeLifecycleOptions>,
     ) -> Result<PromiseRaw<'env, NativeBoundedCompactResult>> {
-        let budget = decode_compaction_budget(budget)?;
+        // Budget validation rejects through the promise like every other failure on this
+        // Promise-typed surface — a `.then()` caller must not need a try/catch for one method.
+        let budget = decode_compaction_budget(budget);
         let actor = self.actor.clone();
         let control = decode_lifecycle(options);
         env.spawn_future(async move {
             actor
-                .compact_bounded(budget, control)
+                .compact_bounded(budget?, control)
                 .await
                 .map(encode_bounded_compact)
                 .map_err(|error| engine_failure("compact TurnDB store within budget", error))
@@ -1605,12 +1607,12 @@ impl NativeStore {
         budget: NativeCompactionBudget,
         options: Option<NativeLifecycleOptions>,
     ) -> Result<PromiseRaw<'env, NativeCompactionSpaceResult>> {
-        let budget = decode_compaction_budget(budget)?;
+        let budget = decode_compaction_budget(budget);
         let actor = self.actor.clone();
         let control = decode_lifecycle(options);
         env.spawn_future(async move {
             actor
-                .estimate_compaction_space(budget, control)
+                .estimate_compaction_space(budget?, control)
                 .await
                 .map(encode_compaction_space)
                 .map_err(|error| engine_failure("estimate TurnDB compaction space", error))
@@ -2301,7 +2303,7 @@ fn decode_sql_param(param: NativeSqlParam) -> Result<SqlValue> {
             return Err(Error::new(
                 Status::InvalidArg,
                 format!(
-                    "unknown SQL parameter kind {other:?}; expected null, string, int, float, bool, or binary"
+                    "unknown SQL parameter kind {other:?}; expected null, string, int, uint, float, bool, binary, or timestamp_ns"
                 ),
             ))
         }
@@ -2626,7 +2628,7 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
             duration_ns: BigInt::from(page.stats.duration_ns),
             examined: page.stats.examined as u32,
             returned: page.stats.returned as u32,
-            shadowed_attr_occurrences: page.stats.shadowed_attr_occurrences as u32,
+            duplicate_attr_occurrences: page.stats.duplicate_attr_occurrences as u32,
             content_values_reconstructed: page.stats.content_values_reconstructed as u32,
             reconstructed_bytes: BigInt::from(page.stats.reconstructed_bytes),
             reconstruction_budget_exhausted: page.stats.reconstruction_budget_exhausted,

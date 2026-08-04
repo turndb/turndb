@@ -8,8 +8,8 @@ side of the Rust/JavaScript seam while allowing any Arrow-capable consumer to in
 Every query gets an isolated DataFusion session containing one table named `records`. Its columns are
 the collision-safe schema produced by `query::Lens`: `id`, named content (`body` or
 `content.<name>`), and self-described typed attributes. SQL uses `$1`, `$2`, and so on. Parameters are
-explicitly one of null, UTF-8 string, signed i64, f64, boolean, or binary; bindings must not interpolate
-them into SQL text. DDL, DML, COPY, PREPARE/EXECUTE, SET, and other session statements are rejected by
+explicitly one of null, UTF-8 string, signed i64, exact unsigned u64, f64, boolean, binary, or
+UTC-nanosecond timestamp; bindings must not interpolate them into SQL text. DDL, DML, COPY, PREPARE/EXECUTE, SET, and other session statements are rejected by
 DataFusion's typed plan validator.
 
 `SqlQuery` is pull-based. `schema_ipc()` is a complete zero-batch Arrow IPC stream, so an empty query

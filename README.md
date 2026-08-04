@@ -204,17 +204,21 @@ The engine is tested harder than its size suggests, because a storage engine tha
 worthless however elegant it is.
 
 ```sh
-cargo test                              # 12 suites
-cargo test --features dst --test dst    # 1,344 crash states, strict-POSIX durability model
+cargo test                              # the ordinary suites
+cargo test --features dst --test dst    # every crash state of six recorded protocols, strict POSIX
 cargo test --test corruption            # ~40k mutants across every parser
 STORM_XOR=$RANDOM cargo test --test corruption   # fresh mutant space
 ```
 
-The **deterministic simulation** harness records every write and fsync, then replays every crash
-point under a model where file content and directory entries become durable independently, and
-asserts the recovered store equals some prefix of the acknowledged writes. It found three real
-bugs in its first hour, including an ACK that was backed by a WAL whose directory entry was not
-yet durable.
+The **deterministic simulation** harness records every write, fsync, rename, link, unlink, and
+punch, then replays every crash point under a model where file content and directory entries
+become durable independently, and asserts the recovered store equals some prefix of the
+acknowledged writes. Six sweeps cover the write path and every publication protocol — backup,
+restore, manifest recovery with rollback, hole punching, and format migration — and each prints
+the exact number of crash states it checked, so the suite reports its own coverage instead of this
+paragraph carrying a number that rots. It found three real bugs in its first hours, including an
+ACK backed by a WAL whose directory entry was not yet durable, and a declared hole punch whose
+partially landed deallocation bricked writer recovery.
 
 The **corruption storm** mutates every on-disk structure and requires errors, never panics. It
 found five parser bug classes, including bounds checks of the form `at + n > len` that *overflow

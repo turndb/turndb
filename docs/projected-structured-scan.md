@@ -16,6 +16,11 @@ and then constructs a partial semantic record from those sets. Attribute layout 
 occurrences remain exact. A field used only by a predicate participates in evaluation but is not
 returned unless it was also projected. The same rule keeps predicate-only content out of result rows.
 
+Float predicates follow the store's byte-exactness rather than pure IEEE semantics: `Eq`/`Ne`
+compare bit patterns (the exact stored NaN payload matches; `-0.0` and `0.0` are distinct), while
+the ordering operators use IEEE partial order (no NaN satisfies any inequality; `-0.0` orders equal
+to `0.0`). Consequently `Eq` does not imply `LtEq`; IEEE equality is expressible as `LtEq && GtEq`.
+
 The writer checks its memtable first. A staged record is already resident as a semantic value, so it
 is filtered in memory; a staged tombstone returns absence. Only ids not present in the memtable reach
 the committed projected-read path. This preserves read-your-writes and ensures a rejected predicate
