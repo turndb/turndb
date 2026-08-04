@@ -169,6 +169,18 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
 - **Tests refuse a stale `.wasm`.** `npm/turndb/test/_artifact.mjs` compares the artifact against
   the newest engine source. Running `node --test` directly after changing Rust would otherwise
   report the *old* engine's behaviour, which has already cost one wrong verification.
+- **Native release tarballs come from the exact tagged source and exact tested bytes.** The manual
+  release workflow verifies an annotated `native-vX.Y.Z` tag, cross-builds one addon, audits its ELF
+  glibc floor and package contents, and install-tests the same uploaded tarballs on every declared
+  Node major before reaching the protected `npm` environment. Tracked native manifests remain
+  private; only release staging removes that guard.
+- **Native packages carry the legal payload and provenance.** Packaging stages the repository's
+  exact `LICENSE`, `NOTICE`, and generated third-party license report; the pinned generator must
+  reproduce that report from the locked release graph. Packaging hashes both tarballs, and
+  publication requires GitHub OIDC with npm provenance. The publish script requires release-job
+  markers, a release manifest, an exact tag, and unchanged tarball bytes. These are accident guards,
+  not authorization: a registry credential holder can deliberately bypass scripts, which is why the
+  protected `npm` environment and owner review remain required.
 
 **Not enforceable here — check these by hand at publish time:**
 
@@ -183,3 +195,7 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
 - **Whether `crates.io` and `npm` metadata still describe what ships.** Registry `description`
   fields render standalone, and `package.json` is not in its own `files` list — so no sweep over
   the package payload reaches them.
+- **The first native npm release's external configuration.** The owner must control the `@turndb`
+  scope and both package names, configure trusted publishing for `.github/workflows/release-native.yml`,
+  and protect the GitHub `npm` environment with required review. Source code cannot prove those
+  registry and repository settings.

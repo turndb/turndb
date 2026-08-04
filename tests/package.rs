@@ -78,7 +78,45 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
     .unwrap();
     assert_eq!(portable["engines"]["node"], ">=22 <27");
     assert_eq!(native["engines"]["node"], ">=22 <27");
-    assert_eq!(native["private"], true, "the native addon has no published prebuild contract yet");
+    assert_eq!(
+        native["private"], true,
+        "prebuild readiness must not bypass owner-approved publication"
+    );
+    assert_eq!(native["napi"]["binaryName"], "turndb");
+    assert_eq!(
+        native["napi"]["targets"],
+        serde_json::json!(["x86_64-unknown-linux-gnu"]),
+        "every configured target needs its own build, package, and runtime evidence"
+    );
+    assert_eq!(native["optionalDependencies"]["@turndb/native-linux-x64-gnu"], "0.1.0");
+    assert_eq!(native["exports"]["."]["types"], "./index.d.ts");
+    assert_eq!(native["exports"]["."]["import"], "./index.mjs");
+    assert_eq!(native["exports"]["."]["require"], "./index.cjs");
+    for legal in ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.html"] {
+        assert!(
+            native["files"].as_array().unwrap().iter().any(|entry| entry == legal),
+            "native root package must declare {legal} in its payload"
+        );
+    }
+
+    let linux: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(format!("{root}/bindings/node/npm/linux-x64-gnu/package.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(linux["name"], "@turndb/native-linux-x64-gnu");
+    assert_eq!(linux["version"], native["version"]);
+    assert_eq!(linux["private"], true);
+    assert_eq!(linux["main"], "turndb.linux-x64-gnu.node");
+    assert_eq!(linux["os"], serde_json::json!(["linux"]));
+    assert_eq!(linux["cpu"], serde_json::json!(["x64"]));
+    assert_eq!(linux["libc"], serde_json::json!(["glibc"]));
+    for legal in ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.html"] {
+        assert!(
+            linux["files"].as_array().unwrap().iter().any(|entry| entry == legal),
+            "native platform package must declare {legal} in its payload"
+        );
+    }
 
     let ci = fs::read_to_string(format!("{root}/.github/workflows/ci.yml")).unwrap();
     let portable_job = ci
@@ -87,7 +125,7 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         .expect("CI must retain a distinct portable npm job");
     let native_job = ci
         .split_once("  native-node:\n")
-        .and_then(|(_, rest)| rest.split_once("  dst:\n").map(|(job, _)| job))
+        .and_then(|(_, rest)| rest.split_once("  native-prebuild:\n").map(|(job, _)| job))
         .expect("CI must retain a distinct native Node job");
     for (name, job) in [("portable", portable_job), ("native", native_job)] {
         assert!(
@@ -97,4 +135,44 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         assert!(!job.contains("node: ['18'"), "{name} CI resurrected an EOL major");
         assert!(!job.contains("node: ['20'"), "{name} CI resurrected an EOL major");
     }
+
+    let prebuild_install_job = ci
+        .split_once("  native-prebuild-install:\n")
+        .and_then(|(_, rest)| rest.split_once("  dst:\n").map(|(job, _)| job))
+        .expect("CI must install-test the collected native prebuild separately");
+    assert!(prebuild_install_job.contains("needs: native-prebuild"));
+    assert!(prebuild_install_job.contains("node: ['22', '24', '26']"));
+    assert!(prebuild_install_job.contains("scripts/test-prebuild.cjs"));
+}
+
+#[test]
+fn native_release_is_explicitly_owner_gated() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow =
+        fs::read_to_string(format!("{root}/.github/workflows/release-native.yml")).unwrap();
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("release_ref:"));
+    assert!(workflow.contains("node: ['22', '24', '26']"));
+    assert!(workflow.contains("needs: [build, install]"));
+    assert!(workflow.contains("environment: npm"));
+    assert!(workflow.contains("id-token: write"));
+    assert!(workflow.contains("package:pack:release"));
+    assert!(workflow.contains("scripts/publish-prebuild.cjs"));
+
+    let publisher =
+        fs::read_to_string(format!("{root}/bindings/node/scripts/publish-prebuild.cjs")).unwrap();
+    for guard in [
+        "GITHUB_ACTIONS",
+        "TURNDB_RELEASE_APPROVED",
+        "publishable !== true",
+        "--exact-match",
+        "cat-file",
+        "--provenance",
+    ] {
+        assert!(publisher.contains(guard), "native publisher lost guard {guard}");
+    }
+    assert!(
+        publisher.contains("for (const tarball of [targetTarball, rootTarball])"),
+        "platform package must publish before the root selector package"
+    );
 }

@@ -181,11 +181,13 @@ prototype/publication status are defined in the
 The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
 Linux hole punching.
 
-`bindings/node` is the in-progress native server-side interface. Its `napi-rs` addon gives each open
+`bindings/node` is the native server-side release candidate. Its `napi-rs` addon gives each open
 writer a dedicated Rust actor and bounded queue, exposes Promise-based batch/durability/scan/content
 operations with `Buffer` and exact `bigint`, and refuses to fall back to WASM when a native artifact
-is unavailable. It is currently a source prototype; its README states the supported slice and the
-remaining production gaps.
+is unavailable. The first prebuilt slice is Linux x86-64 glibc across Node 22, 24, and 26; its root
+and platform manifests remain private in source even when explicit release staging is approved. The
+[native prebuild contract](docs/native-prebuilds.md) states the exact artifact, install, provenance,
+and publication gates.
 
 It also builds for **`wasm32-wasip1`**, which is what the [`turndb` npm package](npm/turndb)
 ships: one `.wasm`, no native addon, no prebuild matrix, no postinstall. A store written by either

@@ -3,21 +3,66 @@
   "version": "0.1.0",
   "private": true,
   "description": "Native N-API embedding interface for TurnDB",
+  "keywords": [
+    "database",
+    "content-addressed",
+    "columnar",
+    "tracing",
+    "napi"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/turndb/turndb.git",
+    "directory": "bindings/node"
+  },
   "main": "index.cjs",
+  "module": "index.mjs",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.cjs",
+      "default": "./index.cjs"
+    }
+  },
   "files": [
     "index.cjs",
+    "index.mjs",
     "index.d.ts",
     "README.md",
-    "*.node"
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.html"
   ],
   "engines": {
     "node": ">=22 <27"
   },
   "scripts": {
-    "test:dev": "node scripts/test-dev.cjs"
+    "test:dev": "node scripts/test-dev.cjs",
+    "prebuild:linux-x64-gnu": "napi build --platform --profile native-release --target x86_64-unknown-linux-gnu --no-js --output-dir artifacts",
+    "prebuild:linux-x64-gnu:cross": "napi build --platform --profile native-release --target x86_64-unknown-linux-gnu --use-napi-cross --no-js --output-dir artifacts",
+    "package:create": "napi create-npm-dirs --npm-dir npm",
+    "package:collect": "napi artifacts --output-dir artifacts --npm-dir npm",
+    "package:pack": "node scripts/pack-prebuild.cjs",
+    "package:pack:release": "node scripts/pack-prebuild.cjs --release",
+    "test:prebuild": "node scripts/test-prebuild.cjs",
+    "test:release": "node scripts/publish-prebuild.cjs dist --check",
+    "test:types": "tsc --project test/types/tsconfig.json"
+  },
+  "optionalDependencies": {
+    "@turndb/native-linux-x64-gnu": "0.1.0"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0"
+    "@napi-rs/cli": "3.7.4",
+    "@types/node": "^24.0.0",
+    "typescript": "6.0.3"
+  },
+  "napi": {
+    "binaryName": "turndb",
+    "targets": [
+      "x86_64-unknown-linux-gnu"
+    ]
   }
 }

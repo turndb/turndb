@@ -13,9 +13,19 @@ function load(filename) {
 }
 
 const explicit = process.env.TURNDB_NATIVE_PATH;
+const libc = process.platform === 'linux'
+  ? (process.report?.getReport?.().header?.glibcVersionRuntime ? 'gnu' : 'musl')
+  : null;
+const target = process.platform === 'linux' && process.arch === 'x64' && libc === 'gnu'
+  ? {
+      suffix: 'linux-x64-gnu',
+      package: '@turndb/native-linux-x64-gnu',
+    }
+  : null;
 const candidates = explicit
   ? [path.resolve(explicit)]
   : [
+      ...(target ? [path.join(__dirname, `turndb.${target.suffix}.node`)] : []),
       path.join(__dirname, `turndb.${process.platform}-${process.arch}.node`),
       path.join(__dirname, 'turndb.node'),
     ];
@@ -28,11 +38,27 @@ for (const candidate of candidates) {
   }
 }
 
+let optionalPackageError;
+if (!native && !explicit && target) {
+  try {
+    native = require(target.package);
+  } catch (error) {
+    const packageMissing = error?.code === 'MODULE_NOT_FOUND'
+      && typeof error.message === 'string'
+      && error.message.includes(`'${target.package}'`);
+    if (!packageMissing) throw error;
+    optionalPackageError = error;
+  }
+}
+
 if (!native) {
   throw new Error(
-    `No TurnDB native addon was found for ${process.platform}-${process.arch}. ` +
+    `No TurnDB native addon was found for ${process.platform}-${process.arch}` +
+      `${libc ? `-${libc}` : ''}. ` +
       `Looked for: ${candidates.join(', ')}. ` +
-      'This package does not silently fall back to the capability-reduced WASM build.'
+      `${target ? `Optional package: ${target.package}. ` : ''}` +
+      'This package does not silently fall back to the capability-reduced WASM build.',
+    { cause: optionalPackageError },
   );
 }
 

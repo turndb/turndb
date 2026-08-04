@@ -42,8 +42,9 @@ content model right before compatibility turns today's choices into permanent pr
   contract. Revision-3 WAL and parts now persist exact whole-value BLAKE3 identities computed during
   ingest, expose them through metadata-only structured scans and Node, preserve them through replay
   and streaming compaction, and report them unavailable for legacy values instead of confusing piece
-  or program hashes with byte identity. The Node package remains a source prototype, not yet a
-  production prebuild matrix. Its accepted command backlog is now a validated per-store open option
+  or program hashes with byte identity. The Node package now has a Linux x86-64 glibc prebuild
+  candidate, while registry publication and other native targets remain separate gates. Its accepted
+  command backlog is now a validated per-store open option
   with an explicit default and maximum, deterministic overload behavior, and an actual-capacity
   handle property. Structured scans now have a shareable Rust cancellation token and absolute
   deadline; Node maps `AbortSignal` and queue-inclusive `timeoutMs` onto them and classifies both as
@@ -60,8 +61,10 @@ content model right before compatibility turns today's choices into permanent pr
   planning, and stream startup; cancellation drops unfinished query work and releases its aggregate
   reservation without pretending it can retract a snapshot publication already submitted to the
   writer. CI builds and exercises
-  that default addon on every Node major claimed by the native package; platform prebuild production
-  and selection remain a separate unfinished gate. Online backup now settles an exact actor-ordered
+  that default addon on every Node major claimed by the native package. A separate prebuild job
+  cross-builds one N-API artifact, audits its glibc floor and package contents, and installs those
+  exact tarballs on the same Node matrix; the loader selects the optional platform package without a
+  WASI fallback. Publication remains owner-gated. Online backup now settles an exact actor-ordered
   cut, verifies the completed pack, and atomically refuses replacement. Restore verifies before
   mutation, extracts with bounded memory, validates a staged ordinary store, and uses an OS
   no-replace rename so an existing destination cannot be overlaid. The Rust and Node APIs return
@@ -418,11 +421,19 @@ the earlier dependency-only estimate; the current number measures the actually e
 DataFusion's unreachable Parquet and external compression features are disabled, while its ordinary
 SQL expression families remain. The default native package chooses the full profile because it
 exposes SQL and Arrow IPC; the structured no-feature build remains useful for embedders that
-explicitly choose the smaller capability set. Prebuild work should evaluate a dedicated LTO/strip
-profile rather than misreporting the ordinary release artifact.
+explicitly choose the smaller capability set. The dedicated prebuild profile now uses symbol
+stripping, thin LTO, and one code-generation unit while retaining unwinding. On the 2026-08-03 host it
+produced a 77,852,768-byte full-feature addon and a 26,147,438-byte publishable platform tarball;
+after adding the compressed third-party license report, the thin publishable root tarball was 32,579
+bytes. This is 37,614,936 bytes (32.6%) smaller than the ordinary stripped full-feature addon above.
+The local artifact required glibc 2.34 and is therefore a size
+measurement, not the release artifact; CI cross-builds and independently enforces a glibc-2.17 floor.
+A fat-LTO trial spent over nine minutes in the final link without producing an addon and was stopped;
+two clean thin-LTO builds completed in 6 minutes 1 second and 5 minutes 34 seconds.
 
-Remaining Phase-3 gaps are prebuilt platform artifacts; finer-grained interruption inside flush part
-encoding (SQL planning/pulls and major maintenance loops already have safe controls); typed
+Remaining Phase-3 gaps are green hosted evidence and owner-approved registry publication for the first
+prebuilt target, any later platform targets, finer-grained interruption inside flush part encoding
+(SQL planning/pulls and major maintenance loops already have safe controls), typed
 corruption/invariant markers for low-level paths that still conservatively
 classify as `INTERNAL`; and measured event-loop/query overhead under a representative mixed workload.
 
@@ -608,7 +619,11 @@ This phase turns demonstrated behavior into promises that downstream projects ca
   attribute against independent deterministic expectations while exercising both zstd encoders.
 - Performance baselines for ingestion, durable commit, metadata scans, content reconstruction,
   compaction, verification, recovery, and open time.
-- Published artifact sizes and measured costs for lightweight and full-featured packages.
+- Published artifact sizes and measured costs for lightweight and full-featured packages. **Release
+  candidate measured for the full native package:** the dedicated profile, binary, and local tarball
+  costs are recorded above and in `docs/native-prebuilds.md`; registry-reported size and installation
+  cost remain unavailable until publication. The lightweight source profile has an earlier binary
+  measurement but no platform package yet.
 - An operational handbook covering backup, recovery, maintenance, upgrades, and failure diagnosis.
 - A security review of file parsing, malformed inputs, binding boundaries, and resource exhaustion.
   **Initial review implemented and published:** manifest authority is semantically validated and
@@ -619,6 +634,30 @@ This phase turns demonstrated behavior into promises that downstream projects ca
   filesystem enumeration, physical WAL frames, and fold block/id growth now have configurable
   object-count admission across the same surfaces, including writer-side output reservations;
   parser, native, and portable boundaries plus remaining containment/CPU risks are documented.
+
+### Native Node 0.1.0 publication gate
+
+The first consumer flywheel does not require the 1.0 format freeze. It does require a narrow release
+claim whose evidence is complete:
+
+- the exact `native-v0.1.0` source tag passes ordinary CI;
+- one Linux x86-64 glibc artifact requires no symbols newer than glibc 2.17 and the same bytes install
+  and execute on Node 22, 24, and 26;
+- the platform and selector tarballs contain their complete API/legal payloads, match the recorded
+  hashes, and publish with provenance;
+- a clean installed-package consumer, shaped like CommandSuite's first adapter, needs no Rust
+  compiler or postinstall build and exercises durable mixed-record ingest, metadata-only timeline
+  projection/filtering/paging, named-content reconstruction, restart, and shutdown;
+- support limits, pre-1.0 semver/format evolution, release notes, and recovery from npm's non-atomic
+  two-package publication are explicit;
+- the owner controls the npm scope, configures trusted publishing and a protected GitHub release
+  environment, reviews the exact tag, and approves the external publication.
+
+The source tree now implements the package graph, loader, audited staging, same-artifact matrix,
+private-by-default manifests, and guarded provenance workflow. Hosted CI evidence, the clean
+installed-package consumer evidence, external registry/environment configuration, and owner approval
+remain before the gate can be reported as passed. Actual CommandSuite migration begins the live
+flywheel after this narrow package contract is available; it is not moved into TurnDB core.
 
 ### 1.0 gate
 
