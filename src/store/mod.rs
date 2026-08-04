@@ -790,11 +790,17 @@ impl Manifest {
     /// Bumps the commit counter, and writes the retained copy `MANIFEST.<commit>` BEFORE the
     /// rename: if the live manifest is later corrupted, the copy of the very state it carried is
     /// what recovery promotes. A crash between the copy and the rename leaves a retained manifest
-    /// describing a commit that never took effect — which is exactly the old manifest's state plus
-    /// a counter bump, and harmless: promotion would reproduce the state the store is already in.
+    /// describing a commit that never took effect. That residue is NOT the old state plus a
+    /// counter bump — the caller mutates the manifest before committing, so the copy names files
+    /// (a new part, a moved fold tail) the live manifest does not. Data-before-pointers makes
+    /// those files durable, but the commit's authority is the rename that never happened:
+    /// whatever the crashed commit acknowledged is still in the WAL, and writer open durably
+    /// removes the residue before replaying it, precisely so the counters this manifest restarts
+    /// cannot re-create a file name the residue still claims a digest for.
     ///
     /// One directory fsync at the end covers both dirents. Pruning runs last and is best-effort —
-    /// a retained manifest that outlives its window is swept space, never a correctness problem.
+    /// a retained manifest that outlives its window is swept space, never a correctness problem,
+    /// because it is OLDER than live: everything it pins, the live chain pins or has aged out.
     #[cfg(test)]
     fn commit(&mut self, dir: &Path) -> Result<()> {
         self.commit_with_limits(dir, ReadLimits::default())
@@ -1482,12 +1488,32 @@ fn promote_manifest_with_limits(
 ) -> Result<()> {
     // Recovery stages one temporary name before publication. If MANIFEST is absent, the rename
     // also leaves one additional persistent root entry. Reserve that worst case before changing
-    // the supplied directory; cleanup of a newer abandoned timeline happens only after publish.
+    // the supplied directory; the abandonment pruning below only removes entries, so the
+    // reservation is not affected by it.
     let directory_entries = count_directory_entries(dir, read_limits, "store directory")?;
     read_limits.admit_directory_entries(
         "store directory during manifest recovery",
         directory_entries.saturating_add(1),
     )?;
+    // Abandonment becomes durable BEFORE the new timeline publishes. The reverse order left a
+    // window where the promoted MANIFEST and the abandoned newer retained manifests were both
+    // durable: a crash there resurrected the abandoned timeline, a re-run of recovery would see
+    // the chain diverge, treat the store as damaged, and — because the resurrected commits are
+    // genuine descendants that can validate — promote the exact history the operator authorized
+    // abandoning. Pruning first converges instead: a crash before the rename leaves the damaged
+    // manifest and fewer candidates, and re-running recovery promotes the same target. The
+    // unlinks are propagated, not best-effort — an abandonment that cannot be made durable must
+    // not be reported as one.
+    let mut abandoned = false;
+    for retained in list_retained_with_limits(dir, read_limits)? {
+        if retained > commit {
+            crate::vfs::unlink(&retained_path(dir, retained))?;
+            abandoned = true;
+        }
+    }
+    if abandoned {
+        crate::vfs::sync_dir(dir)?;
+    }
     let tmp = dir.join("MANIFEST.tmp");
     let f = crate::vfs::create(&tmp)?;
     crate::vfs::write_all_at(&f, &tmp, bytes, 0)?;
@@ -1495,11 +1521,6 @@ fn promote_manifest_with_limits(
     drop(f);
     crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
     crate::vfs::sync_dir(dir)?;
-    for retained in list_retained_with_limits(dir, read_limits)? {
-        if retained > commit {
-            let _ = crate::vfs::unlink(&retained_path(dir, retained));
-        }
-    }
     Ok(())
 }
 
@@ -1729,6 +1750,31 @@ impl Store {
                 }
             }
         };
+
+        // The live MANIFEST is the only commit point, so a retained name it does not dominate is
+        // residue, not state. Two shapes exist. A retained commit NEWER than live is a commit
+        // that never took effect — a crash between the commit protocol's retained copy and its
+        // rename; whatever it acknowledged is still in the WAL and replays below. A retained
+        // manifest from ANOTHER FOLD GENERATION is a re-fold's purge that lost a race with a
+        // crash, and keeps content the re-fold exists to erase readable. Left in place, either
+        // shape pins files this manifest's counters will re-create by name, so a later flush
+        // would truncate a file a retained manifest still claims a digest for — and verification
+        // would report an inconsistency in a store that is behaving correctly. Removal is durable
+        // and precedes the sweep, which then collects whatever only these names pinned. A torn
+        // retained copy parses as nothing, pins nothing, and is left for window pruning.
+        let mut reconciled = false;
+        for c in list_retained_with_limits(dir, read_limits)? {
+            let stale_timeline = c > manifest.commit;
+            let stale_generation = !stale_timeline
+                && load_retained(dir, c).map(|m| m.fold_gen != manifest.fold_gen).unwrap_or(false);
+            if stale_timeline || stale_generation {
+                crate::vfs::unlink(&retained_path(dir, c))?;
+                reconciled = true;
+            }
+        }
+        if reconciled {
+            crate::vfs::sync_dir(dir)?;
+        }
 
         let root_entries = count_directory_entries(dir, read_limits, "store directory")?;
         let fold_path = refold::fold_dir(dir, manifest.fold_gen);
@@ -3958,11 +4004,24 @@ impl Store {
         // re-fold exists to make dropped content GONE, and a retained manifest would keep the old
         // generation — deleted records included — readable for MANIFEST_RETAIN more commits.
         // Time travel does not cross a re-fold, by design; that is the point of running one.
+        //
+        // The unlinks are durable and propagated, because they are the erasure claim, not window
+        // pruning: a swallowed failure or a lost dirent would leave the old generation readable
+        // through a name this method just promised was gone. The re-fold itself is already
+        // committed when this runs, so an error here means "committed, but the purge is
+        // incomplete — reopen the store", and reopening completes it: writer open durably removes
+        // retained manifests from any other fold generation.
         for c in list_retained_with_limits(&self.dir, self.read_limits)? {
             if c != self.manifest.commit {
-                let _ = crate::vfs::unlink(&retained_path(&self.dir, c));
+                crate::vfs::unlink(&retained_path(&self.dir, c)).with_context(|| {
+                    format!(
+                        "re-fold committed, but purging retained manifest {c} failed — reopen \
+                         the store to complete the purge"
+                    )
+                })?;
             }
         }
+        crate::vfs::sync_dir(&self.dir)?;
         self.retained_commit_count = 1;
         let part_cache_budget = self.pcache.budget();
         self.pcache = Arc::new(SectionCache::new(part_cache_budget));

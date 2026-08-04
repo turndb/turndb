@@ -1203,6 +1203,172 @@ fn checked_recovery_requires_an_explicit_rollback_allowance() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A rollback's abandoned timeline must not survive a crash. Recovery now durably prunes the
+/// abandoned retained manifests BEFORE publishing the rolled-back one, so the two timelines are
+/// never both durable — but a store recovered by a build predating that ordering (or restored from
+/// a backup taken mid-recovery) can still present resurrected residue. Writer open must remove it
+/// by NUMBER, without parsing: one resurrected copy here is valid bytes and one is damage, and both
+/// must go, because a retained commit newer than the live one is residue whatever its bytes say.
+/// The assertions are completeness-shaped: verification passes, the rolled-back record is byte-exact,
+/// and a fresh flush — which restarts part numbering below names the residue pinned — round-trips.
+#[test]
+fn a_crashed_rollbacks_resurrected_timeline_cannot_outlive_writer_open() {
+    let dir = tmp("resurrected-rollback");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let want_first = put(&mut store, "first", b"the surviving record, long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let first_commit = store.manifest().commit;
+    put(&mut store, "second", b"abandoned by rollback, long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let second_commit = store.manifest().commit;
+    put(&mut store, "third", b"also abandoned by rollback, long enough to fold");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let third_commit = store.manifest().commit;
+    drop(store);
+
+    let second_path = dir.join(format!("MANIFEST.{second_commit:08}"));
+    let third_path = dir.join(format!("MANIFEST.{third_commit:08}"));
+    let second_valid_bytes = std::fs::read(&second_path).unwrap();
+
+    // Damage the two newest retained copies and the live manifest, forcing a two-commit rollback.
+    for path in [&second_path, &third_path, &dir.join("MANIFEST")] {
+        let mut b = std::fs::read(path).unwrap();
+        b[10] ^= 0xff;
+        std::fs::write(path, &b).unwrap();
+    }
+    let third_damaged_bytes = std::fs::read(&third_path).unwrap();
+    let report = turndb::store::recover_manifest(
+        &dir,
+        cfg(),
+        turndb::store::RecoveryOptions { max_rollback_commits: 2 },
+    )
+    .unwrap();
+    assert_eq!(report.commit, first_commit);
+    assert!(!second_path.exists() && !third_path.exists(), "rollback must prune what it abandons");
+
+    // Resurrect the abandoned timeline: valid bytes at one commit, damage at the other.
+    std::fs::write(&second_path, &second_valid_bytes).unwrap();
+    std::fs::write(&third_path, &third_damaged_bytes).unwrap();
+
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    assert!(!second_path.exists(), "open must remove a resurrected VALID newer retained manifest");
+    assert!(!third_path.exists(), "open must remove a resurrected DAMAGED newer retained manifest");
+    assert_eq!(store.reconstruct("first").unwrap().unwrap(), want_first);
+    assert!(store.reconstruct("second").unwrap().is_none(), "rolled-back records stay rolled back");
+    let want_fourth = put(&mut store, "fourth", b"written after the reconciled open");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    drop(store);
+
+    turndb::store::verify_chain(&dir).unwrap();
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(reader.reconstruct("first").unwrap().unwrap(), want_first);
+    assert_eq!(reader.reconstruct("fourth").unwrap().unwrap(), want_fourth);
+    assert!(reader.reconstruct("third").unwrap().is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The commit protocol's own crash window: the retained copy of a commit lands before the rename
+/// that gives it authority, so a crash between the two leaves live = c, retained = {.., c+1}, the
+/// new part file durable, and the acknowledged records still in the WAL. Writer open must treat the
+/// newer retained name as residue — remove it durably, sweep the part it alone pinned, and replay
+/// the WAL — rather than leave a retained manifest whose pinned file the next flush rewrites in
+/// place. Both records must come back byte-exact and verification must pass after the re-flush
+/// reuses the crashed commit's part name.
+#[test]
+fn writer_open_completes_a_commits_crash_residue() {
+    let dir = tmp("commit-residue");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    let want_first = put(&mut store, "first", b"committed before the crash window opens");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let live_commit = store.manifest().commit;
+    let manifest_live_bytes = std::fs::read(dir.join("MANIFEST")).unwrap();
+    let want_second = put(&mut store, "second", b"acknowledged, then caught in the crash window");
+    store.sync().unwrap();
+    let wal_bytes = std::fs::read(dir.join("WAL")).unwrap();
+    store.flush().unwrap();
+    let crashed_commit = store.manifest().commit;
+    drop(store);
+
+    // Wind the commit back to the moment before its rename: live manifest and WAL as they were,
+    // the retained copy and the part file as the crashed commit left them.
+    std::fs::write(dir.join("MANIFEST"), &manifest_live_bytes).unwrap();
+    std::fs::write(dir.join("WAL"), &wal_bytes).unwrap();
+    let residue_path = dir.join(format!("MANIFEST.{crashed_commit:08}"));
+    assert!(residue_path.exists(), "the construction must leave the crashed commit's residue");
+
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    assert_eq!(store.manifest().commit, live_commit);
+    assert!(!residue_path.exists(), "open must durably remove the crashed commit's residue");
+    // The nearest VALID retained state — the live commit's own copy, same generation — must
+    // survive the same reconciliation untouched.
+    assert!(
+        dir.join(format!("MANIFEST.{live_commit:08}")).exists(),
+        "reconciliation must not remove retained manifests the live commit dominates"
+    );
+    assert_eq!(store.reconstruct("first").unwrap().unwrap(), want_first);
+    assert_eq!(
+        store.reconstruct("second").unwrap().unwrap(),
+        want_second,
+        "the acknowledged record must replay from the WAL, not depend on the residue"
+    );
+    store.flush().unwrap();
+    drop(store);
+
+    turndb::store::verify_chain(&dir).unwrap();
+    let reader = Store::open_read(&dir, cfg()).unwrap();
+    assert_eq!(reader.reconstruct("first").unwrap().unwrap(), want_first);
+    assert_eq!(reader.reconstruct("second").unwrap().unwrap(), want_second);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A re-fold purges the retained log because erasure trumps snapshots — and that purge must hold
+/// across a crash. If a pre-purge retained manifest resurrects, it names the OLD fold generation:
+/// writer open must remove it durably (its erasure declarations do not exist in the new
+/// generation), time travel to it must refuse rather than serve erased content, and the surviving
+/// records must remain byte-exact.
+#[test]
+fn a_crashed_refold_purge_is_completed_at_writer_open() {
+    let dir = tmp("refold-purge-residue");
+    let mut store = Store::open(&dir, cfg()).unwrap();
+    put(&mut store, "erase-me", b"content that must be gone after the re-fold, and long");
+    let want_keep = put(&mut store, "keep", b"content that must survive the re-fold, and long");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let old_commit = store.manifest().commit;
+    put(&mut store, "keep-2", b"a second commit so the retained log has depth");
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let old_retained_path = dir.join(format!("MANIFEST.{old_commit:08}"));
+    let old_retained_bytes = std::fs::read(&old_retained_path).unwrap();
+
+    let stats = store.erase_ids(&["erase-me".into()]).unwrap();
+    assert!(stats.refold.is_some(), "unique content existed, so the fold must be rewritten");
+    assert!(!old_retained_path.exists(), "the purge must have removed the pre-refold log");
+    drop(store);
+
+    // Resurrect the pre-refold retained manifest, as a crash between the purge's unlink and its
+    // directory fsync could.
+    std::fs::write(&old_retained_path, &old_retained_bytes).unwrap();
+
+    let store = Store::open(&dir, cfg()).unwrap();
+    assert!(!old_retained_path.exists(), "open must remove a resurrected old-generation manifest");
+    assert!(store.reconstruct("erase-me").unwrap().is_none(), "erased content stays erased");
+    assert_eq!(store.reconstruct("keep").unwrap().unwrap(), want_keep);
+    drop(store);
+
+    turndb::store::verify_chain(&dir).unwrap();
+    assert!(
+        Store::open_read_at(&dir, cfg(), old_commit).is_err(),
+        "time travel must not cross the re-fold through resurrected residue"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
     // The orphan sweep made this destructive: an unreadable manifest yielded the DEFAULT manifest,
