@@ -61,6 +61,12 @@ turndb verify STORE_DIR --deep
 
 A failed attempt does not publish the candidate. A successful rollback permanently removes newer
 retained manifests from this store directory, so preserve the pre-recovery copy for diagnosis.
+The removal is made durable — unlinked and directory-fsynced — *before* the rolled-back manifest
+publishes, so no crash can leave both the promoted timeline and the abandoned one on disk: a crash
+before publication leaves the damaged manifest with the abandoned commits already gone, and
+re-running recovery promotes the same target. If a crash strands residue anyway (an interrupted
+recovery from a build predating this ordering), the next writer open durably removes any retained
+manifest newer than the live commit before replaying the WAL.
 
 ## Rust API
 
