@@ -283,6 +283,7 @@ export interface OperationMetrics {
 }
 
 export interface Metrics {
+  /** Per-handle counters. They start fresh each time the store is opened. */
   openRecovery: OperationMetrics;
   recoveredWalFrames: bigint;
   sync: OperationMetrics;
@@ -306,6 +307,10 @@ export interface LifecycleEvent {
   durationNs: bigint;
 }
 
+/**
+ * Lifecycle-operation history for this handle. Ordinary reads are not lifecycle operations: a
+ * failed read throws a typed error and affects metrics, but does not append an event here.
+ */
 export interface LifecycleEventBatch {
   events: LifecycleEvent[];
   oldestAvailableSequence: bigint | null;
