@@ -10,7 +10,9 @@ vocabulary belong in adapters above this contract.
 ## 1. Architecture decision
 
 TurnDB is an embedded, content-addressed, columnar, single-writer store with concurrent snapshot
-readers.
+readers. **Single-writer is enforced by the OS on Unix and is the embedder's obligation on
+`wasm32-wasip1`** — see [FORMAT.md](../FORMAT.md#the-writer-lock) and the exclusion row in
+[5. Platform capabilities](#5-platform-capabilities) below.
 
 - Rust owns storage semantics: byte ordering, record visibility, durability, content resolution,
   cursor construction, limits, and cancellation state.

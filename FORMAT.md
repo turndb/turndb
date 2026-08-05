@@ -73,9 +73,14 @@ obligation is precise: **at most one open writer per store directory, across all
 WASM instances.** One process is not sufficient isolation — a single process can open the same
 directory through two instances or two handles, and the file will not stop it.
 
-Two writers on one store will interleave WAL frames and corrupt it. Some of that damage may later
-trip a WAL or frame check, but **detection is not guaranteed, and the absence of an error does not
-establish that the store is intact.**
+What two concurrent writers do to a store has been measured in one pattern only, and this document
+does not generalise beyond it. In four overlapping-writer runs on the `wasm32-wasip1` build, both
+writers received successful durability acknowledgements and one writer's complete record set was
+silently discarded; the surviving store was internally consistent and every remaining record was
+readable. Other overlap patterns may fail differently, including by interleaving WAL frames and
+damaging them. **Detection is not guaranteed, and the absence of an error does not establish that
+the store holds every acknowledged write** — in the measured pattern the store was intact and the
+records were gone, so an integrity check is not the instrument for this.
 
 A lockfile is deliberately not used as a substitute. An `O_EXCL` file survives a hard kill, and a
 store wedged closed by a stale lock nobody can tell from a live one is a worse failure than the one

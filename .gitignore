@@ -20,3 +20,8 @@ bindings/node/npm/*/*.node
 bindings/node/*.tgz
 bindings/node/npm/*/*.tgz
 bindings/node/node_modules/
+
+# `cargo run --example readme_check` opens a store at this relative path, so it lands in the
+# repository root. A generated store is binary and content-addressed; a reviewer cannot read a diff
+# of one. The fix is the example writing to a temp dir (turndb#34) - this is the backstop, not it.
+mystore/

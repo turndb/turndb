@@ -211,7 +211,8 @@ Before widening the implementation, document the promises an embedder can depend
 ### Deliverables
 
 - An architectural decision record defining TurnDB as embedded, content-addressed, columnar, and
-  single-writer with concurrent readers.
+  single-writer with concurrent readers — single-writer being OS-enforced on Unix and the embedder's
+  obligation on `wasm32-wasip1`, as [FORMAT.md](FORMAT.md#the-writer-lock) states normatively.
 - A precise consistency model covering:
   - What `commit`, `sync`, and `flush` mean.
   - The durability acknowledgement point.
