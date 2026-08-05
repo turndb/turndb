@@ -256,9 +256,77 @@ export interface Capabilities {
   max_fold_blocks_default: number;
 }
 
-/** Every engine-reported failure, carrying the engine's own message. */
+export type ErrorCode =
+  | 'INVALID_ARGUMENT'
+  | 'CANCELLED'
+  | 'RESOURCE_EXHAUSTED'
+  | 'UNSUPPORTED'
+  | 'CONTENTION'
+  | 'NOT_FOUND'
+  | 'CORRUPTION'
+  | 'IO'
+  | 'INTERNAL';
+
+/** Every engine-reported failure, carrying a stable class and the engine's full message. */
 export declare class TurndbError extends Error {
   readonly name: 'TurndbError';
+  readonly code: ErrorCode;
+}
+
+export interface VerificationReport {
+  /** Verification covers committed state; sync and flush staged writes before calling to include them. */
+  scope: 'committed_snapshot';
+  /** `incomplete` means verification succeeded but a legacy identity/digest was unavailable. */
+  state: 'valid' | 'incomplete';
+  retainedManifests: { state: 'verified' | 'not_applicable'; count: number };
+  chain: { links: number; partDigests: number; undigestedParts: number };
+  parts: number;
+  partSections: number;
+  fold: {
+    segments: number;
+    blocks: number;
+    bytes: bigint;
+    /** Crash residue outside the committed snapshot, reported rather than absorbed into `valid`. */
+    trailingUncommittedBytes: bigint;
+  };
+  records: number;
+  contentValues: number;
+  contentBytes: bigint;
+  contentIdentities: number;
+  unidentifiedContentValues: number;
+}
+
+export interface StoreHealth {
+  /** The handle answered. This is deliberately not an integrity verdict. */
+  state: 'available';
+  commit: bigint;
+  foldGeneration: number;
+  parts: number;
+  partRows: bigint;
+  memtableEntries: number;
+  memtableBytes: number;
+  walBytes: bigint;
+  walFrames: bigint;
+  foldDiskBytes: bigint;
+  foldSegments: number;
+  foldCacheHits: bigint;
+  foldCacheMisses: bigint;
+  foldCacheBytes: number;
+  foldCacheBudget: number;
+  foldBlockTargetBytes: number;
+  foldSegmentMaxBytes: number;
+  foldCompressionLevel: number;
+  foldCompressionThreads: number;
+  partCacheBytes: number;
+  partCacheBudget: number;
+  maxStoredFrameBytes: bigint;
+  maxDecodedFrameBytes: bigint;
+  maxDirectoryEntries: bigint;
+  maxWalFrames: bigint;
+  maxFoldBlocks: bigint;
+  dedupWindowEntries: number;
+  retainedCommits: number;
+  punchedBlocks: bigint;
 }
 
 /**
@@ -349,6 +417,10 @@ export declare class Store {
    */
   scan(request?: ScanRequest): ScanPage;
   stats(): Stats;
+  /** Verify every integrity leg in the committed snapshot, returning exact counts. */
+  verify(): VerificationReport;
+  /** Cheap operational facts; not a substitute for {@link Store.verify}. */
+  health(): StoreHealth;
   /**
    * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
    *
