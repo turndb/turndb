@@ -44,6 +44,9 @@ use std::cell::RefCell;
 use std::path::Path;
 use turndb::fold::FoldCfg;
 use turndb::read_limits::ReadLimits;
+use turndb::scan::{
+    Compare, ContentMode, ContentSelect, Direction, Predicate, ScanPage, ScanRequest,
+};
 use turndb::store::{Store, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
 
@@ -159,6 +162,16 @@ fn decode_attrs(json: &[u8]) -> Result<Vec<(String, AttrValue)>, String> {
     let arr = v.as_array().ok_or("attributes must be an array of [key, tag, value]")?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
+        out.push(decode_attr_triple(item, i)?);
+    }
+    Ok(out)
+}
+
+/// Decode one `[key, tag, value]` triple. The only place a scalar tag is interpreted, so the
+/// writer's attributes and a scan predicate's comparison value cannot drift apart in what `"u"`
+/// or `"t"` means.
+fn decode_attr_triple(item: &serde_json::Value, i: usize) -> Result<(String, AttrValue), String> {
+    {
         let t = item.as_array().ok_or_else(|| format!("attribute {i} is not an array"))?;
         if t.len() != 3 {
             return Err(format!("attribute {i} needs exactly [key, tag, value]"));
@@ -219,9 +232,8 @@ fn decode_attrs(json: &[u8]) -> Result<Vec<(String, AttrValue)>, String> {
             "n" if val.is_null() => AttrValue::Null,
             other => return Err(format!("attribute {key} has unknown tag {other:?}")),
         };
-        out.push((key.to_string(), av));
+        Ok((key.to_string(), av))
     }
-    Ok(out)
 }
 
 fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
@@ -714,6 +726,321 @@ pub unsafe extern "C" fn tdb_scan_ids(
     match with_store(h, |s| s.scan_ids(f, t, limit as usize, reverse != 0).map_err(fail)) {
         Ok(ids) => {
             set_out(serde_json::Value::from(ids).to_string().as_bytes());
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+// ── Structured scan ─────────────────────────────────────────────────────────
+//
+// `Store::scan` carries no feature gate, so the predicates, projection, and checked cursors below
+// are the same engine surface the native binding exposes — this ABI was simply not carrying them.
+// What it cannot carry is the two request fields that need a clock or another thread: `deadline`
+// and `cancellation` stay `None` here, and the JS layer documents them as native-only rather than
+// accepting a `timeoutMs` this build would silently ignore.
+
+/// Read a `usize` request bound, rejecting a value that is not a non-negative integer.
+fn field_usize(v: &serde_json::Value, name: &str, default: usize) -> Result<usize, String> {
+    match v.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("`{name}` is not a non-negative integer")),
+        Some(_) => Err(format!("`{name}` is not a number")),
+    }
+}
+
+/// Read a `u64` request bound. Accepts a decimal string as well as a number, because a JSON number
+/// crosses JavaScript as f64 and cannot carry every u64 exactly — the same reason the attribute
+/// encoding sends `i`/`u` as text.
+fn field_u64(v: &serde_json::Value, name: &str, default: u64) -> Result<u64, String> {
+    match v.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Number(n)) => {
+            n.as_u64().ok_or_else(|| format!("`{name}` is not a non-negative integer"))
+        }
+        Some(serde_json::Value::String(s)) => {
+            s.parse::<u64>().map_err(|_| format!("`{name}` is not a u64 in decimal text"))
+        }
+        Some(_) => Err(format!("`{name}` is not a number or decimal string")),
+    }
+}
+
+fn field_str(v: &serde_json::Value, name: &str) -> Result<Option<String>, String> {
+    match v.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("`{name}` is not a string")),
+    }
+}
+
+fn decode_compare(s: &str) -> Result<Compare, String> {
+    match s {
+        "eq" => Ok(Compare::Eq),
+        "ne" => Ok(Compare::Ne),
+        "lt" => Ok(Compare::Lt),
+        "lte" => Ok(Compare::LtEq),
+        "gt" => Ok(Compare::Gt),
+        "gte" => Ok(Compare::GtEq),
+        other => Err(format!("unknown comparison {other:?}")),
+    }
+}
+
+fn decode_predicate(item: &serde_json::Value, i: usize) -> Result<Predicate, String> {
+    let kind = item
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .ok_or_else(|| format!("predicate {i} has no `kind`"))?;
+    let op = || -> Result<Compare, String> {
+        let raw = item
+            .get("op")
+            .and_then(|o| o.as_str())
+            .ok_or_else(|| format!("predicate {i} has no `op`"))?;
+        decode_compare(raw)
+    };
+    let present = || -> Result<bool, String> {
+        item.get("present")
+            .and_then(|p| p.as_bool())
+            .ok_or_else(|| format!("predicate {i} has no boolean `present`"))
+    };
+    let name = || -> Result<String, String> {
+        item.get("name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("predicate {i} has no `name`"))
+    };
+    match kind {
+        "id" => {
+            let value = item
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("predicate {i} has no string `value`"))?;
+            Ok(Predicate::Id { op: op()?, value: value.to_string() })
+        }
+        "attr" => {
+            let triple = item
+                .get("attr")
+                .ok_or_else(|| format!("predicate {i} has no `attr` [name, tag, value]"))?;
+            let (name, value) = decode_attr_triple(triple, i)?;
+            Ok(Predicate::Attr { name, op: op()?, value })
+        }
+        "attr_exists" => Ok(Predicate::AttrExists { name: name()?, present: present()? }),
+        "content_exists" => Ok(Predicate::ContentExists { name: name()?, present: present()? }),
+        other => Err(format!("predicate {i} has unknown kind {other:?}")),
+    }
+}
+
+/// Every key this ABI understands. An unrecognised key is refused rather than ignored: a caller who
+/// misspells `maxExamined` and silently gets the default has been told nothing went wrong.
+const SCAN_REQUEST_KEYS: &[&str] = &[
+    "from",
+    "to",
+    "direction",
+    "cursor",
+    "limit",
+    "maxExamined",
+    "maxResolutionEntries",
+    "maxReconstructedBytes",
+    "attrs",
+    "contents",
+    "predicates",
+];
+
+fn decode_scan_request(json: &[u8]) -> Result<ScanRequest, String> {
+    let v: serde_json::Value = if json.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(json).map_err(|e| format!("scan request is not valid JSON: {e}"))?
+    };
+    let obj = v.as_object().ok_or("scan request must be a JSON object")?;
+    for key in obj.keys() {
+        if !SCAN_REQUEST_KEYS.contains(&key.as_str()) {
+            return Err(format!("scan request has unknown field {key:?}"));
+        }
+    }
+
+    let defaults = ScanRequest::default();
+    let direction = match v.get("direction") {
+        None | Some(serde_json::Value::Null) => Direction::Forward,
+        Some(serde_json::Value::String(s)) if s == "forward" => Direction::Forward,
+        Some(serde_json::Value::String(s)) if s == "reverse" => Direction::Reverse,
+        Some(serde_json::Value::String(s)) => {
+            return Err(format!("unknown direction {s:?}"));
+        }
+        Some(_) => return Err("`direction` is not a string".into()),
+    };
+
+    let attrs = match v.get("attrs") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                a.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("projected attribute {i} is not a string"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("`attrs` is not an array".into()),
+    };
+
+    let contents = match v.get("contents") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let name = c
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| format!("content selection {i} has no `name`"))?;
+                let mode = match c.get("mode").and_then(|m| m.as_str()) {
+                    Some("metadata") => ContentMode::Metadata,
+                    Some("bytes") => ContentMode::Bytes,
+                    Some(other) => {
+                        return Err(format!("content selection {i} has unknown mode {other:?}"))
+                    }
+                    None => {
+                        return Err(format!(
+                            "content selection {i} has no `mode` (\"metadata\" or \"bytes\")"
+                        ))
+                    }
+                };
+                Ok(ContentSelect { name: name.to_string(), mode })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        Some(_) => return Err("`contents` is not an array".into()),
+    };
+
+    let predicates = match v.get("predicates") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, p)| decode_predicate(p, i))
+            .collect::<Result<Vec<_>, String>>()?,
+        Some(_) => return Err("`predicates` is not an array".into()),
+    };
+
+    Ok(ScanRequest {
+        from: field_str(&v, "from")?,
+        to: field_str(&v, "to")?,
+        direction,
+        cursor: field_str(&v, "cursor")?,
+        limit: field_usize(&v, "limit", defaults.limit)?,
+        max_examined: field_usize(&v, "maxExamined", defaults.max_examined)?,
+        max_resolution_entries: field_usize(
+            &v,
+            "maxResolutionEntries",
+            defaults.max_resolution_entries,
+        )?,
+        max_reconstructed_bytes: field_u64(
+            &v,
+            "maxReconstructedBytes",
+            defaults.max_reconstructed_bytes,
+        )?,
+        deadline: None,
+        cancellation: None,
+        attrs,
+        contents,
+        predicates,
+    })
+}
+
+/// A counter that can exceed 2^53. Decimal text keeps it exact across JSON; the JS layer returns a
+/// BigInt, matching what the native binding returns for the same field.
+fn big(n: u64) -> serde_json::Value {
+    serde_json::Value::from(n.to_string())
+}
+
+fn encode_scan_page(page: &ScanPage) -> serde_json::Value {
+    let rows = page
+        .rows
+        .iter()
+        .map(|row| {
+            let contents = row
+                .contents
+                .iter()
+                .map(|c| {
+                    let mut o = serde_json::json!({ "name": c.name, "present": c.present });
+                    let m = o.as_object_mut().expect("just built as an object");
+                    if let Some(len) = c.len {
+                        m.insert("len".into(), big(len));
+                    }
+                    if let Some(pieces) = c.pieces {
+                        m.insert("pieces".into(), serde_json::Value::from(pieces));
+                    }
+                    if let Some(identity) = c.identity {
+                        m.insert("identity".into(), serde_json::Value::from(identity.to_hex()));
+                    }
+                    if let Some(bytes) = &c.bytes {
+                        m.insert("bytes".into(), serde_json::Value::from(b64_encode(bytes)));
+                    }
+                    o
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": row.id,
+                "attrs": encode_attrs(&row.attrs),
+                "contents": contents,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let s = &page.stats;
+    let io = &s.io;
+    let r = &s.resolution;
+    serde_json::json!({
+        "rows": rows,
+        "next": page.next,
+        "stats": {
+            "durationNs": big(s.duration_ns),
+            "examined": s.examined,
+            "returned": s.returned,
+            "duplicateAttrOccurrences": s.duplicate_attr_occurrences,
+            "contentValuesReconstructed": s.content_values_reconstructed,
+            "reconstructedBytes": big(s.reconstructed_bytes),
+            "reconstructionBudgetExhausted": s.reconstruction_budget_exhausted,
+            "io": {
+                "partSectionsTouched": big(io.part_sections_touched as u64),
+                "partSectionCacheHits": big(io.part_section_cache_hits),
+                "partSectionCacheMisses": big(io.part_section_cache_misses),
+                "partStoredBytesRead": big(io.part_stored_bytes_read),
+                "partRawBytesDecoded": big(io.part_raw_bytes_decoded),
+                "foldBlocksTouched": big(io.fold_blocks_touched as u64),
+                "foldBlockCacheHits": big(io.fold_block_cache_hits),
+                "foldBlockCacheMisses": big(io.fold_block_cache_misses),
+                "foldStoredBytesRead": big(io.fold_stored_bytes_read),
+                "foldRawBytesDecoded": big(io.fold_raw_bytes_decoded),
+            },
+            "resolution": {
+                "physicalRows": big(r.physical_rows as u64),
+                "supersededRows": big(r.superseded_rows as u64),
+                "tombstones": big(r.tombstones as u64),
+                "memtableEntries": big(r.memtable_entries as u64),
+                "budgetExhausted": r.budget_exhausted,
+            },
+        },
+    })
+}
+
+/// One structured page as JSON: projected attributes, named-content metadata or bytes, the checked
+/// continuation cursor, and the page's exact work statistics.
+///
+/// # Safety
+/// `json`/`json_len` must describe initialised memory valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_scan(h: i32, json: *const u8, json_len: u32) -> i32 {
+    clear_err();
+    let req = match decode_scan_request(slice(json, json_len)) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+    match with_store(h, |s| s.scan(&req).map_err(fail)) {
+        Ok(page) => {
+            set_out(encode_scan_page(&page).to_string().as_bytes());
             0
         }
         Err(_) => -1,
