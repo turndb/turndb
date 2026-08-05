@@ -3,6 +3,11 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
+**"Single-writer" is a design property, not a guarantee on every build.** The engine enforces it on
+Unix and cannot on `wasm32-wasip1`, where it is the embedder's to keep. See
+[FORMAT.md](FORMAT.md#the-writer-lock), which is the normative statement, and
+*One writer per store* under [What it does not do](#what-it-does-not-do).
+
 **Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
@@ -169,8 +174,12 @@ the engine enforces this with `flock`, which the kernel releases when the proces
 stale lock cannot outlive its owner. **Under WASI there is no advisory locking and the engine
 cannot enforce it**: the lock file is created and gates nothing, so the obligation is the
 embedder's — at most one open writer per store directory, across every process and every WASM
-instance. Two writers will interleave their write-ahead logs and corrupt the store, and detection
-is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
+instance. **The guest cannot enforce or detect a violation, and the failure is not corruption.** In
+four measured overlapping-writer runs on Node 24, both writers received successful `sync()`
+acknowledgements and one writer's complete record set was silently discarded. The surviving store
+was internally consistent and every remaining record was readable, so **a clean read or verification
+cannot prove that an acknowledged write survived.** Other overlap patterns may fail differently.
+See [FORMAT.md](FORMAT.md#the-writer-lock) for the normative statement.
 
 ## Platforms
 
