@@ -205,9 +205,25 @@ Non-finite f64 values also use explicit text spellings rather than JSON `null`.
 
 ## Capability profile
 
-`await capabilities()` (or `store.capabilities()`) reports the compiled core's actual guarantees.
-These describe the WASI guest, not the host OS: this package reports embedder-enforced writer
-exclusion, no threads, and refold-only physical reclamation even when Node itself runs on Linux.
+`await capabilities()` (or `store.capabilities()`) reports what is reachable through this binding:
+callable operation names, the lifecycle-journal capacity, and facts explicitly absent here. In
+particular, allocated filesystem blocks and a cancellation token are absent on WASI; neither is
+reported as zero or silently accepted.
+
+`await compiledCapabilities()` is the separate answer to what mechanisms and format guarantees the
+guest contains. It describes the WASI guest, not the host OS: this package reports embedder-enforced
+writer exclusion and no threads even when Node itself runs on Linux. It deliberately carries no
+`physical_erasure` prediction. What one erase did is returned by `store.eraseIds(ids)` as
+`measured`, `not_applicable`, or `not_reclaimed` evidence for that operation.
+
+The callable observability surface is pull-based and local to the open handle:
+
+- `metrics()` returns cumulative operation counters and durations.
+- `lifecycleEvents({ after, limit })` reads the bounded journal non-destructively, including cursor
+  gaps and typed error codes.
+- `contentLiveness()` classifies live, stranded-dead, and block-reclaimable content after flush.
+- `spaceUsage()` classifies logical file bytes by manifest reachability. Its allocated-byte fields
+  are `{ state: 'absent' }` on WASI, never a fabricated zero.
 
 ## No SQL here, on purpose
 
