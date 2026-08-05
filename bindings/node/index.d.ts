@@ -169,7 +169,6 @@ export interface Capabilities {
   partFormatWrite: number;
   partFormatReadMax: number;
   writerExclusion: 'os_enforced' | 'embedder_enforced';
-  physicalErasure: 'punch_or_refold' | 'refold_only';
   positionedIo: boolean;
   threads: boolean;
   columnar: boolean;
