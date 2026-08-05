@@ -31,6 +31,19 @@ store.flush();   // seal into the columnar plane for other readers
 store.get('alice/1700000000000/req-1#input');       // bytes, byte-exact
 store.getText('alice/1700000000000/req-1#input');   // UTF-8 convenience; lossy on invalid bytes
 store.scanIds({ prefix: 'alice/', limit: 50, reverse: true });
+
+// Structured paging: the engine filters and projects, so a timeline page that selects no
+// content opens no fold block. `next` is an opaque checked cursor.
+const page = store.scan({
+  prefix: 'alice/',
+  direction: 'reverse',
+  limit: 50,
+  attrs: ['model', 'inputTokens'],
+  contents: [{ name: 'body', mode: 'metadata' }],
+  predicates: [{ kind: 'attr', name: 'model', op: 'eq', value: 'claude-opus-5' }],
+});
+page.rows[0].attrs;              // [['model', 'claude-opus-5'], ['inputTokens', 1204n]]
+page.stats.io.foldBlocksTouched; // 0n on a metadata-only page
 ```
 
 ## Why
