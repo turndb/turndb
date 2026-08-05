@@ -222,11 +222,25 @@ export interface Stats {
   parts: number;
 }
 
+export type BindingOperation =
+  | 'capabilities' | 'readLimits' | 'putBody' | 'applyBatch' | 'write' | 'delete'
+  | 'sync' | 'flush' | 'autoCompact' | 'maybeCompact' | 'get' | 'getText' | 'getRecord'
+  | 'scanIds' | 'scan' | 'stats' | 'verify' | 'health' | 'metrics' | 'lifecycleEvents'
+  | 'contentLiveness' | 'spaceUsage' | 'eraseIds' | 'close';
+
+/** What is actually callable through this npm/WASI binding. */
 export interface Capabilities {
+  binding: 'wasi';
+  operations: BindingOperation[];
+  limits: { lifecycleEvents: number };
+  unavailable: { allocatedBytes: 'absent'; cancellationToken: 'absent' };
+}
+
+/** Mechanisms and format facts compiled into the guest, independent of binding reachability. */
+export interface CompiledCapabilities {
   part_format_write: number;
   part_format_read_max: number;
   writer_exclusion: 'os_enforced' | 'embedder_enforced';
-  physical_erasure: 'punch_or_refold' | 'refold_only';
   positioned_io: boolean;
   threads: boolean;
   columnar: boolean;
@@ -242,7 +256,6 @@ export interface Capabilities {
   part_distribution: true;
   content_liveness: true;
   lifecycle_event_journal: true;
-  lifecycle_event_capacity: number;
   query_timings: true;
   sql_explain: false;
   max_record_bytes_default: number;
@@ -254,6 +267,97 @@ export interface Capabilities {
   max_directory_entries_default: number;
   max_wal_frames_default: number;
   max_fold_blocks_default: number;
+}
+
+export declare function capabilities(): Promise<Capabilities>;
+export declare function compiledCapabilities(): Promise<CompiledCapabilities>;
+
+export interface OperationMetrics {
+  attempts: bigint;
+  succeeded: bigint;
+  failed: bigint;
+  cancelled: bigint;
+  totalDurationNs: bigint;
+  lastDurationNs: bigint;
+  maxDurationNs: bigint;
+}
+
+export interface Metrics {
+  /** Per-handle counters. They start fresh each time the store is opened. */
+  openRecovery: OperationMetrics;
+  recoveredWalFrames: bigint;
+  sync: OperationMetrics;
+  flush: OperationMetrics;
+  compaction: OperationMetrics;
+  backup: OperationMetrics;
+  verification: OperationMetrics;
+  verificationCorruptionFailures: bigint;
+  punch: OperationMetrics;
+  refold: OperationMetrics;
+  erase: OperationMetrics;
+  formatMigration: OperationMetrics;
+  foldedContent: { pieces: bigint; dedupHits: bigint; logicalBytes: bigint; novelBytes: bigint };
+}
+
+export interface LifecycleEvent {
+  sequence: bigint;
+  operation: string;
+  outcome: 'succeeded' | 'failed' | 'cancelled';
+  errorCode: ErrorCode | null;
+  durationNs: bigint;
+}
+
+/**
+ * Lifecycle-operation history for this handle. Ordinary reads are not lifecycle operations: a
+ * failed read throws a typed error and affects metrics, but does not append an event here.
+ */
+export interface LifecycleEventBatch {
+  events: LifecycleEvent[];
+  oldestAvailableSequence: bigint | null;
+  latestSequence: bigint;
+  droppedEvents: bigint;
+  gap: boolean;
+  capacity: number;
+}
+
+export interface FoldBlockSpace {
+  blocks: bigint;
+  rawBytes: bigint;
+  storedBytes: bigint;
+}
+
+export interface ContentLiveness {
+  livePieces: bigint;
+  liveLogicalBytes: bigint;
+  deadLogicalBytes: bigint;
+  strandedDeadLogicalBytes: bigint;
+  liveBlocks: FoldBlockSpace;
+  reclaimableBlocks: FoldBlockSpace;
+}
+
+export type MeasuredBytes = { state: 'measured'; bytes: bigint } | { state: 'absent' };
+export interface SpaceAmount {
+  files: number;
+  logicalBytes: bigint;
+  allocatedBytes: MeasuredBytes;
+}
+export interface SpaceUsage {
+  live: SpaceAmount;
+  retainedOnly: SpaceAmount;
+  unclassified: SpaceAmount;
+  total: SpaceAmount;
+  filesystemAvailableBytes: MeasuredBytes;
+}
+
+export type ReclamationOutcome =
+  | { state: 'not_applicable' }
+  | { state: 'not_reclaimed'; reason: 'stale_generation_left' }
+  | { state: 'measured'; bytes: bigint; pieces: number };
+export interface ErasureResult {
+  requested: number;
+  erased: number;
+  absent: number;
+  reclamation: ReclamationOutcome;
 }
 
 export type ErrorCode =
@@ -421,6 +525,11 @@ export declare class Store {
   verify(): VerificationReport;
   /** Cheap operational facts; not a substitute for {@link Store.verify}. */
   health(): StoreHealth;
+  metrics(): Metrics;
+  lifecycleEvents(options?: { after?: bigint; limit?: number }): LifecycleEventBatch;
+  contentLiveness(): ContentLiveness;
+  spaceUsage(): SpaceUsage;
+  eraseIds(ids: string[]): ErasureResult;
   /**
    * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
    *
@@ -449,9 +558,6 @@ export declare class Store {
  * processes when multiple stores must be held open concurrently.
  */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
-
-/** Guarantees of the compiled portable core, independent of the host OS running WASI. */
-export declare function capabilities(): Promise<Capabilities>;
 
 /**
  * The first id that cannot start with `prefix`, or `null` when the range is unbounded above.
