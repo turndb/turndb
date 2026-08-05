@@ -195,6 +195,21 @@ export interface BatchRecord {
   delete?: boolean;
 }
 
+export interface NamedContent {
+  name: string;
+  bytes: Uint8Array | string;
+}
+
+export type WriteOperation =
+  | { kind: 'put'; id: string; contents: NamedContent[]; attrs?: Attrs }
+  | { kind: 'delete'; id: string };
+
+export interface WriteResult {
+  applied: number;
+  /** True only when the engine completed the durability sync before returning. */
+  durable: boolean;
+}
+
 export interface StoreRecord {
   id: string;
   body: Uint8Array;
@@ -276,6 +291,13 @@ export declare class Store {
   putBody(id: string, body: Uint8Array | string, attrs?: Attrs): void;
   /** Apply many records atomically — all-or-nothing, so a crash cannot commit half an export. */
   applyBatch(records: BatchRecord[]): number;
+  /**
+   * Apply generic named-content records and deletions atomically.
+   *
+   * With `durable: true`, a successful return is the acknowledgement: the exact batch is durable.
+   * A thrown error is not an acknowledgement and the caller must retain its source copy.
+   */
+  write(operations: WriteOperation[], options?: { durable?: boolean }): WriteResult;
   /** Tombstone a record. Not durable until {@link Store.sync}. */
   delete(id: string): void;
   /** Make everything written so far durable. **The ACK point.** */

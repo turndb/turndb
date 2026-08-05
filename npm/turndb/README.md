@@ -25,6 +25,20 @@ store.putBody('alice/1700000000000/req-1#input', JSON.stringify(messages), {
   inputTokens: 1204,
 });
 
+// One logical inference, with independently addressable request and response bytes. The return
+// value itself is the acknowledgement: it is produced only after the durability sync succeeds.
+const ack = store.write([{
+  kind: 'put',
+  id: 'alice/1700000000000/req-1',
+  contents: [
+    { name: 'request', bytes: requestBytes },
+    { name: 'response', bytes: responseBytes },
+  ],
+  // An array preserves order and duplicate names; an object cannot.
+  attrs: [['kind', 'llm_exchange'], ['tag', 'first'], ['tag', 'second']],
+}], { durable: true });
+if (!ack.durable) throw new Error('the source copy is still required');
+
 store.sync();    // the ACK point — durable from here
 store.flush();   // seal into the columnar plane for other readers
 
@@ -61,6 +75,8 @@ compaction never touches content.
 **`sync()` is the ACK point.** `putBody` is not durable on its own. `flush()` is a different thing
 again: it seals writes into the columnar plane so *other* readers see them. Your own handle sees
 its unflushed writes without either — a live view can read back what it just wrote for free.
+`write(operations, { durable: true })` combines an atomic generic batch with that ACK point and
+returns `{ applied, durable: true }`; a thrown error is never an acknowledgement.
 
 **Flush cadence is a compression dial.** Blocks sealed short compress worse. Measured on real trace
 traffic, flushing every record gave 15×; every 50 gave 171×; every 512 gave 292×. Batch your
