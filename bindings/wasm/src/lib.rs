@@ -42,6 +42,8 @@
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::time::{Duration, Instant};
+use turndb::control::OperationControl;
 use turndb::fold::FoldCfg;
 use turndb::read_limits::ReadLimits;
 use turndb::scan::{
@@ -177,6 +179,15 @@ fn with_store<T>(h: i32, f: impl FnOnce(&mut Store) -> Result<T, i32>) -> Result
             None => Err(fail(format!("store handle {h} is not open"))),
         }
     })
+}
+
+/// Relative deadlines are constructed inside the guest, so they use the same WASI clock as the
+/// checkpoints that enforce them. Zero is deliberately an already-expired deadline.
+fn deadline_control(timeout_ms: u32) -> OperationControl {
+    OperationControl {
+        deadline: Some(Instant::now() + Duration::from_millis(u64::from(timeout_ms))),
+        cancellation: None,
+    }
 }
 
 // ── Attributes ──────────────────────────────────────────────────────────────
@@ -330,6 +341,12 @@ pub extern "C" fn tdb_binding_capabilities() -> i32 {
         ],
         "limits": {
             "lifecycleEvents": turndb::observability::EVENT_JOURNAL_CAPACITY,
+        },
+        "controls": {
+            "deadlineOperations": [
+                "scan", "sync", "flush", "autoCompact", "maybeCompact", "verify",
+                "contentLiveness", "spaceUsage", "eraseIds"
+            ],
         },
         "unavailable": {
             "allocatedBytes": "absent",
@@ -794,6 +811,15 @@ pub extern "C" fn tdb_sync(h: i32) -> i32 {
     with_store(h, |s| s.sync().map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
+/// Deadline-aware [`tdb_sync`]. The final cancellable checkpoint is before WAL fsync; once fsync
+/// starts, the acknowledgement boundary is uninterruptible.
+#[no_mangle]
+pub extern "C" fn tdb_sync_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    with_store(h, |s| s.sync_with_control(&control).map_err(fail_engine)).map_or(-1, |_| 0)
+}
+
 /// Seal the memtable into an immutable part. Reads through this handle do not need it — the writer
 /// sees its own unflushed writes — but the columnar plane and any other reader do.
 #[no_mangle]
@@ -802,11 +828,28 @@ pub extern "C" fn tdb_flush(h: i32) -> i32 {
     with_store(h, |s| s.flush().map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
+/// Deadline-aware [`tdb_flush`]. The final cancellable checkpoint is immediately before manifest
+/// publication; publication and the in-memory state transition are then uninterruptible.
+#[no_mangle]
+pub extern "C" fn tdb_flush_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    with_store(h, |s| s.flush_with_control(&control).map_err(fail_engine)).map_or(-1, |_| 0)
+}
+
 /// Merge parts if the threshold is reached. Returns 1 if a merge ran, 0 if not.
 #[no_mangle]
 pub extern "C" fn tdb_auto_compact(h: i32) -> i32 {
     clear_err();
     with_store(h, |s| s.auto_compact().map_err(fail_engine)).map_or(-1, |m| i32::from(m.is_some()))
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_auto_compact_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    with_store(h, |s| s.auto_compact_with_control(&control).map_err(fail_engine))
+        .map_or(-1, |m| i32::from(m.is_some()))
 }
 
 /// Bounded compaction: if at least `trigger` parts are live, merge the oldest `run` of them.
@@ -821,6 +864,21 @@ pub extern "C" fn tdb_maybe_compact(h: i32, trigger: u32, run: u32) -> i32 {
     clear_err();
     with_store(h, |s| s.maybe_compact(trigger as usize, run as usize).map_err(fail_engine))
         .map_or(-1, |m| i32::from(m.is_some()))
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_maybe_compact_with_timeout(
+    h: i32,
+    trigger: u32,
+    run: u32,
+    timeout_ms: u32,
+) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    with_store(h, |s| {
+        s.maybe_compact_with_control(trigger as usize, run as usize, &control).map_err(fail_engine)
+    })
+    .map_or(-1, |m| i32::from(m.is_some()))
 }
 
 // ── Reads ───────────────────────────────────────────────────────────────────
@@ -1039,6 +1097,7 @@ const SCAN_REQUEST_KEYS: &[&str] = &[
     "attrs",
     "contents",
     "predicates",
+    "timeoutMs",
 ];
 
 fn decode_scan_request(json: &[u8]) -> Result<ScanRequest, String> {
@@ -1134,7 +1193,18 @@ fn decode_scan_request(json: &[u8]) -> Result<ScanRequest, String> {
             "maxReconstructedBytes",
             defaults.max_reconstructed_bytes,
         )?,
-        deadline: None,
+        deadline: match v.get("timeoutMs") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                Instant::now()
+                    + Duration::from_millis(
+                        value
+                            .as_u64()
+                            .filter(|value| *value <= u64::from(u32::MAX))
+                            .ok_or("`timeoutMs` must be an integer from 0 through 4294967295")?,
+                    ),
+            ),
+        },
         cancellation: None,
         attrs,
         contents,
@@ -1357,29 +1427,42 @@ pub unsafe extern "C" fn tdb_lifecycle_events(h: i32, json: *const u8, json_len:
 }
 
 /// Exact content reachability for a settled committed snapshot.
+fn encode_content_liveness(report: turndb::observability::ContentLiveness) -> i32 {
+    let block = |value: turndb::observability::FoldBlockSpace| {
+        serde_json::json!({
+            "blocks": value.blocks.to_string(),
+            "rawBytes": value.raw_bytes.to_string(),
+            "storedBytes": value.stored_bytes.to_string(),
+        })
+    };
+    let value = serde_json::json!({
+        "livePieces": report.live_pieces.to_string(),
+        "liveLogicalBytes": report.live_logical_bytes.to_string(),
+        "deadLogicalBytes": report.dead_logical_bytes.to_string(),
+        "strandedDeadLogicalBytes": report.stranded_dead_logical_bytes.to_string(),
+        "liveBlocks": block(report.live_blocks),
+        "reclaimableBlocks": block(report.reclaimable_blocks),
+    });
+    set_out(value.to_string().as_bytes());
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn tdb_content_liveness(h: i32) -> i32 {
     clear_err();
     match with_store(h, |store| store.content_liveness().map_err(fail_engine)) {
-        Ok(report) => {
-            let block = |value: turndb::observability::FoldBlockSpace| {
-                serde_json::json!({
-                    "blocks": value.blocks.to_string(),
-                    "rawBytes": value.raw_bytes.to_string(),
-                    "storedBytes": value.stored_bytes.to_string(),
-                })
-            };
-            let value = serde_json::json!({
-                "livePieces": report.live_pieces.to_string(),
-                "liveLogicalBytes": report.live_logical_bytes.to_string(),
-                "deadLogicalBytes": report.dead_logical_bytes.to_string(),
-                "strandedDeadLogicalBytes": report.stranded_dead_logical_bytes.to_string(),
-                "liveBlocks": block(report.live_blocks),
-                "reclaimableBlocks": block(report.reclaimable_blocks),
-            });
-            set_out(value.to_string().as_bytes());
-            0
-        }
+        Ok(report) => encode_content_liveness(report),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_content_liveness_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    match with_store(h, |store| store.content_liveness_with_control(&control).map_err(fail_engine))
+    {
+        Ok(report) => encode_content_liveness(report),
         Err(code) => code,
     }
 }
@@ -1395,30 +1478,63 @@ fn encode_space_amount(value: turndb::store::SpaceAmount) -> serde_json::Value {
     })
 }
 
+fn encode_space_usage(usage: turndb::store::StoreSpaceUsage) -> i32 {
+    let value = serde_json::json!({
+        "live": encode_space_amount(usage.live),
+        "retainedOnly": encode_space_amount(usage.retained_only),
+        "unclassified": encode_space_amount(usage.unclassified),
+        "total": encode_space_amount(usage.total),
+        "filesystemAvailableBytes": match usage.filesystem_available_bytes {
+            Some(bytes) => serde_json::json!({ "state": "measured", "bytes": bytes.to_string() }),
+            None => serde_json::json!({ "state": "absent" }),
+        },
+    });
+    set_out(value.to_string().as_bytes());
+    0
+}
+
 /// Reachability-aware logical space facts and only platform facts the guest can measure.
 #[no_mangle]
 pub extern "C" fn tdb_space_usage(h: i32) -> i32 {
     clear_err();
     match with_store(h, |store| store.space_usage().map_err(fail_engine)) {
-        Ok(usage) => {
-            let value = serde_json::json!({
-                "live": encode_space_amount(usage.live),
-                "retainedOnly": encode_space_amount(usage.retained_only),
-                "unclassified": encode_space_amount(usage.unclassified),
-                "total": encode_space_amount(usage.total),
-                "filesystemAvailableBytes": match usage.filesystem_available_bytes {
-                    Some(bytes) => serde_json::json!({ "state": "measured", "bytes": bytes.to_string() }),
-                    None => serde_json::json!({ "state": "absent" }),
-                },
-            });
-            set_out(value.to_string().as_bytes());
-            0
-        }
+        Ok(usage) => encode_space_usage(usage),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_space_usage_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    match with_store(h, |store| store.space_usage_with_control(&control).map_err(fail_engine)) {
+        Ok(usage) => encode_space_usage(usage),
         Err(code) => code,
     }
 }
 
 /// Erase ids and return the outcome of this operation, including reclamation evidence.
+fn encode_erasure_result(result: turndb::store::ErasureStats) -> i32 {
+    let reclamation = match result.refold {
+        None => serde_json::json!({ "state": "not_applicable" }),
+        Some(refold) if refold.stale_generation_left => serde_json::json!({
+            "state": "not_reclaimed", "reason": "stale_generation_left",
+        }),
+        Some(refold) => serde_json::json!({
+            "state": "measured",
+            "bytes": refold.bytes_reclaimed().to_string(),
+            "pieces": refold.pieces_dropped,
+        }),
+    };
+    let value = serde_json::json!({
+        "requested": result.requested,
+        "erased": result.tombstoned,
+        "absent": result.absent,
+        "reclamation": reclamation,
+    });
+    set_out(value.to_string().as_bytes());
+    0
+}
 ///
 /// # Safety
 /// `json`/`json_len` must describe an array of string ids.
@@ -1430,28 +1546,26 @@ pub unsafe extern "C" fn tdb_erase_ids(h: i32, json: *const u8, json_len: u32) -
         Err(error) => return fail_invalid(format!("erase ids are not a string array: {error}")),
     };
     match with_store(h, |store| store.erase_ids(&ids).map_err(fail_engine)) {
-        Ok(result) => {
-            let reclamation = match result.refold {
-                None => serde_json::json!({ "state": "not_applicable" }),
-                Some(refold) if refold.stale_generation_left => serde_json::json!({
-                    "state": "not_reclaimed",
-                    "reason": "stale_generation_left",
-                }),
-                Some(refold) => serde_json::json!({
-                    "state": "measured",
-                    "bytes": refold.bytes_reclaimed().to_string(),
-                    "pieces": refold.pieces_dropped,
-                }),
-            };
-            let value = serde_json::json!({
-                "requested": result.requested,
-                "erased": result.tombstoned,
-                "absent": result.absent,
-                "reclamation": reclamation,
-            });
-            set_out(value.to_string().as_bytes());
-            0
-        }
+        Ok(result) => encode_erasure_result(result),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tdb_erase_ids_with_timeout(
+    h: i32,
+    json: *const u8,
+    json_len: u32,
+    timeout_ms: u32,
+) -> i32 {
+    clear_err();
+    let ids: Vec<String> = match serde_json::from_slice(slice(json, json_len)) {
+        Ok(ids) => ids,
+        Err(error) => return fail_invalid(format!("erase ids are not a string array: {error}")),
+    };
+    let control = deadline_control(timeout_ms);
+    match with_store(h, |store| store.erase_ids_with_control(&ids, &control).map_err(fail_engine)) {
+        Ok(result) => encode_erasure_result(result),
         Err(code) => code,
     }
 }
@@ -1460,50 +1574,58 @@ pub unsafe extern "C" fn tdb_erase_ids(h: i32, json: *const u8, json_len: u32) -
 ///
 /// Staged memtable/WAL state is deliberately outside this scope. A caller that wants current
 /// writes included must make them durable and flush them before calling this operation.
+fn encode_verification_report(report: turndb::store::StoreVerification) -> i32 {
+    let incomplete = report.chain.undigested > 0 || report.unidentified_content_values > 0;
+    let value = serde_json::json!({
+        "scope": "committed_snapshot",
+        "state": if incomplete { "incomplete" } else { "valid" },
+        "retainedManifests": {
+            "state": if report.chain.retained_manifests == 0 { "not_applicable" } else { "verified" },
+            "count": report.chain.retained_manifests,
+        },
+        "chain": {
+            "links": report.chain.links,
+            "partDigests": report.chain.part_digests,
+            "undigestedParts": report.chain.undigested,
+        },
+        "parts": report.parts,
+        "partSections": report.part_sections,
+        "fold": {
+            "segments": report.fold.segments,
+            "blocks": report.fold.blocks,
+            "bytes": report.fold.bytes.to_string(),
+            "trailingUncommittedBytes": report.fold.trailing_uncommitted.to_string(),
+        },
+        "records": report.records,
+        "contentValues": report.content_values,
+        "contentBytes": report.content_bytes.to_string(),
+        "contentIdentities": report.content_identities,
+        "unidentifiedContentValues": report.unidentified_content_values,
+    });
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            set_out(&bytes);
+            0
+        }
+        Err(error) => fail(format!("encode verification report: {error}")),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn tdb_verify(h: i32) -> i32 {
     clear_err();
     match with_store(h, |s| s.verify().map_err(fail_engine)) {
-        Ok(report) => {
-            let incomplete = report.chain.undigested > 0 || report.unidentified_content_values > 0;
-            let value = serde_json::json!({
-                "scope": "committed_snapshot",
-                "state": if incomplete { "incomplete" } else { "valid" },
-                "retainedManifests": {
-                    "state": if report.chain.retained_manifests == 0 {
-                        "not_applicable"
-                    } else {
-                        "verified"
-                    },
-                    "count": report.chain.retained_manifests,
-                },
-                "chain": {
-                    "links": report.chain.links,
-                    "partDigests": report.chain.part_digests,
-                    "undigestedParts": report.chain.undigested,
-                },
-                "parts": report.parts,
-                "partSections": report.part_sections,
-                "fold": {
-                    "segments": report.fold.segments,
-                    "blocks": report.fold.blocks,
-                    "bytes": report.fold.bytes.to_string(),
-                    "trailingUncommittedBytes": report.fold.trailing_uncommitted.to_string(),
-                },
-                "records": report.records,
-                "contentValues": report.content_values,
-                "contentBytes": report.content_bytes.to_string(),
-                "contentIdentities": report.content_identities,
-                "unidentifiedContentValues": report.unidentified_content_values,
-            });
-            match serde_json::to_vec(&value) {
-                Ok(bytes) => {
-                    set_out(&bytes);
-                    0
-                }
-                Err(error) => fail(format!("encode verification report: {error}")),
-            }
-        }
+        Ok(report) => encode_verification_report(report),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_verify_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    match with_store(h, |s| s.verify_with_control(&control).map_err(fail_engine)) {
+        Ok(report) => encode_verification_report(report),
         Err(code) => code,
     }
 }

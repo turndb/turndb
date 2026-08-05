@@ -2911,7 +2911,9 @@ impl Store {
         self.merge_range_with_control(lo, len, &crate::control::OperationControl::default())
     }
 
-    /// [`Store::merge_range`] with cooperative checkpoints before its manifest publication.
+    /// [`Store::merge_range`] with cooperative checkpoints. The final cancellable checkpoint is
+    /// immediately before manifest publication; publication and the in-memory replacement are
+    /// then uninterruptible.
     pub fn merge_range_with_control(
         &mut self,
         lo: usize,
@@ -3028,10 +3030,22 @@ impl Store {
         trigger: usize,
         run: usize,
     ) -> Result<Option<crate::part::merge::MergeStats>> {
+        self.maybe_compact_with_control(trigger, run, &crate::control::OperationControl::default())
+    }
+
+    /// [`Store::maybe_compact`] with cooperative checkpoints. The final cancellable checkpoint is
+    /// immediately before manifest publication in [`Store::merge_range_with_control`].
+    pub fn maybe_compact_with_control(
+        &mut self,
+        trigger: usize,
+        run: usize,
+        control: &crate::control::OperationControl,
+    ) -> Result<Option<crate::part::merge::MergeStats>> {
+        control.check("part compaction")?;
         if self.parts.len() < trigger {
             return Ok(None);
         }
-        self.merge_range(0, run.min(self.parts.len()))
+        self.merge_range_with_control(0, run.min(self.parts.len()), control)
     }
 
     /// The engine's compaction opinion: a TOTAL merge whenever the live list reaches
@@ -3054,7 +3068,8 @@ impl Store {
         self.auto_compact_with_control(&crate::control::OperationControl::default())
     }
 
-    /// [`Store::auto_compact`] with cooperative checkpoints.
+    /// [`Store::auto_compact`] with cooperative checkpoints. Its final cancellable checkpoint is
+    /// the manifest-publication boundary documented by [`Store::merge_range_with_control`].
     pub fn auto_compact_with_control(
         &mut self,
         control: &crate::control::OperationControl,

@@ -106,6 +106,8 @@ export interface ContentSelect {
 }
 
 export interface ScanRequest {
+  /** Cooperative relative deadline. Zero refuses before returning a partial page. */
+  timeoutMs?: number;
   /** Inclusive lower bound. */
   from?: string;
   /** Exclusive upper bound. */
@@ -233,6 +235,13 @@ export interface Capabilities {
   binding: 'wasi';
   operations: BindingOperation[];
   limits: { lifecycleEvents: number };
+  controls: {
+    /** Methods accepting cooperative `timeoutMs`; every name resolves on `Store`. */
+    deadlineOperations: Array<
+      'scan' | 'sync' | 'flush' | 'autoCompact' | 'maybeCompact' | 'verify'
+      | 'contentLiveness' | 'spaceUsage' | 'eraseIds'
+    >;
+  };
   unavailable: { allocatedBytes: 'absent'; cancellationToken: 'absent' };
 }
 
@@ -281,6 +290,13 @@ export interface OperationMetrics {
   lastDurationNs: bigint;
   maxDurationNs: bigint;
 }
+
+/**
+ * Cooperative relative deadline, measured by the guest clock. Zero refuses at the first safe
+ * checkpoint. AbortSignal is deliberately absent: this single-threaded guest cannot observe a
+ * token changing during a synchronous call.
+ */
+export interface DeadlineOptions { timeoutMs?: number }
 
 export interface Metrics {
   /** Per-handle counters. They start fresh each time the store is opened. */
@@ -473,9 +489,11 @@ export declare class Store {
   /** Tombstone a record. Not durable until {@link Store.sync}. */
   delete(id: string): void;
   /** Make everything written so far durable. **The ACK point.** */
-  sync(): void;
+  /** Last cancellable checkpoint: immediately before WAL fsync. */
+  sync(options?: DeadlineOptions): void;
   /** Seal the memtable into an immutable part, making writes visible to other readers. */
-  flush(): void;
+  /** Last cancellable checkpoint: immediately before manifest publication. */
+  flush(options?: DeadlineOptions): void;
   /**
    * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
    *
@@ -485,7 +503,7 @@ export declare class Store {
    * multi-second pause is acceptable, or bound the pause with {@link Store.maybeCompact}. Only
    * total merges settle deletes.
    */
-  autoCompact(): boolean;
+  autoCompact(options?: DeadlineOptions): boolean;
   /**
    * Bounded compaction: if at least `trigger` parts are live (default 8), merge the oldest `run`
    * of them (default 4). Returns whether a merge ran.
@@ -494,7 +512,7 @@ export declare class Store {
    * Bounded merges never settle deletes — run {@link Store.autoCompact} occasionally if the store
    * sees deletions.
    */
-  maybeCompact(opts?: { trigger?: number; run?: number }): boolean;
+  maybeCompact(opts?: { trigger?: number; run?: number; timeoutMs?: number }): boolean;
   /** The body, byte-exact, or `null` if absent or deleted. */
   get(id: string): Uint8Array | null;
   /**
@@ -516,20 +534,21 @@ export declare class Store {
    * Unlike {@link Store.scanIds} the filtering and projection happen in Rust against exact stored
    * values. A page selecting no content opens no fold block.
    *
-   * The native binding's `timeoutMs`/`signal` are deliberately absent: this build is
-   * single-threaded, so there is nothing to interrupt a scan from.
+   * `timeoutMs` is cooperative and checked by the guest. `AbortSignal` is deliberately absent:
+   * this single-threaded guest cannot observe a token changing during a synchronous call.
    */
   scan(request?: ScanRequest): ScanPage;
   stats(): Stats;
   /** Verify every integrity leg in the committed snapshot, returning exact counts. */
-  verify(): VerificationReport;
+  verify(options?: DeadlineOptions): VerificationReport;
   /** Cheap operational facts; not a substitute for {@link Store.verify}. */
   health(): StoreHealth;
   metrics(): Metrics;
   lifecycleEvents(options?: { after?: bigint; limit?: number }): LifecycleEventBatch;
-  contentLiveness(): ContentLiveness;
-  spaceUsage(): SpaceUsage;
-  eraseIds(ids: string[]): ErasureResult;
+  contentLiveness(options?: DeadlineOptions): ContentLiveness;
+  spaceUsage(options?: DeadlineOptions): SpaceUsage;
+  /** Last cancellable checkpoint: before the atomic tombstone batch; after it, erasure completes. */
+  eraseIds(ids: string[], options?: DeadlineOptions): ErasureResult;
   /**
    * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
    *
