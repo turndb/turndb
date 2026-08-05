@@ -47,7 +47,7 @@ use turndb::read_limits::ReadLimits;
 use turndb::scan::{
     Compare, ContentMode, ContentSelect, Direction, Predicate, ScanPage, ScanRequest,
 };
-use turndb::store::{Store, StoreOptions, WriteLimits};
+use turndb::store::{Batch, ContentSpans, Store, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
 
 thread_local! {
@@ -576,6 +576,130 @@ pub unsafe extern "C" fn tdb_apply(h: i32, json: *const u8, json_len: u32) -> i3
     }
     match with_store(h, |s| s.apply(batch).map_err(fail)) {
         Ok(()) => n as i32,
+        Err(_) => -1,
+    }
+}
+
+/// Apply a generic mixed batch atomically and optionally make it durable before returning.
+///
+/// The JSON wire shape is
+/// `[ ["put", id, [[content_name, base64_bytes], ...], attrs], ["del", id], ... ]`.
+/// Every put is staged through [`Batch::put_record`] before the store is touched, so malformed
+/// input cannot leave a prefix applied. On success the output is
+/// `{ "applied": N, "durable": bool }`; `durable` is true only after [`Store::sync`] succeeds.
+///
+/// This is a new export rather than a reinterpretation of [`tdb_apply`]: direct embedders using
+/// the original single-body batch ABI keep the exact contract they compiled against.
+///
+/// # Safety
+/// `json` must be valid UTF-8 JSON of `json_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_write(h: i32, json: *const u8, json_len: u32, durable: u32) -> i32 {
+    clear_err();
+    let raw = slice(json, json_len);
+    let v: serde_json::Value = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("write batch is not valid JSON: {e}")),
+    };
+    let items = match v.as_array() {
+        Some(items) => items,
+        None => return fail("write batch must be an array"),
+    };
+    let mut batch = Batch::new();
+    for (i, item) in items.iter().enumerate() {
+        let tuple = match item.as_array() {
+            Some(tuple) if !tuple.is_empty() => tuple,
+            _ => return fail(format!("write item {i} is not a non-empty array")),
+        };
+        match tuple[0].as_str() {
+            Some("put") => {
+                if tuple.len() != 4 {
+                    return fail(format!("write item {i}: put needs [op, id, contents, attrs]"));
+                }
+                let id = match tuple[1].as_str() {
+                    Some(id) => id,
+                    None => return fail(format!("write item {i}: id is not a string")),
+                };
+                let encoded_contents = match tuple[2].as_array() {
+                    Some(contents) => contents,
+                    None => return fail(format!("write item {i}: contents is not an array")),
+                };
+                let mut decoded = Vec::with_capacity(encoded_contents.len());
+                for (content_i, content) in encoded_contents.iter().enumerate() {
+                    let content = match content.as_array() {
+                        Some(content) if content.len() == 2 => content,
+                        _ => {
+                            return fail(format!(
+                                "write item {i} content {content_i} needs [name, base64]"
+                            ))
+                        }
+                    };
+                    let name = match content[0].as_str() {
+                        Some(name) => name,
+                        None => {
+                            return fail(format!(
+                                "write item {i} content {content_i}: name is not a string"
+                            ))
+                        }
+                    };
+                    let bytes = match content[1].as_str() {
+                        Some(encoded) => match b64_decode(encoded) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                return fail(format!("write item {i} content {content_i}: {e}"))
+                            }
+                        },
+                        None => {
+                            return fail(format!(
+                                "write item {i} content {content_i}: bytes are not base64 text"
+                            ))
+                        }
+                    };
+                    decoded.push((name, bytes));
+                }
+                let contents = decoded
+                    .iter()
+                    .map(|(name, bytes)| {
+                        ContentSpans::new(name, turndb::carve::Carve::default().carve(bytes))
+                    })
+                    .collect::<Vec<_>>();
+                let attrs = match decode_attrs(tuple[3].to_string().as_bytes()) {
+                    Ok(attrs) => attrs,
+                    Err(e) => return fail(format!("write item {i}: {e}")),
+                };
+                if let Err(e) = batch.put_record(id, &contents, attrs) {
+                    return fail(format!("write item {i}: {e:#}"));
+                }
+            }
+            Some("del") => {
+                if tuple.len() != 2 {
+                    return fail(format!("write item {i}: del needs [op, id]"));
+                }
+                match tuple[1].as_str() {
+                    Some(id) => batch.delete(id),
+                    None => return fail(format!("write item {i}: id is not a string")),
+                }
+            }
+            _ => return fail(format!("write item {i}: op must be \"put\" or \"del\"")),
+        }
+    }
+    let applied = batch.len();
+    let should_sync = durable != 0;
+    match with_store(h, |store| {
+        store.apply(batch).map_err(fail)?;
+        if should_sync {
+            store.sync().map_err(fail)?;
+        }
+        Ok(())
+    }) {
+        Ok(()) => {
+            set_out(
+                serde_json::json!({ "applied": applied, "durable": should_sync })
+                    .to_string()
+                    .as_bytes(),
+            );
+            0
+        }
         Err(_) => -1,
     }
 }
