@@ -63,9 +63,12 @@ must not read or write outside the directory it was given).
 **Full threat model, in scope and out, is
 [`docs/security-review.md`](docs/security-review.md).** It is an
 engineering threat review of the version-2 storage core, version-1 pack,
-and both bindings — and it says plainly what it is not: not formal
-verification, and not an independent third-party audit. Read it before
-reporting; several classes are deliberately out of scope and are
+native Node binding and portable WASI binding **as of 2026-08-03** — and
+it says plainly what it is not: not formal verification, and not an
+independent third-party audit. **Its own caveat carries as much weight:
+findings remain useful only if new format fields, parsers and binding
+methods update both the review and their adversarial tests.** Read it
+before reporting; several classes are deliberately out of scope and are
 documented there with reasons.
 
 ## Deliberately out of scope
