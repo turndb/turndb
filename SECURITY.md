@@ -73,16 +73,17 @@ documented there with reasons.
 These are design positions, not gaps we have missed. Each is argued in
 `docs/security-review.md`; the short form:
 
-- **Confidentiality of store contents.** The format is plaintext and
-  explicitly refuses its reserved encryption flag. CRC32 and BLAKE3
-  detect drift and bind identities; they are not keyed authenticity.
-  Encrypt the filesystem, not the store.
+- **Authentication or confidentiality of store contents.** The format
+  is plaintext and explicitly refuses its reserved encryption flag.
+  CRC32 and BLAKE3 detect drift and bind identities; they are not keyed
+  authenticity. Encrypt the filesystem, not the store.
 - **An attacker who can write the live store directory concurrently.**
   Writer locking coordinates cooperating writers. It is not a sandbox
   against a hostile filesystem peer, and path inspection cannot close
   time-of-check/time-of-use replacement races.
-- **Authorization, tenant isolation, redaction, network and transport
-  security.** TurnDB is embedded; these belong to the host.
+- **Authorization, tenant isolation, redaction, network protocol
+  security, and backup transport.** TurnDB is embedded; these belong to
+  the host.
 - **Denial of service from code already running in the same process.**
   That code can exhaust memory or CPU without going through TurnDB.
 
