@@ -26,8 +26,10 @@
  *
  * The host layer permits only one live `Store` in a process, but that is not cross-process
  * exclusion. The obligation is still the embedder's: **at most one open writer per store directory
- * across every process.** Two processes can interleave their write-ahead logs and corrupt the
- * store, and detection is not guaranteed.
+ * across every process.** What a violation does is stated once, with the measurement behind it, in
+ * this package's README under "Cross-process exclusion is yours to provide" — briefly: an
+ * acknowledged write can be lost silently from a store that still reads and verifies clean, so an
+ * integrity check is not the instrument for it.
  */
 
 import { WASI } from 'node:wasi';

@@ -3,6 +3,11 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
+**"Single-writer" is a design property, not a guarantee on every build.** The engine enforces it on
+Unix and cannot on `wasm32-wasip1`, where it is the embedder's to keep. See
+[FORMAT.md](FORMAT.md#the-writer-lock), which is the normative statement, and
+*One writer per store* under [What it does not do](#what-it-does-not-do).
+
 **Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
 where it and the code disagree, one of them is a bug.
 
@@ -80,12 +85,13 @@ s.flush()?;                                   // seal into an immutable part
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
 | **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
 
-The pack command takes the writer role, settles a recovered WAL, fully verifies its staged artifact,
+The pack command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-lock)), settles a
+recovered WAL, fully verifies its staged artifact,
 and refuses to replace an output path. Restore likewise verifies before extraction and atomically
 publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
-Manifest recovery is likewise exclusive and validates the complete candidate before publication;
-rollback past the newest retained commit requires explicit authorization. See
-[manifest recovery](docs/recovery.md).
+Manifest recovery likewise takes the writer role — excluding a live writer only where that role is
+enforced — and validates the complete candidate before publication; rollback past the newest
+retained commit requires explicit authorization. See [manifest recovery](docs/recovery.md).
 
 The query layers are independently selectable: `--features columnar --no-default-features` provides
 the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same
@@ -169,8 +175,12 @@ the engine enforces this with `flock`, which the kernel releases when the proces
 stale lock cannot outlive its owner. **Under WASI there is no advisory locking and the engine
 cannot enforce it**: the lock file is created and gates nothing, so the obligation is the
 embedder's — at most one open writer per store directory, across every process and every WASM
-instance. Two writers will interleave their write-ahead logs and corrupt the store, and detection
-is not guaranteed. See [FORMAT.md](FORMAT.md#the-writer-lock).
+instance. The guest cannot enforce or detect a violation. In four measured
+overlapping-writer runs on Node 24, both writers received successful `sync()` acknowledgements and
+one writer's complete record set was silently discarded. The surviving store was internally
+consistent and every remaining record was readable, so a clean read or verification cannot prove
+that an acknowledged write survived. Other overlap patterns may fail differently.
+See [FORMAT.md](FORMAT.md#the-writer-lock) for the normative statement.
 
 ## Platforms
 

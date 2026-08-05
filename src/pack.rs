@@ -317,9 +317,12 @@ impl Pack {
 /// Pack the committed snapshot of the store at `dir` into one file at `out`.
 ///
 /// Takes the store's writer role, recovers and settles its WAL, and then writes the exact published
-/// cut. A live writer therefore causes ordinary writer contention instead of a racing export. The
-/// completed temporary artifact is fully verified, then hard-linked under the final name. That
-/// publication is atomic and refuses an existing destination.
+/// cut. On Unix that role is an advisory `flock`, so a live writer causes ordinary writer contention
+/// instead of a racing export. On `wasm32-wasip1` there is no advisory locking: the lock file is
+/// created and gates nothing, so a concurrent writer is admitted and the cut may be racing — see
+/// [the writer lock](https://github.com/turndb/turndb/blob/main/FORMAT.md#the-writer-lock), which is
+/// normative. The completed temporary artifact is fully verified, then hard-linked under the final
+/// name. That publication is atomic and refuses an existing destination.
 pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
     write_with_control(dir, out, &crate::control::OperationControl::default())
 }
@@ -332,8 +335,10 @@ pub fn write_with_control(
 ) -> Result<PackStats> {
     control.check("backup")?;
     ensure_destination_available(out)?;
-    // Taking the writer role makes the public directory-based operation safe alongside other
-    // processes and also replays and includes a durable WAL instead of refusing or omitting it.
+    // Taking the writer role is what makes the public directory-based operation safe alongside
+    // other processes on Unix, where the role is an advisory flock; on wasm32-wasip1 it is the
+    // embedder's obligation and this open does not enforce it (FORMAT.md, "The writer lock"). It
+    // also replays and includes a durable WAL instead of refusing or omitting it.
     let mut store = crate::store::Store::open(dir, crate::fold::FoldCfg::default())?;
     let stats = store.backup_with_control(out, control)?;
     Ok(PackStats { files: stats.files, bytes: stats.bytes })
