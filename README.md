@@ -175,11 +175,11 @@ the engine enforces this with `flock`, which the kernel releases when the proces
 stale lock cannot outlive its owner. **Under WASI there is no advisory locking and the engine
 cannot enforce it**: the lock file is created and gates nothing, so the obligation is the
 embedder's — at most one open writer per store directory, across every process and every WASM
-instance. The guest cannot enforce or detect a violation. In four measured overlapping-writer runs
-on Node 24, both writers received successful `sync()` acknowledgements and one writer's complete
-record set was silently discarded. The surviving store was internally consistent and every remaining
-record was readable, so a clean read or verification cannot prove that an acknowledged write
-survived. Other overlap patterns may fail differently.
+instance. The guest cannot enforce or detect a violation. In four measured
+overlapping-writer runs on Node 24, both writers received successful `sync()` acknowledgements and
+one writer's complete record set was silently discarded. The surviving store was internally
+consistent and every remaining record was readable, so a clean read or verification cannot prove
+that an acknowledged write survived. Other overlap patterns may fail differently.
 See [FORMAT.md](FORMAT.md#the-writer-lock) for the normative statement.
 
 ## Platforms
