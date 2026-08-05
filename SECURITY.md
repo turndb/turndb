@@ -101,7 +101,8 @@ place rather than restated here:
   acknowledged writes silently.
 - **Concurrent hostile filesystem mutation is not contained.** Canonical
   backup checks protect an offline supplied store, but are not an
-  `openat2(RESOLVE_BENEATH)` sandbox.
+  `openat2(RESOLVE_BENEATH)` sandbox. **Applications must not grant
+  untrusted writers access to an actively opened store directory.**
 - **CPU budgets are cooperative, not preemptive.** One zstd frame
   decode/encode and one part encoding unit are intentionally
   uninterruptible. Admission limits and worker isolation are the
