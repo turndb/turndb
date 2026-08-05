@@ -4,14 +4,12 @@
 
 Please do **not** open a public issue for a security vulnerability.
 
-Report privately by email to **security@efficacious.io**. That is the
-primary channel and it always works.
+**Email security@efficacious.io.** That channel works at every moment,
+including right now, and does not depend on a repository setting.
 
-GitHub's [private vulnerability
-reporting](https://github.com/turndb/turndb/security/advisories/new) is
-also available. If that page is not reachable, the setting has not been
-armed yet — use the email address above rather than waiting or filing
-publicly.
+GitHub's private vulnerability reporting may also be available, under
+this repository's **Security → Report a vulnerability**. If you do not
+see it there, it is not enabled yet — use email.
 
 Useful reports include the affected commit, the platform and binding
 (native Rust, native Node addon, or portable WASI), and either a
