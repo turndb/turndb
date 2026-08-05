@@ -228,7 +228,7 @@ export type BindingOperation =
   | 'capabilities' | 'readLimits' | 'putBody' | 'applyBatch' | 'write' | 'delete'
   | 'sync' | 'flush' | 'autoCompact' | 'maybeCompact' | 'get' | 'getText' | 'getRecord'
   | 'scanIds' | 'scan' | 'stats' | 'verify' | 'health' | 'metrics' | 'lifecycleEvents'
-  | 'contentLiveness' | 'spaceUsage' | 'eraseIds' | 'close';
+  | 'contentLiveness' | 'spaceUsage' | 'estimateRefoldSpace' | 'refold' | 'eraseIds' | 'close';
 
 /** What is actually callable through this npm/WASI binding. */
 export interface Capabilities {
@@ -239,7 +239,7 @@ export interface Capabilities {
     /** Methods accepting cooperative `timeoutMs`; every name resolves on `Store`. */
     deadlineOperations: Array<
       'scan' | 'sync' | 'flush' | 'autoCompact' | 'maybeCompact' | 'verify'
-      | 'contentLiveness' | 'spaceUsage' | 'eraseIds'
+      | 'contentLiveness' | 'spaceUsage' | 'estimateRefoldSpace' | 'refold' | 'eraseIds'
     >;
   };
   unavailable: { allocatedBytes: 'absent'; cancellationToken: 'absent' };
@@ -368,12 +368,45 @@ export interface SpaceUsage {
 export type ReclamationOutcome =
   | { state: 'not_applicable' }
   | { state: 'not_reclaimed'; reason: 'stale_generation_left' }
-  | { state: 'measured'; bytes: bigint; pieces: number };
+  | {
+      state: 'measured';
+      /** Exact portable file-length delta, not allocated filesystem blocks. */
+      logicalBytes: bigint;
+      pieces?: number;
+      /** WASI cannot measure allocated blocks; absence is not zero and not an operation failure. */
+      allocatedBytes: { state: 'absent' };
+    };
 export interface ErasureResult {
   requested: number;
   erased: number;
   absent: number;
+  remaining: number;
   reclamation: ReclamationOutcome;
+}
+
+export interface RefoldSpaceEstimate {
+  sourceFoldLogicalBytes: bigint;
+  sourcePartBytes: bigint;
+  sourcePartSections: number;
+  sourcePartRawSectionBytes: bigint;
+  retainedOnlyLogicalBytesBefore: bigint;
+  /** Advisory duplicate-generation estimate, explicitly not an admission bound. */
+  estimatedStageBytes: bigint;
+  estimateIsHardBound: false;
+  filesystemAvailableBytes: MeasuredBytes;
+}
+
+export interface RefoldResult {
+  partsIn: number;
+  partsOut: number;
+  recordsKept: number;
+  recordsDropped: number;
+  tombstonesDropped: number;
+  piecesKept: number;
+  piecesDropped: number;
+  foldLogicalBytesBefore: bigint;
+  foldLogicalBytesAfter: bigint;
+  reclamation: Exclude<ReclamationOutcome, { state: 'not_applicable' }>;
 }
 
 export type ErrorCode =
@@ -547,6 +580,19 @@ export declare class Store {
   lifecycleEvents(options?: { after?: bigint; limit?: number }): LifecycleEventBatch;
   contentLiveness(options?: DeadlineOptions): ContentLiveness;
   spaceUsage(options?: DeadlineOptions): SpaceUsage;
+  /** Advisory duplicate-generation preflight. Writes nothing and requires a flushed memtable. */
+  estimateRefoldSpace(options?: DeadlineOptions): RefoldSpaceEstimate | null;
+  /**
+   * Rewrite content from the live-reference set and report exact logical output facts.
+   *
+   * This does NOT promise media-byte non-recoverability: not on arbitrary or copy-on-write
+   * filesystems, not through WASI, and not for copies already made.
+   */
+  refold(options?: DeadlineOptions): RefoldResult;
+  /**
+   * Atomically erase named ids and report query absence separately from reclamation.
+   * This carries the same explicit refusal of media-byte non-recoverability as {@link Store.refold}.
+   */
   /** Last cancellable checkpoint: before the atomic tombstone batch; after it, erasure completes. */
   eraseIds(ids: string[], options?: DeadlineOptions): ErasureResult;
   /**
