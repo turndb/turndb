@@ -107,6 +107,14 @@ function openLimit(value, name) {
   return value;
 }
 
+function timeoutMs(value) {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new TurndbError('timeoutMs must be an integer between 0 and 4294967295');
+  }
+  return value;
+}
+
 /**
  * The first id that cannot start with `prefix` — the exclusive upper bound of its range — or
  * `null` when no such id exists and the range is therefore unbounded above.
@@ -328,6 +336,7 @@ const SCAN_REQUEST_KEYS = new Set([
   'attrs',
   'contents',
   'predicates',
+  'timeoutMs',
 ]);
 
 function encodeScanRequest(opts) {
@@ -360,6 +369,7 @@ function encodeScanRequest(opts) {
   if (opts.attrs != null) req.attrs = opts.attrs;
   if (opts.contents != null) req.contents = opts.contents;
   if (opts.predicates != null) req.predicates = opts.predicates.map(encodePredicate);
+  if (opts.timeoutMs != null) req.timeoutMs = timeoutMs(opts.timeoutMs);
   return req;
 }
 
@@ -630,9 +640,12 @@ export class Store {
   }
 
   /** Make everything written so far durable. **This is the ACK point.** */
-  sync() {
+  sync({ timeoutMs: timeout } = {}) {
     this.#alive();
-    this.#check(this.#exports.tdb_sync(this.#handle));
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_sync(this.#handle)
+      : this.#exports.tdb_sync_with_timeout(this.#handle, value));
   }
 
   /**
@@ -642,9 +655,12 @@ export class Store {
    * flushing is about making them visible to OTHER readers and to the columnar plane. Flushing too
    * often costs compression — blocks sealed short compress worse — so batch it.
    */
-  flush() {
+  flush({ timeoutMs: timeout } = {}) {
     this.#alive();
-    this.#check(this.#exports.tdb_flush(this.#handle));
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_flush(this.#handle)
+      : this.#exports.tdb_flush_with_timeout(this.#handle, value));
   }
 
   /**
@@ -658,9 +674,12 @@ export class Store {
    * bound the pause instead. Total merges are also the only ones that settle deletes: a tombstone
    * can only be dropped when the merge covers every live part.
    */
-  autoCompact() {
+  autoCompact({ timeoutMs: timeout } = {}) {
     this.#alive();
-    return this.#check(this.#exports.tdb_auto_compact(this.#handle)) === 1;
+    const value = timeoutMs(timeout);
+    return this.#check(value === undefined
+      ? this.#exports.tdb_auto_compact(this.#handle)
+      : this.#exports.tdb_auto_compact_with_timeout(this.#handle, value)) === 1;
   }
 
   /**
@@ -681,12 +700,15 @@ export class Store {
     this.#alive();
     const trigger = opts.trigger ?? 8;
     const run = opts.run ?? 4;
+    const timeout = timeoutMs(opts.timeoutMs);
     if (!Number.isInteger(trigger) || trigger < 2 || !Number.isInteger(run) || run < 2) {
       throw new TurndbError(
         `maybeCompact: trigger and run must be integers >= 2 (got trigger=${trigger}, run=${run})`,
       );
     }
-    return this.#check(this.#exports.tdb_maybe_compact(this.#handle, trigger, run)) === 1;
+    return this.#check(timeout === undefined
+      ? this.#exports.tdb_maybe_compact(this.#handle, trigger, run)
+      : this.#exports.tdb_maybe_compact_with_timeout(this.#handle, trigger, run, timeout)) === 1;
   }
 
   /**
@@ -771,9 +793,9 @@ export class Store {
    * `cursor` is opaque and checked: pass back `next` with the same range, direction, and
    * predicates. Projection and page size may change between pages.
    *
-   * **Not available on this build:** the native binding's `timeoutMs`/`signal`. This engine is
-   * single-threaded with no clock in the guest, so there is nothing to interrupt a scan from — and
-   * accepting the options to ignore them would be worse than not offering them.
+   * `timeoutMs` is a cooperative deadline checked against the guest's WASI clock. `AbortSignal`
+   * remains unavailable: this engine is single-threaded, so no caller can flip a token during the
+   * synchronous operation; accepting one and silently ignoring it would be worse than absence.
    *
    * @param {object} [request]
    * @returns {{rows: Array<{id: string, attrs: Array<[string, unknown]>, contents: object[]}>, next?: string, stats: object}}
@@ -803,9 +825,12 @@ export class Store {
    * be included. `incomplete` is a successful verification with an explicitly unestablished legacy
    * fact; corruption throws `TurndbError` with `code === 'CORRUPTION'`.
    */
-  verify() {
+  verify({ timeoutMs: timeout } = {}) {
     this.#alive();
-    this.#check(this.#exports.tdb_verify(this.#handle));
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_verify(this.#handle)
+      : this.#exports.tdb_verify_with_timeout(this.#handle, value));
     const report = JSON.parse(this.#outText());
     report.fold.bytes = BigInt(report.fold.bytes);
     report.fold.trailingUncommittedBytes = BigInt(report.fold.trailingUncommittedBytes);
@@ -893,9 +918,12 @@ export class Store {
   }
 
   /** Exact live/dead/reclaimable content facts for a flushed committed snapshot. */
-  contentLiveness() {
+  contentLiveness({ timeoutMs: timeout } = {}) {
     this.#alive();
-    this.#check(this.#exports.tdb_content_liveness(this.#handle));
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_content_liveness(this.#handle)
+      : this.#exports.tdb_content_liveness_with_timeout(this.#handle, value));
     const report = JSON.parse(this.#outText());
     for (const field of [
       'livePieces', 'liveLogicalBytes', 'deadLogicalBytes', 'strandedDeadLogicalBytes',
@@ -907,9 +935,12 @@ export class Store {
   }
 
   /** Reachability-aware file usage; allocated bytes are explicitly absent on WASI. */
-  spaceUsage() {
+  spaceUsage({ timeoutMs: timeout } = {}) {
     this.#alive();
-    this.#check(this.#exports.tdb_space_usage(this.#handle));
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_space_usage(this.#handle)
+      : this.#exports.tdb_space_usage_with_timeout(this.#handle, value));
     const usage = JSON.parse(this.#outText());
     for (const amount of [usage.live, usage.retainedOnly, usage.unclassified, usage.total]) {
       amount.logicalBytes = BigInt(amount.logicalBytes);
@@ -924,14 +955,17 @@ export class Store {
   }
 
   /** Erase named ids and return this operation's logical and reclamation outcomes. */
-  eraseIds(ids) {
+  eraseIds(ids, { timeoutMs: timeout } = {}) {
     this.#alive();
     if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) {
       throw new TypeError('eraseIds needs an array of string ids');
     }
     const input = this.#putText(JSON.stringify(ids));
     try {
-      this.#check(this.#exports.tdb_erase_ids(this.#handle, ...input));
+      const value = timeoutMs(timeout);
+      this.#check(value === undefined
+        ? this.#exports.tdb_erase_ids(this.#handle, ...input)
+        : this.#exports.tdb_erase_ids_with_timeout(this.#handle, ...input, value));
       const result = JSON.parse(this.#outText());
       if (result.reclamation.state === 'measured') {
         result.reclamation.bytes = BigInt(result.reclamation.bytes);
