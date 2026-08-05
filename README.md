@@ -89,9 +89,9 @@ The pack command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-loc
 recovered WAL, fully verifies its staged artifact,
 and refuses to replace an output path. Restore likewise verifies before extraction and atomically
 publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
-Manifest recovery is likewise exclusive and validates the complete candidate before publication;
-rollback past the newest retained commit requires explicit authorization. See
-[manifest recovery](docs/recovery.md).
+Manifest recovery likewise takes the writer role — excluding a live writer only where that role is
+enforced — and validates the complete candidate before publication; rollback past the newest
+retained commit requires explicit authorization. See [manifest recovery](docs/recovery.md).
 
 The query layers are independently selectable: `--features columnar --no-default-features` provides
 the Arrow scan lens without DataFusion, while the default `sql` feature adds DataFusion over that same
