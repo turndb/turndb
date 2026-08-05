@@ -17,16 +17,19 @@ let stats = store.backup(Path::new("snapshot.turndb"))?;
 other lifecycle work. Directory-level callers can use `pack::write_with_control`; pack validation
 and explicit scrubs have `Pack::open_with_control` and `Pack::verify_with_control`.
 
-`Store::backup` syncs and flushes every earlier accepted operation while holding the sole writer
-role. It then copies the exact committed files while the mutable store is borrowed and no later
-operation can advance the manifest. The Node equivalent, `await store.backup(path)`, is serialized
+`Store::backup` syncs and flushes every earlier accepted operation while holding this process's
+writer role — sole across processes only where that role is enforced. It then copies the exact
+committed files while the mutable store is borrowed and no later operation can advance the manifest
+*from this process*. The Node equivalent, `await store.backup(path)`, is serialized
 through the store actor, so its cut includes every command accepted before it and excludes commands
 submitted after it.
 
 The directory-level `pack::write(dir, out)` and `turndb pack DIR OUT` commands acquire the writer
-role themselves. They recover and settle a durable WAL before packing, and refuse with writer
-contention if another process is currently writing the store. This avoids an external packer racing
-compaction, re-fold, or unreachable-file cleanup.
+role themselves. They recover and settle a durable WAL before packing, and **on Unix** refuse with
+writer contention if another process is currently writing the store, which is what stops an external
+packer racing compaction, re-fold, or unreachable-file cleanup. **On `wasm32-wasip1` that role is
+not enforced** — see [the writer lock](../FORMAT.md#the-writer-lock) — so a concurrent writer is
+admitted, no contention is reported, and the pack may be a racing cut.
 
 A backup is written to a uniquely named sibling staging file, synced, reopened, and fully verified.
 Copy and verification check interruption between files and bounded 1 MiB chunks. Only then is it

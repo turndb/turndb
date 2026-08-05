@@ -62,9 +62,13 @@ Each operation deliberately interprets interruption according to its publication
   exists, TurnDB reports the publication outcome rather than cancellation.
 - **Restore** validates and extracts into a private sibling directory. Cancellation removes staging
   and leaves the destination absent. The atomic no-replace rename is its final checkpoint.
-- **Manifest recovery** holds exclusive writer locks while it discovers and completely validates
-  retained candidates. Cancellation leaves the damaged live manifest and retained history
-  unchanged. Promotion is its final checkpoint; after it begins, TurnDB reports the actual outcome.
+- **Manifest recovery** takes the writer lock for every fold generation while it discovers and
+  completely validates retained candidates. **That lock excludes a live writer only on Unix**; on
+  `wasm32-wasip1` it always succeeds, so recovery is not protected from a concurrent writer and the
+  exclusion is the embedder's, exactly as for ordinary writes — see
+  [the writer lock](../FORMAT.md#the-writer-lock). Cancellation leaves the damaged live manifest and
+  retained history unchanged. Promotion is its final checkpoint; after it begins, TurnDB reports the
+  actual outcome.
 
 An actor operation may have settled earlier accepted writes before a later checkpoint stops its main
 work. That publication is ordered prerequisite work, not a partially published compaction or refold.
