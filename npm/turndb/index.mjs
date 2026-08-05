@@ -42,11 +42,12 @@ const GUEST_ROOT = '/store';
 /** Preview1 reserves 0..2 for stdio, so our only preopen is descriptor 3. */
 const GUEST_ROOT_FD = 3;
 
-/** Thrown for every engine-reported failure, carrying the engine's own message. */
+/** Thrown for every engine-reported failure, carrying its stable class and full message. */
 export class TurndbError extends Error {
-  constructor(message) {
+  constructor(message, code = 'INTERNAL') {
     super(message);
     this.name = 'TurndbError';
+    this.code = code;
   }
 }
 
@@ -146,7 +147,10 @@ function readCapabilities(runtime) {
     const message = new TextDecoder().decode(
       mem.subarray(e.tdb_err_ptr(), e.tdb_err_ptr() + e.tdb_err_len()),
     );
-    throw new TurndbError(message);
+    const code = new TextDecoder().decode(
+      mem.subarray(e.tdb_err_code_ptr(), e.tdb_err_code_ptr() + e.tdb_err_code_len()),
+    );
+    throw new TurndbError(message, code || 'INTERNAL');
   }
   const json = new TextDecoder().decode(
     mem.subarray(e.tdb_out_ptr(), e.tdb_out_ptr() + e.tdb_out_len()),
@@ -450,16 +454,29 @@ export class Store {
     for (const [ptr, len] of pairs) if (ptr !== 0) this.#exports.tdb_free(ptr, len);
   }
 
-  /** The engine's own error message — never flattened into something generic. */
+  /** The engine's stable class and full message — neither is inferred from the other. */
   #err() {
     const ptr = this.#exports.tdb_err_ptr();
     const len = this.#exports.tdb_err_len();
-    if (len === 0) return 'turndb reported a failure with no message';
-    return this.#dec.decode(this.#mem().subarray(ptr, ptr + len));
+    const codePtr = this.#exports.tdb_err_code_ptr();
+    const codeLen = this.#exports.tdb_err_code_len();
+    return {
+      message:
+        len === 0
+          ? 'turndb reported a failure with no message'
+          : this.#dec.decode(this.#mem().subarray(ptr, ptr + len)),
+      code:
+        codeLen === 0
+          ? 'INTERNAL'
+          : this.#dec.decode(this.#mem().subarray(codePtr, codePtr + codeLen)),
+    };
   }
 
   #check(code) {
-    if (code < 0) throw new TurndbError(this.#err());
+    if (code < 0) {
+      const error = this.#err();
+      throw new TurndbError(error.message, error.code);
+    }
     return code;
   }
 
@@ -768,6 +785,51 @@ export class Store {
   }
 
   /**
+   * Verify the complete committed snapshot and return exact evidence for every leg.
+   *
+   * Staged writes are outside this scope. Call {@link sync} and {@link flush} first when they must
+   * be included. `incomplete` is a successful verification with an explicitly unestablished legacy
+   * fact; corruption throws `TurndbError` with `code === 'CORRUPTION'`.
+   */
+  verify() {
+    this.#alive();
+    this.#check(this.#exports.tdb_verify(this.#handle));
+    const report = JSON.parse(this.#outText());
+    report.fold.bytes = BigInt(report.fold.bytes);
+    report.fold.trailingUncommittedBytes = BigInt(report.fold.trailingUncommittedBytes);
+    report.contentBytes = BigInt(report.contentBytes);
+    return report;
+  }
+
+  /**
+   * Cheap operational facts. `state: 'available'` means the handle answered; it is NOT an integrity
+   * verdict. Call {@link verify} for that.
+   */
+  health() {
+    this.#alive();
+    this.#check(this.#exports.tdb_health(this.#handle));
+    const health = JSON.parse(this.#outText());
+    for (const key of [
+      'commit',
+      'partRows',
+      'walBytes',
+      'walFrames',
+      'foldDiskBytes',
+      'foldCacheHits',
+      'foldCacheMisses',
+      'maxStoredFrameBytes',
+      'maxDecodedFrameBytes',
+      'maxDirectoryEntries',
+      'maxWalFrames',
+      'maxFoldBlocks',
+      'punchedBlocks',
+    ]) {
+      health[key] = BigInt(health[key]);
+    }
+    return health;
+  }
+
+  /**
    * Close the store and release its handle.
    *
    * Deliberately not "releases the writer lock": this build holds no advisory lock to release (see
@@ -950,7 +1012,10 @@ export async function open(dir, opts = {}) {
       const ep = instance.exports.tdb_err_ptr();
       const el = instance.exports.tdb_err_len();
       const msg = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer).subarray(ep, ep + el));
-      throw new TurndbError(`opening ${hostDir}: ${msg}`);
+      const cp = instance.exports.tdb_err_code_ptr();
+      const cl = instance.exports.tdb_err_code_len();
+      const code = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer, cp, cl));
+      throw new TurndbError(`opening ${hostDir}: ${msg}`, code || 'INTERNAL');
     }
   } catch (e) {
     try {

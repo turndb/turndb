@@ -1066,6 +1066,8 @@ fn cleanup_refold_stage(dir: &Path, generation: u32, built: &[refold::RefoldedPa
 /// What [`verify_chain`] checked.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChainReport {
+    /// Retained manifest files parsed and checked. Zero is an explicit empty/new-store result.
+    pub retained_manifests: usize,
     /// prev-links verified across the retained window (newest retained == live MANIFEST included).
     pub links: usize,
     /// part digests verified against their files, across every retained manifest.
@@ -1082,6 +1084,16 @@ pub struct StoreVerification {
     pub fold: crate::fold::FoldScrub,
     pub parts: usize,
     pub part_sections: usize,
+    /// Distinct live records in the committed snapshot, reconstructed below.
+    pub records: usize,
+    /// Named content values reconstructed byte-exactly.
+    pub content_values: usize,
+    /// Exact bytes reconstructed across all named content values.
+    pub content_bytes: u64,
+    /// Reconstructed values whose stored whole-value BLAKE3 identity was checked.
+    pub content_identities: usize,
+    /// Legacy values carrying no whole-value identity. Reconstruction still checks every piece.
+    pub unidentified_content_values: usize,
 }
 
 /// Verify the manifest hash chain and every part pin it carries, across the retained window.
@@ -1110,6 +1122,7 @@ pub fn verify_chain_with_limits_and_control(
 ) -> Result<ChainReport> {
     let mut report = ChainReport::default();
     let commits = list_retained_with_limits(dir, read_limits)?;
+    report.retained_manifests = commits.len();
     let mut prev_bytes: Option<Vec<u8>> = None;
     for &c in &commits {
         control.check("manifest verification")?;
@@ -1752,9 +1765,12 @@ impl Store {
                         crate::vfs::unlink(&retained_path(dir, 1))?;
                         crate::vfs::sync_dir(dir)?;
                     }
-                    Manifest::load_with_limits(dir, read_limits)?
+                    verification_integrity(
+                        "open committed manifest",
+                        Manifest::load_with_limits(dir, read_limits),
+                    )?
                 } else {
-                    return Err(e);
+                    return verification_integrity("open committed manifest", Err(e));
                 }
             }
         };
@@ -1797,21 +1813,23 @@ impl Store {
         // because recovery needs it DURING the scan: a crash mid-punch can leave a declared block's
         // payload partially zeroed, and without the declaration that frame reads as a torn write
         // and the committed tail as lost durable bytes.
-        let mut fold = Fold::open_at_with_limits(
-            &fold_path,
-            cfg,
-            manifest.fold_tail(),
-            &manifest.punched,
-            read_limits,
+        let mut fold = verification_integrity(
+            "open committed fold",
+            Fold::open_at_with_limits(
+                &fold_path,
+                cfg,
+                manifest.fold_tail(),
+                &manifest.punched,
+                read_limits,
+            ),
         )?;
 
         let pcache = Arc::new(SectionCache::new(part_cache_bytes));
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(Part::open_in_with_limits(
-                &dir.join(&p.file),
-                pcache.clone(),
-                read_limits,
+            parts.push(Arc::new(verification_integrity(
+                "open committed part",
+                Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits),
             )?));
         }
 
@@ -2015,7 +2033,84 @@ impl Store {
                 .checked_add(sections)
                 .ok_or_else(|| anyhow::anyhow!("verified part section count overflow"))?;
         }
-        Ok(StoreVerification { chain, fold, parts: self.parts.len(), part_sections })
+        // Reconstruct every named value in the committed snapshot. Section and frame checks prove
+        // the storage containers; this proves the references inside them resolve to the exact
+        // content identities the records claim. Deliberately use the committed read core rather
+        // than `Store::ids`/`Store::reconstruct_content`, which include staged memtable state.
+        let ids = verification_integrity("enumerate committed records", read::ids(&self.parts))?;
+        let mut content_values = 0usize;
+        let mut content_bytes = 0u64;
+        let mut content_identities = 0usize;
+        let mut unidentified_content_values = 0usize;
+        for id in &ids {
+            control.check("store verification")?;
+            let record =
+                verification_integrity("decode committed record", read::get(&self.parts, id))?
+                    .ok_or_else(|| {
+                        anyhow::Error::new(crate::error::IntegrityError::new(
+                            "decode committed record",
+                            anyhow::anyhow!("live id {id:?} disappeared during verification"),
+                        ))
+                    })?;
+            for content in &record.contents {
+                control.check("store verification")?;
+                let bytes = verification_integrity(
+                    "reconstruct committed content",
+                    read::reconstruct_content(&self.parts, &self.fold, id, &content.name),
+                )?
+                .ok_or_else(|| {
+                    anyhow::Error::new(crate::error::IntegrityError::new(
+                        "reconstruct committed content",
+                        anyhow::anyhow!(
+                            "record {id:?} lost named content {:?} during verification",
+                            content.name
+                        ),
+                    ))
+                })?;
+                content_values = content_values
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("verified content value count overflow"))?;
+                content_bytes = content_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("verified content byte count overflow"))?;
+                match content.identity {
+                    Some(want) => {
+                        let got = crate::types::ContentHash::of(&bytes);
+                        if got != want {
+                            return Err(crate::error::IntegrityError::new(
+                                "verify committed content identity",
+                                anyhow::anyhow!(
+                                    "record {id:?} content {:?} hashes to {got} but claims {want}",
+                                    content.name
+                                ),
+                            )
+                            .into());
+                        }
+                        content_identities =
+                            content_identities.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("verified content identity count overflow")
+                            })?;
+                    }
+                    None => {
+                        unidentified_content_values =
+                            unidentified_content_values.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("unidentified content value count overflow")
+                            })?;
+                    }
+                }
+            }
+        }
+        Ok(StoreVerification {
+            chain,
+            fold,
+            parts: self.parts.len(),
+            part_sections,
+            records: ids.len(),
+            content_values,
+            content_bytes,
+            content_identities,
+            unidentified_content_values,
+        })
     }
 
     /// Exact file-size and physical-row distribution for the current live immutable parts.
@@ -3378,7 +3473,7 @@ impl Store {
         if let Some(v) = self.mem.get(id) {
             return Ok(v.clone());
         }
-        read::get(&self.parts, id)
+        verification_integrity("read committed record", read::get(&self.parts, id))
     }
 
     /// Batch projection used by structured scans. Immutable rows share part-level decoders while
@@ -3467,7 +3562,10 @@ impl Store {
                 None => Ok(None), // staged deletion
             };
         }
-        read::reconstruct_content(&self.parts, &self.fold, id, name)
+        verification_integrity(
+            "reconstruct committed content",
+            read::reconstruct_content(&self.parts, &self.fold, id, name),
+        )
     }
 
     /// Where content lives, through BOTH dedup tiers.
@@ -4447,7 +4545,7 @@ impl ReadStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Record>> {
-        read::get(&self.parts, id)
+        verification_integrity("read committed record", read::get(&self.parts, id))
     }
 
     pub(crate) fn project_candidates(
@@ -4484,12 +4582,18 @@ impl ReadStore {
     }
 
     pub fn reconstruct(&self, id: &str) -> Result<Option<Vec<u8>>> {
-        read::reconstruct(&self.parts, &self.fold, id)
+        verification_integrity(
+            "reconstruct committed content",
+            read::reconstruct(&self.parts, &self.fold, id),
+        )
     }
 
     /// Byte-exact named content, if both the record and value are present.
     pub fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        read::reconstruct_content(&self.parts, &self.fold, id, name)
+        verification_integrity(
+            "reconstruct committed content",
+            read::reconstruct_content(&self.parts, &self.fold, id, name),
+        )
     }
 
     /// Distinct committed ids, sorted — the union across parts, newest-wins.

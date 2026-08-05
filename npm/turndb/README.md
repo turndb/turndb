@@ -103,6 +103,24 @@ Call `close()` explicitly. A dropped handle is reclaimed when JavaScript eventua
 forgetting `close()` does not wedge the process forever, but collection has no timing guarantee and
 the next `open()` refuses while the old handle is still live.
 
+## Integrity and health
+
+`store.verify()` verifies the **committed snapshot**: the retained-manifest chain, every immutable
+part section, every fold frame, and byte-exact reconstruction of every named content value. It
+returns exact record, content-value, content-byte, identity, part-section, fold, and retained-
+manifest counts. Staged writes are deliberately outside that scope; sync and flush them first when
+they must be included.
+
+`store.health()` is the cheap operational view. It reports whether the handle is available plus its
+commit and staged-entry counts; it makes no integrity claim. A clean health result is therefore not
+a substitute for `verify()`.
+
+Missing records remain `null`. Corrupt persisted state throws `TurndbError` with
+`code === 'CORRUPTION'`, whether the damage prevents the store from opening or is found while
+reading or verifying it. Callers can classify failures through `error.code` without parsing the
+diagnostic message; unsupported operations use `UNSUPPORTED`, and malformed calls use
+`INVALID_ARGUMENT`.
+
 ## Write admission
 
 `open` accepts `maxRecordBytes`, `maxBatchBytes`, `maxBatchRecords`, and `maxIdentifierBytes` as
