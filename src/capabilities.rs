@@ -16,23 +16,12 @@ pub enum WriterExclusion {
     EmbedderEnforced,
 }
 
-/// How this build can physically reclaim dead or erased content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PhysicalErasure {
-    /// Linux hole punching is available, with refold as the portable fallback.
-    PunchOrRefold,
-    /// Reclamation requires rewriting the live fold.
-    RefoldOnly,
-}
-
 /// Capabilities of the compiled TurnDB core, independent of consumer policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Capabilities {
     pub part_format_write: u8,
     pub part_format_read_max: u8,
     pub writer_exclusion: WriterExclusion,
-    pub physical_erasure: PhysicalErasure,
     pub positioned_io: bool,
     pub threads: bool,
     pub columnar: bool,
@@ -48,7 +37,6 @@ pub struct Capabilities {
     pub part_distribution: bool,
     pub content_liveness: bool,
     pub lifecycle_event_journal: bool,
-    pub lifecycle_event_capacity: usize,
     pub query_timings: bool,
     pub sql_explain: bool,
     pub max_record_bytes_default: u64,
@@ -72,11 +60,6 @@ pub const fn capabilities() -> Capabilities {
         } else {
             WriterExclusion::EmbedderEnforced
         },
-        physical_erasure: if cfg!(target_os = "linux") {
-            PhysicalErasure::PunchOrRefold
-        } else {
-            PhysicalErasure::RefoldOnly
-        },
         positioned_io: true,
         threads: !cfg!(target_arch = "wasm32"),
         columnar: cfg!(feature = "columnar"),
@@ -92,7 +75,6 @@ pub const fn capabilities() -> Capabilities {
         part_distribution: true,
         content_liveness: true,
         lifecycle_event_journal: true,
-        lifecycle_event_capacity: crate::observability::EVENT_JOURNAL_CAPACITY,
         query_timings: true,
         sql_explain: cfg!(feature = "sql"),
         max_record_bytes_default: crate::store::DEFAULT_MAX_RECORD_BYTES,
@@ -134,7 +116,6 @@ mod tests {
         assert!(c.part_distribution);
         assert!(c.content_liveness);
         assert!(c.lifecycle_event_journal);
-        assert_eq!(c.lifecycle_event_capacity, crate::observability::EVENT_JOURNAL_CAPACITY);
         assert!(c.query_timings);
         assert_eq!(c.sql_explain, cfg!(feature = "sql"));
     }

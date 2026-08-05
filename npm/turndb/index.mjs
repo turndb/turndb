@@ -139,9 +139,9 @@ export function prefixUpperBound(prefix) {
   return null;
 }
 
-function readCapabilities(runtime) {
+function readProfile(runtime, exportName) {
   const e = runtime.instance.exports;
-  const code = e.tdb_capabilities();
+  const code = e[exportName]();
   const mem = new Uint8Array(e.memory.buffer);
   if (code < 0) {
     const message = new TextDecoder().decode(
@@ -158,19 +158,31 @@ function readCapabilities(runtime) {
   return JSON.parse(json);
 }
 
-/**
- * Guarantees of the compiled portable core. They describe the WASI guest, not the host OS.
- */
+/** Operations, limits, and explicit absences reachable through this npm/WASI binding. */
 export async function capabilities() {
-  // An existing store already owns the one runtime. Reading the immutable build profile does not
+  // An existing store already owns the one runtime. Reading the immutable binding profile does not
   // need another directory capability and must remain available while that store is open.
   if (runtimePromise != null) {
     const runtime = await runtimePromise;
-    if (runtime.active) return readCapabilities(runtime);
+    if (runtime.active) return readProfile(runtime, 'tdb_binding_capabilities');
   }
   const runtime = await acquireRuntime(process.cwd());
   try {
-    return readCapabilities(runtime);
+    return readProfile(runtime, 'tdb_binding_capabilities');
+  } finally {
+    releaseRuntime(runtime);
+  }
+}
+
+/** Mechanisms and format facts compiled into the WASI guest, independent of binding reachability. */
+export async function compiledCapabilities() {
+  if (runtimePromise != null) {
+    const runtime = await runtimePromise;
+    if (runtime.active) return readProfile(runtime, 'tdb_capabilities');
+  }
+  const runtime = await acquireRuntime(process.cwd());
+  try {
+    return readProfile(runtime, 'tdb_capabilities');
   } finally {
     releaseRuntime(runtime);
   }
@@ -419,10 +431,10 @@ export class Store {
     return this.#handle < 0;
   }
 
-  /** Guarantees of the compiled portable core. */
+  /** Operations and limits reachable through this binding. */
   capabilities() {
     this.#alive();
-    return readCapabilities(this.#runtime);
+    return readProfile(this.#runtime, 'tdb_binding_capabilities');
   }
 
   /** Exact frame-byte and persistent object-count admission configured for this handle. */
@@ -829,6 +841,107 @@ export class Store {
     return health;
   }
 
+  /** Cumulative operation counters and durations since this handle opened. */
+  metrics() {
+    this.#alive();
+    this.#check(this.#exports.tdb_metrics(this.#handle));
+    const metrics = JSON.parse(this.#outText());
+    const operationKeys = [
+      'openRecovery', 'sync', 'flush', 'compaction', 'backup', 'verification', 'punch',
+      'refold', 'erase', 'formatMigration',
+    ];
+    for (const key of operationKeys) {
+      for (const field of [
+        'attempts', 'succeeded', 'failed', 'cancelled', 'totalDurationNs', 'lastDurationNs',
+        'maxDurationNs',
+      ]) metrics[key][field] = BigInt(metrics[key][field]);
+    }
+    metrics.recoveredWalFrames = BigInt(metrics.recoveredWalFrames);
+    metrics.verificationCorruptionFailures = BigInt(metrics.verificationCorruptionFailures);
+    for (const field of ['pieces', 'dedupHits', 'logicalBytes', 'novelBytes']) {
+      metrics.foldedContent[field] = BigInt(metrics.foldedContent[field]);
+    }
+    return metrics;
+  }
+
+  /** Non-destructive lifecycle journal read after an independent sequence cursor. */
+  lifecycleEvents({ after = 0n, limit } = {}) {
+    this.#alive();
+    if (typeof after !== 'bigint' || after < 0n) {
+      throw new TypeError('lifecycle after must be a non-negative bigint');
+    }
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
+      throw new TypeError('lifecycle limit must be a non-negative integer');
+    }
+    const input = this.#putText(JSON.stringify({ after: after.toString(), ...(limit === undefined ? {} : { limit }) }));
+    try {
+      this.#check(this.#exports.tdb_lifecycle_events(this.#handle, ...input));
+      const batch = JSON.parse(this.#outText());
+      batch.oldestAvailableSequence = batch.oldestAvailableSequence == null
+        ? null
+        : BigInt(batch.oldestAvailableSequence);
+      batch.latestSequence = BigInt(batch.latestSequence);
+      batch.droppedEvents = BigInt(batch.droppedEvents);
+      for (const event of batch.events) {
+        event.sequence = BigInt(event.sequence);
+        event.durationNs = BigInt(event.durationNs);
+      }
+      return batch;
+    } finally {
+      this.#free([input]);
+    }
+  }
+
+  /** Exact live/dead/reclaimable content facts for a flushed committed snapshot. */
+  contentLiveness() {
+    this.#alive();
+    this.#check(this.#exports.tdb_content_liveness(this.#handle));
+    const report = JSON.parse(this.#outText());
+    for (const field of [
+      'livePieces', 'liveLogicalBytes', 'deadLogicalBytes', 'strandedDeadLogicalBytes',
+    ]) report[field] = BigInt(report[field]);
+    for (const block of [report.liveBlocks, report.reclaimableBlocks]) {
+      for (const field of ['blocks', 'rawBytes', 'storedBytes']) block[field] = BigInt(block[field]);
+    }
+    return report;
+  }
+
+  /** Reachability-aware file usage; allocated bytes are explicitly absent on WASI. */
+  spaceUsage() {
+    this.#alive();
+    this.#check(this.#exports.tdb_space_usage(this.#handle));
+    const usage = JSON.parse(this.#outText());
+    for (const amount of [usage.live, usage.retainedOnly, usage.unclassified, usage.total]) {
+      amount.logicalBytes = BigInt(amount.logicalBytes);
+      if (amount.allocatedBytes.state === 'measured') {
+        amount.allocatedBytes.bytes = BigInt(amount.allocatedBytes.bytes);
+      }
+    }
+    if (usage.filesystemAvailableBytes.state === 'measured') {
+      usage.filesystemAvailableBytes.bytes = BigInt(usage.filesystemAvailableBytes.bytes);
+    }
+    return usage;
+  }
+
+  /** Erase named ids and return this operation's logical and reclamation outcomes. */
+  eraseIds(ids) {
+    this.#alive();
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) {
+      throw new TypeError('eraseIds needs an array of string ids');
+    }
+    const input = this.#putText(JSON.stringify(ids));
+    try {
+      this.#check(this.#exports.tdb_erase_ids(this.#handle, ...input));
+      const result = JSON.parse(this.#outText());
+      if (result.reclamation.state === 'measured') {
+        result.reclamation.bytes = BigInt(result.reclamation.bytes);
+      }
+      return result;
+    } finally {
+      this.#free([input]);
+    }
+  }
+
   /**
    * Close the store and release its handle.
    *
@@ -1025,7 +1138,7 @@ export async function open(dir, opts = {}) {
     }
     throw e;
   }
-  const profile = readCapabilities(runtime);
+  const profile = readProfile(runtime, 'tdb_capabilities');
   return new Store(runtime, handle, {
     maxStoredFrameBytes: maxStoredFrameBytes || profile.max_stored_frame_bytes_default,
     maxDecodedFrameBytes: maxDecodedFrameBytes || profile.max_decoded_frame_bytes_default,
@@ -1035,4 +1148,4 @@ export async function open(dir, opts = {}) {
   });
 }
 
-export default { open, capabilities, Store, TurndbError };
+export default { open, capabilities, compiledCapabilities, Store, TurndbError };
