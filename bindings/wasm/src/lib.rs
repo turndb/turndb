@@ -337,7 +337,8 @@ pub extern "C" fn tdb_binding_capabilities() -> i32 {
             "capabilities", "readLimits", "putBody", "applyBatch", "write", "delete",
             "sync", "flush", "autoCompact", "maybeCompact", "get", "getText",
             "getRecord", "scanIds", "scan", "stats", "verify", "health", "metrics",
-            "lifecycleEvents", "contentLiveness", "spaceUsage", "eraseIds", "close"
+            "lifecycleEvents", "contentLiveness", "spaceUsage", "estimateRefoldSpace",
+            "refold", "eraseIds", "close"
         ],
         "limits": {
             "lifecycleEvents": turndb::observability::EVENT_JOURNAL_CAPACITY,
@@ -345,7 +346,7 @@ pub extern "C" fn tdb_binding_capabilities() -> i32 {
         "controls": {
             "deadlineOperations": [
                 "scan", "sync", "flush", "autoCompact", "maybeCompact", "verify",
-                "contentLiveness", "spaceUsage", "eraseIds"
+                "contentLiveness", "spaceUsage", "estimateRefoldSpace", "refold", "eraseIds"
             ],
         },
         "unavailable": {
@@ -1513,6 +1514,96 @@ pub extern "C" fn tdb_space_usage_with_timeout(h: i32, timeout_ms: u32) -> i32 {
     }
 }
 
+/// Advisory duplicate-generation preflight. It writes nothing and explicitly says that the stage
+/// estimate is not a hard admission bound.
+fn encode_refold_space(estimate: Option<turndb::store::RefoldSpaceEstimate>) -> i32 {
+    let Some(estimate) = estimate else {
+        set_out(b"null");
+        return 0;
+    };
+    let value = serde_json::json!({
+        "sourceFoldLogicalBytes": estimate.source_fold_logical_bytes.to_string(),
+        "sourcePartBytes": estimate.source_part_bytes.to_string(),
+        "sourcePartSections": estimate.source_part_sections,
+        "sourcePartRawSectionBytes": estimate.source_part_raw_section_bytes.to_string(),
+        "retainedOnlyLogicalBytesBefore": estimate.retained_only_bytes_before.to_string(),
+        "estimatedStageBytes": estimate.estimated_stage_bytes.to_string(),
+        "estimateIsHardBound": estimate.estimate_is_hard_bound,
+        "filesystemAvailableBytes": match estimate.filesystem_available_bytes {
+            Some(bytes) => serde_json::json!({ "state": "measured", "bytes": bytes.to_string() }),
+            None => serde_json::json!({ "state": "absent" }),
+        },
+    });
+    set_out(value.to_string().as_bytes());
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_estimate_refold_space(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |store| store.estimate_refold_space().map_err(fail_engine)) {
+        Ok(estimate) => encode_refold_space(estimate),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_estimate_refold_space_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    match with_store(h, |store| {
+        store.estimate_refold_space_with_control(&control).map_err(fail_engine)
+    }) {
+        Ok(estimate) => encode_refold_space(estimate),
+        Err(code) => code,
+    }
+}
+
+/// Rewrite content from the live-reference set. Requires a flushed memtable.
+fn encode_refold_result(stats: turndb::store::refold::RefoldStats) -> i32 {
+    let value = serde_json::json!({
+        "partsIn": stats.parts_in,
+        "partsOut": stats.parts_out,
+        "recordsKept": stats.records_kept,
+        "recordsDropped": stats.records_dropped,
+        "tombstonesDropped": stats.tombstones_dropped,
+        "piecesKept": stats.pieces_kept,
+        "piecesDropped": stats.pieces_dropped,
+        "foldLogicalBytesBefore": stats.fold_bytes_before.to_string(),
+        "foldLogicalBytesAfter": stats.fold_bytes_after.to_string(),
+        "reclamation": if stats.stale_generation_left {
+            serde_json::json!({ "state": "not_reclaimed", "reason": "stale_generation_left" })
+        } else {
+            serde_json::json!({
+                "state": "measured",
+                "logicalBytes": stats.bytes_reclaimed().to_string(),
+                "allocatedBytes": { "state": "absent" },
+            })
+        },
+    });
+    set_out(value.to_string().as_bytes());
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_refold(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |store| store.refold().map_err(fail_engine)) {
+        Ok(stats) => encode_refold_result(stats),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_refold_with_timeout(h: i32, timeout_ms: u32) -> i32 {
+    clear_err();
+    let control = deadline_control(timeout_ms);
+    match with_store(h, |store| store.refold_with_control(&control).map_err(fail_engine)) {
+        Ok(stats) => encode_refold_result(stats),
+        Err(code) => code,
+    }
+}
+
 /// Erase ids and return the outcome of this operation, including reclamation evidence.
 fn encode_erasure_result(result: turndb::store::ErasureStats) -> i32 {
     let reclamation = match result.refold {
@@ -1522,14 +1613,16 @@ fn encode_erasure_result(result: turndb::store::ErasureStats) -> i32 {
         }),
         Some(refold) => serde_json::json!({
             "state": "measured",
-            "bytes": refold.bytes_reclaimed().to_string(),
+            "logicalBytes": refold.bytes_reclaimed().to_string(),
             "pieces": refold.pieces_dropped,
+            "allocatedBytes": { "state": "absent" },
         }),
     };
     let value = serde_json::json!({
         "requested": result.requested,
         "erased": result.tombstoned,
         "absent": result.absent,
+        "remaining": result.remaining,
         "reclamation": reclamation,
     });
     set_out(value.to_string().as_bytes());
