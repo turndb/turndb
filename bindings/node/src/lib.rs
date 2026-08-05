@@ -290,7 +290,6 @@ pub struct NativeCapabilities {
     pub part_format_write: u8,
     pub part_format_read_max: u8,
     pub writer_exclusion: String,
-    pub physical_erasure: String,
     pub positioned_io: bool,
     pub threads: bool,
     pub columnar: bool,
@@ -355,11 +354,6 @@ pub fn capabilities() -> NativeCapabilities {
             turndb::capabilities::WriterExclusion::EmbedderEnforced => "embedder_enforced",
         }
         .into(),
-        physical_erasure: match c.physical_erasure {
-            turndb::capabilities::PhysicalErasure::PunchOrRefold => "punch_or_refold",
-            turndb::capabilities::PhysicalErasure::RefoldOnly => "refold_only",
-        }
-        .into(),
         positioned_io: c.positioned_io,
         threads: c.threads,
         columnar: c.columnar,
@@ -379,7 +373,7 @@ pub fn capabilities() -> NativeCapabilities {
         part_distribution: c.part_distribution,
         content_liveness: c.content_liveness,
         lifecycle_event_journal: c.lifecycle_event_journal,
-        lifecycle_event_capacity: c.lifecycle_event_capacity as u32,
+        lifecycle_event_capacity: turndb::observability::EVENT_JOURNAL_CAPACITY as u32,
         query_timings: c.query_timings,
         sql_explain: c.sql_explain,
         storage_runtime_options: true,
