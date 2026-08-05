@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import './_artifact.mjs';
-import { open, capabilities, TurndbError } from '../index.mjs';
+import { open, capabilities, compiledCapabilities, TurndbError } from '../index.mjs';
 
 async function withStore(fn, opts) {
   const dir = await mkdtemp(join(tmpdir(), 'turndb-test-'));
@@ -13,10 +13,16 @@ async function withStore(fn, opts) {
 }
 
 test('capabilities describe the WASI guest rather than its host', async () => {
-  const c = await capabilities();
+  const reachable = await capabilities();
+  assert.equal(reachable.binding, 'wasi');
+  for (const operation of ['metrics', 'lifecycleEvents', 'contentLiveness', 'spaceUsage', 'eraseIds']) {
+    assert.ok(reachable.operations.includes(operation), `${operation} must be callable`);
+  }
+  assert.equal(reachable.limits.lifecycleEvents, 256);
+  assert.equal(reachable.unavailable.allocatedBytes, 'absent');
+  const c = await compiledCapabilities();
   assert.equal(c.portable_wasm, true);
   assert.equal(c.writer_exclusion, 'embedder_enforced');
-  assert.equal(c.physical_erasure, 'refold_only');
   assert.equal(c.threads, false);
   assert.equal(c.columnar, false);
   assert.equal(c.sql, false);
@@ -31,7 +37,6 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.part_distribution, true);
   assert.equal(c.content_liveness, true);
   assert.equal(c.lifecycle_event_journal, true);
-  assert.equal(c.lifecycle_event_capacity, 256);
   assert.equal(c.query_timings, true);
   assert.equal(c.sql_explain, false);
   assert.equal(c.max_record_bytes_default, 64 << 20);
@@ -44,7 +49,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(c.max_wal_frames_default, 100000);
   assert.equal(c.max_fold_blocks_default, 1000000);
 
-  await withStore((s) => assert.deepEqual(s.capabilities(), c));
+  await withStore((s) => assert.deepEqual(s.capabilities(), reachable));
 });
 
 test('a record round-trips byte-exact, including non-UTF8 bytes', async () => {

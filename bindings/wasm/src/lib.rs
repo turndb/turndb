@@ -316,6 +316,35 @@ pub extern "C" fn tdb_capabilities() -> i32 {
     }
 }
 
+/// Operations and limits reachable through this binding, not merely compiled into the guest.
+#[no_mangle]
+pub extern "C" fn tdb_binding_capabilities() -> i32 {
+    clear_err();
+    let value = serde_json::json!({
+        "binding": "wasi",
+        "operations": [
+            "capabilities", "readLimits", "putBody", "applyBatch", "write", "delete",
+            "sync", "flush", "autoCompact", "maybeCompact", "get", "getText",
+            "getRecord", "scanIds", "scan", "stats", "verify", "health", "metrics",
+            "lifecycleEvents", "contentLiveness", "spaceUsage", "eraseIds", "close"
+        ],
+        "limits": {
+            "lifecycleEvents": turndb::observability::EVENT_JOURNAL_CAPACITY,
+        },
+        "unavailable": {
+            "allocatedBytes": "absent",
+            "cancellationToken": "absent",
+        },
+    });
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => {
+            set_out(&bytes);
+            0
+        }
+        Err(error) => fail(format!("encode binding capability profile: {error}")),
+    }
+}
+
 /// Open (or create) a store. Returns a handle, or -1.
 ///
 /// Numeric options are 0 for the engine defaults.
@@ -1224,6 +1253,206 @@ pub extern "C" fn tdb_stats(h: i32) -> i32 {
             0
         }
         Err(_) => -1,
+    }
+}
+
+fn encode_operation_metrics(value: turndb::observability::OperationMetrics) -> serde_json::Value {
+    serde_json::json!({
+        "attempts": value.attempts.to_string(),
+        "succeeded": value.succeeded.to_string(),
+        "failed": value.failed.to_string(),
+        "cancelled": value.cancelled.to_string(),
+        "totalDurationNs": value.total_duration_ns.to_string(),
+        "lastDurationNs": value.last_duration_ns.to_string(),
+        "maxDurationNs": value.max_duration_ns.to_string(),
+    })
+}
+
+/// Cumulative process-lifetime operation facts for this handle.
+#[no_mangle]
+pub extern "C" fn tdb_metrics(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |store| Ok(store.metrics())) {
+        Ok(metrics) => {
+            let value = serde_json::json!({
+                "openRecovery": encode_operation_metrics(metrics.open_recovery),
+                "recoveredWalFrames": metrics.recovered_wal_frames.to_string(),
+                "sync": encode_operation_metrics(metrics.sync),
+                "flush": encode_operation_metrics(metrics.flush),
+                "compaction": encode_operation_metrics(metrics.compaction),
+                "backup": encode_operation_metrics(metrics.backup),
+                "verification": encode_operation_metrics(metrics.verification),
+                "verificationCorruptionFailures": metrics.verification_corruption_failures.to_string(),
+                "punch": encode_operation_metrics(metrics.punch),
+                "refold": encode_operation_metrics(metrics.refold),
+                "erase": encode_operation_metrics(metrics.erase),
+                "formatMigration": encode_operation_metrics(metrics.format_migration),
+                "foldedContent": {
+                    "pieces": metrics.folded_content.pieces.to_string(),
+                    "dedupHits": metrics.folded_content.dedup_hits.to_string(),
+                    "logicalBytes": metrics.folded_content.logical_bytes.to_string(),
+                    "novelBytes": metrics.folded_content.novel_bytes.to_string(),
+                },
+            });
+            set_out(value.to_string().as_bytes());
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// Read retained lifecycle outcomes after an independent cursor.
+///
+/// # Safety
+/// `json`/`json_len` must describe `{ "after": "u64", "limit": u32 }`.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_lifecycle_events(h: i32, json: *const u8, json_len: u32) -> i32 {
+    clear_err();
+    let request: serde_json::Value = match serde_json::from_slice(slice(json, json_len)) {
+        Ok(value) => value,
+        Err(error) => return fail_invalid(format!("lifecycle request is not valid JSON: {error}")),
+    };
+    let after = match request.get("after").and_then(serde_json::Value::as_str) {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) => value,
+            Err(error) => return fail_invalid(format!("lifecycle after is not u64: {error}")),
+        },
+        None => 0,
+    };
+    let limit = request
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(turndb::observability::EVENT_JOURNAL_CAPACITY as u64);
+    let Ok(limit) = usize::try_from(limit) else {
+        return fail_invalid("lifecycle limit exceeds usize");
+    };
+    match with_store(h, |store| Ok(store.lifecycle_events_after(after, limit))) {
+        Ok(batch) => {
+            let events: Vec<_> = batch
+                .events
+                .into_iter()
+                .map(|event| {
+                    serde_json::json!({
+                        "sequence": event.sequence.to_string(),
+                        "operation": event.operation.name(),
+                        "outcome": event.outcome.name(),
+                        "errorCode": event.error_class.map(turndb::error::ErrorClass::code),
+                        "durationNs": event.duration_ns.to_string(),
+                    })
+                })
+                .collect();
+            let value = serde_json::json!({
+                "events": events,
+                "oldestAvailableSequence": batch.oldest_available_sequence.map(|v| v.to_string()),
+                "latestSequence": batch.latest_sequence.to_string(),
+                "droppedEvents": batch.dropped_events.to_string(),
+                "gap": batch.gap,
+                "capacity": turndb::observability::EVENT_JOURNAL_CAPACITY,
+            });
+            set_out(value.to_string().as_bytes());
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// Exact content reachability for a settled committed snapshot.
+#[no_mangle]
+pub extern "C" fn tdb_content_liveness(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |store| store.content_liveness().map_err(fail_engine)) {
+        Ok(report) => {
+            let block = |value: turndb::observability::FoldBlockSpace| {
+                serde_json::json!({
+                    "blocks": value.blocks.to_string(),
+                    "rawBytes": value.raw_bytes.to_string(),
+                    "storedBytes": value.stored_bytes.to_string(),
+                })
+            };
+            let value = serde_json::json!({
+                "livePieces": report.live_pieces.to_string(),
+                "liveLogicalBytes": report.live_logical_bytes.to_string(),
+                "deadLogicalBytes": report.dead_logical_bytes.to_string(),
+                "strandedDeadLogicalBytes": report.stranded_dead_logical_bytes.to_string(),
+                "liveBlocks": block(report.live_blocks),
+                "reclaimableBlocks": block(report.reclaimable_blocks),
+            });
+            set_out(value.to_string().as_bytes());
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+fn encode_space_amount(value: turndb::store::SpaceAmount) -> serde_json::Value {
+    serde_json::json!({
+        "files": value.files,
+        "logicalBytes": value.logical_bytes.to_string(),
+        "allocatedBytes": match value.allocated_bytes {
+            Some(bytes) => serde_json::json!({ "state": "measured", "bytes": bytes.to_string() }),
+            None => serde_json::json!({ "state": "absent" }),
+        },
+    })
+}
+
+/// Reachability-aware logical space facts and only platform facts the guest can measure.
+#[no_mangle]
+pub extern "C" fn tdb_space_usage(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |store| store.space_usage().map_err(fail_engine)) {
+        Ok(usage) => {
+            let value = serde_json::json!({
+                "live": encode_space_amount(usage.live),
+                "retainedOnly": encode_space_amount(usage.retained_only),
+                "unclassified": encode_space_amount(usage.unclassified),
+                "total": encode_space_amount(usage.total),
+                "filesystemAvailableBytes": match usage.filesystem_available_bytes {
+                    Some(bytes) => serde_json::json!({ "state": "measured", "bytes": bytes.to_string() }),
+                    None => serde_json::json!({ "state": "absent" }),
+                },
+            });
+            set_out(value.to_string().as_bytes());
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// Erase ids and return the outcome of this operation, including reclamation evidence.
+///
+/// # Safety
+/// `json`/`json_len` must describe an array of string ids.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_erase_ids(h: i32, json: *const u8, json_len: u32) -> i32 {
+    clear_err();
+    let ids: Vec<String> = match serde_json::from_slice(slice(json, json_len)) {
+        Ok(ids) => ids,
+        Err(error) => return fail_invalid(format!("erase ids are not a string array: {error}")),
+    };
+    match with_store(h, |store| store.erase_ids(&ids).map_err(fail_engine)) {
+        Ok(result) => {
+            let reclamation = match result.refold {
+                None => serde_json::json!({ "state": "not_applicable" }),
+                Some(refold) if refold.stale_generation_left => serde_json::json!({
+                    "state": "not_reclaimed",
+                    "reason": "stale_generation_left",
+                }),
+                Some(refold) => serde_json::json!({
+                    "state": "measured",
+                    "bytes": refold.bytes_reclaimed().to_string(),
+                    "pieces": refold.pieces_dropped,
+                }),
+            };
+            let value = serde_json::json!({
+                "requested": result.requested,
+                "erased": result.tombstoned,
+                "absent": result.absent,
+                "reclamation": reclamation,
+            });
+            set_out(value.to_string().as_bytes());
+            0
+        }
+        Err(code) => code,
     }
 }
 

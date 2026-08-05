@@ -20,6 +20,7 @@ pub enum LifecycleOperation {
     Verification,
     Punch,
     Refold,
+    Erase,
     FormatMigration,
 }
 
@@ -34,6 +35,7 @@ impl LifecycleOperation {
             LifecycleOperation::Verification => "verification",
             LifecycleOperation::Punch => "punch",
             LifecycleOperation::Refold => "refold",
+            LifecycleOperation::Erase => "erase",
             LifecycleOperation::FormatMigration => "format_migration",
         }
     }
@@ -194,6 +196,7 @@ pub struct StoreMetrics {
     pub verification_corruption_failures: u64,
     pub punch: OperationMetrics,
     pub refold: OperationMetrics,
+    pub erase: OperationMetrics,
     pub format_migration: OperationMetrics,
     pub folded_content: FoldedContentMetrics,
 }

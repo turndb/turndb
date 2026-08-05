@@ -1974,6 +1974,7 @@ impl Store {
             LifecycleOperation::Verification => self.metrics.verification.observe(duration, result),
             LifecycleOperation::Punch => self.metrics.punch.observe(duration, result),
             LifecycleOperation::Refold => self.metrics.refold.observe(duration, result),
+            LifecycleOperation::Erase => self.metrics.erase.observe(duration, result),
             LifecycleOperation::FormatMigration => {
                 self.metrics.format_migration.observe(duration, result)
             }
@@ -3796,6 +3797,21 @@ impl Store {
     /// report completion. Erasure therefore either stops before mutation or drives its full safety
     /// protocol to completion.
     pub fn erase_ids_with_control(
+        &mut self,
+        ids: &[String],
+        control: &crate::control::OperationControl,
+    ) -> Result<ErasureStats> {
+        let started = std::time::Instant::now();
+        let result = self.erase_ids_inner_with_control(ids, control);
+        self.observe_lifecycle(
+            crate::observability::LifecycleOperation::Erase,
+            started.elapsed(),
+            &result,
+        );
+        result
+    }
+
+    fn erase_ids_inner_with_control(
         &mut self,
         ids: &[String],
         control: &crate::control::OperationControl,
