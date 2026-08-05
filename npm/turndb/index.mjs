@@ -266,6 +266,122 @@ function decodeFloat(v) {
   return Number(v);
 }
 
+/** One `[name, tag, value]` triple, tagged by exactly the rules the writer uses. */
+function encodeAttrTriple(name, value) {
+  return JSON.parse(encodeAttrs([[name, value]]))[0];
+}
+
+function encodePredicate(p, i) {
+  if (!p || typeof p !== 'object') throw new TypeError(`predicate ${i} must be an object`);
+  switch (p.kind) {
+    case 'id':
+      if (typeof p.value !== 'string') throw new TypeError(`predicate ${i} needs a string value`);
+      return { kind: 'id', op: p.op, value: assertEncodable(p.value, `predicate ${i} value`) };
+    case 'attr':
+      if (typeof p.name !== 'string') throw new TypeError(`predicate ${i} needs a name`);
+      return { kind: 'attr', op: p.op, attr: encodeAttrTriple(p.name, p.value) };
+    case 'attr_exists':
+    case 'content_exists':
+      if (typeof p.name !== 'string') throw new TypeError(`predicate ${i} needs a name`);
+      if (typeof p.present !== 'boolean') {
+        throw new TypeError(`predicate ${i} needs a boolean \`present\``);
+      }
+      return { kind: p.kind, name: assertEncodable(p.name, `predicate ${i} name`), present: p.present };
+    default:
+      throw new TypeError(`predicate ${i} has unknown kind ${JSON.stringify(p.kind)}`);
+  }
+}
+
+/**
+ * Every key {@link Store.scan} understands.
+ *
+ * The engine refuses an unknown field too, but this layer builds the wire object key by key — so
+ * without this check a misspelling would be dropped here and never reach the engine to be refused.
+ * The caller would get a silent default and no indication anything was wrong.
+ */
+const SCAN_REQUEST_KEYS = new Set([
+  'from',
+  'to',
+  'prefix',
+  'direction',
+  'cursor',
+  'limit',
+  'maxExamined',
+  'maxResolutionEntries',
+  'maxReconstructedBytes',
+  'attrs',
+  'contents',
+  'predicates',
+]);
+
+function encodeScanRequest(opts) {
+  if (opts == null || typeof opts !== 'object') {
+    throw new TypeError('scan request must be an object');
+  }
+  for (const key of Object.keys(opts)) {
+    if (!SCAN_REQUEST_KEYS.has(key)) {
+      throw new TypeError(`scan request has unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  let { from, to, prefix } = opts;
+  if (prefix != null) {
+    assertEncodable(prefix, 'prefix');
+    from = prefix;
+    to = prefixUpperBound(prefix) ?? undefined;
+  }
+  const req = {};
+  if (from != null) req.from = assertEncodable(from, 'from');
+  if (to != null) req.to = assertEncodable(to, 'to');
+  if (opts.direction != null) req.direction = opts.direction;
+  if (opts.cursor != null) req.cursor = opts.cursor;
+  if (opts.limit != null) req.limit = opts.limit;
+  if (opts.maxExamined != null) req.maxExamined = opts.maxExamined;
+  if (opts.maxResolutionEntries != null) req.maxResolutionEntries = opts.maxResolutionEntries;
+  // Decimal text, because a JSON number cannot carry every u64 exactly.
+  if (opts.maxReconstructedBytes != null) {
+    req.maxReconstructedBytes = opts.maxReconstructedBytes.toString();
+  }
+  if (opts.attrs != null) req.attrs = opts.attrs;
+  if (opts.contents != null) req.contents = opts.contents;
+  if (opts.predicates != null) req.predicates = opts.predicates.map(encodePredicate);
+  return req;
+}
+
+function decodeScanPage(v) {
+  return {
+    rows: v.rows.map((row) => ({
+      id: row.id,
+      attrs: decodeAttrs(row.attrs),
+      contents: row.contents.map((c) => {
+        const out = { name: c.name, present: c.present };
+        if (c.len !== undefined) out.len = BigInt(c.len);
+        if (c.pieces !== undefined) out.pieces = c.pieces;
+        if (c.identity !== undefined) out.identity = c.identity;
+        if (c.bytes !== undefined) out.bytes = Buffer.from(c.bytes, 'base64');
+        return out;
+      }),
+    })),
+    ...(v.next == null ? {} : { next: v.next }),
+    stats: {
+      durationNs: BigInt(v.stats.durationNs),
+      examined: v.stats.examined,
+      returned: v.stats.returned,
+      duplicateAttrOccurrences: v.stats.duplicateAttrOccurrences,
+      contentValuesReconstructed: v.stats.contentValuesReconstructed,
+      reconstructedBytes: BigInt(v.stats.reconstructedBytes),
+      reconstructionBudgetExhausted: v.stats.reconstructionBudgetExhausted,
+      io: Object.fromEntries(Object.entries(v.stats.io).map(([k, n]) => [k, BigInt(n)])),
+      resolution: {
+        physicalRows: BigInt(v.stats.resolution.physicalRows),
+        supersededRows: BigInt(v.stats.resolution.supersededRows),
+        tombstones: BigInt(v.stats.resolution.tombstones),
+        memtableEntries: BigInt(v.stats.resolution.memtableEntries),
+        budgetExhausted: v.stats.resolution.budgetExhausted,
+      },
+    },
+  };
+}
+
 const storeFinalizer = new FinalizationRegistry(({ runtime, handle }) => {
   // A forgotten close must not wedge this process forever. Finalization is only a fallback: it
   // cannot report either error and gives no timing guarantee, so callers still close explicitly.
@@ -548,6 +664,37 @@ export class Store {
     try {
       this.#check(this.#exports.tdb_scan_ids(this.#handle, ...a[0], ...a[1], limit, reverse ? 1 : 0));
       return JSON.parse(this.#outText());
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * One structured page: projected attributes, named-content metadata or bytes, a checked
+   * continuation cursor, and the page's exact work statistics.
+   *
+   * The difference from {@link Store.scanIds} is that the engine does the filtering and the
+   * projection. `attrs` and `contents` are projections — a page that selects no content opens no
+   * fold block, which is what makes a metadata-only timeline cheap. `predicates` are evaluated in
+   * Rust against exact stored values, so a float comparison honours the stored NaN payload rather
+   * than whatever JavaScript would have done to it.
+   *
+   * `cursor` is opaque and checked: pass back `next` with the same range, direction, and
+   * predicates. Projection and page size may change between pages.
+   *
+   * **Not available on this build:** the native binding's `timeoutMs`/`signal`. This engine is
+   * single-threaded with no clock in the guest, so there is nothing to interrupt a scan from — and
+   * accepting the options to ignore them would be worse than not offering them.
+   *
+   * @param {object} [request]
+   * @returns {{rows: Array<{id: string, attrs: Array<[string, unknown]>, contents: object[]}>, next?: string, stats: object}}
+   */
+  scan(request = {}) {
+    this.#alive();
+    const a = [this.#putText(JSON.stringify(encodeScanRequest(request)))];
+    try {
+      this.#check(this.#exports.tdb_scan(this.#handle, ...a[0]));
+      return decodeScanPage(JSON.parse(this.#outText()));
     } finally {
       this.#free(a);
     }
