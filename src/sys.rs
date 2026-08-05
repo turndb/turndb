@@ -140,9 +140,12 @@ pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result
 /// *safe* single-writer gate: a stale lock cannot outlive its owner.
 ///
 /// **WASI has no advisory locking**, so this returns `Ok(true)` unconditionally. The single-writer
-/// invariant is then the embedder's to keep, and it is not an academic concern: two writers on one
-/// store will interleave WAL frames and corrupt it. The intended deployment is one store per Node
-/// process, where the runtime provides the exclusion the OS otherwise would. A lockfile is *not* a
+/// invariant is then the embedder's to keep, and it is not an academic concern: in the one overlap
+/// pattern that has been measured, both writers were acknowledged as durable and one writer's whole
+/// record set was silently lost from a store that still verified clean. FORMAT.md, "The writer
+/// lock", is the normative account and the only one; do not restate it here. The intended
+/// deployment is one store per Node process, where the runtime provides the exclusion the OS
+/// otherwise would. A lockfile is *not* a
 /// substitute — an `O_EXCL` file survives a hard kill and would wedge the store closed with no safe
 /// way to tell a stale lock from a live one.
 ///
