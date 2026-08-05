@@ -528,6 +528,66 @@ export class Store {
     }
   }
 
+  /**
+   * Apply generic records and deletions atomically.
+   *
+   * A successful result says whether this exact batch is durable. With `durable: true`, the engine
+   * syncs before returning; a caller may discard its source copy only after receiving
+   * `{ durable: true }`. A thrown error is deliberately not an acknowledgement.
+   *
+   * Named contents are an ordered array rather than an object. Content names must be unique within
+   * one record, while attributes deliberately keep order and duplicate names.
+   *
+   * @param {Array<{kind:'put', id:string,
+   *   contents:Array<{name:string,bytes:Uint8Array|Buffer|string}>, attrs?:object|Array<[string,unknown]>}
+   *   | {kind:'delete',id:string}>} operations
+   * @param {{durable?:boolean}} [options]
+   * @returns {{applied:number,durable:boolean}}
+   */
+  write(operations, options = {}) {
+    this.#alive();
+    if (!Array.isArray(operations)) throw new TypeError('write operations must be an array');
+    const durable = options.durable ?? false;
+    if (typeof durable !== 'boolean') throw new TypeError('write durable option must be a boolean');
+    const items = operations.map((operation, i) => {
+      if (!operation || typeof operation !== 'object') {
+        throw new TypeError(`write operation ${i} must be an object`);
+      }
+      assertId(operation.id);
+      if (operation.kind === 'delete') {
+        if ('contents' in operation || 'attrs' in operation) {
+          throw new TypeError(`delete write operation ${i} must not carry contents or attrs`);
+        }
+        return ['del', operation.id];
+      }
+      if (operation.kind !== 'put') {
+        throw new TypeError(`write operation ${i} kind must be "put" or "delete"`);
+      }
+      if (!Array.isArray(operation.contents)) {
+        throw new TypeError(`put write operation ${i} contents must be an array`);
+      }
+      const contents = operation.contents.map((content, contentIndex) => {
+        if (!content || typeof content !== 'object' || typeof content.name !== 'string') {
+          throw new TypeError(`write operation ${i} content ${contentIndex} needs a string name`);
+        }
+        assertEncodable(content.name, `write operation ${i} content ${contentIndex} name`);
+        const bytes = typeof content.bytes === 'string' ? this.#enc.encode(content.bytes) : content.bytes;
+        if (!(bytes instanceof Uint8Array)) {
+          throw new TypeError(`write operation ${i} content ${contentIndex} bytes must be bytes or a string`);
+        }
+        return [content.name, Buffer.from(bytes).toString('base64')];
+      });
+      return ['put', operation.id, contents, JSON.parse(encodeAttrs(operation.attrs))];
+    });
+    const a = [this.#putText(JSON.stringify(items))];
+    try {
+      this.#check(this.#exports.tdb_write(this.#handle, ...a[0], durable ? 1 : 0));
+      return JSON.parse(this.#outText());
+    } finally {
+      this.#free(a);
+    }
+  }
+
   /** Tombstone a record. Not durable until {@link sync}. */
   delete(id) {
     this.#alive();
