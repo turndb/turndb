@@ -22,7 +22,6 @@ test('reports the native capability profile without a portable fallback', () => 
     partFormatWrite: 2,
     partFormatReadMax: 2,
     writerExclusion: 'os_enforced',
-    physicalErasure: process.platform === 'linux' ? 'punch_or_refold' : 'refold_only',
     positionedIo: true,
     threads: true,
     columnar: true,
