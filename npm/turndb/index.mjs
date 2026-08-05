@@ -954,6 +954,47 @@ export class Store {
     return usage;
   }
 
+  /** Advisory duplicate-generation preflight. Does not write. Requires a flushed memtable. */
+  estimateRefoldSpace({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_estimate_refold_space(this.#handle)
+      : this.#exports.tdb_estimate_refold_space_with_timeout(this.#handle, value));
+    const estimate = JSON.parse(this.#outText());
+    if (estimate === null) return null;
+    for (const field of [
+      'sourceFoldLogicalBytes', 'sourcePartBytes', 'sourcePartRawSectionBytes',
+      'retainedOnlyLogicalBytesBefore', 'estimatedStageBytes',
+    ]) estimate[field] = BigInt(estimate[field]);
+    if (estimate.filesystemAvailableBytes.state === 'measured') {
+      estimate.filesystemAvailableBytes.bytes = BigInt(estimate.filesystemAvailableBytes.bytes);
+    }
+    return estimate;
+  }
+
+  /**
+   * Rewrite content from the live-reference set and report logical output facts.
+   *
+   * This can establish query absence, logical file-length reclamation, and an auditable lifecycle
+   * event. It cannot establish media-byte non-recoverability: not on arbitrary or copy-on-write
+   * filesystems, not through WASI, and not for copies made before this call.
+   */
+  refold({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_refold(this.#handle)
+      : this.#exports.tdb_refold_with_timeout(this.#handle, value));
+    const result = JSON.parse(this.#outText());
+    result.foldLogicalBytesBefore = BigInt(result.foldLogicalBytesBefore);
+    result.foldLogicalBytesAfter = BigInt(result.foldLogicalBytesAfter);
+    if (result.reclamation.state === 'measured') {
+      result.reclamation.logicalBytes = BigInt(result.reclamation.logicalBytes);
+    }
+    return result;
+  }
+
   /** Erase named ids and return this operation's logical and reclamation outcomes. */
   eraseIds(ids, { timeoutMs: timeout } = {}) {
     this.#alive();
@@ -968,7 +1009,7 @@ export class Store {
         : this.#exports.tdb_erase_ids_with_timeout(this.#handle, ...input, value));
       const result = JSON.parse(this.#outText());
       if (result.reclamation.state === 'measured') {
-        result.reclamation.bytes = BigInt(result.reclamation.bytes);
+        result.reclamation.logicalBytes = BigInt(result.reclamation.logicalBytes);
       }
       return result;
     } finally {

@@ -34,9 +34,9 @@ usage: turndb <verb> [args]
                                  validate and promote a retained manifest; rollback defaults to 0
     snapshots <DIR>              list retained commits available to time travel
     erase     <DIR> (--id ID ... | --attr KEY=VALUE)
-                                 tombstone, settle, and REWRITE until content and metadata are
-                                 physically gone. Prints what it did; capturing that output is
-                                 your compliance programme's job, not this tool's
+                                 tombstone, settle, and REWRITE until this store no longer
+                                 references the content or metadata. Does not promise media-byte
+                                 non-recoverability; prints the measurable result
 
   ingesting:
     import    <DIR> <JSONL>      ingest records ({\"body\": ..., attrs...} per line; - for stdin),

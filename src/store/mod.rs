@@ -3784,7 +3784,8 @@ impl Store {
         Ok(scope)
     }
 
-    /// ERASE records: tombstone, settle, and rewrite until the content is physically gone.
+    /// ERASE records: tombstone, settle, and rewrite until this store no longer references the
+    /// records and its old logical files have been removed.
     ///
     /// This is the compliance path, and it composes three operations that each already existed:
     /// deletes shadow the ids; a TOTAL merge drops the tombstones once nothing remains for them
@@ -3794,9 +3795,10 @@ impl Store {
     /// retained commit log, which the erasure story REQUIRES: a snapshot that could still serve
     /// the erased record is not erasure.
     ///
-    /// What this does NOT promise, stated because overclaiming here is a liability: nothing about
-    /// copies outside this store — packs written earlier, replicas, backups. It removes data from
-    /// THIS store, and only that.
+    /// What this does NOT promise, stated because overclaiming here is a liability: media-byte
+    /// non-recoverability on arbitrary or copy-on-write filesystems, through WASI, or for copies
+    /// already made (packs, replicas, backups). The measurable claims are query absence, logical
+    /// file-length reclamation, and the lifecycle event for this operation.
     ///
     /// Ids that do not exist are counted, not errored: a DSAR naming already-gone data is a
     /// normal outcome, and the record should say so rather than fail.
@@ -3808,8 +3810,8 @@ impl Store {
     ///
     /// Once the atomic tombstone batch is applied, interruption is deliberately deferred until the
     /// total merge and re-fold finish. Returning `cancelled` after logical deletion but before
-    /// physical erasure would make a retry mistake the ids for previously absent records and falsely
-    /// report completion. Erasure therefore either stops before mutation or drives its full safety
+    /// reclamation would make a retry mistake the ids for previously absent records and falsely
+    /// report completion. Erasure therefore either stops before mutation or drives its full store
     /// protocol to completion.
     pub fn erase_ids_with_control(
         &mut self,
@@ -3845,7 +3847,13 @@ impl Store {
             }
         }
         if tombstoned == 0 {
-            return Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: None });
+            return Ok(ErasureStats {
+                requested: ids.len(),
+                tombstoned,
+                absent,
+                remaining: self.ids()?.len(),
+                refold: None,
+            });
         }
         control.check("record erasure")?;
         let mut batch = Batch::new();
@@ -3860,7 +3868,13 @@ impl Store {
             self.merge_range(0, self.parts.len())?;
         }
         let refold = self.refold()?;
-        Ok(ErasureStats { requested: ids.len(), tombstoned, absent, refold: Some(refold) })
+        Ok(ErasureStats {
+            requested: ids.len(),
+            tombstoned,
+            absent,
+            remaining: self.ids()?.len(),
+            refold: Some(refold),
+        })
     }
 
     fn live_fold_pieces_with_control(
@@ -4162,7 +4176,7 @@ impl Store {
         let old_gen = self.manifest.fold_gen;
         self.manifest = m;
         // PURGE the retained log down to this commit alone. Erasure semantics trump snapshots: a
-        // re-fold exists to make dropped content GONE, and a retained manifest would keep the old
+        // re-fold exists to make dropped content unreachable in this store, and a retained manifest would keep the old
         // generation — deleted records included — readable for MANIFEST_RETAIN more commits.
         // Time travel does not cross a re-fold, by design; that is the point of running one.
         //
@@ -4553,6 +4567,8 @@ pub struct ErasureStats {
     pub tombstoned: usize,
     /// Named but already gone. A normal outcome, recorded rather than errored.
     pub absent: usize,
+    /// Live records remaining after this operation completed.
+    pub remaining: usize,
     /// `None` when nothing existed to erase and the store was left untouched.
     pub refold: Option<refold::RefoldStats>,
 }

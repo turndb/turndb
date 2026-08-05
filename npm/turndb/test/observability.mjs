@@ -88,7 +88,8 @@ test('erasure returns measured versus not-applicable outcomes and journals the o
       { requested: 1, erased: 1, absent: 0 },
     );
     assert.equal(erased.reclamation.state, 'measured');
-    assert.ok(erased.reclamation.bytes > 0n);
+    assert.ok(erased.reclamation.logicalBytes > 0n);
+    assert.deepEqual(erased.reclamation.allocatedBytes, { state: 'absent' });
     assert.equal(store.get('erase/me'), null);
 
     const absent = store.eraseIds(['erase/me']);
