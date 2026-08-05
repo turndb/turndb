@@ -56,6 +56,7 @@ thread_local! {
     static STORES: RefCell<Vec<Option<Store>>> = const { RefCell::new(Vec::new()) };
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ERR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static ERR_CODE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 // ── Memory and result plumbing ──────────────────────────────────────────────
@@ -100,6 +101,17 @@ pub extern "C" fn tdb_err_len() -> u32 {
     ERR.with(|e| e.borrow().len() as u32)
 }
 
+/// Stable machine-readable class for the most recent failed call.
+#[no_mangle]
+pub extern "C" fn tdb_err_code_ptr() -> *const u8 {
+    ERR_CODE.with(|e| e.borrow().as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn tdb_err_code_len() -> u32 {
+    ERR_CODE.with(|e| e.borrow().len() as u32)
+}
+
 fn set_out(bytes: &[u8]) {
     OUT.with(|o| {
         let mut o = o.borrow_mut();
@@ -110,17 +122,35 @@ fn set_out(bytes: &[u8]) {
 
 /// Record an error and return the failure code. `{:#}` keeps anyhow's whole context chain, which
 /// is the difference between "open failed" and "open failed: read MANIFEST: no such file".
-fn fail(e: impl std::fmt::Display) -> i32 {
+fn fail_as(code: &str, e: impl std::fmt::Display) -> i32 {
     ERR.with(|slot| {
         let mut slot = slot.borrow_mut();
         slot.clear();
         slot.extend_from_slice(format!("{e:#}").as_bytes());
     });
+    ERR_CODE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.clear();
+        slot.extend_from_slice(code.as_bytes());
+    });
     -1
+}
+
+fn fail(e: impl std::fmt::Display) -> i32 {
+    fail_as("INTERNAL", e)
+}
+
+fn fail_invalid(e: impl std::fmt::Display) -> i32 {
+    fail_as("INVALID_ARGUMENT", e)
+}
+
+fn fail_engine(e: anyhow::Error) -> i32 {
+    fail_as(turndb::error::classify(&e).code(), e)
 }
 
 fn clear_err() {
     ERR.with(|e| e.borrow_mut().clear());
+    ERR_CODE.with(|e| e.borrow_mut().clear());
 }
 
 /// # Safety
@@ -380,7 +410,7 @@ pub unsafe extern "C" fn tdb_open_v3(
     clear_err();
     let dir = match text(dir, dir_len) {
         Ok(d) => d,
-        Err(e) => return fail(format!("store path is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("store path is not UTF-8: {e}")),
     };
     let mut cfg = FoldCfg::default();
     if block_target > 0 {
@@ -455,7 +485,7 @@ pub unsafe extern "C" fn tdb_open_v3(
             slot[idx] = Some(s);
             idx as i32
         }),
-        Err(e) => fail(e),
+        Err(e) => fail_engine(e),
     }
 }
 
@@ -500,14 +530,14 @@ pub unsafe extern "C" fn tdb_put_body(
     clear_err();
     let id = match text(id, id_len) {
         Ok(v) => v,
-        Err(e) => return fail(format!("id is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("id is not UTF-8: {e}")),
     };
     let attrs = match decode_attrs(slice(attrs, attrs_len)) {
         Ok(a) => a,
-        Err(e) => return fail(e),
+        Err(e) => return fail_invalid(e),
     };
     let body = slice(body, body_len);
-    with_store(h, |s| s.put_body(id, body, attrs).map_err(fail)).map_or(-1, |_| 0)
+    with_store(h, |s| s.put_body(id, body, attrs).map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
 /// Apply a whole batch atomically: `[["put", id, bodyBase64, attrs], ["del", id], ...]`.
@@ -523,11 +553,11 @@ pub unsafe extern "C" fn tdb_apply(h: i32, json: *const u8, json_len: u32) -> i3
     let raw = slice(json, json_len);
     let v: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(v) => v,
-        Err(e) => return fail(format!("batch is not valid JSON: {e}")),
+        Err(e) => return fail_invalid(format!("batch is not valid JSON: {e}")),
     };
     let items = match v.as_array() {
         Some(a) => a,
-        None => return fail("batch must be an array"),
+        None => return fail_invalid("batch must be an array"),
     };
     // Build the whole batch before touching the store: a malformed item must not leave half an
     // export applied.
@@ -536,45 +566,49 @@ pub unsafe extern "C" fn tdb_apply(h: i32, json: *const u8, json_len: u32) -> i3
     for (i, item) in items.iter().enumerate() {
         let t = match item.as_array() {
             Some(t) if !t.is_empty() => t,
-            _ => return fail(format!("batch item {i} is not a non-empty array")),
+            _ => return fail_invalid(format!("batch item {i} is not a non-empty array")),
         };
         match t[0].as_str() {
             Some("put") => {
                 if t.len() != 4 {
-                    return fail(format!("batch item {i}: put needs [op, id, body, attrs]"));
+                    return fail_invalid(format!(
+                        "batch item {i}: put needs [op, id, body, attrs]"
+                    ));
                 }
                 let id = match t[1].as_str() {
                     Some(s) => s,
-                    None => return fail(format!("batch item {i}: id is not a string")),
+                    None => return fail_invalid(format!("batch item {i}: id is not a string")),
                 };
                 let body = match t[2].as_str() {
                     Some(s) => match b64_decode(s) {
                         Ok(b) => b,
-                        Err(e) => return fail(format!("batch item {i}: {e}")),
+                        Err(e) => return fail_invalid(format!("batch item {i}: {e}")),
                     },
-                    None => return fail(format!("batch item {i}: body is not base64 text")),
+                    None => {
+                        return fail_invalid(format!("batch item {i}: body is not base64 text"))
+                    }
                 };
                 let attrs = match decode_attrs(t[3].to_string().as_bytes()) {
                     Ok(a) => a,
-                    Err(e) => return fail(format!("batch item {i}: {e}")),
+                    Err(e) => return fail_invalid(format!("batch item {i}: {e}")),
                 };
                 batch.put_body(id, &body, attrs);
                 n += 1;
             }
             Some("del") => {
                 if t.len() != 2 {
-                    return fail(format!("batch item {i}: del needs [op, id]"));
+                    return fail_invalid(format!("batch item {i}: del needs [op, id]"));
                 }
                 match t[1].as_str() {
                     Some(id) => batch.delete(id),
-                    None => return fail(format!("batch item {i}: id is not a string")),
+                    None => return fail_invalid(format!("batch item {i}: id is not a string")),
                 }
                 n += 1;
             }
-            _ => return fail(format!("batch item {i}: op must be \"put\" or \"del\"")),
+            _ => return fail_invalid(format!("batch item {i}: op must be \"put\" or \"del\"")),
         }
     }
-    match with_store(h, |s| s.apply(batch).map_err(fail)) {
+    match with_store(h, |s| s.apply(batch).map_err(fail_engine)) {
         Ok(()) => n as i32,
         Err(_) => -1,
     }
@@ -599,37 +633,41 @@ pub unsafe extern "C" fn tdb_write(h: i32, json: *const u8, json_len: u32, durab
     let raw = slice(json, json_len);
     let v: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(v) => v,
-        Err(e) => return fail(format!("write batch is not valid JSON: {e}")),
+        Err(e) => return fail_invalid(format!("write batch is not valid JSON: {e}")),
     };
     let items = match v.as_array() {
         Some(items) => items,
-        None => return fail("write batch must be an array"),
+        None => return fail_invalid("write batch must be an array"),
     };
     let mut batch = Batch::new();
     for (i, item) in items.iter().enumerate() {
         let tuple = match item.as_array() {
             Some(tuple) if !tuple.is_empty() => tuple,
-            _ => return fail(format!("write item {i} is not a non-empty array")),
+            _ => return fail_invalid(format!("write item {i} is not a non-empty array")),
         };
         match tuple[0].as_str() {
             Some("put") => {
                 if tuple.len() != 4 {
-                    return fail(format!("write item {i}: put needs [op, id, contents, attrs]"));
+                    return fail_invalid(format!(
+                        "write item {i}: put needs [op, id, contents, attrs]"
+                    ));
                 }
                 let id = match tuple[1].as_str() {
                     Some(id) => id,
-                    None => return fail(format!("write item {i}: id is not a string")),
+                    None => return fail_invalid(format!("write item {i}: id is not a string")),
                 };
                 let encoded_contents = match tuple[2].as_array() {
                     Some(contents) => contents,
-                    None => return fail(format!("write item {i}: contents is not an array")),
+                    None => {
+                        return fail_invalid(format!("write item {i}: contents is not an array"))
+                    }
                 };
                 let mut decoded = Vec::with_capacity(encoded_contents.len());
                 for (content_i, content) in encoded_contents.iter().enumerate() {
                     let content = match content.as_array() {
                         Some(content) if content.len() == 2 => content,
                         _ => {
-                            return fail(format!(
+                            return fail_invalid(format!(
                                 "write item {i} content {content_i} needs [name, base64]"
                             ))
                         }
@@ -637,7 +675,7 @@ pub unsafe extern "C" fn tdb_write(h: i32, json: *const u8, json_len: u32, durab
                     let name = match content[0].as_str() {
                         Some(name) => name,
                         None => {
-                            return fail(format!(
+                            return fail_invalid(format!(
                                 "write item {i} content {content_i}: name is not a string"
                             ))
                         }
@@ -646,11 +684,13 @@ pub unsafe extern "C" fn tdb_write(h: i32, json: *const u8, json_len: u32, durab
                         Some(encoded) => match b64_decode(encoded) {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                return fail(format!("write item {i} content {content_i}: {e}"))
+                                return fail_invalid(format!(
+                                    "write item {i} content {content_i}: {e}"
+                                ))
                             }
                         },
                         None => {
-                            return fail(format!(
+                            return fail_invalid(format!(
                                 "write item {i} content {content_i}: bytes are not base64 text"
                             ))
                         }
@@ -665,30 +705,30 @@ pub unsafe extern "C" fn tdb_write(h: i32, json: *const u8, json_len: u32, durab
                     .collect::<Vec<_>>();
                 let attrs = match decode_attrs(tuple[3].to_string().as_bytes()) {
                     Ok(attrs) => attrs,
-                    Err(e) => return fail(format!("write item {i}: {e}")),
+                    Err(e) => return fail_invalid(format!("write item {i}: {e}")),
                 };
                 if let Err(e) = batch.put_record(id, &contents, attrs) {
-                    return fail(format!("write item {i}: {e:#}"));
+                    return fail_engine(e);
                 }
             }
             Some("del") => {
                 if tuple.len() != 2 {
-                    return fail(format!("write item {i}: del needs [op, id]"));
+                    return fail_invalid(format!("write item {i}: del needs [op, id]"));
                 }
                 match tuple[1].as_str() {
                     Some(id) => batch.delete(id),
-                    None => return fail(format!("write item {i}: id is not a string")),
+                    None => return fail_invalid(format!("write item {i}: id is not a string")),
                 }
             }
-            _ => return fail(format!("write item {i}: op must be \"put\" or \"del\"")),
+            _ => return fail_invalid(format!("write item {i}: op must be \"put\" or \"del\"")),
         }
     }
     let applied = batch.len();
     let should_sync = durable != 0;
     match with_store(h, |store| {
-        store.apply(batch).map_err(fail)?;
+        store.apply(batch).map_err(fail_engine)?;
         if should_sync {
-            store.sync().map_err(fail)?;
+            store.sync().map_err(fail_engine)?;
         }
         Ok(())
     }) {
@@ -713,16 +753,16 @@ pub unsafe extern "C" fn tdb_delete(h: i32, id: *const u8, id_len: u32) -> i32 {
     clear_err();
     let id = match text(id, id_len) {
         Ok(v) => v,
-        Err(e) => return fail(format!("id is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("id is not UTF-8: {e}")),
     };
-    with_store(h, |s| s.delete(id).map_err(fail)).map_or(-1, |_| 0)
+    with_store(h, |s| s.delete(id).map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
 /// Make everything written so far durable. This is the ACK point.
 #[no_mangle]
 pub extern "C" fn tdb_sync(h: i32) -> i32 {
     clear_err();
-    with_store(h, |s| s.sync().map_err(fail)).map_or(-1, |_| 0)
+    with_store(h, |s| s.sync().map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
 /// Seal the memtable into an immutable part. Reads through this handle do not need it — the writer
@@ -730,14 +770,14 @@ pub extern "C" fn tdb_sync(h: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn tdb_flush(h: i32) -> i32 {
     clear_err();
-    with_store(h, |s| s.flush().map_err(fail)).map_or(-1, |_| 0)
+    with_store(h, |s| s.flush().map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
 /// Merge parts if the threshold is reached. Returns 1 if a merge ran, 0 if not.
 #[no_mangle]
 pub extern "C" fn tdb_auto_compact(h: i32) -> i32 {
     clear_err();
-    with_store(h, |s| s.auto_compact().map_err(fail)).map_or(-1, |m| i32::from(m.is_some()))
+    with_store(h, |s| s.auto_compact().map_err(fail_engine)).map_or(-1, |m| i32::from(m.is_some()))
 }
 
 /// Bounded compaction: if at least `trigger` parts are live, merge the oldest `run` of them.
@@ -750,7 +790,7 @@ pub extern "C" fn tdb_auto_compact(h: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn tdb_maybe_compact(h: i32, trigger: u32, run: u32) -> i32 {
     clear_err();
-    with_store(h, |s| s.maybe_compact(trigger as usize, run as usize).map_err(fail))
+    with_store(h, |s| s.maybe_compact(trigger as usize, run as usize).map_err(fail_engine))
         .map_or(-1, |m| i32::from(m.is_some()))
 }
 
@@ -766,9 +806,9 @@ pub unsafe extern "C" fn tdb_reconstruct(h: i32, id: *const u8, id_len: u32) -> 
     clear_err();
     let id = match text(id, id_len) {
         Ok(v) => v,
-        Err(e) => return fail(format!("id is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("id is not UTF-8: {e}")),
     };
-    match with_store(h, |s| s.reconstruct(id).map_err(fail)) {
+    match with_store(h, |s| s.reconstruct(id).map_err(fail_engine)) {
         Ok(Some(b)) => {
             set_out(&b);
             1
@@ -791,11 +831,11 @@ pub unsafe extern "C" fn tdb_get_record(h: i32, id: *const u8, id_len: u32) -> i
     clear_err();
     let id_s = match text(id, id_len) {
         Ok(v) => v,
-        Err(e) => return fail(format!("id is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("id is not UTF-8: {e}")),
     };
     let found = match with_store(h, |s| {
-        let rec = s.get(id_s).map_err(fail)?;
-        let body = s.reconstruct(id_s).map_err(fail)?;
+        let rec = s.get(id_s).map_err(fail_engine)?;
+        let body = s.reconstruct(id_s).map_err(fail_engine)?;
         Ok((rec, body))
     }) {
         Ok(v) => v,
@@ -839,15 +879,15 @@ pub unsafe extern "C" fn tdb_scan_ids(
     clear_err();
     let from = match text(from, from_len) {
         Ok(v) => v,
-        Err(e) => return fail(format!("`from` is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("`from` is not UTF-8: {e}")),
     };
     let to = match text(to, to_len) {
         Ok(v) => v,
-        Err(e) => return fail(format!("`to` is not UTF-8: {e}")),
+        Err(e) => return fail_invalid(format!("`to` is not UTF-8: {e}")),
     };
     let f = (!from.is_empty()).then_some(from);
     let t = (!to.is_empty()).then_some(to);
-    match with_store(h, |s| s.scan_ids(f, t, limit as usize, reverse != 0).map_err(fail)) {
+    match with_store(h, |s| s.scan_ids(f, t, limit as usize, reverse != 0).map_err(fail_engine)) {
         Ok(ids) => {
             set_out(serde_json::Value::from(ids).to_string().as_bytes());
             0
@@ -1160,9 +1200,9 @@ pub unsafe extern "C" fn tdb_scan(h: i32, json: *const u8, json_len: u32) -> i32
     clear_err();
     let req = match decode_scan_request(slice(json, json_len)) {
         Ok(v) => v,
-        Err(e) => return fail(e),
+        Err(e) => return fail_invalid(e),
     };
-    match with_store(h, |s| s.scan(&req).map_err(fail)) {
+    match with_store(h, |s| s.scan(&req).map_err(fail_engine)) {
         Ok(page) => {
             set_out(encode_scan_page(&page).to_string().as_bytes());
             0
@@ -1176,7 +1216,7 @@ pub unsafe extern "C" fn tdb_scan(h: i32, json: *const u8, json_len: u32) -> i32
 pub extern "C" fn tdb_stats(h: i32) -> i32 {
     clear_err();
     match with_store(h, |s| {
-        let ids = s.ids().map_err(fail)?;
+        let ids = s.ids().map_err(fail_engine)?;
         Ok(serde_json::json!({ "records": ids.len(), "parts": s.parts().len() }))
     }) {
         Ok(v) => {
@@ -1184,6 +1224,107 @@ pub extern "C" fn tdb_stats(h: i32) -> i32 {
             0
         }
         Err(_) => -1,
+    }
+}
+
+/// Verify every integrity leg in the committed snapshot and return exact evidence as JSON.
+///
+/// Staged memtable/WAL state is deliberately outside this scope. A caller that wants current
+/// writes included must make them durable and flush them before calling this operation.
+#[no_mangle]
+pub extern "C" fn tdb_verify(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |s| s.verify().map_err(fail_engine)) {
+        Ok(report) => {
+            let incomplete = report.chain.undigested > 0 || report.unidentified_content_values > 0;
+            let value = serde_json::json!({
+                "scope": "committed_snapshot",
+                "state": if incomplete { "incomplete" } else { "valid" },
+                "retainedManifests": {
+                    "state": if report.chain.retained_manifests == 0 {
+                        "not_applicable"
+                    } else {
+                        "verified"
+                    },
+                    "count": report.chain.retained_manifests,
+                },
+                "chain": {
+                    "links": report.chain.links,
+                    "partDigests": report.chain.part_digests,
+                    "undigestedParts": report.chain.undigested,
+                },
+                "parts": report.parts,
+                "partSections": report.part_sections,
+                "fold": {
+                    "segments": report.fold.segments,
+                    "blocks": report.fold.blocks,
+                    "bytes": report.fold.bytes.to_string(),
+                    "trailingUncommittedBytes": report.fold.trailing_uncommitted.to_string(),
+                },
+                "records": report.records,
+                "contentValues": report.content_values,
+                "contentBytes": report.content_bytes.to_string(),
+                "contentIdentities": report.content_identities,
+                "unidentifiedContentValues": report.unidentified_content_values,
+            });
+            match serde_json::to_vec(&value) {
+                Ok(bytes) => {
+                    set_out(&bytes);
+                    0
+                }
+                Err(error) => fail(format!("encode verification report: {error}")),
+            }
+        }
+        Err(code) => code,
+    }
+}
+
+/// Return cheap operational facts without making an integrity claim.
+#[no_mangle]
+pub extern "C" fn tdb_health(h: i32) -> i32 {
+    clear_err();
+    match with_store(h, |store| Ok(store.health())) {
+        Ok(health) => {
+            let value = serde_json::json!({
+                "state": "available",
+                "commit": health.commit.to_string(),
+                "foldGeneration": health.fold_generation,
+                "parts": health.parts,
+                "partRows": health.part_rows.to_string(),
+                "memtableEntries": health.memtable_entries,
+                "memtableBytes": health.memtable_bytes,
+                "walBytes": health.wal_bytes.to_string(),
+                "walFrames": health.wal_frames.to_string(),
+                "foldDiskBytes": health.fold_disk_bytes.to_string(),
+                "foldSegments": health.fold_segments,
+                "foldCacheHits": health.fold_cache_hits.to_string(),
+                "foldCacheMisses": health.fold_cache_misses.to_string(),
+                "foldCacheBytes": health.fold_cache_bytes,
+                "foldCacheBudget": health.fold_cache_budget,
+                "foldBlockTargetBytes": health.fold_block_target_bytes,
+                "foldSegmentMaxBytes": health.fold_segment_max_bytes,
+                "foldCompressionLevel": health.fold_compression_level,
+                "foldCompressionThreads": health.fold_compression_threads,
+                "partCacheBytes": health.part_cache_bytes,
+                "partCacheBudget": health.part_cache_budget,
+                "maxStoredFrameBytes": health.max_stored_frame_bytes.to_string(),
+                "maxDecodedFrameBytes": health.max_decoded_frame_bytes.to_string(),
+                "maxDirectoryEntries": health.max_directory_entries.to_string(),
+                "maxWalFrames": health.max_wal_frames.to_string(),
+                "maxFoldBlocks": health.max_fold_blocks.to_string(),
+                "dedupWindowEntries": health.dedup_window_entries,
+                "retainedCommits": health.retained_commits,
+                "punchedBlocks": health.punched_blocks.to_string(),
+            });
+            match serde_json::to_vec(&value) {
+                Ok(bytes) => {
+                    set_out(&bytes);
+                    0
+                }
+                Err(error) => fail(format!("encode health report: {error}")),
+            }
+        }
+        Err(code) => code,
     }
 }
 
