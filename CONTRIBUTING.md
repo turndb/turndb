@@ -137,23 +137,22 @@ to what turndb needs from an operating system, and what it does not get on that 
 
 ### What you can run locally, and what only CI can run
 
-**Today CI does not use one compiler, and neither will you.** `rust gates` installs
-`dtolnay/rust-toolchain@1.95.0`; the npm, native-addon and prebuild jobs install `@stable`. So the
-gate that runs `clippy -D warnings` and the jobs that build the shipped artifacts are on different
-rustc versions, and your local default is a third. Nothing pins them.
+**Same compiler as CI, and it is the file that makes it true — not the workflow.** `rust-toolchain.toml`
+pins `1.95.0`, and rustup honours it over whatever you have installed and over whatever a CI action
+installed first. Inside this repository `cargo --version` reports 1.95.0 even when your default is
+newer; outside it, it reports your default.
 
-A `rust-toolchain.toml` fixes this, because rustup honours it over whatever is installed and over
-whatever a CI action put there first — with the file present, `cargo --version` inside this
-repository reports the pinned version even when your default is newer, and the `@stable` lines
-become a description of what gets *downloaded* rather than what *builds*. **One is proposed but not
-merged; until it is, treat "CI and I ran the same compiler" as unestablished** and report your
-`rustc --version` alongside any result that could plausibly depend on it.
+**So do not read the workflow as the source of truth.** `rust gates` installs
+`dtolnay/rust-toolchain@1.95.0` while the npm, native-addon and prebuild jobs install `@stable` —
+those lines describe what gets *downloaded*, not what *builds*, and the pin overrides all of them.
+Before the pin landed they genuinely diverged: the gate deciding acceptability and the jobs building
+the shipped artifacts ran different rustc versions. Delete the pin and that returns, silently.
 
 **Runnable locally, and identical to CI:** every command in the block above, plus
 `bash npm/build.sh`, which rebuilds `turndb.wasm` from committed Rust and runs the package suite.
-The artifact is byte-reproducible *once a toolchain is pinned* — three machines produced the same
-sha256 for the same commit under `1.95.0`, and a fourth build on `1.97.1` differed by 4,137 bytes.
-Without a pin, "same commit" does not imply "same bytes".
+The artifact is byte-reproducible **because** of that pin — three machines produced the same sha256
+for the same commit under `1.95.0`, and a build on `1.97.1` differed by 4,137 bytes. Reproducibility
+is a property of the pin, not of the commit.
 
 **Runnable locally but NOT on every push:** `cargo test --features dst --test dst`. The crash-state
 harness runs nightly (`nightly.yml`) and on demand, not per push, because of its runtime. **It does
