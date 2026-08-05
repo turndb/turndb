@@ -32,9 +32,10 @@ us so we can pin, patch or fork.
 ## Supported versions
 
 **There is no supported version.** TurnDB is pre-release: the `turndb`
-crate is unpublished, the `@turndb/native` package is `private`, and
-both binding crates carry `publish = false`. Every artifact today is
-built from source at a commit.
+crate is unpublished on crates.io, the portable `turndb` npm package is
+unpublished, `@turndb/native` is marked `private`, and both binding
+crates carry `publish = false`. Every artifact today is built from
+source at a commit.
 
 Security fixes land on `main`. If you are running TurnDB, you are
 running a commit, and the fix for you is to move to a later one.
