@@ -82,6 +82,111 @@ export interface ScanOptions {
   reverse?: boolean;
 }
 
+export type Compare = 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte';
+
+/**
+ * Float comparisons: `eq`/`ne` are BIT equality — they match the exact stored NaN payload and
+ * distinguish -0.0 from 0.0, honoring the store's byte-exactness promise. Ordering ops use IEEE
+ * partial order, so no NaN satisfies any inequality and -0.0 orders equal to 0.0; `eq` therefore
+ * does not imply `lte`. IEEE equality is expressible as `lte` && `gte`.
+ *
+ * `value` is tagged by exactly the rules {@link Attrs} uses on the write side — pass a BigInt for
+ * an exact i64, `{ u }` for unsigned, `{ f }` to force a float, `{ timestampNs }` for a timestamp.
+ */
+export type Predicate =
+  | { kind: 'id'; op: Compare; value: string }
+  | { kind: 'attr'; name: string; op: Compare; value: AttrValue }
+  | { kind: 'attr_exists'; name: string; present: boolean }
+  | { kind: 'content_exists'; name: string; present: boolean };
+
+export interface ContentSelect {
+  name: string;
+  /** `metadata` describes the value without reconstructing it and opens no fold block. */
+  mode: 'metadata' | 'bytes';
+}
+
+export interface ScanRequest {
+  /** Inclusive lower bound. */
+  from?: string;
+  /** Exclusive upper bound. */
+  to?: string;
+  /** Shorthand for the half-open range covering exactly this prefix. Overrides `from`/`to`. */
+  prefix?: string;
+  direction?: 'forward' | 'reverse';
+  /** Opaque checked continuation from a previous page's `next`. */
+  cursor?: string;
+  /** Default 100. */
+  limit?: number;
+  /** Hard bound on candidate records examined. A partial page carries a cursor. */
+  maxExamined?: number;
+  /** Pre-predicate immutable-row plus memtable-entry ceiling; one id group may exceed it. */
+  maxResolutionEntries?: number;
+  /** Whole-page content byte ceiling; one oversized row is admitted to guarantee progress. */
+  maxReconstructedBytes?: number | bigint;
+  /** Attribute keys to return. Order and duplicate keys are preserved. */
+  attrs?: string[];
+  /** Named content values to describe or reconstruct. */
+  contents?: ContentSelect[];
+  predicates?: Predicate[];
+}
+
+export interface ProjectedContent {
+  name: string;
+  present: boolean;
+  len?: bigint;
+  pieces?: number;
+  /** BLAKE3 of the exact reconstructed bytes; unavailable for values written by legacy formats. */
+  identity?: string;
+  /** Present only for a value selected with `mode: 'bytes'`. */
+  bytes?: Uint8Array;
+}
+
+export interface ScanStats {
+  durationNs: bigint;
+  examined: number;
+  returned: number;
+  /** Repeat `(name, type)` occurrences beyond each first. Every occurrence is still returned. */
+  duplicateAttrOccurrences: number;
+  contentValuesReconstructed: number;
+  reconstructedBytes: bigint;
+  /** A matching row was left for the next page rather than crossing the reconstruction ceiling. */
+  reconstructionBudgetExhausted: boolean;
+  /** Exact operation-local storage reads. Zero fold reads on a metadata-only page. */
+  io: {
+    partSectionsTouched: bigint;
+    partSectionCacheHits: bigint;
+    partSectionCacheMisses: bigint;
+    partStoredBytesRead: bigint;
+    partRawBytesDecoded: bigint;
+    foldBlocksTouched: bigint;
+    foldBlockCacheHits: bigint;
+    foldBlockCacheMisses: bigint;
+    foldStoredBytesRead: bigint;
+    foldRawBytesDecoded: bigint;
+  };
+  resolution: {
+    physicalRows: bigint;
+    supersededRows: bigint;
+    tombstones: bigint;
+    memtableEntries: bigint;
+    budgetExhausted: boolean;
+  };
+}
+
+export interface ScanRow {
+  id: string;
+  /** Order and duplicate keys preserved, exactly as stored. */
+  attrs: Array<[string, AttrValue]>;
+  contents: ProjectedContent[];
+}
+
+export interface ScanPage {
+  rows: ScanRow[];
+  /** Absent when the range is exhausted. */
+  next?: string;
+  stats: ScanStats;
+}
+
 export interface BatchRecord {
   id: string;
   body?: Uint8Array | string;
@@ -210,6 +315,17 @@ export declare class Store {
   getRecord(id: string): StoreRecord | null;
   /** Live ids in range, in id order. The paging primitive. */
   scanIds(opts?: ScanOptions): string[];
+  /**
+   * One structured page: engine-side predicates, attribute and named-content projection, and a
+   * checked continuation cursor.
+   *
+   * Unlike {@link Store.scanIds} the filtering and projection happen in Rust against exact stored
+   * values. A page selecting no content opens no fold block.
+   *
+   * The native binding's `timeoutMs`/`signal` are deliberately absent: this build is
+   * single-threaded, so there is nothing to interrupt a scan from.
+   */
+  scan(request?: ScanRequest): ScanPage;
   stats(): Stats;
   /**
    * Close the store and release its handle. Does NOT sync — call {@link Store.sync} first.
