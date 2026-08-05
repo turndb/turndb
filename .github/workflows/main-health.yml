@@ -6,11 +6,17 @@
 # was in the run list the whole time — and nothing surfaced it, because surfacing it required
 # somebody to choose to check.
 #
-# So the mechanism cannot be a dashboard, a badge, or a convention. It has to push. An issue is the
-# cheapest thing in this repository that pushes: watchers are notified, it survives restarts and
-# context loss, it is visible to a contributor who has never met this team, and it costs no
-# third-party service — which `489e79b` established we will not add for a constraint with a known
-# end date.
+# So the mechanism cannot be a dashboard, a badge, or a convention. It has to push, to a NAMED
+# person. An issue alone does not: this repository had `subscribers_count: 0` and an empty
+# subscriber list when that was measured, so an unassigned issue is one more surface somebody must
+# choose to inspect — the defect, not the fix.
+#
+# What pushes is assignment plus an @mention of the actor whose run failed. GitHub notifies an
+# assignee and a mentioned user regardless of repository subscription, so delivery does not depend
+# on anyone having remembered to watch the repo. The issue is still the durable artifact: it
+# survives restarts and context loss, it is visible to a contributor who has never met this team,
+# and it costs no third-party service — which `489e79b` established we will not add for a
+# constraint with a known end date.
 #
 # It closes itself when `main` goes green, so the signal cannot decay into a stale open issue that
 # everyone learns to scroll past. An alert that is always on is the same defect one layer out.
@@ -33,7 +39,8 @@ permissions:
   issues: write
 
 concurrency:
-  group: main-health
+  # Per branch: a drill on `ci-alert-drill` must not serialise behind or race a real `main` incident.
+  group: main-health-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
@@ -50,16 +57,28 @@ jobs:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           SHA: ${{ github.event.workflow_run.head_sha }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
           LABEL: ci-red
         run: |
           set -euo pipefail
 
-          # The label has to exist before it can be searched for; creating it is idempotent.
+          # The label is for humans browsing; it is NOT the identity. One label is shared by every
+          # watched branch, so looking up "the open ci-red issue" would let a drill close a real
+          # `main` incident. Identity is this exact marker, matched over EVERY open labelled issue
+          # rather than the first one returned.
+          marker="<!-- ci-red-branch: $BRANCH -->"
+
           gh label create "$LABEL" --repo "$REPO" --color B60205 \
             --description "a watched branch is failing CI; opened and closed automatically" 2>/dev/null || true
 
-          existing=$(gh issue list --repo "$REPO" --label "$LABEL" --state open \
-            --json number --jq '.[0].number // empty')
+          existing=""
+          for n in $(gh issue list --repo "$REPO" --label "$LABEL" --state open --limit 100 \
+                       --json number --jq '.[].number'); do
+            if gh issue view "$n" --repo "$REPO" --json body --jq '.body' | grep -qF "$marker"; then
+              existing="$n"
+              break
+            fi
+          done
 
           short="${SHA:0:9}"
 
@@ -68,9 +87,9 @@ jobs:
               gh issue comment "$existing" --repo "$REPO" --body \
                 "\`$BRANCH\` is green again at \`$short\` — [run $RUN_ID]($RUN_URL). Closing."
               gh issue close "$existing" --repo "$REPO"
-              echo "closed #$existing"
+              echo "closed #$existing for $BRANCH"
             else
-              echo "$BRANCH is green and no issue is open; nothing to do"
+              echo "$BRANCH is green and no issue is open for it; nothing to do"
             fi
             exit 0
           fi
@@ -78,21 +97,31 @@ jobs:
           # Any non-success conclusion counts: failure, timed_out, cancelled, action_required.
           # A cancelled run is not a passing run, and treating it as one is how a gate goes quiet.
           body=$(printf '%s\n' \
-            "CI concluded **$CONCLUSION** on \`$BRANCH\` at \`$short\`." \
+            "@$ACTOR — CI concluded **$CONCLUSION** on \`$BRANCH\` at \`$short\`." \
             "" \
             "- run: [$RUN_ID]($RUN_URL)" \
             "- commit: \`$SHA\`" \
             "" \
-            "This issue was opened automatically and closes itself when a CI run on" \
-            "\`$BRANCH\` succeeds. If it is open, \`$BRANCH\` is not green — whatever any badge" \
-            "shows. A \`ci-alert-drill\` issue is a deliberate exercise of this alert, not an" \
-            "incident.")
+            "You are assigned and mentioned because you triggered the run, not because you" \
+            "necessarily broke it — this repository has no subscribers, so an unassigned issue" \
+            "would reach nobody." \
+            "" \
+            "This closes itself when a CI run on \`$BRANCH\` succeeds. While it is open," \
+            "\`$BRANCH\` is not green, whatever any badge shows. A \`ci-alert-drill\` issue is a" \
+            "deliberate exercise of this alert, not an incident." \
+            "" \
+            "$marker")
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "$body"
-            echo "commented on #$existing"
+            echo "commented on #$existing for $BRANCH"
           else
+            # Assignment can fail if the actor is not a collaborator; the @mention in the body
+            # still notifies them, so a failed assignment must not lose the alert.
             gh issue create --repo "$REPO" --label "$LABEL" \
-              --title "$BRANCH is red: CI $CONCLUSION at $short" --body "$body"
-            echo "opened a red-branch issue for $BRANCH"
+              --title "$BRANCH is red: CI $CONCLUSION at $short" --body "$body" \
+              --assignee "$ACTOR" \
+              || gh issue create --repo "$REPO" --label "$LABEL" \
+                   --title "$BRANCH is red: CI $CONCLUSION at $short" --body "$body"
+            echo "opened a red-branch issue for $BRANCH, assigned to $ACTOR"
           fi
