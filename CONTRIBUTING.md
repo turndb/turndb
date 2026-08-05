@@ -135,6 +135,53 @@ The native build is Unix only, matching the crate's stated scope. The WASM bindi
 (`bindings/wasm`, published to npm) builds for `wasm32-wasip1`; `src/sys.rs` is the single answer
 to what turndb needs from an operating system, and what it does not get on that target.
 
+### What you can run locally, and what only CI can run
+
+**Today CI does not use one compiler, and neither will you.** `rust gates` installs
+`dtolnay/rust-toolchain@1.95.0`; the npm, native-addon and prebuild jobs install `@stable`. So the
+gate that runs `clippy -D warnings` and the jobs that build the shipped artifacts are on different
+rustc versions, and your local default is a third. Nothing pins them.
+
+A `rust-toolchain.toml` fixes this, because rustup honours it over whatever is installed and over
+whatever a CI action put there first — with the file present, `cargo --version` inside this
+repository reports the pinned version even when your default is newer, and the `@stable` lines
+become a description of what gets *downloaded* rather than what *builds*. **One is proposed but not
+merged; until it is, treat "CI and I ran the same compiler" as unestablished** and report your
+`rustc --version` alongside any result that could plausibly depend on it.
+
+**Runnable locally, and identical to CI:** every command in the block above, plus
+`bash npm/build.sh`, which rebuilds `turndb.wasm` from committed Rust and runs the package suite.
+The artifact is byte-reproducible *once a toolchain is pinned* — three machines produced the same
+sha256 for the same commit under `1.95.0`, and a fourth build on `1.97.1` differed by 4,137 bytes.
+Without a pin, "same commit" does not imply "same bytes".
+
+**Runnable locally but NOT on every push:** `cargo test --features dst --test dst`. The crash-state
+harness runs nightly (`nightly.yml`) and on demand, not per push, because of its runtime. **It does
+not run against `wasm32-wasip1` at all** — it drives the write path below `src/sys.rs`, and the
+portable target does not execute it. So a change to the WASM binding is *not* crash-tested by any
+suite, here or in CI. That is a real gap and it is stated rather than papered over.
+
+**Not runnable locally:**
+
+- The **native prebuild** and its install check, which exercise `ubuntu-22.04` glibc packaging.
+- The **Node matrix** (22, 24, 26) unless you have all three installed; `npm/build.sh` uses whichever
+  `node` is on your PATH.
+- The **release-profile suite**, which is deferred while this repository is private — the free-tier
+  runner cannot link DataFusion-static release test binaries. See `docs/support-and-compatibility.md`.
+
+**Exercisable on demand:** the red-branch alert. `main-health.yml` opens an issue when CI concludes
+anything but success on `main`, and closes it when `main` recovers. Because `workflow_run` only ever
+runs the copy of a workflow file that is on the **default branch**, the filter cannot be widened
+from a feature branch to test it — so the branch `ci-alert-drill` is permanently in the filter.
+Push anything failing to it and read the issue that opens; push a fix and watch it close. **An
+alert nobody has watched fire is indistinguishable from one that does not work**, and `main` is
+never involved.
+
+**Not runnable by anyone yet:** required status checks. GitHub rulesets return *"upgrade to Pro or
+make this repository public"* on a private free-tier repository, and no branch protection exists.
+**Nothing gates the merge button today** — a reviewer reads the check list. The `gate` job in
+`ci.yml` exists so that list has one line worth reading.
+
 ## Changing the format
 
 **Anything that changes what a future build promises to read goes to the repository owner first.** A
