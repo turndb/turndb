@@ -366,7 +366,10 @@ export declare class Store {
  *
  * **At most one open writer per store directory across every process.** This package is always the
  * `wasm32-wasip1` build and WASI has no advisory locking, so the engine cannot enforce
- * cross-process exclusion. Two writers corrupt the store, and detection is not guaranteed.
+ * cross-process exclusion. Measured concurrent writers both received successful durability
+ * acknowledgements while one writer's entire record set was silently discarded; the surviving
+ * store remained internally consistent. The embedder must enforce this precondition before it can
+ * treat an acknowledgement as durable fact.
  *
  * Within one process, sequential opens — including opens of different directories — reuse one WASI
  * instance. The directory capability is switched between handles without widening the sandbox to a

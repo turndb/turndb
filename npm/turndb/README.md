@@ -88,8 +88,11 @@ WASI has no advisory locking. The lock file is created and gates nothing.
 
 The host layer permits one live `Store` per process. That is not enough isolation: another process
 can still open the same directory. The obligation is therefore **at most one open writer per store
-directory across every process.** Two writers will interleave their write-ahead logs and corrupt
-the store, and **detection is not guaranteed**: a clean read afterwards does not mean it is intact.
+directory across every process.** The guest cannot enforce or detect a violation. In four measured
+overlapping-writer runs on Node 24, both writers received successful `sync()` acknowledgements and
+one writer's complete record set was silently discarded. The surviving store was internally
+consistent and every remaining record was readable, so a clean read or verification cannot prove
+that an acknowledged write survived. Other overlap patterns may fail differently.
 
 Sequential opens, including different directories, reuse one WASI instance. This removes
 per-construction external-memory pressure while keeping the sandbox narrow: only the current store
