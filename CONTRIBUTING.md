@@ -169,6 +169,12 @@ suite, here or in CI. That is a real gap and it is stated rather than papered ov
 - The **release-profile suite**, which is deferred while this repository is private — the free-tier
   runner cannot link DataFusion-static release test binaries. See `docs/support-and-compatibility.md`.
 
+**A workflow change is not a Rust-free change.** `tests/package.rs` reads
+`.github/workflows/ci.yml` and asserts the Node matrix there matches what the packages claim. So
+editing CI can fail `cargo test` for reasons that look nothing like CI — and the reverse: a Rust
+test can be the thing that stops you silently narrowing the supported Node range. **Run `cargo test
+--test package` after touching a workflow file.** This cost a CI cycle to discover.
+
 **Exercisable on demand:** the red-branch alert. `main-health.yml` opens an issue when CI concludes
 anything but success on `main`, and closes it when `main` recovers. Because `workflow_run` only ever
 runs the copy of a workflow file that is on the **default branch**, the filter cannot be widened
