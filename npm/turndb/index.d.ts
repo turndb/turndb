@@ -195,6 +195,21 @@ export interface BatchRecord {
   delete?: boolean;
 }
 
+export interface NamedContent {
+  name: string;
+  bytes: Uint8Array | string;
+}
+
+export type WriteOperation =
+  | { kind: 'put'; id: string; contents: NamedContent[]; attrs?: Attrs }
+  | { kind: 'delete'; id: string };
+
+export interface WriteResult {
+  applied: number;
+  /** True only when the engine completed the durability sync before returning. */
+  durable: boolean;
+}
+
 export interface StoreRecord {
   id: string;
   body: Uint8Array;
@@ -276,6 +291,13 @@ export declare class Store {
   putBody(id: string, body: Uint8Array | string, attrs?: Attrs): void;
   /** Apply many records atomically — all-or-nothing, so a crash cannot commit half an export. */
   applyBatch(records: BatchRecord[]): number;
+  /**
+   * Apply generic named-content records and deletions atomically.
+   *
+   * With `durable: true`, a successful return is the acknowledgement: the exact batch is durable.
+   * A thrown error is not an acknowledgement and the caller must retain its source copy.
+   */
+  write(operations: WriteOperation[], options?: { durable?: boolean }): WriteResult;
   /** Tombstone a record. Not durable until {@link Store.sync}. */
   delete(id: string): void;
   /** Make everything written so far durable. **The ACK point.** */
@@ -344,7 +366,10 @@ export declare class Store {
  *
  * **At most one open writer per store directory across every process.** This package is always the
  * `wasm32-wasip1` build and WASI has no advisory locking, so the engine cannot enforce
- * cross-process exclusion. Two writers corrupt the store, and detection is not guaranteed.
+ * cross-process exclusion. Measured concurrent writers both received successful durability
+ * acknowledgements while one writer's entire record set was silently discarded; the surviving
+ * store remained internally consistent. The embedder must enforce this precondition before it can
+ * treat an acknowledgement as durable fact.
  *
  * Within one process, sequential opens — including opens of different directories — reuse one WASI
  * instance. The directory capability is switched between handles without widening the sandbox to a
