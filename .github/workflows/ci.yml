@@ -51,7 +51,6 @@ env:
 jobs:
   rust:
     name: rust gates
-    if: github.ref != 'refs/heads/ci-alert-drill'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -174,7 +173,6 @@ jobs:
     # exercise a clean tarball install. `--use-napi-cross` pins the GNU symbol floor; package:pack
     # independently inspects the resulting ELF and refuses anything newer than GLIBC_2.17.
     name: native prebuild (linux x64 glibc)
-    if: github.ref != 'refs/heads/ci-alert-drill'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
