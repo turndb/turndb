@@ -1,0 +1,98 @@
+# A red `main` opens an issue. Nobody has to decide to look.
+#
+# `main` was red from 07-31 04:41 to 08-04 20:30. Four consecutive push runs failed, and for three
+# and a half of those four days the badge said green, because a nightly CI run reported success on
+# the same failing commit. Five agents worked across that window. Nothing was hidden — the failure
+# was in the run list the whole time — and nothing surfaced it, because surfacing it required
+# somebody to choose to check.
+#
+# So the mechanism cannot be a dashboard, a badge, or a convention. It has to push. An issue is the
+# cheapest thing in this repository that pushes: watchers are notified, it survives restarts and
+# context loss, it is visible to a contributor who has never met this team, and it costs no
+# third-party service — which `489e79b` established we will not add for a constraint with a known
+# end date.
+#
+# It closes itself when `main` goes green, so the signal cannot decay into a stale open issue that
+# everyone learns to scroll past. An alert that is always on is the same defect one layer out.
+name: main health
+
+# `ci-alert-drill` is a permanent, deliberately-failable branch. It is here because an alert nobody
+# has watched fire is indistinguishable from one that does not work, and `workflow_run` will only
+# ever run the copy of this file that is on the DEFAULT branch — so the filter cannot be widened
+# from a feature branch to prove it. Push anything failing to `ci-alert-drill` and this opens an
+# issue; push a fix and it closes it. `main` is never involved.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, ci-alert-drill]
+
+# Only what this needs. It reads runs and writes issues; it never touches contents.
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: main-health
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: report main health
+    runs-on: ubuntu-latest
+    steps:
+      - name: open, update or close the red-main issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          LABEL: ci-red
+        run: |
+          set -euo pipefail
+
+          # The label has to exist before it can be searched for; creating it is idempotent.
+          gh label create "$LABEL" --repo "$REPO" --color B60205 \
+            --description "a watched branch is failing CI; opened and closed automatically" 2>/dev/null || true
+
+          existing=$(gh issue list --repo "$REPO" --label "$LABEL" --state open \
+            --json number --jq '.[0].number // empty')
+
+          short="${SHA:0:9}"
+
+          if [ "$CONCLUSION" = "success" ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$REPO" --body \
+                "\`$BRANCH\` is green again at \`$short\` — [run $RUN_ID]($RUN_URL). Closing."
+              gh issue close "$existing" --repo "$REPO"
+              echo "closed #$existing"
+            else
+              echo "$BRANCH is green and no issue is open; nothing to do"
+            fi
+            exit 0
+          fi
+
+          # Any non-success conclusion counts: failure, timed_out, cancelled, action_required.
+          # A cancelled run is not a passing run, and treating it as one is how a gate goes quiet.
+          body=$(printf '%s\n' \
+            "CI concluded **$CONCLUSION** on \`$BRANCH\` at \`$short\`." \
+            "" \
+            "- run: [$RUN_ID]($RUN_URL)" \
+            "- commit: \`$SHA\`" \
+            "" \
+            "This issue was opened automatically and closes itself when a CI run on" \
+            "\`$BRANCH\` succeeds. If it is open, \`$BRANCH\` is not green — whatever any badge" \
+            "shows. A \`ci-alert-drill\` issue is a deliberate exercise of this alert, not an" \
+            "incident.")
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            echo "commented on #$existing"
+          else
+            gh issue create --repo "$REPO" --label "$LABEL" \
+              --title "$BRANCH is red: CI $CONCLUSION at $short" --body "$body"
+            echo "opened a red-branch issue for $BRANCH"
+          fi
