@@ -85,7 +85,8 @@ s.flush()?;                                   // seal into an immutable part
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
 | **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
 
-The pack command takes the writer role, settles a recovered WAL, fully verifies its staged artifact,
+The pack command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-lock)), settles a
+recovered WAL, fully verifies its staged artifact,
 and refuses to replace an output path. Restore likewise verifies before extraction and atomically
 publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
 Manifest recovery is likewise exclusive and validates the complete candidate before publication;
@@ -174,11 +175,11 @@ the engine enforces this with `flock`, which the kernel releases when the proces
 stale lock cannot outlive its owner. **Under WASI there is no advisory locking and the engine
 cannot enforce it**: the lock file is created and gates nothing, so the obligation is the
 embedder's — at most one open writer per store directory, across every process and every WASM
-instance. **The guest cannot enforce or detect a violation, and the failure is not corruption.** In
-four measured overlapping-writer runs on Node 24, both writers received successful `sync()`
-acknowledgements and one writer's complete record set was silently discarded. The surviving store
-was internally consistent and every remaining record was readable, so **a clean read or verification
-cannot prove that an acknowledged write survived.** Other overlap patterns may fail differently.
+instance. The guest cannot enforce or detect a violation. In four measured overlapping-writer runs
+on Node 24, both writers received successful `sync()` acknowledgements and one writer's complete
+record set was silently discarded. The surviving store was internally consistent and every remaining
+record was readable, so a clean read or verification cannot prove that an acknowledged write
+survived. Other overlap patterns may fail differently.
 See [FORMAT.md](FORMAT.md#the-writer-lock) for the normative statement.
 
 ## Platforms
