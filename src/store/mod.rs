@@ -1255,14 +1255,20 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
-/// Recover a damaged manifest only after excluding writers and validating the complete candidate.
+/// Recover a damaged manifest after validating the complete candidate, and — on Unix — only after
+/// excluding writers.
 ///
 /// This is an explicit offline operator action, never an automatic fallback. In the common case,
 /// the newest retained copy carries the same commit as the damaged live manifest and no data is
 /// abandoned. Falling back farther requires an explicit [`RecoveryOptions::max_rollback_commits`]
 /// allowance. Before publication, TurnDB validates the candidate's exact committed fold prefix,
 /// every named part and section, every visible content program, and every available whole-value
-/// identity. A healthy store and a concurrently open writer are both refused.
+/// identity. A healthy store is refused unconditionally. A concurrently open writer is refused only
+/// where the writer lock is enforced: recovery takes that lock for every fold generation, and on
+/// `wasm32-wasip1` the lock always succeeds, so a live writer is neither detected nor refused and
+/// recovery can promote a manifest underneath one. There the exclusion is the embedder's to provide
+/// for recovery exactly as for ordinary writes — see
+/// [the writer lock](https://github.com/turndb/turndb/blob/main/FORMAT.md#the-writer-lock).
 pub fn recover_manifest(
     dir: &Path,
     cfg: FoldCfg,
@@ -2700,8 +2706,10 @@ impl Store {
     /// Settle every accepted operation and publish a verified, immutable backup artifact.
     ///
     /// The destination must not exist. Holding `&mut self` prevents this process from changing the
-    /// manifest while the packer walks the files it names; the writer lock excludes a second writer
-    /// process.
+    /// manifest while the packer walks the files it names — that part holds everywhere. Excluding a
+    /// second writer *process* is the writer lock's job, and the lock is enforced only on Unix: on
+    /// `wasm32-wasip1` it gates nothing, so a concurrent writer is admitted and the artifact may be
+    /// a racing cut. See [the writer lock](https://github.com/turndb/turndb/blob/main/FORMAT.md#the-writer-lock).
     pub fn backup(&mut self, out: &Path) -> Result<crate::pack::BackupStats> {
         self.backup_with_control(out, &crate::control::OperationControl::default())
     }

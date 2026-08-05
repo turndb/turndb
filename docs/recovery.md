@@ -12,8 +12,11 @@ backup or healthy replica.
 
 `store::recover_manifest` and the equivalent Node and CLI operations:
 
-1. Acquire the writer lock for every fold generation present in the store. A live writer causes a
-   typed contention failure; recovery never races ingest or maintenance.
+1. Acquire the writer lock for every fold generation present in the store. **On Unix** a live writer
+   causes a typed contention failure, so recovery cannot race ingest or maintenance. **On
+   `wasm32-wasip1` that lock gates nothing** — see [the writer lock](../FORMAT.md#the-writer-lock) —
+   so a live writer is not detected and recovery can promote a manifest underneath one. There the
+   exclusion is the embedder's, for recovery exactly as for ordinary writes.
 2. Refuse an intact live manifest. Recovery cannot be used as an accidental rollback mechanism.
 3. Examine retained manifests from newest to oldest and find the nearest *fully usable* candidate.
 4. Open only the exact fold prefix authorized by that candidate. Valid or damaged bytes from later
