@@ -24,6 +24,17 @@ turndb splits the two planes:
 * **parts** hold record ids, named content programs, and typed attribute columns — references, not
   bytes.
 
+Where the planes meet is the **carve**: dedup can only recognise repetition where piece boundaries
+land, and full-resend traffic repeats exactly at message boundaries. So the engine's default carve
+is structural, not content-defined — the elements of a top-level JSON array become pieces, and the
+punctuation between them stays inline. Turn *k*'s messages and turn *k+1*'s re-sent messages
+resolve to the same pieces, so each message is stored once however many later requests carry it:
+the storage cost of a full-resend conversation drops from quadratic in its turn count to linear.
+That boundary choice, not content addressing itself, is what the collapse above comes from. Bodies
+that are not JSON arrays fall back to content-defined chunking, and the carve is an opinion with
+escape hatches, not a lock-in: pick a strategy per write, or hand the store your own spans and
+bypass it entirely ([`src/carve.rs`](src/carve.rs)).
+
 Because a part holds no content, **compaction never touches content**: merging rewrites references
 and columns, which on trace data is a small fraction of the bytes. That is what lets a trace store
 behave like a database instead of a write-once archive.
@@ -73,6 +84,28 @@ s.put_body("trace:1#input", body, vec![])?;   // carved by the engine's default 
 s.sync()?;                                    // the ACK point — durable from here
 s.flush()?;                                   // seal into an immutable part
 ```
+
+## Storing gen_ai traces
+
+[`examples/genai_dogfood.rs`](examples/genai_dogfood.rs) is the working mapping from LLM API calls
+to turndb records, with the reasoning behind each choice in its doc comment;
+[`examples/genai_query.rs`](examples/genai_query.rs) runs a trace UI's actual reads — a member's
+page, a `responseId` lookup, aggregates — against the result, and checks byte-exact reconstruction
+first. The shape:
+
+* **Three records per API call** — `#system` / `#input` / `#output` — because a record has one
+  body by design. Each body is the message array verbatim, which is what lets the structural carve
+  above resolve re-sent turns to the same pieces.
+* **Ids are `member/ts/responseId#kind`** with the timestamp zero-padded, so ids sort
+  lexicographically into member-then-time order — the access pattern a trace UI actually has — and
+  the front-coded id column stays both compressible and range-scannable.
+* **Attributes are flattened to OpenTelemetry `gen_ai.*` semantic-convention names**, not stored
+  as nested JSON: token usage becomes `gen_ai.usage.*` integer columns that SQL can filter and
+  aggregate directly.
+* **Arrays become repeated attributes.** turndb preserves duplicate keys in order, so
+  `finish_reasons` round-trips without inventing a join separator that could collide.
+* **Custom fields pass through with inferred types** — one column per (key, type), so a deployment
+  adding its own fields needs no schema change anywhere.
 
 ## What it does
 
