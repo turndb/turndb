@@ -47,6 +47,8 @@ test('expired portable deadlines refuse at safe checkpoints and a generous deadl
     cancelled(() => store.verify({ timeoutMs: 0 }));
     cancelled(() => store.contentLiveness({ timeoutMs: 0 }));
     cancelled(() => store.spaceUsage({ timeoutMs: 0 }));
+    cancelled(() => store.estimateRefoldSpace({ timeoutMs: 0 }));
+    cancelled(() => store.refold({ timeoutMs: 0 }));
     cancelled(() => store.scan({ timeoutMs: 0, contents: [{ name: 'body', mode: 'bytes' }] }));
     cancelled(() => store.scan({
       from: 'zz/', timeoutMs: 1, contents: [{ name: 'body', mode: 'bytes' }],
