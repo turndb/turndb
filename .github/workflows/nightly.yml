@@ -1,0 +1,49 @@
+# The DST harness, in its own workflow so a scheduled run can never speak for a push run.
+#
+# It used to live in `ci.yml` behind `if: github.event_name == 'schedule'`, with five sibling jobs
+# gated on the inverse. That arrangement is why `main` displayed green for three and a half of the
+# four days it was red: a scheduled CI run emitted a check named `rust gates` with conclusion
+# `skipped` onto the same commit as the push run whose `rust gates` had FAILED, and the badge —
+# which reads the newest completed run of a workflow on the default branch — took the nightly's
+# `success`. Four nights, four repaints, one failing commit.
+#
+# Splitting the file removes the collision by construction rather than by a condition someone has
+# to keep correct: this workflow's runs are named `Nightly`, its checks are its own, and its
+# conclusion cannot be mistaken for CI's. Nothing is dropped or weakened — the same harness runs
+# on the same schedule, and `workflow_dispatch` still lets anyone demand it on any ref.
+name: Nightly
+
+on:
+  schedule:
+    # off the hour, matching the cadence this harness has always run at
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same runner economics as `ci.yml`: debug info is the bulk of what gets linked and nothing here
+  # reads a backtrace, so dropping it is the cheap half; capping build parallelism is the rest.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_BUILD_JOBS: '2'
+
+jobs:
+  dst:
+    name: deterministic simulation (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dst
+
+      # Arms a recorder in the write-path seam and replays every crash state. Scheduled rather than
+      # per-push because of its runtime, and named here rather than omitted: a check nobody can see
+      # the absence of is the defect this file exists to remove.
+      - name: dst harness
+        run: cargo test --features dst --test dst -- --nocapture

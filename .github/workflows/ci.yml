@@ -13,7 +13,14 @@
 #                       the portable npm package built from committed Rust, and the native N-API
 #                       addon across every Node major its package claims
 #   nightly + on demand the DST harness, which reconstructs crash states and is the one suite too
-#                       slow to sit in front of every push
+#                       slow to sit in front of every push. It lives in `nightly.yml`, NOT here —
+#                       see that file for why a scheduled run must not share a workflow with a
+#                       push run.
+#
+# Every job below runs on every push and PR. NOTHING in this file is conditional on the event, so a
+# `skipped` check here is an anomaly rather than routine, and the `gate` job at the bottom fails on
+# one. That is deliberate: skipped and passed were previously indistinguishable to whoever acted on
+# the result.
 #
 # The corruption suite is NOT scheduled: it is an ordinary `tests/corruption.rs` and already runs
 # inside the default `cargo test`. It was a candidate for deferral until someone checked.
@@ -23,9 +30,6 @@ on:
   push:
     branches: ['**']
   pull_request:
-  schedule:
-    # nightly, off the hour — the DST harness only
-    - cron: '17 4 * * *'
   workflow_dispatch:
 
 # A newer push supersedes an older run on the same ref. Actions minutes on a private repository are
@@ -47,7 +51,6 @@ env:
 jobs:
   rust:
     name: rust gates
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,7 +114,6 @@ jobs:
     # package says it supports, while passing locally on 24. Testing one version would have made
     # that a property of whichever version someone picked.
     name: npm package (node ${{ matrix.node }})
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -146,7 +148,6 @@ jobs:
     # addon from a single Node/V8 release; only loading and exercising the same Rust surface across
     # the declared majors proves that seam. Platform prebuild coverage is a separate shipping gate.
     name: native addon (node ${{ matrix.node }})
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -172,7 +173,6 @@ jobs:
     # exercise a clean tarball install. `--use-napi-cross` pins the GNU symbol floor; package:pack
     # independently inspects the resulting ELF and refuses anything newer than GLIBC_2.17.
     name: native prebuild (linux x64 glibc)
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -226,7 +226,6 @@ jobs:
     # The artifact is built once above. Loading that exact tarball on every declared Node major is
     # the N-API compatibility proof; rebuilding separately on each major would test different bits.
     name: native prebuild install (node ${{ matrix.node }})
-    if: github.event_name != 'schedule'
     needs: native-prebuild
     runs-on: ubuntu-22.04
     strategy:
@@ -246,19 +245,41 @@ jobs:
       - name: install and exercise the same packed addon
         run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
 
-  dst:
-    name: deterministic simulation (nightly)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+  # One check that says what actually ran, because a reader of a check list cannot tell a job that
+  # passed from a job that never executed. GitHub renders `skipped` in the same muted grey as
+  # `neutral`, and a matrix job that skips is not even expanded — a scheduled run used to emit the
+  # literal `npm package (node ${{ matrix.node }})` — so the absence of a check is spelled
+  # differently from the presence of a failing one and neither shouts.
+  #
+  # This job runs on every event, `needs` everything, and fails unless every dependency SUCCEEDED.
+  # `skipped` and `cancelled` are failures here on purpose: nothing in this file is conditional, so
+  # a skip means a dependency died or someone added a condition without adding it to this list.
+  gate:
+    name: gate
+    if: always()
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: dst
-
-      # Arms a recorder in the write-path seam and replays every crash state. Scheduled rather than
-      # per-push because of its runtime, and named here rather than omitted: a check nobody can see
-      # the absence of is the defect this file exists to remove.
-      - name: dst harness
-        run: cargo test --features dst --test dst -- --nocapture
+      - name: state what ran
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ['RESULTS'])
+          width = max(len(n) for n in needs)
+          bad = []
+          for name in sorted(needs):
+              result = needs[name]['result']
+              print('  ' + name.ljust(width) + '  ' + result)
+              if result != 'success':
+                  bad.append((name, result))
+          if bad:
+              print('')
+              for name, result in bad:
+                  print('NOT PASSED: ' + name + ' -> ' + result)
+              sys.exit(1)
+          print('')
+          print('every gate in this workflow ran and passed')
+          PY

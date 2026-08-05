@@ -119,14 +119,8 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
     }
 
     let ci = fs::read_to_string(format!("{root}/.github/workflows/ci.yml")).unwrap();
-    let portable_job = ci
-        .split_once("  npm:\n")
-        .and_then(|(_, rest)| rest.split_once("  native-node:\n").map(|(job, _)| job))
-        .expect("CI must retain a distinct portable npm job");
-    let native_job = ci
-        .split_once("  native-node:\n")
-        .and_then(|(_, rest)| rest.split_once("  native-prebuild:\n").map(|(job, _)| job))
-        .expect("CI must retain a distinct native Node job");
+    let portable_job = ci_job_block(&ci, "npm");
+    let native_job = ci_job_block(&ci, "native-node");
     for (name, job) in [("portable", portable_job), ("native", native_job)] {
         assert!(
             job.contains("node: ['22', '24', '26']"),
@@ -136,13 +130,35 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         assert!(!job.contains("node: ['20'"), "{name} CI resurrected an EOL major");
     }
 
-    let prebuild_install_job = ci
-        .split_once("  native-prebuild-install:\n")
-        .and_then(|(_, rest)| rest.split_once("  dst:\n").map(|(job, _)| job))
-        .expect("CI must install-test the collected native prebuild separately");
+    let prebuild_install_job = ci_job_block(&ci, "native-prebuild-install");
     assert!(prebuild_install_job.contains("needs: native-prebuild"));
     assert!(prebuild_install_job.contains("node: ['22', '24', '26']"));
     assert!(prebuild_install_job.contains("scripts/test-prebuild.cjs"));
+}
+
+/// A single job's block from a workflow file, bounded by the next top-level job key.
+///
+/// This used to bound each job by whichever job was written after it — `npm` ended where
+/// `native-node` began, `native-prebuild-install` ended where `dst` began. That couples a claim
+/// about the Node matrix to the *order and membership* of every other job, so moving `dst` into
+/// `nightly.yml` failed this test with `CI must install-test the collected native prebuild
+/// separately` — a message describing a defect that did not exist. A check that fails for a reason
+/// unrelated to what it asserts is a check nobody can act on.
+fn ci_job_block<'a>(ci: &'a str, name: &str) -> &'a str {
+    let key = format!("  {name}:\n");
+    let start =
+        ci.find(&key).unwrap_or_else(|| panic!("CI must retain a distinct {name} job")) + key.len();
+    let rest = &ci[start..];
+    let mut offset = 0usize;
+    for line in rest.lines() {
+        let is_top_level_key =
+            line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':');
+        if is_top_level_key {
+            return &rest[..offset];
+        }
+        offset += line.len() + 1;
+    }
+    rest
 }
 
 #[test]
