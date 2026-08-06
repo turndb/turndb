@@ -330,7 +330,15 @@ gh api repos/turndb/turndb/environments/npm \
   --jq '[.protection_rules[]? | select(.type=="required_reviewers")] | .[].reviewers[].reviewer.login'
 ```
 
-**A 404 from the first means the environment does not exist. An empty result from the second means
-it exists with no required reviewer, which is a gate that stops nothing.** Both read as a working
-gate from the workflow file. And both queries need push access — without it they return **403,
-which is a third answer and not evidence of either of the first two.**
+**Read each answer against the command that produced it — they fail differently.**
+
+The first lists the environments that exist, so **absence is absence: if `npm` is not in that
+output, the environment does not exist.** It does not return 404 for a missing environment; a 404
+there means the *repository* is missing or unreadable, which is a different problem.
+
+The second names the environment, so **404 is exactly "no such environment"** — and an **empty
+result** means it exists with **no required reviewer**, which is a gate that stops nothing. Both of
+those read as a working gate from the workflow file.
+
+**Either command returns 403 without push access.** That is a third answer and evidence for none of
+the others: it says you could not see, not that there was nothing to see.
