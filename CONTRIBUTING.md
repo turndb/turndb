@@ -231,10 +231,11 @@ For a release `X.Y.Z`, the publisher:
    set -o pipefail
    dry_run_output="$(mktemp)"
    dry_run_json="$(mktemp)"
+   audited_integrity_file="${TMPDIR:-/tmp}/turndb-X.Y.Z.integrity"
    npm publish --dry-run --json | tee "$dry_run_output"
    sed -n '/^{/,$p' "$dry_run_output" > "$dry_run_json"
    node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.argv[1])); console.table(p.files); console.log(p.size, p.unpackedSize, p.integrity)' "$dry_run_json"
-   audited_integrity="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1])).integrity)' "$dry_run_json")"
+   node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1])).integrity)' "$dry_run_json" > "$audited_integrity_file"
    ```
 
    The publisher confirms that `prepublishOnly` rebuilt the WASM and passed the package tests, then
@@ -247,7 +248,12 @@ For a release `X.Y.Z`, the publisher:
 
    ```sh
    npm view turndb@X.Y.Z name version dist.integrity dist.tarball --json
+   audited_integrity_file="${TMPDIR:-/tmp}/turndb-X.Y.Z.integrity"
+   test -s "$audited_integrity_file"
+   audited_integrity="$(cat "$audited_integrity_file")"
    published_integrity="$(npm view turndb@X.Y.Z dist.integrity)"
+   test -n "$audited_integrity"
+   test -n "$published_integrity"
    test "$published_integrity" = "$audited_integrity"
    ```
 
@@ -255,6 +261,10 @@ For a release `X.Y.Z`, the publisher:
 `prepublishOnly`; it refuses an uncommitted tree and `npm/build.sh` rebuilds and tests the artifact.
 It is a provenance guard, not an authorization gate, and `--ignore-scripts` bypasses it. Publishing
 a prebuilt tarball also does not re-run it. Neither bypass is part of this procedure.
+
+Step 4 rebuilds before publishing, so this procedure depends on `rust-toolchain.toml` making that
+build reproducible. The integrity comparison enforces the property against the registry result; a
+mismatch is a failed release verification, never a value to update by hand.
 
 ### The publication gate
 
