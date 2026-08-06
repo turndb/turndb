@@ -28,12 +28,14 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    # `main` for the post-merge record, `ci-alert-drill` because main-health.yml's
+    # workflow_run trigger watches CI on exactly those two branches. Feature branches are
+    # covered by `pull_request:` below; listing '**' here ran CI twice on every PR commit.
+    branches: [main, ci-alert-drill]
   pull_request:
   workflow_dispatch:
 
-# A newer push supersedes an older run on the same ref. Actions minutes on a private repository are
-# billed against the org plan, so a superseded run is spend with no reader.
+# A newer push supersedes an older run on the same ref. A superseded run is spend with no reader.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
