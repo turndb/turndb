@@ -1,0 +1,93 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly in TurnDB.
+title: "[bug] <short description>"
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        **Two things make a TurnDB bug report actionable**, and both are
+        easy to leave out:
+
+        - **Which binding.** Native Rust, native Node addon, and portable
+          WASI differ in ways that decide the answer — the WASI build
+          cannot enforce the single-writer lock, for example. "TurnDB
+          does X" is often true of one and not the others.
+        - **Exactly what you ran.** A package version if you installed a
+          published artifact, or a commit if you built from source.
+
+        If a store directory or pack file reproduces it, say so before
+        attaching one — an adversarial store is a payload, and we may
+        want a private channel. See SECURITY.md.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, in one or two sentences?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact steps. Include commands and the shortest repro you can find.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error messages and relevant output. Report numbers from the command, not from a truncated view of it.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The published version you installed, or the commit you built from — `git rev-parse HEAD`. Whichever identifies what you actually ran.
+      placeholder: "0.1.0  —  or a 40-character commit id"
+    validations:
+      required: true
+  - type: dropdown
+    id: binding
+    attributes:
+      label: Which binding?
+      description: If unsure, pick "unsure" — do not guess.
+      options:
+        - Rust crate (turndb)
+        - Native Node addon (@turndb/native)
+        - Portable WASI (turndb, wasm32-wasip1)
+        - turndb CLI
+        - On-disk format / an existing store
+        - unsure
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and architecture, plus the Node version if a binding is involved.
+      placeholder: "Linux x86_64, Node v24.13.0"
+    validations:
+      required: true
+  - type: textarea
+    id: writers
+    attributes:
+      label: Was more than one writer open on the store?
+      description: |
+        Including another process, another WASM instance, or a scheduled
+        maintenance task. The single-writer invariant is OS-enforced on
+        Unix and is the embedder's obligation under WASI, where a
+        violation is not detected — so this changes the diagnosis. "I do
+        not know" is a useful answer.
+    validations:
+      required: false

@@ -1,0 +1,17 @@
+# Contact links are a routing table. A link to a channel that does not
+# exist is a dead end presented as a channel, so add one only after
+# confirming the destination is live.
+#
+# No "Question or idea → Discussions" link. Discussions is a repository
+# setting and can be turned on without anyone opening this file, so
+# check it rather than this comment before adding one:
+#
+#   gh api repos/turndb/turndb --jq '{discussions: .has_discussions}'
+#
+# No commercial or hosted-offering link: add one if and when there is a
+# hosted offering to link to.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/turndb/turndb/security/policy
+    about: Do NOT open a public issue for security problems. See SECURITY.md for how to report privately.

@@ -1,0 +1,105 @@
+# Dependabot config — https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# CONFIGURE EVERY ECOSYSTEM PRESENT IN THE TREE. A config covering some
+# of them reads as covering all of them, and nothing reports the gap —
+# that is what this comment exists to prevent.
+#
+# Which ecosystems exist is a fact about the tree, not a permanent one.
+# Check the set rather than trusting the list below to be complete:
+#
+#   git ls-files | grep -iE '(^|/)(Cargo\.toml|package\.json|pyproject\.toml|\
+#     requirements[^/]*\.txt|go\.mod|Gemfile|composer\.json|Dockerfile|\
+#     pom\.xml|build\.gradle[^/]*|pubspec\.yaml|mix\.exs)$'
+#   git ls-files '.github/workflows/*'
+#
+#   cargo           — root workspace Cargo.toml/Cargo.lock, which
+#                     resolves for the engine and the binding crates
+#   npm             — bindings/node ONLY, because it is the only npm
+#                     manifest with dependencies to update. A fact about
+#                     the tree too — check it before assuming this
+#                     scoping is still right:
+#
+#                       git ls-files '*package.json' | while read f; do
+#                         printf '%s ' "$f"
+#                         python3 -c "import json,sys;d=json.load(open('$f'));\
+#                           print([k for k in ('dependencies','devDependencies',\
+#                           'optionalDependencies','peerDependencies') if d.get(k)] or 'none')"
+#                       done
+#   github-actions  — .github/workflows/
+#
+# NO `labels:` KEY HERE. Dependabot cannot apply a label that does not
+# exist: it drops the label silently and reports nothing, exactly as
+# GitHub silently ignores a CODEOWNERS entry naming a non-collaborator.
+# A `labels:` key is only correct if every label in it exists.
+#
+# The two issue templates DO carry one, so this check covers three files
+# rather than this one — confirm each label against the repository:
+#
+#   gh api repos/turndb/turndb/labels --paginate --jq '.[].name'
+#   git grep -A2 '^labels:' -- .github/ISSUE_TEMPLATE
+#
+# Grouping: minor + patch batch into one PR per ecosystem per week;
+# majors open their own PR because a breaking change deserves review on
+# its own.
+
+version: 2
+updates:
+  # ───────────────────────────── Rust workspace ────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ───────────────────── npm (native binding toolchain) ────────────────────
+  - package-ecosystem: "npm"
+    directory: "/bindings/node"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ───────────────────────────── GitHub Actions ────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

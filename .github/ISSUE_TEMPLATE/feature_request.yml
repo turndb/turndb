@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a capability or a change to how TurnDB behaves.
+title: "[feature] <short description>"
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        TurnDB's scope is a general-purpose embedded content-addressed
+        columnar store. Proposals are weighed against that rather than
+        against any single consumer's needs — see `ROADMAP.md`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today? Describe the situation, not the solution you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried or considered instead
+      description: Including whether the existing API can already do this awkwardly.
+    validations:
+      required: false
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface would this touch?
+      options:
+        - Rust crate API
+        - Native Node addon
+        - Portable WASI binding
+        - turndb CLI
+        - On-disk format (FORMAT.md)
+        - unsure
+    validations:
+      required: true
