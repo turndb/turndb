@@ -6,10 +6,17 @@
 #
 #   cargo           — root workspace Cargo.toml/Cargo.lock, which resolves
 #                     for the engine and both binding crates
-#   npm             — bindings/node ONLY. The other two package.json files
-#                     (npm/turndb, bindings/node/npm/linux-x64-gnu) declare
-#                     no dependencies of any kind, so there is nothing there
-#                     to update. Add them if that changes.
+#   npm             — bindings/node ONLY, because it is the only npm
+#                     manifest with dependencies to update. That is a fact
+#                     about the tree, not a permanent one — confirm it
+#                     before assuming this scoping is still right:
+#
+#                       git ls-files '*package.json' | while read f; do
+#                         printf '%s ' "$f"
+#                         python3 -c "import json,sys;d=json.load(open('$f'));\
+#                           print([k for k in ('dependencies','devDependencies',\
+#                           'optionalDependencies','peerDependencies') if d.get(k)] or 'none')"
+#                       done
 #   github-actions  — .github/workflows/
 #
 # NO `labels:` KEY. Dependabot cannot apply a label that does not exist:
