@@ -1,0 +1,76 @@
+[package]
+versioned_files = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "bindings/node/Cargo.toml",
+  "bindings/wasm/Cargo.toml",
+  "bindings/node/package.json",
+  "bindings/node/npm/linux-x64-gnu/package.json",
+  "npm/turndb/package.json",
+]
+changelog = "CHANGELOG.md"
+
+[github]
+owner = "turndb"
+repo = "turndb"
+
+[changes]
+# Release intent lives in reviewed change files. Conventional-looking commit subjects must not
+# silently enlarge or reclassify the version prepared by those files.
+ignore_conventional_commits = true
+
+[[workflows]]
+name = "document-change"
+
+[[workflows.steps]]
+type = "CreateChangeFile"
+
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "Command"
+command = "git switch -C release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "Command"
+command = "python3 scripts/sync-release-version.py $version"
+
+[[workflows.steps]]
+type = "Command"
+command = "python3 scripts/check-release-metadata.py"
+
+[[workflows.steps]]
+type = "Command"
+command = "git add --all"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: prepare release $version\""
+
+[[workflows.steps]]
+type = "Command"
+command = "git push --force --set-upstream origin release"
+
+[[workflows.steps]]
+type = "CreatePullRequest"
+base = "main"
+
+[workflows.steps.title]
+template = "chore: prepare release $version"
+
+[workflows.steps.body]
+template = "This PR was created by Knope. Review the generated CHANGELOG.md entry and all lockstep version changes. Merging it creates the v$version release after the protected publication jobs are approved."
+
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "Command"
+command = "bash scripts/ensure-release-tag.sh v$version"
+
+[[workflows.steps]]
+type = "Release"

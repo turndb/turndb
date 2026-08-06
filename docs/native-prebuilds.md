@@ -95,7 +95,7 @@ buys the maintained Arrow/DataFusion query machinery that the native package act
 ## Owner-gated release
 
 The `Release native Node package` workflow is manually dispatched with an exact annotated tag named
-`native-vX.Y.Z`. It:
+`vX.Y.Z`. It:
 
 1. checks out and verifies that exact tag;
 2. installs the locked `napi-rs` tooling;

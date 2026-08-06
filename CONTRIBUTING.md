@@ -201,6 +201,21 @@ assertions change in the same commit.
 crates.io, npm, and making a repository public are one-way doors. Each goes through the repository
 owner on its own review. **Landing on `main` does not approve publication.**
 
+User-visible changes are recorded with `knope document-change`. The generated file under
+`.changeset/` names the single lockstep package (`default`) and one of `major`, `minor`, or `patch`;
+CI validates manually written files too. Before blaming a Knope command that commits, run
+`ssh-add -l`: an unavailable signing key can make the commit wait without producing tool output.
+For this pre-1.0 release line, both `patch` and `minor` advance `0.1.x`; only `major` advances to
+`0.2.0`, so the change type remains a compatibility statement even when two choices produce the
+same next number.
+
+Pushing a change file to `main` updates the `release` PR. Merging that PR creates the single
+annotated `vX.Y.Z` tag and GitHub release, then starts the crate and native publication workflows;
+both publication jobs stop at the protected `npm` environment for owner review. The release-PR
+workflow needs the owner-managed `KNOPE_TOKEN` secret because GitHub does not trigger CI for a pull
+request created with the default workflow token. The portable package remains the deliberate manual
+procedure below and uses the same lockstep tag and declared version.
+
 ### Publishing the portable npm package
 
 The portable `turndb` package is deliberately published by the repository owner from a clean local
@@ -211,13 +226,13 @@ environment or the package's scripts.
 
 For a release `X.Y.Z`, the publisher:
 
-1. obtains explicit release approval, creates an annotated `npm-vX.Y.Z` tag at the approved commit,
-   and checks out that exact tag;
+1. obtains explicit release approval and checks out the exact annotated lockstep `vX.Y.Z` tag
+   created when the release PR merged;
 2. verifies the tag, version, clean tree, and registry identity:
 
    ```sh
-   test "$(git describe --tags --exact-match HEAD)" = "npm-vX.Y.Z"
-   test "$(git cat-file -t npm-vX.Y.Z)" = tag
+   test "$(git describe --tags --exact-match HEAD)" = "vX.Y.Z"
+   test "$(git cat-file -t vX.Y.Z)" = tag
    test "$(node -p "require('./npm/turndb/package.json').version")" = "X.Y.Z"
    test -z "$(git status --porcelain)"
    npm whoami
@@ -286,8 +301,8 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
 - **Tests refuse a stale `.wasm`.** `npm/turndb/test/_artifact.mjs` compares the artifact against
   the newest engine source. Running `node --test` directly after changing Rust would otherwise
   report the *old* engine's behaviour, which has already cost one wrong verification.
-- **Native release tarballs come from the exact tagged source and exact tested bytes.** The manual
-  release workflow verifies an annotated `native-vX.Y.Z` tag, cross-builds one addon, audits its ELF
+- **Native release tarballs come from the exact tagged source and exact tested bytes.** The release
+  workflow verifies the annotated lockstep `vX.Y.Z` tag, cross-builds one addon, audits its ELF
   glibc floor and package contents, and install-tests the same uploaded tarballs on every declared
   Node major before reaching the protected `npm` environment. Tracked native manifests remain
   private; only release staging removes that guard.
