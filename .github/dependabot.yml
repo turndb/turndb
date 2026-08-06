@@ -20,6 +20,11 @@
 # and the routing is lost silently, exactly as GitHub silently ignores a
 # CODEOWNERS entry naming a non-collaborator.
 #
+# Labelling dependency PRs is wanted and is NOT being given up: it is
+# blocked on `dependencies` and `ci` existing, which is a repository
+# settings change and not this file's to make. Create them, confirm with
+# the command below, then add the `labels:` keys back.
+#
 # Before adding a `labels:` key, confirm each label exists:
 #   gh api repos/turndb/turndb/labels --jq '.[].name'
 #
