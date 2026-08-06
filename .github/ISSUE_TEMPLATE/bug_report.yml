@@ -16,8 +16,8 @@ body:
           WASI differ in ways that decide the answer — the WASI build
           cannot enforce the single-writer lock, for example. "TurnDB
           does X" is often true of one and not the others.
-        - **A commit, not a version.** TurnDB is unpublished. There is no
-          release to name.
+        - **Exactly what you ran.** A package version if you installed a
+          published artifact, or a commit if you built from source.
 
         If a store directory or pack file reproduces it, say so before
         attaching one — an adversarial store is a payload, and we may
@@ -50,11 +50,11 @@ body:
     validations:
       required: true
   - type: input
-    id: commit
+    id: version
     attributes:
-      label: Commit
-      description: The commit you built from — `git rev-parse HEAD`. There are no published releases, so this is the only way to identify what you ran.
-      placeholder: "40-character commit id"
+      label: Version or commit
+      description: The published version you installed, or the commit you built from — `git rev-parse HEAD`. Whichever identifies what you actually ran.
+      placeholder: "0.1.0  —  or a 40-character commit id"
     validations:
       required: true
   - type: dropdown
