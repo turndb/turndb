@@ -13,13 +13,17 @@ This repository is trunk-based. `main` is the only long-lived branch.
 | `main` | The trunk. **Branch your work from here.** Changes land through a pull request, verified by someone who did not write them, and merge with a merge commit — never a squash or rebase — so every commit that was reviewed is the commit that lands. |
 | `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
-Nobody pushes to `main` directly — **by convention, not by machinery.** Rulesets became available
-when the repository went public on 2026-08-05, and none is configured yet: `gh api
-repos/turndb/turndb/rules/branches/main` returns `[]`, so nothing server-side refuses a direct push.
-That is a gap between what this document asks and what the repo enforces. It closes by creating a
-ruleset on `main` that requires a pull request and the `gate` check — after one CI run has passed,
-because arming a required check that cannot run leaves the merge button permanently dark. This
-paragraph should then say "protected" and mean it.
+Nobody pushes to `main` directly — **and since 2026-08-06 that is machinery, not only convention.**
+An active ruleset named `main` requires a pull request and the `gate` status check, with no bypass
+actors, so a direct push is refused server-side. Verify it:
+
+```
+gh api repos/turndb/turndb/rules/branches/main --jq '[.[].type]'
+# ["pull_request","required_status_checks"]
+```
+
+It was armed after CI first went green, because a required check that cannot run leaves the merge
+button permanently dark.
 
 **`develop` is retired.** Until 2026-07-31 this repository used a `develop` integration branch with
 frozen `review/<date>` PR branches; every commit from that model is in `main`'s history. Deleting
@@ -185,11 +189,11 @@ Push anything failing to it and read the issue that opens; push a fix and watch 
 alert nobody has watched fire is indistinguishable from one that does not work**, and `main` is
 never involved.
 
-**Available and not yet configured:** required status checks. GitHub rulesets returned *"upgrade to
-Pro or make this repository public"* while this repository was private on the free tier; publication
-made them available. None is configured — `rules/branches/main` returns `[]`.
-**Nothing gates the merge button today** — a reviewer reads the check list. The `gate` job in
-`ci.yml` exists so that list has one line worth reading.
+**Configured and enforcing:** required status checks. GitHub rulesets returned *"upgrade to Pro or
+make this repository public"* while this repository was private on the free tier; publication made
+them available and the `main` ruleset was armed once CI first passed.
+**`gate` gates the merge button** — it is the one line in the check list worth reading, and the `gate`
+job in `ci.yml` exists to make that true.
 
 ## Changing the format
 
