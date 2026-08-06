@@ -15,6 +15,15 @@
 # Grouping matches CommandSuite: minor + patch batch into one PR per
 # ecosystem per week; majors open their own PR because a breaking change
 # deserves review on its own.
+#
+# The `dependencies` and `ci` labels below were CREATED on this repository
+# rather than assumed. Dependabot does not create a label it cannot find --
+# it drops it silently, so a config naming an absent label routes nothing
+# and reports nothing. Check with:
+#
+#   gh api repos/turndb/turndb/labels --jq '[.[].name]'
+#
+# and add the label rather than removing it from here if it goes missing.
 
 version: 2
 updates:
