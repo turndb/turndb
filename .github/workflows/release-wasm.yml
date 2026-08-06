@@ -1,0 +1,139 @@
+name: Release portable wasm npm package
+
+# Publishing the portable `turndb` npm package (npm/turndb): one wasm32-wasip1 artifact, no native
+# addon, no prebuild matrix. A merged Knope release PR or a deliberate manual dispatch supplies the
+# exact annotated lockstep tag; the publish job stops at the protected `npm` environment for an
+# owner's explicit act, exactly as the crate and native releases do.
+#
+# The tarball is built once from the exact-tag checkout, exercised by the install matrix, and then
+# published byte-identically. Publishing a tarball path runs no lifecycle scripts, so the package's
+# `prepublishOnly` clean-tree guard does not fire here; its purpose — an artifact reproducible from
+# a commit — is met by construction, because the build job refuses anything but an exact annotated
+# tag.
+#
+# Authentication is npm Trusted Publishing (OIDC): no long-lived registry token is stored in this
+# repository. If no trusted publisher is configured for the `turndb` package, the publish step fails
+# and nothing is uploaded — which is the correct failure. Configuring one is an owner action.
+
+on:
+  workflow_call:
+    inputs:
+      release_ref:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Exact annotated lockstep tag to release (vX.Y.Z)
+        required: true
+        type: string
+
+concurrency:
+  group: release-wasm-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build release candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: verify exact release tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+          case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
+      - name: verify lockstep package version matches the tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: test "v$(node -p "require('./npm/turndb/package.json').version")" = "$RELEASE_REF"
+      # build.sh rebuilds turndb.wasm from the tagged source, then runs the package suite against
+      # the artifact it just built.
+      - name: build wasm from source and run the package suite
+        run: bash npm/build.sh
+      - name: pack the release tarball
+        run: |
+          mkdir -p npm/dist
+          npm pack ./npm/turndb --pack-destination npm/dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-wasm-${{ inputs.release_ref }}
+          path: npm/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  install:
+    name: install release candidate (node ${{ matrix.node }})
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-wasm-${{ inputs.release_ref }}
+          path: dist/
+      # Install the exact tarball into a fresh project and exercise the public surface: load the
+      # wasm, open a store, write a record, sync, and read it back byte-exact.
+      - name: install the exact release tarball and exercise it
+        run: |
+          mkdir smoke && cd smoke
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund ../dist/turndb-*.tgz
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { mkdtemp } from "node:fs/promises";
+            import { tmpdir } from "node:os";
+            import { join } from "node:path";
+            import { open, capabilities } from "turndb";
+            const caps = await capabilities();
+            assert.equal(caps.binding, "wasi");
+            const dir = await mkdtemp(join(tmpdir(), "turndb-release-smoke-"));
+            const store = await open(dir);
+            const payload = JSON.stringify([{ role: "user", content: "release smoke" }]);
+            store.putBody("smoke:1#input", payload);
+            store.sync();
+            const body = store.get("smoke:1#input");
+            assert.equal(new TextDecoder().decode(body), payload);
+            store.close();
+          '
+
+  publish:
+    name: publish to npm
+    needs: [build, install]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: install trusted-publishing npm
+        run: npm install --global npm@11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-wasm-${{ inputs.release_ref }}
+          path: dist/
+      - name: publish the exact audited tarball
+        run: npm publish dist/turndb-*.tgz

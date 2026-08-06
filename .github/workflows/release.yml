@@ -67,3 +67,10 @@ jobs:
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
     secrets: inherit
+
+  wasm:
+    needs: tag
+    uses: ./.github/workflows/release-wasm.yml
+    with:
+      release_ref: ${{ needs.tag.outputs.release_ref }}
+    secrets: inherit
