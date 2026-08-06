@@ -13,14 +13,27 @@ This repository is trunk-based. `main` is the only long-lived branch.
 | `main` | The trunk. **Branch your work from here.** Changes land through a pull request, verified by someone who did not write them, and merge with a merge commit — never a squash or rebase — so every commit that was reviewed is the commit that lands. |
 | `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
-Nobody pushes to `main` directly — **and since 2026-08-06 that is machinery, not only convention.**
-A ruleset enforces it, and it was armed only after CI first went green, because a required check
-that cannot run leaves the merge button permanently dark.
+Nobody pushes to `main` directly — **and since 2026-08-05T23:59:20Z that is machinery, not only
+convention.** A ruleset enforces it.
+
+**Two historical claims sit in that sentence, and neither is checkable by the command below** — an
+API returns current state, never past state. Their evidence, so a reader can weigh them rather than
+trust them:
+
+| claim | evidence |
+|---|---|
+| protection began `2026-08-05T23:59:20Z` | `gh api repos/turndb/turndb/rulesets/<id> --jq .created_at` → `2026-08-05T16:59:20.247-07:00` |
+| armed only after CI first went green | first successful CI run completed `2026-08-05T23:57:58Z` on `e42a960d4`; ruleset created 1m22s later |
+
+**That margin is 82 seconds and I did not know it when I first wrote the claim.** It was arming a
+required check after proving it can pass, which is the right order — a check that cannot run leaves
+the merge button permanently dark — but the sentence asserted a sequence nobody had measured.
 
 **This paragraph describes mutable configuration that lives outside the repository.** It cannot be
 made correct by being written carefully; it can only be made checkable.
 
-**What is asserted here, and therefore what the check must print:** a ruleset exists named `main`;
+**What is asserted about the *current configuration*, and therefore what the check must print** —
+the historical claims above are a separate class and are evidenced separately: a ruleset exists named `main`;
 it is active; it targets a branch; it applies to `refs/heads/main`; nobody can bypass it; a pull
 request is required; a status check is required; and that check is `gate`. **Eight properties — the
 command below prints all eight and nothing that is not asserted.**
