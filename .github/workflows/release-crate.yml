@@ -1,0 +1,113 @@
+name: Release turndb crate
+
+# Publishing the `turndb` crate to crates.io. Deliberately dispatched against an exact annotated
+# tag, never triggered by a push or a merge — the same shape as `release-native.yml`, for the same
+# reason: a release must be an act somebody performs, not a consequence of landing a branch.
+#
+# The gate is the `npm` environment's required reviewer, which is where a dispatch actually stops
+# and waits. On the name: `npm` is wrong for a crates.io release and a `crates-io` environment would
+# read better. It is not used here because an environment named in a workflow file that has never
+# been created carries NO protection rules and gates nothing, while looking identical in the YAML to
+# one that does. That defect was found in this repository on 2026-08-05 — `release-native.yml`
+# declared `environment: npm` for weeks against zero configured environments. A real gate under an
+# imprecise name beats a precise name over no gate. Renaming is an owner action; see the check
+# command in CONTRIBUTING before trusting any environment by its appearance here.
+#
+# Authentication is crates.io Trusted Publishing (OIDC): no long-lived registry token is stored in
+# this repository. If no trusted publisher is configured for the `turndb` crate, the auth step
+# fails and nothing is uploaded — which is the correct failure. Configuring one is an owner action.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Exact annotated tag to release (vX.Y.Z)
+        required: true
+        type: string
+
+concurrency:
+  group: release-crate-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: build and verify the release candidate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # Identical to release-native.yml's check: the ref must be an ANNOTATED tag object, HEAD must
+      # be exactly it, and the name must match the release shape. A lightweight tag passes the first
+      # test and fails the second, which is the point — a release names an object somebody signed
+      # their intent onto, not a branch tip that moves.
+      - name: verify exact release tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+          case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
+      # The tag must name the version Cargo.toml declares. Publishing v0.1.1 from a tree that says
+      # 0.1.0 is a mistake crates.io would accept, and it is unrecoverable: a version number cannot
+      # be reused once taken.
+      - name: verify the tag matches the manifest version
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="turndb") | .version')"
+          test -n "$manifest"
+          test "$RELEASE_REF" = "v$manifest"
+      - name: verify the licence report is current
+        run: bash scripts/check-third-party-licenses.sh
+      # Build the actual artifact and report what is in it. `exclude` in Cargo.toml is a claim; this
+      # is the tarball. The list is printed so a reviewer approving the deployment can read what
+      # would ship rather than trusting the manifest.
+      - name: package and list the artifact
+        run: |
+          cargo package -p turndb --locked
+          crate="$(find target/package -name 'turndb-*.crate' | head -1)"
+          echo "artifact: $crate"
+          echo "packed bytes: $(stat -c%s "$crate")"
+          echo "entries: $(tar tzf "$crate" | wc -l)"
+          tar tzf "$crate"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turndb-crate-${{ inputs.release_ref }}
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  publish:
+    name: publish to crates.io
+    needs: [package]
+    runs-on: ubuntu-22.04
+    # This is the gate. The run halts here and waits for the environment's required reviewer; the
+    # request is addressed to a person rather than left in a log for someone to notice.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # Re-verified after approval rather than trusted from the packaging job. Approval can be given
+      # minutes or hours later; the check costs nothing and closes the window.
+      - name: verify exact release tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+      - name: mint a short-lived crates.io token
+        uses: rust-lang/crates-io-auth-action@v1.0.5
+        id: auth
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p turndb --locked
