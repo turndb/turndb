@@ -233,8 +233,8 @@ For a release `X.Y.Z`, the publisher:
    dry_run_json="$(mktemp)"
    npm publish --dry-run --json | tee "$dry_run_output"
    sed -n '/^{/,$p' "$dry_run_output" > "$dry_run_json"
-   node -e 'const p=require(process.argv[1]); console.table(p.files); console.log(p.size, p.unpackedSize, p.integrity)' "$dry_run_json"
-   audited_integrity="$(node -e 'process.stdout.write(require(process.argv[1]).integrity)' "$dry_run_json")"
+   node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.argv[1])); console.table(p.files); console.log(p.size, p.unpackedSize, p.integrity)' "$dry_run_json"
+   audited_integrity="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1])).integrity)' "$dry_run_json")"
    ```
 
    The publisher confirms that `prepublishOnly` rebuilt the WASM and passed the package tests, then
