@@ -1,0 +1,13 @@
+# NOTE: no "Question or idea → Discussions" link here. CommandSuite has
+# one; Discussions is MEASURED OFF on this repository —
+# `has_discussions: false` (`has_issues: true`, `has_wiki: false`).
+# Confirmed disabled, not merely unconfirmed: a contact link to a
+# disabled feature is a dead end presented as a channel. Add the link if
+# and when Discussions is turned on.
+#
+# Likewise no commercial/hosted link: TurnDB has no hosted offering.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/turndb/turndb/security/policy
+    about: Do NOT open a public issue for security problems. See SECURITY.md for how to report privately.

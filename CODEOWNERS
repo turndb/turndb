@@ -1,0 +1,15 @@
+# Default reviewers for pull requests that arrive without one.
+#
+# THIS IS A BACKSTOP, NOT THE REVIEW MODEL. Internal work is reviewed by
+# the verifier named on the objective that produced it — the verifier is
+# named per piece of work, not fixed by repository, and is regularly
+# someone who is not a collaborator here. A CODEOWNERS entry cannot
+# express that and should not try to. What it is for is the case
+# CODEOWNERS is actually good at: a pull request from outside that model,
+# which otherwise sits with nobody's name on it.
+#
+# Both accounts below were verified as collaborators with push, not
+# inferred from a display name. GitHub SILENTLY IGNORES an entry naming
+# a non-collaborator: the file parses, the review is never requested,
+# and nothing reports the difference.
+* @soundledger @exactjoinery
