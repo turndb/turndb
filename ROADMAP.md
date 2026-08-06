@@ -649,7 +649,7 @@ This phase turns demonstrated behavior into promises that downstream projects ca
 The first consumer flywheel does not require the 1.0 format freeze. It does require a narrow release
 claim whose evidence is complete:
 
-- the exact `native-v0.1.0` source tag passes ordinary CI;
+- the exact lockstep `v0.1.0` source tag passes ordinary CI;
 - one Linux x86-64 glibc artifact requires no symbols newer than glibc 2.17 and the same bytes install
   and execute on Node 22, 24, and 26;
 - the platform and selector tarballs contain their complete API/legal payloads, match the recorded

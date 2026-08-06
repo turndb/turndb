@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Validate changesets and every lockstep version source declared in knope.toml."""
+
+import json
+import pathlib
+import re
+import sys
+import tomllib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONFIG = tomllib.loads((ROOT / "knope.toml").read_text())
+VERSIONED_FILES = CONFIG["package"]["versioned_files"]
+ALLOWED_BUMPS = {"major", "minor", "patch"}
+SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\Z")
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+def versions_for(relative: str) -> list[tuple[str, str]]:
+    path = ROOT / relative
+    if not path.is_file():
+        fail(f"knope.toml versioned_files entry does not exist: {relative}")
+    if path.name == "Cargo.lock":
+        packages = tomllib.loads(path.read_text()).get("package", [])
+        local = [(f"{relative}:{p['name']}", p["version"]) for p in packages if "source" not in p]
+        if not local:
+            fail(f"no workspace packages found in {relative}")
+        return local
+    if path.suffix == ".toml":
+        data = tomllib.loads(path.read_text())
+        version = data.get("package", {}).get("version")
+        return [(relative, version)]
+    if path.suffix == ".json":
+        data = json.loads(path.read_text())
+        found = [(relative, data.get("version"))]
+        if path.name == "package-lock.json":
+            root_version = data.get("packages", {}).get("", {}).get("version")
+            found.append((f"{relative}:packages['']", root_version))
+        return found
+    fail(f"unsupported knope.toml versioned_files entry: {relative}")
+
+
+def check_versions() -> str:
+    if not isinstance(VERSIONED_FILES, list) or not VERSIONED_FILES:
+        fail("knope.toml package.versioned_files must be a non-empty list")
+    if not all(isinstance(item, str) for item in VERSIONED_FILES):
+        fail("release detector supports only path entries in package.versioned_files")
+    observed = [entry for relative in VERSIONED_FILES for entry in versions_for(relative)]
+    reference = observed[0][1]
+    if not isinstance(reference, str) or not SEMVER.fullmatch(reference):
+        fail(f"invalid release version at {observed[0][0]}: {reference!r}")
+    wrong = [(where, value) for where, value in observed if value != reference]
+    if wrong:
+        fail("lockstep version mismatch: " + ", ".join(f"{where}={value!r}" for where, value in wrong))
+
+    selector = json.loads((ROOT / "bindings/node/package.json").read_text())
+    selector_lock = json.loads((ROOT / "bindings/node/package-lock.json").read_text())
+    platform = json.loads(
+        (ROOT / "bindings/node/npm/linux-x64-gnu/package.json").read_text()
+    )
+    pin = selector.get("optionalDependencies", {}).get(platform.get("name"))
+    if pin != reference:
+        fail(f"selector pin {pin!r} does not equal platform version {reference!r}")
+    lock_versions = [selector_lock.get("version"), selector_lock.get("packages", {}).get("", {}).get("version")]
+    if lock_versions != [reference, reference]:
+        fail(f"selector lock versions {lock_versions!r} do not equal {reference!r}")
+    lock_pin = selector_lock.get("packages", {}).get("", {}).get("optionalDependencies", {}).get(platform.get("name"))
+    if lock_pin != reference:
+        fail(f"selector lock pin {lock_pin!r} does not equal platform version {reference!r}")
+    print(f"release metadata: {len(VERSIONED_FILES)} versioned_files, version {reference}, pin aligned")
+    return reference
+
+
+def check_changesets() -> None:
+    directory = ROOT / ".changeset"
+    for path in sorted(directory.glob("*.md")) if directory.is_dir() else []:
+        if path.name.lower() == "readme.md":
+            continue
+        lines = path.read_text().splitlines()
+        if len(lines) < 4 or lines[0] != "---":
+            fail(f"{path.relative_to(ROOT)}: missing opening changeset frontmatter")
+        try:
+            end = lines.index("---", 1)
+        except ValueError:
+            fail(f"{path.relative_to(ROOT)}: missing closing changeset frontmatter")
+        entries = [line for line in lines[1:end] if line.strip()]
+        if len(entries) != 1 or ":" not in entries[0]:
+            fail(f"{path.relative_to(ROOT)}: expected exactly one package bump")
+        package, bump = (part.strip() for part in entries[0].split(":", 1))
+        if package != "default":
+            fail(f"{path.relative_to(ROOT)}: unknown package {package!r}; expected 'default'")
+        if bump not in ALLOWED_BUMPS:
+            fail(f"{path.relative_to(ROOT)}: unknown bump {bump!r}")
+        if not any(line.strip() for line in lines[end + 1 :]):
+            fail(f"{path.relative_to(ROOT)}: missing release note")
+
+
+def check_tag_contract() -> None:
+    text_files = [
+        ROOT / ".github/workflows/release-crate.yml",
+        ROOT / ".github/workflows/release-native.yml",
+        ROOT / "bindings/node/scripts/publish-prebuild.cjs",
+        ROOT / "CONTRIBUTING.md",
+        ROOT / "docs/native-prebuilds.md",
+        ROOT / "ROADMAP.md",
+    ]
+    obsolete = []
+    for path in text_files:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if re.search(r"(?:native-v|npm-v)(?:X|\d|\[|\$|`)", line):
+                obsolete.append(f"{path.relative_to(ROOT)}:{number}")
+    if obsolete:
+        fail("obsolete release tag namespace: " + ", ".join(obsolete))
+
+    crate = text_files[0].read_text()
+    native = text_files[1].read_text()
+    publisher = text_files[2].read_text()
+    contributing = text_files[3].read_text()
+    shell_pattern = 'case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*)'
+    if shell_pattern not in crate or shell_pattern not in native:
+        fail("both release workflows must accept only the lockstep vX.Y.Z namespace")
+    if "const expectedTag = `v${manifest.version}`;" not in publisher:
+        fail("native publisher does not derive the lockstep tag from its manifest")
+    for command in (
+        'test "$(git describe --tags --exact-match HEAD)" = "vX.Y.Z"',
+        'test "$(git cat-file -t vX.Y.Z)" = tag',
+    ):
+        if command not in contributing:
+            fail(f"portable publish procedure lost tag check: {command}")
+
+
+if __name__ == "__main__":
+    check_versions()
+    check_changesets()
+    check_tag_contract()
+    print("changesets: all configured packages and bump types are valid")

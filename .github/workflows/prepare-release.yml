@@ -1,0 +1,49 @@
+name: Prepare release PR
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: "!contains(github.event.head_commit.message, 'chore: prepare release')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # Must be a write-capable owner token: PRs created with GITHUB_TOKEN do not trigger CI.
+          token: ${{ secrets.KNOPE_TOKEN }}
+      - id: changes
+        name: detect pending change files
+        run: |
+          if find .changeset -maxdepth 1 -type f -name '*.md' ! -iname README.md | grep -q .; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: validate pending change files and lockstep manifests
+        if: steps.changes.outputs.present == 'true'
+        run: python3 scripts/check-release-metadata.py
+      - name: configure release author
+        if: steps.changes.outputs.present == 'true'
+        run: |
+          git config user.name 'turndb-release'
+          git config user.email 'turndb-release@users.noreply.github.com'
+      - uses: knope-dev/action@v2.1.2
+        if: steps.changes.outputs.present == 'true'
+        with:
+          version: 0.23.0
+      - name: create or update release PR
+        if: steps.changes.outputs.present == 'true'
+        run: knope prepare-release --verbose
+        env:
+          GITHUB_TOKEN: ${{ secrets.KNOPE_TOKEN }}

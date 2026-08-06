@@ -72,6 +72,11 @@ jobs:
       - name: fmt
         run: cargo fmt --check
 
+      - name: validate release metadata and change files
+        run: |
+          python3 scripts/check-release-metadata.py
+          python3 scripts/test-release-metadata.py
+
       # --all-targets --all-features EXACTLY. Narrower flags miss the test bodies behind a feature,
       # which is how a lint survived in this tree.
       - name: clippy

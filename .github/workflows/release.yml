@@ -1,0 +1,69 @@
+name: Release merged version PR
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  tag:
+    if: github.head_ref == 'release' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      release_ref: ${{ steps.version.outputs.release_ref }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - name: verify lockstep release metadata
+        run: python3 scripts/check-release-metadata.py
+      - id: version
+        name: read declared release version
+        run: echo "release_ref=v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name==\"turndb\") | .version')" >> "$GITHUB_OUTPUT"
+      - name: configure annotated tagger
+        run: |
+          git config user.name 'turndb-release'
+          git config user.email 'turndb-release@users.noreply.github.com'
+      - uses: knope-dev/action@v2.1.2
+        with:
+          version: 0.23.0
+      - name: ensure the annotated tag exists at this exact merge
+        env:
+          RELEASE_REF: ${{ steps.version.outputs.release_ref }}
+        run: bash scripts/ensure-release-tag.sh "$RELEASE_REF"
+      - id: github_release
+        name: detect an already-created GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ steps.version.outputs.release_ref }}
+        run: |
+          if gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+      # Knope's GitHub Release step uses the Releases API, which would create a lightweight ref if
+      # the tag were absent. The command above creates and pushes the annotated object first;
+      # Release attaches to it. On a retry, an existing GitHub release is success, not a dead end.
+      - name: create annotated tag and GitHub release
+        if: steps.github_release.outputs.exists != 'true'
+        run: knope release --verbose
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  crate:
+    needs: tag
+    uses: ./.github/workflows/release-crate.yml
+    with:
+      release_ref: ${{ needs.tag.outputs.release_ref }}
+    secrets: inherit
+
+  native:
+    needs: tag
+    uses: ./.github/workflows/release-native.yml
+    with:
+      release_ref: ${{ needs.tag.outputs.release_ref }}
+    secrets: inherit

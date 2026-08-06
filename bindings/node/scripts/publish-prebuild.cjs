@@ -39,7 +39,7 @@ if (compareVersions(npmVersion, '11.5.1') < 0) {
   throw new Error(`trusted publication requires npm >=11.5.1; found ${npmVersion}`);
 }
 
-const expectedTag = `native-v${manifest.version}`;
+const expectedTag = `v${manifest.version}`;
 if (!checkOnly) {
   const actualTag = child.execFileSync(
     'git', ['describe', '--tags', '--exact-match', 'HEAD'],

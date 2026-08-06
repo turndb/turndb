@@ -1,8 +1,8 @@
 name: Release turndb crate
 
-# Publishing the `turndb` crate to crates.io. Deliberately dispatched against an exact annotated
-# tag, never triggered by a push or a merge — the same shape as `release-native.yml`, for the same
-# reason: a release must be an act somebody performs, not a consequence of landing a branch.
+# Publishing the `turndb` crate to crates.io. A merged Knope release PR or a deliberate manual
+# dispatch supplies the exact annotated lockstep tag. Neither path can publish merely because a
+# branch landed: the registry job stops at the protected environment for an owner's explicit act.
 #
 # The gate is the `npm` environment's required reviewer, which is where a dispatch actually stops
 # and waits. On the name: `npm` is wrong for a crates.io release and a `crates-io` environment would
@@ -18,12 +18,17 @@ name: Release turndb crate
 # fails and nothing is uploaded — which is the correct failure. Configuring one is an owner action.
 
 on:
+  workflow_call:
+    inputs:
+      release_ref:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       release_ref:
         description: Exact annotated tag to release (vX.Y.Z)
         required: true
-        type: string
+    type: string
 
 concurrency:
   group: release-crate-${{ inputs.release_ref }}
@@ -33,6 +38,7 @@ jobs:
   package:
     name: build and verify the release candidate
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,6 +90,7 @@ jobs:
     name: publish to crates.io
     needs: [package]
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     # This is the gate. The run halts here and waits for the environment's required reviewer; the
     # request is addressed to a person rather than left in a log for someone to notice.
     environment: npm
