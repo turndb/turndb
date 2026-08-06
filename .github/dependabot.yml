@@ -12,20 +12,13 @@
 #                     to update. Add them if that changes.
 #   github-actions  — .github/workflows/
 #
-# NO `labels:` KEY, DELIBERATELY. An earlier draft carried `dependencies`
-# and `ci`, inherited from CommandSuite where both exist. Neither exists
-# here — this repository's labels are bug, ci-red, documentation,
-# duplicate, enhancement, good first issue, help wanted, invalid,
-# question, wontfix. Dependabot cannot apply a label that does not exist
-# and the routing is lost silently, exactly as GitHub silently ignores a
-# CODEOWNERS entry naming a non-collaborator.
+# NO `labels:` KEY. Dependabot cannot apply a label that does not exist:
+# it drops the label silently and reports nothing, exactly as GitHub
+# silently ignores a CODEOWNERS entry naming a non-collaborator. So a
+# `labels:` key is only correct if every label in it exists.
 #
-# Labelling dependency PRs is wanted and is NOT being given up: it is
-# blocked on `dependencies` and `ci` existing, which is a repository
-# settings change and not this file's to make. Create them, confirm with
-# the command below, then add the `labels:` keys back.
-#
-# Before adding a `labels:` key, confirm each label exists:
+# Before adding one, confirm each label against the repository rather
+# than against this comment:
 #   gh api repos/turndb/turndb/labels --jq '.[].name'
 #
 # Grouping: minor + patch batch into one PR per ecosystem per week;
