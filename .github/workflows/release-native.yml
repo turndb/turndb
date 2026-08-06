@@ -55,7 +55,7 @@ jobs:
         run: npm run test:prebuild --prefix bindings/node
       - name: verify publish guards and embedded manifests
         run: npm run test:release --prefix bindings/node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: turndb-native-${{ inputs.release_ref }}
           path: bindings/node/dist/

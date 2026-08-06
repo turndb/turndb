@@ -217,7 +217,7 @@ jobs:
       - name: test packed install on build host
         run: npm run test:prebuild --prefix bindings/node
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: turndb-native-linux-x64-gnu
           path: bindings/node/dist/

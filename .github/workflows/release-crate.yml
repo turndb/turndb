@@ -74,7 +74,7 @@ jobs:
           echo "packed bytes: $(stat -c%s "$crate")"
           echo "entries: $(tar tzf "$crate" | wc -l)"
           tar tzf "$crate"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: turndb-crate-${{ inputs.release_ref }}
           path: target/package/*.crate
