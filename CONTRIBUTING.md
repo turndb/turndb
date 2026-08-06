@@ -13,11 +13,12 @@ This repository is trunk-based. `main` is the only long-lived branch.
 | `main` | The trunk. **Branch your work from here.** Changes land through a pull request, verified by someone who did not write them, and merge with a merge commit — never a squash or rebase — so every commit that was reviewed is the commit that lands. |
 | `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
-Nobody pushes to `main` directly — **by convention, not by machinery.** The repository is currently
-private on a plan that offers no branch protection, so nothing server-side refuses a direct push.
-That is a gap between what this document asks and what the repo can enforce; when the repository
-goes public, branch protection on `main` should be turned on the same day, and this paragraph
-updated to say "protected" and mean it.
+Nobody pushes to `main` directly. Changes land through a pull request, and a repository ruleset
+enforces that server-side.
+
+**The live ruleset is the authority on what it requires. This document does not restate it** —
+a restatement is one configuration change away from being wrong, and the wrongness is silent.
+`gh api repos/turndb/turndb/rules/branches/main` reports what currently applies.
 
 **`develop` is retired.** Until 2026-07-31 this repository used a `develop` integration branch with
 frozen `review/<date>` PR branches; every commit from that model is in `main`'s history. Deleting
@@ -25,9 +26,7 @@ the remote branch did not delete anyone's local ref, and a stale local `develop`
 a word of complaint — so if your clone predates the migration, run `git fetch --prune` and
 `git branch -D develop` before branching anything. Because `develop` was merged (not squashed) into
 `main`, a branch accidentally cut from the stale ref is merely behind `main` rather than carrying
-phantom commits — but base your work on `main` all the same. Nothing server-side currently refuses
-a push that recreates `develop` (see the protection gap above); a CI guard that fails such a push
-is written and waiting on a workflow-scoped token to land.
+phantom commits — but base your work on `main` all the same.
 
 CommandSuite made the same migration to trunk-based development (its #55); each repository states
 its own model in its own `CONTRIBUTING.md` — three copies of a branch model is worse than one,
@@ -165,8 +164,9 @@ suite, here or in CI. That is a real gap and it is stated rather than papered ov
 - The **native prebuild** and its install check, which exercise `ubuntu-22.04` glibc packaging.
 - The **Node matrix** (22, 24, 26) unless you have all three installed; `npm/build.sh` uses whichever
   `node` is on your PATH.
-- The **release-profile suite**, which is deferred while this repository is private — the free-tier
-  runner cannot link DataFusion-static release test binaries. See `docs/support-and-compatibility.md`.
+- The **release-profile suite**, which runs hosted now that the repository is public — the larger
+  public runner links the DataFusion-static release test binaries that the private free-tier runner
+  could not. See `docs/support-and-compatibility.md`.
 
 **A workflow change is not a Rust-free change.** `tests/package.rs` reads
 `.github/workflows/ci.yml` and asserts the Node matrix there matches what the packages claim. So
@@ -182,10 +182,9 @@ Push anything failing to it and read the issue that opens; push a fix and watch 
 alert nobody has watched fire is indistinguishable from one that does not work**, and `main` is
 never involved.
 
-**Not runnable by anyone yet:** required status checks. GitHub rulesets return *"upgrade to Pro or
-make this repository public"* on a private free-tier repository, and no branch protection exists.
-**Nothing gates the merge button today** — a reviewer reads the check list. The `gate` job in
-`ci.yml` exists so that list has one line worth reading.
+**Enforced, not documented here:** required status checks. **What is required is whatever the
+ruleset says** — see [Branches](#branches) for where to ask it. The `gate` job in `ci.yml` exists so
+that a required check has one line worth reading.
 
 ## Changing the format
 
@@ -236,12 +235,12 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
 
 **Not enforceable here — check these by hand at publish time:**
 
-- **The GitHub repository description**, once the repo is public. It is currently empty. It is a
-  standalone surface: whatever it says is the whole claim for anyone who does not click through, so
-  it must carry **no unqualified enforcement claim**. "Single-writer" belongs there only with the
-  WASI reduction attached, or not at all — the npm package description dropped it for exactly this
-  reason. The hazard is that someone fills it in from the README's first line, in a hurry, on the
-  day the repo goes public.
+- **The GitHub repository description.** Set 2026-08-05 and carrying no unqualified enforcement
+  claim. It is a standalone surface: whatever it says is the whole claim for anyone who does not
+  click through, so it must carry **no unqualified enforcement claim**. "Single-writer" belongs
+  there only with the WASI reduction attached, or not at all — the npm package description dropped
+  it for exactly this reason. **The hazard this survived** was someone filling it from the README's
+  first line, in a hurry, on publication day. Re-check it whenever the README's opening changes.
 - **The copyright holder in `LICENSE` and `NOTICE`** must name whoever holds the copyright at
   publish time.
 - **Whether `crates.io` and `npm` metadata still describe what ships.** Registry `description`
