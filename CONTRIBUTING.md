@@ -316,3 +316,21 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
   scope and both package names, configure trusted publishing for `.github/workflows/release-native.yml`,
   and protect the GitHub `npm` environment with required review. Source code cannot prove those
   registry and repository settings.
+
+**The `npm` environment is the one item above you can check from a shell, and it is worth running
+rather than reading.** An environment named in a workflow file that was never created carries **no
+protection rules and gates nothing**, while reading identically in the YAML to one that does —
+`release-native.yml` declared `environment: npm` here for weeks against zero configured
+environments. `.github/workflows/release-crate.yml` points at this check by the `environments/npm`
+string below, so keep that string greppable if you move this section.
+
+```sh
+gh api repos/turndb/turndb/environments --jq '.environments[].name'
+gh api repos/turndb/turndb/environments/npm \
+  --jq '[.protection_rules[]? | select(.type=="required_reviewers")] | .[].reviewers[].reviewer.login'
+```
+
+**A 404 from the first means the environment does not exist. An empty result from the second means
+it exists with no required reviewer, which is a gate that stops nothing.** Both read as a working
+gate from the workflow file. And both queries need push access — without it they return **403,
+which is a third answer and not evidence of either of the first two.**

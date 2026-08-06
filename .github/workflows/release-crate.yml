@@ -10,8 +10,14 @@ name: Release turndb crate
 # been created carries NO protection rules and gates nothing, while looking identical in the YAML to
 # one that does. That defect was found in this repository on 2026-08-05 — `release-native.yml`
 # declared `environment: npm` for weeks against zero configured environments. A real gate under an
-# imprecise name beats a precise name over no gate. Renaming is an owner action; see the check
-# command in CONTRIBUTING before trusting any environment by its appearance here.
+# imprecise name beats a precise name over no gate. Renaming is an owner action. Before trusting any
+# environment by its appearance here, run the check in CONTRIBUTING.md — locate it with
+#
+#   grep -n 'environments/npm' CONTRIBUTING.md
+#
+# and if that returns nothing, this pointer has rotted: the check is what to restore, not the
+# pointer. Naming the string rather than the section is deliberate, because the previous version of
+# this comment sent readers to a file that did not contain the command (turndb#55).
 #
 # Authentication is crates.io Trusted Publishing (OIDC): no long-lived registry token is stored in
 # this repository. If no trusted publisher is configured for the `turndb` crate, the auth step
