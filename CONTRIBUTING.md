@@ -14,16 +14,26 @@ This repository is trunk-based. `main` is the only long-lived branch.
 | `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
 Nobody pushes to `main` directly — **and since 2026-08-06 that is machinery, not only convention.**
-An active ruleset named `main` requires a pull request and the `gate` status check, with no bypass
-actors, so a direct push is refused server-side. Verify it:
+A ruleset enforces it, and it was armed only after CI first went green, because a required check
+that cannot run leaves the merge button permanently dark.
+
+**This paragraph describes mutable configuration that lives outside the repository.** It cannot be
+made correct by being written carefully; it can only be made checkable. Every property asserted
+above is printed by one command, so a reader verifies rather than trusts:
 
 ```
-gh api repos/turndb/turndb/rules/branches/main --jq '[.[].type]'
-# ["pull_request","required_status_checks"]
+gh api repos/turndb/turndb/rulesets --jq '.[]|select(.name=="main")|.id' \
+  | xargs -I% gh api repos/turndb/turndb/rulesets/% \
+      --jq '{name,enforcement,target,refs:.conditions.ref_name.include,
+             bypass:(.bypass_actors|length),rules:[.rules[].type]}'
+
+# {"name":"main","enforcement":"active","target":"branch",
+#  "refs":["refs/heads/main"],"bypass":0,
+#  "rules":["pull_request","required_status_checks"]}
 ```
 
-It was armed after CI first went green, because a required check that cannot run leaves the merge
-button permanently dark.
+**If that output differs, this paragraph is wrong and the output is right.** The ruleset id is
+looked up by name rather than pinned, so the check survives the ruleset being recreated.
 
 **`develop` is retired.** Until 2026-07-31 this repository used a `develop` integration branch with
 frozen `review/<date>` PR branches; every commit from that model is in `main`'s history. Deleting
@@ -193,7 +203,8 @@ never involved.
 make this repository public"* while this repository was private on the free tier; publication made
 them available and the `main` ruleset was armed once CI first passed.
 **`gate` gates the merge button** — it is the one line in the check list worth reading, and the `gate`
-job in `ci.yml` exists to make that true.
+job in `ci.yml` exists to make that true. **The ruleset's full state, and the command that prints it,
+are under [Branches](#branches) — stated once so the two cannot drift apart.**
 
 ## Changing the format
 
