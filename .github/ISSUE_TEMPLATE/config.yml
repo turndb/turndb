@@ -1,9 +1,13 @@
-# NOTE: no "Question or idea → Discussions" link here. CommandSuite has
-# one; Discussions is MEASURED OFF on this repository —
-# `has_discussions: false` (`has_issues: true`, `has_wiki: false`).
-# Confirmed disabled, not merely unconfirmed: a contact link to a
-# disabled feature is a dead end presented as a channel. Add the link if
-# and when Discussions is turned on.
+# No "Question or idea → Discussions" contact link here. CommandSuite has
+# one; this repository does not, because Discussions is not enabled — and
+# a contact link to a disabled feature is a dead end presented as a
+# channel.
+#
+# That is a repository setting and it can change without anyone opening
+# this file. Confirm before adding the link, rather than trusting this
+# comment:
+#
+#   gh api repos/turndb/turndb --jq '{discussions: .has_discussions}'
 #
 # Likewise no commercial/hosted link: TurnDB has no hosted offering.
 blank_issues_enabled: false
