@@ -54,8 +54,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+  # Each publication workflow's publish job requests `id-token: write` for registry trusted
+  # publishing. A caller job grants a called workflow at most its own permissions, and the
+  # default grant does not include `id-token`, so the grant must be explicit here: without it
+  # the whole workflow fails validation at startup, before any job's `if` is evaluated.
   crate:
     needs: tag
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/release-crate.yml
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
@@ -63,6 +70,9 @@ jobs:
 
   native:
     needs: tag
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/release-native.yml
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
@@ -70,6 +80,9 @@ jobs:
 
   wasm:
     needs: tag
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/release-wasm.yml
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
