@@ -3,10 +3,10 @@
 **Status: format version 2. Not frozen.** See [Compatibility](#compatibility) for what is
 promised and what is not.
 
-This is the one document in this repository, and the only place mechanics are written down twice. It
-exists because a portable format has to outlive the implementation that happens to write it: code can
-be rewritten, bytes on someone's disk cannot. Everything else about how turndb works belongs in the
-code.
+This document deliberately restates what the code implements, so a disagreement between the two is
+detectable. It exists because a portable format has to outlive the implementation that happens to
+write it: code can be rewritten, bytes on someone's disk cannot. Everything else about how turndb
+works belongs in the code.
 
 It is **normative**. Where this document and the code disagree, that is a bug in one of them, and the
 first job is to find out which.
@@ -38,15 +38,14 @@ mystore/
   part-r0001-00000001-00000003.part  written by a re-fold into generation 1
 ```
 
-Part filenames are informative only: the manifests name what is reachable. **The sweep is narrower
-than "everything unnamed", and deliberately so.** It removes exactly two classes — a `part-*.part`
-that no manifest (live or retained — see [The manifest](#the-manifest)) names, and a whole
-fold-generation directory whose generation no manifest names. Everything else in the directory is
-named by no manifest and is *supposed* to survive: the WAL holds records that are not committed yet
-and so cannot be named; the retained `MANIFEST.NNNNNNNN` files *are* the naming authority; sidecars
-and dictionaries belong to a fold generation rather than to a commit; and `WRITER.lock` belongs to
-the process, not to any snapshot. A sweep that took "unnamed is unreachable" literally would delete
-acknowledged data that has not yet been flushed.
+Part filenames are informative only: the manifests name what is reachable. **The sweep removes
+exactly two classes of file** — a `part-*.part` that no manifest (live or retained — see
+[The manifest](#the-manifest)) names, and a whole fold-generation directory whose generation no
+manifest names. Everything else in the directory is named by no manifest and is *supposed* to
+survive: the WAL holds records that are not committed yet and so cannot be named; the retained
+`MANIFEST.NNNNNNNN` files *are* the naming authority; sidecars and dictionaries belong to a fold
+generation rather than to a commit; and `WRITER.lock` belongs to the process, not to any snapshot.
+A sweep of everything unnamed would delete acknowledged data that has not yet been flushed.
 
 The three part-name forms exist so a merge output can never collide with an input it is about to
 replace.
@@ -66,18 +65,18 @@ releases when the descriptor closes — including on a crash. That is what makes
 rather than a convention: a stale lock cannot outlive its owner, so there is never a lock nobody can
 distinguish from a live one.
 
-**On `wasm32-wasip1` there is no advisory locking, and this document must not imply otherwise.**
-WASI provides no equivalent, so the lock call succeeds unconditionally and the file is created but
-gates nothing. On that build the single-writer invariant is **the embedder's to keep**, and the
+**On `wasm32-wasip1` there is no advisory locking.** WASI provides no equivalent, so the lock call
+succeeds unconditionally and the file is created but gates nothing. On that build the single-writer
+invariant is **the embedder's to keep**, and the
 obligation is precise: **at most one open writer per store directory, across all processes and all
 WASM instances.** One process is not sufficient isolation — a single process can open the same
 directory through two instances or two handles, and the file will not stop it.
 
-What two concurrent writers do to a store has been measured in one pattern only, and this document
-does not generalise beyond it. In four overlapping-writer runs on the `wasm32-wasip1` build, both
-writers received successful durability acknowledgements and one writer's complete record set was
-silently discarded; the surviving store was internally consistent and every remaining record was
-readable. Other overlap patterns may fail differently, including by interleaving WAL frames and
+What two concurrent writers do to a store has been measured in one pattern only. In four
+overlapping-writer runs on the `wasm32-wasip1` build, both writers received successful durability
+acknowledgements and one writer's complete record set was silently discarded; the surviving store
+was internally consistent and every remaining record was readable. Other overlap patterns may fail
+differently, including by interleaving WAL frames and
 damaging them. **Detection is not guaranteed, and the absence of an error does not establish that
 the store holds every acknowledged write** — in the measured pattern the store was intact and the
 records were gone, so an integrity check is not the instrument for this.
@@ -137,7 +136,7 @@ bit, and that is what the field is reserved for.
 Bit 0 is **reserved and refused**: nothing writes it and nothing reads it. The bit is claimed so
 that if encryption is ever built, every reader shipped before it already refuses rather than
 serving ciphertext as content — a reject-forward lever protects only the readers that already
-refuse, so claiming it early costs four bytes of documentation and buys that guarantee. The
+refuse, so reserving the bit now, at no format cost, is what secures that guarantee. The
 refusal names encryption, because "this is encrypted and this build cannot read it" sends an
 operator somewhere very different from "unknown flags".
 
@@ -219,9 +218,9 @@ Per-section `xsum` covers what content hashes do not. Content carries BLAKE3 per
 on **every** read; the columnar metadata — ids, attribute values, offset arrays, dictionaries — has no
 such cover, and a flipped bit there is a wrong query answer with no error anywhere. Verification is
 **not** performed on the read path: hashing a section costs time proportional to the whole part rather
-than to what a query touches. It is exposed as a deliberate call. A reader may ignore `xsum` entirely and remain
-**format-compatible** — it cannot thereby remain *correct* under corruption, which is the whole point
-of the field. A writer may not omit one.
+than to what a query touches. It is exposed as an explicit call, `Part::verify_sections`. A reader
+may ignore `xsum` entirely and remain **format-compatible** — it cannot thereby remain *correct*
+under corruption. A writer may not omit one.
 
 ### Sections
 
@@ -437,7 +436,7 @@ homogeneous columns rather than one that can mis-decode. Type tags and value wid
 
 A column is a sparse pair of parallel arrays: `rid` (ascending row indices) and `val`. `col.rid.N` is
 encoded per `colmeta`: kind 0 (`RID_DENSE`) means the array is exactly `0..n` and is **elided** — it
-carried no information and was 39.4% of part metadata on a real corpus. Kind 1 (`RID_DELTA`) is
+carries no information and, in one measured corpus, was 39.4% of part metadata. Kind 1 (`RID_DELTA`) is
 ascending varint deltas, where a repeated key on one row encodes as a zero.
 
 Columns alone cannot reproduce a row's *interleaving* — `[a, b, a]` and `[a, a, b]` have identical
@@ -582,16 +581,18 @@ crc32=9a3fc217
 Two lines: compact JSON, then a trailer `crc32=XXXXXXXX` — eight hex digits, crc32 over exactly the
 JSON bytes (not the newline). The trailer exists because the manifest was the one structure whose
 corruption could **destroy data while parsing cleanly**: every field is load-bearing, and a flipped
-bit that still reads as JSON — a shortened `fold_off`, a wrong generation — was *believed*, after
-which recovery truncated durable fold bytes to match it. A reader must verify the trailer and refuse
-on mismatch.
+bit that still reads as JSON — a shortened `fold_off`, a wrong generation — would simply be
+believed. During development, before the trailer existed, exactly that happened: recovery believed a
+corrupted manifest that parsed cleanly and truncated durable fold bytes to match it. A reader must
+verify the trailer and refuse on mismatch.
 
 The trailer is recognised by **shape**: a manifest written before it existed is bare compact JSON,
-which cannot end with that final line, and is accepted unverified — that is what "before anyone was
-watching" costs, exactly as part version 0 does. Corruption cannot demote a checksummed manifest to
-a legacy one: damage to the payload fails the checksum, and damage to the trailer leaves trailing
-bytes that JSON parsing refuses. A build predating the trailer refuses a manifest carrying one (as a
-parse error), which is the safe direction — refusal, never misreading.
+which cannot end with that final line, and is accepted unverified — a pre-trailer manifest carries
+no checksum to verify, exactly as a version-0 part carries no version field. Corruption cannot
+demote a checksummed manifest to a legacy one: damage to the payload fails the checksum, and damage
+to the trailer leaves trailing bytes that JSON parsing refuses. A build predating the trailer
+refuses a manifest carrying one (as a parse error), which is the safe direction — refusal, never
+misreading.
 
 JSON on purpose: it is small, written once per flush, and self-describing, so a field can be added
 without a version lever — **provided the new field has a documented default**, since older writers will
@@ -617,12 +618,12 @@ walkable, so an erased block presents as a valid header over a payload whose che
 is byte-for-byte what a torn write looks like. This declaration is the only thing that distinguishes
 them.
 
-Two consequences worth stating because both have been got wrong here. The ranges are **per fold
-generation**: block ids restart at 0 in a new generation, so a re-fold — which rewrites the world
-without the erased content and therefore has no holes to declare — must reset the list rather than
-carry it forward, or it names live blocks as erased. And a **retained** manifest predates every punch
-that followed it, so a reader opening a retained snapshot must take `punched` from the **live**
-manifest, where it is cumulative, rather than from the snapshot's own.
+Two consequences follow. The ranges are **per fold generation**: block ids restart at 0 in a new
+generation, so a re-fold — which rewrites the world without the erased content and therefore has no
+holes to declare — must reset the list rather than carry it forward, or it names live blocks as
+erased. And a **retained** manifest predates every punch that followed it, so a reader opening a
+retained snapshot must take `punched` from the **live** manifest, where it is cumulative, rather
+than from the snapshot's own.
 
 Committed with tmp + fsync + rename + fsync-dir, so a crash sees either the old manifest or the new
 one. **An unreadable manifest is an error, not an empty store** — conflating those with a sweep that
@@ -678,8 +679,7 @@ pruned.
 
 What the chain is *for*: catching what per-section checksums cannot. A part swapped for another
 valid part, a manifest restored out of order, a file replaced wholesale — each is internally
-consistent, and only the chain notices. That is an integrity property, and this document claims
-nothing beyond it.
+consistent, and only the chain notices. That is an integrity property, nothing more.
 
 ### Ordering
 
@@ -719,19 +719,18 @@ rather than mislead:
    operator their disk is failing when the truth is that they erased something on purpose is a
    fault, not a cosmetic issue.
 
-2. **A partially-erased record does not become wholly unreadable.** An audit record you are legally
-   required to keep is not improved by refusing to serve the part of it that survives.
+2. **A partially-erased record does not become wholly unreadable.** An audit record under a legal
+   retention obligation is not improved by refusing to serve the part of it that survives.
 
-**Condition 2 is NOT met by the current implementation, and this is the honest state rather than a
-plan.** A record whose pieces span several blocks, only some of them punched, is refused whole.
-Serving the surviving part means returning a reconstruction that is *not* byte-exact, and the
-byte-exact promise is the one this format is built to keep — so the resolution is a new return shape
-that declares its gaps rather than a relaxation of `reconstruct`, and that is an open decision, not
-an implementation detail. Recorded here so a reader knows which way the gap runs.
+**Condition 2 is not met by the current implementation.** A record whose pieces span several
+blocks, only some of them punched, is refused whole. Serving the surviving part means returning a
+reconstruction that is *not* byte-exact, and the byte-exact promise is the one this format is built
+to keep — so the resolution is a new return shape that declares its gaps rather than a relaxation
+of `reconstruct`, and that is an open decision, not an implementation detail.
 
-**Scope, stated because it is easy to overstate.** These conditions bite on *retained* reads after an
-erasure. Live reads are unaffected by construction: punching decides what is dead from live
-visibility, so no live record's blocks are punchable.
+**Scope.** These conditions bite on *retained* reads after an erasure. Live reads are unaffected
+by construction: punching decides what is dead from live visibility, so no live record's blocks
+are punchable.
 
 **What erasure does not promise:** anything about copies outside this store — packs written earlier,
 replicas, backups, or any consumer that already read the data. It removes content from THIS store,
@@ -822,7 +821,7 @@ crossings are mechanical; nothing is reinterpreted in either direction.
 Enforced, not assumed. Each refuses rather than truncating, because a store that cannot be written is
 recoverable and one that lies is not. The first table contains representational format bounds.
 
-All are checked at the point of writing, and each refuses rather than truncating.
+All are checked at the point of writing.
 
 | limit | value | why |
 |---|---|---|
@@ -856,14 +855,14 @@ manifest and candidate-dictionary ceilings define this reader's supported profil
 | physical WAL frames | 100,000 | checked during replay and before writer/batch append; configurable per open |
 | fold blocks / block-id span | 1,000,000 | checked before sidecar/scan vectors and sparse-directory resize; configurable per open |
 
-The atomic-frame defaults are `ReadLimits`, not narrower format fields. A caller can raise them to
+The atomic-frame defaults live in `ReadLimits`. A caller can raise them to
 open an older legitimate large-frame store or lower them for a stricter deployment. Tail scanning
 surfaces an over-budget valid frame as resource exhaustion rather than treating it as torn residue.
 Writers seal fold blocks early under the effective ceiling and check part sections/TOCs before the
 footer completeness marker, so they do not publish frames the same handle refuses to read.
-The object-count fields share the same runtime-only `ReadLimits`: they do not narrow any on-disk
-integer. Writer output reserves directory names, WAL frames, and fold block ids before mutation so a
-handle does not deliberately create structures it cannot later admit.
+The object-count fields share the same runtime-only `ReadLimits`. Writer output reserves directory
+names, WAL frames, and fold block ids before mutation so a handle does not create structures it
+cannot later admit.
 
 Backup additionally resolves every source against the canonical store root and accepts only the
 ordinary file at that exact path. A symlinked part, fold directory, segment, sidecar, dictionary, or
@@ -873,8 +872,7 @@ manifest is refused rather than followed into the backup artifact.
 
 ## Non-goals
 
-Things a reader might reasonably expect to find here, and the reason each is absent. A format
-document that only lists what exists leaves the next person to rediscover these arguments.
+Things a reader might reasonably expect to find here, and the reason each is absent.
 
 **Parity / erasure coding for repair.** The format detects corruption at every level — frame
 checksums, section checksums, the TOC and footer chains, per-piece BLAKE3 on every content read,
@@ -882,12 +880,14 @@ and manifest-pinned part digests — and repairs none of it. Reed-Solomon compan
 rot *on a single copy*, which is not the failure this system is deployed into: cold tiers live on
 object storage with its own durability, sealed packs are copied, and the honest recovery for a
 damaged member is to restore it. Adding an erasure-coding dependency to duplicate what the storage
-layer already provides would read as thorough and be surface. Where belt-and-braces is wanted,
-external PAR2 over a sealed pack is an operations recipe and needs nothing from this format.
+layer already provides would add apparent thoroughness without adding protection. Where
+belt-and-braces is wanted, external PAR2 over a sealed pack is an operations recipe and needs
+nothing from this format.
 
 **A second identity algorithm.** BLAKE3 identifies both individual fold pieces and complete named
 values; the scopes differ, the identity function does not. Where a cheaper check is wanted for a hot
-path, `r16` and the frame checksums already provide it; neither ever concludes identity.
+path, the truncated BLAKE3 prefix carried in each fold block header and the frame checksums already
+provide it; neither ever concludes identity.
 
 ## Compatibility
 

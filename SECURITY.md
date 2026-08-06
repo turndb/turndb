@@ -4,8 +4,8 @@
 
 Please do **not** open a public issue for a security vulnerability.
 
-**Email security@efficacious.io.** That channel works at every moment,
-including right now, and does not depend on a repository setting.
+**Email security@efficacious.io.** That channel does not depend on any
+repository setting.
 
 GitHub's private vulnerability reporting may also be available, under
 this repository's **Security → Report a vulnerability**. If you do not
@@ -18,25 +18,23 @@ behaviour. If a store reproduces it, say so rather than attaching it
 until we have agreed a channel — an adversarial store is the payload.
 
 **We aim to acknowledge within 72 hours.** We do not commit to a patch
-window. TurnDB has no published release: there is no artifact in a
-registry to patch, and no supported version to patch it against. When
-the crate and package are published, this section gets a concrete
-remediation commitment and not before — a window we have never had to
-meet is not a commitment, it is a decoration.
+window yet: TurnDB is pre-1.0 with a single released version and no
+release history to base a commitment on. This section will gain a
+concrete remediation commitment as that history accumulates.
 
 If the issue is in a dependency rather than in TurnDB, please still tell
 us so we can pin, patch or fork.
 
 ## Supported versions
 
-**There is no supported version.** TurnDB is pre-release: the `turndb`
-crate is unpublished on crates.io, the portable `turndb` npm package is
-unpublished, `@turndb/native` is marked `private`, and both binding
-crates carry `publish = false`. Every artifact today is built from
-source at a commit.
+**There is no supported-version window yet.** TurnDB is pre-1.0, and
+version 0.1.0 (released 2026-08-06) is the only published release: the
+`turndb` crate on crates.io, the portable `turndb` npm package, and
+`@turndb/native`.
 
-Security fixes land on `main`. If you are running TurnDB, you are
-running a commit, and the fix for you is to move to a later one.
+Security fixes land on `main` and reach the registries with the next
+release. If you need a fix before then, build from source at a commit
+that carries it.
 
 This section is replaced with a supported-version window when there is a
 published release line to support.
@@ -73,7 +71,7 @@ documented there with reasons.
 
 ## Deliberately out of scope
 
-These are design positions, not gaps we have missed. Each is argued in
+These are design positions. Each is argued in
 `docs/security-review.md`; the short form:
 
 - **Authentication or confidentiality of store contents.** The format
@@ -92,8 +90,7 @@ These are design positions, not gaps we have missed. Each is argued in
 
 ## Known security-relevant limitations
 
-Documented rather than hidden, and each stated once in its authoritative
-place rather than restated here:
+Each is documented in full in its authoritative place; the short form:
 
 - **The single-writer invariant is not enforced on WASI.** It is
   OS-enforced on Unix via `flock`; under WASI there is no advisory
@@ -101,8 +98,8 @@ place rather than restated here:
   embedder's. The measured consequence, and why a clean `verify()` does
   not settle it, is in [`FORMAT.md`](FORMAT.md#the-writer-lock).
   **This is a correctness and durability property, not only a security
-  one** — it is listed here because an embedder who gets it wrong loses
-  acknowledged writes silently.
+  one** — an embedder who gets it wrong loses acknowledged writes
+  silently.
 - **Concurrent hostile filesystem mutation is not contained.** Canonical
   backup checks protect an offline supplied store, but are not an
   `openat2(RESOLVE_BENEATH)` sandbox. **Applications must not grant
@@ -122,5 +119,4 @@ them in a resource-limited helper process.
 
 ## Disclosure history
 
-*Empty. TurnDB has not been published and no vulnerability has been
-reported.*
+*Empty. No vulnerability has been reported.*

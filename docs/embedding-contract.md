@@ -1,11 +1,11 @@
 # TurnDB embedding contract
 
-Status: accepted direction for the pre-1.0 implementation. Sections marked **current gap** describe
+Status: current design contract for the pre-1.0 implementation. Sections marked **current gap** describe
 work that must land before the corresponding promise is considered supported.
 
-This document turns the product boundary in `ROADMAP.md` into decisions an embedder can design
-against. It is intentionally consumer-neutral: OpenTelemetry, CommandSuite, and any other record
-vocabulary belong in adapters above this contract.
+This document turns TurnDB's product boundary into decisions an embedder can design
+against. It is intentionally consumer-neutral: OpenTelemetry, production trace platforms, and any
+other record vocabulary belong in adapters above this contract.
 
 ## 1. Architecture decision
 
@@ -101,8 +101,9 @@ memtable/locator planning, after its indivisible part-encoding unit, during boun
 immediately before manifest publication. Cancellation removes the unpublished part and preserves the
 live memtable/manifest; already sealed fold bytes are safe unreachable data.
 
-The future binding-level operation named `commit(records, durability: "sync")` is composition, not a
-new storage transition: apply the atomic batch, then `sync`, and resolve only after both succeed.
+A binding-level `commit(records, durability: "sync")` operation, if added, is intended as
+composition rather than a new storage transition: apply the atomic batch, then `sync`, and resolve
+only after both succeed.
 
 ### `flush`
 
@@ -250,7 +251,7 @@ writer. Portable use must be an explicit package or entry point chosen by the ca
 
 ## 6. Binding seam
 
-The native Node release candidate uses `napi-rs` at N-API 6 for stable Node ABI compatibility. It may
+The native Node binding uses `napi-rs` at N-API 6 for stable Node ABI compatibility. It may
 carry several additional megabytes when those bytes replace bespoke scheduling, buffer, cancellation,
 and error machinery that TurnDB would otherwise have to build and maintain.
 
@@ -270,7 +271,7 @@ thread, encode binary content as base64 for the native path, or round i64 throug
 The WASM package remains synchronous internally and single-threaded. Its current object API is a
 lightweight compatibility profile, not the template for native concurrency.
 
-The current native prototype implements one dedicated store thread and a bounded command queue.
+The native binding implements one dedicated store thread and a bounded command queue.
 `NativeStore.open` accepts a per-handle capacity from 1 through 65,536, defaults to 64 for
 compatibility, and exposes the selected value on the handle; package capabilities report the default
 and maximum. Open and every store operation return Promises; content crosses as `Buffer`, i64 crosses
@@ -300,11 +301,11 @@ unfinished planning future or Rust execution stream aborts its query work and re
 For a writer query, an already-expired deadline refuses before actor submission. Cancellation after
 submission does not retract an ordered snapshot sync/flush that the actor may already complete.
 
-**Current gaps:** binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption,
-writer contention, backup/restore, and manifest recovery have stable machine-readable codes. The
-Linux x86-64 glibc loader/package path and same-artifact Node-major matrix are implemented, but no
-registry artifact is claimed until the owner-gated release completes; other platforms remain
-unqualified. The aggregate execution budget is not a total-process RSS limit.
+Binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption, writer
+contention, backup/restore, and manifest recovery have stable machine-readable codes, and the
+Linux x86-64 glibc loader/package path and same-artifact Node-major matrix are implemented and
+published as `@turndb/native` 0.1.0. **Current gaps:** other platforms remain unqualified, and the
+aggregate execution budget is not a total-process RSS limit.
 
 The package-level `TurnDbError` uses the same generic typed-cause classifier exposed to Rust
 embedders. It gives stable codes to boundary/scan/cursor validation, bounded-queue overload, closed
@@ -346,7 +347,8 @@ staging estimates expose disk-planning evidence without inventing a consumer pol
 the current commit/fold generation, part rows (physical rows, not an invented live-row count), staged
 memtable entries and bytes, WAL and fold disk bytes, fold and part cache counters/budgets, Tier-0 dedup
 window entries, retained commits, and punched blocks. No record or content is decoded. Latency
-histograms, slow-query events, and structured export hooks remain Phase-5 work; consumers may poll
+histograms, slow-query events, and structured export hooks remain planned follow-on work;
+consumers may poll
 this generic value into their telemetry system. The separate
 `space_usage` / `spaceUsage` inventory performs reachability-aware traversal and reports exact,
 disjoint live, retained-only, and unclassified storage categories. Structured pages separately expose

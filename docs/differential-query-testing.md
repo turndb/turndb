@@ -35,8 +35,8 @@ Run the gate directly with:
 cargo test --test query point_structured_and_datafusion_paths_agree_on_versioned_general_records
 ```
 
-This deterministic test is the initial three-path differential gate, not the whole query-testing
-story. It does not replace randomized property generation, parser fuzzing, malformed-store mutation,
+This deterministic test is the initial three-path differential gate, not a complete query-testing
+strategy. It does not replace randomized property generation, parser fuzzing, malformed-store mutation,
 or differential coverage of future indexes and orderings. A new query-visible scalar type, visibility
 rule, predicate class, or result representation should extend this corpus or add an equally strong
 independent oracle before being considered stabilized.

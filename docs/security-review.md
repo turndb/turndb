@@ -2,8 +2,8 @@
 
 This review covers TurnDB's version-2 storage core, version-1 pack, native Node binding, and
 portable WASI binding as of 2026-08-03. It is an engineering threat review, not a claim of formal
-verification or an independent third-party audit. Findings remain useful only if new format fields,
-parsers, and binding methods update both the review and their adversarial tests.
+verification or an independent third-party audit. New format fields, parsers, and binding methods
+must update both this review and their adversarial tests.
 
 ## Threat model
 
@@ -175,7 +175,7 @@ enforce the single-writer lock, which is a capability reduction rather than a pa
    Admission limits and worker isolation remain the protection against a single expensive atomic
    codec operation.
 
-These are tracked as open hardening work, not hidden behind a blanket “untrusted input safe” claim.
+These are open hardening items.
 Deployments accepting arbitrary third-party stores should still validate them in a resource-limited
 helper process when stronger containment is required: configured allocation ceilings do not make
 codec CPU preemptive or defend against a malicious peer concurrently replacing filesystem objects.
@@ -189,6 +189,7 @@ type/range validation and an engine-owned work or memory bound where the binding
 Every destructive/publication operation must identify its last cancellable point and prove no-replace
 publication. Any new `unsafe` block needs a local safety contract and an adversarial boundary test.
 
-Test fixtures that create stores or sparse adversarial files must own their temporary directories
+When maintaining this suite: test fixtures that create stores or sparse adversarial files must own
+their temporary directories
 with scope-bound cleanup. The qualification suite also runs with incremental compilation disabled so
 repeated long-running verification does not leave unbounded build or fixture data behind.

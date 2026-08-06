@@ -5,9 +5,8 @@ compatibility rather than one V8 or Node release. Each `NativeStore` owns a dedi
 a bounded command queue; filesystem, compression, scan, and sync work do not run on the JavaScript
 event loop.
 
-Version 0.1.0's first prebuilt distribution target is Linux x86-64 glibc, installed and exercised on
-Node 22, 24, and 26. Registry availability is an external fact; this README and a source build do not
-claim that publication occurred. On a supported host, install a published release with:
+Version 0.1.0 is published on npm. Its first prebuilt distribution target is Linux x86-64 glibc,
+installed and exercised on Node 22, 24, and 26. On a supported host, install it with:
 
 ```sh
 npm install @turndb/native
@@ -19,8 +18,8 @@ Build and exercise the source addon from the workspace with:
 npm run test:dev --prefix bindings/node
 ```
 
-Its closed Node range is `>=22 <27`; the required Linux x86-64 matrix is Node 22, 24, and 26. N-API
-6 does not by itself establish support or prove that matrix green; see the repository's
+Its closed Node range is `>=22 <27`; the required Linux x86-64 matrix is Node 22, 24, and 26.
+Support claims come from that tested matrix, not from N-API 6 alone; see the repository's
 [support and compatibility policy](https://github.com/turndb/turndb/blob/main/docs/support-and-compatibility.md).
 
 The package loader accepts `TURNDB_NATIVE_PATH` for development and otherwise looks for a packaged
@@ -29,9 +28,8 @@ threads, and physical reclamation are capabilities, not implementation details t
 silently.
 
 The root package is platform-neutral and selects `@turndb/native-linux-x64-gnu` as an optional
-dependency. The tracked manifests and ordinary candidate tarballs remain private. Explicit release
-staging produces publishable tarballs, and the owner-gated workflow is the supported publication
-path. See the [native prebuild and release contract](../../docs/native-prebuilds.md) for clean-install
+dependency. Publication goes through the owner-gated staged release workflow.
+See the [native prebuild and release contract](https://github.com/turndb/turndb/blob/main/docs/native-prebuilds.md) for clean-install
 commands, artifact measurements, the glibc floor, and first-release gates.
 
 ## Semantics
@@ -43,11 +41,11 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   `maxIdentifierBytes` configure Rust-owned admission policy. Batches are fully charged before the
   first fold mutation; byte limits use deterministic worst-case framed-WAL sizes rather than current
   dedup state. Size/count refusals are `RESOURCE_EXHAUSTED`, while malformed limits or names are
-  `INVALID_ARGUMENT`. See [write admission limits](../../docs/write-admission.md).
+  `INVALID_ARGUMENT`. See [write admission limits](https://github.com/turndb/turndb/blob/main/docs/write-admission.md).
 - Attributes are an ordered array, not an object. Duplicate names and exact scalar types survive.
   Signed/unsigned integers and UTC nanosecond timestamps enter and leave as JavaScript `bigint`;
   binary metadata and content use `Buffer`; explicit null carries its own `kind`. See
-  [the version-2 scalar contract](../../docs/field-types-v4.md).
+  [the version-2 scalar contract](https://github.com/turndb/turndb/blob/main/docs/field-types-v4.md).
 - `scan()` is the Rust structured pager. Rust owns visibility, filtering, ordering, work bounds, and
   opaque cursor validation. The writer view includes accepted unflushed writes. Content metadata
   includes `identity`, the lowercase BLAKE3 hex digest of the complete reconstructed value, when its
@@ -67,16 +65,16 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   bounds the sum per page (1,000,000 by default); equal-id groups stay atomic, one oversized first
   group is admitted for progress, and `budgetExhausted` explains a partial page. Empty pages may carry
   `next` after bounded progress through tombstone-only groups. See
-  [projected structured scans](../../docs/projected-structured-scan.md) and
-  [structured scan I/O statistics](../../docs/structured-scan-io.md), plus the
-  [resolved-row budget contract](../../docs/resolved-row-paging.md).
+  [projected structured scans](https://github.com/turndb/turndb/blob/main/docs/projected-structured-scan.md) and
+  [structured scan I/O statistics](https://github.com/turndb/turndb/blob/main/docs/structured-scan-io.md), plus the
+  [resolved-row budget contract](https://github.com/turndb/turndb/blob/main/docs/resolved-row-paging.md).
 - `explainScan()` validates and prepares the same request and opaque cursor as `scan()`, then reports
   projected, predicate-only, and byte-reconstructed fields; effective bounds and budgets; and exact
   pre-resolution part/row/memtable scope. It does not estimate result counts or read value/content
-  columns. See [structured scan explanation](../../docs/scan-explanation.md).
+  columns. See [structured scan explanation](https://github.com/turndb/turndb/blob/main/docs/scan-explanation.md).
 - Every rejection is normalized to `TurnDbError`. Its stable `code` comes from the Rust engine's
   typed cause classifier; `BUSY` and `CLOSED` are the only binding-owned states. Messages retain full
-  diagnostic context but are not an API. See [error taxonomy](../../docs/error-taxonomy.md).
+  diagnostic context but are not an API. See [error taxonomy](https://github.com/turndb/turndb/blob/main/docs/error-taxonomy.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
@@ -94,7 +92,7 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   newest retained commit. The result reports the selected commit, rollback distance, and validation
   work. Cancellation during validation leaves the damaged manifest and retained history unchanged;
   promotion is the final uninterruptible boundary. See
-  [the recovery procedure](../../docs/recovery.md).
+  [the recovery procedure](https://github.com/turndb/turndb/blob/main/docs/recovery.md).
 - `querySql()` is the richer immutable query plane. The native package deliberately includes the
   Arrow/DataFusion dependency: Rust binds typed `$1` parameters, refuses DDL/DML/session statements,
   enforces a configurable execution-memory pool (256 MiB by default), and returns a
@@ -121,29 +119,29 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   `RESOURCE_EXHAUSTED`, `UNSUPPORTED`, and `INTERNAL`; the original native error is retained as `cause`
   and the full contextual message remains available. The declared code union reserves `NOT_FOUND`,
   `CORRUPTION`, and broader `IO` use while typed engine errors are added—unclassified core failures
-  report `INTERNAL` rather than being guessed from prose.
+  report `INTERNAL`.
 - `compact()`, `verify()`, `punch()`, `refold()`, and `backup()` run on the same serialized writer actor. They
   sync and flush earlier writes before operating, so their reports cover an exact cut and their
   filesystem work stays off the event loop. `compact(true)` requests a full merge; the default uses
   the engine's measured automatic policy. Each accepts queue-inclusive `timeoutMs` and
   `AbortSignal` options backed by Rust cooperative checkpoints. Cancelled compaction/refold staging
   is removed; punching retains safe resumable progress. See
-  [lifecycle cancellation and deadlines](../../docs/lifecycle-control.md).
+  [lifecycle cancellation and deadlines](https://github.com/turndb/turndb/blob/main/docs/lifecycle-control.md).
 - `compactBounded({ maxInputParts, maxInputRows, maxInputBytes }, options)` publishes one contiguous
   merge within all three exact physical-input limits. It reports the executed plan, output bytes,
   and merge statistics; an insufficient budget is `RESOURCE_EXHAUSTED`, never an implicit overrun.
   Only a total-live-list step drops tombstones. See
-  [bounded incremental compaction](../../docs/bounded-compaction.md).
+  [bounded incremental compaction](https://github.com/turndb/turndb/blob/main/docs/bounded-compaction.md).
 - `spaceUsage(options)` classifies every regular store file exactly once as live, retained-only, or
   unclassified, with logical bytes everywhere and allocated/free bytes where the platform can prove
   them. `estimateCompactionSpace(budget, options)` and `estimateRefoldSpace(options)` add exact source
   facts and explicitly non-binding stage estimates. TurnDB supplies evidence; the embedding
   application chooses admission and reserve policy. See
-  [maintenance space accounting and preflight](../../docs/maintenance-space.md).
+  [maintenance space accounting and preflight](https://github.com/turndb/turndb/blob/main/docs/maintenance-space.md).
 - `formatMigrationStatus(options)` distinguishes live legacy parts from old-format files pinned only
   by retained snapshots. `estimateFormatMigrationSpace(options)` preflights the oldest live legacy
   part, and `migrateFormatStep(options)` atomically upgrades one part so restart simply continues with
-  the remainder. See [resumable format migration](../../docs/format-migration.md).
+  the remainder. See [resumable format migration](https://github.com/turndb/turndb/blob/main/docs/format-migration.md).
 - `erase(ids)` is deliberately strong: it tombstones present ids, settles tombstones, rewrites live
   content, and purges retained manifests so this store has no snapshot path back to the erased rows.
   It accepts cancellation during read-only planning, then deliberately defers it once tombstones are
@@ -158,15 +156,15 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   core execution time. Verification reports a dedicated corruption-failure subset without conflating
   cancellation or I/O. Folded-content counters expose exact piece hits/logical/novel bytes, and
   `partDistribution(options)` reports live immutable-part byte/row order statistics. See
-  [pull-based operation metrics](../../docs/operation-metrics.md).
+  [pull-based operation metrics](https://github.com/turndb/turndb/blob/main/docs/operation-metrics.md).
 - `contentLiveness(options)` walks visible record programs and fold headers to separate unique live
   piece bytes, dead bytes stranded inside mixed compressed blocks, and wholly unreferenced block
   payload eligible for punch/refold. It requires a flushed memtable and accepts cancellation; see
-  [content liveness and reclamation](../../docs/content-liveness.md).
+  [content liveness and reclamation](https://github.com/turndb/turndb/blob/main/docs/content-liveness.md).
 - `lifecycleEvents(afterSequence, limit)` reads a bounded, non-destructive journal of stable lifecycle
   operation/outcome/error-class/duration facts. Sequence gaps and cumulative eviction are explicit,
   so independent exporters can detect loss; see
-  [bounded lifecycle events](../../docs/lifecycle-events.md).
+  [bounded lifecycle events](https://github.com/turndb/turndb/blob/main/docs/lifecycle-events.md).
 - Structured scan stats include `durationNs`; SQL stats separately expose
   `planningDurationNs` and cumulative active `executionDurationNs`. Read-only SQL `EXPLAIN` streams
   DataFusion's plan as ordinary Arrow IPC. TurnDB supplies evidence and leaves slow thresholds to the
@@ -176,8 +174,8 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   segment, compression level, and compression-worker policy. Independently opened snapshots accept
   the same read ceilings; writer-created snapshots inherit them. `health()` reports the effective
   writer values, including current physical WAL frames; see
-  [resource budgets and overload](../../docs/resource-budgets.md) and
-  [persistent object-count admission](../../docs/object-admission.md).
+  [resource budgets and overload](https://github.com/turndb/turndb/blob/main/docs/resource-budgets.md) and
+  [persistent object-count admission](https://github.com/turndb/turndb/blob/main/docs/object-admission.md).
 - `schema()` discovers the attribute names and scalar types and the independently named content
   fields present in the store. It reads part metadata, not values or content, and the writer view also
   includes unflushed records. `mayIncludeShadowedFields` is true when immutable parts contribute to
@@ -185,9 +183,10 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   a shadowed or deleted physical row; the result is descriptive and never a required global schema.
 
 Part encoding during flush remains one uninterruptible unit. Low-level untyped invariant failures
-also retain the conservative `INTERNAL` class. Those remain explicit Phase 3/4 work rather than being
+also retain the conservative `INTERNAL` class. Those remain planned engine work rather than being
 simulated in JavaScript.
 
-The external [reference-consumer qualification](../../docs/reference-consumer-qualification.md)
+The external [reference-consumer qualification](https://github.com/turndb/turndb/blob/main/docs/reference-consumer-qualification.md)
 uses this public surface for both linked application/AI telemetry and a non-telemetry build pipeline.
-It is executable evidence for the general record seam, not an additional package API or core schema.
+It is executable evidence for the generic record model and this binding's public surface, not an
+additional package API or core schema.

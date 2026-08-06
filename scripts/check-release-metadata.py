@@ -104,7 +104,6 @@ def check_tag_contract() -> None:
         ROOT / "bindings/node/scripts/publish-prebuild.cjs",
         ROOT / "CONTRIBUTING.md",
         ROOT / "docs/native-prebuilds.md",
-        ROOT / "ROADMAP.md",
     ]
     obsolete = []
     for path in text_files:

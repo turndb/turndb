@@ -81,16 +81,15 @@ an open/durable-write/health/close cycle. Temporary consumers and npm caches are
 The `native-release` Cargo profile keeps unwinding semantics, strips symbols, uses thin LTO, and uses
 one code-generation unit. On the 2026-08-03 Linux x86-64 development host, the full SQL/Arrow addon
 was 77,852,768 bytes and its publishable platform tarball was 26,147,438 bytes. The ordinary stripped
-release addon measured on the preceding tree was 115,467,704 bytes, so the dedicated profile removed
-37,614,936 installed bytes (32.6%). After adding the compressed 332 KB third-party attribution
-report, the thin publishable root tarball was 32,579 bytes.
+release addon measured 115,467,704 bytes in the same development measurements, so the dedicated
+profile removed 37,614,936 installed bytes (32.6%). After adding the compressed 332 KB third-party
+attribution report, the thin publishable root tarball was 32,579 bytes.
 
 These are local measurements, not registry sizes or performance promises. The host-built ELF required
-glibc 2.34 and therefore does not qualify as the glibc-2.17 release artifact. A fat-LTO trial spent
-more than nine minutes in the final DataFusion-heavy link without producing an addon and was stopped;
-two clean thin-LTO builds completed in 6 minutes 1 second and 5 minutes 34 seconds. Artifact size is
-accepted here because it
-buys the maintained Arrow/DataFusion query machinery that the native package actually exposes.
+glibc 2.34 and therefore does not qualify as the glibc-2.17 release artifact. Fat LTO was abandoned
+for link time — more than nine minutes in the DataFusion-heavy final link without completing — while
+clean thin-LTO builds complete in about six minutes. The artifact size is accepted because it carries
+the maintained Arrow/DataFusion query machinery that the native package exposes.
 
 ## Owner-gated release
 
@@ -134,8 +133,8 @@ the result; dependency or license changes cannot silently leave the shipped attr
 
 The package version is not the on-disk format version. A `0.x` consumer must follow the compatibility
 policy: a minor release may advance the writer format or make a documented API break, and downgrade
-writing is not promised. This is suitable for an early CommandSuite integration flywheel without
-pretending the format or API has reached the 1.0 freeze.
+writing is not promised. This is suitable for an early production integration without pretending
+the format or API has reached the 1.0 freeze.
 
 The candidate's consumer-facing scope and known limits are collected in the
 [native 0.1.0 release notes](releases/native-0.1.0.md).

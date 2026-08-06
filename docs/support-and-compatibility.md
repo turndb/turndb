@@ -8,7 +8,7 @@ line. Publication of a crate or package remains a separate owner-approved action
 
 | Surface | Current evidence | Status |
 |---|---|---|
-| Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, corruption suite run hosted. The release-profile suite exceeds the private free-tier runner class (SIGBUS/disk, documented in the CI workflow) and is verified on the local qualified platform until the repository is public, when the same job arms hosted on the larger free runner | qualified development platform; release-profile hosted evidence deferred to repository publication, and named here rather than implied |
+| Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, and the corruption suite run hosted. The release-profile suite is verified on the local qualified platform; its hosted job runs on the larger public-repository runner class (the private free-tier runner could not link it — SIGBUS/disk, documented in the CI workflow) | qualified development platform; release-profile evidence is local until the hosted job reports green |
 | Rust crash model | nightly deterministic simulation on Linux x86-64 | qualified durability model when the scheduled gate is green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
 | Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
@@ -16,15 +16,15 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Native Windows | the native core requires Unix positioned I/O and writer locking | unsupported |
 
 Node ranges are deliberately closed at the next untested major: both manifests declare
-`>=22 <27`. Node 22 and 24 are maintained LTS lines and Node 26 is the Current line at the
-2026-08-03 review; the repository follows the [official Node release status](https://nodejs.org/en/about/previous-releases),
+`>=22 <27`. Node 22 and 24 are maintained LTS lines and Node 26 is the Current line as of
+2026-08-03; the repository follows the [official Node release status](https://nodejs.org/en/about/previous-releases),
 not historical popularity. A repository test keeps both manifests and CI's exact majors in sync.
 Adding a newly released major requires a green matrix before widening the range. EOL majors are not
 retained merely because N-API can load on them.
 
-The 2026-08-03 policy change was locally exercised on Node 24. Node 22 and 26 remain claims pending
-the branch's required CI jobs; configured jobs are not reported as green runs. A release is blocked
-until every declared major passes.
+The 2026-08-03 policy change was locally exercised on Node 24. Node 22, 24, and 26 are exercised by
+the required CI matrix on `main` (`.github/workflows/ci.yml`). A release is blocked until every
+declared major passes.
 
 N-API 6 decouples the addon from a particular V8 ABI. It does not prove OS/architecture prebuild
 availability or runtime correctness on every later Node release. Only the matrix above is evidence.
@@ -112,9 +112,10 @@ retained history; no compatibility promise resurrects erased content.
 
 ## Release status
 
-Green source tests do not create a published artifact. The native package has a prebuild/install
-matrix and an owner-gated provenance-capable release workflow, but both tracked manifests remain
-`private` and no registry publication is claimed. The portable package and Rust crate also remain
-subject to the publication checklist in `CONTRIBUTING.md`. Native production support begins only
-after the exact tagged tarballs pass the release matrix and an owner approves their publication; this
-policy does not manufacture registry or CI facts from source readiness.
+Green source tests do not create a published artifact. Version 0.1.0 of the Rust crate, the
+portable npm package, and `@turndb/native` was published on 2026-08-06. The native package's
+tracked manifests remain `private` in source, so publication happens only through the owner-gated
+provenance-capable release workflow; the portable package and Rust crate remain subject to the
+publication checklist in `CONTRIBUTING.md`. Native production support begins only after the exact
+tagged tarballs pass the release matrix and an owner approves their publication; this policy does
+not manufacture registry or CI facts from source readiness.

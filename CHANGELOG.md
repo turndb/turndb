@@ -7,43 +7,12 @@ TurnDB does not follow Semantic Versioning yet, because it is pre-1.0
 and nothing here is a compatibility promise. See **Stability** below
 before relying on anything in this file.
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-08-06
 
-**Not yet released.** No tag exists and nothing has been published to
-crates.io or npm. This entry describes what 0.1.0 *would* contain; the
-date is deliberately absent rather than guessed, and should be filled in
-by whoever tags it.
+First release, published as three artifacts: the `turndb` crate on
+crates.io, the portable `turndb` npm package, and `@turndb/native`.
 
-Checked, and this is the claim in this file most likely to expire —
-publication makes it false immediately. **Three names, because the claim
-covers three publishable artifacts:** the `turndb` crate, the portable
-`turndb` npm package, and `@turndb/native`.
-
-```
-git tag        0 tags
-
-for u in https://crates.io/api/v1/crates/turndb \
-         https://registry.npmjs.org/turndb \
-         https://registry.npmjs.org/@turndb%2Fnative; do
-  printf '%s  %s\n' "$(curl -s -o /dev/null -w '%{http_code}' -A '<your-agent>' "$u")" "$u"
-done
-               404 on all three
-```
-
-**Run the same loop against names that do exist — `serde`, `typescript`,
-`@types%2Fnode` — and it must print `200`.** A check that cannot produce
-a `200` is measuring your request rather than the registry, and there are
-two easy ways to get exactly that:
-
-```
-curl … https://crates.io/api/v1/crates/turndb   without -A   403   not 404
-curl … registry.npmjs.org/turndb                without https://   301   not 404
-```
-
-Send a `User-Agent`, write the scheme, and read the status code rather
-than the headers.
-
-### Stability — read this before the feature list
+### Stability
 
 **Pre-1.0. Format version 2. Not frozen.** [`FORMAT.md`](FORMAT.md) is
 normative: where it and the code disagree, one of them is a bug.
@@ -64,13 +33,11 @@ property rather than a feature gap:** the single-writer invariant is
 OS-enforced on Unix via `flock` and **is not enforced under WASI**,
 where it is the embedder's obligation. The measured consequence, and why
 a clean `verify()` does not settle it, is in
-[`FORMAT.md`](FORMAT.md#the-writer-lock). It is stated there once rather
-than restated here.
+[`FORMAT.md`](FORMAT.md#the-writer-lock).
 
 ### Added
 
-First release, so everything is new. Each item is already documented in
-the tree; this file is not the first home of any claim.
+First release, so everything is new.
 
 - **Durability** — WAL with an explicit ACK point, all-or-nothing batch
   replay, a single commit point (the manifest) with a checksummed commit
@@ -107,13 +74,10 @@ the tree; this file is not the first home of any claim.
 - **CLI** — `turndb <verb>`: reading (`inspect`, `ids`, `get`, `verify`,
   `query`), operating (`compact`, `refold`, `punch`, `recover`,
   `snapshots`, `erase`), ingesting (`import`), shipping (`pack`,
-  `unpack`). **`turndb help` prints the authoritative verb set; where it
-  and this list disagree, it is right.**
+  `unpack`). `turndb help` prints the authoritative verb set; where it
+  and this list disagree, it is right.
 
 ### Known limitations
-
-Documented rather than omitted. Each is stated in full elsewhere; these
-are pointers.
 
 - **Single-writer is not enforced under WASI** — see Stability above and
   [`FORMAT.md`](FORMAT.md#the-writer-lock).
@@ -126,52 +90,4 @@ are pointers.
   [`docs/security-review.md`](docs/security-review.md), which is scoped
   as of 2026-08-03 and is not an independent third-party audit.
 
-### How this entry was derived
-
-Stated so a reader can check it rather than trust it, and so the next
-release can use a narrower denominator.
-
-**Denominator: the entire history.** There is no prior tag to diff from
-— `git tag` returns nothing — so the bound is every commit reachable
-from `main`.
-
-**Measured at `db357fb`.** These counts move with every merge, so they
-are pinned to a commit rather than stated as current. Re-run against the
-tagged commit when 0.1.0 is cut; a difference is expected and is the
-point of naming the measurement point:
-
-```
-git rev-list --count db357fb             234 commits
-git rev-list --count --no-merges db357fb 215 non-merge commits
-git rev-list --count --merges db357fb     19 merge commits
-git tag                                    0 tags
-```
-
-**Four of those pin to a commit. A fifth measurement does not, and is
-deliberately not quoted here:** `gh pr list --state merged` counts merged
-pull requests — a live query against GitHub, with no commit to pin it to
-and a default result limit. **It has already drifted past the merge count
-above, and can only drift further.** Run it yourself if you want
-corroboration at the moment you are reading; a number printed here would
-be a snapshot wearing the same clothes as the four that are not.
-
-**Capabilities were taken from what is already documented** — the
-`## What it does` table in [`README.md`](README.md) and the `docs/`
-tree — and not from the commit log. That is deliberate: a changelog
-derived from commit subjects reproduces whatever the subjects claimed,
-whereas the documented surface has been reviewed. **The commit and PR
-record is the traceability, not the source.**
-
-**What this entry leaves out**, so the omission is a decision rather
-than an accident: individual commits are not enumerated. 215 non-merge
-commits across a first release describe how the engine was built, not
-what a consumer receives. **A partition of them by subject prefix covers
-205 and silently drops 10**, several substantial — which is why the
-prefix partition was not used as the spine:
-
-```
-git log --no-merges --format='%s' db357fb | grep -cE '^[a-z][a-z0-9_-]*[(:]'   205
-git rev-list --count --no-merges db357fb                                       215
-```
-
-[0.1.0]: https://github.com/turndb/turndb/commits/main
+[0.1.0]: https://github.com/turndb/turndb/releases/tag/v0.1.0

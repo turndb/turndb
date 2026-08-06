@@ -1,10 +1,11 @@
 # Native Node 0.1.0 release notes
 
-Registry status is external: this source note does not claim publication. Treat 0.1.0 as available
-only when npm exposes both packages with provenance matching the tagged release workflow.
+This note is the source-side release record: `@turndb/native` 0.1.0 and its platform package were
+published to npm on 2026-08-06.
 
-This is TurnDB's first native Node distribution and the intended starting point for CommandSuite's
-live storage integration. It is a pre-1.0 adoption release, not a format or API freeze.
+This is TurnDB's first native Node distribution and the intended starting point for the first
+production consumer's live storage integration. It is a pre-1.0 adoption release, not a format or
+API freeze.
 
 ## Distribution
 
@@ -63,10 +64,8 @@ notes before minor upgrades.
   has cooperative cancellation and admission limits.
 - Some low-level invariant failures conservatively use `INTERNAL` until a typed engine cause proves a
   narrower class.
-- The full SQL/Arrow addon is intentionally substantial: the local dedicated-profile candidate was
-  77,852,768 bytes and packed to approximately 26.1 MB. Registry size remains unmeasured until
-  publication.
+- The full SQL/Arrow addon is intentionally substantial: the dedicated-profile candidate measured
+  77,852,768 bytes on the 2026-08-03 development host and packed to approximately 26.1 MB.
 
 The support policy, operational constraints, and exact evidence tiers live in
-[support and compatibility](../support-and-compatibility.md). No registry release should be inferred
-until this note's status changes and the exact tag's hosted jobs are green.
+[support and compatibility](../support-and-compatibility.md).

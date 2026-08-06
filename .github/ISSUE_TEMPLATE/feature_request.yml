@@ -9,7 +9,7 @@ body:
       value: |
         TurnDB's scope is a general-purpose embedded content-addressed
         columnar store. Proposals are weighed against that rather than
-        against any single consumer's needs — see `ROADMAP.md`.
+        against any single consumer's needs.
   - type: textarea
     id: problem
     attributes:

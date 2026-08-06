@@ -37,7 +37,7 @@ their exact checks before incrementing a commit, creating a retained copy, or st
 A handle therefore does not deliberately create a directory shape its own policy refuses to
 enumerate.
 
-`retained_commits` now returns a `Result`, because a bounded listing must be able to report typed
+`retained_commits` returns a `Result` because a bounded listing must be able to report typed
 resource exhaustion. `retained_commits_with_limits` accepts an explicit profile. Writer health keeps
 the retained-window count as process state and remains a constant-work snapshot rather than hiding a
 directory scan in a getter.

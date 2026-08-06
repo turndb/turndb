@@ -5,12 +5,10 @@ complete scalar attribute tag set. See [`content-identity-v3.md`](content-identi
 [`field-types-v4.md`](field-types-v4.md); this document remains the design and compatibility record
 for the version-2 generalization of the record model.
 
-Status: accepted for implementation on `codex/turn-maturity`.
+Status: implemented in format version 2.
 
-This decision is the first format-bearing step in the roadmap. It describes the logical record model,
-the compatibility boundary, and the physical direction. `FORMAT.md` remains normative for every format
-the code actually writes; this document becomes historical design rationale once version 2 is fully
-specified there.
+`FORMAT.md` remains normative for every format the code actually writes; this document records the
+design rationale for the version-2 record model.
 
 ## Decision
 
@@ -60,8 +58,8 @@ program whose piece references address the shared fold. The fold remains involve
 - reference discovery for punch and refold; and
 - erasure, which reasons about reachability across every named content value.
 
-This is the property that a general columnar database with a hash column does not acquire merely by
-storing the same fields.
+A general columnar database with a hash column stores the same fields, but its engine participates
+in none of these operations.
 
 ## Part version 2
 
@@ -108,8 +106,8 @@ The WAL has no payload version byte, so a new record payload cannot reuse the cu
 new standalone record tag and a new in-batch record tag introduce the generalized payload. Existing
 record and tombstone tags retain their exact interpretation.
 
-The generalized record payload, as first designed (whole-value identities were added to the same
-on-disk version before any release), is:
+The generalized record payload is shown below; the shipped tags additionally carry a per-content
+whole-value identity (see [`content-identity-v3.md`](content-identity-v3.md)):
 
 ```text
 varint  id_len
@@ -149,10 +147,9 @@ A content projection has two useful modes:
   without reading fold blocks; and
 - value projection reconstructs the selected values and performs the existing per-piece verification.
 
-The initial implementation may expose exact reconstruction before a stable aggregate identity for a
-multi-piece program. It must not pretend that one piece hash is the identity of the whole value. If a
-whole-value digest is added, it is BLAKE3 of the reconstructed bytes and is either stored explicitly or
-computed with the documented I/O cost.
+One piece hash is not the identity of the whole value. Version 2 stores one exact whole-value
+digest per content occurrence — BLAKE3 of the reconstructed bytes, computed during ingest — as
+documented in [`content-identity-v3.md`](content-identity-v3.md).
 
 Metadata-only scans and scans of unrelated content columns must continue to open zero fold blocks.
 
