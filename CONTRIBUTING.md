@@ -223,14 +223,33 @@ For a release `X.Y.Z`, the publisher:
    npm whoami
    ```
 
-3. from `npm/turndb`, runs `npm publish --dry-run --json`, confirms that `prepublishOnly` rebuilt
-   the WASM and passed the package tests, and reads the reported tarball file list, packed size, and
-   unpacked size. The expected payload is `LICENSE`, `NOTICE`, `README.md`, `index.d.ts`,
-   `index.mjs`, `package.json`, and `turndb.wasm`; any addition or omission stops the release;
+3. from `npm/turndb`, runs the following in one shell. npm writes the `prepublishOnly` build output
+   ahead of the JSON object, so the whole output is not valid JSON; the `sed` step deliberately
+   extracts the final object before parsing it:
+
+   ```sh
+   set -o pipefail
+   dry_run_output="$(mktemp)"
+   dry_run_json="$(mktemp)"
+   npm publish --dry-run --json | tee "$dry_run_output"
+   sed -n '/^{/,$p' "$dry_run_output" > "$dry_run_json"
+   node -e 'const p=require(process.argv[1]); console.table(p.files); console.log(p.size, p.unpackedSize, p.integrity)' "$dry_run_json"
+   audited_integrity="$(node -e 'process.stdout.write(require(process.argv[1]).integrity)' "$dry_run_json")"
+   ```
+
+   The publisher confirms that `prepublishOnly` rebuilt the WASM and passed the package tests, then
+   reads the reported tarball file list, packed size, unpacked size, and integrity. The expected
+   payload is `LICENSE`, `NOTICE`, `README.md`, `index.d.ts`, `index.mjs`, `package.json`, and
+   `turndb.wasm`; any addition or omission stops the release;
 4. runs `npm publish --access public` from the same directory, without `--ignore-scripts`; and
-5. verifies the registry result with
-   `npm view turndb@X.Y.Z name version dist.integrity dist.tarball --json`, then installs that exact
-   version into an empty directory and runs a documented README example against it.
+5. verifies that the registry has the same bytes that the dry run audited, then installs that exact
+   version into an empty directory and runs a documented README example against it:
+
+   ```sh
+   npm view turndb@X.Y.Z name version dist.integrity dist.tarball --json
+   published_integrity="$(npm view turndb@X.Y.Z dist.integrity)"
+   test "$published_integrity" = "$audited_integrity"
+   ```
 
 `npm/prepublish-check.sh` is reached by both the dry run and the real directory publish through
 `prepublishOnly`; it refuses an uncommitted tree and `npm/build.sh` rebuilds and tests the artifact.
