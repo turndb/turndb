@@ -26,9 +26,7 @@ the remote branch did not delete anyone's local ref, and a stale local `develop`
 a word of complaint — so if your clone predates the migration, run `git fetch --prune` and
 `git branch -D develop` before branching anything. Because `develop` was merged (not squashed) into
 `main`, a branch accidentally cut from the stale ref is merely behind `main` rather than carrying
-phantom commits — but base your work on `main` all the same. Nothing server-side currently refuses
-a push that recreates `develop` (see the protection gap above); a CI guard that fails such a push
-is written and waiting on a workflow-scoped token to land.
+phantom commits — but base your work on `main` all the same.
 
 CommandSuite made the same migration to trunk-based development (its #55); each repository states
 its own model in its own `CONTRIBUTING.md` — three copies of a branch model is worse than one,
@@ -184,10 +182,9 @@ Push anything failing to it and read the issue that opens; push a fix and watch 
 alert nobody has watched fire is indistinguishable from one that does not work**, and `main` is
 never involved.
 
-**Enforced, not documented here:** required status checks. Rulesets were unavailable while this
-repository was private on the free tier; publication made them available. **What is required today
-is whatever the ruleset says** — see [Branches](#branches) for where to ask it. The `gate` job in
-`ci.yml` exists so that a required check has one line worth reading.
+**Enforced, not documented here:** required status checks. **What is required is whatever the
+ruleset says** — see [Branches](#branches) for where to ask it. The `gate` job in `ci.yml` exists so
+that a required check has one line worth reading.
 
 ## Changing the format
 
