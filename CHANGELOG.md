@@ -15,17 +15,33 @@ date is deliberately absent rather than guessed, and should be filled in
 by whoever tags it.
 
 Checked, and this is the claim in this file most likely to expire —
-publication makes it false immediately:
+publication makes it false immediately. **Three names, because the claim
+covers three publishable artifacts:** the `turndb` crate, the portable
+`turndb` npm package, and `@turndb/native`.
 
 ```
-git tag                                                    0 tags
-curl -sI -A '<your-agent>' crates.io/api/v1/crates/turndb   404
-curl -sI registry.npmjs.org/turndb                          404
+git tag        0 tags
+
+for u in https://crates.io/api/v1/crates/turndb \
+         https://registry.npmjs.org/turndb \
+         https://registry.npmjs.org/@turndb%2Fnative; do
+  printf '%s  %s\n' "$(curl -s -o /dev/null -w '%{http_code}' -A '<your-agent>' "$u")" "$u"
+done
+               404 on all three
 ```
 
-crates.io returns `403` to a request with no `User-Agent`, which is not
-the same answer as `404`. Send one, or the check reports on your request
-rather than on the crate.
+**Run the same loop against names that do exist — `serde`, `typescript`,
+`@types%2Fnode` — and it must print `200`.** A check that cannot produce
+a `200` is measuring your request rather than the registry, and there are
+two easy ways to get exactly that:
+
+```
+curl … https://crates.io/api/v1/crates/turndb   without -A   403   not 404
+curl … registry.npmjs.org/turndb                without https://   301   not 404
+```
+
+Send a `User-Agent`, write the scheme, and read the status code rather
+than the headers.
 
 ### Stability — read this before the feature list
 
