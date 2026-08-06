@@ -88,7 +88,16 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         serde_json::json!(["x86_64-unknown-linux-gnu"]),
         "every configured target needs its own build, package, and runtime evidence"
     );
-    assert_eq!(native["optionalDependencies"]["@turndb/native-linux-x64-gnu"], "0.1.0");
+    // The selector must request exactly the platform package this tree builds, so derive the
+    // expectation instead of writing the version twice. A literal here passes whenever the
+    // literal happens to match and says nothing about whether the pin tracks the package: it
+    // reads as a check on the pin while actually checking a constant. It also fails on every
+    // correct version bump, which is the reverse of what it is for.
+    assert_eq!(
+        native["optionalDependencies"]["@turndb/native-linux-x64-gnu"], native["version"],
+        "the selector's optionalDependencies pin must name its own version; a stale pin selects \
+         a platform package that was never published at that version"
+    );
     assert_eq!(native["exports"]["."]["types"], "./index.d.ts");
     assert_eq!(native["exports"]["."]["import"], "./index.mjs");
     assert_eq!(native["exports"]["."]["require"], "./index.cjs");
