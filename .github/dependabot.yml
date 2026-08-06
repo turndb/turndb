@@ -1,15 +1,23 @@
 # Dependabot config — https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 #
-# THREE ecosystems, not two. TurnDB is a Rust workspace that also ships a
-# native Node addon, so it carries cargo and npm manifests plus workflow
-# actions. A config covering only one reads as covered.
+# CONFIGURE EVERY ECOSYSTEM PRESENT IN THE TREE. A config covering some
+# of them reads as covering all of them, and nothing reports the gap —
+# that is what this comment exists to prevent.
 #
-#   cargo           — root workspace Cargo.toml/Cargo.lock, which resolves
-#                     for the engine and both binding crates
+# Which ecosystems exist is a fact about the tree, not a permanent one.
+# Check the set rather than trusting the list below to be complete:
+#
+#   git ls-files | grep -iE '(^|/)(Cargo\.toml|package\.json|pyproject\.toml|\
+#     requirements[^/]*\.txt|go\.mod|Gemfile|composer\.json|Dockerfile|\
+#     pom\.xml|build\.gradle[^/]*|pubspec\.yaml|mix\.exs)$'
+#   git ls-files '.github/workflows/*'
+#
+#   cargo           — root workspace Cargo.toml/Cargo.lock, which
+#                     resolves for the engine and the binding crates
 #   npm             — bindings/node ONLY, because it is the only npm
-#                     manifest with dependencies to update. That is a fact
-#                     about the tree, not a permanent one — confirm it
-#                     before assuming this scoping is still right:
+#                     manifest with dependencies to update. A fact about
+#                     the tree too — check it before assuming this
+#                     scoping is still right:
 #
 #                       git ls-files '*package.json' | while read f; do
 #                         printf '%s ' "$f"
@@ -19,14 +27,16 @@
 #                       done
 #   github-actions  — .github/workflows/
 #
-# NO `labels:` KEY. Dependabot cannot apply a label that does not exist:
-# it drops the label silently and reports nothing, exactly as GitHub
-# silently ignores a CODEOWNERS entry naming a non-collaborator. So a
-# `labels:` key is only correct if every label in it exists.
+# NO `labels:` KEY HERE. Dependabot cannot apply a label that does not
+# exist: it drops the label silently and reports nothing, exactly as
+# GitHub silently ignores a CODEOWNERS entry naming a non-collaborator.
+# A `labels:` key is only correct if every label in it exists.
 #
-# Before adding one, confirm each label against the repository rather
-# than against this comment:
-#   gh api repos/turndb/turndb/labels --jq '.[].name'
+# The two issue templates DO carry one, so this check covers three files
+# rather than this one — confirm each label against the repository:
+#
+#   gh api repos/turndb/turndb/labels --paginate --jq '.[].name'
+#   git grep -A2 '^labels:' -- .github/ISSUE_TEMPLATE
 #
 # Grouping: minor + patch batch into one PR per ecosystem per week;
 # majors open their own PR because a breaking change deserves review on
@@ -54,7 +64,7 @@ updates:
           - "minor"
           - "patch"
 
-  # ──────────────────── npm (native binding toolchain only) ────────────────
+  # ───────────────────── npm (native binding toolchain) ────────────────────
   - package-ecosystem: "npm"
     directory: "/bindings/node"
     schedule:

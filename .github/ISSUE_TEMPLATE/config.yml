@@ -1,15 +1,15 @@
-# No "Question or idea → Discussions" contact link here. CommandSuite has
-# one; this repository does not, because Discussions is not enabled — and
-# a contact link to a disabled feature is a dead end presented as a
-# channel.
+# Contact links are a routing table. A link to a channel that does not
+# exist is a dead end presented as a channel, so add one only after
+# confirming the destination is live.
 #
-# That is a repository setting and it can change without anyone opening
-# this file. Confirm before adding the link, rather than trusting this
-# comment:
+# No "Question or idea → Discussions" link. Discussions is a repository
+# setting and can be turned on without anyone opening this file, so
+# check it rather than this comment before adding one:
 #
 #   gh api repos/turndb/turndb --jq '{discussions: .has_discussions}'
 #
-# Likewise no commercial/hosted link: TurnDB has no hosted offering.
+# No commercial or hosted-offering link: add one if and when there is a
+# hosted offering to link to.
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability

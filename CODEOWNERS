@@ -1,15 +1,20 @@
 # Default reviewers for pull requests that arrive without one.
 #
 # THIS IS A BACKSTOP, NOT THE REVIEW MODEL. Internal work is reviewed by
-# the verifier named on the objective that produced it — the verifier is
-# named per piece of work, not fixed by repository, and is regularly
-# someone who is not a collaborator here. A CODEOWNERS entry cannot
-# express that and should not try to. What it is for is the case
-# CODEOWNERS is actually good at: a pull request from outside that model,
-# which otherwise sits with nobody's name on it.
+# the verifier named on the objective that produced it: selected per
+# piece of work, and may differ from the fixed list below or hold no
+# write access here at all. A CODEOWNERS entry cannot express that and
+# should not try to. What it is for is the case CODEOWNERS is actually
+# good at: a pull request from outside that model, which otherwise sits
+# with nobody's name on it.
 #
-# Both accounts below were verified as collaborators with push, not
-# inferred from a display name. GitHub SILENTLY IGNORES an entry naming
-# a non-collaborator: the file parses, the review is never requested,
-# and nothing reports the difference.
+# GITHUB SILENTLY IGNORES AN ENTRY NAMING A NON-COLLABORATOR: the file
+# parses, the review is never requested, and nothing reports the
+# difference. So the line below is only doing its job if every account
+# on it currently has push. Check it against the repository rather than
+# against this comment — and note the check needs push access itself,
+# returning 403 without it:
+#
+#   gh api repos/turndb/turndb/collaborators \
+#     --jq '.[] | {(.login): .permissions.push}'
 * @soundledger @exactjoinery
