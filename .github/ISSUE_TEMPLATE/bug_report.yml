@@ -54,7 +54,7 @@ body:
     attributes:
       label: Commit
       description: The commit you built from — `git rev-parse HEAD`. There are no published releases, so this is the only way to identify what you ran.
-      placeholder: "8c506f6ca42fca1689b264102ccda616a0794000"
+      placeholder: "40-character commit id"
     validations:
       required: true
   - type: dropdown
