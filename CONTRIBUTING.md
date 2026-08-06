@@ -13,53 +13,12 @@ This repository is trunk-based. `main` is the only long-lived branch.
 | `main` | The trunk. **Branch your work from here.** Changes land through a pull request, verified by someone who did not write them, and merge with a merge commit — never a squash or rebase — so every commit that was reviewed is the commit that lands. |
 | `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
-Nobody pushes to `main` directly — **and since 2026-08-05T23:59:20Z that is machinery, not only
-convention.** A ruleset enforces it.
+Nobody pushes to `main` directly. Changes land through a pull request, and a repository ruleset
+enforces that server-side.
 
-**Two historical claims sit in that sentence, and neither is checkable by the command below** — an
-API returns current state, never past state. Their evidence, so a reader can weigh them rather than
-trust them:
-
-| claim | evidence |
-|---|---|
-| protection began `2026-08-05T23:59:20Z` | `gh api repos/turndb/turndb/rulesets/<id> --jq .created_at` → `2026-08-05T16:59:20.247-07:00` |
-| armed only after CI first went green | first successful CI run completed `2026-08-05T23:57:58Z` on `e42a960d4`; ruleset created 1m22s later |
-
-**That margin is 82 seconds and I did not know it when I first wrote the claim.** It was arming a
-required check after proving it can pass, which is the right order — a check that cannot run leaves
-the merge button permanently dark — but the sentence asserted a sequence nobody had measured.
-
-**This paragraph describes mutable configuration that lives outside the repository.** It cannot be
-made correct by being written carefully; it can only be made checkable.
-
-**What is asserted about the *current configuration*, and therefore what the check must print** —
-the historical claims above are a separate class and are evidenced separately: a ruleset exists named `main`;
-it is active; it targets a branch; it applies to `refs/heads/main`; nobody can bypass it; a pull
-request is required; a status check is required; and that check is `gate`. **Eight properties — the
-command below prints all eight and nothing that is not asserted.**
-
-```
-gh api repos/turndb/turndb/rulesets --jq '.[]|select(.name=="main")|.id' \
-  | xargs -I% gh api repos/turndb/turndb/rulesets/% --jq '{
-      name, enforcement, target,
-      refs: .conditions.ref_name.include,
-      bypass: (.bypass_actors|length),
-      rules: [.rules[].type],
-      checks: [.rules[]|select(.type=="required_status_checks")
-                       |.parameters.required_status_checks[].context]
-    }'
-
-# {"name":"main","enforcement":"active","target":"branch",
-#  "refs":["refs/heads/main"],"bypass":0,
-#  "rules":["pull_request","required_status_checks"],"checks":["gate"]}
-```
-
-**If that output differs, this paragraph is wrong and the output is right.** The ruleset id is
-looked up by name rather than pinned, so the check survives the ruleset being recreated — an absent
-or renamed ruleset yields no confirmation, which is the correct failure.
-
-**This is a projection chosen to cover the claim, not the ruleset's full state.** If you add an
-assertion to this paragraph, add its field to the command.
+**The live ruleset is the authority on what it requires. This document does not restate it** —
+a restatement is one configuration change away from being wrong, and the wrongness is silent.
+`gh api repos/turndb/turndb/rules/branches/main` reports what currently applies.
 
 **`develop` is retired.** Until 2026-07-31 this repository used a `develop` integration branch with
 frozen `review/<date>` PR branches; every commit from that model is in `main`'s history. Deleting
@@ -225,13 +184,10 @@ Push anything failing to it and read the issue that opens; push a fix and watch 
 alert nobody has watched fire is indistinguishable from one that does not work**, and `main` is
 never involved.
 
-**Configured and enforcing:** required status checks. GitHub rulesets returned *"upgrade to Pro or
-make this repository public"* while this repository was private on the free tier; publication made
-them available and the `main` ruleset was armed once CI first passed.
-**`gate` gates the merge button** — it is the one line in the check list worth reading, and the `gate`
-job in `ci.yml` exists to make that true. **The command that verifies this — including that
-the required context is `gate` specifically — is under [Branches](#branches), stated once so the two
-cannot drift apart.**
+**Enforced, not documented here:** required status checks. Rulesets were unavailable while this
+repository was private on the free tier; publication made them available. **What is required today
+is whatever the ruleset says** — see [Branches](#branches) for where to ask it. The `gate` job in
+`ci.yml` exists so that a required check has one line worth reading.
 
 ## Changing the format
 
