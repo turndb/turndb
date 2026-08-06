@@ -128,7 +128,7 @@ positive u32 numbers. Defaults are 64 MiB, 256 MiB, 4,096, and 4 KiB. The first 
 limits: they count deterministic worst-case complete WAL frames, treating every folded piece as
 novel, so acceptance never depends on hidden dedup history. An atomic batch is completely charged and
 validated before any member mutates the fold or WAL. See
-[write admission limits](../../docs/write-admission.md) for the exact unit and native API.
+[write admission limits](https://github.com/turndb/turndb/blob/main/docs/write-admission.md) for the exact unit and native API.
 
 ## Frame and persistent object admission
 
@@ -142,13 +142,13 @@ growth, physical frames in an unflushed WAL, and blocks plus block-id span in on
 A strict frame profile seals fold blocks early so small records keep progressing; one indivisible
 oversized piece is refused before mutation, and an oversized part output is refused before
 publication. Batch WAL frames and future filesystem/block objects are likewise admitted before the
-associated mutation. See [atomic frame read admission](../../docs/read-admission.md) and
-[persistent object-count admission](../../docs/object-admission.md).
+associated mutation. See [atomic frame read admission](https://github.com/turndb/turndb/blob/main/docs/read-admission.md) and
+[persistent object-count admission](https://github.com/turndb/turndb/blob/main/docs/object-admission.md).
 
 ## When a write stalls, and by how much
 
-This build is single-threaded, so two operations run on **your** thread and nothing else's. Both
-are predictable enough to budget for — this section is the arithmetic.
+This build is single-threaded, so two operations run on the calling thread. Both are predictable
+enough to budget for; this section gives the arithmetic.
 
 **Block seals.** The fold gathers *unique* content until it reaches `blockTarget` (default 4 MiB),
 then seals the block: one zstd compression, executed inside whichever `putBody` crossed the
@@ -166,12 +166,12 @@ bodies through this package's wasm build, in a Node 22 container on one Linux x8
 versus ~1.7s at level 19** (the engine's default, tuned for the native build where compression
 runs on a thread pool).
 
-Level 3 also costs more disk, and this README does not publish a figure: measurements through the
-package on one real trace corpus varied materially with workload ordering and sample
-configuration, and nothing in the default depends on the number — the default is set by the stall. If
+Level 3 also costs more disk; no figure is published because measurements through the package on
+one real trace corpus varied materially with workload ordering and sample configuration. The
+default is set by the stall, not the disk cost. If
 disk matters, measure your own workload: write a sample at both levels and compare the
 directories. A trace workload writing 1.8 GB/day of unique content seals ~430 times a day: ~34
-seconds of total stall at level 3, ~12 minutes — in 1.7-second ambushes — at level 19. Pass
+seconds of total stall at level 3, ~12 minutes — in 1.7-second pauses — at level 19. Pass
 `level: 19` only if that trade is one you have measured your event loop against.
 
 **Compaction.** Merges never rewrite content — that is the format's load-bearing claim and the
@@ -199,7 +199,7 @@ inputs are accepted only inside JavaScript's safe range; use `bigint` for the fu
 Unsigned u64 and UTC nanosecond timestamps use `{ u: bigint }` and
 `{ timestampNs: bigint }` wrappers so a read-modify-write cycle retains their type. `Uint8Array`
 stores binary metadata and `null` stores explicit null; missing remains absence of the key. See
-[the version-2 scalar contract](../../docs/field-types-v4.md).
+[the version-2 scalar contract](https://github.com/turndb/turndb/blob/main/docs/field-types-v4.md).
 The JSON-only WASM boundary carries those values as decimal text internally, never through a float.
 Non-finite f64 values also use explicit text spellings rather than JSON `null`.
 

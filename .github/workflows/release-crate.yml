@@ -28,7 +28,7 @@ on:
       release_ref:
         description: Exact annotated tag to release (vX.Y.Z)
         required: true
-    type: string
+        type: string
 
 concurrency:
   group: release-crate-${{ inputs.release_ref }}

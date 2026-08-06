@@ -1,6 +1,6 @@
 # Projected structured scans
 
-The feature-independent structured pager now resolves visibility first and decodes only the fields
+The feature-independent structured pager resolves visibility first and decodes only the fields
 needed by projection or predicates. This is the storage-native small-query path; it does not route
 through Arrow or DataFusion and does not require a flush to see the writer's memtable.
 
@@ -61,7 +61,7 @@ the Rust query contract rather than in a binding.
 
 ## Grouped physical gather
 
-The pager now retains the authoritative part and row found by its bounded k-way id-range merge. It
+The pager retains the authoritative part and row found by its bounded k-way id-range merge. It
 projects that row directly and reuses an already projected content program during reconstruction,
 rather than point-locating the id and decoding the program again. See
 [resolved-row structured paging](resolved-row-paging.md).

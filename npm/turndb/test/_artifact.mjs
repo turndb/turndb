@@ -2,11 +2,9 @@
 //
 // `turndb.wasm` is generated, never committed — it is gitignored, has never appeared in any commit,
 // and `npm/build.sh` produces it. That is deliberate: the repository carries source, not a 1.1 MB
-// binary. The cost is a trap, and it has already caught someone: running `node --test` directly
-// after changing Rust exercises whatever artifact happens to be on disk, so an engine fix looks
-// absent and a verifier concludes the commit is broken. It is the same shape as the stale built-SDK
-// trap that cost two people time on CommandSuite, and it fails the same way — a plausible result
-// rather than an error.
+// binary. The cost is a trap: running `node --test` directly after changing Rust exercises
+// whatever artifact happens to be on disk, so an engine fix looks absent and a verifier concludes
+// the commit is broken — a plausible result rather than an error.
 //
 // So: compare the artifact against the newest engine source and refuse if it is older. Build with
 // `bash npm/build.sh`, which rebuilds and then runs these tests in the right order.

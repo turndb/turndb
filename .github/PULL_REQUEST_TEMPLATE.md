@@ -23,9 +23,9 @@
 
 <!--
   Numbers, and where they came from. Name the command, not the
-  conclusion. If you truncated the output, you did not read the output —
-  report the number the command produced (`| wc -l`, a summary line, an
-  exit code), never one read off a `head`, `tail`, or paged view.
+  conclusion. Read the full output, not a truncated portion — report the
+  number the command produced (`| wc -l`, a summary line, an exit code),
+  never one read off a `head`, `tail`, or paged view.
 -->
 
 ## What this does NOT cover

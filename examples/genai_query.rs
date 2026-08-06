@@ -1,9 +1,10 @@
-//! The queries CommandSuite's UI actually issues, run against the dogfood store.
+//! The queries a production trace UI actually issues, run against the store built by
+//! `genai_dogfood`.
 //!
 //! usage: genai_query <store-dir> <genai.jsonl>
 //!
 //! Storage numbers are meaningless if the read path cannot answer. These are the three questions
-//! the server asks today — a member's page, a lookup by `responseId`, and an aggregate — plus the
+//! a trace server asks — a member's page, a lookup by `responseId`, and an aggregate — plus the
 //! one that matters more than any of them: does the stored context come back byte for byte.
 
 use anyhow::{Context, Result};

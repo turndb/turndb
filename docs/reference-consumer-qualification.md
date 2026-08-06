@@ -32,8 +32,7 @@ scope: the backup created beforehand is an external copy and still contains the 
 
 A checked legacy pack supplies real version-1 bytes for upgrade qualification
 (`qualification/fixtures/revision-one.turndb.hex`): two records, one per part, written and packed
-by `main`'s own build at commit `2fdc779` — the actual version-1 writer, not a reconstruction —
-and deep-verified by that build before check-in. The external harness can only restore it and use
+by an actual version-1 build and deep-verified before check-in. The external harness can only restore it and use
 public Node methods. The workflow preflights and migrates one part, closes and reopens, resumes
 the second part, and verifies that record bytes stay exact while whole-value identities are
 honestly reported unavailable — a version-1 value has none, and migration never invents one.
@@ -49,7 +48,7 @@ writer, pages and compares the complete live id set, measures dead content, pref
 refold, verifies zero remaining dead/reclaimable bytes, and runs complete store verification. The
 ordinary Node suite runs 64 cycles as a bounded regression profile.
 
-On 2026-08-03, the larger local profile ran:
+A development-host run of the larger local profile, measured on 2026-08-03:
 
 ```text
 node qualification/soak.cjs <empty-store-dir> 512
@@ -62,11 +61,11 @@ node qualification/soak.cjs <empty-store-dir> 512
 ```
 
 This is lifecycle evidence, not a throughput benchmark: the payload is deliberately compressible and
-the result includes local filesystem/fsync behavior. A first policy that ran only one eight-input
-compaction every eight produced parts reached a high-water of 71. It was rejected: the merge output is
-itself a part, so that cadence accumulates one part per interval. Draining through additional bounded
-units held the high-water at 9 without replacing bounded work with an unbounded operation. Compaction
-cadence remains consumer policy; TurnDB supplies exact backlog, plans, limits, and outcomes.
+the result includes local filesystem/fsync behavior. Running only one eight-input compaction every
+eight produced parts is insufficient — the merge output is itself a part, so that cadence
+accumulates one part per interval (a high-water of 71 in this profile); draining through additional
+bounded units holds the high-water at 9 without replacing bounded work with an unbounded operation.
+Compaction cadence remains consumer policy; TurnDB supplies exact backlog, plans, limits, and outcomes.
 
-The Phase 6 matrix now exercises every listed workload property through public consumer seams. Adding
-consumer concepts to `src/` remains an unacceptable way to keep it passing.
+The qualification matrix exercises every listed workload property through public consumer seams.
+Consumer concepts must not be added to `src/` to keep it passing.

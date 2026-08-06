@@ -1,18 +1,18 @@
-//! CommandSuite's `GenAiInference` records, stored in turndb — the dogfood slice.
+//! A production trace platform's gen_ai inference records, stored in turndb.
 //!
 //! usage: genai_dogfood <genai.jsonl> <store-dir>
 //!
 //! The mapping, and the reasoning behind each choice:
 //!
 //! * **Three records per API call**, `#system` / `#input` / `#output`, rather than one record with
-//!   three bodies. A record has one body by design, and the split is already proven by
-//!   turndb-datasets' `kind=input` / `kind=output` convention.
+//!   three bodies. A record has one body by design, and the split follows the established
+//!   `kind=input` / `kind=output` convention for trace datasets.
 //! * **The body is the message array verbatim**, which is what makes the whole thing work: the
 //!   engine's carve splits a top-level JSON array at element boundaries, so turn *k*'s messages and
 //!   turn *k+1*'s messages resolve to the same pieces. That is the quadratic-to-linear step.
 //! * **Ids are `member/ts/responseId#kind`** with the timestamp zero-padded, so ids sort
-//!   lexicographically into member-then-time order — which is the access pattern the UI actually
-//!   has, and it makes the front-coded id column both compressible and range-scannable.
+//!   lexicographically into member-then-time order — the access pattern a trace UI actually
+//!   has — and it makes the front-coded id column both compressible and range-scannable.
 //! * **Attributes are flattened to gen_ai semconv names**, not stored as nested JSON. `usage`
 //!   becomes four `gen_ai.usage.*` integers, so they are queryable columns rather than opaque text.
 //! * **`finish_reasons` is a repeated attribute**, not a joined string — turndb preserves duplicate

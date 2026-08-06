@@ -3,13 +3,13 @@
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
 a directory you can `tar`, and reading one needs nothing but the files.
 
-**"Single-writer" is a design property, not a guarantee on every build.** The engine enforces it on
-Unix and cannot on `wasm32-wasip1`, where it is the embedder's to keep. See
-[FORMAT.md](FORMAT.md#the-writer-lock), which is the normative statement, and
-*One writer per store* under [What it does not do](#what-it-does-not-do).
+Single-writer enforcement is platform-dependent: the engine enforces it on Unix and cannot on
+`wasm32-wasip1`, where the embedder must guarantee it. See *One writer per store* under
+[What it does not do](#what-it-does-not-do) and [FORMAT.md](FORMAT.md#the-writer-lock) for the
+normative statement.
 
-**Status: pre-1.0, format version 2, not frozen.** See [FORMAT.md](FORMAT.md), which is normative:
-where it and the code disagree, one of them is a bug.
+**Status: pre-1.0, format version 2, not frozen.** [FORMAT.md](FORMAT.md) is normative: where it
+and the code disagree, one of them is a bug.
 
 ## What problem it solves
 
@@ -25,15 +25,15 @@ turndb splits the two planes:
   bytes.
 
 Where the planes meet is the **carve**: dedup can only recognise repetition where piece boundaries
-land, and full-resend traffic repeats exactly at message boundaries. So the engine's default carve
-is structural, not content-defined — the elements of a top-level JSON array become pieces, and the
-punctuation between them stays inline. Turn *k*'s messages and turn *k+1*'s re-sent messages
-resolve to the same pieces, so each message is stored once however many later requests carry it:
-the storage cost of a full-resend conversation drops from quadratic in its turn count to linear.
-That boundary choice, not content addressing itself, is what the collapse above comes from. Bodies
-that are not JSON arrays fall back to content-defined chunking, and the carve is an opinion with
-escape hatches, not a lock-in: pick a strategy per write, or hand the store your own spans and
-bypass it entirely ([`src/carve.rs`](src/carve.rs)).
+land, and full-resend traffic repeats exactly at message boundaries. The engine's default carve is
+therefore structural, not content-defined — the elements of a top-level JSON array become pieces,
+and the punctuation between them stays inline. Turn *k*'s messages and turn *k+1*'s re-sent
+messages resolve to the same pieces, so each message is stored once however many later requests
+carry it, and the storage cost of a full-resend conversation drops from quadratic in its turn
+count to linear. This boundary choice, not content addressing by itself, is what produces the
+dedup ratios reported below. Bodies that are not JSON arrays fall back to content-defined
+chunking, and the default is not a lock-in: pick a carve strategy per write, or hand the store
+your own spans and bypass carving entirely ([`src/carve.rs`](src/carve.rs)).
 
 Because a part holds no content, **compaction never touches content**: merging rewrites references
 and columns, which on trace data is a small fraction of the bytes. That is what lets a trace store
@@ -44,11 +44,10 @@ Measured on 40k records of real agent traffic (1.89 GiB of message bodies): 38.9
 SQLite path on 3,000 full-resend calls — same records, their schema and insert code — 320.24 MiB
 became 1.56 MiB.
 
-> **On these numbers.** They come from corpora that are not yet public, so you cannot reproduce
-> them today, and they are provisional pending a larger and more rigorous run. Treat them as our
-> measurements rather than as published results. What you *can* reproduce is the shape of the
-> claim: point turndb at your own traces and compare. The ratio depends entirely on how much your
-> traffic re-sends, which is the whole thesis.
+> **On these numbers.** They were measured on corpora that are not public, and they are
+> provisional pending a larger and more rigorous run — our measurements, not independently
+> reproducible results. The ratio also depends entirely on how much your traffic re-sends. The
+> reproducible form of the claim is comparative: point turndb at your own traces and measure.
 
 ## The cardinal invariant
 
@@ -227,8 +226,9 @@ Linux hole punching.
 `bindings/node` is the native server-side release candidate. Its `napi-rs` addon gives each open
 writer a dedicated Rust actor and bounded queue, exposes Promise-based batch/durability/scan/content
 operations with `Buffer` and exact `bigint`, and refuses to fall back to WASM when a native artifact
-is unavailable. The first prebuilt slice is Linux x86-64 glibc across Node 22, 24, and 26; its root
-and platform manifests remain private in source even when explicit release staging is approved. The
+is unavailable. The first prebuilt slice is Linux x86-64 glibc across Node 22, 24, and 26; its
+package manifests are marked private in source, so publication can only happen through the staged
+release path. The
 [native prebuild contract](docs/native-prebuilds.md) states the exact artifact, install, provenance,
 and publication gates.
 
@@ -243,8 +243,8 @@ isn't there.
 
 ## Testing
 
-The engine is tested harder than its size suggests, because a storage engine that loses data is
-worthless however elegant it is.
+The test suite is large relative to the engine, deliberately: a storage engine that loses data is
+worthless.
 
 ```sh
 cargo test                              # the ordinary suites
@@ -257,11 +257,10 @@ The **deterministic simulation** harness records every write, fsync, rename, lin
 punch, then replays every crash point under a model where file content and directory entries
 become durable independently, and asserts the recovered store equals some prefix of the
 acknowledged writes. Six sweeps cover the write path and every publication protocol — backup,
-restore, manifest recovery with rollback, hole punching, and format migration — and each prints
-the exact number of crash states it checked, so the suite reports its own coverage instead of this
-paragraph carrying a number that rots. It found three real bugs in its first hours, including an
-ACK backed by a WAL whose directory entry was not yet durable, and a declared hole punch whose
-partially landed deallocation bricked writer recovery.
+restore, manifest recovery with rollback, hole punching, and format migration — and each sweep
+prints the exact number of crash states it checked, so the suite reports its own coverage. It has
+found real bugs, including an ACK backed by a WAL whose directory entry was not yet durable, and a
+declared hole punch whose partially landed deallocation bricked writer recovery.
 
 The **corruption storm** mutates every on-disk structure and requires errors, never panics. It
 found five parser bug classes, including bounds checks of the form `at + n > len` that *overflow

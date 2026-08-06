@@ -1,4 +1,4 @@
-// CommandSuite-shaped generic ingest through the portable binding. Completeness is the contract:
+// Production-trace-shaped generic ingest through the portable binding. Completeness is the contract:
 // every named content, duplicate attribute occurrence, and colliding-timestamp id must survive.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -59,7 +59,7 @@ test('durable write calls the WASI sync boundary before acknowledging', async ()
   }
 });
 
-test('a durable CommandSuite-shaped batch reopens byte-exact and pages eight timestamp peers once', async () => {
+test('a durable production-trace-shaped batch reopens byte-exact and pages eight timestamp peers once', async () => {
   const { dir, store } = await tempStore();
   const timestamp = '1785910000000';
   const ids = Array.from(

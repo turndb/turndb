@@ -13,11 +13,8 @@ This repository is trunk-based. `main` is the only long-lived branch.
 | `main` | The trunk. **Branch your work from here.** Changes land through a pull request, verified by someone who did not write them, and merge with a merge commit — never a squash or rebase — so every commit that was reviewed is the commit that lands. |
 | `<name>/<topic>` | Your working branch. Short-lived: it exists to carry one change to review and dies when the PR merges. |
 
-Nobody pushes to `main` directly — **by convention, not by machinery.** The repository is currently
-private on a plan that offers no branch protection, so nothing server-side refuses a direct push.
-That is a gap between what this document asks and what the repo can enforce; when the repository
-goes public, branch protection on `main` should be turned on the same day, and this paragraph
-updated to say "protected" and mean it.
+Nobody pushes to `main` directly. Branch protection on `main` enforces this: changes reach `main`
+only through a pull request.
 
 **`develop` is retired.** Until 2026-07-31 this repository used a `develop` integration branch with
 frozen `review/<date>` PR branches; every commit from that model is in `main`'s history. Deleting
@@ -26,23 +23,16 @@ a word of complaint — so if your clone predates the migration, run `git fetch 
 `git branch -D develop` before branching anything. Because `develop` was merged (not squashed) into
 `main`, a branch accidentally cut from the stale ref is merely behind `main` rather than carrying
 phantom commits — but base your work on `main` all the same. Nothing server-side currently refuses
-a push that recreates `develop` (see the protection gap above); a CI guard that fails such a push
-is written and waiting on a workflow-scoped token to land.
-
-CommandSuite made the same migration to trunk-based development (its #55); each repository states
-its own model in its own `CONTRIBUTING.md` — three copies of a branch model is worse than one,
-because they drift and then nobody knows which is true.
+a push that recreates `develop`; a CI guard that fails such a push is planned but not yet in
+place.
 
 ### Commit signing does not currently work
 
 `commit.gpgsign=true` is configured with an SSH key and **signing fails on the machines the core
-team develops on**, observed independently on two hosts, in two repositories, by three agents. The
-failure differs between attempts rather than between machines: sometimes git's signing path returns
+team develops on**, observed independently on two hosts, in two repositories. The failure differs
+between attempts rather than between machines: sometimes git's signing path returns
 `communication with agent failed`, sometimes the commit hangs past a bounded timeout. In every
-observed case the commit does not complete.
-
-This is environmental rather than one person's misconfiguration, and it says nothing about your
-machine. Commit with `-c commit.gpgsign=false`.
+observed case the commit does not complete. Commit with `-c commit.gpgsign=false`.
 
 **This matters if branch protection ever requires signed commits.** It would have to be solved
 before that requirement lands, not after — otherwise the first anyone learns of it is a rejected
@@ -59,7 +49,7 @@ into consensus.
 
 ## Standards
 
-These are not aspirations. They are what a change is checked against.
+These are what a change is checked against.
 
 **Measure, do not assert.** Say where a number came from and what it omits. Every dial in this
 engine that got measured — carve, compaction policy, block size, key granularity — produced a
@@ -92,8 +82,7 @@ to a contract silently degrading. A paged read that excludes every deleted id ca
 short page. A serializer that emits the right keys can still render every value as `[object
 Object]`.
 
-Before committing a test, ask **both** of these. They are not the same question, and the second is
-the one people forget:
+Before committing a test, ask **both** of these. They are not the same question:
 
 - **Would this pass against a version that returns *some* of the right answer?** This catches a fix
   that does too little — the short page, the half-rendered field, the truncated window.
@@ -158,34 +147,30 @@ is a property of the pin, not of the commit.
 harness runs nightly (`nightly.yml`) and on demand, not per push, because of its runtime. **It does
 not run against `wasm32-wasip1` at all** — it drives the write path below `src/sys.rs`, and the
 portable target does not execute it. So a change to the WASM binding is *not* crash-tested by any
-suite, here or in CI. That is a real gap and it is stated rather than papered over.
+suite, here or in CI.
 
 **Not runnable locally:**
 
 - The **native prebuild** and its install check, which exercise `ubuntu-22.04` glibc packaging.
 - The **Node matrix** (22, 24, 26) unless you have all three installed; `npm/build.sh` uses whichever
   `node` is on your PATH.
-- The **release-profile suite**, which is deferred while this repository is private — the free-tier
-  runner cannot link DataFusion-static release test binaries. See `docs/support-and-compatibility.md`.
 
 **A workflow change is not a Rust-free change.** `tests/package.rs` reads
 `.github/workflows/ci.yml` and asserts the Node matrix there matches what the packages claim. So
 editing CI can fail `cargo test` for reasons that look nothing like CI — and the reverse: a Rust
 test can be the thing that stops you silently narrowing the supported Node range. **Run `cargo test
---test package` after touching a workflow file.** This cost a CI cycle to discover.
+--test package` after touching a workflow file.**
 
 **Exercisable on demand:** the red-branch alert. `main-health.yml` opens an issue when CI concludes
 anything but success on `main`, and closes it when `main` recovers. Because `workflow_run` only ever
 runs the copy of a workflow file that is on the **default branch**, the filter cannot be widened
 from a feature branch to test it — so the branch `ci-alert-drill` is permanently in the filter.
-Push anything failing to it and read the issue that opens; push a fix and watch it close. **An
-alert nobody has watched fire is indistinguishable from one that does not work**, and `main` is
-never involved.
+Push anything failing to it and read the issue that opens; push a fix and watch it close. That is
+how to confirm the alert works, and `main` is never involved.
 
-**Not runnable by anyone yet:** required status checks. GitHub rulesets return *"upgrade to Pro or
-make this repository public"* on a private free-tier repository, and no branch protection exists.
-**Nothing gates the merge button today** — a reviewer reads the check list. The `gate` job in
-`ci.yml` exists so that list has one line worth reading.
+**Enforced at the merge button:** a ruleset on `main` requires a pull request with one approving
+review and a passing `gate` status check before merge. The `gate` job in `ci.yml` is that required
+check.
 
 ## Changing the format
 
@@ -203,28 +188,30 @@ owner on its own review. **Landing on `main` does not approve publication.**
 
 User-visible changes are recorded with `knope document-change`. The generated file under
 `.changeset/` names the single lockstep package (`default`) and one of `major`, `minor`, or `patch`;
-CI validates manually written files too. Before blaming a Knope command that commits, run
+CI validates manually written files too. If a Knope command that commits hangs or fails, first run
 `ssh-add -l`: an unavailable signing key can make the commit wait without producing tool output.
 For this pre-1.0 release line, both `patch` and `minor` advance `0.1.x`; only `major` advances to
 `0.2.0`, so the change type remains a compatibility statement even when two choices produce the
 same next number.
 
 Pushing a change file to `main` updates the `release` PR. Merging that PR creates the single
-annotated `vX.Y.Z` tag and GitHub release, then starts the crate and native publication workflows;
-both publication jobs stop at the protected `npm` environment for owner review. The release-PR
-workflow needs the owner-managed `KNOPE_TOKEN` secret because GitHub does not trigger CI for a pull
-request created with the default workflow token. The portable package remains the deliberate manual
-procedure below and uses the same lockstep tag and declared version.
+annotated `vX.Y.Z` tag and GitHub release, then starts the crate, native, and portable-wasm
+publication workflows; every publication job stops at the protected `npm` environment for owner
+review. The release-PR workflow needs the owner-managed `KNOPE_TOKEN` secret because GitHub does
+not trigger CI for a pull request created with the default workflow token.
 
 ### Publishing the portable npm package
 
-The portable `turndb` package is deliberately published by the repository owner from a clean local
-checkout. It is not part of `release-native.yml`: that workflow publishes only the two native
-packages. Until `turndb` has an npm trusted publisher pinned to this repository and a dedicated
-review-gated workflow, the authorization control is the owner's npm credentials, not a GitHub
-environment or the package's scripts.
+The portable `turndb` package is published by `.github/workflows/release-wasm.yml`, which runs from
+the release fan-out alongside the crate and native workflows. It checks out the exact annotated
+lockstep tag, verifies the package version against it, rebuilds the wasm from that source and runs
+the package suite, exercises the packed tarball on every supported Node major, and publishes that
+exact audited tarball through npm trusted publishing behind the protected `npm` environment.
+Publication therefore requires an npm trusted publisher configured for that workflow — an owner
+action; see the publication gate below.
 
-For a release `X.Y.Z`, the publisher:
+If the workflow cannot be used, the fallback is a manual publish by the repository owner from a
+clean local checkout, under the owner's npm credentials. For a release `X.Y.Z`, the publisher:
 
 1. obtains explicit release approval and checks out the exact annotated lockstep `vX.Y.Z` tag
    created when the release PR merged;
@@ -283,8 +270,7 @@ mismatch is a failed release verification, never a value to update by hand.
 
 ### The publication gate
 
-These live here rather than in anyone's notes, because a gate item in one person's file is not a
-gate. Most are enforced by the toolchain and need no remembering; the ones that are not say so.
+Most of these are enforced by the toolchain and need no remembering; the ones that are not say so.
 
 **Enforced — you cannot skip these by accident:**
 
@@ -300,7 +286,7 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
   silently; this is what stops that.
 - **Tests refuse a stale `.wasm`.** `npm/turndb/test/_artifact.mjs` compares the artifact against
   the newest engine source. Running `node --test` directly after changing Rust would otherwise
-  report the *old* engine's behaviour, which has already cost one wrong verification.
+  report the *old* engine's behaviour.
 - **Native release tarballs come from the exact tagged source and exact tested bytes.** The release
   workflow verifies the annotated lockstep `vX.Y.Z` tag, cross-builds one addon, audits its ELF
   glibc floor and package contents, and install-tests the same uploaded tarballs on every declared
@@ -316,18 +302,17 @@ gate. Most are enforced by the toolchain and need no remembering; the ones that 
 
 **Not enforceable here — check these by hand at publish time:**
 
-- **The GitHub repository description**, once the repo is public. It is currently empty. It is a
-  standalone surface: whatever it says is the whole claim for anyone who does not click through, so
-  it must carry **no unqualified enforcement claim**. "Single-writer" belongs there only with the
-  WASI reduction attached, or not at all — the npm package description dropped it for exactly this
-  reason. The hazard is that someone fills it in from the README's first line, in a hurry, on the
-  day the repo goes public.
+- **The GitHub repository description.** It is a standalone surface: whatever it says is the whole
+  claim for anyone who does not click through, so it must carry **no unqualified enforcement
+  claim**. "Single-writer" belongs there only with the WASI reduction attached, or not at all — the
+  npm package description dropped it for exactly this reason. Do not fill it in from the README's
+  first line, which carries the unqualified form.
 - **The copyright holder in `LICENSE` and `NOTICE`** must name whoever holds the copyright at
   publish time.
 - **Whether `crates.io` and `npm` metadata still describe what ships.** Registry `description`
   fields render standalone, and `package.json` is not in its own `files` list — so no sweep over
   the package payload reaches them.
-- **The first native npm release's external configuration.** The owner must control the `@turndb`
-  scope and both package names, configure trusted publishing for `.github/workflows/release-native.yml`,
-  and protect the GitHub `npm` environment with required review. Source code cannot prove those
-  registry and repository settings.
+- **The npm releases' external configuration.** The owner must control the `@turndb` scope and all
+  three package names, configure trusted publishing for `.github/workflows/release-native.yml` and
+  `.github/workflows/release-wasm.yml`, and protect the GitHub `npm` environment with required
+  review. Source code cannot prove those registry and repository settings.

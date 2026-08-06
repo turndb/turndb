@@ -1,11 +1,10 @@
 # Exact named-content identity: part of format version 2
 
-The named-content generalization made independently named content a first-class columnar namespace,
-but at first a reference could
-only report presence, reconstructed length, and its piece count. Those facts described the reference
-program; none was the identity of the complete byte value. In particular, one piece hash is not the
-identity of a multi-piece value, and hashing an encoded reconstruction program would change when
-carving boundaries changed even if the bytes did not.
+Named content is a first-class columnar namespace. A reference alone reports presence,
+reconstructed length, and piece count — facts about the reference program, none of them the
+identity of the complete byte value: one piece hash is not the identity of a multi-piece value, and
+hashing an encoded reconstruction program would change when carving boundaries changed even if the
+bytes did not.
 
 Version 2 persists one exact whole-value identity per content occurrence:
 

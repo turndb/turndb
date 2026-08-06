@@ -1,8 +1,8 @@
 # Resolved-row structured paging
 
 The structured pager carries each candidate's authoritative storage origin out of the bounded range
-merge. It no longer discards that information and repeats newest-first point searches during
-projection and content reconstruction.
+merge, so projection and content reconstruction index directly into the resolved part and row
+rather than repeating newest-first point searches.
 
 ## Committed range resolution
 
@@ -25,8 +25,8 @@ quietly acquire different visibility rules.
 
 A writer's ordered memtable participates as one more source in the same bounded k-way range merge
 as the immutable parts, so staged records and staged deletions resolve through the identical
-newest-wins pipeline — there is no separate overlay pass or materialized memtable range (the "Hard
-resolution bound" section below describes the merge this replaced it with). Projection of a
+newest-wins pipeline — there is no separate overlay pass or materialized memtable range (see the
+"Hard resolution bound" section below). Projection of a
 memtable origin remains entirely in memory and preserves read-your-writes.
 
 The scan call holds an immutable borrow of the writer, so a resolved memtable origin cannot change

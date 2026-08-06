@@ -19,9 +19,9 @@ the oracle: the expected whole content and metadata are independently regenerate
 wrong program order cannot pass merely because each individual piece is valid.
 
 CI runs the proof once on Node 24 after rebuilding the WASM artifact from the checked-out source.
-Node-major coverage remains in the package matrices; repeating identical format bytes on every Node
-major would add time without broadening the runtime boundary. The script uses isolated temporary
-stores and removes them on every exit.
+It runs once because Node-major coverage lives in the package matrices and repeating identical
+format bytes on every Node major would add time without broadening the runtime boundary. The script
+uses isolated temporary stores and removes them on every exit.
 
 The proof does not claim capability parity. WASI still has embedder-enforced writer exclusion, inline
 compression, no SQL/Arrow lens, and refold-only reclamation. It proves only the overlapping persisted
