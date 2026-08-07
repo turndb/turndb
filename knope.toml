@@ -63,7 +63,7 @@ base = "main"
 template = "chore: prepare release $version"
 
 [workflows.steps.body]
-template = "This PR was created by Knope. Review the generated CHANGELOG.md entry and all lockstep version changes. Merging it creates the v$version release after the protected publication jobs are approved."
+template = "This PR was created by Knope. Review the generated CHANGELOG.md entry and all lockstep version changes. Merging it creates the v$version release after the protected publication jobs are approved.\n\nAfter the native publication succeeds, restore the platform package's resolved lock entry on main: `npm install --package-lock-only --ignore-scripts` in `bindings/node`, committed via PR. The release branch intentionally carries a version-less stub for it, which npm accepts only while the pinned version is unpublished."
 
 [[workflows]]
 name = "release"

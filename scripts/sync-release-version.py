@@ -43,13 +43,18 @@ for package_name_in_lock in stale_local_packages:
 # regenerates the lock by resolving against the registry, and the platform package's new version
 # is unpublished at prepare time — this release is what publishes it — so npm silently drops the
 # unresolvable optional dependency's entry and `npm ci` then refuses the lock as out of sync.
-# Only the three version fields change; every other byte of the lock, including the platform
-# package's version-less `"optional": true` entry, is preserved.
+#
+# The platform package's entry is CONVERTED to the version-less `{"optional": true}` stub rather
+# than preserved: npm accepts the stub exactly while the pinned version is absent from the
+# registry — which is the release branch's whole lifetime — and refuses it afterwards. The
+# matching post-publication step (see the release PR body) restores the resolved entry on `main`
+# with `npm install --package-lock-only` once the version exists.
 lock_path = ROOT / "bindings/node/package-lock.json"
 npm_lock = json.loads(lock_path.read_text())
 npm_lock["version"] = VERSION
 npm_lock["packages"][""]["version"] = VERSION
 npm_lock["packages"][""]["optionalDependencies"][package_name] = VERSION
+npm_lock["packages"][f"node_modules/{package_name}"] = {"optional": True}
 lock_path.write_text(json.dumps(npm_lock, indent=2) + "\n")
 
 # THIRD_PARTY_LICENSES.html lists the workspace's own crates with their versions, so a version
