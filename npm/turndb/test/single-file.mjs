@@ -2,13 +2,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import './_artifact.mjs';
 import { open, openFile, singleFileKind, TurndbError } from '../index.mjs';
 
-const CLI = new URL('../../../target/debug/turndb', import.meta.url).pathname;
+// npm/build.sh builds the CLI and exports this; it is the producer of the artifacts read below,
+// because this binding deliberately has no pack or checkpoint surface of its own.
+const CLI = process.env.TURNDB_CLI
+  ?? new URL('../../../target/debug/turndb', import.meta.url).pathname;
+if (!existsSync(CLI)) {
+  throw new Error(
+    `single-file tests need the turndb CLI to produce their fixtures; run \`bash npm/build.sh\`, `
+    + `or set TURNDB_CLI. Looked at ${CLI}`,
+  );
+}
 
 test('reads a store held in one file, pack or container', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-wasm-file-'));
