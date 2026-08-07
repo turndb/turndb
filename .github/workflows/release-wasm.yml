@@ -135,5 +135,7 @@ jobs:
         with:
           name: turndb-wasm-${{ inputs.release_ref }}
           path: dist/
+      # The leading ./ is load-bearing: npm's spec parser reads a bare `dist/<file>.tgz` as a
+      # GitHub owner/repo shorthand and tries to clone it; only an unambiguous path is a tarball.
       - name: publish the exact audited tarball
-        run: npm publish dist/turndb-*.tgz
+        run: npm publish ./dist/turndb-*.tgz
