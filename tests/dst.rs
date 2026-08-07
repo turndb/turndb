@@ -256,6 +256,16 @@ enum Variant {
     /// AllLanded, except the very last pending write of the last-touched file is TORN at a
     /// fraction of its length.
     TornTail(u8),
+    /// Only the LAST pending write to each file landed; every earlier unsynced write to that file
+    /// did not.
+    ///
+    /// Without an intervening fsync the order dirty pages reach the platter is unspecified, so a
+    /// later write surviving while an earlier one is lost is a legal POSIX outcome — and it is the
+    /// precise hazard a commit record poses. A protocol that writes its commit record last and
+    /// fsyncs before it is unaffected: at every crash point the record is either not yet written,
+    /// or everything it names is already durable. A protocol that skips that fsync publishes a
+    /// pointer to bytes that never landed, and only this variant can tell the two apart.
+    LastPendingOnly,
 }
 
 const VARIANTS: &[Variant] = &[
@@ -265,6 +275,7 @@ const VARIANTS: &[Variant] = &[
     Variant::ContentLag,
     Variant::TornTail(1),
     Variant::TornTail(2),
+    Variant::LastPendingOnly,
 ];
 
 /// Materialize the crash state into `out` (rebasing paths from `root`), and answer whether
@@ -308,6 +319,21 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
                 let content: Vec<u8> = match variant {
                     Variant::DurableOnly | Variant::ContentLag => node.durable.clone(),
                     Variant::AllLanded | Variant::NamesLag => node.volatile.clone(),
+                    Variant::LastPendingOnly => {
+                        let mut img = node.durable.clone();
+                        if let Some((off, data)) = node.pending.last() {
+                            if *off == u64::MAX {
+                                img = data.clone();
+                            } else {
+                                let end = *off as usize + data.len();
+                                if img.len() < end {
+                                    img.resize(end, 0);
+                                }
+                                img[*off as usize..end].copy_from_slice(data);
+                            }
+                        }
+                        img
+                    }
                     Variant::TornTail(_) => {
                         if torn.map(|(ti, _)| ti) == Some(i) {
                             // durable + all pending except the last, torn
@@ -1179,3 +1205,110 @@ fn every_format_migration_crash_preserves_contents_and_resumes() {
 /// and nondeterministic iteration would make a failing seed unreproducible.
 #[allow(dead_code)]
 fn _model_is_deterministic(_: &HashMap<(), ()>) {}
+
+/// A container's crash model is not the directory's: it has no directory entries to lose, and its
+/// commit point is a superblock write rather than a rename. What replaces rename-atomicity is slot
+/// alternation — the state a reader would resolve is never the slot a writer is touching — so the
+/// claim under test is that a crash anywhere in a checkpoint leaves the container serving the
+/// PREVIOUS committed state or the NEW one, and never a mixture of the two.
+///
+/// The two states are made observably different on purpose: records exist at commit 2 that do not
+/// exist at commit 1, so a torn commit that half-published cannot pass by serving the same answer
+/// either way.
+///
+/// Mutation-checked, because a sweep that has never failed has not been shown to work: removing
+/// the fsync that orders the members and directory ahead of the superblock fails this at crash
+/// point 5 under `LastPendingOnly`, with the superblock naming a tail past the end of the file.
+///
+/// What this sweep does NOT establish is the other half of why the slots alternate. A superblock's
+/// meaningful content is its first 56 bytes inside a 4 KiB aligned write, so every tear this model
+/// produces leaves those bytes whole and the record valid — overwriting the live slot instead of
+/// alternating survives this sweep unchanged. Alternation earns its keep against a tear *within*
+/// that prefix, which needs sub-sector atomicity to fail, and against a concurrent reader
+/// resolving a slot while the writer rewrites it, which is a race no crash model expresses.
+#[test]
+fn every_container_checkpoint_crash_lands_on_one_committed_state() {
+    let root = tmp("container");
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.join("store");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+
+    // Commit 1: the store as it stands after the first settle.
+    let first = build_settled_store(&work, cfg, 400);
+    let container = root.join("state.turndb");
+    turndb::store::checkpoint_into_container(&work, &container).unwrap();
+
+    // Records that exist only at commit 2, so the two states cannot be confused.
+    let mut second = first.clone();
+    {
+        let mut s = Store::open(&work, cfg).unwrap();
+        for i in 0..4 {
+            let id = format!("grown:{i}");
+            let body = body_for(900 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            second.insert(id, body);
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    assert!(second.len() > first.len(), "the two commits must differ observably");
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    turndb::store::checkpoint_into_container(&work, &container).unwrap();
+    let ops = record::disarm();
+    assert!(ops.len() > 4, "the checkpoint must exercise a real op stream, got {}", ops.len());
+
+    let stage = tmp("container-stage");
+    let checked = replay_recorded("container", &base, &root, &ops, &stage, |stage, k, variant| {
+        let file = stage.join("state.turndb");
+        if !file.exists() {
+            return;
+        }
+        // Opening never panics and never refuses: the container was already committed once, so
+        // every reachable crash state is a documented recovery rather than an error.
+        let c = turndb::container::Container::open(&file).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: container refused to open: {e:#}")
+        });
+        let seq = c.seq();
+        assert!(
+            seq == 1 || seq == 2,
+            "crash point {k} {variant:?}: container resolved to commit {seq}, not 1 or 2"
+        );
+        // Whatever state it resolved to must be whole: every member it names checksums.
+        c.verify().unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: recovered commit {seq} fails verification: {e:#}")
+        });
+        drop(c);
+
+        // And it must serve exactly one of the two timelines, byte-exact — never a mixture.
+        let rs = turndb::store::open_read_container(&file, cfg).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: commit {seq} refuses a reader: {e:#}")
+        });
+        let want = if seq == 1 { &first } else { &second };
+        let got = rs.ids().unwrap();
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "crash point {k} {variant:?}: commit {seq} serves {} records, its timeline has {}",
+            got.len(),
+            want.len()
+        );
+        for (id, body) in want {
+            assert_eq!(
+                rs.reconstruct(id).unwrap().as_deref(),
+                Some(body.as_slice()),
+                "crash point {k} {variant:?}: commit {seq} record {id} drifted"
+            );
+        }
+    });
+    println!("dst container: {checked} crash states checked across {} ops", ops.len());
+
+    // The source directory is untouched by a checkpoint, at every crash point.
+    let src = Store::open_read(&work, cfg).unwrap();
+    assert_eq!(src.ids().unwrap().len(), second.len(), "checkpoint must not disturb its source");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
