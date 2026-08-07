@@ -18,7 +18,7 @@ turndb — content-addressed columnar store for AI traces
 
 usage: turndb <verb> [args]
 
-  reading (STORE may be a store directory or a .turndb pack file):
+  reading (STORE may be a store directory, a sealed pack, or a .turndb container):
     inspect   <STORE>            what is inside: manifest, parts, fold, snapshots
     ids       <STORE>            every live record id, one per line
     get       <STORE> <ID>       reconstruct one record's content to stdout, byte-exact
@@ -43,8 +43,11 @@ usage: turndb <verb> [args]
                                  carved by the engine's default opinion, batched per 1000
 
   shipping:
-    pack      <DIR> <OUT>        the committed snapshot as one file
+    pack      <DIR> <OUT>        the committed snapshot as one SEALED file
     unpack    <PACK> <OUTDIR>    extract back into an ordinary store directory
+    checkpoint <DIR> <OUT.turndb>
+                                 the committed snapshot as one GROWABLE file, created or grown in
+                                 place; re-running it re-ingests only what changed
 ";
 
 fn main() {
@@ -62,11 +65,38 @@ fn main() {
     }
 }
 
+/// A store is a directory; a single file is a pack or a container. The two file forms are told
+/// apart by their magic rather than by extension, because the extension is the user's to choose
+/// and the magic is the format's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Directory,
+    Pack,
+    Container,
+}
+
+fn classify(path: &Path) -> Source {
+    if !path.is_file() {
+        return Source::Directory;
+    }
+    let mut head = [0u8; 8];
+    if let Ok(f) = std::fs::File::open(path) {
+        use std::io::Read;
+        if (&f).take(8).read_exact(&mut head).is_ok() && &head == turndb::container::MAGIC {
+            return Source::Container;
+        }
+    }
+    Source::Pack
+}
+
+/// Reads one named member out of whichever single-file form the path turned out to be.
+type MemberReader = Box<dyn Fn(&str) -> Result<Vec<u8>>>;
+
 fn open_read(path: &Path) -> Result<ReadStore> {
-    if path.is_file() {
-        turndb::store::open_read_pack(path, FoldCfg::default())
-    } else {
-        Store::open_read(path, FoldCfg::default())
+    match classify(path) {
+        Source::Directory => Store::open_read(path, FoldCfg::default()),
+        Source::Pack => turndb::store::open_read_pack(path, FoldCfg::default()),
+        Source::Container => turndb::store::open_read_container(path, FoldCfg::default()),
     }
 }
 
@@ -167,6 +197,19 @@ fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        "checkpoint" => {
+            let stats =
+                turndb::store::checkpoint_into_container(&arg(0, "DIR")?, &arg(1, "OUT.turndb")?)?;
+            println!(
+                "commit {}: {} members, {} bytes ingested, {} unchanged, {} superseded",
+                stats.commit_seq,
+                stats.members,
+                stats.ingested_bytes,
+                stats.skipped_members,
+                stats.free_bytes
+            );
+            Ok(())
+        }
         "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
         "import" => {
             let dir = arg(0, "DIR")?;
@@ -194,7 +237,12 @@ fn run(args: &[String]) -> Result<()> {
 fn inspect(path: &Path) -> Result<()> {
     let rs = open_read(path)?;
     let m = rs.manifest();
-    let kind = if path.is_file() { "pack" } else { "store" };
+    let source = classify(path);
+    let kind = match source {
+        Source::Directory => "store",
+        Source::Pack => "pack",
+        Source::Container => "container",
+    };
     println!("{kind}: {}", path.display());
     println!(
         "manifest: commit {}, next_seq {}, fold generation {}, tail (seg {}, off {})",
@@ -206,27 +254,48 @@ fn inspect(path: &Path) -> Result<()> {
     }
     let ids = rs.ids()?;
     println!("live records: {}", ids.len());
-    if !path.is_file() {
-        let snaps = turndb::store::retained_commits(path)?;
-        if !snaps.is_empty() {
+    match source {
+        Source::Directory => {
+            let snaps = turndb::store::retained_commits(path)?;
+            if !snaps.is_empty() {
+                println!(
+                    "snapshots: {}",
+                    snaps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        Source::Pack => {
+            let pk = turndb::pack::Pack::open(path)?;
+            println!("pack files: {}", pk.names().count());
+        }
+        Source::Container => {
+            let c = turndb::container::Container::open(path)?;
             println!(
-                "snapshots: {}",
-                snaps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+                "container members: {}, commit {}, {} member bytes, {} superseded",
+                c.len(),
+                c.seq(),
+                c.member_bytes(),
+                c.free_bytes()
             );
         }
-    } else {
-        let pk = turndb::pack::Pack::open(path)?;
-        println!("pack files: {}", pk.names().count());
     }
     Ok(())
 }
 
 fn verify(path: &Path, deep: bool) -> Result<()> {
     // Structural first: every checksum that exists gets checked.
-    if path.is_file() {
-        let pk = turndb::pack::Pack::open(path)?;
-        let n = pk.verify().context("pack verification failed")?;
-        println!("pack: {n} files pass their checksums");
+    match classify(path) {
+        Source::Pack => {
+            let pk = turndb::pack::Pack::open(path)?;
+            let n = pk.verify().context("pack verification failed")?;
+            println!("pack: {n} files pass their checksums");
+        }
+        Source::Container => {
+            let c = turndb::container::Container::open(path)?;
+            let n = c.verify().context("container verification failed")?;
+            println!("container: {n} members pass their checksums");
+        }
+        Source::Directory => {}
     }
     let rs = open_read(path)?;
     let mut sections = 0usize;
@@ -247,19 +316,29 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
             }
         );
     } else {
-        // A pack carries its manifest verbatim: verify each part pin against the pack extents.
-        let pk = turndb::pack::Pack::open(path)?;
+        // A single-file store carries its manifest verbatim, so there is no retained chain to walk;
+        // what can be checked is each part pin against the extent the file actually holds.
+        let (kind, read_member): (&str, MemberReader) = match classify(path) {
+            Source::Container => {
+                let c = turndb::container::Container::open(path)?;
+                ("container", Box::new(move |name: &str| c.read_file_bounded(name, u64::MAX)))
+            }
+            _ => {
+                let pk = turndb::pack::Pack::open(path)?;
+                ("pack", Box::new(move |name: &str| pk.read_file(name)))
+            }
+        };
         let mut pins = 0usize;
         for p in &rs.manifest().parts {
             if let Some(want) = &p.b3 {
-                let got = blake3::hash(&pk.read_file(&p.file)?).to_hex().to_string();
+                let got = blake3::hash(&read_member(&p.file)?).to_hex().to_string();
                 if *want != got {
-                    bail!("packed part {} drifted from its manifest pin", p.file);
+                    bail!("{kind} part {} drifted from its manifest pin", p.file);
                 }
                 pins += 1;
             }
         }
-        println!("chain: {pins} part pins verified inside the pack");
+        println!("chain: {pins} part pins verified inside the {kind}");
     }
     if deep {
         // The strongest check the format offers: reconstruct every live record, which verifies

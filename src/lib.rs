@@ -46,6 +46,7 @@
 
 pub mod capabilities;
 pub mod carve;
+pub mod container;
 pub mod control;
 pub mod error;
 pub mod fold;
