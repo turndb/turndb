@@ -1077,6 +1077,72 @@ pub fn open_read_container_with_limits(
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
+/// Which single-file form a path holds.
+///
+/// Told apart by magic rather than by extension, because the extension is the user's to choose and
+/// the magic is the format's. Both forms answer reads identically; they differ in whether the file
+/// can still grow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SingleFileKind {
+    /// Sealed: footer at EOF, immutable, writer-less by definition.
+    Pack,
+    /// Growable: alternating superblocks at the head, appended beyond the committed tail.
+    Container,
+}
+
+/// Classify a single-file store by its magic.
+///
+/// The two forms carry their magic in different places, which is the addressing difference that
+/// separates them: a container is superblock-addressed, so its magic is the first eight bytes; a
+/// pack is footer-addressed, so its magic begins the footer at EOF. Checking only one position
+/// finds only one form.
+///
+/// A path that is not a regular file, or that carries neither magic, is reported as `None` rather
+/// than guessed at — callers that also accept directories dispatch on that.
+pub fn single_file_kind(path: &Path) -> Option<SingleFileKind> {
+    if !path.is_file() {
+        return None;
+    }
+    let f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+
+    let mut magic = [0u8; 8];
+    if len >= crate::container::REGION_START
+        && crate::sys::read_exact_at(&f, &mut magic, 0).is_ok()
+        && &magic == crate::container::MAGIC
+    {
+        return Some(SingleFileKind::Container);
+    }
+    if len >= crate::pack::FOOTER_LEN
+        && crate::sys::read_exact_at(&f, &mut magic, len - crate::pack::FOOTER_LEN).is_ok()
+        && &magic == crate::pack::MAGIC
+    {
+        return Some(SingleFileKind::Pack);
+    }
+    None
+}
+
+/// Open a READER over whichever single-file form the path holds.
+///
+/// The one entry a consumer needs when it has a `.turndb` and does not care which form produced
+/// it. A directory is refused here — [`Store::open_read`] is that path.
+pub fn open_read_file(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
+    open_read_file_with_limits(path, cfg, ReadLimits::default())
+}
+
+/// Open a single-file reader with explicit frame and persistent object-count admission.
+pub fn open_read_file_with_limits(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    match single_file_kind(path) {
+        Some(SingleFileKind::Container) => open_read_container_with_limits(path, cfg, read_limits),
+        Some(SingleFileKind::Pack) => open_read_pack_with_limits(path, cfg, read_limits),
+        None => bail!("{} is not a turndb pack or container (no recognised magic)", path.display()),
+    }
+}
+
 /// Checkpoint a store directory into a container, creating it or growing one that exists.
 ///
 /// This is the directory→file transition, and it is incremental by construction: parts and rolled
