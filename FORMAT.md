@@ -155,6 +155,16 @@ The footer lands last and is the completeness marker: a part whose footer is abs
 checksum was torn mid-write and is **refused**, never half-read. Refused is not the same as removed —
 a part a manifest names is a hard error, and only files no manifest names are swept as unreachable.
 
+**Every offset a part contains is relative to that part's first byte, and the same holds for a fold
+segment.** Both are therefore *relocatable*: the identical bytes are a valid artifact whether they
+live as their own file, as an extent inside a larger container, or as a remote object, and any
+reader that can supply the byte range can read one without translating a single field. The
+[pack](#the-pack) already depends on this, laying whole parts and segments end to end at arbitrary
+offsets and addressing them through its own table of contents. A field holding an offset into the
+enclosing *file* rather than into the artifact would end that property silently — nothing would
+break until someone tried to relocate — so this format has none, and adding one is a breaking
+change even though no existing reader would notice.
+
 ### Footer — 56 bytes, at EOF
 
 ```

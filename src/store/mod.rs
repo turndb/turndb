@@ -1003,6 +1003,169 @@ pub fn open_read_pack_with_limits(
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
+/// Open a READER over a container — the store in one **mutable** file.
+///
+/// Identical in every observable way to opening the directory it was checkpointed from: same
+/// manifest, same parts, same fold, same version resolution. The difference from a pack is only
+/// that the file this reads can still grow — a container names its state in a superblock rather
+/// than a footer at EOF, so appending does not invalidate the state a reader already resolved.
+pub fn open_read_container(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
+    open_read_container_with_limits(path, cfg, ReadLimits::default())
+}
+
+/// Open a container reader with explicit frame and persistent object-count admission.
+pub fn open_read_container_with_limits(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    let read_limits = read_limits.validate()?;
+    let container = crate::container::Container::open(path)?;
+    let manifest = Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+
+    let fold_rel = if manifest.fold_gen == 0 {
+        "fold".to_string()
+    } else {
+        format!("fold-{:04}", manifest.fold_gen)
+    };
+    let mut segs = Vec::new();
+    let mut dict_files = Vec::new();
+    for name in container.names().map(String::from).collect::<Vec<_>>() {
+        let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
+        if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            let extent = container.extent(&name).expect("name came from this directory");
+            let segment_len = crate::readat::ReadAt::len(&extent)?;
+            segs.push(crate::fold::SegmentInput {
+                seg: n,
+                reader: Arc::new(extent) as Arc<dyn crate::readat::ReadAt>,
+                sidecar: container
+                    .read_file_bounded(
+                        &format!("{fold_rel}/seg-{n:08}.dir"),
+                        crate::fold::segment::max_dir_sidecar_bytes(segment_len)
+                            .min(read_limits.max_stored_frame_bytes),
+                    )
+                    .ok(),
+            });
+        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
+            dict_files.push(container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        }
+    }
+    let fold = Fold::open_read_from_with_limits(
+        segs,
+        dict_files,
+        cfg,
+        path,
+        &manifest.punched,
+        read_limits,
+    )?;
+
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    for p in &manifest.parts {
+        let ext = container.extent(&p.file).ok_or_else(|| {
+            anyhow::anyhow!(
+                "container manifest names {} but the container does not hold it",
+                p.file
+            )
+        })?;
+        parts.push(Arc::new(Part::open_reader_with_limits(
+            Box::new(ext),
+            pcache.clone(),
+            read_limits,
+        )?));
+    }
+    Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
+}
+
+/// Checkpoint a store directory into a container, creating it or growing one that exists.
+///
+/// This is the directory→file transition, and it is incremental by construction: parts and rolled
+/// fold segments are immutable and uniquely named, so a member already present under the same name
+/// and length is skipped rather than rewritten. Only `MANIFEST` and the live segment are restaged
+/// every time.
+///
+/// The source must be quiescent — a non-empty WAL means writes exist that no manifest names yet,
+/// exactly the condition [`crate::pack::write`] refuses for the same reason.
+pub fn checkpoint_into_container(dir: &Path, out: &Path) -> Result<CheckpointStats> {
+    let wal = dir.join("WAL");
+    if wal.metadata().map(|m| m.len()).unwrap_or(0) != 0 {
+        bail!("checkpoint refuses a store with a non-empty WAL: settle it with sync and flush");
+    }
+    let manifest = Manifest::load_with_limits(dir, ReadLimits::default())?;
+    let mut container = if out.exists() {
+        crate::container::Container::open(out)?
+    } else {
+        crate::container::Container::create(out)?
+    };
+
+    let mut names: Vec<String> = vec!["MANIFEST".to_string()];
+    for p in &manifest.parts {
+        names.push(p.file.clone());
+    }
+    let fold_rel = if manifest.fold_gen == 0 {
+        "fold".to_string()
+    } else {
+        format!("fold-{:04}", manifest.fold_gen)
+    };
+    let fold_path = refold::fold_dir(dir, manifest.fold_gen);
+    let mut fold_names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&fold_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let keep = name.ends_with(".fold")
+                || name.ends_with(".dir")
+                || (name.starts_with("zdict-") && name.ends_with(".zd"));
+            if keep {
+                fold_names.push(format!("{fold_rel}/{name}"));
+            }
+        }
+    }
+    fold_names.sort();
+    names.extend(fold_names);
+
+    let mut ingested = 0u64;
+    let mut skipped = 0usize;
+    for name in &names {
+        let src = dir.join(name);
+        let src_len = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        // MANIFEST and the live segment change in place; an immutable member of the same length is
+        // already the same bytes, because parts and rolled segments are never rewritten.
+        let immutable = name != "MANIFEST" && !name.ends_with(".dir");
+        if immutable {
+            if let Some(existing) = container.extent(name) {
+                if crate::readat::ReadAt::len(&existing)? == src_len {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+        ingested += container.ingest(name, &src)?;
+    }
+    let seq = container.commit()?;
+    Ok(CheckpointStats {
+        members: container.len(),
+        ingested_bytes: ingested,
+        skipped_members: skipped,
+        commit_seq: seq,
+        free_bytes: container.free_bytes(),
+    })
+}
+
+/// What one [`checkpoint_into_container`] moved.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointStats {
+    /// Members the container holds after the checkpoint.
+    pub members: usize,
+    /// Bytes written into the container by this call.
+    pub ingested_bytes: u64,
+    /// Members already present byte-for-byte and therefore not rewritten.
+    pub skipped_members: usize,
+    /// The container's committed sequence after this call.
+    pub commit_seq: u64,
+    /// Bytes now superseded inside the container, reclaimable only by rewriting it.
+    pub free_bytes: u64,
+}
+
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
     let p = retained_path(dir, commit);
     let b = read_manifest_file(&p).with_context(|| {
