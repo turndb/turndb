@@ -7,7 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
-  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest, retainedCommits,
+  capabilities, checkpointIntoContainer, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest,
+  retainedCommits, singleFileKind,
   restoreBackup, TurnDbError,
 } = require('..');
 
@@ -1417,4 +1418,70 @@ test('discovers typed field and content namespaces without reading values', asyn
     contents: ['request'],
     mayIncludeShadowedFields: true,
   });
+});
+
+test('serves a store held in one file, produced and read entirely from Node', async (t) => {
+  const dir = temporaryStore(t);
+  const store = await NativeStore.open(dir);
+  const body = Buffer.from(JSON.stringify([{ role: 'user', content: 'single file' }]));
+  await store.write(
+    [
+      {
+        kind: 'put',
+        id: 'trace/0001#input',
+        contents: [{ name: 'body', bytes: body }],
+        attrs: [{ name: 'model', kind: 'string', stringValue: 'm0' }],
+      },
+    ],
+    true,
+  );
+  await store.flush();
+
+  assert.equal(singleFileKind(dir), null, 'a directory carries neither magic');
+
+  const pack = path.join(os.tmpdir(), `${path.basename(dir)}.pack`);
+  t.after(() => fs.rmSync(pack, { force: true }));
+  await store.backup(pack);
+  await store.close(false);
+
+  const container = path.join(os.tmpdir(), `${path.basename(dir)}.turndb`);
+  t.after(() => fs.rmSync(container, { force: true }));
+  const first = await checkpointIntoContainer(dir, container);
+  assert.ok(first.members >= 3, 'manifest, part, and segment at least');
+  assert.equal(first.commitSeq, 1n);
+  assert.equal(first.skippedMembers, 0);
+  assert.equal(singleFileKind(container), 'container');
+  assert.equal(singleFileKind(pack), 'pack');
+
+  // Both single-file forms answer exactly as the directory does, byte for byte.
+  const fromDir = await NativeSnapshot.open(dir);
+  const want = await fromDir.scan();
+  for (const [label, file] of [['container', container], ['pack', pack]]) {
+    const snapshot = await NativeSnapshot.openFile(file);
+    const got = await snapshot.scan();
+    assert.deepEqual(
+      got.rows.map((row) => row.id),
+      want.rows.map((row) => row.id),
+      `${label} must page the same ids`,
+    );
+    assert.deepEqual(
+      await snapshot.readContent('trace/0001#input', 'body'),
+      body,
+      `${label} must reconstruct byte-exact`,
+    );
+    await snapshot.close();
+  }
+  await fromDir.close();
+
+  // A second checkpoint with no writes between re-ingests strictly less.
+  const second = await checkpointIntoContainer(dir, container);
+  assert.equal(second.commitSeq, 2n);
+  assert.ok(second.skippedMembers > 0, 'immutable members skip');
+  assert.ok(second.ingestedBytes < first.ingestedBytes);
+
+  await assert.rejects(
+    NativeSnapshot.openFile(path.join(dir, 'MANIFEST')),
+    (error) => error instanceof TurnDbError,
+    'a file carrying neither magic must refuse',
+  );
 });

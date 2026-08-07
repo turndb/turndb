@@ -150,7 +150,7 @@ function guardFactories(Class) {
   // Instances created by the native factories still satisfy `instanceof` against the public
   // facade because both use the same native prototype.
   NativeFacade.prototype = Class.prototype;
-  for (const name of ['open', 'openAt']) {
+  for (const name of ['open', 'openFile', 'openAt']) {
     if (typeof Class[name] === 'function') NativeFacade[name] = guarded(Class[name].bind(Class));
   }
   return NativeFacade;
@@ -162,6 +162,7 @@ module.exports = {
   NativeSnapshot: guardFactories(native.NativeSnapshot),
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
+  checkpointIntoContainer: guarded(native.checkpointIntoContainer, 'checkpointIntoContainer'),
   restoreBackup: guarded(native.restoreBackup, 'restoreBackup'),
   recoverManifest: guarded(native.recoverManifest, 'recoverManifest'),
   TurnDbError,

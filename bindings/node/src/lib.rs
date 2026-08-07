@@ -1134,6 +1134,51 @@ impl NativeSnapshot {
         }
     }
 
+    /// Open a snapshot over a store held in ONE FILE — a sealed pack or a growable container.
+    ///
+    /// Which of the two it is comes from the file's magic, not its extension, and both answer
+    /// reads identically: same manifest, same parts, same fold, same SQL. There is no writer role
+    /// to take and no WAL to replay, so unlike a directory open this cannot contend with a writer.
+    #[napi(factory)]
+    pub async fn open_file(
+        path: String,
+        options: Option<NativeSnapshotOpenOptions>,
+    ) -> Result<NativeSnapshot> {
+        if path.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
+        }
+        let read_limits = decode_read_limits(
+            options.as_ref().and_then(|value| value.max_stored_frame_bytes.clone()),
+            options.as_ref().and_then(|value| value.max_decoded_frame_bytes.clone()),
+            options.as_ref().and_then(|value| value.max_directory_entries.clone()),
+            options.as_ref().and_then(|value| value.max_wal_frames.clone()),
+            options.as_ref().and_then(|value| value.max_fold_blocks.clone()),
+        )?;
+        #[cfg(feature = "sql")]
+        let budget = decode_sql_budget(
+            options.as_ref().and_then(|value| value.max_concurrent_sql_memory_bytes.clone()),
+        )?;
+        let store = napi::tokio::task::spawn_blocking(move || {
+            turndb::store::open_read_file_with_limits(
+                &PathBuf::from(path),
+                FoldCfg::default(),
+                read_limits,
+            )
+        })
+        .await
+        .map_err(|error| failure("join TurnDB single-file snapshot open", error))?
+        .map_err(|error| engine_failure("open TurnDB single-file snapshot", error))?;
+        #[cfg(feature = "sql")]
+        {
+            Ok(NativeSnapshot::from_store(store, budget))
+        }
+        #[cfg(not(feature = "sql"))]
+        {
+            let _ = options;
+            Ok(NativeSnapshot::from_store(store))
+        }
+    }
+
     /// Open one retained manifest commit. Retention is bounded and erasure can purge history.
     #[napi(factory)]
     pub async fn open_at(
@@ -1271,6 +1316,67 @@ impl NativeSnapshot {
     #[napi]
     pub async fn close(&self) -> Result<()> {
         self.state.close()
+    }
+}
+
+/// What one [`checkpoint_into_container`] moved.
+#[napi(object)]
+pub struct NativeCheckpointResult {
+    /// Members the container holds after the checkpoint.
+    pub members: u32,
+    /// Bytes written into the container by this call.
+    pub ingested_bytes: BigInt,
+    /// Members already present byte-for-byte and therefore not rewritten.
+    pub skipped_members: u32,
+    /// The container's committed sequence after this call.
+    pub commit_seq: BigInt,
+    /// Bytes now superseded inside the container, reclaimable only by rewriting it.
+    pub free_bytes: BigInt,
+}
+
+/// Checkpoint a store directory into a growable single file, creating it or growing one in place.
+///
+/// Incremental by construction: parts and rolled fold segments are immutable and uniquely named,
+/// so a member already present under the same name and length is skipped rather than rewritten.
+/// The source must be quiescent — settle it with `sync` and `flush` first — for the same reason a
+/// backup refuses a store with a live WAL.
+#[napi]
+pub async fn checkpoint_into_container(
+    directory_path: String,
+    container_path: String,
+) -> Result<NativeCheckpointResult> {
+    if directory_path.is_empty() || container_path.is_empty() {
+        return Err(Error::new(Status::InvalidArg, "store and container paths must not be empty"));
+    }
+    let stats = napi::tokio::task::spawn_blocking(move || {
+        turndb::store::checkpoint_into_container(
+            &PathBuf::from(directory_path),
+            &PathBuf::from(container_path),
+        )
+    })
+    .await
+    .map_err(|error| failure("join TurnDB checkpoint", error))?
+    .map_err(|error| engine_failure("checkpoint TurnDB store into a container", error))?;
+    Ok(NativeCheckpointResult {
+        members: stats.members as u32,
+        ingested_bytes: BigInt::from(stats.ingested_bytes),
+        skipped_members: stats.skipped_members as u32,
+        commit_seq: BigInt::from(stats.commit_seq),
+        free_bytes: BigInt::from(stats.free_bytes),
+    })
+}
+
+/// Which single-file form a path holds: `"pack"` if sealed, `"container"` if it can still grow,
+/// `null` for a directory or anything carrying neither magic.
+///
+/// Reading does not need this — [`NativeSnapshot::open_file`] dispatches on its own. It is here
+/// for tooling that must know whether a file can be appended to before it plans to.
+#[napi]
+pub fn single_file_kind(path: String) -> Option<String> {
+    match turndb::store::single_file_kind(&PathBuf::from(path)) {
+        Some(turndb::store::SingleFileKind::Pack) => Some("pack".to_string()),
+        Some(turndb::store::SingleFileKind::Container) => Some("container".to_string()),
+        None => None,
     }
 }
 
