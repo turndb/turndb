@@ -624,6 +624,41 @@ export declare class Store {
  */
 export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
 
+/** Read admission for a single-file open; the write-side limits do not apply to a reader. */
+export type OpenFileOptions = Pick<
+  OpenOptions,
+  | 'maxStoredFrameBytes'
+  | 'maxDecodedFrameBytes'
+  | 'maxDirectoryEntries'
+  | 'maxWalFrames'
+  | 'maxFoldBlocks'
+>;
+
+/**
+ * Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+ *
+ * Which form it is comes from the file's magic, not its extension, and both answer reads
+ * identically. Neither has a writer role to take, so this open cannot contend with anything and
+ * needs no WAL replay; in exchange the returned handle **refuses every mutating method**
+ * (`putBody`, `applyBatch`, `write`, `delete`, `sync`, `flush`, compaction, erasure) with a
+ * `TurndbError` naming the handle as read-only.
+ *
+ * Reads available: {@link Store.get}, {@link Store.getText}, {@link Store.getRecord},
+ * {@link Store.scan}, {@link Store.scanIds}, {@link Store.stats}.
+ *
+ * WASI preopens directories rather than files, so the file's parent is the capability the guest is
+ * granted and the file is addressed by name inside it.
+ */
+export declare function openFile(file: string, opts?: OpenFileOptions): Promise<Store>;
+
+/**
+ * Which single-file form a path holds, or `null` for a directory or a file carrying neither magic.
+ *
+ * Reading does not need this — {@link openFile} dispatches on its own — but tooling that must know
+ * whether a file can still be appended to before it plans to does.
+ */
+export declare function singleFileKind(file: string): Promise<'pack' | 'container' | null>;
+
 /**
  * The first id that cannot start with `prefix`, or `null` when the range is unbounded above.
  *

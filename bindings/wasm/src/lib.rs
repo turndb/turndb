@@ -49,13 +49,74 @@ use turndb::read_limits::ReadLimits;
 use turndb::scan::{
     Compare, ContentMode, ContentSelect, Direction, Predicate, ScanPage, ScanRequest,
 };
-use turndb::store::{Batch, ContentSpans, Store, StoreOptions, WriteLimits};
+use turndb::store::{Batch, ContentSpans, ReadStore, Store, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
+
+/// What a handle addresses.
+///
+/// A directory open takes the writer role and can mutate; a single-file open — pack or container —
+/// is a reader and never can, because neither form has a writer role to take. Both answer the read
+/// surface identically, so the read entry points accept either and the mutating ones refuse a
+/// reader by name rather than by a confusing failure further down.
+enum Handle {
+    Writer(Box<Store>),
+    Reader(Box<ReadStore>),
+}
+
+impl Handle {
+    fn get(&self, id: &str) -> anyhow::Result<Option<turndb::types::Record>> {
+        match self {
+            Handle::Writer(s) => s.get(id),
+            Handle::Reader(s) => s.get(id),
+        }
+    }
+
+    fn reconstruct(&self, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        match self {
+            Handle::Writer(s) => s.reconstruct(id),
+            Handle::Reader(s) => s.reconstruct(id),
+        }
+    }
+
+    fn ids(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            Handle::Writer(s) => s.ids(),
+            Handle::Reader(s) => s.ids(),
+        }
+    }
+
+    fn scan(&self, request: &ScanRequest) -> anyhow::Result<ScanPage> {
+        match self {
+            Handle::Writer(s) => s.scan(request),
+            Handle::Reader(s) => s.scan(request),
+        }
+    }
+
+    fn scan_ids(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        match self {
+            Handle::Writer(s) => s.scan_ids(from, to, limit, reverse),
+            Handle::Reader(s) => s.scan_ids(from, to, limit, reverse),
+        }
+    }
+
+    fn part_count(&self) -> usize {
+        match self {
+            Handle::Writer(s) => s.part_count(),
+            Handle::Reader(s) => s.part_count(),
+        }
+    }
+}
 
 thread_local! {
     /// Open stores by handle. A slot is `None` once closed, so a stale handle errors rather than
     /// addressing whatever was opened next.
-    static STORES: RefCell<Vec<Option<Store>>> = const { RefCell::new(Vec::new()) };
+    static STORES: RefCell<Vec<Option<Handle>>> = const { RefCell::new(Vec::new()) };
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ERR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static ERR_CODE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -171,11 +232,28 @@ unsafe fn text<'a>(ptr: *const u8, len: u32) -> Result<&'a str, std::str::Utf8Er
     std::str::from_utf8(slice(ptr, len))
 }
 
+/// Resolve a handle that must be able to MUTATE. A single-file handle is refused here by name: a
+/// pack is immutable by definition and a container is opened read-only by this binding, so every
+/// write verb needs the directory form.
 fn with_store<T>(h: i32, f: impl FnOnce(&mut Store) -> Result<T, i32>) -> Result<T, i32> {
     STORES.with(|s| {
         let mut s = s.borrow_mut();
         match usize::try_from(h).ok().and_then(|i| s.get_mut(i)).and_then(|slot| slot.as_mut()) {
-            Some(store) => f(store),
+            Some(Handle::Writer(store)) => f(store),
+            Some(Handle::Reader(_)) => {
+                Err(fail(format!("store handle {h} is a read-only single-file store")))
+            }
+            None => Err(fail(format!("store handle {h} is not open"))),
+        }
+    })
+}
+
+/// Resolve a handle for a READ. Either form answers, because the read surface is identical.
+fn with_handle<T>(h: i32, f: impl FnOnce(&Handle) -> Result<T, i32>) -> Result<T, i32> {
+    STORES.with(|s| {
+        let s = s.borrow();
+        match usize::try_from(h).ok().and_then(|i| s.get(i)).and_then(|slot| slot.as_ref()) {
+            Some(handle) => f(handle),
             None => Err(fail(format!("store handle {h} is not open"))),
         }
     })
@@ -529,11 +607,105 @@ pub unsafe extern "C" fn tdb_open_v3(
                 slot.push(None);
                 slot.len() - 1
             });
-            slot[idx] = Some(s);
+            slot[idx] = Some(Handle::Writer(Box::new(s)));
             idx as i32
         }),
         Err(e) => fail_engine(e),
     }
+}
+
+/// Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+///
+/// Which form it is comes from the file's magic, not its extension. Neither has a writer role to
+/// take, so this is the one open in this binding that cannot contend with anything, and every
+/// mutating verb refuses the handle it returns.
+///
+/// The whole file is addressed by range, so a host that can serve positioned reads over a blob —
+/// which is what `File.slice()` is — can serve one of these.
+///
+/// # Safety
+///
+/// `path` must point to `path_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_open_file(
+    path: *const u8,
+    path_len: u32,
+    max_stored_frame_bytes: u32,
+    max_decoded_frame_bytes: u32,
+    max_directory_entries: u32,
+    max_wal_frames: u32,
+    max_fold_blocks: u32,
+) -> i32 {
+    clear_err();
+    let path = match text(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return fail_invalid(format!("store path is not UTF-8: {e}")),
+    };
+    let d = ReadLimits::default();
+    let read_limits = ReadLimits {
+        max_stored_frame_bytes: if max_stored_frame_bytes == 0 {
+            d.max_stored_frame_bytes
+        } else {
+            u64::from(max_stored_frame_bytes)
+        },
+        max_decoded_frame_bytes: if max_decoded_frame_bytes == 0 {
+            d.max_decoded_frame_bytes
+        } else {
+            u64::from(max_decoded_frame_bytes)
+        },
+        max_directory_entries: if max_directory_entries == 0 {
+            d.max_directory_entries
+        } else {
+            u64::from(max_directory_entries)
+        },
+        max_wal_frames: if max_wal_frames == 0 {
+            d.max_wal_frames
+        } else {
+            u64::from(max_wal_frames)
+        },
+        max_fold_blocks: if max_fold_blocks == 0 {
+            d.max_fold_blocks
+        } else {
+            u64::from(max_fold_blocks)
+        },
+    };
+    match turndb::store::open_read_file_with_limits(
+        Path::new(path),
+        FoldCfg::default(),
+        read_limits,
+    ) {
+        Ok(s) => STORES.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let idx = slot.iter().position(|x| x.is_none()).unwrap_or_else(|| {
+                slot.push(None);
+                slot.len() - 1
+            });
+            slot[idx] = Some(Handle::Reader(Box::new(s)));
+            idx as i32
+        }),
+        Err(e) => fail_engine(e),
+    }
+}
+
+/// Whether a path holds a single-file store, as JSON: `"pack"`, `"container"`, or `null`.
+///
+/// # Safety
+///
+/// `path` must point to `path_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tdb_single_file_kind(path: *const u8, path_len: u32) -> i32 {
+    clear_err();
+    let path = match text(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return fail_invalid(format!("store path is not UTF-8: {e}")),
+    };
+    let kind = match turndb::store::single_file_kind(Path::new(path)) {
+        Some(turndb::store::SingleFileKind::Pack) => serde_json::Value::from("pack"),
+        Some(turndb::store::SingleFileKind::Container) => serde_json::Value::from("container"),
+        None => serde_json::Value::Null,
+    };
+    set_out(kind.to_string().as_bytes());
+    0
 }
 
 /// Close a store, dropping the handle. Flushes nothing — call [`tdb_sync`] first if the writes
@@ -896,7 +1068,7 @@ pub unsafe extern "C" fn tdb_reconstruct(h: i32, id: *const u8, id_len: u32) -> 
         Ok(v) => v,
         Err(e) => return fail_invalid(format!("id is not UTF-8: {e}")),
     };
-    match with_store(h, |s| s.reconstruct(id).map_err(fail_engine)) {
+    match with_handle(h, |s| s.reconstruct(id).map_err(fail_engine)) {
         Ok(Some(b)) => {
             set_out(&b);
             1
@@ -921,7 +1093,7 @@ pub unsafe extern "C" fn tdb_get_record(h: i32, id: *const u8, id_len: u32) -> i
         Ok(v) => v,
         Err(e) => return fail_invalid(format!("id is not UTF-8: {e}")),
     };
-    let found = match with_store(h, |s| {
+    let found = match with_handle(h, |s| {
         let rec = s.get(id_s).map_err(fail_engine)?;
         let body = s.reconstruct(id_s).map_err(fail_engine)?;
         Ok((rec, body))
@@ -975,7 +1147,7 @@ pub unsafe extern "C" fn tdb_scan_ids(
     };
     let f = (!from.is_empty()).then_some(from);
     let t = (!to.is_empty()).then_some(to);
-    match with_store(h, |s| s.scan_ids(f, t, limit as usize, reverse != 0).map_err(fail_engine)) {
+    match with_handle(h, |s| s.scan_ids(f, t, limit as usize, reverse != 0).map_err(fail_engine)) {
         Ok(ids) => {
             set_out(serde_json::Value::from(ids).to_string().as_bytes());
             0
@@ -1302,7 +1474,7 @@ pub unsafe extern "C" fn tdb_scan(h: i32, json: *const u8, json_len: u32) -> i32
         Ok(v) => v,
         Err(e) => return fail_invalid(e),
     };
-    match with_store(h, |s| s.scan(&req).map_err(fail_engine)) {
+    match with_handle(h, |s| s.scan(&req).map_err(fail_engine)) {
         Ok(page) => {
             set_out(encode_scan_page(&page).to_string().as_bytes());
             0
@@ -1315,9 +1487,9 @@ pub unsafe extern "C" fn tdb_scan(h: i32, json: *const u8, json_len: u32) -> i32
 #[no_mangle]
 pub extern "C" fn tdb_stats(h: i32) -> i32 {
     clear_err();
-    match with_store(h, |s| {
+    match with_handle(h, |s| {
         let ids = s.ids().map_err(fail_engine)?;
-        Ok(serde_json::json!({ "records": ids.len(), "parts": s.parts().len() }))
+        Ok(serde_json::json!({ "records": ids.len(), "parts": s.part_count() }))
     }) {
         Ok(v) => {
             set_out(v.to_string().as_bytes());
@@ -1644,6 +1816,9 @@ pub unsafe extern "C" fn tdb_erase_ids(h: i32, json: *const u8, json_len: u32) -
     }
 }
 
+/// # Safety
+///
+/// `json` must point to `json_len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn tdb_erase_ids_with_timeout(
     h: i32,

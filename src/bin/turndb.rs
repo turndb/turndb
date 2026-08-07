@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
-use turndb::store::{ReadStore, Store};
+use turndb::store::{ReadStore, SingleFileKind, Store};
 
 const USAGE: &str = "\
 turndb — content-addressed columnar store for AI traces
@@ -65,9 +65,8 @@ fn main() {
     }
 }
 
-/// A store is a directory; a single file is a pack or a container. The two file forms are told
-/// apart by their magic rather than by extension, because the extension is the user's to choose
-/// and the magic is the format's.
+/// A store is a directory; a single file is a pack or a container. The discrimination is the
+/// library's — [`turndb::store::single_file_kind`] — so the CLI and both bindings agree.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Source {
     Directory,
@@ -76,17 +75,14 @@ enum Source {
 }
 
 fn classify(path: &Path) -> Source {
-    if !path.is_file() {
-        return Source::Directory;
+    match turndb::store::single_file_kind(path) {
+        Some(SingleFileKind::Container) => Source::Container,
+        Some(SingleFileKind::Pack) => Source::Pack,
+        // A regular file with no recognised magic is still reported as a pack so the pack opener
+        // produces its own specific refusal rather than a vaguer one from here.
+        None if path.is_file() => Source::Pack,
+        None => Source::Directory,
     }
-    let mut head = [0u8; 8];
-    if let Ok(f) = std::fs::File::open(path) {
-        use std::io::Read;
-        if (&f).take(8).read_exact(&mut head).is_ok() && &head == turndb::container::MAGIC {
-            return Source::Container;
-        }
-    }
-    Source::Pack
 }
 
 /// Reads one named member out of whichever single-file form the path turned out to be.

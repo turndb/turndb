@@ -35,7 +35,7 @@
 import { WASI } from 'node:wasi';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 const WASM_PATH = join(dirname(fileURLToPath(import.meta.url)), 'turndb.wasm');
 
@@ -1225,4 +1225,99 @@ export async function open(dir, opts = {}) {
   });
 }
 
-export default { open, capabilities, compiledCapabilities, Store, TurndbError };
+/**
+ * Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+ *
+ * Which form it is comes from the file's magic, not its extension, and both answer reads
+ * identically. Neither has a writer role to take, so this open cannot contend with anything; the
+ * returned handle refuses every mutating method.
+ *
+ * WASI preopens directories, not files, so the file's parent is what the guest is given and the
+ * file is named inside it.
+ */
+export async function openFile(file, opts = {}) {
+  const maxStoredFrameBytes = openLimit(opts.maxStoredFrameBytes, 'maxStoredFrameBytes');
+  const maxDecodedFrameBytes = openLimit(opts.maxDecodedFrameBytes, 'maxDecodedFrameBytes');
+  const maxDirectoryEntries = openLimit(opts.maxDirectoryEntries, 'maxDirectoryEntries');
+  const maxWalFrames = openLimit(opts.maxWalFrames, 'maxWalFrames');
+  const maxFoldBlocks = openLimit(opts.maxFoldBlocks, 'maxFoldBlocks');
+  const hostFile = resolve(file);
+  const hostDir = dirname(hostFile);
+  const runtime = await acquireRuntime(hostDir);
+  const { instance } = runtime;
+
+  const enc = new TextEncoder();
+  const path = enc.encode(`${GUEST_ROOT}/${basename(hostFile)}`);
+  let handle;
+  try {
+    const ptr = instance.exports.tdb_alloc(path.length);
+    new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
+    try {
+      handle = instance.exports.tdb_open_file(
+        ptr,
+        path.length,
+        maxStoredFrameBytes,
+        maxDecodedFrameBytes,
+        maxDirectoryEntries,
+        maxWalFrames,
+        maxFoldBlocks,
+      );
+    } finally {
+      instance.exports.tdb_free(ptr, path.length);
+    }
+    if (handle < 0) {
+      const ep = instance.exports.tdb_err_ptr();
+      const el = instance.exports.tdb_err_len();
+      const msg = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer).subarray(ep, ep + el));
+      const cp = instance.exports.tdb_err_code_ptr();
+      const cl = instance.exports.tdb_err_code_len();
+      const code = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer, cp, cl));
+      throw new TurndbError(`opening ${hostFile}: ${msg}`, code || 'INTERNAL');
+    }
+  } catch (e) {
+    try {
+      releaseRuntime(runtime);
+    } catch (closeError) {
+      e.cause ??= closeError;
+    }
+    throw e;
+  }
+  const profile = readProfile(runtime, 'tdb_capabilities');
+  return new Store(runtime, handle, {
+    maxStoredFrameBytes: maxStoredFrameBytes || profile.max_stored_frame_bytes_default,
+    maxDecodedFrameBytes: maxDecodedFrameBytes || profile.max_decoded_frame_bytes_default,
+    maxDirectoryEntries: maxDirectoryEntries || profile.max_directory_entries_default,
+    maxWalFrames: maxWalFrames || profile.max_wal_frames_default,
+    maxFoldBlocks: maxFoldBlocks || profile.max_fold_blocks_default,
+  });
+}
+
+/**
+ * Which single-file form a path holds: `'pack'`, `'container'`, or `null` for a directory or a
+ * file carrying neither magic. Reading does not need this — {@link openFile} dispatches on its
+ * own — but tooling that must know whether a file can still be appended to does.
+ */
+export async function singleFileKind(file) {
+  const hostFile = resolve(file);
+  const runtime = await acquireRuntime(dirname(hostFile));
+  try {
+    const { instance } = runtime;
+    const enc = new TextEncoder();
+    const path = enc.encode(`${GUEST_ROOT}/${basename(hostFile)}`);
+    const ptr = instance.exports.tdb_alloc(path.length);
+    new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
+    try {
+      if (instance.exports.tdb_single_file_kind(ptr, path.length) < 0) return null;
+    } finally {
+      instance.exports.tdb_free(ptr, path.length);
+    }
+    const op = instance.exports.tdb_out_ptr();
+    const ol = instance.exports.tdb_out_len();
+    const out = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer, op, ol));
+    return JSON.parse(out);
+  } finally {
+    releaseRuntime(runtime);
+  }
+}
+
+export default { open, openFile, singleFileKind, capabilities, compiledCapabilities, Store, TurndbError };
