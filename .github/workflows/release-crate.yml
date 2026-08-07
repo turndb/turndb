@@ -67,6 +67,8 @@ jobs:
             | jq -r '.packages[] | select(.name=="turndb") | .version')"
           test -n "$manifest"
           test "$RELEASE_REF" = "v$manifest"
+      - name: install pinned license-report generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
       - name: verify the licence report is current
         run: bash scripts/check-third-party-licenses.sh
       # Build the actual artifact and report what is in it. `exclude` in Cargo.toml is a claim; this
