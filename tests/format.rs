@@ -270,7 +270,24 @@ fn merged_part_footer_distinguishes_seq_lo_from_seq_hi() {
     }
     s.merge_range(0, 3).unwrap().unwrap();
 
-    let b = part(&dir);
+    // The three merged-away originals remain on disk until the sweep, so the directory holds four
+    // `.part` files and `read_dir` order — filesystem-dependent — must not pick one. FORMAT.md
+    // names a merge output by its sequence RANGE (`part-<lo>-<hi>.part`, two dashes); select it
+    // by that documented name.
+    let b = std::fs::read(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(".part") && n.matches('-').count() == 2)
+                    .unwrap_or(false)
+            })
+            .expect("a merged part named by its sequence range"),
+    )
+    .unwrap();
     let f = b.len() - 56;
     assert_eq!(le64(&b, f + 28), 1, "seq_lo at footer+28 is the LOW end of the merged range");
     assert_eq!(le64(&b, f + 36), 3, "seq_hi at footer+36 is the HIGH end");
