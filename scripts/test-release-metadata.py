@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Positive and negative controls for the release metadata detector."""
 
+import json
 import pathlib
 import subprocess
 import tempfile
@@ -31,7 +32,12 @@ with tempfile.TemporaryDirectory() as temp:
     copy = pathlib.Path(temp) / "repo"
     subprocess.run(["cp", "-a", str(ROOT), str(copy)], check=True)
     manifest = copy / "npm/turndb/package.json"
-    manifest.write_text(manifest.read_text().replace('"version": "0.1.0"', '"version": "9.9.9"', 1))
+    # Derive the version to perturb rather than hardcoding one: a hardcoded string stops matching
+    # on the first release PR that bumps it, injects no drift, and fails the control spuriously.
+    current = json.loads(manifest.read_text())["version"]
+    manifest.write_text(
+        manifest.read_text().replace(f'"version": "{current}"', '"version": "9.9.9"', 1)
+    )
     result = run(copy)
     if result.returncode == 0 or "lockstep version mismatch" not in result.stderr:
         raise SystemExit(f"version-drift control did not discriminate:\n{result.stdout}{result.stderr}")
