@@ -39,10 +39,15 @@ for package_name_in_lock in stale_local_packages:
         check=True,
     )
 
-# npm owns the lock-file representation. Asking it to update only the lock avoids duplicating that
-# schema here while --ignore-scripts keeps a version bump from building or publishing anything.
-subprocess.run(
-    ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
-    cwd=ROOT / "bindings/node",
-    check=True,
-)
+# The lock file is edited directly rather than through `npm install --package-lock-only`: npm
+# regenerates the lock by resolving against the registry, and the platform package's new version
+# is unpublished at prepare time — this release is what publishes it — so npm silently drops the
+# unresolvable optional dependency's entry and `npm ci` then refuses the lock as out of sync.
+# Only the three version fields change; every other byte of the lock, including the platform
+# package's version-less `"optional": true` entry, is preserved.
+lock_path = ROOT / "bindings/node/package-lock.json"
+npm_lock = json.loads(lock_path.read_text())
+npm_lock["version"] = VERSION
+npm_lock["packages"][""]["version"] = VERSION
+npm_lock["packages"][""]["optionalDependencies"][package_name] = VERSION
+lock_path.write_text(json.dumps(npm_lock, indent=2) + "\n")
