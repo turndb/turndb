@@ -20,9 +20,15 @@ jobs:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
       - name: verify lockstep release metadata
         run: python3 scripts/check-release-metadata.py
+      # The extraction is captured and tested rather than inlined into echo: a jq failure inside a
+      # command substitution leaves echo's exit code green, and the empty ref then fails the NEXT
+      # step — which is exactly how the first live run of this workflow died.
       - id: version
         name: read declared release version
-        run: echo "release_ref=v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name==\"turndb\") | .version')" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "turndb") | .version')"
+          test -n "$version"
+          echo "release_ref=v${version}" >> "$GITHUB_OUTPUT"
       - name: configure annotated tagger
         run: |
           git config user.name 'turndb-release'
