@@ -51,3 +51,18 @@ npm_lock["version"] = VERSION
 npm_lock["packages"][""]["version"] = VERSION
 npm_lock["packages"][""]["optionalDependencies"][package_name] = VERSION
 lock_path.write_text(json.dumps(npm_lock, indent=2) + "\n")
+
+# THIRD_PARTY_LICENSES.html lists the workspace's own crates with their versions, so a version
+# bump stales the committed report even though no license changed. Rewrite exactly those entries;
+# CI remains the arbiter — check-third-party-licenses.sh regenerates the report from scratch and
+# byte-compares, so a wrong substitution fails the release PR rather than shipping.
+report_path = ROOT / "THIRD_PARTY_LICENSES.html"
+report = report_path.read_text()
+workspace_names = {package["name"] for package in lock.get("package", []) if "source" not in package}
+for name in sorted(workspace_names):
+    report = re.sub(
+        rf"(>{re.escape(name)} )\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(</a>)",
+        rf"\g<1>{VERSION}\g<2>",
+        report,
+    )
+report_path.write_text(report)
