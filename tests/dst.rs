@@ -1312,3 +1312,119 @@ fn every_container_checkpoint_crash_lands_on_one_committed_state() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&stage).ok();
 }
+
+/// The lifecycle around a container, which is where its ordering claims actually live.
+///
+/// The commit sweep above covers publishing one state inside the file. This covers the cycle a
+/// writer performs on it: materialize a working directory, write, settle, ingest what changed, and
+/// remove the directory. Two of those steps are orderings that reasoning gets wrong quietly —
+/// removing the working directory before the checkpoint is durable loses acknowledged writes, and
+/// adopting a partially materialized directory serves a store that was never committed.
+///
+/// The contract is the main workload sweep's, unchanged: every write whose `sync()` returned
+/// before the crash is present afterwards and byte-exact. Recovery is `ContainerStore::open`,
+/// which is the code under test — it decides between adopting the directory it finds and rebuilding
+/// from the file.
+///
+/// This one needed no mutation check to show it bites: it failed on its first run, at crash point
+/// 15 under `DurableOnly`, with a record that predated the session gone. Materialization fsynced
+/// each member's CONTENT and never the staging directory, so the member dirents stayed volatile
+/// while the rename made the working directory's own name durable — publishing a directory that
+/// looked complete, was adopted on the next open, and was missing files. Content durability is not
+/// name durability, and a working directory is worse than a missing one precisely because it is
+/// trusted.
+#[test]
+fn every_container_session_crash_keeps_every_acknowledged_write() {
+    use turndb::store::ContainerStore;
+
+    let root = tmp("container-session");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+
+    // A committed container to start from, so the sweep exercises materialize-and-adopt rather
+    // than first creation.
+    let mut before = BTreeMap::new();
+    {
+        let mut cs = ContainerStore::open(&file, cfg).unwrap();
+        for i in 0..5 {
+            let id = format!("before:{i}");
+            let body = body_for(700 + i);
+            cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            before.insert(id, body);
+        }
+        cs.close().unwrap();
+    }
+    assert!(!hot_of(&file).exists(), "a clean close leaves only the file");
+
+    // The session under test: open, write, acknowledge, close. Everything acked here must survive
+    // a crash at any point in it.
+    let mut acked = before.clone();
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut cs = ContainerStore::open(&file, cfg).unwrap();
+        for i in 0..4 {
+            let id = format!("acked:{i}");
+            let body = body_for(800 + i);
+            cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            acked.insert(id, body);
+        }
+        cs.store().sync().unwrap(); // the ACK point — everything above is durable from here
+        cs.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 20, "a session must exercise a real op stream, got {}", ops.len());
+
+    let stage = tmp("container-session-stage");
+    let checked =
+        replay_recorded("container-session", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() && !hot_of(&file).exists() {
+                return; // crashed before anything of this session reached the disk
+            }
+            // Recovery is the real open, adopt logic included. It must never refuse: every state
+            // reachable here is one this code is responsible for reading.
+            let mut cs = ContainerStore::open(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the session refused to reopen: {e:#}")
+            });
+
+            // Which writes are guaranteed depends on whether the acking write reached the disk,
+            // so the floor is the pre-session state and the ceiling is everything acked. What is
+            // NOT allowed is a record that is present but wrong.
+            let store = cs.store();
+            let mut found = 0usize;
+            for (id, body) in &acked {
+                match store.reconstruct(id).unwrap() {
+                    Some(got) => {
+                        assert_eq!(
+                            got, *body,
+                            "crash point {k} {variant:?}: {id} came back but drifted"
+                        );
+                        found += 1;
+                    }
+                    None => assert!(
+                        !before.contains_key(id),
+                        "crash point {k} {variant:?}: {id} predates this session and vanished"
+                    ),
+                }
+            }
+            assert!(
+                found >= before.len(),
+                "crash point {k} {variant:?}: recovered {found} records, fewer than the {} \
+                 committed before the session began",
+                before.len()
+            );
+        });
+    println!("dst container session: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The working directory beside a container, by the same rule the engine uses.
+fn hot_of(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_os_string();
+    name.push(turndb::container::HOT_SUFFIX);
+    PathBuf::from(name)
+}

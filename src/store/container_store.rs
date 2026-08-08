@@ -129,6 +129,14 @@ fn materialize(container: &Container, hot: &Path) -> Result<()> {
     // holds and has no ceiling of its own; reading one into a Vec to write it straight back out
     // would be an unbounded allocation on the most-travelled path in this module, in an engine
     // whose entire read side is admission-bounded precisely so that cannot happen.
+    // Every directory the members land in, so their NAMES can be made durable before the tree is
+    // published. Content fsyncs are not enough: a dirent is durable only at its parent's fsync,
+    // and publishing a directory whose name survives while its entries do not produces exactly the
+    // failure this guards — a working directory that looks complete, is adopted on the next open,
+    // and is missing files. `pack::extract_into` has always done this; this did not.
+    let mut dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    dirs.insert(staging.clone());
+
     let mut buf = vec![0u8; 1 << 20];
     for name in container.names().map(String::from).collect::<Vec<_>>() {
         let source = container
@@ -138,6 +146,17 @@ fn materialize(container: &Container, hot: &Path) -> Result<()> {
         let dst = staging.join(&name);
         if let Some(parent) = dst.parent() {
             crate::vfs::mkdir_all(parent)?;
+            let mut ancestor = Some(parent);
+            while let Some(d) = ancestor {
+                if !d.starts_with(&staging) {
+                    break;
+                }
+                dirs.insert(d.to_path_buf());
+                if d == staging {
+                    break;
+                }
+                ancestor = d.parent();
+            }
         }
         let f = crate::vfs::create(&dst)?;
         let mut at = 0u64;
@@ -151,6 +170,12 @@ fn materialize(container: &Container, hot: &Path) -> Result<()> {
     }
     if !staging.join("MANIFEST").exists() {
         bail!("container holds no MANIFEST, so it names no store to open");
+    }
+    // Children before parents: a parent's fsync does not promote a child directory's own entries.
+    let mut ordered: Vec<&PathBuf> = dirs.iter().collect();
+    ordered.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in ordered {
+        crate::vfs::sync_dir(d)?;
     }
     crate::vfs::rename_noreplace(&staging, hot)
         .with_context(|| format!("publish the working directory {}", hot.display()))?;
