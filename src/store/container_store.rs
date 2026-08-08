@@ -49,26 +49,7 @@ impl ContainerStore {
     /// Resuming an interrupted session is the default, not a repair: a hot directory that outlived
     /// its writer holds writes the container has not been told about, so it is adopted as-is.
     pub fn open(path: &Path, cfg: FoldCfg) -> Result<ContainerStore> {
-        let hot = hot_path(path);
-        let container_exists = path.exists();
-
-        if hot.exists() {
-            // Adopt it. Its state is at least as new as the container's, and re-materializing
-            // would overwrite acknowledged writes with an older committed snapshot.
-            if container_exists {
-                // Refuse the one case that is not a resume: a hot directory beside a container it
-                // did not come from is a name collision, and guessing which to keep loses data.
-                Container::open(path).with_context(|| {
-                    format!("{} has a hot directory but is not a container", path.display())
-                })?;
-            }
-        } else if container_exists {
-            let container = Container::open(path)?;
-            materialize(&container, &hot)?;
-        } else {
-            crate::vfs::mkdir_all(&hot)?;
-        }
-
+        let hot = prepare(path)?;
         let store = Store::open(&hot, cfg)
             .with_context(|| format!("open the working directory for {}", path.display()))?;
         Ok(ContainerStore { store: Some(store), container: path.to_path_buf(), hot })
@@ -101,13 +82,57 @@ impl ContainerStore {
     /// The directory is removed last: if anything before it fails, the working state is still
     /// there to open again.
     pub fn close(mut self) -> Result<CheckpointStats> {
-        let stats = self.checkpoint()?;
+        let store = self.store.as_mut().expect("open");
+        store.sync()?;
+        store.flush()?;
         // Drop the store first so the fold's writer lock is released before the tree goes.
         self.store = None;
-        crate::vfs::remove_tree(&self.hot)
-            .with_context(|| format!("remove the working directory {}", self.hot.display()))?;
-        Ok(stats)
+        settle(&self.container)
     }
+}
+
+/// Make a container ready to be written, and answer where its working state lives.
+///
+/// Split out from [`ContainerStore::open`] because a caller that manages its own [`Store`] — the
+/// native binding's actor, for one — still has to make the same decision, and there is exactly one
+/// safe answer to it. Reimplementing the adopt rule somewhere else is how a second implementation
+/// gets it backwards.
+///
+/// Pair with [`settle`] on the way out.
+pub fn prepare(container: &Path) -> Result<PathBuf> {
+    let hot = hot_path(container);
+    let exists = container.exists();
+
+    if hot.exists() {
+        // Adopt it. Its state is at least as new as the container's, and re-materializing would
+        // overwrite acknowledged writes with an older committed snapshot.
+        if exists {
+            // Refuse the one case that is not a resume: a working directory beside a container it
+            // did not come from is a name collision, and guessing which to keep loses data.
+            Container::open(container).with_context(|| {
+                format!("{} has a hot directory but is not a container", container.display())
+            })?;
+        }
+    } else if exists {
+        let open = Container::open(container)?;
+        materialize(&open, &hot)?;
+    } else {
+        crate::vfs::mkdir_all(&hot)?;
+    }
+    Ok(hot)
+}
+
+/// Fold a prepared working directory back into its container and remove it.
+///
+/// The caller must have settled its own writes first — this ingests what the directory has
+/// committed, and cannot see what a writer has not yet flushed. The directory goes last: if the
+/// checkpoint fails, the working state is still there to open again.
+pub fn settle(container: &Path) -> Result<CheckpointStats> {
+    let hot = hot_path(container);
+    let stats = checkpoint_into_container(&hot, container)?;
+    crate::vfs::remove_tree(&hot)
+        .with_context(|| format!("remove the working directory {}", hot.display()))?;
+    Ok(stats)
 }
 
 /// The working directory that belongs to a container.

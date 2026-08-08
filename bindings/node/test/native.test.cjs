@@ -1485,3 +1485,38 @@ test('serves a store held in one file, produced and read entirely from Node', as
     'a file carrying neither magic must refuse',
   );
 });
+
+test('writes a store held in one file, end to end from Node', async (t) => {
+  const dir = temporaryStore(t);
+  const file = path.join(dir, 'live.turndb');
+  const body = Buffer.from(JSON.stringify([{ role: 'user', content: 'written from node' }]));
+
+  // The file does not exist yet; opening for writing creates it.
+  const store = await NativeStore.openFile(file);
+  await store.write(
+    [{ kind: 'put', id: 'w/0001#input', contents: [{ name: 'body', bytes: body }] }],
+    true,
+  );
+  await store.close();
+
+  // The promise of the shape: after a clean close the file is the only artifact.
+  assert.equal(singleFileKind(file), 'container');
+  assert.equal(fs.existsSync(`${file}-hot`), false, 'a clean close removes the working directory');
+
+  const snapshot = await NativeSnapshot.openFile(file);
+  assert.deepEqual(await snapshot.readContent('w/0001#input', 'body'), body);
+  await snapshot.close();
+
+  // Reopening appends rather than replacing.
+  const again = await NativeStore.openFile(file);
+  await again.write(
+    [{ kind: 'put', id: 'w/0002#input', contents: [{ name: 'body', bytes: body }] }],
+    true,
+  );
+  await again.close();
+
+  const after = await NativeSnapshot.openFile(file);
+  const rows = await after.scan();
+  assert.deepEqual(rows.rows.map((r) => r.id).sort(), ['w/0001#input', 'w/0002#input']);
+  await after.close();
+});
