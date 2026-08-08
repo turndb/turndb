@@ -168,9 +168,18 @@ from a feature branch to test it — so the branch `ci-alert-drill` is permanent
 Push anything failing to it and read the issue that opens; push a fix and watch it close. That is
 how to confirm the alert works, and `main` is never involved.
 
-**Enforced at the merge button:** a ruleset on `main` requires a pull request with one approving
-review and a passing `gate` status check before merge. The `gate` job in `ci.yml` is that required
-check.
+**Enforced at the merge button:** a ruleset on `main`, and **the live ruleset is the authority on
+what it requires — this document does not restate it.** A restatement is one configuration change
+away from being wrong, and wrong in the direction nobody notices: it keeps describing a gate that
+was loosened. Ask the repository instead.
+
+```sh
+gh api repos/turndb/turndb/rules/branches/main
+```
+
+The one thing worth stating here, because it is a fact about this repository rather than about the
+ruleset: the required status check, whatever the ruleset names, is produced by the `gate` job in
+`ci.yml`.
 
 ## Changing the format
 
