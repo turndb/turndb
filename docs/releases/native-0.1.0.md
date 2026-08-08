@@ -16,7 +16,8 @@ API freeze.
 - Module systems: explicit CommonJS and ESM entry points, plus NodeNext-checked TypeScript declarations
 - Installation: prebuilt N-API 6 addon; no Rust compiler, postinstall build, or WASI fallback
 
-Both packages are private in source and ordinary packing remains private. The explicit release mode
+Both manifests carry npm's `"private": true` — the field that makes `npm publish` refuse — and
+ordinary packing preserves it. The explicit release mode
 creates publishable staging tarballs; the protected workflow install-tests their exact bytes on the
 declared matrix and publishes with npm provenance.
 See the [native prebuild and release contract](../native-prebuilds.md).

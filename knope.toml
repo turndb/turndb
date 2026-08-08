@@ -7,6 +7,8 @@ versioned_files = [
   "bindings/node/package.json",
   "bindings/node/npm/linux-x64-gnu/package.json",
   "npm/turndb/package.json",
+  "cli/package.json",
+  "cli/npm/linux-x64-gnu/package.json",
 ]
 changelog = "CHANGELOG.md"
 
