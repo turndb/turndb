@@ -314,3 +314,158 @@ fn store_open_never_panics_on_manifest_damage() {
     });
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The container's two hand-rolled parsers: the superblock decode and the varint directory walk.
+///
+/// Both were written for this format and neither had been fuzzed — the storm's own premise is that
+/// hand-rolled parsing over bytes from a broken disk is exactly where panics hide, and a directory
+/// walk that reads a length and then a slice is the shape that hides them best.
+#[test]
+fn container_parsers_never_panic_on_damage() {
+    let dir = tmp("container");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A container with several members, so the directory carries real entries to damage: a
+    // one-member container would never exercise the walk past its first iteration.
+    let source = dir.join("store");
+    let mut s = Store::open(&source, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+    for i in 0..12 {
+        let body = vec![b'a' + (i % 26) as u8; 900];
+        s.put(&format!("c:{i:02}"), &[Span::Piece(&body)], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let built = dir.join("built.turndb");
+    turndb::store::checkpoint_into_container(&source, &built).unwrap();
+    let pristine = std::fs::read(&built).unwrap();
+    assert!(pristine.len() > 8192, "the fixture must have members past the superblocks");
+
+    let target = dir.join("mutant.turndb");
+    storm("container", &pristine, &target, 6000, 0xC0117A, |p| {
+        let Ok(c) = turndb::container::Container::open(p) else { return };
+        // An open that survives a mutant must still fail closed on every other surface: a
+        // directory that parsed is not a directory that points anywhere real.
+        let _ = c.verify();
+        let _ = c.free_bytes();
+        let _ = c.member_bytes();
+        for name in c.names().map(String::from).collect::<Vec<_>>() {
+            let _ = c.read_file_bounded(&name, 1 << 20);
+            let _ = c.extent(&name);
+        }
+        // And the whole store on top of it, which is where a plausible-but-wrong directory does
+        // its damage: an extent that parses as a part but names the wrong bytes.
+        let Ok(rs) = turndb::store::open_read_container(p, FoldCfg::default()) else { return };
+        let _ = rs.ids();
+        for i in 0..12 {
+            let _ = rs.reconstruct(&format!("c:{i:02}"));
+        }
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The directory walk, reached through its checksum rather than around it.
+///
+/// The byte storm above cannot get here. Every route to this parser is gated: a flip in the
+/// superblock fails its BLAKE3, a flip in the directory payload fails its crc32, so the varint
+/// walk never sees damaged bytes and a missing bounds check inside it survives six thousand
+/// mutants untouched. That is defence in depth working exactly as intended and a blind spot in the
+/// test at the same time.
+///
+/// A checksum proves bytes did not drift; it proves nothing about what they mean. A writer bug, or
+/// anyone who can run this format's own encoder, produces a directory that passes every checksum
+/// and still claims a name longer than the payload or an extent past the end of the file. So this
+/// mutates the DECOMPRESSED payload and then repairs both checksums over it, which is the only way
+/// the walk is reachable at all.
+#[test]
+fn a_checksum_valid_directory_with_hostile_contents_is_refused_not_trusted() {
+    let dir = tmp("container-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let source = dir.join("store");
+    let mut s = Store::open(&source, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+    for i in 0..8 {
+        let body = vec![b'x'; 700];
+        s.put(&format!("d:{i:02}"), &[Span::Piece(&body)], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    drop(s);
+
+    let built = dir.join("built.turndb");
+    turndb::store::checkpoint_into_container(&source, &built).unwrap();
+    let pristine = std::fs::read(&built).unwrap();
+
+    // The live slot is the one with the higher sequence; both carry the magic.
+    let slot_len = turndb::container::SLOT_LEN as usize;
+    let seq_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap());
+    let live = if seq_at(&pristine, slot_len) > seq_at(&pristine, 0) { slot_len } else { 0 };
+    let get64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let get32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    let dir_off = get64(&pristine, live + 16) as usize;
+    let dir_stored = get32(&pristine, live + 24) as usize;
+    let dir_raw = get32(&pristine, live + 28);
+    let codec = pristine[live + 48];
+    let payload =
+        turndb::fold::codec::decode(codec, &pristine[dir_off..dir_off + dir_stored], dir_raw, None)
+            .unwrap();
+    assert!(payload.len() > 32, "the fixture directory must have entries to damage");
+
+    let target = dir.join("hostile.turndb");
+    let mut rng = Rng(0xD142EC);
+    let mut opened = 0usize;
+    for round in 0..4000 {
+        let mut mutated = payload.clone();
+        for _ in 0..rng.below(3) + 1 {
+            mutate(&mut mutated, &mut rng);
+        }
+        // Rebuild the container around the damaged payload, stored rather than compressed, with
+        // both checksums recomputed so nothing refuses it before the walk runs.
+        let mut file = pristine[..dir_off].to_vec();
+        let new_off = file.len() as u64;
+        file.extend_from_slice(&mutated);
+        let tail = file.len() as u64;
+
+        let mut slot = [0u8; 4096];
+        slot.copy_from_slice(&pristine[live..live + slot_len]);
+        slot[16..24].copy_from_slice(&new_off.to_le_bytes());
+        slot[24..28].copy_from_slice(&(mutated.len() as u32).to_le_bytes());
+        slot[28..32].copy_from_slice(&(mutated.len() as u32).to_le_bytes());
+        slot[36..40].copy_from_slice(&crc32fast::hash(&mutated).to_le_bytes());
+        slot[40..48].copy_from_slice(&tail.to_le_bytes());
+        slot[48] = 0; // stored
+        let digest = blake3::hash(&slot[0..52]);
+        slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
+
+        // Both slots carry it, so the reader cannot fall back to an undamaged older state.
+        file[0..slot_len].copy_from_slice(&slot);
+        file[slot_len..slot_len * 2].copy_from_slice(&slot);
+        std::fs::write(&target, &file).unwrap();
+
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let Ok(c) = turndb::container::Container::open(&target) else { return false };
+            let _ = c.verify();
+            for name in c.names().map(String::from).collect::<Vec<_>>() {
+                let _ = c.read_file_bounded(&name, 1 << 20);
+            }
+            let _ = turndb::store::open_read_container(&target, FoldCfg::default());
+            true
+        }));
+        let survived = match r {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "container directory: PANIC on a checksum-valid hostile directory (round {round}) \
+                 — a parser must refuse, not panic"
+            ),
+        };
+        if survived {
+            opened += 1;
+        }
+    }
+    // If nothing ever parsed, the harness is checking that the checksum works rather than that the
+    // walk does, and the next missing bounds check goes unnoticed exactly as the last one did.
+    assert!(opened > 0, "no mutated directory ever parsed: the walk is still not being reached");
+    println!("container directory: 4000 hostile directories, {opened} parsed and were survived");
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -128,14 +128,28 @@ fn materialize(container: &Container, hot: &Path) -> Result<()> {
     let _ = crate::vfs::remove_tree(&staging);
     crate::vfs::mkdir_all(&staging)?;
 
+    // Streamed in a fixed window rather than read whole. A part is the largest thing a store
+    // holds and has no ceiling of its own; reading one into a Vec to write it straight back out
+    // would be an unbounded allocation on the most-travelled path in this module, in an engine
+    // whose entire read side is admission-bounded precisely so that cannot happen.
+    let mut buf = vec![0u8; 1 << 20];
     for name in container.names().map(String::from).collect::<Vec<_>>() {
-        let bytes = container.read_file_bounded(&name, u64::MAX)?;
+        let source = container
+            .extent(&name)
+            .ok_or_else(|| anyhow::anyhow!("container lost member {name}"))?;
+        let len = crate::readat::ReadAt::len(&source)?;
         let dst = staging.join(&name);
         if let Some(parent) = dst.parent() {
             crate::vfs::mkdir_all(parent)?;
         }
         let f = crate::vfs::create(&dst)?;
-        crate::vfs::write_all_at(&f, &dst, &bytes, 0)?;
+        let mut at = 0u64;
+        while at < len {
+            let take = buf.len().min((len - at) as usize);
+            crate::readat::ReadAt::read_exact_at(&source, &mut buf[..take], at)?;
+            crate::vfs::write_all_at(&f, &dst, &buf[..take], at)?;
+            at += take as u64;
+        }
         crate::vfs::sync_file(&f, &dst)?;
     }
     if !staging.join("MANIFEST").exists() {

@@ -826,6 +826,136 @@ crossings are mechanical; nothing is reinterpreted in either direction.
 
 ---
 
+## The container
+
+A **container** is a store in one file that can still grow. It holds what a pack holds — the
+committed snapshot's files under the same flat `/`-joined names — and differs in exactly one thing:
+where it says it is complete.
+
+A pack is footer-addressed, and the footer is at EOF. That is right for a sealed artifact and wrong
+for one that grows: appending past the footer leaves a window in which EOF is not a footer, and a
+crash there leaves a file nothing can open. A container is **superblock-addressed** instead. Two
+fixed slots at the head of the file are written **alternately**, so the slot a reader resolves is
+never the slot a writer is touching, and everything else is appended beyond the last committed
+tail.
+
+```
+[ slot 0 (4 KiB) ][ slot 1 (4 KiB) ][ member ][ member ][ directory ][ member ] ...
+                                    ^ region start, byte 8192
+```
+
+Both forms are read-only in the same sense the pack is: a container has no writer role and no lock.
+Writing to one is a directory operation on working state beside it, folded back in at a
+checkpoint — see [ContainerStore](#writing-to-a-container).
+
+### Superblock — 4096 bytes, two slots at bytes 0 and 4096
+
+Only the first 56 bytes are defined; the rest is reserved and MUST be zero. A slot is a whole page
+so that writing one is a single positioned write that cannot straddle two.
+
+```
+offset  size  field
+     0     8  MAGIC = "TURNCTNR"
+     8     8  seq          commit sequence; the highest valid slot is the live state
+    16     8  dir_off      byte offset of the directory payload
+    24     4  dir_stored   directory payload size on disk
+    28     4  dir_raw      directory size decompressed
+    32     4  n_entries    members the directory names
+    36     4  dir_xsum     crc32 of the STORED directory payload
+    40     8  tail         first byte beyond this commit's data
+    48     1  dir_codec    0 stored, 1 zstd
+    49     1  version      the container plane's reject-forward lever; this revision writes 1
+    50     2  reserved, MUST BE ZERO — and a reader must refuse otherwise
+    52     4  xsum         first 4 bytes of blake3 over slot[0..52]
+```
+
+`version` is independent of the record format version: the container plane can evolve without the
+parts and fold segments inside it changing, and a version above the reader's own refuses rather
+than misparses.
+
+**A torn slot and a slot from the future are different failures and must not be confused.** A slot
+whose checksum does not cover its bytes was never completed; it carries no claim, and the other
+slot wins. A slot whose checksum *passes* under a version the reader does not know is an authentic
+statement from a newer writer, and falling back to the older slot would serve a stale state while
+reporting success — so the container is refused entire.
+
+### Directory
+
+Compressed with `dir_codec`, located by `dir_off`, checksummed by `dir_xsum`. Decompressed:
+
+```
+varint   n_entries
+repeated n_entries times:
+  varint  name_len
+  bytes   name         the member's store-relative path, e.g. "MANIFEST", "fold/seg-00000000.fold"
+  varint  off          absolute offset of the member's first byte in the container
+  varint  len
+  u32     xsum         crc32 of the member's bytes
+varint   n_free
+repeated n_free times:
+  varint  off
+  varint  len
+```
+
+Entries are sorted by name. A name is one or more normal path components joined by `/` — the same
+namespace a pack TOC uses, and the shape [`safe_part_file_name`](#the-manifest) already guarantees
+for manifest entries. A duplicate name is refused, and every member must lie inside the committed
+region: an entry pointing past `tail` is corruption and refuses before anything reads through it.
+
+Per-member `xsum` follows the pack's policy: not verified on the read path — the inner formats
+carry their own integrity, and content carries BLAKE3 — but verified by a deliberate scrub, and a
+writer may not omit it.
+
+### Commit
+
+The order is the crash-safety argument, and it is the whole of it:
+
+1. append members beyond the previous `tail`;
+2. append the new directory;
+3. **fsync** — everything the next superblock will name must be durable before it names it;
+4. write the superblock into the slot the live state was **not** read from, with `seq + 1`;
+5. fsync.
+
+A crash before step 4 leaves the previous state entire, because nothing referenced the new bytes. A
+torn write in step 4 fails its checksum and loses to the other slot. Recovery is therefore not a
+repair: the newest slot that passes its checksum **is** the state, and uncommitted bytes past its
+tail are ignored and later overwritten.
+
+Skipping step 3 is the failure this ordering exists for. Without an intervening fsync the order
+dirty pages reach the platter is unspecified, so the superblock can survive while the members it
+names do not — a published pointer to bytes that never landed. The
+[deterministic simulator](https://github.com/turndb/turndb/blob/main/tests/dst.rs) models that as
+`LastPendingOnly` and fails the container sweep at the commit if the fsync is removed.
+
+### Free space
+
+`n_free` records extents that are no longer named — a member restaged under the same name
+supersedes its predecessor rather than overwriting it. **Freed extents are recorded but never
+reused.** A reader that resolved an older superblock still holds offsets into them, and handing
+those bytes to a new member would be silent corruption rather than a detected fault. Space is
+therefore reclaimed by rewriting the container, not by allocating into holes.
+
+### Writing to a container
+
+A container has no writer role, so writing means running an ordinary store on working state beside
+the file and folding it back in:
+
+```
+mystore.turndb        the committed store
+mystore.turndb-hot/   working state while a writer holds it
+```
+
+Exclusion is unchanged — the working directory carries the fold's ordinary advisory lock, and two
+writers of one container contend for it. A checkpoint settles the directory and ingests what
+changed; because parts and rolled segments are immutable and uniquely named, a member already
+present at the same name and length is not rewritten.
+
+**A working directory that outlives its writer is adopted, not rebuilt.** It holds writes the
+container was never told about, so materializing over it would replace acknowledged data with an
+older committed snapshot.
+
+---
+
 ## Limits
 
 Enforced, not assumed. Each refuses rather than truncating, because a store that cannot be written is
