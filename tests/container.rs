@@ -424,3 +424,91 @@ fn an_abandoned_working_directory_is_resumed_rather_than_discarded() {
     assert_eq!(rs.reconstruct("kept:2").unwrap().unwrap(), second);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn reclaim_returns_the_space_repeated_checkpoints_leak() {
+    use turndb::container::reclaim;
+    use turndb::store::ContainerStore;
+
+    let root = tmp("reclaim");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("grows.turndb");
+
+    // Every session restages MANIFEST and the sidecars, so waste accumulates whether or not the
+    // store grows. Ten sessions is a fortnight of daily checkpoints, not an abusive fixture.
+    let mut want = Vec::new();
+    for round in 0..10 {
+        let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+        let id = format!("r:{round:02}");
+        let body = noise(round, 1200);
+        cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.push((id, body));
+        cs.close().unwrap();
+    }
+
+    let before = Container::open(&ct).unwrap();
+    let waste = before.free_bytes();
+    let live = before.member_bytes();
+    let members = before.len();
+    assert!(waste > 0, "repeated checkpoints must leave superseded extents to reclaim");
+    drop(before);
+
+    let stats = reclaim(&ct).unwrap();
+    assert_eq!(stats.members, members, "reclaim carries every member across");
+    assert!(stats.reclaimed > 0, "reclaim must return space: {stats:?}");
+    assert!(stats.bytes_after < stats.bytes_before, "the file must shrink: {stats:?}");
+
+    // The point of the exercise: the waste is gone and the content is not.
+    let after = Container::open(&ct).unwrap();
+    assert_eq!(after.free_bytes(), 0, "nothing is superseded in a freshly written container");
+    assert_eq!(after.member_bytes(), live, "live bytes are unchanged");
+    assert_eq!(after.verify().unwrap(), members);
+    drop(after);
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    for (id, body) in &want {
+        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the rewrite");
+    }
+    drop(rs);
+
+    // Idempotent: a container with nothing to reclaim is left exactly as it is.
+    let again = reclaim(&ct).unwrap();
+    assert_eq!(again.reclaimed, 0, "a clean container has nothing to return: {again:?}");
+    assert_eq!(again.bytes_after, again.bytes_before);
+
+    // And it stays writable afterwards.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    cs.store().put("after:1", &[Span::Piece(b"still writable")], vec![]).unwrap();
+    cs.close().unwrap();
+    assert_eq!(
+        open_read_container(&ct, cfg()).unwrap().reconstruct("after:1").unwrap().unwrap(),
+        b"still writable"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn reclaim_refuses_a_container_a_writer_may_be_holding() {
+    use turndb::container::reclaim;
+    use turndb::store::ContainerStore;
+
+    let root = tmp("reclaim-busy");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("busy.turndb");
+
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    cs.store().put("held:1", &[Span::Piece(b"in flight")], vec![]).unwrap();
+    cs.store().sync().unwrap();
+
+    // Rewriting now would publish a container about to be superseded by a checkpoint of writes it
+    // never saw — and the writer's own working directory is the evidence that is happening.
+    let err = match reclaim(&ct) {
+        Ok(s) => panic!("reclaim must refuse a container with a live writer, got {s:?}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("working directory"), "the refusal must name why, got: {err}");
+
+    cs.close().unwrap();
+    reclaim(&ct).expect("once the writer is gone, reclaim proceeds");
+    std::fs::remove_dir_all(&root).ok();
+}

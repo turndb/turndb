@@ -33,6 +33,10 @@ usage: turndb <verb> [args]
     recover   <DIR> [--max-rollback N]
                                  validate and promote a retained manifest; rollback defaults to 0
     snapshots <DIR>              list retained commits available to time travel
+    reclaim   <FILE.turndb>      rewrite a container without the extents nothing names any more.
+                                 A container only grows — freed extents are never reused, because
+                                 a reader may still hold offsets into them — so this is the only
+                                 thing that returns that space
     erase     <DIR> (--id ID ... | --attr KEY=VALUE)
                                  tombstone, settle, and REWRITE until this store no longer
                                  references the content or metadata. Does not promise media-byte
@@ -212,6 +216,22 @@ fn run(args: &[String]) -> Result<()> {
         "snapshots" => {
             for c in turndb::store::retained_commits(&arg(0, "DIR")?)? {
                 println!("{c}");
+            }
+            Ok(())
+        }
+        "reclaim" => {
+            let file = arg(0, "FILE.turndb")?;
+            let stats = turndb::container::reclaim(&file)?;
+            if stats.reclaimed == 0 {
+                println!(
+                    "nothing to reclaim ({} members, {} bytes)",
+                    stats.members, stats.bytes_after
+                );
+            } else {
+                println!(
+                    "reclaimed {} bytes ({} -> {}), {} members carried across",
+                    stats.reclaimed, stats.bytes_before, stats.bytes_after, stats.members
+                );
             }
             Ok(())
         }
