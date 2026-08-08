@@ -89,8 +89,26 @@ fn classify(path: &Path) -> Source {
     }
 }
 
-/// Reads one named member out of whichever single-file form the path turned out to be.
-type MemberReader = Box<dyn Fn(&str) -> Result<Vec<u8>>>;
+/// Digests one named member of whichever single-file form the path turned out to be.
+///
+/// A digest rather than the bytes: a part is the largest thing a store holds, and reading one
+/// whole only to hash it is an unbounded allocation for no gain. The reader streams instead.
+type MemberDigest = Box<dyn Fn(&str) -> Result<String>>;
+
+/// BLAKE3 over a positioned reader, in a fixed window.
+fn digest_reader(r: &dyn turndb::readat::ReadAt) -> Result<String> {
+    let len = r.len()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    while at < len {
+        let take = buf.len().min((len - at) as usize);
+        r.read_exact_at(&mut buf[..take], at)?;
+        hasher.update(&buf[..take]);
+        at += take as u64;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
 
 fn open_read(path: &Path) -> Result<ReadStore> {
     match classify(path) {
@@ -332,20 +350,32 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
     } else {
         // A single-file store carries its manifest verbatim, so there is no retained chain to walk;
         // what can be checked is each part pin against the extent the file actually holds.
-        let (kind, read_member): (&str, MemberReader) = match classify(path) {
+        let (kind, digest_member): (&str, MemberDigest) = match classify(path) {
             Source::Container => {
                 let c = turndb::container::Container::open(path)?;
-                ("container", Box::new(move |name: &str| c.read_file_bounded(name, u64::MAX)))
+                let digest = move |name: &str| {
+                    let extent = c
+                        .extent(name)
+                        .ok_or_else(|| anyhow::anyhow!("container does not hold {name}"))?;
+                    digest_reader(&extent)
+                };
+                ("container", Box::new(digest))
             }
             _ => {
                 let pk = turndb::pack::Pack::open(path)?;
-                ("pack", Box::new(move |name: &str| pk.read_file(name)))
+                let digest = move |name: &str| {
+                    let extent = pk
+                        .file(name)
+                        .ok_or_else(|| anyhow::anyhow!("pack does not hold {name}"))?;
+                    digest_reader(&extent)
+                };
+                ("pack", Box::new(digest))
             }
         };
         let mut pins = 0usize;
         for p in &rs.manifest().parts {
             if let Some(want) = &p.b3 {
-                let got = blake3::hash(&read_member(&p.file)?).to_hex().to_string();
+                let got = digest_member(&p.file)?;
                 if *want != got {
                     bail!("{kind} part {} drifted from its manifest pin", p.file);
                 }
