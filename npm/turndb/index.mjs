@@ -33,7 +33,7 @@
  */
 
 import { WASI } from 'node:wasi';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -1169,6 +1169,18 @@ export async function open(dir, opts = {}) {
   const maxWalFrames = openLimit(opts.maxWalFrames, 'maxWalFrames');
   const maxFoldBlocks = openLimit(opts.maxFoldBlocks, 'maxFoldBlocks');
   const hostDir = resolve(dir);
+  // `Store::open` creates the store directory, so this binding must too — but WASI preopens the
+  // host directory before the guest runs, so the engine never gets the chance. Without this the
+  // first call a new user makes fails inside `uvwasi_init` with a bare errno that names neither
+  // the path nor the cause.
+  try {
+    await mkdir(hostDir, { recursive: true });
+  } catch (cause) {
+    throw new TurndbError(
+      `opening ${hostDir}: the store directory could not be created: ${cause.message}`,
+      'INVALID_ARGUMENT',
+    );
+  }
   const runtime = await acquireRuntime(hostDir);
   const { instance } = runtime;
 
@@ -1243,6 +1255,21 @@ export async function openFile(file, opts = {}) {
   const maxFoldBlocks = openLimit(opts.maxFoldBlocks, 'maxFoldBlocks');
   const hostFile = resolve(file);
   const hostDir = dirname(hostFile);
+  // A single file cannot be created by opening it, so this is a refusal rather than a mkdir — but
+  // it has to happen here, because the WASI preopen of the parent fails first and reports an errno
+  // that names neither the file nor the reason.
+  try {
+    const info = await stat(hostFile);
+    if (!info.isFile()) {
+      throw new TurndbError(`opening ${hostFile}: not a regular file`, 'INVALID_ARGUMENT');
+    }
+  } catch (cause) {
+    if (cause instanceof TurndbError) throw cause;
+    throw new TurndbError(
+      `opening ${hostFile}: no such pack or container`,
+      cause.code === 'ENOENT' ? 'NOT_FOUND' : 'INVALID_ARGUMENT',
+    );
+  }
   const runtime = await acquireRuntime(hostDir);
   const { instance } = runtime;
 
