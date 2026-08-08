@@ -227,8 +227,8 @@ Linux hole punching.
 writer a dedicated Rust actor and bounded queue, exposes Promise-based batch/durability/scan/content
 operations with `Buffer` and exact `bigint`, and refuses to fall back to WASM when a native artifact
 is unavailable. The first prebuilt slice is Linux x86-64 glibc across Node 22, 24, and 26; its
-package manifests are marked private in source, so publication can only happen through the staged
-release path. The
+package manifests carry npm's `"private": true`, which makes `npm publish` refuse outright, so
+publication can only happen through the staged release path. The
 [native prebuild contract](docs/native-prebuilds.md) states the exact artifact, install, provenance,
 and publication gates.
 

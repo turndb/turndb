@@ -1,0 +1,121 @@
+name: Release CLI npm package
+
+# Publishing `@turndb/cli` and its platform packages: the crate's binary, delivered to people who
+# install with npm rather than cargo. A merged Knope release PR or a deliberate manual dispatch
+# supplies the exact annotated lockstep tag; the publish job stops at the protected `npm`
+# environment for an owner's explicit act, exactly as the crate, native, and wasm releases do.
+#
+# The binary is built once from the exact-tag checkout, exercised by an install that drives it as a
+# consumer would, and then published byte-identically. Both manifests are `private` in source and
+# are cleared only by `pack-cli.cjs --release`, so a stray `npm publish` from a working tree
+# refuses rather than shipping.
+#
+# Authentication is npm Trusted Publishing (OIDC): no long-lived registry token is stored here.
+
+on:
+  workflow_call:
+    inputs:
+      release_ref:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Exact annotated lockstep tag to release (vX.Y.Z)
+        required: true
+        type: string
+
+concurrency:
+  group: release-cli-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build release candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: verify exact release tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+          case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
+      - name: verify lockstep package version matches the tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: test "v$(node -p "require('./cli/package.json').version")" = "$RELEASE_REF"
+      - name: install pinned license-report generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: verify third-party licenses
+        run: bash scripts/check-third-party-licenses.sh
+      - name: build the binary and pack both tarballs
+        run: node cli/scripts/pack-cli.cjs --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-cli-${{ inputs.release_ref }}
+          path: cli/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  install:
+    name: install release candidate (node ${{ matrix.node }})
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-cli-${{ inputs.release_ref }}
+          path: cli/dist/
+      # Drives node_modules/.bin/turndb, not the built binary: the launcher resolving its platform
+      # package is the part most likely to be wrong, and only an install exercises it.
+      - name: install the exact tarballs and drive the CLI
+        run: node cli/scripts/test-cli.cjs cli/dist
+
+  publish:
+    name: publish to npm
+    needs: [build, install]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: install trusted-publishing npm
+        run: npm install --global npm@11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-cli-${{ inputs.release_ref }}
+          path: dist/
+      # The platform package first: a selector whose optional dependency does not yet exist would
+      # install a launcher that cannot resolve its binary, and npm reports a missing OPTIONAL
+      # dependency as success rather than as a failed install.
+      - name: publish platform package, then selector
+        run: |
+          set -euo pipefail
+          npm publish ./dist/turndb-cli-linux-x64-gnu-*.tgz --access public --provenance
+          npm publish ./dist/turndb-cli-0*.tgz --access public --provenance

@@ -93,3 +93,13 @@ jobs:
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
     secrets: inherit
+
+  cli:
+    needs: tag
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-cli.yml
+    with:
+      release_ref: ${{ needs.tag.outputs.release_ref }}
+    secrets: inherit

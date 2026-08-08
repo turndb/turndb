@@ -144,6 +144,15 @@ jobs:
       - name: build wasm from source and run the package suite
         run: bash npm/build.sh
 
+      # The CLI package's launcher resolves a platform package at runtime, which only an install
+      # exercises. Run it once — the resolution is independent of Node major, and the job already
+      # has the toolchain to build the binary.
+      - name: cli package installs and runs
+        if: matrix.node == '24'
+        run: |
+          node cli/scripts/pack-cli.cjs
+          node cli/scripts/test-cli.cjs
+
       # Format/codec interoperability is independent of Node major. Run it once: WASI writes and
       # native reads, then native writes and WASI reads, each against an independent expected corpus.
       - name: cross-runtime store compatibility
