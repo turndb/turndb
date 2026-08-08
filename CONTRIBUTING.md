@@ -149,6 +149,28 @@ not run against `wasm32-wasip1` at all** — it drives the write path below `src
 portable target does not execute it. So a change to the WASM binding is *not* crash-tested by any
 suite, here or in CI.
 
+### A new sweep must be shown to fail
+
+**Anything added to `tests/dst.rs` or `tests/corruption.rs` gets a deliberate defect introduced
+under it, once, to prove the sweep detects it.** Say in the test's doc comment what you broke and
+where it failed. Then revert the defect — the mutation is a check on the harness, not a fixture to
+keep.
+
+This is not a style preference. Both harnesses have shipped sweeps that were green and inert:
+
+- A container commit sweep passed all 48 of its crash states with the fsync that orders members
+  ahead of the superblock **deleted**. No variant expressed a later write landing while an earlier
+  one did not, so the failure was unreachable. Fixing that took a new variant, not a new assertion.
+- A container corruption sweep passed 6,000 mutants with a bounds check in the directory walk
+  **deleted**. Every route to that parser is checksum-gated, so byte flips never reach it. Reaching
+  it needed a harness that damages the payload and then repairs the checksums over it.
+- A space-accounting test passed against a function that returns zero for anything not backed by a
+  directory, because nothing compared its answer to a second source.
+
+In each case the sweep looked thorough, ran for real, and would have gone on passing through the
+bug it existed to find. A green harness that has never been made to go red is a hypothesis about
+coverage, not evidence of it — and the cost of checking is one commit you throw away.
+
 **Not runnable locally:**
 
 - The **native prebuild** and its install check, which exercise `ubuntu-22.04` glibc packaging.

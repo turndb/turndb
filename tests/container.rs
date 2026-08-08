@@ -512,3 +512,39 @@ fn reclaim_refuses_a_container_a_writer_may_be_holding() {
     reclaim(&ct).expect("once the writer is gone, reclaim proceeds");
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn space_accounting_answers_for_a_single_file_store_too() {
+    let root = tmp("space");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("store");
+    build_store(&dir);
+
+    // The directory's own answer is the reference: whatever it reports, the same store served out
+    // of a file must report too. A fold that cannot measure itself returns zero rather than
+    // failing, so this is the shape of bug that hides in a report nobody cross-checks.
+    let from_dir = Store::open_read(&dir, cfg()).unwrap();
+    let want = from_dir.fold().disk_bytes();
+    assert!(want > 0, "the fixture must have fold bytes to account for");
+    drop(from_dir);
+
+    let ct = root.join("space.turndb");
+    checkpoint_into_container(&dir, &ct).unwrap();
+    let from_container = open_read_container(&ct, cfg()).unwrap();
+    assert_eq!(
+        from_container.fold().disk_bytes(),
+        want,
+        "a container-backed fold must account for the same bytes as the directory it came from"
+    );
+    drop(from_container);
+
+    let pk = root.join("space.pack");
+    turndb::pack::write(&dir, &pk).unwrap();
+    let from_pack = turndb::store::open_read_pack(&pk, cfg()).unwrap();
+    assert_eq!(
+        from_pack.fold().disk_bytes(),
+        want,
+        "a pack-backed fold must account for the same bytes too"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -1375,10 +1375,12 @@ impl Fold {
 
     /// Total bytes across all segment files. Excludes anything still in the open buffer.
     pub fn disk_bytes(&self) -> u64 {
-        (0..self.headers.len() as u32)
-            .filter_map(|n| std::fs::metadata(segment::seg_path(&self.dir, n)).ok())
-            .map(|m| m.len())
-            .sum()
+        // Measured through the readers rather than the filesystem. `dir` is a real directory only
+        // for a directory-backed fold; for one served out of a pack or a container it is a LABEL,
+        // so building segment paths from it yields paths that do not exist, `metadata` fails, and
+        // `.ok()` turns the whole sum into a silent zero. A reader knows its own length whatever
+        // is behind it, which is the only form of this question that has an answer everywhere.
+        self.readers.iter().filter_map(|r| crate::readat::ReadAt::len(r).ok()).sum()
     }
 
     /// The active segment's dictionary. Currently unused because the compression pool is handed its
