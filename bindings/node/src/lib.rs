@@ -1507,6 +1507,9 @@ pub fn recover_manifest<'env>(
 #[napi]
 pub struct NativeStore {
     actor: Actor,
+    /// Set when this handle was opened over a single file. The actor drives an ordinary store in
+    /// the working directory beside it; this is what closing folds that work back into.
+    container: Option<PathBuf>,
     #[cfg(feature = "sql")]
     sql_budget: SqlBudget,
 }
@@ -1548,10 +1551,64 @@ impl NativeStore {
         .map_err(|error| engine_failure("open TurnDB store", error))?;
         #[cfg(feature = "sql")]
         {
-            Ok(NativeStore { actor, sql_budget })
+            Ok(NativeStore { actor, container: None, sql_budget })
         }
         #[cfg(not(feature = "sql"))]
-        Ok(NativeStore { actor })
+        Ok(NativeStore { actor, container: None })
+    }
+
+    /// Open a writer over a store held in ONE FILE, creating the file if it does not exist.
+    ///
+    /// The engine's write path is directory-shaped — append semantics, fsync, and rename atomicity
+    /// are properties a directory has and a byte range inside a file does not — so this drives an
+    /// ordinary store in a working directory beside the file and folds it back in on
+    /// [`NativeStore::close`]. After a clean close the file is the only artifact; after a crash the
+    /// working directory remains and the next open resumes from it, because it holds writes the
+    /// file was never told about.
+    ///
+    /// Every write method applies unchanged: it is the same engine either way.
+    #[napi(factory)]
+    pub async fn open_file(
+        path: String,
+        options: Option<NativeOpenOptions>,
+    ) -> Result<NativeStore> {
+        if path.is_empty() {
+            return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
+        }
+        let capacity = options
+            .as_ref()
+            .and_then(|options| options.command_queue_capacity)
+            .unwrap_or(DEFAULT_QUEUE_CAPACITY as u32);
+        if !(1..=MAX_QUEUE_CAPACITY as u32).contains(&capacity) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "commandQueueCapacity must be between 1 and {MAX_QUEUE_CAPACITY}, got {capacity}"
+                ),
+            ));
+        }
+        #[cfg(feature = "sql")]
+        let sql_budget = decode_sql_budget(
+            options.as_ref().and_then(|options| options.max_concurrent_sql_memory_bytes.clone()),
+        )?;
+        let store_options = decode_store_options(options.as_ref())?;
+        let container = PathBuf::from(path);
+        let opened = container.clone();
+        let actor = napi::tokio::task::spawn_blocking(move || {
+            // One implementation of the adopt-or-materialize decision, shared with the crate's
+            // own ContainerStore. A second copy of it here is how the two get out of step.
+            let hot = turndb::store::container_store::prepare(&opened)?;
+            Actor::open_with_capacity_and_options(&hot, capacity as usize, store_options)
+        })
+        .await
+        .map_err(|error| failure("join TurnDB single-file open", error))?
+        .map_err(|error| engine_failure("open TurnDB single-file store", error))?;
+        #[cfg(feature = "sql")]
+        {
+            Ok(NativeStore { actor, container: Some(container), sql_budget })
+        }
+        #[cfg(not(feature = "sql"))]
+        Ok(NativeStore { actor, container: Some(container) })
     }
 
     /// The bounded backlog configured for this handle.
@@ -2003,10 +2060,34 @@ impl NativeStore {
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
     #[napi]
     pub async fn close(&self, durable: Option<bool>) -> Result<()> {
+        // A container close has to SEAL, not merely sync. `close(durable)` makes the WAL durable;
+        // it does not empty it, and a checkpoint refuses a store whose WAL still holds writes no
+        // part names — correctly, since those writes are not in anything the container would
+        // ingest. Flushing first is what `ContainerStore::close` does for the same reason.
+        if self.container.is_some() && durable.unwrap_or(true) {
+            self.actor
+                .flush(OperationControl::default())
+                .await
+                .map_err(|error| engine_failure("seal TurnDB writes before closing", error))?;
+        }
         self.actor
             .close(durable.unwrap_or(true))
             .await
-            .map_err(|error| engine_failure("close TurnDB store", error))
+            .map_err(|error| engine_failure("close TurnDB store", error))?;
+        // The actor is down and its writer lock released, so the working directory can be folded
+        // in and removed. A non-durable close deliberately skips it: the caller asked not to
+        // settle, and publishing unsettled state into the file would settle it anyway.
+        if let (Some(container), true) = (self.container.clone(), durable.unwrap_or(true)) {
+            napi::tokio::task::spawn_blocking(move || {
+                turndb::store::container_store::settle(&container)
+            })
+            .await
+            .map_err(|error| failure("join TurnDB single-file close", error))?
+            .map_err(|error| {
+                engine_failure("fold the working directory into its container", error)
+            })?;
+        }
+        Ok(())
     }
 }
 
