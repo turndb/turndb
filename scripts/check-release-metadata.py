@@ -55,6 +55,26 @@ def check_versions() -> str:
     if wrong:
         fail("lockstep version mismatch: " + ", ".join(f"{where}={value!r}" for where, value in wrong))
 
+    # Every selector's platform pins, not just the native one's. A pin left behind produces a
+    # package that installs cleanly and cannot run: npm treats a missing OPTIONAL dependency as a
+    # successful install, so the failure surfaces as a launcher that finds nothing.
+    for relative in ("bindings/node/package.json", "cli/package.json"):
+        path = ROOT / relative
+        if not path.is_file():
+            continue
+        pins = json.loads(path.read_text()).get("optionalDependencies", {})
+        stale = {
+            name: pinned
+            for name, pinned in pins.items()
+            if name.startswith("@turndb/") and pinned != reference
+        }
+        if stale:
+            fail(
+                f"{relative} pins "
+                + ", ".join(f"{n}@{v}" for n, v in sorted(stale.items()))
+                + f" but this release is {reference}"
+            )
+
     selector = json.loads((ROOT / "bindings/node/package.json").read_text())
     selector_lock = json.loads((ROOT / "bindings/node/package-lock.json").read_text())
     platform = json.loads(

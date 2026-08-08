@@ -105,8 +105,25 @@ jobs:
             exit 0
           fi
 
-          # Any non-success conclusion counts: failure, timed_out, cancelled, action_required.
-          # A cancelled run is not a passing run, and treating it as one is how a gate goes quiet.
+          # A cancelled run is not a passing run, so it still counts — EXCEPT when it was
+          # superseded. Merging two pull requests a minute apart cancels the first run by design,
+          # and the run that replaced it reports the truth about a commit containing everything the
+          # cancelled one carried. Alerting there teaches people the alert is noise, which is the
+          # expensive failure for something whose only job is to be believed.
+          #
+          # The distinction is whether the commit is still the tip. If it is, nothing is coming to
+          # report on it and a cancellation must be surfaced — a hand-cancelled run on the current
+          # head is exactly the case where silence would hide a red trunk.
+          if [ "$CONCLUSION" = "cancelled" ]; then
+            tip=$(gh api "repos/$REPO/commits/$BRANCH" --jq .sha)
+            if [ "$tip" != "$SHA" ]; then
+              echo "cancelled run at $short was superseded by $tip; the newer run reports for it"
+              exit 0
+            fi
+            echo "cancelled run at $short is still the tip of $BRANCH; nothing else will report"
+          fi
+
+          # Any other non-success conclusion counts: failure, timed_out, action_required.
           body=$(printf '%s\n' \
             "@$ACTOR — CI concluded **$CONCLUSION** on \`$BRANCH\` at \`$short\`." \
             "" \

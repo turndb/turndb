@@ -14,13 +14,28 @@ VERSION = sys.argv[1] if len(sys.argv) == 2 else ""
 if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", VERSION):
     raise SystemExit("usage: sync-release-version.py X.Y.Z")
 
-manifest_path = ROOT / "bindings/node/package.json"
-manifest = json.loads(manifest_path.read_text())
-package_name = "@turndb/native-linux-x64-gnu"
-if package_name not in manifest.get("optionalDependencies", {}):
-    raise SystemExit(f"selector has no optional dependency for {package_name}")
-manifest["optionalDependencies"][package_name] = VERSION
-manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+# Every selector package pins its platform packages by exact version, and Knope bumps the
+# `version` field of each manifest without touching the pins that reference them. Naming one
+# selector here worked while there was one; the CLI's arrived, its pin stayed at the previous
+# version, and the release failed at pack time with a selector that could never resolve a binary.
+# Discover them instead: any @turndb/* optional dependency is a sibling in this repository and
+# moves in lockstep by definition.
+SELECTORS = ["bindings/node/package.json", "cli/package.json"]
+synced = 0
+for relative in SELECTORS:
+    manifest_path = ROOT / relative
+    if not manifest_path.is_file():
+        raise SystemExit(f"selector manifest does not exist: {relative}")
+    manifest = json.loads(manifest_path.read_text())
+    pins = manifest.get("optionalDependencies", {})
+    siblings = [name for name in pins if name.startswith("@turndb/")]
+    if not siblings:
+        raise SystemExit(f"{relative} pins no @turndb platform package; is it still a selector?")
+    for name in siblings:
+        pins[name] = VERSION
+        synced += 1
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+print(f"synced {synced} platform pins across {len(SELECTORS)} selectors to {VERSION}")
 
 # Knope updates the root Cargo.lock entry but, with explicit workspace member manifests in
 # versioned_files, leaves member entries at their old versions. Ask Cargo to update every local
@@ -53,8 +68,9 @@ lock_path = ROOT / "bindings/node/package-lock.json"
 npm_lock = json.loads(lock_path.read_text())
 npm_lock["version"] = VERSION
 npm_lock["packages"][""]["version"] = VERSION
-npm_lock["packages"][""]["optionalDependencies"][package_name] = VERSION
-npm_lock["packages"][f"node_modules/{package_name}"] = {"optional": True}
+for name in [n for n in npm_lock["packages"][""].get("optionalDependencies", {}) if n.startswith("@turndb/")]:
+    npm_lock["packages"][""]["optionalDependencies"][name] = VERSION
+    npm_lock["packages"][f"node_modules/{name}"] = {"optional": True}
 lock_path.write_text(json.dumps(npm_lock, indent=2) + "\n")
 
 # THIRD_PARTY_LICENSES.html lists the workspace's own crates with their versions, so a version
