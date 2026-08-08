@@ -18,7 +18,9 @@ const CLI_DIR = path.resolve(__dirname, '..');
 const ROOT = path.resolve(CLI_DIR, '..');
 const TARGET = process.env.TURNDB_CLI_TARGET ?? 'x86_64-unknown-linux-gnu';
 const SLICE = process.env.TURNDB_CLI_SLICE ?? 'linux-x64-gnu';
+// Slices land in one directory across matrix jobs, so a job must not clear its siblings' output.
 const DIST = path.join(CLI_DIR, 'dist');
+const SELECTOR_ONLY = process.argv.includes('--selector-only');
 
 function run(cmd, args, opts = {}) {
   execFileSync(cmd, args, { stdio: 'inherit', ...opts });
@@ -52,7 +54,6 @@ fs.copyFileSync(path.join(CLI_DIR, 'README.md'), path.join(platformDir, 'README.
 const size = fs.statSync(path.join(platformDir, 'turndb')).size;
 console.log(`${SLICE}: turndb binary ${size} bytes`);
 
-fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(DIST, { recursive: true });
 
 // Toggle `private` around the pack and always put it back, so an interrupted release cannot leave
@@ -67,22 +68,38 @@ try {
       fs.writeFileSync(file, `${JSON.stringify(json, null, 2)}\n`);
     }
   }
-  run('npm', ['pack', platformDir, '--pack-destination', DIST]);
-  run('npm', ['pack', CLI_DIR, '--pack-destination', DIST]);
+  if (!SELECTOR_ONLY) {
+    run('npm', ['pack', platformDir, '--pack-destination', DIST]);
+  }
+  // The selector is packed once, by whichever invocation is told to; a matrix job packing it
+  // would race its siblings for the same filename.
+  if (SELECTOR_ONLY || process.env.TURNDB_CLI_PACK_SELECTOR === '1') {
+    run('npm', ['pack', CLI_DIR, '--pack-destination', DIST]);
+  }
 } finally {
   manifests.forEach((file, i) => fs.writeFileSync(file, originals[i]));
 }
 
-// A selector whose optional dependency does not match the platform tarball beside it would install
-// a launcher that can never resolve its binary — and npm would report that as success, because a
-// missing OPTIONAL dependency is not an install failure.
+// Every pin the selector carries must name a package this repository can actually build, and at
+// the same version. npm reports a missing OPTIONAL dependency as a successful install, so a pin
+// that resolves to nothing produces a launcher that can never find its binary and says nothing.
 const selector = JSON.parse(fs.readFileSync(path.join(CLI_DIR, 'package.json'), 'utf8'));
 const platform = JSON.parse(fs.readFileSync(path.join(platformDir, 'package.json'), 'utf8'));
-const pinned = selector.optionalDependencies?.[platform.name];
-if (pinned !== platform.version) {
-  throw new Error(
-    `selector pins ${platform.name}@${pinned} but the packed platform package is `
-      + `${platform.version}; the lockstep version sync did not cover one of them`,
-  );
+for (const [name, pinned] of Object.entries(selector.optionalDependencies ?? {})) {
+  const slice = name.replace('@turndb/cli-', '');
+  const manifestPath = path.join(CLI_DIR, 'npm', slice, 'package.json');
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`selector pins ${name} but cli/npm/${slice} does not exist`);
+  }
+  const declared = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).version;
+  if (pinned !== declared) {
+    throw new Error(
+      `selector pins ${name}@${pinned} but that package declares ${declared}; `
+        + 'the lockstep version sync did not cover one of them',
+    );
+  }
+}
+if (selector.optionalDependencies?.[platform.name] === undefined) {
+  throw new Error(`the selector does not pin ${platform.name}, so this slice is unreachable`);
 }
 console.log(`packed ${fs.readdirSync(DIST).sort().join(', ')}`);
