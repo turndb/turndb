@@ -329,3 +329,98 @@ fn the_container_plane_versions_independently() {
     assert!(err.contains("version"), "the refusal must name the version lever, got: {err}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn a_container_can_be_written_to_and_stays_one_file() {
+    use turndb::store::ContainerStore;
+
+    let root = tmp("writer");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("live.turndb");
+
+    // Nothing exists yet: opening for writing creates the container and its working directory.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let hot = cs.hot_directory().to_path_buf();
+    let mut want = Vec::new();
+    for i in 0..8 {
+        let id = format!("w:{i:02}");
+        let body = noise(i, 1500);
+        cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.push((id, body));
+    }
+    let stats = cs.close().unwrap();
+    assert!(stats.members >= 3, "the container must hold a real store: {stats:?}");
+
+    // The promise of the single-file shape: after a clean close, the file is the only artifact.
+    assert!(ct.is_file(), "the container must be a file");
+    assert!(!hot.exists(), "a clean close removes the working directory");
+
+    // And it reads as a store, byte-exact, with no directory anywhere.
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    for (id, body) in &want {
+        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the round trip");
+    }
+    drop(rs);
+
+    // Reopening materializes, appends, and folds back in.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let extra = noise(99, 1500);
+    cs.store().put("w:99", &[Span::Piece(&extra)], vec![]).unwrap();
+    cs.close().unwrap();
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    assert_eq!(
+        rs.reconstruct("w:99").unwrap().unwrap(),
+        extra,
+        "the appended record must be there"
+    );
+    assert_eq!(rs.ids().unwrap().len(), want.len() + 1, "and nothing earlier may be lost");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn an_abandoned_working_directory_is_resumed_rather_than_discarded() {
+    use turndb::store::ContainerStore;
+
+    let root = tmp("resume");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("crash.turndb");
+
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let first = noise(1, 900);
+    cs.store().put("kept:1", &[Span::Piece(&first)], vec![]).unwrap();
+    cs.close().unwrap();
+
+    // A session that acknowledges a write and then dies: the hot directory outlives it holding
+    // state the container was never told about.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let hot = cs.hot_directory().to_path_buf();
+    let second = noise(2, 900);
+    cs.store().put("kept:2", &[Span::Piece(&second)], vec![]).unwrap();
+    cs.store().sync().unwrap();
+    // Dropping without close() is the abandoned session: there is deliberately no Drop that
+    // checkpoints, so the container learns nothing and the working directory stays behind. The
+    // kernel releases the fold's flock the same way it would on a real crash.
+    drop(cs);
+    assert!(hot.exists(), "the fixture must leave a working directory behind");
+
+    // The container alone has only the first record — proving the second exists solely in hot.
+    let stale = open_read_container(&ct, cfg()).unwrap();
+    assert!(stale.reconstruct("kept:2").unwrap().is_none(), "the fixture must be a real gap");
+    drop(stale);
+
+    // Resuming must adopt that directory, not materialize over it: re-materializing would replace
+    // acknowledged writes with an older committed snapshot.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    assert_eq!(
+        cs.store().reconstruct("kept:2").unwrap().unwrap(),
+        second,
+        "an acknowledged write must survive the abandoned session"
+    );
+    cs.close().unwrap();
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    assert_eq!(rs.reconstruct("kept:1").unwrap().unwrap(), first);
+    assert_eq!(rs.reconstruct("kept:2").unwrap().unwrap(), second);
+    std::fs::remove_dir_all(&root).ok();
+}

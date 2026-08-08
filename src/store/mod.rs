@@ -31,9 +31,12 @@
 //! Anything the fold wrote past that tail is discarded and regenerated, so there is no window in
 //! which a part could reference content that never landed.
 
+pub mod container_store;
 pub mod read;
 pub mod refold;
 pub mod wal;
+
+pub use container_store::ContainerStore;
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;

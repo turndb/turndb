@@ -48,6 +48,10 @@ usage: turndb <verb> [args]
     checkpoint <DIR> <OUT.turndb>
                                  the committed snapshot as one GROWABLE file, created or grown in
                                  place; re-running it re-ingests only what changed
+    write     <FILE.turndb> <JSONL>
+                                 ingest INTO a single file, creating it if absent. Working state
+                                 lives beside it in FILE.turndb-hot while open and is folded back
+                                 in on close, so what remains is the one file
 ";
 
 fn main() {
@@ -207,6 +211,20 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
+        "write" => {
+            // The single-file shape's whole point: open a .turndb, write to it, close it, and
+            // still have a file. Everything between is an ordinary store.
+            let file = arg(0, "FILE.turndb")?;
+            let source = arg(1, "JSONL")?;
+            let mut cs = turndb::store::ContainerStore::open(&file, FoldCfg::default())?;
+            let imported = import_into(cs.store(), &source)?;
+            let stats = cs.close()?;
+            println!(
+                "{imported} records; container commit {} holds {} members ({} bytes ingested)",
+                stats.commit_seq, stats.members, stats.ingested_bytes
+            );
+            Ok(())
+        }
         "import" => {
             let dir = arg(0, "DIR")?;
             let src = arg(1, "JSONL")?;
@@ -471,6 +489,13 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
 /// scalar field is an attribute, and `id` (or trace_id:span_id#kind, or a line counter) names it.
 /// Batched per 1000 lines — each batch replays all-or-nothing — and flushed at the end.
 fn import(dir: &Path, src: &Path) -> Result<()> {
+    let mut s = Store::open(dir, FoldCfg::default())?;
+    import_into(&mut s, src)?;
+    Ok(())
+}
+
+/// The ingest itself, over a store someone else opened — a directory writer or a container's.
+fn import_into(s: &mut Store, src: &Path) -> Result<u64> {
     use std::io::BufRead;
     let reader: Box<dyn std::io::Read> = if src.as_os_str() == "-" {
         Box::new(std::io::stdin().lock())
@@ -478,7 +503,6 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
         Box::new(std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?)
     };
     let reader = std::io::BufReader::with_capacity(1 << 22, reader);
-    let mut s = Store::open(dir, FoldCfg::default())?;
     let mut pending: Vec<PendingRecord> = Vec::new();
     let mut est_bytes = 0u64;
     let (mut n, mut applied, mut skipped, mut refused_oversize, mut logical) =
@@ -549,7 +573,7 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
                 .sum::<u64>()
             + 1024;
         if !pending.is_empty() && (pending.len() >= 1000 || est_bytes + record_est > EST_CEILING) {
-            apply_pending(&mut s, &mut pending, &mut applied, &mut refused_oversize)?;
+            apply_pending(s, &mut pending, &mut applied, &mut refused_oversize)?;
             est_bytes = 0;
         }
         est_bytes += record_est;
@@ -557,7 +581,7 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
         n += 1;
     }
     if !pending.is_empty() {
-        apply_pending(&mut s, &mut pending, &mut applied, &mut refused_oversize)?;
+        apply_pending(s, &mut pending, &mut applied, &mut refused_oversize)?;
     }
     let el = t.elapsed().as_secs_f64();
     println!(
@@ -568,7 +592,7 @@ fn import(dir: &Path, src: &Path) -> Result<()> {
         applied as f64 / el.max(0.001),
         s.part_count()
     );
-    Ok(())
+    Ok(applied)
 }
 
 const EST_CEILING: u64 = 128 << 20;
