@@ -56,6 +56,10 @@ pub const REGION_START: u64 = SLOT_LEN * 2;
 /// Bytes of a slot the format actually defines; the rest is zero and reserved.
 const SB_LEN: usize = 56;
 
+/// Suffix of the working directory a writer keeps beside a container, mirroring SQLite's `-wal`.
+/// Named here because file-level operations on a container have to know whether one exists.
+pub const HOT_SUFFIX: &str = "-hot";
+
 /// Refuse a directory that claims more than this compressed, before allocating for it.
 const MAX_DIR_STORED: u32 = 64 << 20;
 /// Refuse a directory that claims more than this decompressed.
@@ -316,6 +320,32 @@ impl Container {
         Ok(())
     }
 
+    /// Stage a member of known length, filled a window at a time by `fill(offset, into)`.
+    ///
+    /// The primitive both [`Container::ingest`] and [`reclaim`] are built on: a member is as large
+    /// as the largest part a store holds, so nothing here may assume one fits in memory.
+    pub fn put_stream(
+        &mut self,
+        name: &str,
+        len: u64,
+        mut fill: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
+    ) -> Result<()> {
+        validate_name(name)?;
+        let off = self.tail;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; (1 << 20).min(len.max(1)) as usize];
+        let mut at = 0u64;
+        while at < len {
+            let take = buf.len().min((len - at) as usize);
+            fill(at, &mut buf[..take])?;
+            crate::vfs::write_all_at(&self.f, &self.path, &buf[..take], off + at)?;
+            hasher.update(&buf[..take]);
+            at += take as u64;
+        }
+        self.stage_entry(name, off, len, hasher.finalize());
+        Ok(())
+    }
+
     /// Stage a member by streaming a file in. Returns the byte count ingested.
     pub fn ingest(&mut self, name: &str, from: &Path) -> Result<u64> {
         validate_name(name)?;
@@ -425,6 +455,87 @@ impl Container {
         }
         Ok(self.dir.len())
     }
+}
+
+/// What one [`reclaim`] recovered.
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimStats {
+    /// Members carried across; the logical content is unchanged.
+    pub members: usize,
+    /// File size before.
+    pub bytes_before: u64,
+    /// File size after.
+    pub bytes_after: u64,
+    /// Difference — superseded extents, plus whatever the directory rewrite saved.
+    pub reclaimed: u64,
+}
+
+/// Rewrite a container without the extents nothing names any more.
+///
+/// A container only grows. Restaging a member supersedes its predecessor rather than overwriting
+/// it, and freed extents are deliberately never reused — a reader that resolved an older
+/// superblock still holds offsets into them, so handing those bytes to a new member would be
+/// silent corruption rather than a detected fault. The cost of that guarantee is that a container
+/// checkpointed daily accumulates dead space forever, and this is the only thing that returns it.
+///
+/// The rewrite is a copy to a fresh file and an atomic rename, not an edit: at no point is the
+/// container being read half-rewritten, and a crash leaves the original untouched. A reader
+/// holding the old file keeps reading it — the inode outlives the name.
+///
+/// Refused while a writer's working directory exists beside the file, because that directory holds
+/// state the container has not been told about and rewriting would publish a version of the
+/// container that is about to be superseded by a checkpoint of writes it never saw.
+pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
+    let mut hot = path.as_os_str().to_os_string();
+    hot.push(HOT_SUFFIX);
+    if Path::new(&hot).exists() {
+        bail!(
+            "{} has a writer's working directory beside it; settle or close that writer first",
+            path.display()
+        );
+    }
+
+    let source = Container::open(path)?;
+    let bytes_before = std::fs::metadata(path)?.len();
+    if source.free_bytes() == 0 {
+        return Ok(ReclaimStats {
+            members: source.len(),
+            bytes_before,
+            bytes_after: bytes_before,
+            reclaimed: 0,
+        });
+    }
+
+    let staging = path.with_extension("reclaiming");
+    let _ = crate::vfs::unlink(&staging);
+    let mut fresh = Container::create(&staging)?;
+    for name in source.names().map(String::from).collect::<Vec<_>>() {
+        let extent = source
+            .extent(&name)
+            .ok_or_else(|| anyhow::anyhow!("container lost member {name} mid-reclaim"))?;
+        let len = crate::readat::ReadAt::len(&extent)?;
+        // Streamed: a part is the largest thing a store holds, and a reclaim that has to hold one
+        // in memory would fail on exactly the containers most worth reclaiming.
+        fresh.put_stream(&name, len, |at, into| {
+            crate::readat::ReadAt::read_exact_at(&extent, into, at)
+        })?;
+    }
+    let members = fresh.len();
+    fresh.commit()?;
+    fresh.verify()?;
+    drop(fresh);
+
+    let bytes_after = std::fs::metadata(&staging)?.len();
+    crate::vfs::rename(&staging, path)?;
+    if let Some(parent) = path.parent() {
+        let _ = crate::vfs::sync_dir(parent);
+    }
+    Ok(ReclaimStats {
+        members,
+        bytes_before,
+        bytes_after,
+        reclaimed: bytes_before.saturating_sub(bytes_after),
+    })
 }
 
 /// A member name is one or more normal path components joined by `/` — the same namespace a pack

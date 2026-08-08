@@ -935,6 +935,15 @@ reused.** A reader that resolved an older superblock still holds offsets into th
 those bytes to a new member would be silent corruption rather than a detected fault. Space is
 therefore reclaimed by rewriting the container, not by allocating into holes.
 
+A container consequently only grows, and a checkpoint restages `MANIFEST` whether or not anything
+else changed — so dead space accumulates with sessions, not with writes. **Reclaim** is the
+operation that returns it: every live member copied to a fresh container, committed, verified, and
+published over the original with an atomic rename. It is a copy and a rename rather than an edit,
+so the container being read is never half-rewritten and a crash leaves the original untouched; a
+reader holding the old file keeps reading it, because the inode outlives the name. Reclaim is
+refused while a writer's working directory exists beside the file — that directory holds state the
+container has not been told about.
+
 ### Writing to a container
 
 A container has no writer role, so writing means running an ordinary store on working state beside

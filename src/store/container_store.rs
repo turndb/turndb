@@ -33,11 +33,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::{checkpoint_into_container, CheckpointStats, Store};
-use crate::container::Container;
+use crate::container::{Container, HOT_SUFFIX};
 use crate::fold::FoldCfg;
-
-/// Suffix of the working directory beside a container, mirroring SQLite's `-wal`.
-const HOT_SUFFIX: &str = "-hot";
 
 /// A writable store held as one file.
 pub struct ContainerStore {
