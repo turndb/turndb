@@ -1,22 +1,42 @@
 {
   "name": "@turndb/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "The turndb command line: inspect, verify, query, and ship a store without a server running",
   "license": "Apache-2.0",
-  "bin": { "turndb": "bin/turndb.cjs" },
-  "files": ["bin/turndb.cjs", "README.md", "LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.html"],
-  "keywords": ["turndb", "cli", "storage", "content-addressed", "traces", "llm", "observability"],
+  "bin": {
+    "turndb": "bin/turndb.cjs"
+  },
+  "files": [
+    "bin/turndb.cjs",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.html"
+  ],
+  "keywords": [
+    "turndb",
+    "cli",
+    "storage",
+    "content-addressed",
+    "traces",
+    "llm",
+    "observability"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/turndb/turndb.git",
     "directory": "cli"
   },
-  "bugs": { "url": "https://github.com/turndb/turndb/issues" },
+  "bugs": {
+    "url": "https://github.com/turndb/turndb/issues"
+  },
   "homepage": "https://github.com/turndb/turndb#readme",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "optionalDependencies": {
-    "@turndb/cli-linux-x64-gnu": "0.1.1"
+    "@turndb/cli-linux-x64-gnu": "0.1.2"
   },
   "scripts": {
     "pack:release": "node scripts/pack-cli.cjs",
