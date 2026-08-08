@@ -56,3 +56,31 @@ test('reads a store held in one file, pack or container', async () => {
 
   await rm(root, { recursive: true, force: true });
 });
+
+test('the first call a new user makes reports its own failure', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'turndb-first-contact-'));
+
+  // A store directory that does not exist yet is the overwhelmingly common first call, and
+  // `Store::open` creates it — this binding must not diverge just because WASI preopens first.
+  const fresh = join(root, 'deep', 'nested', 'store');
+  const store = await open(fresh);
+  store.putBody('x', 'y');
+  store.sync();
+  store.close();
+  assert.deepEqual((await open(fresh)).scanIds(), ['x'], 'the created store must be reopenable');
+
+  // A single file cannot be created by opening it, so that is a refusal — but a refusal that
+  // names the path and carries a code, not a bare errno out of uvwasi_init.
+  await assert.rejects(
+    openFile(join(root, 'absent.turndb')),
+    (e) => e instanceof TurndbError && e.code === 'NOT_FOUND' && /absent\.turndb/.test(e.message),
+    'a missing single file must refuse by name',
+  );
+  await assert.rejects(
+    openFile(root),
+    (e) => e instanceof TurndbError && /not a regular file/.test(e.message),
+    'a directory handed to openFile must refuse as one',
+  );
+
+  await rm(root, { recursive: true, force: true });
+});

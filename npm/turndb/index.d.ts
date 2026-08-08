@@ -617,6 +617,8 @@ export declare class Store {
  * store remained internally consistent. The embedder must enforce this precondition before it can
  * treat an acknowledgement as durable fact.
  *
+ * The store directory is created if it does not exist, matching the Rust `Store::open` it wraps.
+ *
  * Within one process, sequential opens — including opens of different directories — reuse one WASI
  * instance. The directory capability is switched between handles without widening the sandbox to a
  * common ancestor. Consequently only one `Store` may be open in a process at a time; use separate

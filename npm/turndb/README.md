@@ -18,7 +18,7 @@ npm install turndb
 ```js
 import { open } from 'turndb';
 
-const store = await open('./traces');
+const store = await open('./traces');   // the directory is created if it does not exist
 
 store.putBody('alice/1700000000000/req-1#input', JSON.stringify(messages), {
   model: 'claude-opus-5',
