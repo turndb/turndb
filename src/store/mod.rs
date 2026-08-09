@@ -1196,6 +1196,19 @@ pub fn checkpoint_into_container(dir: &Path, out: &Path) -> Result<CheckpointSta
     let mut skipped = 0usize;
     for name in &names {
         let src = dir.join(name);
+        // A store that never applies a record never commits, and a directory store announces
+        // itself as new precisely by having no MANIFEST — `Manifest::load_with_limits` is explicit
+        // about that. A container has no equivalent affordance: its members ARE its state, so one
+        // holding no MANIFEST names no store and every later command refuses it. Writing the
+        // manifest the loader just handed us keeps the empty store openable without teaching the
+        // container reader a second way to be empty, and without committing behind the back of a
+        // Store this checkpoint may not own — `checkpoint()` runs with the writer still open.
+        if name == "MANIFEST" && !src.exists() {
+            let bytes = manifest.encode()?;
+            container.put_bytes(name, &bytes)?;
+            ingested += bytes.len() as u64;
+            continue;
+        }
         let src_len = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
         // MANIFEST and the live segment change in place; an immutable member of the same length is
         // already the same bytes, because parts and rolled segments are never rewritten.
