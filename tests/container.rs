@@ -379,6 +379,40 @@ fn a_container_can_be_written_to_and_stays_one_file() {
 }
 
 #[test]
+fn a_session_that_writes_nothing_still_leaves_a_container_that_opens() {
+    use turndb::store::ContainerStore;
+
+    let root = tmp("empty-writer");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("empty.turndb");
+
+    // Applying no records is not an error. `turndb write new.turndb input.jsonl` reaches exactly
+    // this state whenever every line of the input is skipped — a mistyped schema, an empty file —
+    // and it used to leave an 8 KiB container holding no members at all, because a store that
+    // never commits never writes a MANIFEST and the checkpoint ingested that name unconditionally.
+    let cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let hot = cs.hot_directory().to_path_buf();
+    cs.close().unwrap();
+
+    assert!(ct.is_file(), "the container must exist");
+    assert!(!hot.exists(), "a clean close removes the working directory");
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    assert!(rs.ids().unwrap().is_empty(), "an empty store holds no ids");
+    drop(rs);
+
+    // And it must take writes afterwards rather than stay poisoned by its own first session.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let body = noise(7, 900);
+    cs.store().put("later", &[Span::Piece(&body)], vec![]).unwrap();
+    cs.close().unwrap();
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    assert_eq!(rs.reconstruct("later").unwrap().unwrap(), body, "the later write must survive");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn an_abandoned_working_directory_is_resumed_rather_than_discarded() {
     use turndb::store::ContainerStore;
 

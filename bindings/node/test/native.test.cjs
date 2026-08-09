@@ -1520,3 +1520,34 @@ test('writes a store held in one file, end to end from Node', async (t) => {
   assert.deepEqual(rows.rows.map((r) => r.id).sort(), ['w/0001#input', 'w/0002#input']);
   await after.close();
 });
+
+test('a file store closed without a single write is still a store', async (t) => {
+  const dir = temporaryStore(t);
+  const file = path.join(dir, 'empty.turndb');
+
+  // Applying nothing is not an error, and a directory store says so by having no MANIFEST at all.
+  // A container cannot: its members are its state, so one holding no MANIFEST named no store and
+  // every later open refused the file it had just been asked to create.
+  const store = await NativeStore.openFile(file);
+  await store.close();
+
+  assert.equal(singleFileKind(file), 'container');
+  assert.equal(fs.existsSync(`${file}-hot`), false, 'a clean close removes the working directory');
+
+  const snapshot = await NativeSnapshot.openFile(file);
+  assert.deepEqual((await snapshot.scan()).rows, [], 'an empty store scans to nothing');
+  await snapshot.close();
+
+  // And it must take writes afterwards rather than stay poisoned by its own first session.
+  const body = Buffer.from('written after an empty session');
+  const later = await NativeStore.openFile(file);
+  await later.write(
+    [{ kind: 'put', id: 'w/0003#input', contents: [{ name: 'body', bytes: body }] }],
+    true,
+  );
+  await later.close();
+
+  const reopened = await NativeSnapshot.openFile(file);
+  assert.deepEqual(await reopened.readContent('w/0003#input', 'body'), body);
+  await reopened.close();
+});
