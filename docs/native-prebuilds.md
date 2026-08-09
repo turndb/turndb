@@ -122,7 +122,8 @@ unpublish or rewrite versions; an owner decides how to recover.
 Before the first release, repository owners must configure all external facts the source tree cannot:
 
 - create or confirm control of the `@turndb` npm scope and both package names;
-- configure npm trusted publishers for this repository and workflow;
+- configure npm trusted publishers for this repository naming `.github/workflows/release.yml`, the
+  workflow that *calls* this one — OIDC reports the caller, not the leaf holding the publish step;
 - create a protected GitHub environment named `npm` with required reviewer approval;
 - confirm `LICENSE`, `NOTICE`, descriptions, repository URLs, and release notes;
 - run the ordinary CI and native release workflow green at the exact tag.

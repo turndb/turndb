@@ -76,6 +76,7 @@ jobs:
         run: |
           python3 scripts/check-release-metadata.py
           python3 scripts/test-release-metadata.py
+          python3 scripts/test-release-notes.py
 
       # --all-targets --all-features EXACTLY. Narrower flags miss the test bodies behind a feature,
       # which is how a lint survived in this tree.

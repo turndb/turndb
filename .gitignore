@@ -25,3 +25,6 @@ bindings/node/node_modules/
 # repository root. A generated store is binary and content-addressed; a reviewer cannot read a diff
 # of one. The fix is the example writing to a temp dir (turndb#34) - this is the backstop, not it.
 mystore/
+
+# Python bytecode from the release control scripts, which import one another by path.
+__pycache__/
