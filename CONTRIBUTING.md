@@ -343,7 +343,14 @@ Most of these are enforced by the toolchain and need no remembering; the ones th
 - **Whether `crates.io` and `npm` metadata still describe what ships.** Registry `description`
   fields render standalone, and `package.json` is not in its own `files` list — so no sweep over
   the package payload reaches them.
-- **The npm releases' external configuration.** The owner must control the `@turndb` scope and all
-  three package names, configure trusted publishing for `.github/workflows/release-native.yml` and
-  `.github/workflows/release-wasm.yml`, and protect the GitHub `npm` environment with required
-  review. Source code cannot prove those registry and repository settings.
+- **The registries' trusted publishers.** Every publication workflow runs as a *called* workflow
+  under `.github/workflows/release.yml`. GitHub names the calling workflow in the OIDC token's
+  `workflow_ref` claim — the called one appears only in `job_workflow_ref` — and both crates.io and
+  npm match on the former. So every trusted publisher must name **`release.yml`**, never the leaf
+  that contains the publish step. Publishers pointed at the leaves were correct while releases were
+  dispatched leaf by leaf, and every one of them broke on the first orchestrated run: crates.io said
+  so precisely, npm reported `ENEEDAUTH` as though no credential had been offered at all.
+- **The npm releases' external configuration.** The owner must control the `@turndb` scope and every
+  published package name, and protect the GitHub `npm` environment with required review. A package
+  that does not yet exist on the registry has nowhere to attach a trusted publisher, so its first
+  publication needs another route. Source code cannot prove those registry and repository settings.

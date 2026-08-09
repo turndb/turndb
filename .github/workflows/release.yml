@@ -29,13 +29,16 @@ jobs:
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "turndb") | .version')"
           test -n "$version"
           echo "release_ref=v${version}" >> "$GITHUB_OUTPUT"
+      # Ahead of the tag on purpose. A release with nothing to say is a defect, and the cheapest
+      # place to discover it is before an immutable tag exists to describe.
+      - name: extract the release notes
+        env:
+          RELEASE_REF: ${{ steps.version.outputs.release_ref }}
+        run: python3 scripts/release-notes.py "${RELEASE_REF#v}" > "$RUNNER_TEMP/notes.md"
       - name: configure annotated tagger
         run: |
           git config user.name 'turndb-release'
           git config user.email 'turndb-release@users.noreply.github.com'
-      - uses: knope-dev/action@v2.1.2
-        with:
-          version: 0.23.0
       - name: ensure the annotated tag exists at this exact merge
         env:
           RELEASE_REF: ${{ steps.version.outputs.release_ref }}
@@ -51,14 +54,22 @@ jobs:
           else
             echo 'exists=false' >> "$GITHUB_OUTPUT"
           fi
-      # Knope's GitHub Release step uses the Releases API, which would create a lightweight ref if
-      # the tag were absent. The command above creates and pushes the annotated object first;
-      # Release attaches to it. On a retry, an existing GitHub release is success, not a dead end.
-      - name: create annotated tag and GitHub release
+      # This was `knope release`, which decides whether there is anything to release by comparing
+      # the prepared version against the newest git tag. The step above has just created that tag,
+      # so knope read its own precondition as proof the release existed, logged `Last tag is 0.1.2`,
+      # and exited zero having created nothing — v0.1.2 shipped with no GitHub release and a green
+      # job. Reordering is not the fix: knope's Release step reaches for the Releases API, which
+      # creates a lightweight ref when the tag is absent, and the annotated object is the thing the
+      # publication workflows verify. So the release is created here against the tag that already
+      # exists, from notes that must be non-empty. On a retry, an existing release is success.
+      - name: create the GitHub release from the changelog entry
         if: steps.github_release.outputs.exists != 'true'
-        run: knope release --verbose
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ steps.version.outputs.release_ref }}
+        run: |
+          gh release create "$RELEASE_REF" --verify-tag \
+            --title "$RELEASE_REF" --notes-file "$RUNNER_TEMP/notes.md"
 
   # Each publication workflow's publish job requests `id-token: write` for registry trusted
   # publishing. A caller job grants a called workflow at most its own permissions, and the
