@@ -29,9 +29,11 @@
 //! optimization, not a different call.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
+use super::members::ContainerMembers;
 use super::{checkpoint_into_container, CheckpointStats, Store};
 use crate::container::{Container, HOT_SUFFIX};
 use crate::fold::FoldCfg;
@@ -49,9 +51,13 @@ impl ContainerStore {
     /// Resuming an interrupted session is the default, not a repair: a hot directory that outlived
     /// its writer holds writes the container has not been told about, so it is adopted as-is.
     pub fn open(path: &Path, cfg: FoldCfg) -> Result<ContainerStore> {
-        let hot = prepare(path)?;
-        let store = Store::open(&hot, cfg)
-            .with_context(|| format!("open the working directory for {}", path.display()))?;
+        let Prepared { hot, sealed } = prepare_with_members(path)?;
+        let options = crate::store::StoreOptions { fold: cfg, ..Default::default() };
+        let store = match sealed {
+            Some(sealed) => Store::open_with_members(&hot, options, sealed),
+            None => Store::open_with_options(&hot, options),
+        }
+        .with_context(|| format!("open the working directory for {}", path.display()))?;
         Ok(ContainerStore { store: Some(store), container: path.to_path_buf(), hot })
     }
 
@@ -100,6 +106,24 @@ impl ContainerStore {
 ///
 /// Pair with [`settle`] on the way out.
 pub fn prepare(container: &Path) -> Result<PathBuf> {
+    Ok(prepare_with_members(container)?.hot)
+}
+
+/// A prepared working directory, and the sealed history left where it lies.
+pub struct Prepared {
+    /// Where this session's mutable state lives.
+    pub hot: PathBuf,
+    /// Immutable members still inside the container, for [`Store::open_with_members`]. `None` when
+    /// there is no container behind this session yet.
+    pub sealed: Option<Arc<ContainerMembers>>,
+}
+
+/// [`prepare`], also answering where the members it did not copy can be read.
+///
+/// Parts are immutable once committed, so copying them out to append one record is work with no
+/// product. They stay in the container and the writer reads them as extents; only state a session
+/// mutates — the manifest, the WAL, the live fold segment — has to be a file.
+pub fn prepare_with_members(container: &Path) -> Result<Prepared> {
     let hot = hot_path(container);
     let exists = container.exists();
 
@@ -109,17 +133,22 @@ pub fn prepare(container: &Path) -> Result<PathBuf> {
         if exists {
             // Refuse the one case that is not a resume: a working directory beside a container it
             // did not come from is a name collision, and guessing which to keep loses data.
-            Container::open(container).with_context(|| {
+            let open = Container::open(container).with_context(|| {
                 format!("{} has a hot directory but is not a container", container.display())
             })?;
+            // An adopted directory may hold its own copy of a member — an earlier session that
+            // materialized everything, or one interrupted mid-roll. `Store` prefers the directory
+            // for any name present in both, so offering the container's copy alongside is safe.
+            return Ok(Prepared { sealed: Some(Arc::new(ContainerMembers::capture(&open)?)), hot });
         }
     } else if exists {
         let open = Container::open(container)?;
         materialize(&open, &hot)?;
+        return Ok(Prepared { sealed: Some(Arc::new(ContainerMembers::capture(&open)?)), hot });
     } else {
         crate::vfs::mkdir_all(&hot)?;
     }
-    Ok(hot)
+    Ok(Prepared { hot, sealed: None })
 }
 
 /// Fold a prepared working directory back into its container and remove it.
@@ -133,6 +162,14 @@ pub fn settle(container: &Path) -> Result<CheckpointStats> {
     crate::vfs::remove_tree(&hot)
         .with_context(|| format!("remove the working directory {}", hot.display()))?;
     Ok(stats)
+}
+
+/// Whether a member name is a part.
+///
+/// The same shape the orphan sweep matches on, and deliberately not a looser test: a fold segment
+/// or a sidecar that fell through here would be left out of a working directory that needs it.
+fn is_part(name: &str) -> bool {
+    name.starts_with("part-") && name.ends_with(".part")
 }
 
 /// The working directory that belongs to a container.
@@ -164,6 +201,12 @@ fn materialize(container: &Container, hot: &Path) -> Result<()> {
 
     let mut buf = vec![0u8; 1 << 20];
     for name in container.names().map(String::from).collect::<Vec<_>>() {
+        // Parts are immutable once committed and the writer reads them as extents, so copying one
+        // out produces a second identical byte range and nothing else. Skipping them is what makes
+        // opening cost the session's own state rather than the store's whole history.
+        if is_part(&name) {
+            continue;
+        }
         let source = container
             .extent(&name)
             .ok_or_else(|| anyhow::anyhow!("container lost member {name}"))?;

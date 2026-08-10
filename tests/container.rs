@@ -413,6 +413,72 @@ fn a_session_that_writes_nothing_still_leaves_a_container_that_opens() {
 }
 
 #[test]
+fn reopening_leaves_the_sealed_parts_in_the_container() {
+    use turndb::store::ContainerStore;
+
+    let root = tmp("no-copy");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("big.turndb");
+
+    // Enough records, flushed repeatedly, to put several sealed parts in the container.
+    let mut want = Vec::new();
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    for round in 0..4u64 {
+        for i in 0..6u64 {
+            let id = format!("r:{round}:{i:02}");
+            let body = noise(round * 100 + i, 4000);
+            cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            want.push((id, body));
+        }
+        cs.store().flush().unwrap();
+    }
+    cs.close().unwrap();
+
+    let sealed: Vec<String> = {
+        let c = Container::open(&ct).unwrap();
+        c.names().filter(|n| n.starts_with("part-")).map(String::from).collect()
+    };
+    assert!(sealed.len() >= 2, "the container must hold several sealed parts: {sealed:?}");
+
+    // Reopening for writing must not copy them out. This is the whole point: the cost of opening
+    // a store to append one record was the size of its entire history.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let hot = cs.hot_directory().to_path_buf();
+    let copied: Vec<String> = std::fs::read_dir(&hot)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("part-"))
+        .collect();
+    assert!(
+        copied.is_empty(),
+        "no sealed part may be copied into the working directory: {copied:?}"
+    );
+
+    // And the writer must still read every one of them, through the container, while open.
+    for (id, body) in &want {
+        assert_eq!(
+            cs.store().reconstruct(id).unwrap().unwrap(),
+            *body,
+            "{id} must be readable from the container extent"
+        );
+    }
+
+    // A further write folds back in without losing the members it never copied.
+    let extra = noise(9999, 4000);
+    cs.store().put("r:later", &[Span::Piece(&extra)], vec![]).unwrap();
+    cs.close().unwrap();
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    for (id, body) in &want {
+        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the reopen");
+    }
+    assert_eq!(rs.reconstruct("r:later").unwrap().unwrap(), extra);
+    assert!(!hot.exists(), "a clean close removes the working directory");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn an_abandoned_working_directory_is_resumed_rather_than_discarded() {
     use turndb::store::ContainerStore;
 

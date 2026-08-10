@@ -32,6 +32,7 @@
 //! which a part could reference content that never landed.
 
 pub mod container_store;
+pub mod members;
 pub mod read;
 pub mod refold;
 pub mod wal;
@@ -1209,7 +1210,19 @@ pub fn checkpoint_into_container(dir: &Path, out: &Path) -> Result<CheckpointSta
             ingested += bytes.len() as u64;
             continue;
         }
-        let src_len = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        // A member the working directory does not hold is one the session never copied out —
+        // the container is already its only home and there is nothing to move. Deciding this on
+        // presence rather than on a length comparison matters: `metadata` on a missing file yields
+        // zero, which reads as "a different length" and sends an absent member to `ingest`, which
+        // then fails on a file that was never supposed to exist.
+        if !src.exists() {
+            if container.contains(name) {
+                skipped += 1;
+                continue;
+            }
+            bail!("MANIFEST names {name} but neither {} nor the container holds it", dir.display());
+        }
+        let src_len = std::fs::metadata(&src)?.len();
         // MANIFEST and the live segment change in place; an immutable member of the same length is
         // already the same bytes, because parts and rolled segments are never rewritten.
         let immutable = name != "MANIFEST" && !name.ends_with(".dir");
@@ -1989,6 +2002,30 @@ impl Store {
 
     /// Open a writer with explicit storage, cache, and admission configuration.
     pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
+        Self::open_over(dir, options, None)
+    }
+
+    /// Open a writer whose sealed history stays where it lies.
+    ///
+    /// `dir` holds what this session writes — the manifest, the WAL, the live fold segment. Every
+    /// immutable member the manifest names that is NOT in `dir` is read from `sealed` in place.
+    /// That is what makes opening a container cost the active segment rather than the whole store.
+    ///
+    /// The directory answers first for any name present in both: a member beside the manifest is
+    /// one this session rebuilt, and the manifest commits to that copy.
+    pub fn open_with_members(
+        dir: &Path,
+        options: StoreOptions,
+        sealed: Arc<members::ContainerMembers>,
+    ) -> Result<Store> {
+        Self::open_over(dir, options, Some(sealed))
+    }
+
+    fn open_over(
+        dir: &Path,
+        options: StoreOptions,
+        sealed: Option<Arc<members::ContainerMembers>>,
+    ) -> Result<Store> {
         let recovery_started = std::time::Instant::now();
         let StoreOptions { fold: cfg, write_limits, read_limits, part_cache_bytes } = options;
         let write_limits = write_limits.validate()?;
@@ -2078,10 +2115,33 @@ impl Store {
         let pcache = Arc::new(SectionCache::new(part_cache_bytes));
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(verification_integrity(
-                "open committed part",
-                Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits),
-            )?));
+            // A part is immutable once committed, so where it lies is placement and not identity.
+            // The directory answers first: a part the container also holds is one this session
+            // rebuilt, and the manifest commits to the copy beside it.
+            let opened = match sealed.as_ref().filter(|_| !dir.join(&p.file).exists()) {
+                Some(source) => {
+                    let reader = source.extent(&p.file).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MANIFEST names part {} but neither {} nor the container holds it",
+                            p.file,
+                            dir.display()
+                        )
+                    })?;
+                    verification_integrity(
+                        "open committed part",
+                        Part::open_reader_with_limits(
+                            Box::new(members::shared(reader)),
+                            pcache.clone(),
+                            read_limits,
+                        ),
+                    )?
+                }
+                None => verification_integrity(
+                    "open committed part",
+                    Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits),
+                )?,
+            };
+            parts.push(Arc::new(opened));
         }
 
         // A part file or fold generation no manifest names was written by a flush, merge, or
