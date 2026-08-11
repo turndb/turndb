@@ -32,6 +32,7 @@
 //! which a part could reference content that never landed.
 
 pub mod container_store;
+pub mod members;
 pub mod read;
 pub mod refold;
 pub mod wal;
@@ -1209,7 +1210,19 @@ pub fn checkpoint_into_container(dir: &Path, out: &Path) -> Result<CheckpointSta
             ingested += bytes.len() as u64;
             continue;
         }
-        let src_len = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        // A member the working directory does not hold is one the session never copied out —
+        // the container is already its only home and there is nothing to move. Deciding this on
+        // presence rather than on a length comparison matters: `metadata` on a missing file yields
+        // zero, which reads as "a different length" and sends an absent member to `ingest`, which
+        // then fails on a file that was never supposed to exist.
+        if !src.exists() {
+            if container.contains(name) {
+                skipped += 1;
+                continue;
+            }
+            bail!("MANIFEST names {name} but neither {} nor the container holds it", dir.display());
+        }
+        let src_len = std::fs::metadata(&src)?.len();
         // MANIFEST and the live segment change in place; an immutable member of the same length is
         // already the same bytes, because parts and rolled segments are never rewritten.
         let immutable = name != "MANIFEST" && !name.ends_with(".dir");
@@ -1246,6 +1259,32 @@ pub struct CheckpointStats {
     pub commit_seq: u64,
     /// Bytes now superseded inside the container, reclaimable only by rewriting it.
     pub free_bytes: u64,
+}
+
+/// The leading run of fold segments the working directory does not hold, as readers.
+///
+/// Stops at the first segment present on disk rather than gathering every absent one. The fold
+/// addresses segments by position, so a supplied segment above a directory-held one would shift
+/// every index below it; and there is no such case to serve anyway — the working directory holds
+/// the active segment and everything a session rolled after opening, which is always a suffix.
+fn sealed_fold_segments(
+    source: &members::ContainerMembers,
+    fold_path: &Path,
+    fold_gen: u32,
+) -> Result<Vec<Arc<dyn crate::readat::ReadAt>>> {
+    let prefix = if fold_gen == 0 { "fold".to_string() } else { format!("fold-{fold_gen:04}") };
+    let mut sealed = Vec::new();
+    for seg in 0u32.. {
+        if fold_path.join(crate::fold::segment::seg_name(seg)).exists() {
+            break;
+        }
+        let name = format!("{prefix}/{}", crate::fold::segment::seg_name(seg));
+        match source.extent(&name) {
+            Some(reader) => sealed.push(reader),
+            None => break,
+        }
+    }
+    Ok(sealed)
 }
 
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
@@ -1989,6 +2028,30 @@ impl Store {
 
     /// Open a writer with explicit storage, cache, and admission configuration.
     pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
+        Self::open_over(dir, options, None)
+    }
+
+    /// Open a writer whose sealed history stays where it lies.
+    ///
+    /// `dir` holds what this session writes — the manifest, the WAL, the live fold segment. Every
+    /// immutable member the manifest names that is NOT in `dir` is read from `sealed` in place.
+    /// That is what makes opening a container cost the active segment rather than the whole store.
+    ///
+    /// The directory answers first for any name present in both: a member beside the manifest is
+    /// one this session rebuilt, and the manifest commits to that copy.
+    pub fn open_with_members(
+        dir: &Path,
+        options: StoreOptions,
+        sealed: Arc<members::ContainerMembers>,
+    ) -> Result<Store> {
+        Self::open_over(dir, options, Some(sealed))
+    }
+
+    fn open_over(
+        dir: &Path,
+        options: StoreOptions,
+        sealed: Option<Arc<members::ContainerMembers>>,
+    ) -> Result<Store> {
         let recovery_started = std::time::Instant::now();
         let StoreOptions { fold: cfg, write_limits, read_limits, part_cache_bytes } = options;
         let write_limits = write_limits.validate()?;
@@ -2059,6 +2122,16 @@ impl Store {
             root_entries.saturating_add(additions),
         )?;
 
+        // Whichever segments the working directory does not hold, the sealed source must — and only
+        // the LEADING run of them, because the fold addresses segments by position. The working
+        // directory always holds the active segment, so this is every segment before it; a session
+        // resumed from a directory that materialized everything finds nothing here and opens
+        // exactly as it always did.
+        let sealed_segments = match &sealed {
+            Some(source) => sealed_fold_segments(source, &fold_path, manifest.fold_gen)?,
+            None => Vec::new(),
+        };
+
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
         // is discarded, and the log regenerates it. The punched declaration rides in with the tail
         // because recovery needs it DURING the scan: a crash mid-punch can leave a declared block's
@@ -2066,11 +2139,12 @@ impl Store {
         // and the committed tail as lost durable bytes.
         let mut fold = verification_integrity(
             "open committed fold",
-            Fold::open_at_with_limits(
+            Fold::open_at_over_with_limits(
                 &fold_path,
                 cfg,
                 manifest.fold_tail(),
                 &manifest.punched,
+                sealed_segments,
                 read_limits,
             ),
         )?;
@@ -2078,10 +2152,33 @@ impl Store {
         let pcache = Arc::new(SectionCache::new(part_cache_bytes));
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
-            parts.push(Arc::new(verification_integrity(
-                "open committed part",
-                Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits),
-            )?));
+            // A part is immutable once committed, so where it lies is placement and not identity.
+            // The directory answers first: a part the container also holds is one this session
+            // rebuilt, and the manifest commits to the copy beside it.
+            let opened = match sealed.as_ref().filter(|_| !dir.join(&p.file).exists()) {
+                Some(source) => {
+                    let reader = source.extent(&p.file).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MANIFEST names part {} but neither {} nor the container holds it",
+                            p.file,
+                            dir.display()
+                        )
+                    })?;
+                    verification_integrity(
+                        "open committed part",
+                        Part::open_reader_with_limits(
+                            Box::new(members::shared(reader)),
+                            pcache.clone(),
+                            read_limits,
+                        ),
+                    )?
+                }
+                None => verification_integrity(
+                    "open committed part",
+                    Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits),
+                )?,
+            };
+            parts.push(Arc::new(opened));
         }
 
         // A part file or fold generation no manifest names was written by a flush, merge, or

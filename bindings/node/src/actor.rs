@@ -237,6 +237,23 @@ impl Actor {
         capacity: usize,
         options: StoreOptions,
     ) -> Result<Actor> {
+        Self::open_prepared(
+            turndb::store::container_store::Prepared { hot: path.to_path_buf(), sealed: None },
+            capacity,
+            options,
+        )
+    }
+
+    /// Open over a prepared working directory, sealed members and all.
+    ///
+    /// Takes the whole [`Prepared`](turndb::store::container_store::Prepared) rather than its path
+    /// because the path alone is not a complete store when a container is behind it — the members
+    /// that stayed put are reachable only through the other half.
+    pub fn open_prepared(
+        prepared: turndb::store::container_store::Prepared,
+        capacity: usize,
+        options: StoreOptions,
+    ) -> Result<Actor> {
         if !(1..=MAX_QUEUE_CAPACITY).contains(&capacity) {
             return Err(anyhow!(
                 "command queue capacity must be between 1 and {MAX_QUEUE_CAPACITY}, got {capacity}"
@@ -244,10 +261,10 @@ impl Actor {
         }
         let (tx, rx) = mpsc::sync_channel(capacity);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let path = path.to_path_buf();
+        let path = prepared.hot.clone();
         std::thread::Builder::new()
             .name("turndb-store".into())
-            .spawn(move || match Store::open_with_options(&path, options) {
+            .spawn(move || match prepared.open(options) {
                 Ok(store) => {
                     let _ = ready_tx.send(Ok(()));
                     run(store, &path, rx);

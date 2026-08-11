@@ -1597,8 +1597,11 @@ impl NativeStore {
         let actor = napi::tokio::task::spawn_blocking(move || {
             // One implementation of the adopt-or-materialize decision, shared with the crate's
             // own ContainerStore. A second copy of it here is how the two get out of step.
-            let hot = turndb::store::container_store::prepare(&opened)?;
-            Actor::open_with_capacity_and_options(&hot, capacity as usize, store_options)
+            //
+            // The whole `Prepared` goes to the actor, not just its path: sealed members stay in the
+            // container, so the directory on its own is a store missing most of itself.
+            let prepared = turndb::store::container_store::prepare(&opened)?;
+            Actor::open_prepared(prepared, capacity as usize, store_options)
         })
         .await
         .map_err(|error| failure("join TurnDB single-file open", error))?

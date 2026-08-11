@@ -327,6 +327,32 @@ impl Fold {
         punched: &[(u32, u32)],
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
+        Fold::open_at_over_with_limits(dir, cfg, committed, punched, Vec::new(), read_limits)
+    }
+
+    /// Open a writer whose sealed segments live somewhere other than `dir`.
+    ///
+    /// `sealed` supplies segments `0..sealed.len()` as range readers — container extents, today —
+    /// and `dir` supplies the rest, the last of which is the appendable one. Copying a sealed
+    /// segment out to append to a later one is work with no product, and it is the reason opening
+    /// a container cost the size of its history.
+    ///
+    /// **The active segment is not among them, deliberately.** A container's copy of the segment
+    /// that was active when it was checkpointed can hold bytes past the committed tail — the
+    /// checkpoint ingests the file as it lies, not as the manifest bounds it — and truncating back
+    /// to that tail is precisely what recovery does. A sealed segment is one the committed tail is
+    /// strictly beyond, so no truncation can ever apply to it.
+    ///
+    /// Sidecars stay on the directory path. They are small next to the segments they describe, and
+    /// leaving them there keeps the block-directory rebuild identical for both kinds of segment.
+    pub fn open_at_over_with_limits(
+        dir: &Path,
+        cfg: FoldCfg,
+        committed: Option<FoldTail>,
+        punched: &[(u32, u32)],
+        sealed: Vec<Arc<dyn ReadAt>>,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
         let read_limits = read_limits.validate()?;
         if (cfg.seg_max as u64) > SEG_MAX_LIMIT {
             bail!(
@@ -378,12 +404,27 @@ impl Fold {
             }
         }
 
+        // Segments supplied from elsewhere occupy `0..base`; the directory continues from there.
+        // Density is checked across the union, because a gap still means a segment is missing
+        // however it was supplied.
+        let base = u32::try_from(sealed.len()).context("too many sealed fold segments")?;
         let mut nums = list_segments_with_limits(dir, read_limits)?;
         nums.sort_unstable();
         for (i, n) in nums.iter().enumerate() {
-            if *n != i as u32 {
-                bail!("fold segments are not dense: expected seg {i}, found {n}");
+            let want = base + i as u32;
+            if *n != want {
+                bail!("fold segments are not dense: expected seg {want}, found {n}");
             }
+        }
+
+        let mut sealed_headers: Vec<SegHeader> = Vec::with_capacity(sealed.len());
+        for (i, reader) in sealed.iter().enumerate() {
+            let seg = i as u32;
+            let mut hb = [0u8; SEG_HDR_LEN as usize];
+            reader
+                .read_exact_at(&mut hb, 0)
+                .with_context(|| format!("read the header of sealed fold segment {seg}"))?;
+            sealed_headers.push(SegHeader::decode(&hb, seg)?);
         }
 
         let mut headers: Vec<SegHeader> = Vec::with_capacity(nums.len());
@@ -422,6 +463,18 @@ impl Fold {
             if !retry {
                 break 'scan;
             }
+        }
+
+        if nums.is_empty() && base > 0 {
+            // Sealed history with nothing appendable in front of it. The caller materializes the
+            // active segment precisely so this cannot happen; reaching it means the working
+            // directory lost it, and inventing an empty segment here would strand every block the
+            // committed tail still points at inside a segment nothing would then be scanned into.
+            bail!(
+                "{base} sealed fold segments were supplied but {} holds no active segment to \
+                 append to — the working directory is incomplete",
+                dir.display()
+            );
         }
 
         if nums.is_empty() {
@@ -481,6 +534,16 @@ impl Fold {
             dicts.insert(h.dict_id, Arc::new(bytes));
         }
 
+        // Merged before anything reads a header, because recovery indexes `headers` by ABSOLUTE
+        // segment number — `headers[active]`. Merging after it would leave those indexes short by
+        // the number of supplied segments, which is an out-of-bounds panic when it is lucky and a
+        // silently wrong dictionary flag when it is not.
+        let mut headers = {
+            let mut all = sealed_headers;
+            all.extend(headers);
+            all
+        };
+
         let mut active = *nums.last().unwrap();
         let mut active_f = segment::open_rw(dir, active)?;
         let flen = active_f.metadata()?.len();
@@ -497,6 +560,18 @@ impl Fold {
                         "committed fold tail (seg {}, off {}) is beyond the last good block (seg {}, off {}) \
                          — the fold lost durable bytes",
                         ct.seg, ct.off, active, good_tail
+                    );
+                }
+                // Rolling back below the supplied segments is not something this can do, and it is
+                // not something it should ever be asked to do. A sealed segment is one the
+                // committed tail is strictly beyond, so a tail landing inside one means the
+                // supplier is ahead of the manifest — state was sealed that was never committed.
+                // Refusing says that; unlinking cannot, because there is no file to unlink.
+                if ct.seg < base {
+                    bail!(
+                        "committed fold tail is in segment {} but segments below {base} are sealed \
+                         and cannot be rolled back — the sealed history is ahead of the manifest",
+                        ct.seg
                     );
                 }
                 while active > ct.seg {
@@ -517,8 +592,11 @@ impl Fold {
         crate::vfs::sync_file(&active_f, &active_path)?;
         segment::fsync_dir(dir)?;
 
+        // The supplied segments sit in front of the directory's, so `headers[i]`, `readers[i]` and
+        // segment number i are all the same index — everything below addresses segments that way.
         let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(headers.len());
-        for h in &headers {
+        readers.extend(sealed.iter().cloned());
+        for h in headers.iter().skip(sealed.len()) {
             readers.push(Arc::new(segment::open_rw(dir, h.seg)?));
         }
 
