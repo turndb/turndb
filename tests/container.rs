@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use turndb::container::{Container, CONTAINER_VERSION, MAGIC, SLOT_LEN};
 use turndb::fold::FoldCfg;
+use turndb::readat::ReadAt as _;
 use turndb::store::{checkpoint_into_container, open_read_container, Span, Store};
 use turndb::AttrValue;
 
@@ -475,6 +476,160 @@ fn reopening_leaves_the_sealed_parts_in_the_container() {
     }
     assert_eq!(rs.reconstruct("r:later").unwrap().unwrap(), extra);
     assert!(!hot.exists(), "a clean close removes the working directory");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn reopening_leaves_the_sealed_fold_segments_in_the_container() {
+    use turndb::store::ContainerStore;
+
+    let root = tmp("no-copy-fold");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("deep.turndb");
+
+    // `cfg()` rolls at 16 KiB, so this leaves a fold several segments deep.
+    let mut want = Vec::new();
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    for i in 0..40u64 {
+        let id = format!("s:{i:03}");
+        let body = noise(i, 2000);
+        cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.push((id, body));
+    }
+    cs.close().unwrap();
+
+    let in_container: Vec<String> = {
+        let c = Container::open(&ct).unwrap();
+        c.names().filter(|n| n.ends_with(".fold")).map(String::from).collect()
+    };
+    assert!(
+        in_container.len() >= 3,
+        "the fixture must leave a multi-segment fold: {in_container:?}"
+    );
+
+    // Reopening copies out the segment the committed tail is in, and nothing below it. Those are
+    // sealed: the tail is strictly beyond them, so no truncation can ever apply.
+    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let hot = cs.hot_directory().to_path_buf();
+    let copied: Vec<String> = std::fs::read_dir(hot.join("fold"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".fold"))
+        .collect();
+    assert!(
+        copied.len() < in_container.len(),
+        "sealed segments must stay in the container: copied {copied:?} of {in_container:?}"
+    );
+    assert_eq!(copied.len(), 1, "only the segment holding the committed tail: {copied:?}");
+    {
+        let container_fold: u64 = {
+            let c = Container::open(&ct).unwrap();
+            in_container.iter().map(|n| c.extent(n).unwrap().len().unwrap()).sum()
+        };
+        let copied_bytes: u64 =
+            copied.iter().map(|n| std::fs::metadata(hot.join("fold").join(n)).unwrap().len()).sum();
+        // The win, in bytes rather than in file counts: what a reopen costs must be a fraction of
+        // what the store holds, and it is bounded by one segment however deep the history gets.
+        assert!(
+            copied_bytes * 4 < container_fold,
+            "reopening must copy a fraction of the fold: {copied_bytes} of {container_fold} \
+             across {} of {} segments",
+            copied.len(),
+            in_container.len()
+        );
+    }
+
+    // Every record must still reconstruct, which means the writer is reading the segments it did
+    // not copy — through the container, block by block.
+    for (id, body) in &want {
+        assert_eq!(
+            cs.store().reconstruct(id).unwrap().unwrap(),
+            *body,
+            "{id} must be readable from a sealed segment extent"
+        );
+    }
+
+    // Appending must land in the live segment and fold back in without losing the sealed ones.
+    let extra = noise(4242, 2000);
+    cs.store().put("s:extra", &[Span::Piece(&extra)], vec![]).unwrap();
+    cs.close().unwrap();
+
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    for (id, body) in &want {
+        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the reopen");
+    }
+    assert_eq!(rs.reconstruct("s:extra").unwrap().unwrap(), extra);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_committed_tail_inside_a_sealed_segment_is_refused_not_rolled_back() {
+    use std::sync::Arc;
+    use turndb::fold::{Fold, FoldTail};
+    use turndb::readat::ReadAt;
+
+    let root = tmp("sealed-rollback");
+    std::fs::create_dir_all(&root).unwrap();
+    let fold_dir = root.join("fold");
+
+    // A fold several segments deep, so there is a sealed one to aim a tail into.
+    {
+        let mut f = Fold::open(&fold_dir, cfg()).unwrap();
+        for i in 0..24u64 {
+            f.put(&noise(i, 2000)).unwrap();
+        }
+        f.sync().unwrap();
+    }
+    let mut segs: Vec<u32> = std::fs::read_dir(&fold_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| turndb::fold::segment::parse_seg_name(&e.file_name().to_string_lossy()))
+        .collect();
+    segs.sort_unstable();
+    assert!(segs.len() >= 3, "the fixture must roll several segments: {segs:?}");
+
+    // Seal everything below the last one: hand it in as a reader and take it out of the directory,
+    // which is exactly the shape a container-backed open produces.
+    // An open handle outlives the unlink on Unix, which is how a reader keeps addressing bytes the
+    // directory no longer names — the same property a container extent has.
+    let last = *segs.last().unwrap();
+    let mut sealed: Vec<Arc<dyn ReadAt>> = Vec::new();
+    for n in 0..last {
+        let path = fold_dir.join(turndb::fold::segment::seg_name(n));
+        let file = std::fs::File::open(&path).unwrap();
+        sealed.push(Arc::new(file) as Arc<dyn ReadAt>);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // A tail inside a sealed segment means whatever supplied them is AHEAD of the manifest: state
+    // was sealed that was never committed. Rolling back would mean unlinking a segment that is not
+    // a file, so this must say so rather than try.
+    let refused = Fold::open_at_over_with_limits(
+        &fold_dir,
+        cfg(),
+        Some(FoldTail { seg: 0, off: 64 }),
+        &[],
+        sealed.clone(),
+        Default::default(),
+    );
+    match refused {
+        Ok(_) => panic!("a committed tail below the sealed floor must be refused"),
+        Err(e) => {
+            let text = format!("{e:#}");
+            assert!(
+                text.contains("sealed") && text.contains("ahead of the manifest"),
+                "the refusal must name the disagreement it found: {text}"
+            );
+        }
+    }
+
+    // The same open without that disagreement is the ordinary case and must still work.
+    if let Err(e) =
+        Fold::open_at_over_with_limits(&fold_dir, cfg(), None, &[], sealed, Default::default())
+    {
+        panic!("a fold over sealed segments must open: {e:#}");
+    }
     std::fs::remove_dir_all(&root).ok();
 }
 

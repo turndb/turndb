@@ -1261,6 +1261,32 @@ pub struct CheckpointStats {
     pub free_bytes: u64,
 }
 
+/// The leading run of fold segments the working directory does not hold, as readers.
+///
+/// Stops at the first segment present on disk rather than gathering every absent one. The fold
+/// addresses segments by position, so a supplied segment above a directory-held one would shift
+/// every index below it; and there is no such case to serve anyway — the working directory holds
+/// the active segment and everything a session rolled after opening, which is always a suffix.
+fn sealed_fold_segments(
+    source: &members::ContainerMembers,
+    fold_path: &Path,
+    fold_gen: u32,
+) -> Result<Vec<Arc<dyn crate::readat::ReadAt>>> {
+    let prefix = if fold_gen == 0 { "fold".to_string() } else { format!("fold-{fold_gen:04}") };
+    let mut sealed = Vec::new();
+    for seg in 0u32.. {
+        if fold_path.join(crate::fold::segment::seg_name(seg)).exists() {
+            break;
+        }
+        let name = format!("{prefix}/{}", crate::fold::segment::seg_name(seg));
+        match source.extent(&name) {
+            Some(reader) => sealed.push(reader),
+            None => break,
+        }
+    }
+    Ok(sealed)
+}
+
 fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
     let p = retained_path(dir, commit);
     let b = read_manifest_file(&p).with_context(|| {
@@ -2096,6 +2122,16 @@ impl Store {
             root_entries.saturating_add(additions),
         )?;
 
+        // Whichever segments the working directory does not hold, the sealed source must — and only
+        // the LEADING run of them, because the fold addresses segments by position. The working
+        // directory always holds the active segment, so this is every segment before it; a session
+        // resumed from a directory that materialized everything finds nothing here and opens
+        // exactly as it always did.
+        let sealed_segments = match &sealed {
+            Some(source) => sealed_fold_segments(source, &fold_path, manifest.fold_gen)?,
+            None => Vec::new(),
+        };
+
         // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
         // is discarded, and the log regenerates it. The punched declaration rides in with the tail
         // because recovery needs it DURING the scan: a crash mid-punch can leave a declared block's
@@ -2103,11 +2139,12 @@ impl Store {
         // and the committed tail as lost durable bytes.
         let mut fold = verification_integrity(
             "open committed fold",
-            Fold::open_at_with_limits(
+            Fold::open_at_over_with_limits(
                 &fold_path,
                 cfg,
                 manifest.fold_tail(),
                 &manifest.punched,
+                sealed_segments,
                 read_limits,
             ),
         )?;

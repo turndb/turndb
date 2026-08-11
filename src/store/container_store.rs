@@ -21,12 +21,15 @@
 //! `flock` on the fold, unchanged — a container has no lock of its own, and two writers holding
 //! one `.turndb` are excluded because they contend for the same hot directory.
 //!
-//! What this does not yet do is leave sealed artifacts inside the container while writing. Parts
-//! and rolled segments are immutable and could be read as extents rather than copied out, which
-//! would make opening independent of store size; doing that means teaching the writer's fold to
-//! mix container extents with a live segment, which is surgery on the recovery path the crash
-//! simulator covers. The API here is the one that survives that change — it becomes an internal
-//! optimization, not a different call.
+//! **Sealed artifacts stay in the container while a writer works.** Parts and sealed fold segments
+//! are immutable, so they are read as extents rather than copied out, and opening costs the state a
+//! session can actually change rather than the whole store's history. What materializes is the
+//! manifest, the dictionaries, the sidecars, and fold segments from the committed tail's segment
+//! upward — the tail's own because recovery TRUNCATES it, and any above it because recovery
+//! UNLINKS those, and neither is something that can be done to a member of a container.
+//!
+//! The remaining copy is therefore bounded by `seg_max` rather than by the store: opening a 50 GB
+//! container costs one segment, not fifty gigabytes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -172,6 +175,37 @@ fn is_part(name: &str) -> bool {
     name.starts_with("part-") && name.ends_with(".part")
 }
 
+/// The lowest fold segment a working directory must hold as a real file.
+///
+/// Everything below it is sealed: the committed tail is strictly beyond it, so no truncation can
+/// ever apply. Everything from it up must be materialized — the segment holding the tail because
+/// recovery truncates it, and any segment above it because recovery UNLINKS those, which it cannot
+/// do to a member of a container.
+///
+/// A container with no readable manifest yields 0, which materializes everything. That is the
+/// conservative answer and the one that matches what this did before any of it was skipped.
+fn first_live_segment(container: &Container) -> u32 {
+    let Ok(bytes) = container.read_file_bounded("MANIFEST", crate::store::MAX_MANIFEST_BYTES)
+    else {
+        return 0;
+    };
+    match super::Manifest::parse(&bytes) {
+        Ok(manifest) => manifest.fold_tail().map(|tail| tail.seg).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// Whether `name` is a fold segment sealed below `first_live`.
+fn is_sealed_segment(name: &str, first_live: u32) -> bool {
+    let Some((_, file)) = name.rsplit_once('/') else {
+        return false;
+    };
+    match crate::fold::segment::parse_seg_name(file) {
+        Some(n) => n < first_live,
+        None => false,
+    }
+}
+
 /// The working directory that belongs to a container.
 pub fn hot_path(container: &Path) -> PathBuf {
     let mut name = container.as_os_str().to_os_string();
@@ -199,12 +233,16 @@ fn materialize(container: &Container, hot: &Path) -> Result<()> {
     let mut dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     dirs.insert(staging.clone());
 
+    let first_live = first_live_segment(container);
     let mut buf = vec![0u8; 1 << 20];
     for name in container.names().map(String::from).collect::<Vec<_>>() {
-        // Parts are immutable once committed and the writer reads them as extents, so copying one
-        // out produces a second identical byte range and nothing else. Skipping them is what makes
-        // opening cost the session's own state rather than the store's whole history.
-        if is_part(&name) {
+        // Parts and sealed segments are immutable once committed and the writer reads them as
+        // extents, so copying one out produces a second identical byte range and nothing else.
+        // Skipping them is what makes opening cost the session's own state rather than the store's
+        // whole history. Sidecars are not skipped: they are small next to the segments they
+        // describe, and leaving them on the directory path keeps the fold's block-directory
+        // rebuild identical for both kinds of segment.
+        if is_part(&name) || is_sealed_segment(&name, first_live) {
             continue;
         }
         let source = container
