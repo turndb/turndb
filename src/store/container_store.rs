@@ -54,13 +54,12 @@ impl ContainerStore {
     /// Resuming an interrupted session is the default, not a repair: a hot directory that outlived
     /// its writer holds writes the container has not been told about, so it is adopted as-is.
     pub fn open(path: &Path, cfg: FoldCfg) -> Result<ContainerStore> {
-        let Prepared { hot, sealed } = prepare_with_members(path)?;
-        let options = crate::store::StoreOptions { fold: cfg, ..Default::default() };
-        let store = match sealed {
-            Some(sealed) => Store::open_with_members(&hot, options, sealed),
-            None => Store::open_with_options(&hot, options),
-        }
-        .with_context(|| format!("open the working directory for {}", path.display()))?;
+        let prepared = prepare(path)?;
+        let hot = prepared.hot.clone();
+        let store =
+            prepared
+                .open(crate::store::StoreOptions { fold: cfg, ..Default::default() })
+                .with_context(|| format!("open the working directory for {}", path.display()))?;
         Ok(ContainerStore { store: Some(store), container: path.to_path_buf(), hot })
     }
 
@@ -100,33 +99,41 @@ impl ContainerStore {
     }
 }
 
-/// Make a container ready to be written, and answer where its working state lives.
+/// A prepared working directory, and the sealed history left where it lies.
+///
+/// Both halves or neither. This used to be a bare `PathBuf`, and it must not be one again: the
+/// directory alone is no longer a complete store, so a caller that opens a plain [`Store`] over it
+/// gets one missing every member that stayed in the container. That is not a hypothetical — it is
+/// what the native binding did the moment parts stopped being copied, and the type is what makes
+/// the second half impossible to drop.
+pub struct Prepared {
+    /// Where this session's mutable state lives.
+    pub hot: PathBuf,
+    /// Immutable members still inside the container, for [`Store::open_with_members`]. `None` when
+    /// there is no container behind this session yet, and only then.
+    pub sealed: Option<Arc<ContainerMembers>>,
+}
+
+impl Prepared {
+    /// Open the writer this prepared, routing sealed members to wherever they actually are.
+    pub fn open(self, options: crate::store::StoreOptions) -> Result<Store> {
+        match self.sealed {
+            Some(sealed) => Store::open_with_members(&self.hot, options, sealed),
+            None => Store::open_with_options(&self.hot, options),
+        }
+    }
+}
+
+/// Make a container ready to be written, and answer where its state now lives — both halves of it.
 ///
 /// Split out from [`ContainerStore::open`] because a caller that manages its own [`Store`] — the
 /// native binding's actor, for one — still has to make the same decision, and there is exactly one
 /// safe answer to it. Reimplementing the adopt rule somewhere else is how a second implementation
 /// gets it backwards.
 ///
+/// Feed the result to [`Prepared::open`] rather than opening a [`Store`] over the path yourself.
 /// Pair with [`settle`] on the way out.
-pub fn prepare(container: &Path) -> Result<PathBuf> {
-    Ok(prepare_with_members(container)?.hot)
-}
-
-/// A prepared working directory, and the sealed history left where it lies.
-pub struct Prepared {
-    /// Where this session's mutable state lives.
-    pub hot: PathBuf,
-    /// Immutable members still inside the container, for [`Store::open_with_members`]. `None` when
-    /// there is no container behind this session yet.
-    pub sealed: Option<Arc<ContainerMembers>>,
-}
-
-/// [`prepare`], also answering where the members it did not copy can be read.
-///
-/// Parts are immutable once committed, so copying them out to append one record is work with no
-/// product. They stay in the container and the writer reads them as extents; only state a session
-/// mutates — the manifest, the WAL, the live fold segment — has to be a file.
-pub fn prepare_with_members(container: &Path) -> Result<Prepared> {
+pub fn prepare(container: &Path) -> Result<Prepared> {
     let hot = hot_path(container);
     let exists = container.exists();
 
