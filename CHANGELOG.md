@@ -91,6 +91,50 @@ First release, so everything is new.
   as of 2026-08-03 and is not an independent third-party audit.
 
 [0.1.0]: https://github.com/turndb/turndb/releases/tag/v0.1.0
+## 0.1.3 (2026-08-11)
+
+### Features
+
+#### Opening a `.turndb` no longer copies its history
+
+Opening a container for writing materialized every member into the working directory first, so
+appending one record to a large store paid for a full copy of its history before the first write.
+
+Parts and sealed fold segments are immutable once committed, so where they lie is placement rather
+than identity — the manifest names them, and the read path has taken range readers rather than
+paths since packs existed. They stay in the container now and the writer reads them as extents.
+Only state a session actually mutates has to become a file.
+
+What still materializes is the manifest, the dictionaries, the sidecars, and fold segments from the
+committed tail's segment upward — that one because recovery truncates it, and any above it because
+recovery unlinks those, and neither can be done to a member of a container. Everything below is
+sealed by definition: the committed tail is strictly beyond it.
+
+The working directory answers first for any name it holds, which is what makes an interrupted
+session still resume correctly — a member beside the manifest is one that session rebuilt, and the
+manifest commits to that copy.
+
+The remaining copy is therefore bounded by the segment size rather than by the store. On a fixture
+whose fold spans seven segments, a reopen copies one of them — 8,088 bytes of 80,616.
+
+### Fixes
+
+#### A store you create but never write to is still a store
+
+Creating a `.turndb` and applying no records left a container holding no members at all — every
+later command refused it with `container member not found: MANIFEST`, and the working directory
+was left behind. Reaching it took nothing exotic: `turndb write new.turndb input.jsonl` where
+every line of the input is skipped, which is what a mistyped schema or an empty file produces.
+
+A directory store announces itself as new precisely by having no manifest on disk, and a store
+that never applies a record never commits one. A container has no equivalent affordance — its
+members *are* its state — so the checkpoint now writes the manifest it already holds rather than
+looking for a file that was never going to exist. An empty container opens, scans to nothing, and
+takes writes afterwards, exactly as the directory it mirrors always did.
+
+Existing containers were never affected: a zero-record write into one committed cleanly and kept
+its contents throughout.
+
 ## 0.1.2 (2026-08-08)
 
 ### Features

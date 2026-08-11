@@ -1,6 +1,6 @@
 {
   "name": "turndb",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A content-addressed columnar store for AI traces: byte-exact, embedded, and readable by the CLI and the Rust crate over the same directory.",
   "license": "Apache-2.0",
   "type": "module",
