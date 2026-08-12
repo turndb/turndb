@@ -3135,3 +3135,70 @@ fn a_single_file_store_lives_its_whole_life_against_one_file() {
     assert!(err.contains("sealed"), "a sealed container refuses a writer: {err}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Compaction inside the live file: a total merge streams the winners into a new member, one
+/// flip publishes the splice, superseded inputs age out of the retention window, and the sweep's
+/// frees are visible as reclaimable space in the file itself.
+#[test]
+fn a_single_file_store_compacts_in_place() {
+    let root = tmp("single-file-compact");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("compact.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body =
+        |seed: usize| -> Vec<u8> { (0..1200).map(|i| ((seed * 31 + i) % 251) as u8).collect() };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    // Three flush rounds with overlapping ids, so the merge has versions to supersede.
+    for round in 0..3usize {
+        for i in 0..10usize {
+            let id = format!("k:{:02}", (round * 5 + i) % 20);
+            s.put(&id, &[Span::Piece(&body(round * 100 + i))], vec![]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    s.delete("k:03").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // The winners as the store answers them before compaction — the oracle for after.
+    let before: Vec<(String, Option<Vec<u8>>)> = (0..20usize)
+        .map(|i| {
+            let id = format!("k:{i:02}");
+            (id.clone(), s.reconstruct(&id).unwrap())
+        })
+        .collect();
+    assert!(before.iter().any(|(_, v)| v.is_none()), "the delete must be visible");
+
+    // Total merge: four parts become one, tombstones may drop, one flip publishes the splice.
+    let stats = s.merge_range(0, 4).unwrap().expect("four parts is a mergeable run");
+    assert_eq!(stats.inputs, 4);
+    assert_eq!(stats.fold_bytes_touched, 0, "a merge must never touch content");
+    for (id, want) in &before {
+        assert_eq!(&s.reconstruct(id).unwrap(), want, "{id} must answer identically post-merge");
+    }
+
+    // Age the merge inputs out of the retention window; the sweep frees them inside the file.
+    for round in 0..5usize {
+        s.put(&format!("late:{round}"), &[Span::Piece(&body(900 + round))], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    for (id, want) in &before {
+        assert_eq!(&s.reconstruct(id).unwrap(), want, "{id} across retention aging");
+    }
+    s.close().unwrap();
+
+    // The frees are real: the file carries reclaimable space where the superseded parts were,
+    // and an independent reader answers the merged truth.
+    let c = turndb::container::Container::open(&ct).unwrap();
+    assert!(c.free_bytes() > 0, "superseded members must be free-listed, not forgotten");
+    c.verify().unwrap();
+    drop(c);
+    let r = turndb::store::open_read_container(&ct, cfg).unwrap();
+    for (id, want) in &before {
+        assert_eq!(&r.reconstruct(id).unwrap(), want, "{id} through a plain reader");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

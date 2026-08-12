@@ -1577,6 +1577,91 @@ fn every_single_file_session_crash_keeps_every_acknowledged_write() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// The native merge: answer-preserving by definition, so the sweep's invariant is total — at
+/// EVERY crash state, every record answers exactly as it did before the merge began. There is no
+/// window where the store may serve anything else: the splice publishes in one flip, and until
+/// it does, the merged member is uncommitted noise.
+#[test]
+fn every_single_file_merge_crash_answers_identically() {
+    let root = tmp("native-merge");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(500);
+        let mut seed = [i as u8; 32];
+        while b.len() < 500 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(500);
+        b
+    };
+
+    // Three parts with overlapping ids and one delete — versions to supersede, a tombstone to
+    // carry, and a mergeable run.
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for round in 0..3usize {
+            for i in 0..6usize {
+                let id = format!("m:{:02}", (round * 3 + i) % 9);
+                s.put(&id, &[Span::Piece(&body_for(round * 50 + i))], vec![]).unwrap();
+            }
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        s.delete("m:02").unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let oracle: BTreeMap<String, Option<Vec<u8>>> = {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        (0..9usize)
+            .map(|i| {
+                let id = format!("m:{i:02}");
+                let v = s.reconstruct(&id).unwrap();
+                (id, v)
+            })
+            .collect()
+    };
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        s.merge_range(0, 4).unwrap().expect("four parts merge");
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 4, "a merge must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file merge", &ops);
+
+    let stage = tmp("native-merge-stage");
+    let checked =
+        replay_recorded("single-file-merge", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the merge left a store that refuses: {e:#}")
+            });
+            for (id, want) in &oracle {
+                let got = s.reconstruct(id).unwrap();
+                assert_eq!(
+                    &got, want,
+                    "crash point {k} {variant:?}: {id} must answer identically on both sides \
+                     of a merge"
+                );
+            }
+        });
+    println!("dst single-file merge: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
 /// The WAL sidecar beside a single-file store, by the same rule the engine uses.
 fn wal_of(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_os_string();

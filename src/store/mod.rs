@@ -1932,6 +1932,16 @@ fn file_wal_path(store: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// The transient scratch directory a single-file store's maintenance uses for merge spools:
+/// `<store>.turndb-tmp/`. Exists only while an operation runs; never holds durable state; swept
+/// whole at writer open, which is what makes crashed-merge cleanup O(1) instead of a scan of
+/// whatever directory the store file happens to live in.
+fn file_tmp_dir(store: &Path) -> PathBuf {
+    let mut p = store.as_os_str().to_os_string();
+    p.push("-tmp");
+    PathBuf::from(p)
+}
+
 /// Where a store lives: a directory of files, or one container file. Everything the engine does
 /// is home-neutral above the storage seams; what branches here is only placement — where a part
 /// lands, how a manifest publishes, what a sweep frees.
@@ -2259,6 +2269,12 @@ impl Store {
         {
             let mut c = container.lock().expect("container lock poisoned");
             sweep_unreachable_container(&mut c, &manifest, read_limits)?;
+        }
+        // A crashed merge leaves its spool scratch beside the store — pre-commit garbage, removed
+        // whole. The member it was assembling is uncommitted noise needing nothing.
+        let tmp_dir = file_tmp_dir(path);
+        if tmp_dir.exists() {
+            let _ = crate::vfs::remove_tree(&tmp_dir);
         }
 
         let wal_path = file_wal_path(path);
@@ -3694,48 +3710,102 @@ impl Store {
             !self.manifest.parts.iter().any(|p| p.file == file),
             "merge output {file} collides with a live part"
         );
-        let path = self.home.dir()?.join(&file);
         // A tombstone may only be discarded when this merge covers the ENTIRE live list — otherwise a
         // part outside the run could still hold an older version of the deleted id, and dropping the
         // tombstone would resurrect it.
         let total = lo == 0 && len == self.parts.len();
-        let (meta, stats) = match crate::part::merge::merge_opts_with_control_and_limits(
-            &path,
-            &inputs,
-            self.cfg.level,
-            total,
-            control,
-            self.read_limits,
-        ) {
-            Ok(built) => built,
-            Err(error) => {
-                let _ = crate::vfs::unlink(&path);
-                return Err(error);
-            }
-        };
-
-        // Publish: the merged part is durable (part::build fsyncs) before the manifest names it, and
-        // the manifest swap is the single linearization point. A crash before it leaves the merged
-        // file as an unreachable orphan. The INPUTS are not deleted here: retained manifests still
-        // name them, so a reader inside the retention window keeps a complete snapshot on disk.
-        // They fall to the sweep when the window prunes past their last naming manifest.
+        // Publish: the merged part is durable before the manifest names it — the part fsync in a
+        // directory, the pre-flip barrier in a single file — and the manifest swap is the single
+        // linearization point. A crash before it leaves the merged output unreachable: an orphan
+        // file, or uncommitted noise past the tail. The INPUTS are not deleted here: retained
+        // manifests still name them, so a reader inside the retention window keeps a complete
+        // snapshot. They fall to the sweep when the window prunes past their last naming manifest.
         // Every fallible preparation step and the final cancellation checkpoint happen before
         // commit is attempted. Once commit starts, its ordinary crash protocol—not cancellation—
-        // decides the outcome, and the output must remain available to any retained manifest that
-        // may have landed.
-        let digest = match hash_file_with_control(&path, control, "part compaction output hashing")
-            .map(|hash| hash.to_hex().to_string())
-        {
-            Ok(digest) => digest,
-            Err(error) => {
-                let _ = crate::vfs::unlink(&path);
-                return Err(error);
+        // decides the outcome.
+        let (meta, stats, digest, opened) = match &self.home {
+            Home::Dir(dir) => {
+                let path = dir.join(&file);
+                let (meta, stats) = match crate::part::merge::merge_opts_with_control_and_limits(
+                    &path,
+                    &inputs,
+                    self.cfg.level,
+                    total,
+                    control,
+                    self.read_limits,
+                ) {
+                    Ok(built) => built,
+                    Err(error) => {
+                        let _ = crate::vfs::unlink(&path);
+                        return Err(error);
+                    }
+                };
+                let digest =
+                    match hash_file_with_control(&path, control, "part compaction output hashing")
+                        .map(|hash| hash.to_hex().to_string())
+                    {
+                        Ok(digest) => digest,
+                        Err(error) => {
+                            let _ = crate::vfs::unlink(&path);
+                            return Err(error);
+                        }
+                    };
+                if let Err(error) = control.check("part compaction") {
+                    let _ = crate::vfs::unlink(&path);
+                    return Err(error.into());
+                }
+                let opened =
+                    Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
+                (meta, stats, digest, opened)
+            }
+            Home::File { container, path } => {
+                // Spools live in the transient scratch directory beside the store; the merged
+                // part streams straight into the live file as a member, pinned in-pass.
+                let tmp = file_tmp_dir(path);
+                crate::vfs::mkdir_all(&tmp)?;
+                let member =
+                    container.lock().expect("container lock poisoned").begin_member(&file)?;
+                let built = crate::part::merge::merge_into_with_control_for_operation(
+                    member,
+                    &tmp.join("m"),
+                    &inputs,
+                    self.cfg.level,
+                    total,
+                    control,
+                    "part compaction",
+                    self.read_limits,
+                );
+                let (meta, stats, member) = match built {
+                    Ok(v) => v,
+                    Err(error) => {
+                        container.lock().expect("container lock poisoned").abandon_open_member();
+                        let _ = crate::vfs::remove_tree(&tmp);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = control.check("part compaction") {
+                    container.lock().expect("container lock poisoned").abandon_open_member();
+                    let _ = crate::vfs::remove_tree(&tmp);
+                    return Err(error.into());
+                }
+                let digest = {
+                    let mut c = container.lock().expect("container lock poisoned");
+                    PieceHash(c.finish_member(member)?).to_hex()
+                };
+                let _ = crate::vfs::remove_tree(&tmp);
+                let reader = container
+                    .lock()
+                    .expect("container lock poisoned")
+                    .extent(&file)
+                    .expect("the member was staged a moment ago");
+                let opened = Part::open_reader_with_limits(
+                    Box::new(reader),
+                    self.pcache.clone(),
+                    self.read_limits,
+                )?;
+                (meta, stats, digest, opened)
             }
         };
-        if let Err(error) = control.check("part compaction") {
-            let _ = crate::vfs::unlink(&path);
-            return Err(error.into());
-        }
         let mut m = self.manifest.clone();
         m.parts.splice(
             lo..lo + len,
@@ -3747,15 +3817,21 @@ impl Store {
                 b3: Some(digest),
             }],
         );
-        m.commit_with_limits(self.home.dir()?, self.read_limits)?;
-
-        self.parts.splice(
-            lo..lo + len,
-            [Arc::new(Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?)],
-        );
+        match &self.home {
+            Home::Dir(dir) => {
+                m.commit_with_limits(dir, self.read_limits)?;
+                sweep_unreachable_with_limits(dir, self.read_limits)?;
+            }
+            Home::File { container, .. } => {
+                let mut c = container.lock().expect("container lock poisoned");
+                m.commit_into_container(&mut c)?;
+                sweep_unreachable_container(&mut c, &m, self.read_limits)?;
+                c.commit()?; // <- the linearization point
+            }
+        }
         self.manifest = m;
         self.note_manifest_commit();
-        sweep_unreachable_with_limits(self.home.dir()?, self.read_limits)?;
+        self.parts.splice(lo..lo + len, [Arc::new(opened)]);
         Ok(Some(stats))
     }
 

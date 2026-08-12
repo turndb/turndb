@@ -389,15 +389,7 @@ pub(crate) struct Writer<S: crate::vfs::ArtifactSink = FilePartSink> {
 impl Writer<FilePartSink> {
     #[cfg(test)]
     pub(crate) fn new(path: &Path, level: i32) -> Result<Writer> {
-        Self::new_with_limits(path, level, crate::read_limits::ReadLimits::default())
-    }
-
-    pub(crate) fn new_with_limits(
-        path: &Path,
-        level: i32,
-        read_limits: crate::read_limits::ReadLimits,
-    ) -> Result<Writer> {
-        Writer::over(FilePartSink::create(path)?, level, read_limits)
+        Writer::over(FilePartSink::create(path)?, level, crate::read_limits::ReadLimits::default())
     }
 }
 
