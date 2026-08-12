@@ -844,6 +844,18 @@ tail.
                                     ^ region start, byte 8192
 ```
 
+**A member is a list of extents, not one range.** A member staged whole has exactly one, but a
+member may be *extended* across commits — the delta lands at the staging cursor and becomes the
+member's next extent, with other members' bytes between. Readers stitch the list into one logical
+range, so a part or fold segment opens out of a container byte-identical to its directory and
+pack forms whether it lies in one extent or many. Physically adjacent extents coalesce as they are
+staged, so a member extended by consecutive commits with nothing between them stays one extent.
+
+Members and every fresh extent start on a 4096-byte boundary. The padding this costs (under 4 KiB
+per fresh extent) is deliberate: hole punching deallocates whole filesystem blocks, so an unaligned
+extent strands its edges. The padding is structural — a rewrite would recreate it — and is
+therefore **not** free-listed: free space means what a rewrite can return.
+
 Both forms are read-only in the same sense the pack is: a container has no writer role and no lock.
 Writing to one is a directory operation on working state beside it, folded back in at a
 checkpoint — see [ContainerStore](#writing-to-a-container).
@@ -864,14 +876,21 @@ offset  size  field
     36     4  dir_xsum     crc32 of the STORED directory payload
     40     8  tail         first byte beyond this commit's data
     48     1  dir_codec    0 stored, 1 zstd
-    49     1  version      the container plane's reject-forward lever; this revision writes 1
-    50     2  reserved, MUST BE ZERO — and a reader must refuse otherwise
+    49     1  version      the container plane's reject-forward lever; this revision writes 2
+    50     1  flags        bit 0 SEALED; every other bit MUST be zero and a reader must refuse
+    51     1  reserved, MUST BE ZERO — and a reader must refuse otherwise
     52     4  xsum         first 4 bytes of blake3 over slot[0..52]
 ```
 
 `version` is independent of the record format version: the container plane can evolve without the
 parts and fold segments inside it changing, and a version above the reader's own refuses rather
-than misparses.
+than misparses. **Version 1** — the first published revision: one `(off, len)` pair per member, a
+free list of bare pairs, no flags — is read for exactly one purpose, opening what it already
+holds; the first commit over it publishes version 2, and nothing writes version 1 again.
+
+**A sealed container is final.** The SEALED flag refuses every further staging and commit, on this
+open and every open after it; reads are untouched. Rewriting one under another name is copying,
+which sealing cannot and does not prevent — the flag makes the *file* final, not the bytes secret.
 
 **A torn slot and a slot from the future are different failures and must not be confused.** A slot
 whose checksum does not cover its bytes was never completed; it carries no claim, and the other
@@ -888,23 +907,35 @@ varint   n_entries
 repeated n_entries times:
   varint  name_len
   bytes   name         the member's store-relative path, e.g. "MANIFEST", "fold/seg-00000000.fold"
-  varint  off          absolute offset of the member's first byte in the container
-  varint  len
-  u32     xsum         crc32 of the member's bytes
+  varint  n_extents    0 is a legal empty member
+  repeated n_extents times:
+    varint  off        absolute offset of the extent's first byte in the container
+    varint  len        MUST be at least 1 — an empty extent addresses nothing and is refused
+  u32     xsum         crc32 of the member's LOGICAL bytes, in extent order
 varint   n_free
 repeated n_free times:
   varint  off
   varint  len
+  varint  freed_seq    the commit sequence that first recorded this extent free
 ```
 
 Entries are sorted by name. A name is one or more normal path components joined by `/` — the same
 namespace a pack TOC uses, and the shape [`safe_part_file_name`](#the-manifest) already guarantees
-for manifest entries. A duplicate name is refused, and every member must lie inside the committed
-region: an entry pointing past `tail` is corruption and refuses before anything reads through it.
+for manifest entries. A duplicate name is refused, and every extent — member and free alike — must
+lie inside the committed region: one pointing past `tail` is corruption and refuses before
+anything reads through it. A `freed_seq` above the superblock's own `seq` claims a commit that has
+not happened and refuses the same way.
+
+**No byte may be claimed twice.** Member extents, free extents, and the directory's own extent
+must be pairwise disjoint. A checksum-valid directory can still lie about this — checksums prove
+bytes did not drift, not that they mean anything — so disjointness is validated at open, and an
+overlap refuses the container before a read can be served bytes that are simultaneously someone
+else's.
 
 Per-member `xsum` follows the pack's policy: not verified on the read path — the inner formats
 carry their own integrity, and content carries BLAKE3 — but verified by a deliberate scrub, and a
-writer may not omit it.
+writer may not omit it. A writer extending a member extends the checksum by CRC combination; it
+never rereads what it already wrote.
 
 ### Commit
 
@@ -921,6 +952,10 @@ torn write in step 4 fails its checksum and loses to the other slot. Recovery is
 repair: the newest slot that passes its checksum **is** the state, and uncommitted bytes past its
 tail are ignored and later overwritten.
 
+One commit legitimately skips steps 1–3: sealing with nothing staged. The committed directory is
+already durable and the new superblock re-points at it, adding only the flag — so the flip and its
+barrier are the entire commit.
+
 Skipping step 3 is the failure this ordering exists for. Without an intervening fsync the order
 dirty pages reach the platter is unspecified, so the superblock can survive while the members it
 names do not — a published pointer to bytes that never landed. The
@@ -930,19 +965,29 @@ names do not — a published pointer to bytes that never landed. The
 ### Free space
 
 `n_free` records extents that are no longer named — a member restaged under the same name
-supersedes its predecessor rather than overwriting it. **Freed extents are recorded but never
-reused.** A reader that resolved an older superblock still holds offsets into them, and handing
-those bytes to a new member would be silent corruption rather than a detected fault. Space is
-therefore reclaimed by rewriting the container, not by allocating into holes.
+supersedes its predecessor rather than overwriting it, a removed member's extents join the list
+whole, and each commit free-lists the directory it supersedes, because a directory is bytes like
+any other and leaving it uncounted is how dead space becomes unaccountable. **Freed extents are
+recorded but never reused.** A reader that resolved an older superblock still holds offsets into
+them, and handing those bytes to a new member would be silent corruption rather than a detected
+fault. Space is therefore reclaimed by rewriting the container, or — where the platform can punch
+holes — returned in place without moving an offset, which zeroes freed bytes but never repurposes
+them.
+
+`freed_seq` is what makes returning it in place a bounded risk instead of a leap: an extent may be
+deallocated only when every superblock a supported reader could still be holding postdates the
+commit that freed it. Version-1 free lists carry no stamp and read as `freed_seq` 0 — freed before
+anything a reader could still hold.
 
 A container consequently only grows, and a checkpoint restages `MANIFEST` whether or not anything
 else changed — so dead space accumulates with sessions, not with writes. **Reclaim** is the
-operation that returns it: every live member copied to a fresh container, committed, verified, and
-published over the original with an atomic rename. It is a copy and a rename rather than an edit,
-so the container being read is never half-rewritten and a crash leaves the original untouched; a
-reader holding the old file keeps reading it, because the inode outlives the name. Reclaim is
-refused while a writer's working directory exists beside the file — that directory holds state the
-container has not been told about.
+operation that returns it whole: every live member copied to a fresh container as one aligned
+extent, committed, verified, and published over the original with an atomic rename. It is a copy
+and a rename rather than an edit, so the container being read is never half-rewritten and a crash
+leaves the original untouched; a reader holding the old file keeps reading it, because the inode
+outlives the name. Reclaim is refused while a writer's working directory exists beside the file —
+that directory holds state the container has not been told about — and refused for a sealed
+container, whose bytes are final.
 
 ### Writing to a container
 

@@ -2,7 +2,7 @@
 //! without invalidating what a reader already resolved, and survives a torn commit.
 
 use std::path::{Path, PathBuf};
-use turndb::container::{Container, CONTAINER_VERSION, MAGIC, SLOT_LEN};
+use turndb::container::{Container, ALIGN, CONTAINER_VERSION, MAGIC, REGION_START, SLOT_LEN};
 use turndb::fold::FoldCfg;
 use turndb::readat::ReadAt as _;
 use turndb::store::{checkpoint_into_container, open_read_container, Span, Store};
@@ -158,8 +158,11 @@ fn superseded_space_is_still_reported_after_a_reopen() {
     c.commit().unwrap();
     c.put_bytes("rewritten", &noise(2, 5000)).unwrap();
     c.commit().unwrap();
+    // The waste is the superseded member extent plus the first commit's directory, which the
+    // second commit superseded — a directory is bytes like any other, and leaving it uncounted
+    // is how dead space becomes unaccountable.
     let staged = c.free_bytes();
-    assert_eq!(staged, 5000, "the superseded extent is waste the container still carries");
+    assert!(staged > 5000, "superseded member and directory extents are waste: {staged}");
     drop(c);
 
     // The free list has to round-trip through the directory, or a container reports itself compact
@@ -801,5 +804,383 @@ fn space_accounting_answers_for_a_single_file_store_too() {
         want,
         "a pack-backed fold must account for the same bytes too"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_member_grows_across_commits_without_being_copied() {
+    let root = tmp("grow-member");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("grow-member.turndb");
+
+    let first = noise(1, 3000);
+    let second = noise(2, 2000);
+    let third = noise(3, 1000);
+    let fourth = noise(4, 1000);
+    let fill = |src: &[u8]| {
+        let src = src.to_vec();
+        move |at: u64, into: &mut [u8]| {
+            into.copy_from_slice(&src[at as usize..at as usize + into.len()]);
+            Ok(())
+        }
+    };
+
+    let mut c = Container::create(&ct).unwrap();
+    c.put_bytes("fold/seg-00000000.fold", &first).unwrap();
+    c.commit().unwrap();
+
+    // A commit intervened (its directory landed past the member), so this extension cannot
+    // coalesce: the member gains an extent instead of being rewritten.
+    c.append_stream("fold/seg-00000000.fold", second.len() as u64, fill(&second)).unwrap();
+    c.commit().unwrap();
+
+    // Two extensions with nothing between them coalesce into one extent.
+    c.append_stream("fold/seg-00000000.fold", third.len() as u64, fill(&third)).unwrap();
+    c.append_stream("fold/seg-00000000.fold", fourth.len() as u64, fill(&fourth)).unwrap();
+    c.commit().unwrap();
+
+    let mut want = first.clone();
+    want.extend_from_slice(&second);
+    want.extend_from_slice(&third);
+    want.extend_from_slice(&fourth);
+
+    let extents = c.member_extents("fold/seg-00000000.fold").unwrap();
+    assert_eq!(extents.len(), 3, "one extent per commit that extended it: {extents:?}");
+    for &(off, _) in &extents {
+        assert_eq!(off % ALIGN, 0, "every fresh extent starts on a page: {extents:?}");
+    }
+    assert_eq!(extents[0].0, REGION_START, "the first member starts the region");
+    assert_eq!(c.read_file_bounded("fold/seg-00000000.fold", 1 << 20).unwrap(), want);
+    // The combined checksum must equal a checksum of the logical bytes, or verify would pass on
+    // writes and fail on reopen — the combine is the thing under test here.
+    assert_eq!(c.verify().unwrap(), 1);
+    drop(c);
+
+    let reopened = Container::open(&ct).unwrap();
+    assert_eq!(reopened.member_extents("fold/seg-00000000.fold").unwrap(), extents);
+    assert_eq!(reopened.read_file_bounded("fold/seg-00000000.fold", 1 << 20).unwrap(), want);
+    assert_eq!(reopened.verify().unwrap(), 1);
+
+    // The scattered member still opens through the reader seam like any contiguous one.
+    let reader = reopened.extent("fold/seg-00000000.fold").unwrap();
+    assert_eq!(reader.len().unwrap(), want.len() as u64);
+    let mut tail_bytes = vec![0u8; 1500];
+    reader.read_exact_at(&mut tail_bytes, want.len() as u64 - 1500).unwrap();
+    assert_eq!(tail_bytes, want[want.len() - 1500..]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn an_extension_after_an_intervening_member_takes_a_fresh_aligned_extent() {
+    let root = tmp("interleave");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("interleave.turndb");
+
+    let mut c = Container::create(&ct).unwrap();
+    c.put_bytes("a", &noise(1, 100)).unwrap();
+    // Nothing landed since: the extension coalesces and the member stays one extent.
+    c.append_stream("a", 50, |at, into| {
+        into.copy_from_slice(&noise(2, 50)[at as usize..at as usize + into.len()]);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(c.member_extents("a").unwrap().len(), 1, "adjacent extension must coalesce");
+
+    // A member landed between: the next extension cannot coalesce and must not overwrite it.
+    c.put_bytes("b", &noise(3, 100)).unwrap();
+    c.append_stream("a", 50, |at, into| {
+        into.copy_from_slice(&noise(4, 50)[at as usize..at as usize + into.len()]);
+        Ok(())
+    })
+    .unwrap();
+    let extents = c.member_extents("a").unwrap();
+    assert_eq!(extents.len(), 2, "an intervening member forces a fresh extent");
+    assert_eq!(extents[1].0 % ALIGN, 0, "the fresh extent starts on a page");
+    c.commit().unwrap();
+
+    let mut want_a = noise(1, 100);
+    want_a.extend_from_slice(&noise(2, 50));
+    want_a.extend_from_slice(&noise(4, 50));
+    assert_eq!(c.read_file_bounded("a", 1024).unwrap(), want_a);
+    assert_eq!(c.read_file_bounded("b", 1024).unwrap(), noise(3, 100));
+    assert_eq!(c.verify().unwrap(), 2);
+
+    // Extending a member that does not exist is a refusal, not a creation.
+    assert!(c.append_stream("nope", 1, |_, _| Ok(())).is_err());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sealed_is_final() {
+    let root = tmp("sealed");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("sealed.turndb");
+
+    // Staged content commits and seals in one flip.
+    let mut c = Container::create(&ct).unwrap();
+    c.put_bytes("kept", b"the last bytes this file will ever gain").unwrap();
+    let seq = c.commit_sealed().unwrap();
+    assert_eq!(seq, 1);
+    assert!(c.sealed());
+
+    // Every mutation refuses, on this handle and on a fresh one.
+    assert!(c.put_bytes("more", b"x").unwrap_err().to_string().contains("sealed"));
+    assert!(c.append_stream("kept", 1, |_, _| Ok(())).unwrap_err().to_string().contains("sealed"));
+    assert!(c.remove("kept").unwrap_err().to_string().contains("sealed"));
+    assert!(c.commit().unwrap_err().to_string().contains("sealed"));
+    assert!(c.commit_sealed().unwrap_err().to_string().contains("sealed"));
+    drop(c);
+
+    let reopened = Container::open(&ct).unwrap();
+    assert!(reopened.sealed(), "the flag must survive a reopen");
+    assert_eq!(
+        reopened.read_file_bounded("kept", 1024).unwrap(),
+        b"the last bytes this file will ever gain"
+    );
+    assert_eq!(reopened.verify().unwrap(), 1, "sealed refuses writes, never reads");
+    drop(reopened);
+
+    // Reclaim rewrites, and a sealed container is final: refuse, do not quietly unseal.
+    assert!(turndb::container::reclaim(&ct).unwrap_err().to_string().contains("sealed"));
+
+    // The flag is byte 50 bit 0 of the live slot, inside the checksummed prefix.
+    let bytes = std::fs::read(&ct).unwrap();
+    let live = newest_slot(&bytes);
+    assert_eq!(bytes[live + 50] & 1, 1);
+
+    // Sealing with nothing staged is a pure flip: same directory, one more commit, final.
+    let ct2 = root.join("sealed-flip.turndb");
+    let mut c = Container::create(&ct2).unwrap();
+    c.put_bytes("kept", b"payload").unwrap();
+    c.commit().unwrap();
+    let sealed_at = c.commit_sealed().unwrap();
+    assert_eq!(sealed_at, 2, "a pure seal is its own commit");
+    drop(c);
+    let r = Container::open(&ct2).unwrap();
+    assert!(r.sealed());
+    assert_eq!(r.read_file_bounded("kept", 64).unwrap(), b"payload");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The first published containers carried single-extent members and an unstamped free list. They
+/// must open exactly as written, and the first commit over one publishes the current revision —
+/// an upgrade the owner performs by writing, not a migration tool.
+#[test]
+fn the_first_published_revision_upgrades_on_first_commit() {
+    let root = tmp("first-revision");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("old.turndb");
+
+    fn vput(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    // Hand-build the old layout: two packed members with a dead gap between them (its free list
+    // recorded extents as bare pairs), then the directory, then a version-1 superblock.
+    let alpha = b"legacy payload".to_vec();
+    let beta = noise(9, 20);
+    let alpha_off = REGION_START;
+    let dead_off = alpha_off + alpha.len() as u64;
+    let beta_off = dead_off + 10;
+    let dir_off = beta_off + beta.len() as u64;
+
+    let mut payload = Vec::new();
+    vput(&mut payload, 2);
+    for (name, off, bytes) in [("alpha", alpha_off, &alpha), ("beta", beta_off, &beta)] {
+        vput(&mut payload, name.len() as u64);
+        payload.extend_from_slice(name.as_bytes());
+        vput(&mut payload, off);
+        vput(&mut payload, bytes.len() as u64);
+        payload.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+    }
+    vput(&mut payload, 1);
+    vput(&mut payload, dead_off);
+    vput(&mut payload, 10);
+
+    let tail = dir_off + payload.len() as u64;
+    let mut slot = [0u8; SLOT_LEN as usize];
+    slot[0..8].copy_from_slice(MAGIC);
+    slot[8..16].copy_from_slice(&1u64.to_le_bytes()); // seq
+    slot[16..24].copy_from_slice(&dir_off.to_le_bytes());
+    slot[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    slot[28..32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    slot[32..36].copy_from_slice(&2u32.to_le_bytes()); // n_entries
+    slot[36..40].copy_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    slot[40..48].copy_from_slice(&tail.to_le_bytes());
+    slot[48] = 0; // stored
+    slot[49] = 1; // the first published revision
+    let digest = blake3::hash(&slot[0..52]);
+    slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
+
+    let mut file = vec![0u8; REGION_START as usize];
+    file[0..SLOT_LEN as usize].copy_from_slice(&slot);
+    file.extend_from_slice(&alpha);
+    file.extend_from_slice(&noise(0, 10)); // the dead extent's bytes
+    file.extend_from_slice(&beta);
+    file.extend_from_slice(&payload);
+    std::fs::write(&ct, &file).unwrap();
+
+    // It opens exactly as written: members, bytes, and the waste it already carried.
+    let mut c = Container::open(&ct).unwrap();
+    assert_eq!(c.read_file_bounded("alpha", 64).unwrap(), alpha);
+    assert_eq!(c.read_file_bounded("beta", 64).unwrap(), beta);
+    assert_eq!(c.free_bytes(), 10, "the old free list must round-trip");
+    assert_eq!(c.verify().unwrap(), 2);
+
+    // Writing to it publishes the current revision; nothing it held is disturbed.
+    let delta = noise(11, 30);
+    c.append_stream("alpha", delta.len() as u64, |at, into| {
+        into.copy_from_slice(&delta[at as usize..at as usize + into.len()]);
+        Ok(())
+    })
+    .unwrap();
+    let seq = c.commit().unwrap();
+    assert_eq!(seq, 2);
+    drop(c);
+
+    let bytes = std::fs::read(&ct).unwrap();
+    let live = newest_slot(&bytes);
+    assert_eq!(bytes[live + 49], CONTAINER_VERSION, "a commit publishes the current revision");
+
+    let reopened = Container::open(&ct).unwrap();
+    let mut want = alpha.clone();
+    want.extend_from_slice(&delta);
+    assert_eq!(reopened.read_file_bounded("alpha", 64).unwrap(), want);
+    assert_eq!(reopened.read_file_bounded("beta", 64).unwrap(), beta);
+    assert!(reopened.free_bytes() >= 10, "old waste stays answerable after the upgrade");
+    assert_eq!(reopened.verify().unwrap(), 2);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A checksum-valid directory that lies about layout must refuse at open, before any read can be
+/// served bytes that are simultaneously someone else's. The random storm reaches these shapes by
+/// luck; this reaches each one on purpose.
+#[test]
+fn a_directory_that_lies_about_layout_is_refused_at_open() {
+    let root = tmp("layout-lies");
+    std::fs::create_dir_all(&root).unwrap();
+
+    fn vput(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    // One real member so the file has bytes to lie about.
+    let body = noise(5, 4096);
+    let member_off = REGION_START;
+
+    // Build a container around a hand-encoded directory and return the open error.
+    let build = |tag: &str, payload: &[u8], n_entries: u32, seq: u64| -> String {
+        let dir_off = member_off + body.len() as u64;
+        let tail = dir_off + payload.len() as u64;
+        let mut slot = [0u8; SLOT_LEN as usize];
+        slot[0..8].copy_from_slice(MAGIC);
+        slot[8..16].copy_from_slice(&seq.to_le_bytes());
+        slot[16..24].copy_from_slice(&dir_off.to_le_bytes());
+        slot[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        slot[28..32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        slot[32..36].copy_from_slice(&n_entries.to_le_bytes());
+        slot[36..40].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        slot[40..48].copy_from_slice(&tail.to_le_bytes());
+        slot[48] = 0; // stored
+        slot[49] = CONTAINER_VERSION;
+        let digest = blake3::hash(&slot[0..52]);
+        slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
+
+        let mut file = vec![0u8; REGION_START as usize];
+        file[0..SLOT_LEN as usize].copy_from_slice(&slot);
+        file.extend_from_slice(&noise(5, 4096));
+        file.extend_from_slice(payload);
+        let path = root.join(format!("{tag}.turndb"));
+        std::fs::write(&path, &file).unwrap();
+        match Container::open(&path) {
+            Ok(_) => panic!("{tag}: a lying directory must refuse at open"),
+            Err(e) => format!("{e:#}"),
+        }
+    };
+
+    // Two members claiming overlapping extents.
+    let mut p = Vec::new();
+    vput(&mut p, 2);
+    for (name, off, len) in [("first", member_off, 4096u64), ("second", member_off + 100, 200u64)] {
+        vput(&mut p, name.len() as u64);
+        p.extend_from_slice(name.as_bytes());
+        vput(&mut p, 1); // n_extents
+        vput(&mut p, off);
+        vput(&mut p, len);
+        p.extend_from_slice(&0u32.to_le_bytes());
+    }
+    vput(&mut p, 0);
+    assert!(build("member-overlap", &p, 2, 1).contains("overlapping"));
+
+    // A free extent under a live member's bytes.
+    let mut p = Vec::new();
+    vput(&mut p, 1);
+    vput(&mut p, 5);
+    p.extend_from_slice(b"whole");
+    vput(&mut p, 1);
+    vput(&mut p, member_off);
+    vput(&mut p, 4096);
+    p.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+    vput(&mut p, 1); // n_free
+    vput(&mut p, member_off + 1000);
+    vput(&mut p, 100);
+    vput(&mut p, 1); // freed_seq
+    assert!(build("free-overlap", &p, 1, 1).contains("overlapping"));
+
+    // A member extent reaching past the committed tail.
+    let mut p = Vec::new();
+    vput(&mut p, 1);
+    vput(&mut p, 4);
+    p.extend_from_slice(b"past");
+    vput(&mut p, 1);
+    vput(&mut p, member_off);
+    vput(&mut p, 1 << 30);
+    p.extend_from_slice(&0u32.to_le_bytes());
+    vput(&mut p, 0);
+    assert!(build("past-tail", &p, 1, 1).contains("committed region"));
+
+    // An empty extent, which addresses nothing and may not be encoded.
+    let mut p = Vec::new();
+    vput(&mut p, 1);
+    vput(&mut p, 5);
+    p.extend_from_slice(b"empty");
+    vput(&mut p, 1);
+    vput(&mut p, member_off);
+    vput(&mut p, 0);
+    p.extend_from_slice(&0u32.to_le_bytes());
+    vput(&mut p, 0);
+    assert!(build("empty-extent", &p, 1, 1).contains("empty extent"));
+
+    // A free extent claiming it was freed by a commit that has not happened.
+    let mut p = Vec::new();
+    vput(&mut p, 1);
+    vput(&mut p, 5);
+    p.extend_from_slice(b"whole");
+    vput(&mut p, 1);
+    vput(&mut p, member_off);
+    vput(&mut p, 2048);
+    p.extend_from_slice(&crc32fast::hash(&body[..2048]).to_le_bytes());
+    vput(&mut p, 1);
+    vput(&mut p, member_off + 2048);
+    vput(&mut p, 100);
+    vput(&mut p, 99); // freed_seq far beyond seq 1
+    assert!(build("future-free", &p, 1, 1).contains("has not happened"));
+
     std::fs::remove_dir_all(&root).ok();
 }
