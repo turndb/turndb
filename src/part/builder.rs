@@ -24,6 +24,13 @@ use std::path::{Path, PathBuf};
 
 /// An append-only overflow file for one unbounded section. Named `<part>.s<N>.tmp`, so a crash
 /// leaves only `*.tmp` litter for the store's sweep; deleted on `finish` and best-effort on drop.
+///
+/// Creation and removal go through the vfs seam so the crash simulator materializes the litter
+/// the writer-open sweep must handle. The CONTENT writes deliberately do not: a spool's bytes are
+/// never read by recovery, never claimed durable, and never named by anything committed — while
+/// recording them would push every appended byte into the op log and multiply every sweep by the
+/// data volume. The simulator sees spools as the empty files whose names must be swept, which is
+/// the whole of what any invariant asks of them.
 struct Spool {
     path: PathBuf,
     w: std::io::BufWriter<std::fs::File>,
@@ -33,7 +40,7 @@ struct Spool {
 impl Spool {
     fn new(base: &Path, n: usize) -> Result<Spool> {
         let path = base.with_extension(format!("s{n}.tmp"));
-        let f = std::fs::File::create(&path)
+        let f = crate::vfs::create(&path)
             .with_context(|| format!("create spool {}", path.display()))?;
         Ok(Spool { path, w: std::io::BufWriter::new(f), len: 0 })
     }
@@ -51,14 +58,14 @@ impl Spool {
         read_limits.admit_decoded(format!("new part section {section:?}"), self.len)?;
         self.w.flush()?;
         let b = std::fs::read(&self.path)?;
-        let _ = std::fs::remove_file(&self.path);
+        let _ = crate::vfs::unlink(&self.path);
         Ok(b)
     }
 }
 
 impl Drop for Spool {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = crate::vfs::unlink(&self.path);
     }
 }
 

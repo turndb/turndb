@@ -204,10 +204,31 @@ pub fn build_full_with_limits(
     seq_lo: u64,
     seq_hi: u64,
     level: i32,
-    mut resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+    resolve: impl FnMut(&PieceHash) -> Option<Loc>,
     retain: &HashMap<PieceHash, Loc>,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<PartMeta> {
+    let sink = FilePartSink::create(path)?;
+    let (meta, _) =
+        build_full_into(sink, records, tombs, seq_lo, seq_hi, level, resolve, retain, read_limits)?;
+    Ok(meta)
+}
+
+/// [`build_full`] into any sink — the seam that lets a flush assemble a part directly inside a
+/// container member instead of a file of its own. Returns the sink so a member handle can be
+/// carried back to the registration that names it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_full_into<S: crate::vfs::ArtifactSink>(
+    sink: S,
+    records: &[Record],
+    tombs: &[bool],
+    seq_lo: u64,
+    seq_hi: u64,
+    level: i32,
+    mut resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+    retain: &HashMap<PieceHash, Loc>,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(PartMeta, S)> {
     if !tombs.is_empty() && tombs.len() != records.len() {
         bail!("tombstone flags ({}) must be parallel to records ({})", tombs.len(), records.len());
     }
@@ -255,7 +276,7 @@ pub fn build_full_with_limits(
     let (id_stream, id_restarts) = idcol::build(&ids)?;
 
     // ---- lay the sections down, in a fixed order (determinism) ----
-    let mut w = Writer::new_with_limits(path, level, read_limits)?;
+    let mut w = Writer::over(sink, level, read_limits)?;
     w.section("ids", &id_stream)?;
     w.section("ids.restart", &u32s(&id_restarts))?;
     w.section("cmeta", &content.meta)?;
@@ -319,8 +340,8 @@ pub fn build_full_with_limits(
         bail!("{} records exceeds the u32 record count a part footer can name", ids.len());
     }
     let meta = PartMeta { n_records: ids.len() as u32, seq_lo, seq_hi };
-    w.finish(meta)?;
-    Ok(meta)
+    let sink = w.finish(meta)?;
+    Ok((meta, sink))
 }
 
 fn u32s(v: &[u32]) -> Vec<u8> {
@@ -330,16 +351,42 @@ fn u64s(v: &[u64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-pub(crate) struct Writer {
+/// A part landing in a file of its own — today's only shape, and the default sink. `sync` is the
+/// part's completeness barrier, exactly the fsync `finish` has always issued.
+pub(crate) struct FilePartSink {
     f: File,
     path: std::path::PathBuf,
+}
+
+impl FilePartSink {
+    pub(crate) fn create(path: &Path) -> Result<FilePartSink> {
+        let f =
+            crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
+        Ok(FilePartSink { f, path: path.to_path_buf() })
+    }
+}
+
+impl crate::vfs::ArtifactSink for FilePartSink {
+    fn write_all_at(&mut self, data: &[u8], off: u64) -> std::io::Result<()> {
+        crate::vfs::write_all_at(&self.f, &self.path, data, off)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        crate::vfs::sync_file(&self.f, &self.path)
+    }
+    fn describe(&self) -> String {
+        format!("part {}", self.path.display())
+    }
+}
+
+pub(crate) struct Writer<S: crate::vfs::ArtifactSink = FilePartSink> {
+    sink: S,
     off: u64,
     toc: Vec<(String, Section)>,
     level: i32,
     read_limits: crate::read_limits::ReadLimits,
 }
 
-impl Writer {
+impl Writer<FilePartSink> {
     #[cfg(test)]
     pub(crate) fn new(path: &Path, level: i32) -> Result<Writer> {
         Self::new_with_limits(path, level, crate::read_limits::ReadLimits::default())
@@ -350,10 +397,21 @@ impl Writer {
         level: i32,
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Writer> {
+        Writer::over(FilePartSink::create(path)?, level, read_limits)
+    }
+}
+
+impl<S: crate::vfs::ArtifactSink> Writer<S> {
+    /// Assemble into any sink — a fresh file, or a member region inside a container. The part's
+    /// internal offsets are sink-relative either way, which is the artifact-relative invariant
+    /// every reader already depends on.
+    pub(crate) fn over(
+        sink: S,
+        level: i32,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Writer<S>> {
         let read_limits = read_limits.validate()?;
-        let f =
-            crate::vfs::create(path).with_context(|| format!("create part {}", path.display()))?;
-        Ok(Writer { f, path: path.to_path_buf(), off: 0, toc: Vec::new(), level, read_limits })
+        Ok(Writer { sink, off: 0, toc: Vec::new(), level, read_limits })
     }
 
     pub(crate) fn section(&mut self, name: &str, raw: &[u8]) -> Result<()> {
@@ -367,7 +425,9 @@ impl Writer {
         let (codec, payload) = crate::fold::codec::encode(raw, None, self.level)?;
         self.read_limits
             .admit_stored(format!("new part section {name:?}"), payload.len() as u64)?;
-        crate::vfs::write_all_at(&self.f, &self.path, &payload, self.off)?;
+        self.sink
+            .write_all_at(&payload, self.off)
+            .with_context(|| format!("write section {name:?} of {}", self.sink.describe()))?;
         self.toc.push((
             name.to_string(),
             Section {
@@ -382,11 +442,11 @@ impl Writer {
         Ok(())
     }
 
-    pub(crate) fn finish(self, meta: PartMeta) -> Result<()> {
+    pub(crate) fn finish(self, meta: PartMeta) -> Result<S> {
         self.finish_version(meta, PART_VERSION)
     }
 
-    fn finish_version(self, meta: PartMeta, version: u8) -> Result<()> {
+    fn finish_version(mut self, meta: PartMeta, version: u8) -> Result<S> {
         if version > PART_VERSION {
             bail!("cannot write unsupported part version {version}");
         }
@@ -426,7 +486,9 @@ impl Writer {
         }
         self.read_limits.admit("new part TOC", toc_payload.len() as u64, toc.len() as u64)?;
         let toc_off = self.off;
-        crate::vfs::write_all_at(&self.f, &self.path, &toc_payload, toc_off)?;
+        self.sink
+            .write_all_at(&toc_payload, toc_off)
+            .with_context(|| format!("write TOC of {}", self.sink.describe()))?;
 
         let mut foot = Vec::with_capacity(FOOTER_LEN as usize);
         foot.extend_from_slice(MAGIC);
@@ -449,10 +511,13 @@ impl Writer {
         let x = blake3::hash(&foot);
         foot.extend_from_slice(&x.as_bytes()[0..4]);
         debug_assert_eq!(foot.len(), FOOTER_LEN as usize);
-        // The footer lands LAST and is the completeness marker.
-        crate::vfs::write_all_at(&self.f, &self.path, &foot, toc_off + toc_payload.len() as u64)?;
-        crate::vfs::sync_file(&self.f, &self.path)?;
-        Ok(())
+        // The footer lands LAST and is the completeness marker; the sink decides whether the
+        // barrier is its own fsync or an enclosing commit's.
+        self.sink
+            .write_all_at(&foot, toc_off + toc_payload.len() as u64)
+            .with_context(|| format!("write footer of {}", self.sink.describe()))?;
+        self.sink.sync().with_context(|| format!("sync {}", self.sink.describe()))?;
+        Ok(self.sink)
     }
 }
 
@@ -1545,6 +1610,106 @@ pub(crate) fn build_revision_one_fixture(path: &Path, seq: u64, id: &str) -> Res
 mod compatibility_tests {
     use super::*;
     use crate::fold::FoldCfg;
+
+    /// The sink seam's contract: a part assembled inside a container member is byte-identical to
+    /// the same part assembled in a file of its own, the member handle's in-pass BLAKE3 equals a
+    /// hash of those bytes, and the part opens straight off the extent. If any of these drift,
+    /// the flush that writes parts into the live file is writing a different format than every
+    /// existing reader was proven against.
+    #[test]
+    fn a_part_assembled_into_a_member_is_byte_identical_to_its_file_form() {
+        let (dir, path) = temp_part("sink-identity");
+        let records = vec![
+            crate::types::Record {
+                id: "a:1".into(),
+                contents: vec![crate::types::Content {
+                    name: "body".into(),
+                    ops: vec![crate::types::ContentOp::Lit(b"first body".to_vec())],
+                    identity: Some(crate::types::ContentHash(
+                        *blake3::hash(b"first body").as_bytes(),
+                    )),
+                }],
+                attrs: vec![("n".into(), AttrValue::Int(1))],
+            },
+            crate::types::Record {
+                id: "a:2".into(),
+                contents: vec![crate::types::Content {
+                    name: "body".into(),
+                    ops: vec![crate::types::ContentOp::Lit(b"second body".to_vec())],
+                    identity: Some(crate::types::ContentHash(
+                        *blake3::hash(b"second body").as_bytes(),
+                    )),
+                }],
+                attrs: vec![("n".into(), AttrValue::Int(2))],
+            },
+        ];
+        let retain = std::collections::HashMap::new();
+
+        let meta_file = build_full(&path, &records, &[], 1, 1, 3, |_| None, &retain).unwrap();
+        let file_bytes = std::fs::read(&path).unwrap();
+
+        let ct = dir.join("sink.turndb");
+        let mut c = crate::container::Container::create(&ct).unwrap();
+        let member = c.begin_member("part-00000001.part").unwrap();
+
+        // The tail is owned: every other staging call and the commit itself refuse mid-write.
+        assert!(c.put_bytes("elbow", b"x").unwrap_err().to_string().contains("in progress"));
+        assert!(c.commit().unwrap_err().to_string().contains("in progress"));
+
+        let (meta_member, member) = build_full_into(
+            member,
+            &records,
+            &[],
+            1,
+            1,
+            3,
+            |_| None,
+            &retain,
+            crate::read_limits::ReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(meta_member.n_records, meta_file.n_records);
+        let digest = c.finish_member(member).unwrap();
+        c.commit().unwrap();
+
+        let got = c.read_file_bounded("part-00000001.part", 1 << 20).unwrap();
+        assert_eq!(got, file_bytes, "the member form must be byte-identical to the file form");
+        assert_eq!(
+            digest,
+            *blake3::hash(&file_bytes).as_bytes(),
+            "the in-pass pin must equal a hash of the finished bytes"
+        );
+
+        let part = Part::open_reader(
+            Box::new(c.extent("part-00000001.part").unwrap()),
+            SectionCache::shared(),
+        )
+        .unwrap();
+        assert_eq!(part.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An abandoned member write leaves nothing: no entry, no free-listing, and the bytes it
+    /// landed are uncommitted noise the next stage overwrites.
+    #[test]
+    fn an_abandoned_member_write_is_noise_not_state() {
+        let (dir, _path) = temp_part("sink-abandon");
+        let ct = dir.join("abandon.turndb");
+        let mut c = crate::container::Container::create(&ct).unwrap();
+        let mut w = c.begin_member("doomed").unwrap();
+        crate::vfs::ArtifactSink::write_all_at(&mut w, b"half an artifact", 0).unwrap();
+        c.abandon_member(w);
+
+        c.put_bytes("kept", b"real").unwrap();
+        c.commit().unwrap();
+        drop(c);
+
+        let r = crate::container::Container::open(&ct).unwrap();
+        assert!(!r.contains("doomed"));
+        assert_eq!(r.read_file_bounded("kept", 64).unwrap(), b"real");
+        assert_eq!(r.verify().unwrap(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     fn temp_part(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(

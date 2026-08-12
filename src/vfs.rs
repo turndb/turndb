@@ -113,6 +113,21 @@ pub mod record {
 #[cfg(feature = "dst")]
 use record::{push, Op};
 
+/// Where a self-contained artifact's bytes land: a file of its own, or a member region inside a
+/// container. The artifact's internal offsets stay artifact-relative either way — the sink is
+/// what maps them to a place.
+///
+/// Writes arrive strictly sequentially (`off` always equals the bytes written so far); a sink may
+/// rely on that, for example to hash the artifact in the same pass that writes it. `sync` is the
+/// artifact's own completeness barrier where it has one — a sink whose durability belongs to an
+/// enclosing commit protocol makes it a no-op and its documentation says so.
+pub(crate) trait ArtifactSink {
+    fn write_all_at(&mut self, data: &[u8], off: u64) -> std::io::Result<()>;
+    fn sync(&mut self) -> std::io::Result<()>;
+    /// For error context: what a human should read when a write into this sink fails.
+    fn describe(&self) -> String;
+}
+
 #[inline]
 pub(crate) fn create(path: &Path) -> Result<File> {
     let f = File::create(path)?;

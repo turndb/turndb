@@ -78,7 +78,8 @@ const SB_LEN: usize = 56;
 
 /// Members and fresh extents start on this boundary. Hole punching deallocates whole filesystem
 /// blocks, so an unaligned extent strands its edges; the padding this costs (< 4 KiB per fresh
-/// extent, recorded as free) is what makes a freed extent's bytes actually returnable in place.
+/// extent, structural and deliberately not free-listed) is what makes a freed extent's bytes
+/// actually returnable in place.
 pub const ALIGN: u64 = 4096;
 
 /// Suffix of the working directory a writer keeps beside a container, mirroring SQLite's `-wal`.
@@ -227,6 +228,8 @@ pub struct Container {
     /// Staged members exist in the file but in no committed superblock until `commit`.
     staged: bool,
     sealed: bool,
+    /// Whether a [`MemberWrite`] handle is outstanding — it owns the tail while it lives.
+    member_open: bool,
 }
 
 impl Container {
@@ -254,6 +257,7 @@ impl Container {
             slot: 0,
             staged: false,
             sealed: false,
+            member_open: false,
         })
     }
 
@@ -311,6 +315,7 @@ impl Container {
             slot,
             staged: false,
             sealed: live.flags & SB_FLAG_SEALED != 0,
+            member_open: false,
             sb: live,
         })
     }
@@ -392,7 +397,59 @@ impl Container {
         if self.sealed {
             bail!("container {} is sealed; sealed is final", self.path.display());
         }
+        if self.member_open {
+            bail!(
+                "container {} has a member write in progress; finish or abandon it first",
+                self.path.display()
+            );
+        }
         Ok(())
+    }
+
+    /// Begin staging one member incrementally. The returned handle owns the write position and
+    /// hashes the member in the same pass that writes it — crc32 for the directory entry, BLAKE3
+    /// for whatever pin the caller keeps — so nothing is reread to register it.
+    ///
+    /// Exactly one member write may be open at a time, and every other staging call — including
+    /// `commit` — refuses while it is: the handle owns the tail, and a second writer would land
+    /// bytes inside the member being assembled. [`Container::finish_member`] registers the entry;
+    /// [`Container::abandon_member`] releases the tail and leaves the bytes as uncommitted noise,
+    /// which is exactly what they already are.
+    pub fn begin_member(&mut self, name: &str) -> Result<MemberWrite> {
+        self.ensure_writable()?;
+        validate_name(name)?;
+        let off = self.aligned_start();
+        self.member_open = true;
+        Ok(MemberWrite {
+            f: self.f.clone(),
+            path: self.path.clone(),
+            name: name.to_string(),
+            off,
+            written: 0,
+            crc: crc32fast::Hasher::new(),
+            b3: blake3::Hasher::new(),
+        })
+    }
+
+    /// Register the finished member and return the BLAKE3 of its bytes, computed while they were
+    /// written. Visible only after [`Container::commit`], durable only after that commit's
+    /// barrier — finishing a member fsyncs nothing.
+    pub fn finish_member(&mut self, w: MemberWrite) -> Result<[u8; 32]> {
+        if !self.member_open {
+            bail!("container {} has no member write in progress", self.path.display());
+        }
+        self.member_open = false;
+        let digest = *w.b3.finalize().as_bytes();
+        self.stage_entry(&w.name, w.off, w.written, w.crc.finalize());
+        Ok(digest)
+    }
+
+    /// Release an in-progress member write without registering it. Its bytes sit past the last
+    /// committed tail where no directory names them — the container's ordinary uncommitted noise,
+    /// overwritten by whatever stages next.
+    pub fn abandon_member(&mut self, w: MemberWrite) {
+        drop(w);
+        self.member_open = false;
     }
 
     /// Align the staging cursor for a fresh extent. The padding this skips is structural — a
@@ -637,6 +694,62 @@ impl Container {
             }
         }
         Ok(self.dir.len())
+    }
+}
+
+/// One member being staged incrementally: the write position, and the member's checksums
+/// accumulated in the same pass. Created by [`Container::begin_member`], consumed by
+/// [`Container::finish_member`] or [`Container::abandon_member`].
+///
+/// The handle owns no borrow of the container — exclusivity is enforced by the container
+/// refusing every other staging call while one is outstanding — so an artifact builder can hold
+/// it across its whole assembly.
+pub struct MemberWrite {
+    f: Arc<File>,
+    path: PathBuf,
+    name: String,
+    off: u64,
+    written: u64,
+    crc: crc32fast::Hasher,
+    b3: blake3::Hasher,
+}
+
+impl MemberWrite {
+    /// Bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl crate::vfs::ArtifactSink for MemberWrite {
+    fn write_all_at(&mut self, data: &[u8], off: u64) -> std::io::Result<()> {
+        // Sequential by contract: the hashers below are only meaningful if every byte passes
+        // through exactly once, in order.
+        if off != self.written {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "member {} write at {off} but {} bytes are written — sinks are sequential",
+                    self.name, self.written
+                ),
+            ));
+        }
+        crate::vfs::write_all_at(&self.f, &self.path, data, self.off + off)?;
+        self.crc.update(data);
+        self.b3.update(data);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    /// Deliberately a no-op: a member's durability belongs to the container commit that names
+    /// it — the fsync before the superblock flip is the barrier, and an artifact-level fsync here
+    /// would be a second, redundant one per part.
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        format!("member {} of container {}", self.name, self.path.display())
     }
 }
 
