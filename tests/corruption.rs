@@ -74,14 +74,18 @@ fn mutate(bytes: &mut Vec<u8>, rng: &mut Rng) {
     }
 }
 
+/// STORM_XOR varies every seed for soak runs — unset, it is 0 and the run is the deterministic
+/// default. Every mutation loop routes through this, hand-rolled ones included: a soak that only
+/// reaches some of the mutants is a soak that silently re-treads the rest. A finding reports the
+/// EFFECTIVE seed, so a discovery replays exactly by exporting that value.
+fn seeded(base: u64) -> u64 {
+    base ^ std::env::var("STORM_XOR").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
+}
+
 /// Run `f` against `rounds` mutants of `pristine`, writing each to `path` first. `f` may error all
 /// it likes; a panic is the failure, reported with the seed and round that reproduce it.
 fn storm(tag: &str, pristine: &[u8], path: &Path, rounds: usize, seed: u64, f: impl Fn(&Path)) {
-    // STORM_XOR varies every storm's seed for soak runs — unset, it is 0 and the run is the
-    // deterministic default. A finding reports the EFFECTIVE seed, so a soak discovery replays
-    // exactly by exporting that value.
-    let seed =
-        seed ^ std::env::var("STORM_XOR").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let seed = seeded(seed);
     let mut rng = Rng(seed);
     for round in 0..rounds {
         let mut m = pristine.to_vec();
@@ -221,7 +225,8 @@ fn wal_record_decode_never_panics_on_damage() {
     let mut pristine = Vec::new();
     turndb::store::wal::encode_record(&mut pristine, &r, &[(h, body_bytes)]).unwrap();
 
-    let mut rng = Rng(0xC0DEC);
+    let seed = seeded(0xC0DEC);
+    let mut rng = Rng(seed);
     for round in 0..15000 {
         let mut m = pristine.clone();
         for _ in 0..rng.below(3) + 1 {
@@ -413,7 +418,8 @@ fn a_checksum_valid_directory_with_hostile_contents_is_refused_not_trusted() {
     assert!(payload.len() > 32, "the fixture directory must have entries to damage");
 
     let target = dir.join("hostile.turndb");
-    let mut rng = Rng(0xD142EC);
+    let seed = seeded(0xD142EC);
+    let mut rng = Rng(seed);
     let mut opened = 0usize;
     for round in 0..4000 {
         let mut mutated = payload.clone();
@@ -455,8 +461,8 @@ fn a_checksum_valid_directory_with_hostile_contents_is_refused_not_trusted() {
         let survived = match r {
             Ok(v) => v,
             Err(_) => panic!(
-                "container directory: PANIC on a checksum-valid hostile directory (round {round}) \
-                 — a parser must refuse, not panic"
+                "container directory: PANIC on a checksum-valid hostile directory (seed {seed}, round \
+                 {round}) — a parser must refuse, not panic"
             ),
         };
         if survived {

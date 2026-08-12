@@ -248,8 +248,8 @@ worthless.
 
 ```sh
 cargo test                              # the ordinary suites
-cargo test --features dst --test dst    # every crash state of six recorded protocols, strict POSIX
-cargo test --test corruption            # ~40k mutants across every parser
+cargo test --features dst --test dst    # every crash state of seven recorded protocols, strict POSIX
+cargo test --test corruption            # ~48k mutants across every parser
 STORM_XOR=$RANDOM cargo test --test corruption   # fresh mutant space
 ```
 
