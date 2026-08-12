@@ -320,6 +320,20 @@ impl Container {
         })
     }
 
+    /// Take the single-writer role on this container: an exclusive advisory lock on the file
+    /// itself, exactly where SQLite puts it. The kernel releases it when the descriptor closes —
+    /// including on a crash — so a stale lock cannot outlive its owner. On `wasm32-wasip1` the
+    /// call succeeds unconditionally and gates nothing; the single-writer invariant is the
+    /// embedder's to keep, unchanged from the directory store's statement of the same caveat.
+    pub fn lock_writer(&self) -> Result<()> {
+        if !crate::sys::lock_exclusive(&self.f)
+            .with_context(|| format!("locking {}", self.path.display()))?
+        {
+            bail!("{} already has a writer; a store takes exactly one", self.path.display());
+        }
+        Ok(())
+    }
+
     /// The committed sequence this handle is reading.
     pub fn seq(&self) -> u64 {
         self.sb.seq
@@ -495,6 +509,13 @@ impl Container {
     /// overwritten by whatever stages next.
     pub fn abandon_member(&mut self, w: MemberWrite) {
         drop(w);
+        self.abandon_open_member();
+    }
+
+    /// [`Container::abandon_member`] for the caller whose handle was consumed by the failure —
+    /// an assembly that errored owns no `MemberWrite` to hand back, only the duty to release
+    /// the tail. Single-writer makes this unambiguous: an open member write is always ours.
+    pub fn abandon_open_member(&mut self) {
         self.member_open = false;
     }
 

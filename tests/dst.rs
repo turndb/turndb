@@ -1471,6 +1471,119 @@ fn every_container_session_crash_keeps_every_acknowledged_write() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// The NATIVE single-file session: `Store::open_file`, writes, an ACK, a flush — the protocol
+/// whose superblock flip is the linearization point — more writes, another ACK that is never
+/// flushed, and a session end with the `-wal` sidecar left behind. Every crash state must reopen
+/// from the file plus that sidecar alone: opening never refuses, an acknowledged record that
+/// comes back is byte-exact, and nothing committed before the session can vanish. This is the
+/// sweep the hot-directory session sweep retires into once the bridge is deleted.
+#[test]
+fn every_single_file_session_crash_keeps_every_acknowledged_write() {
+    let root = tmp("native-session");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(600);
+        let mut seed = [i as u8; 32];
+        while b.len() < 600 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(600);
+        b
+    };
+
+    // A committed baseline from an earlier, cleanly closed session: exactly one file at rest.
+    let mut before = BTreeMap::new();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..5 {
+            let id = format!("before:{i}");
+            let body = body_for(700 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            before.insert(id, body);
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    assert!(!wal_of(&file).exists(), "a clean close leaves only the file");
+
+    let mut acked = before.clone();
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..3 {
+            let id = format!("acked:a{i}");
+            let body = body_for(800 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            acked.insert(id, body);
+        }
+        s.sync().unwrap(); // ACK — durable in the sidecar from here
+        s.flush().unwrap(); // the flip: fold delta, part, manifests, one barrier, one slot
+        for i in 0..3 {
+            let id = format!("acked:b{i}");
+            let body = body_for(900 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            acked.insert(id, body);
+        }
+        s.sync().unwrap(); // ACKed and never flushed: the sidecar alone carries these
+        drop(s); // the session dies without closing — the -wal stays behind
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 20, "a session must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file session", &ops);
+
+    let stage = tmp("native-session-stage");
+    let checked =
+        replay_recorded("single-file-session", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!(
+                    "crash point {k} {variant:?}: the single-file store refused to reopen: {e:#}"
+                )
+            });
+            let mut found = 0usize;
+            for (id, body) in &acked {
+                match s.reconstruct(id).unwrap() {
+                    Some(got) => {
+                        assert_eq!(
+                            got, *body,
+                            "crash point {k} {variant:?}: {id} came back but drifted"
+                        );
+                        found += 1;
+                    }
+                    None => assert!(
+                        !before.contains_key(id),
+                        "crash point {k} {variant:?}: {id} predates this session and vanished"
+                    ),
+                }
+            }
+            assert!(
+                found >= before.len(),
+                "crash point {k} {variant:?}: recovered {found} records, fewer than the {} \
+                 committed before the session began",
+                before.len()
+            );
+        });
+    println!("dst single-file session: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The WAL sidecar beside a single-file store, by the same rule the engine uses.
+fn wal_of(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_os_string();
+    name.push("-wal");
+    PathBuf::from(name)
+}
+
 /// The working directory beside a container, by the same rule the engine uses.
 fn hot_of(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_os_string();

@@ -3017,3 +3017,121 @@ fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     assert_eq!(tail.events, [*cancelled]);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The single-file writer's whole life: born from an absent path, records in, three-fsync
+/// flushes, crash recovery from the WAL sidecar alone, reader parity, exclusion by flock on the
+/// file itself, and a clean close that leaves exactly one file at rest.
+#[test]
+fn a_single_file_store_lives_its_whole_life_against_one_file() {
+    let root = tmp("single-file-life");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_mul(31).wrapping_add((i % 251) as u8)).collect()
+    };
+
+    // Born from an absent path, exactly as a directory store is.
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    let mut want: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..24u8 {
+        let id = format!("r:{i:02}");
+        let b = body(i, 1500);
+        s.put(
+            &id,
+            &[Span::Lit(b"["), Span::Piece(&b), Span::Lit(b"]")],
+            vec![("n".into(), AttrValue::Int(i64::from(i)))],
+        )
+        .unwrap();
+        let mut w = b"[".to_vec();
+        w.extend_from_slice(&b);
+        w.extend_from_slice(b"]");
+        want.push((id, w));
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // A second writer refuses while this one holds the file.
+    let second_err = match Store::open_file(&ct, cfg) {
+        Ok(_) => panic!("a second writer must refuse while the first holds the file"),
+        Err(e) => e.to_string(),
+    };
+    assert!(second_err.contains("already has a writer"), "flock on the file is the gate");
+
+    // Second flush: the retained log grows as members, parts accumulate.
+    for i in 24..40u8 {
+        let id = format!("r:{i:02}");
+        let b = body(i, 1500);
+        s.put(&id, &[Span::Lit(b"["), Span::Piece(&b), Span::Lit(b"]")], vec![]).unwrap();
+        let mut w = b"[".to_vec();
+        w.extend_from_slice(&b);
+        w.extend_from_slice(b"]");
+        want.push((id, w));
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    for (id, w) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), w, "{id} through the live writer");
+    }
+    drop(s);
+
+    // While hot: the file and its WAL sidecar, nothing else.
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["live.turndb".to_string(), "live.turndb-wal".to_string()]);
+
+    // Reopen: everything back, including through an independent reader of the same file.
+    let s = Store::open_file(&ct, cfg).unwrap();
+    for (id, w) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), w, "{id} after reopen");
+    }
+    drop(s);
+    let r = turndb::store::open_read_container(&ct, cfg).unwrap();
+    assert_eq!(r.ids().unwrap().len(), want.len());
+    for (id, w) in &want {
+        assert_eq!(&r.reconstruct(id).unwrap().unwrap(), w, "{id} through a plain reader");
+    }
+    drop(r);
+
+    // The crash story: acknowledged but never flushed. The WAL sidecar alone must carry it.
+    {
+        let mut s = Store::open_file(&ct, cfg).unwrap();
+        let b = body(99, 2000);
+        s.put("crash:1", &[Span::Piece(&b)], vec![("late".into(), AttrValue::Bool(true))]).unwrap();
+        s.delete("r:00").unwrap();
+        s.sync().unwrap(); // the ACK — and then the writer dies without ever flushing
+                           // (drop releases the flock as process death would; only flush truncates the WAL, so the
+                           // sidecar still carries everything acknowledged — the state a crash leaves)
+    }
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    assert_eq!(s.reconstruct("crash:1").unwrap().unwrap(), body(99, 2000), "acked writes replay");
+    assert!(s.reconstruct("r:00").unwrap().is_none(), "acked deletes replay");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    for (id, w) in want.iter().skip(1) {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), w, "{id} across the crash");
+    }
+
+    // Clean close: exactly one file at rest.
+    s.close().unwrap();
+    let names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["live.turndb".to_string()], "a closed store is one file");
+
+    // Sealed is final for writers too.
+    {
+        let mut c = turndb::container::Container::open(&ct).unwrap();
+        c.commit_sealed().unwrap();
+    }
+    let err = match Store::open_file(&ct, cfg) {
+        Ok(_) => panic!("a sealed container must refuse a writer"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("sealed"), "a sealed container refuses a writer: {err}");
+    std::fs::remove_dir_all(&root).ok();
+}
