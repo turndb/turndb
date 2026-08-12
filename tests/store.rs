@@ -3202,3 +3202,79 @@ fn a_single_file_store_compacts_in_place() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Erasure inside the live file: tombstone → flush → total merge → refold, ending in ONE flip
+/// that swaps the generation, purges the retained log, and frees the old generation's members.
+/// Reachability ends atomically; the freed bytes await punch or reclaim, which is the free
+/// list's job to account for.
+#[test]
+fn a_single_file_store_erases_content_and_purges_history() {
+    let root = tmp("single-file-erase");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("erase.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    // Incompressible bodies, so dropped content is a visible fraction of the fold.
+    let body = |seed: u64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(3000);
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        while out.len() < 3000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(3000);
+        out
+    };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for i in 0..8u64 {
+        s.put(&format!("e:{i:02}"), &[Span::Piece(&body(i))], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let stats = s.erase_ids(&["e:03".to_string()]).unwrap();
+    let refold = stats.refold.as_ref().expect("an erase that dropped a record must refold");
+    assert!(refold.pieces_dropped > 0, "the erased body's pieces must drop: {stats:?}");
+    assert!(s.reconstruct("e:03").unwrap().is_none(), "erased means unreachable");
+    for i in (0..8u64).filter(|&i| i != 3) {
+        assert_eq!(
+            s.reconstruct(&format!("e:{i:02}")).unwrap().unwrap(),
+            body(i),
+            "e:{i:02} must survive the erasure byte-exact"
+        );
+    }
+    s.close().unwrap();
+
+    // The file's own testimony: generation 1 lives, generation 0 is freed, the retained log is
+    // purged to one commit, and the superseded bytes are on the free list.
+    let c = turndb::container::Container::open(&ct).unwrap();
+    let names: Vec<String> = c.names().map(String::from).collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("fold-0001/")),
+        "the new generation's members must exist: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("fold/")),
+        "the old generation must be freed in the same flip: {names:?}"
+    );
+    let retained: Vec<&String> = names.iter().filter(|n| n.starts_with("MANIFEST.")).collect();
+    assert_eq!(retained.len(), 1, "time travel does not cross a refold: {names:?}");
+    assert!(
+        names.iter().all(|n| !n.starts_with("part-") || n.starts_with("part-r0001-")),
+        "only the rebuilt parts survive: {names:?}"
+    );
+    assert!(c.free_bytes() > 0, "the abandoned generation is free space, accounted for");
+    c.verify().unwrap();
+    drop(c);
+
+    // And the store still answers, through the writer and through a plain reader.
+    let s = Store::open_file(&ct, cfg).unwrap();
+    assert!(s.reconstruct("e:03").unwrap().is_none());
+    assert_eq!(s.reconstruct("e:07").unwrap().unwrap(), body(7));
+    s.close().unwrap();
+    let r = turndb::store::open_read_container(&ct, cfg).unwrap();
+    assert_eq!(r.ids().unwrap().len(), 7);
+    std::fs::remove_dir_all(&root).ok();
+}

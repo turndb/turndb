@@ -512,6 +512,20 @@ impl Container {
         self.abandon_open_member();
     }
 
+    /// Throw away every staged change and return to the committed state — the in-memory
+    /// equivalent of dropping the handle and reopening. For a failed multi-member staging run (a
+    /// refold stages a whole generation), this is the unwind: the bytes written stay where they
+    /// are as uncommitted noise, and the directory view snaps back to what the superblock says.
+    pub fn discard_staged(&mut self) -> Result<()> {
+        let (dir, free) = read_directory(&self.f, &self.path, &self.sb)?;
+        self.dir = dir;
+        self.free = free;
+        self.tail = self.sb.tail;
+        self.staged = false;
+        self.member_open = false;
+        Ok(())
+    }
+
     /// [`Container::abandon_member`] for the caller whose handle was consumed by the failure —
     /// an assembly that errored owns no `MemberWrite` to hand back, only the duty to release
     /// the tail. Single-writer makes this unambiguous: an open member write is always ours.

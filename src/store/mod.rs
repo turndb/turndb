@@ -4928,8 +4928,6 @@ impl Store {
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<refold::RefoldStats> {
-        // Not yet taught the single-file protocol; refuses there rather than inventing paths.
-        let dir = self.home.dir()?.to_path_buf();
         control.check("content refold")?;
         if !self.mem.is_empty() {
             bail!("refold requires a flushed memtable; call sync() and flush() first");
@@ -4937,6 +4935,11 @@ impl Store {
         if self.parts.is_empty() {
             return Ok(refold::RefoldStats::default());
         }
+        if let Home::File { container, .. } = &self.home {
+            let container = container.clone();
+            return self.refold_in_file(container, control);
+        }
+        let dir = self.home.dir()?.to_path_buf();
         self.admit_store_directory_growth(self.parts.len() as u64 + 3, "content refold")?;
         let seqs: Vec<(u64, u64)> =
             self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
@@ -5051,6 +5054,98 @@ impl Store {
         if refold::fold_dir(&dir, old_gen).exists() {
             stats.stale_generation_left = true;
         }
+        Ok(stats)
+    }
+
+    /// The refold's single-file form. The build stages a whole new generation and its rebuilt
+    /// parts as uncommitted members; publication is ONE flip carrying the swap, the retained-log
+    /// purge, and the sweep's frees. The directory protocol's hardest ordering problem — a crash
+    /// between the commit and the purge leaving erased content readable through a retained name —
+    /// cannot occur: the purge IS part of the commit. Time travel does not cross a refold, here
+    /// by construction rather than by propagated unlinks.
+    fn refold_in_file(
+        &mut self,
+        container: std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
+        control: &crate::control::OperationControl,
+    ) -> Result<refold::RefoldStats> {
+        let seqs: Vec<(u64, u64)> =
+            self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
+        let (new_gen, built, mut stats, nf) =
+            refold::refold_into_container_with_control_and_limits(
+                container.clone(),
+                &self.parts,
+                &seqs,
+                &self.fold,
+                self.manifest.fold_gen,
+                self.cfg,
+                control,
+                self.read_limits,
+            )?;
+
+        let mut m = self.manifest.clone();
+        m.parts = built
+            .iter()
+            .map(|(file, lo, hi, n, b3)| PartRef {
+                file: file.clone(),
+                seq_lo: *lo,
+                seq_hi: *hi,
+                records: *n,
+                b3: Some(b3.clone()),
+            })
+            .collect();
+        m.fold_gen = new_gen;
+        // Block ids are PER GENERATION; the new fold has no holes to declare.
+        m.punched.clear();
+        let t = nf.tail();
+        m.fold_seg = t.seg;
+        m.fold_off = t.off;
+        if let Err(error) = control.check("content refold publication") {
+            let _ = container.lock().expect("container lock poisoned").discard_staged();
+            return Err(error.into());
+        }
+        {
+            let mut c = container.lock().expect("container lock poisoned");
+            if let Err(error) = m.commit_into_container(&mut c) {
+                let _ = c.discard_staged();
+                return Err(error);
+            }
+            // The purge, staged into the SAME commit: every retained manifest except this
+            // commit's own goes, because a retained name would keep the superseded generation —
+            // deleted content included — readable for MANIFEST_RETAIN more commits.
+            for commit in container_retained_commits(&c) {
+                if commit != m.commit {
+                    let _ = c.remove(&format!("MANIFEST.{commit:08}"));
+                }
+            }
+            // With no retained pins left, the sweep frees the old generation and every
+            // superseded part in the same state that abandons them.
+            sweep_unreachable_container(&mut c, &m, self.read_limits)?;
+            c.commit().context(
+                "re-fold staged completely but the publishing flip failed — nothing was \
+                 published; reopen the store",
+            )?;
+        }
+
+        self.manifest = m;
+        self.note_manifest_commit();
+        self.retained_commit_count = 1;
+        let part_cache_budget = self.pcache.budget();
+        self.pcache = Arc::new(SectionCache::new(part_cache_budget));
+        self.parts.clear();
+        for p in &self.manifest.parts {
+            let reader =
+                container.lock().expect("container lock poisoned").extent(&p.file).ok_or_else(
+                    || anyhow::anyhow!("refold committed {} but the container lost it", p.file),
+                )?;
+            self.parts.push(Arc::new(Part::open_reader_with_limits(
+                Box::new(reader),
+                self.pcache.clone(),
+                self.read_limits,
+            )?));
+        }
+        self.fold = nf;
+        // Freed in the same flip that abandoned it: there is no stale generation to report.
+        stats.stale_generation_left = false;
         Ok(stats)
     }
 

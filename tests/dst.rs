@@ -1662,6 +1662,91 @@ fn every_single_file_merge_crash_answers_identically() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// The native erase pipeline — tombstone flush, total merge, refold — is THREE flips, and every
+/// crash point between and inside them must leave a store that opens and answers honestly:
+/// survivors answer their exact bytes at every state; the erased id answers its pre-erase bytes
+/// or nothing, never garbage; and once any state shows it gone, that is a committed flip's doing.
+/// The directory refold's hardest window — committed swap, crashed purge — has no analogue here,
+/// and this sweep is what says so.
+#[test]
+fn every_single_file_erase_crash_answers_honestly() {
+    let root = tmp("native-erase");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(800);
+        let mut seed = [i as u8; 32];
+        while b.len() < 800 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(800);
+        b
+    };
+
+    let mut bodies = BTreeMap::new();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..6usize {
+            let id = format!("e:{i}");
+            let body = body_for(i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            bodies.insert(id, body);
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        s.erase_ids(&["e:2".to_string()]).unwrap();
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 10, "an erase must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file erase", &ops);
+
+    let stage = tmp("native-erase-stage");
+    let checked =
+        replay_recorded("single-file-erase", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the erase left a store that refuses: {e:#}")
+            });
+            for (id, body) in &bodies {
+                let got = s.reconstruct(id).unwrap();
+                if id == "e:2" {
+                    // Pre-erase bytes or gone — a committed flip decides which; drifted is the
+                    // one answer no crash state may give.
+                    if let Some(got) = got {
+                        assert_eq!(
+                            got, *body,
+                            "crash point {k} {variant:?}: the erased id drifted instead of \
+                             answering or vanishing"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        got.as_ref(),
+                        Some(body),
+                        "crash point {k} {variant:?}: {id} is a survivor and must answer exactly"
+                    );
+                }
+            }
+        });
+    println!("dst single-file erase: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
 /// The WAL sidecar beside a single-file store, by the same rule the engine uses.
 fn wal_of(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_os_string();
