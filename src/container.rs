@@ -368,6 +368,52 @@ impl Container {
         self.dir.get(name).map(|m| m.extents.clone())
     }
 
+    /// A member's logical length, staged view included.
+    pub fn member_len(&self, name: &str) -> Option<u64> {
+        self.dir.get(name).map(|m| m.len)
+    }
+
+    /// Deallocate a logical byte range of a member in place: each physical run it maps to is
+    /// hole-punched, offsets unmoved, then the file is fsynced so the destruction is not left
+    /// pending behind checksummed bytes a reader would still trust. The caller owes the same
+    /// truth `Fold::punch_blocks` owes — the range must be declared dead by the manifest before
+    /// any byte goes.
+    pub fn punch_within_member(&self, name: &str, off: u64, len: u64) -> Result<()> {
+        let m = self
+            .dir
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("container member not found: {name}"))?;
+        if off.checked_add(len).is_none_or(|end| end > m.len) {
+            bail!("punch of {len} bytes at {off} exceeds member {name}'s {} bytes", m.len);
+        }
+        let mut remaining = len;
+        let mut at = off;
+        let mut logical = 0u64;
+        for &(phys, elen) in &m.extents {
+            if remaining == 0 {
+                break;
+            }
+            let start = logical;
+            logical += elen;
+            if at >= logical {
+                continue;
+            }
+            let within = at - start;
+            let take = remaining.min(elen - within);
+            crate::vfs::punch_hole(&self.f, &self.path, phys + within, take).with_context(
+                || {
+                    format!(
+                        "punching {take} bytes of member {name}; this filesystem may not support                          hole punching — re-fold instead"
+                    )
+                },
+            )?;
+            at += take;
+            remaining -= take;
+        }
+        crate::vfs::sync_file(&self.f, &self.path)?;
+        Ok(())
+    }
+
     /// A member as a positioned reader over its logical bytes. This is the seam: a part or fold
     /// segment opens from it with no translation and no idea whether its bytes are one extent or
     /// many.
@@ -750,6 +796,49 @@ impl crate::vfs::ArtifactSink for MemberWrite {
 
     fn describe(&self) -> String {
         format!("member {} of container {}", self.name, self.path.display())
+    }
+}
+
+/// A member read through a writer's own staged view.
+///
+/// The committed directory cannot serve the fold's active segment: the writer reads blocks it
+/// appended moments ago, and those extents exist only in the staged state until the next commit.
+/// This reader resolves the member's extents at every read, under the same lock the writer
+/// stages through — so it always sees exactly what has been appended, and nothing that has not.
+pub struct MemberReader {
+    container: std::sync::Arc<std::sync::Mutex<Container>>,
+    name: String,
+}
+
+impl MemberReader {
+    pub fn new(
+        container: std::sync::Arc<std::sync::Mutex<Container>>,
+        name: String,
+    ) -> MemberReader {
+        MemberReader { container, name }
+    }
+}
+
+impl crate::readat::ReadAt for MemberReader {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        // Resolve under the lock, read outside it: extents are never reused or moved once
+        // staged, and the file handle outlives the lock, so a resolved view stays valid.
+        let reader = {
+            let c = self.container.lock().expect("container lock poisoned");
+            let m = c.dir.get(&self.name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("container member not found: {}", self.name),
+                )
+            })?;
+            Extents::new(c.f.clone(), &m.extents)
+        };
+        crate::readat::ReadAt::read_exact_at(&reader, buf, off)
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        let c = self.container.lock().expect("container lock poisoned");
+        Ok(c.dir.get(&self.name).map(|m| m.len).unwrap_or(0))
     }
 }
 

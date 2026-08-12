@@ -665,3 +665,87 @@ fn a_segment_claiming_encryption_or_an_unknown_flag_refuses() {
     assert!(Fold::open_read(&dir, FoldCfg::default()).is_err(), "unknown flags must refuse");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The fold living inside a container: blocks append into a growing member, a roll seals one
+/// member and begins the next, the writer reads its own appends through the staged view, and
+/// recovery is arithmetic — uncommitted growth does not exist after a reopen, with no truncate
+/// and no unlink anywhere.
+#[test]
+fn a_fold_lives_inside_a_container_and_recovers_by_reading() {
+    use std::sync::{Arc, Mutex};
+    use turndb::container::Container;
+    use turndb::read_limits::ReadLimits;
+
+    let root = tmp("in-container");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("fold.turndb");
+    drop(Container::create(&ct).unwrap());
+
+    let cfg = FoldCfg { block_target: 4096, seg_max: 16 * 1024, ..Default::default() };
+    let c = Arc::new(Mutex::new(Container::open(&ct).unwrap()));
+    let mut f =
+        Fold::open_container_writer(c.clone(), 0, cfg, None, &[], ReadLimits::default()).unwrap();
+
+    // Enough incompressible pieces to seal several blocks and roll at least one segment.
+    let corpus = corpus();
+    let mut placed = Vec::new();
+    for d in corpus.iter().cycle().take(96) {
+        let p = f.put(d).unwrap();
+        placed.push((p.loc, p.hash, d.clone()));
+    }
+    let tail = f.sync().unwrap();
+    assert!(f.segment_count() > 1, "the fixture must roll across members");
+
+    // The writer reads its own appends before any commit: the staged view serves them.
+    for (loc, hash, d) in &placed {
+        assert_eq!(&f.read_verified(*loc, *hash).unwrap(), d, "read-your-writes inside the file");
+    }
+
+    // Publish, exactly as a native flush would after building its part.
+    c.lock().unwrap().commit().unwrap();
+    drop(f);
+
+    // Post-commit appends that are NEVER committed: staged extents that must vanish by reading.
+    {
+        let mut f2 =
+            Fold::open_container_writer(c.clone(), 0, cfg, Some(tail), &[], ReadLimits::default())
+                .unwrap();
+        for d in corpus.iter().take(8) {
+            f2.put(d).unwrap();
+        }
+        f2.sync().unwrap();
+        drop(f2);
+    }
+    drop(c); // the staged, uncommitted state dies with the handle — this is the crash
+
+    let c2 = Arc::new(Mutex::new(Container::open(&ct).unwrap()));
+    let f3 =
+        Fold::open_container_writer(c2.clone(), 0, cfg, Some(tail), &[], ReadLimits::default())
+            .unwrap();
+    assert_eq!(f3.tail(), tail, "uncommitted growth does not exist after a reopen");
+    for (loc, hash, d) in &placed {
+        assert_eq!(&f3.read_verified(*loc, *hash).unwrap(), d, "committed pieces survive");
+    }
+
+    // The sealed segment's advisory sidecar rode the same commit as the blocks it describes.
+    {
+        let c = c2.lock().unwrap();
+        assert!(c.contains("fold/seg-00000000.fold"));
+        assert!(c.contains("fold/seg-00000001.fold"));
+        assert!(c.contains("fold/seg-00000000.dir"), "the sealed member's sidecar is a member");
+        let active_member = format!("fold/seg-{:08}.fold", tail.seg);
+        assert_eq!(
+            c.member_len(&active_member).unwrap(),
+            u64::from(tail.off),
+            "the committed member length IS the tail"
+        );
+    }
+
+    // A manifest that disagrees with the container must refuse, not roll back.
+    let wrong = FoldTail { seg: tail.seg, off: tail.off + 64 };
+    let err = Fold::open_container_writer(c2, 0, cfg, Some(wrong), &[], ReadLimits::default())
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.to_string().contains("disagree"), "got: {err:#}");
+    std::fs::remove_dir_all(&root).ok();
+}

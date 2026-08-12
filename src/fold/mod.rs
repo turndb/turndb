@@ -28,6 +28,7 @@ pub mod codec;
 pub mod dedup;
 pub mod pipe;
 pub mod segment;
+mod segstore;
 
 pub use block::{Loc, BLOCK_TARGET_DEFAULT, CODEC_STORED, CODEC_ZSTD, CODEC_ZSTD_DICT};
 pub use segment::FoldTail;
@@ -255,9 +256,9 @@ pub struct Fold {
     /// from here, so a piece is readable the instant `put` returns.
     inflight: HashMap<u32, Arc<Vec<u8>>>,
     pool: pipe::Pool,
-    /// `None` for a read-only fold with no directory behind it (a pack): there is nothing to
-    /// append to, and `poisoned` refuses every write long before this would matter.
-    active_f: Option<File>,
+    /// Where the write side lives: segment files in a directory, members of a container, or a
+    /// read-only refusal — the fold owns the arithmetic, the store owns where bytes land.
+    segs: Box<dyn segstore::SegmentStore>,
     /// Pieces gathered but not yet compressed and appended.
     open_block: Vec<u8>,
     dedup: DedupTable,
@@ -501,7 +502,7 @@ impl Fold {
                 dicts: HashMap::new(),
                 active: 0,
                 cur_off: SEG_HDR_LEN as u32,
-                active_f: Some(f),
+                segs: Box::new(segstore::DirSegments::new(dir.to_path_buf(), 0, f, read_limits)),
                 open_block: Vec::with_capacity(cfg.block_target * 2),
                 dedup: DedupTable::new(),
                 cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
@@ -657,7 +658,12 @@ impl Fold {
             dicts,
             active,
             cur_off: target as u32,
-            active_f: Some(active_f),
+            segs: Box::new(segstore::DirSegments::new(
+                dir.to_path_buf(),
+                active,
+                active_f,
+                read_limits,
+            )),
             open_block: Vec::with_capacity(cfg.block_target * 2),
             dedup: DedupTable::new(),
             cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
@@ -668,6 +674,187 @@ impl Fold {
             inflight: HashMap::new(),
             pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
             _lock: Some(lock),
+            punched: punched.to_vec(),
+            read_limits,
+        })
+    }
+
+    /// Open a writer fold whose segments live as members of a container — the live-file store's
+    /// content plane. No truncation and no unlinking happen here, because they cannot be needed:
+    /// the committed directory's extent lists ARE the truncation. Bytes a crash left past the
+    /// committed state are outside every committed extent and therefore do not exist; a segment
+    /// created after the last commit is in no directory and therefore does not exist. The two
+    /// recovery mutations the directory fold performs at open are replaced by reading.
+    ///
+    /// The caller owes: `committed` from the manifest this container carries, `punched` from that
+    /// same manifest, and writer exclusion at the container-file level — the fold takes no lock
+    /// of its own here.
+    pub fn open_container_writer(
+        container: std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
+        fold_gen: u32,
+        cfg: FoldCfg,
+        committed: Option<FoldTail>,
+        punched: &[(u32, u32)],
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<Fold> {
+        let read_limits = read_limits.validate()?;
+        let prefix = fold_member_prefix(fold_gen);
+        let member_of = |seg: u32| format!("{prefix}/{}", segment::seg_name(seg));
+
+        // Enumerate this generation's segment members. Names come from a committed (or staged)
+        // directory that already validated them; parse rather than trust regardless.
+        let nums: Vec<u32> = {
+            let c = container.lock().expect("container lock poisoned");
+            let mut nums: Vec<u32> = c
+                .names()
+                .filter_map(|name| name.strip_prefix(&format!("{prefix}/")))
+                .filter_map(segment::parse_seg_name)
+                .collect();
+            nums.sort_unstable();
+            nums
+        };
+        for (i, &n) in nums.iter().enumerate() {
+            if n != i as u32 {
+                bail!("fold {prefix} has a gap: segment {} is missing", i);
+            }
+        }
+
+        if nums.is_empty() {
+            if let Some(ct) = committed {
+                if ct > (FoldTail { seg: 0, off: SEG_HDR_LEN as u32 }) {
+                    bail!(
+                        "committed fold tail (seg {}, off {}) but the container holds no fold \
+                         segments — the fold lost durable data",
+                        ct.seg,
+                        ct.off
+                    );
+                }
+            }
+            let name = member_of(0);
+            {
+                let mut c = container.lock().expect("container lock poisoned");
+                c.put_bytes(&name, &SegHeader { seg: 0, flags: 0, dict_id: [0u8; 32] }.encode())?;
+            }
+            let reader: Arc<dyn ReadAt> =
+                Arc::new(crate::container::MemberReader::new(container.clone(), name));
+            return Ok(Fold {
+                dir: PathBuf::from(&prefix),
+                cfg,
+                headers: vec![SegHeader { seg: 0, flags: 0, dict_id: [0u8; 32] }],
+                readers: vec![reader],
+                dicts: HashMap::new(),
+                active: 0,
+                cur_off: SEG_HDR_LEN as u32,
+                segs: Box::new(segstore::ContainerSegments::new(container, prefix)),
+                open_block: Vec::with_capacity(cfg.block_target * 2),
+                dedup: DedupTable::new(),
+                cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
+                poisoned: false,
+                scratch: Vec::new(),
+                blockdir: Vec::new(),
+                next_block: 0,
+                inflight: HashMap::new(),
+                pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
+                _lock: None,
+                punched: punched.to_vec(),
+                read_limits,
+            });
+        }
+
+        let mut headers = Vec::with_capacity(nums.len());
+        let mut readers: Vec<Arc<dyn ReadAt>> = Vec::with_capacity(nums.len());
+        for &n in &nums {
+            let name = member_of(n);
+            let reader = crate::container::MemberReader::new(container.clone(), name.clone());
+            let mut hb = [0u8; SEG_HDR_LEN as usize];
+            crate::readat::ReadAt::read_exact_at(&reader, &mut hb, 0)
+                .with_context(|| format!("read header of segment member {name}"))?;
+            headers.push(SegHeader::decode(&hb, n)?);
+            readers.push(Arc::new(reader));
+        }
+
+        let mut dicts: HashMap<[u8; 32], Arc<Vec<u8>>> = HashMap::new();
+        for h in &headers {
+            if !h.has_dict() || dicts.contains_key(&h.dict_id) {
+                continue;
+            }
+            let name = format!("{prefix}/zdict-{}.zd", PieceHash(h.dict_id).to_hex());
+            let bytes = {
+                let c = container.lock().expect("container lock poisoned");
+                c.read_file_bounded(&name, MAX_DICTIONARY_BYTES).with_context(|| {
+                    format!("segment {} names dictionary {name} but it is unreadable", h.seg)
+                })?
+            };
+            let got: [u8; 32] = blake3::hash(&bytes).into();
+            if got != h.dict_id {
+                bail!("dictionary {name} content hash does not match the id naming it");
+            }
+            dicts.insert(h.dict_id, Arc::new(bytes));
+        }
+
+        // The committed directory and the manifest must AGREE on the tail: they publish in the
+        // same flip, so a disagreement is corruption or loss, never a crash to roll back from.
+        let active = *nums.last().unwrap();
+        let alen = crate::readat::ReadAt::len(&readers[active as usize])?;
+        let cur_off = match committed {
+            Some(ct) => {
+                if ct.seg != active || u64::from(ct.off) != alen {
+                    bail!(
+                        "committed fold tail (seg {}, off {}) but the container's active segment \
+                         member is (seg {active}, len {alen}) — the manifest and the container \
+                         disagree",
+                        ct.seg,
+                        ct.off,
+                    );
+                }
+                ct.off
+            }
+            None => u32::try_from(alen).context("segment member longer than a segment can be")?,
+        };
+
+        let mut blockdir: Vec<Option<(u32, u32)>> = Vec::new();
+        let mut next_block = 0u32;
+        let mut seen_blocks = 0u64;
+        for (i, h) in headers.iter().enumerate() {
+            let len = crate::readat::ReadAt::len(&readers[i])?;
+            let (_, entries) = segment::scan_tail_with_limits(
+                &readers[i],
+                len,
+                h.has_dict(),
+                punched,
+                read_limits,
+            )?;
+            for (id, off) in entries {
+                install_block_location(
+                    &mut blockdir,
+                    &mut next_block,
+                    &mut seen_blocks,
+                    id,
+                    (h.seg, off),
+                    read_limits,
+                )?;
+            }
+        }
+
+        Ok(Fold {
+            dir: PathBuf::from(&prefix),
+            cfg,
+            headers,
+            readers,
+            dicts,
+            active,
+            cur_off,
+            segs: Box::new(segstore::ContainerSegments::new(container, prefix)),
+            open_block: Vec::with_capacity(cfg.block_target * 2),
+            dedup: DedupTable::new(),
+            cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
+            poisoned: false,
+            scratch: Vec::new(),
+            blockdir,
+            next_block,
+            inflight: HashMap::new(),
+            pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
+            _lock: None,
             punched: punched.to_vec(),
             read_limits,
         })
@@ -936,7 +1123,7 @@ impl Fold {
             dicts,
             active: segs.last().unwrap().seg,
             cur_off,
-            active_f: None,
+            segs: Box::new(segstore::NoSegments),
             open_block: Vec::new(),
             dedup: DedupTable::with_capacity(16),
             cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
@@ -1210,15 +1397,10 @@ impl Fold {
         {
             self.roll()?;
         }
-        let path = segment::seg_path(&self.dir, self.active);
-        let f = self
-            .active_f
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("read-only fold cannot append"))?;
-        if let Err(e) = crate::vfs::write_all_at(f, &path, &self.scratch[..n], self.cur_off as u64)
-        {
+        let frame_end = n;
+        if let Err(e) = self.segs.append(self.active, self.cur_off, &self.scratch[..frame_end]) {
             self.poisoned = true;
-            return Err(anyhow::Error::new(e).context("fold block append failed; fold poisoned"));
+            return Err(e.context("fold block append failed; fold poisoned"));
         }
         self.read_limits.admit_fold_blocks(u64::from(d.block_id) + 1)?;
         if self.blockdir.len() <= d.block_id as usize {
@@ -1246,10 +1428,7 @@ impl Fold {
         self.seal_block()?;
         // Every block must be compressed AND written before a tail can be reported durable.
         self.write_ready(true)?;
-        let f =
-            self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot sync"))?;
-        crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
-            .context("fsync active fold segment")?;
+        self.segs.sync(self.active)?;
         Ok(self.tail())
     }
 
@@ -1324,11 +1503,9 @@ impl Fold {
             if hdr.block_id != id {
                 bail!("directory sent block {id} to a frame carrying id {}", hdr.block_id);
             }
-            let f = segment::open_rw(&self.dir, seg)?;
             // The PAYLOAD only — the header stays so the frame chain remains walkable. See
             // `segment::punch`.
-            let path = segment::seg_path(&self.dir, seg);
-            segment::punch(&f, &path, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
+            self.segs.punch(seg, off as u64 + block::BLOCK_HDR_LEN as u64, hdr.stored as u64)?;
             // The block is gone as content: drop it from the directory so no Loc can resolve
             // into erased bytes, exactly as a reopened store's scan would.
             self.blockdir[id as usize] = None;
@@ -1478,16 +1655,9 @@ impl Fold {
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
     /// segment handle and the next write silently corrupted the fold.)
     fn roll(&mut self) -> Result<()> {
-        let entries = count_fold_directory_entries(&self.dir, self.read_limits)?;
-        self.read_limits.admit_directory_entries(
-            "fold directory during segment roll",
-            entries.saturating_add(2),
-        )?;
+        self.segs.admit_roll()?;
         let flags = self.headers[self.active as usize].flags;
-        let f =
-            self.active_f.as_ref().ok_or_else(|| anyhow::anyhow!("read-only fold cannot roll"))?;
-        crate::vfs::sync_file(f, &segment::seg_path(&self.dir, self.active))
-            .context("fsync before roll")?;
+        self.segs.sync(self.active).context("fsync before roll")?;
         // The segment being sealed gets its directory sidecar now — the write that turns the next
         // open's full scan of it into a 2 KB read. Best-effort, AFTER the fsync above: advisory
         // data must never fail a roll, and a sidecar must never describe bytes less durable than
@@ -1502,15 +1672,13 @@ impl Fold {
             })
             .collect();
         entries.sort_by_key(|&(_, off)| off);
-        let _ = segment::write_dir_sidecar(&self.dir, self.active, self.cur_off, &entries);
+        self.segs.write_sidecar(self.active, self.cur_off, &entries);
         let next = self
             .active
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("segment number space exhausted"))?;
-        let f = segment::create_flagged(&self.dir, next, [0u8; 32], flags)?;
-        let reader = Arc::new(segment::open_rw(&self.dir, next)?);
+        let reader = self.segs.create_segment(next, [0u8; 32], flags)?;
 
-        self.active_f = Some(f);
         self.headers.push(SegHeader { seg: next, flags, dict_id: [0u8; 32] });
         self.readers.push(reader);
         self.active = next;
@@ -1524,6 +1692,16 @@ pub(crate) struct BlockStorage {
     pub block_id: u32,
     pub raw_bytes: u32,
     pub stored_bytes: u32,
+}
+
+/// The member-name prefix a fold generation lives under inside a container: `fold` for
+/// generation 0, `fold-NNNN` above it — the same names the directory layout used.
+pub(crate) fn fold_member_prefix(fold_gen: u32) -> String {
+    if fold_gen == 0 {
+        "fold".to_string()
+    } else {
+        format!("fold-{fold_gen:04}")
+    }
 }
 
 /// Compression threads: 0 means one per core.
@@ -1561,7 +1739,7 @@ fn list_segments_with_limits(
     Ok(out)
 }
 
-fn count_fold_directory_entries(
+pub(super) fn count_fold_directory_entries(
     dir: &Path,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<u64> {
