@@ -17,8 +17,10 @@
 //!     or drifted content is a failure even if no ack covered it.
 //!
 //! Beyond the write path, each PUBLICATION PROTOCOL gets its own crash sweep: backup, restore,
-//! manifest recovery promotion, hole punching, and format migration each run once for real, and
-//! then every op prefix × durability variant is replayed against protocol-specific invariants.
+//! manifest recovery promotion, hole punching, format migration, container checkpointing, and the
+//! container session cycle each run once for real, and then every op prefix × durability variant
+//! is replayed against protocol-specific invariants. Container superblock alternation is also
+//! proven from each recorded trace directly — see `assert_slot_alternation`.
 //!
 //! Run with: `cargo test --features dst --test dst`
 #![cfg(feature = "dst")]
@@ -256,6 +258,14 @@ enum Variant {
     /// AllLanded, except the very last pending write of the last-touched file is TORN at a
     /// fraction of its length.
     TornTail(u8),
+    /// TornTail's cut, but at a fraction of the write's first 64 bytes rather than its whole
+    /// length. Length-proportional cuts never land inside the defined region of a page-sized
+    /// write — for a 4 KiB superblock slot, thirds fall at 1365 and 2730 while everything the
+    /// format defines sits in the first 56 bytes, so every TornTail leaves the slot's claim
+    /// intact and checksum-valid. This variant cuts at 21 and 42: through the sequence, the
+    /// directory pointer, and the tail, which is what forces the slot checksum to actually
+    /// carry the crash-safety argument.
+    TornHead(u8),
     /// Only the LAST pending write to each file landed; every earlier unsynced write to that file
     /// did not.
     ///
@@ -275,6 +285,8 @@ const VARIANTS: &[Variant] = &[
     Variant::ContentLag,
     Variant::TornTail(1),
     Variant::TornTail(2),
+    Variant::TornHead(1),
+    Variant::TornHead(2),
     Variant::LastPendingOnly,
 ];
 
@@ -293,7 +305,7 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
     // truncate" is a state no crash can produce, and simulating it would demand recovery from
     // the impossible. (The SetLen-never-happened case is DurableOnly's job.)
     let torn: Option<(usize, usize)> = match variant {
-        Variant::TornTail(frac) => fs
+        Variant::TornTail(frac) | Variant::TornHead(frac) => fs
             .inodes
             .iter()
             .enumerate()
@@ -301,7 +313,11 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
             .find(|(_, n)| n.pending.last().is_some_and(|(off, _)| *off != u64::MAX))
             .map(|(i, n)| {
                 let (_, data) = n.pending.last().unwrap();
-                (i, data.len() * frac as usize / 3)
+                let span = match variant {
+                    Variant::TornHead(_) => data.len().min(64),
+                    _ => data.len(),
+                };
+                (i, span * frac as usize / 3)
             }),
         _ => None,
     };
@@ -334,7 +350,7 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
                         }
                         img
                     }
-                    Variant::TornTail(_) => {
+                    Variant::TornTail(_) | Variant::TornHead(_) => {
                         if torn.map(|(ti, _)| ti) == Some(i) {
                             // durable + all pending except the last, torn
                             let mut img = node.durable.clone();
@@ -560,6 +576,7 @@ fn every_crash_state_recovers_to_an_acked_consistent_store() {
     let work = root.join("store");
     let (ops, issued, acks) = run_workload(&work);
     assert!(ops.len() > 100, "the workload must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("workload", &ops);
     let boundaries = group_boundaries(&issued);
 
     let stage = root.join("stage");
@@ -741,6 +758,37 @@ fn replay_recorded(
         }
     }
     checked
+}
+
+/// Slot alternation, proven from the trace rather than hoped for from a crash.
+///
+/// The crash sweep alone cannot establish that superblock writes alternate: a slot overwritten in
+/// place still passes every crash state whose tear spares its checksummed prefix, and the reader
+/// race alternation exists for — resolving a slot while the writer rewrites it — is a race no
+/// crash model expresses. But the invariant is a property of the write *sequence*, so it is
+/// checked on the recorded op log directly: consecutive superblock claims (magic-bearing,
+/// whole-slot positioned writes at slot offsets) on one file may never target the same slot,
+/// deterministically, at every recording.
+fn assert_slot_alternation(tag: &str, ops: &[Op]) {
+    let slot_len = turndb::container::SLOT_LEN;
+    let mut last: BTreeMap<&Path, u64> = BTreeMap::new();
+    for op in ops {
+        let Op::WriteAt { path, off, data } = op else { continue };
+        if (*off == 0 || *off == slot_len)
+            && data.len() as u64 == slot_len
+            && data.starts_with(turndb::container::MAGIC)
+        {
+            if let Some(prev) = last.insert(path.as_path(), *off) {
+                assert_ne!(
+                    prev,
+                    *off,
+                    "{tag}: {} wrote a superblock claim into the slot the previous claim \
+                     occupies — the live slot was overwritten instead of alternated",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 /// A small settled store under `dir`, closed cleanly, plus the id -> body map it must serve.
@@ -1220,12 +1268,11 @@ fn _model_is_deterministic(_: &HashMap<(), ()>) {}
 /// the fsync that orders the members and directory ahead of the superblock fails this at crash
 /// point 5 under `LastPendingOnly`, with the superblock naming a tail past the end of the file.
 ///
-/// What this sweep does NOT establish is the other half of why the slots alternate. A superblock's
-/// meaningful content is its first 56 bytes inside a 4 KiB aligned write, so every tear this model
-/// produces leaves those bytes whole and the record valid — overwriting the live slot instead of
-/// alternating survives this sweep unchanged. Alternation earns its keep against a tear *within*
-/// that prefix, which needs sub-sector atomicity to fail, and against a concurrent reader
-/// resolving a slot while the writer rewrites it, which is a race no crash model expresses.
+/// Alternation itself is covered twice over. `TornHead` cuts a slot write inside its 56 defined
+/// bytes, so a torn claim actually fails its checksum here rather than surviving whole; and
+/// `assert_slot_alternation` proves from the recorded trace that no claim ever lands in the slot
+/// the previous claim occupies — the property whose violating race (a reader resolving a slot
+/// while the writer rewrites it) no crash model can express.
 #[test]
 fn every_container_checkpoint_crash_lands_on_one_committed_state() {
     let root = tmp("container");
@@ -1259,6 +1306,7 @@ fn every_container_checkpoint_crash_lands_on_one_committed_state() {
     turndb::store::checkpoint_into_container(&work, &container).unwrap();
     let ops = record::disarm();
     assert!(ops.len() > 4, "the checkpoint must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("container checkpoint", &ops);
 
     let stage = tmp("container-stage");
     let checked = replay_recorded("container", &base, &root, &ops, &stage, |stage, k, variant| {
@@ -1376,6 +1424,7 @@ fn every_container_session_crash_keeps_every_acknowledged_write() {
     }
     let ops = record::disarm();
     assert!(ops.len() > 20, "a session must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("container session", &ops);
 
     let stage = tmp("container-session-stage");
     let checked =
