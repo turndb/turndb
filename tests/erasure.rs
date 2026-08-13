@@ -41,7 +41,7 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 /// retained manifest that still NAMES the record. Returns the store dir and the retained commit.
 fn store_with_a_punched_retained_record(tag: &str) -> (PathBuf, u64) {
     let dir = tmp(tag);
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
 
     s.put("k", &[Span::Piece(&noise(1, 64 * 1024))], vec![]).unwrap();
     for i in 0..8 {
@@ -69,7 +69,7 @@ fn store_with_a_punched_retained_record(tag: &str) -> (PathBuf, u64) {
 fn a_read_of_erased_content_reports_erasure_not_corruption() {
     let (dir, c1) = store_with_a_punched_retained_record("reports");
 
-    let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
+    let old = turndb::store::open_read_container_at(&store_file(&dir), cfg(), c1).unwrap();
     // The retained snapshot still names the record — only its bytes are gone.
     assert!(old.ids().unwrap().contains(&"k".to_string()));
 
@@ -97,16 +97,20 @@ fn a_read_of_erased_content_reports_erasure_not_corruption() {
 fn an_unreadable_live_manifest_refuses_rather_than_declaring_nothing_erased() {
     let (dir, c1) = store_with_a_punched_retained_record("authority");
 
-    // Corrupt the LIVE manifest only. The retained one at c1 is untouched, so everything this
-    // snapshot names is still on disk and readable — the only thing missing is the erasure
+    // Corrupt the LIVE manifest member only. The retained one at c1 is untouched, so everything
+    // this snapshot names is still held and readable — the only thing missing is the erasure
     // declaration, which is exactly the condition under test.
-    let live = dir.join("MANIFEST");
-    let mut bytes = std::fs::read(&live).unwrap();
-    bytes[0] ^= 0xff;
-    std::fs::write(&live, &bytes).unwrap();
-    assert!(dir.join(format!("MANIFEST.{c1:08}")).exists(), "the retained manifest must survive");
+    let file = store_file(&dir);
+    let (m_off, _) = {
+        let c = turndb::container::Container::open(&file).unwrap();
+        assert!(c.contains(&format!("MANIFEST.{c1:08}")), "the retained manifest must survive");
+        c.member_extents("MANIFEST").unwrap()[0]
+    };
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[m_off as usize] ^= 0xff;
+    std::fs::write(&file, &bytes).unwrap();
 
-    match Store::open_read_at(&dir, cfg(), c1) {
+    match turndb::store::open_read_container_at(&store_file(&dir), cfg(), c1) {
         Ok(_) => panic!(
             "the live erasure declaration is authoritative and must be readable — opening a \
              retained snapshot without it would report erased blocks as corruption"
@@ -126,7 +130,7 @@ fn an_unreadable_live_manifest_refuses_rather_than_declaring_nothing_erased() {
 #[test]
 fn erased_is_distinguishable_from_never_existed() {
     let (dir, c1) = store_with_a_punched_retained_record("distinct");
-    let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
+    let old = turndb::store::open_read_container_at(&store_file(&dir), cfg(), c1).unwrap();
 
     assert!(old.reconstruct("k").is_err(), "erased content refuses");
     assert!(
@@ -141,7 +145,7 @@ fn erased_is_distinguishable_from_never_existed() {
 #[test]
 fn punching_does_not_disturb_live_reads() {
     let dir = tmp("live");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let keep = noise(42, 64 * 1024);
     s.put("keeper", &[Span::Piece(&keep)], vec![]).unwrap();
     s.put("victim", &[Span::Piece(&noise(43, 64 * 1024))], vec![]).unwrap();
@@ -170,7 +174,7 @@ fn punching_does_not_disturb_live_reads() {
 #[test]
 fn a_refold_clears_the_punched_list_it_no_longer_describes() {
     let dir = tmp("refoldclear");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put("k", &[Span::Piece(&noise(11, 64 * 1024))], vec![]).unwrap();
     for i in 0..8 {
         s.put(&format!("f{i}"), &[Span::Piece(&noise(400 + i, 64 * 1024))], vec![]).unwrap();
@@ -214,7 +218,7 @@ fn a_refold_clears_the_punched_list_it_no_longer_describes() {
 #[test]
 fn erase_ids_leaves_nothing_to_distinguish_it_from_absence() {
     let dir = tmp("eraseids");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put("aaa-kept", &[Span::Piece(&noise(1, 4096))], vec![]).unwrap();
     s.put("mmm-victim", &[Span::Piece(&noise(2, 4096))], vec![]).unwrap();
     s.sync().unwrap();
@@ -233,7 +237,7 @@ fn erase_ids_leaves_nothing_to_distinguish_it_from_absence() {
     // And time travel does not quietly serve the erased snapshot: the retained log is purged, so
     // the reader is refused rather than handed a window in which the record still exists.
     assert!(
-        Store::open_read_at(&dir, cfg(), c1).is_err(),
+        turndb::store::open_read_container_at(&store_file(&dir), cfg(), c1).is_err(),
         "a snapshot that could still serve the erased record is not erasure"
     );
     drop(s);
@@ -247,7 +251,7 @@ fn erase_ids_leaves_nothing_to_distinguish_it_from_absence() {
 #[test]
 fn a_partially_erased_record_refuses_even_though_its_shared_piece_survives() {
     let dir = tmp("partial");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let shared = noise(900, 64 * 1024);
     let unique = noise(901, 64 * 1024);
 
@@ -269,7 +273,7 @@ fn a_partially_erased_record_refuses_even_though_its_shared_piece_survives() {
     assert!(s.punch_unreferenced().unwrap().blocks_punched > 0);
     drop(s);
 
-    let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
+    let old = turndb::store::open_read_container_at(&store_file(&dir), cfg(), c1).unwrap();
     assert_eq!(
         old.reconstruct("keeper").unwrap().unwrap(),
         shared,
@@ -279,4 +283,11 @@ fn a_partially_erased_record_refuses_even_though_its_shared_piece_survives() {
         old.reconstruct("victim").expect_err("one erased piece still refuses the whole record");
     assert!(err.to_string().contains("ERASED"), "{err:#}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

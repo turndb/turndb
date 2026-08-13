@@ -10,7 +10,7 @@ import './_artifact.mjs';
 import { open, openFile, singleFileKind, TurndbError } from '../index.mjs';
 
 // npm/build.sh builds the CLI and exports this; it is the producer of the artifacts read below,
-// because this binding deliberately has no pack or checkpoint surface of its own.
+// because this binding deliberately has no convert or seal surface of its own.
 const CLI = process.env.TURNDB_CLI
   ?? new URL('../../../target/debug/turndb', import.meta.url).pathname;
 if (!existsSync(CLI)) {
@@ -34,13 +34,16 @@ test('reads a store held in one file, pack or container', async () => {
   assert.equal(await singleFileKind(dir), null, 'a directory carries neither magic');
 
   const container = join(root, 'store.turndb');
-  const pack = join(root, 'store.pack');
-  execFileSync(CLI, ['checkpoint', dir, container]);
-  execFileSync(CLI, ['pack', dir, pack]);
+  const sealed = join(root, 'snapshot.turndb');
+  // The retired directory layout keeps exactly one door, and this walks through it; the sealed
+  // snapshot is the pack's successor — same magic, same reader, finality by flag. (The pack
+  // READER survives for old artifacts; nothing produces new ones, so nothing here does either.)
+  execFileSync(CLI, ['convert', dir, container]);
+  execFileSync(CLI, ['seal', container, sealed]);
   assert.equal(await singleFileKind(container), 'container');
-  assert.equal(await singleFileKind(pack), 'pack');
+  assert.equal(await singleFileKind(sealed), 'container');
 
-  for (const [label, file] of [['container', container], ['pack', pack]]) {
+  for (const [label, file] of [['container', container], ['sealed snapshot', sealed]]) {
     const ro = await openFile(file);
     assert.deepEqual(ro.scanIds(), ['trace:1#input'], `${label} pages the same ids`);
     assert.equal(new TextDecoder().decode(ro.get('trace:1#input')), payload, `${label} is byte-exact`);

@@ -261,6 +261,35 @@ impl Container {
         })
     }
 
+    /// Finish a birth a crash interrupted: the file exists but is shorter than the superblock
+    /// region, so it provably names no member byte — nothing durable can live below
+    /// [`REGION_START`]. The writer rewrites both slots exactly as [`Container::create`] would
+    /// and the store is born after all. Deliberately NOT part of [`Container::open`]: a reader
+    /// has no create-if-absent contract, and finishing someone else's birth is a writer's move.
+    pub(crate) fn recreate_interrupted(path: &Path) -> Result<Container> {
+        let f = crate::vfs::open_rw(path)
+            .with_context(|| format!("reopen interrupted container {}", path.display()))?;
+        let sb = Superblock::empty();
+        crate::vfs::write_all_at(&f, path, &sb.encode(), 0)?;
+        crate::vfs::write_all_at(&f, path, &[0u8; SLOT_LEN as usize], SLOT_LEN)?;
+        crate::vfs::sync_file(&f, path)?;
+        if let Some(parent) = path.parent() {
+            let _ = crate::vfs::sync_dir(parent);
+        }
+        Ok(Container {
+            f: Arc::new(f),
+            path: path.to_path_buf(),
+            dir: BTreeMap::new(),
+            free: Vec::new(),
+            sb,
+            tail: REGION_START,
+            slot: 0,
+            staged: false,
+            sealed: false,
+            member_open: false,
+        })
+    }
+
     /// Open an existing container at its newest committed state.
     pub fn open(path: &Path) -> Result<Container> {
         let (f, created) = crate::vfs::open_or_create(path)

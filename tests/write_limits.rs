@@ -43,7 +43,9 @@ fn record_limit_is_an_exact_inclusive_framed_wal_boundary() {
     let dir = tmp("record-boundary");
     // Revision-4 record with id "x", content name "body", one literal op, no attrs or novel pieces:
     // 63 bytes of framing/metadata plus the literal bytes.
-    let mut store = Store::open_with_limits(&dir, FoldCfg::default(), limits(67, 1_000)).unwrap();
+    let mut store =
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(67, 1_000))
+            .unwrap();
     store.put("x", &[Span::Lit(b"1234")], vec![]).unwrap();
     let before = store.health();
 
@@ -61,7 +63,7 @@ fn worst_case_measurement_does_not_depend_on_dedup_state() {
     let dir = tmp("dedup-independent");
     let bytes = b"same";
     {
-        let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
         store.put("x", &[Span::Piece(bytes)], vec![]).unwrap();
         store.sync().unwrap();
         store.flush().unwrap();
@@ -69,7 +71,9 @@ fn worst_case_measurement_does_not_depend_on_dedup_state() {
 
     // The all-novel upper bound is 132 bytes. It remains the admission size even though the piece
     // is already durable and this particular write would carry no novel bytes.
-    let mut store = Store::open_with_limits(&dir, FoldCfg::default(), limits(131, 1_000)).unwrap();
+    let mut store =
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(131, 1_000))
+            .unwrap();
     let error = store.put("y", &[Span::Piece(bytes)], vec![]).unwrap_err();
     assert_eq!(
         error.downcast_ref::<WriteAdmissionError>(),
@@ -81,7 +85,9 @@ fn worst_case_measurement_does_not_depend_on_dedup_state() {
 fn atomic_batch_limit_includes_members_and_commit_marker() {
     let dir = tmp("batch-boundary");
     // A one-byte tombstone frame is 18 bytes. Two members plus an 18-byte commit-marker frame = 54.
-    let mut store = Store::open_with_limits(&dir, FoldCfg::default(), limits(100, 54)).unwrap();
+    let mut store =
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(100, 54))
+            .unwrap();
     let mut accepted = Batch::new();
     accepted.delete("a");
     accepted.delete("b");
@@ -106,7 +112,8 @@ fn batch_record_count_is_inclusive_and_checked_before_byte_work() {
     let dir = tmp("batch-count");
     let mut write_limits = limits(100, 1_000);
     write_limits.max_batch_records = 2;
-    let mut store = Store::open_with_limits(&dir, FoldCfg::default(), write_limits).unwrap();
+    let mut store =
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), write_limits).unwrap();
     let mut accepted = Batch::new();
     accepted.delete("a");
     accepted.delete("b");
@@ -128,7 +135,9 @@ fn batch_record_count_is_inclusive_and_checked_before_byte_work() {
 #[test]
 fn a_late_oversized_batch_item_is_identified_before_any_fold_work() {
     let dir = tmp("batch-item");
-    let mut store = Store::open_with_limits(&dir, FoldCfg::default(), limits(67, 1_000)).unwrap();
+    let mut store =
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(67, 1_000))
+            .unwrap();
     let before = store.health();
     let mut batch = Batch::new();
     batch.put("a", &[Span::Lit(b"1234")], vec![]);
@@ -147,7 +156,8 @@ fn identifiers_are_utf8_byte_bounded_without_reserving_a_vocabulary() {
     let dir = tmp("identifiers");
     let mut write_limits = limits(1_000, 2_000);
     write_limits.max_identifier_bytes = 4;
-    let mut store = Store::open_with_limits(&dir, FoldCfg::default(), write_limits).unwrap();
+    let mut store =
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), write_limits).unwrap();
     store.put("éé", &[Span::Lit(b"")], vec![("éé".into(), AttrValue::Null)]).unwrap();
 
     let error = store.put("ééa", &[Span::Lit(b"")], vec![]).unwrap_err();
@@ -170,13 +180,23 @@ fn identifiers_are_utf8_byte_bounded_without_reserving_a_vocabulary() {
 }
 
 #[test]
-fn invalid_policy_is_refused_before_the_store_directory_is_created() {
+fn invalid_policy_is_refused_before_the_store_file_is_created() {
     let dir = tmp("invalid-policy");
+    let file = store_file(&dir);
     let write_limits = WriteLimits { max_batch_records: 0, ..WriteLimits::default() };
-    let error = Store::open_with_limits(&dir, FoldCfg::default(), write_limits).err().unwrap();
+    let error =
+        Store::open_file_with_limits(&file, FoldCfg::default(), write_limits).err().unwrap();
     assert!(matches!(
         error.downcast_ref::<WriteAdmissionError>(),
         Some(WriteAdmissionError::InvalidLimits(_))
     ));
-    assert!(!dir.exists());
+    assert!(!file.exists(), "a refused policy must create nothing");
+    std::fs::remove_dir_all(&*dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

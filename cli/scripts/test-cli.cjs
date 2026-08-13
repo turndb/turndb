@@ -33,7 +33,7 @@ try {
 
   const help = cli(['help']);
   assert.equal(help.status, 0, `help exited ${help.status}: ${help.stderr}`);
-  assert.match(help.stdout, /content-addressed columnar store/, 'help must be the real usage text');
+  assert.match(help.stdout, /database for AI traces, in one file/, 'help must be the real usage text');
 
   // A real store, so the install is exercised as a store tool rather than as a binary that runs.
   const jsonl = path.join(work, 'traces.jsonl');
@@ -43,7 +43,7 @@ try {
       .map((i) => JSON.stringify({ body: JSON.stringify([{ role: 'user', content: `t${i}` }]), model: `m${i % 2}` }))
       .join('\n') + '\n',
   );
-  const store = path.join(work, 'store');
+  const store = path.join(work, 'store.turndb');
   const imported = cli(['import', store, jsonl]);
   assert.equal(imported.status, 0, `import exited ${imported.status}: ${imported.stderr}`);
 
@@ -55,19 +55,19 @@ try {
   assert.equal(verified.status, 0, `verify exited ${verified.status}: ${verified.stderr}`);
   assert.match(verified.stdout, /reconstruct byte-exact/, 'deep verify must report reconstruction');
 
-  // The single-file forms the packages now read, produced by the same binary.
-  const container = path.join(work, 'store.turndb');
-  assert.equal(cli(['checkpoint', store, container]).status, 0, 'checkpoint must succeed');
-  const inspected = cli(['inspect', container]);
+  // The store IS the single-file form; sealing ships its snapshot with the same binary.
+  const sealedOut = path.join(work, 'snapshot.turndb');
+  assert.equal(cli(['seal', store, sealedOut]).status, 0, 'seal must succeed');
+  const inspected = cli(['inspect', sealedOut]);
   assert.equal(inspected.status, 0, `inspect exited ${inspected.status}: ${inspected.stderr}`);
-  assert.match(inspected.stdout, /^container:/m, 'a container must be reported as one');
+  assert.match(inspected.stdout, /\(sealed\)/, 'a sealed snapshot must be reported as one');
 
   // A refusal must be a refusal: nonzero status and a message on stderr, not a stack trace.
   const missing = cli(['inspect', path.join(work, 'nope')]);
   assert.notEqual(missing.status, 0, 'a missing store must exit nonzero');
   assert.match(missing.stderr, /^turndb: /m, 'errors must carry the CLI prefix');
 
-  console.log('cli install: help, import, ids, verify --deep, checkpoint, inspect, refusal');
+  console.log('cli install: help, import, ids, verify --deep, seal, inspect, refusal');
 } finally {
   fs.rmSync(work, { recursive: true, force: true });
 }

@@ -1,8 +1,9 @@
-//! The `turndb` CLI — the auditor's face of the format.
+//! The `turndb` CLI — the operator's porch on the product.
 //!
-//! A store you can inspect, verify, query, pack, and recover from a command line with no server
-//! running is a store an auditor can trust. Every read verb takes either a store directory or a
-//! pack file and treats them identically, because the readers underneath do.
+//! A store you can inspect, verify, query, seal, and recover from a command line with no server
+//! running is a store an auditor can trust. Every verb takes a `.turndb` file — the only layout a
+//! store has. The retired layouts (store directories, sealed packs) keep exactly one door:
+//! `convert`.
 //!
 //! Argument parsing is by hand, on purpose: the crate's dependency discipline does not bend for
 //! flag ergonomics.
@@ -14,48 +15,44 @@ use turndb::fold::FoldCfg;
 use turndb::store::{ReadStore, SingleFileKind, Store};
 
 const USAGE: &str = "\
-turndb — content-addressed columnar store for AI traces
+turndb — the database for AI traces, in one file
 
 usage: turndb <verb> [args]
 
-  reading (STORE may be a store directory, a sealed pack, or a .turndb container):
-    inspect   <STORE>            what is inside: manifest, parts, fold, snapshots
+  reading (STORE is a .turndb file, live or sealed):
+    inspect   <STORE>            what is inside: manifest, parts, fold, members, snapshots
     ids       <STORE>            every live record id, one per line
     get       <STORE> <ID>       reconstruct one record's content to stdout, byte-exact
-    verify    <STORE> [--deep]   integrity: structural checksums; --deep reconstructs everything
+    verify    <STORE> [--deep]   integrity: structural checksums, the manifest chain, every part
+                                 pin; --deep reconstructs everything
     query     <STORE> <SQL>      run SQL over the store (table name: t)
+    snapshots <STORE>            list retained commits available to time travel
 
-  operating (a store directory, writer role taken):
-    compact   <DIR>              merge every live part into one
-    refold    <DIR>              rewrite the fold, dropping content no live record references
-    punch     <DIR>              deallocate unreachable fold blocks IN PLACE — the cheap half of
-                                 erasure; no offsets move, no parts are rebuilt
-    recover   <DIR> [--max-rollback N]
-                                 validate and promote a retained manifest; rollback defaults to 0
-    snapshots <DIR>              list retained commits available to time travel
-    reclaim   <FILE.turndb>      rewrite a container without the extents nothing names any more.
-                                 A container only grows — freed extents are never reused, because
-                                 a reader may still hold offsets into them — so this is the only
-                                 thing that returns that space
-    erase     <DIR> (--id ID ... | --attr KEY=VALUE)
+  writing (writer role: flock on the file; creates the file if absent):
+    import    <STORE> <JSONL>    ingest records ({\"body\": ..., attrs...} per line; - for stdin),
+                                 carved by the engine's default opinion, batched per 1000
+
+  operating (writer role):
+    compact   <STORE>            merge every live part into one
+    refold    <STORE>            rewrite the fold, dropping content no live record references
+    punch     <STORE>            deallocate IN PLACE, both halves: dead content blocks under the
+                                 manifest's declaration, and free extents older than the
+                                 retention window. No offsets move, no parts are rebuilt
+    erase     <STORE> (--id ID ... | --attr KEY=VALUE)
                                  tombstone, settle, and REWRITE until this store no longer
                                  references the content or metadata. Does not promise media-byte
                                  non-recoverability; prints the measurable result
-
-  ingesting:
-    import    <DIR> <JSONL>      ingest records ({\"body\": ..., attrs...} per line; - for stdin),
-                                 carved by the engine's default opinion, batched per 1000
+    recover   <STORE> [--max-rollback N]
+                                 validate and promote a retained manifest; rollback defaults to 0
+    reclaim   <STORE>            rewrite the file without the extents nothing names any more —
+                                 returns edge bytes and fragmentation that punch cannot
 
   shipping:
-    pack      <DIR> <OUT>        the committed snapshot as one SEALED file
-    unpack    <PACK> <OUTDIR>    extract back into an ordinary store directory
-    checkpoint <DIR> <OUT.turndb>
-                                 the committed snapshot as one GROWABLE file, created or grown in
-                                 place; re-running it re-ingests only what changed
-    write     <FILE.turndb> <JSONL>
-                                 ingest INTO a single file, creating it if absent. Working state
-                                 lives beside it in FILE.turndb-hot while open and is folded back
-                                 in on close, so what remains is the one file
+    seal      <STORE> <OUT>      the committed snapshot as one SEALED file: no retained log, no
+                                 writer ever again, published only if OUT does not exist
+
+  converting (the one door retired layouts keep):
+    convert   <SRC> <OUT>        store directory or pack -> single-file store, verified whole
 ";
 
 fn main() {
@@ -93,12 +90,6 @@ fn classify(path: &Path) -> Source {
     }
 }
 
-/// Digests one named member of whichever single-file form the path turned out to be.
-///
-/// A digest rather than the bytes: a part is the largest thing a store holds, and reading one
-/// whole only to hash it is an unbounded allocation for no gain. The reader streams instead.
-type MemberDigest = Box<dyn Fn(&str) -> Result<String>>;
-
 /// BLAKE3 over a positioned reader, in a fixed window.
 fn digest_reader(r: &dyn turndb::readat::ReadAt) -> Result<String> {
     let len = r.len()?;
@@ -116,10 +107,32 @@ fn digest_reader(r: &dyn turndb::readat::ReadAt) -> Result<String> {
 
 fn open_read(path: &Path) -> Result<ReadStore> {
     match classify(path) {
-        Source::Directory => Store::open_read(path, FoldCfg::default()),
-        Source::Pack => turndb::store::open_read_pack(path, FoldCfg::default()),
         Source::Container => turndb::store::open_read_container(path, FoldCfg::default()),
+        Source::Directory => bail!(
+            "{} is a store directory — a retired layout; convert it first:\n  turndb convert {} {}.turndb",
+            path.display(),
+            path.display(),
+            path.display()
+        ),
+        Source::Pack => bail!(
+            "{} is a sealed pack — a retired layout; convert it first:\n  turndb convert {} <OUT>.turndb",
+            path.display(),
+            path.display()
+        ),
     }
+}
+
+/// Open the writer on a `.turndb` file — every mutating verb comes through here.
+fn open_writer(path: &Path) -> Result<Store> {
+    if path.is_dir() {
+        bail!(
+            "{} is a store directory — a retired layout; convert it first:\n  turndb convert {} {}.turndb",
+            path.display(),
+            path.display(),
+            path.display()
+        );
+    }
+    Store::open_file(path, FoldCfg::default())
 }
 
 fn run(args: &[String]) -> Result<()> {
@@ -153,7 +166,7 @@ fn run(args: &[String]) -> Result<()> {
         "verify" => verify(&arg(0, "STORE")?, rest.contains(&"--deep")),
         "query" => query(&arg(0, "STORE")?, rest.get(1).copied()),
         "compact" => {
-            let mut s = Store::open(&arg(0, "DIR")?, FoldCfg::default())?;
+            let mut s = open_writer(&arg(0, "STORE")?)?;
             let n = s.part_count();
             match s.merge_range(0, n)? {
                 Some(st) => {
@@ -170,7 +183,7 @@ fn run(args: &[String]) -> Result<()> {
             }
         }
         "punch" => {
-            let mut s = Store::open(&arg(0, "DIR")?, FoldCfg::default())?;
+            let mut s = open_writer(&arg(0, "STORE")?)?;
             s.flush()?;
             let st = s.punch_unreferenced()?;
             println!(
@@ -178,10 +191,16 @@ fn run(args: &[String]) -> Result<()> {
                  remains in parts until a refold)",
                 st.blocks_punched, st.blocks_examined
             );
+            let fp = s.punch_free_space()?;
+            println!(
+                "returned {} free bytes across {} extents ({} deferred inside the retention \
+                 window, {} edge bytes await a reclaim)",
+                fp.punched_bytes, fp.punched_extents, fp.deferred_extents, fp.edge_bytes
+            );
             Ok(())
         }
         "refold" => {
-            let mut s = Store::open(&arg(0, "DIR")?, FoldCfg::default())?;
+            let mut s = open_writer(&arg(0, "STORE")?)?;
             let st = s.refold()?;
             println!(
                 "kept {} records and {} pieces; dropped {} records and {} pieces; reclaimed {} bytes{}",
@@ -202,8 +221,8 @@ fn run(args: &[String]) -> Result<()> {
                 Some([]) | None => 0,
                 _ => bail!("recover accepts only --max-rollback N\n\n{USAGE}"),
             };
-            let report = turndb::store::recover_manifest(
-                &arg(0, "DIR")?,
+            let report = turndb::store::recover_manifest_file(
+                &arg(0, "STORE")?,
                 FoldCfg::default(),
                 turndb::store::RecoveryOptions { max_rollback_commits },
             )?;
@@ -214,7 +233,7 @@ fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         "snapshots" => {
-            for c in turndb::store::retained_commits(&arg(0, "DIR")?)? {
+            for c in turndb::store::retained_commits_file(&arg(0, "STORE")?)? {
                 println!("{c}");
             }
             Ok(())
@@ -235,47 +254,44 @@ fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        "checkpoint" => {
-            let stats =
-                turndb::store::checkpoint_into_container(&arg(0, "DIR")?, &arg(1, "OUT.turndb")?)?;
-            println!(
-                "commit {}: {} members, {} bytes ingested, {} unchanged, {} superseded",
-                stats.commit_seq,
-                stats.members,
-                stats.ingested_bytes,
-                stats.skipped_members,
-                stats.free_bytes
-            );
-            Ok(())
-        }
-        "erase" => erase(&arg(0, "DIR")?, &rest[1..]),
-        "write" => {
-            // The single-file shape's whole point: open a .turndb, write to it, close it, and
-            // still have a file. Everything between is an ordinary store.
-            let file = arg(0, "FILE.turndb")?;
-            let source = arg(1, "JSONL")?;
-            let mut cs = turndb::store::ContainerStore::open(&file, FoldCfg::default())?;
-            let imported = import_into(cs.store(), &source)?;
-            let stats = cs.close()?;
-            println!(
-                "{imported} records; container commit {} holds {} members ({} bytes ingested)",
-                stats.commit_seq, stats.members, stats.ingested_bytes
-            );
-            Ok(())
-        }
+
+        "erase" => erase(&arg(0, "STORE")?, &rest[1..]),
         "import" => {
-            let dir = arg(0, "DIR")?;
-            let src = arg(1, "JSONL")?;
-            import(&dir, &src)
-        }
-        "pack" => {
-            let st = turndb::pack::write(&arg(0, "DIR")?, &arg(1, "OUT")?)?;
-            println!("packed {} files, {} bytes", st.files, st.bytes);
+            // The single-file shape's whole point: open a .turndb, write into it, close it, and
+            // still have one file. Created if absent, appended to if not.
+            let file = arg(0, "STORE")?;
+            let source = arg(1, "JSONL")?;
+            let mut s = open_writer(&file)?;
+            let imported = import_into(&mut s, &source)?;
+            s.close()?;
+            println!("{imported} records into {}", file.display());
             Ok(())
         }
-        "unpack" => {
-            let n = turndb::pack::unpack(&arg(0, "PACK")?, &arg(1, "OUTDIR")?)?;
-            println!("extracted {n} files");
+        "seal" => {
+            let mut s = open_writer(&arg(0, "STORE")?)?;
+            let out = arg(1, "OUT")?;
+            let st = s.backup(&out)?;
+            println!(
+                "sealed commit {} into {}: {} members, {} bytes",
+                st.commit,
+                out.display(),
+                st.files,
+                st.bytes
+            );
+            Ok(())
+        }
+        "convert" => {
+            let src = arg(0, "SRC")?;
+            let out = arg(1, "OUT")?;
+            let st = turndb::store::convert_to_file(&src, &out)?;
+            println!(
+                "converted {} -> {}: {} members, {} bytes, opens at commit {}",
+                src.display(),
+                out.display(),
+                st.members,
+                st.bytes,
+                st.commit
+            );
             Ok(())
         }
         "help" | "--help" | "-h" => {
@@ -289,13 +305,8 @@ fn run(args: &[String]) -> Result<()> {
 fn inspect(path: &Path) -> Result<()> {
     let rs = open_read(path)?;
     let m = rs.manifest();
-    let source = classify(path);
-    let kind = match source {
-        Source::Directory => "store",
-        Source::Pack => "pack",
-        Source::Container => "container",
-    };
-    println!("{kind}: {}", path.display());
+    let c = turndb::container::Container::open(path)?;
+    println!("store: {}{}", path.display(), if c.sealed() { " (sealed)" } else { "" });
     println!(
         "manifest: commit {}, next_seq {}, fold generation {}, tail (seg {}, off {})",
         m.commit, m.next_seq, m.fold_gen, m.fold_seg, m.fold_off
@@ -306,104 +317,65 @@ fn inspect(path: &Path) -> Result<()> {
     }
     let ids = rs.ids()?;
     println!("live records: {}", ids.len());
-    match source {
-        Source::Directory => {
-            let snaps = turndb::store::retained_commits(path)?;
-            if !snaps.is_empty() {
-                println!(
-                    "snapshots: {}",
-                    snaps.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
-                );
-            }
-        }
-        Source::Pack => {
-            let pk = turndb::pack::Pack::open(path)?;
-            println!("pack files: {}", pk.names().count());
-        }
-        Source::Container => {
-            let c = turndb::container::Container::open(path)?;
-            println!(
-                "container members: {}, commit {}, {} member bytes, {} superseded",
-                c.len(),
-                c.seq(),
-                c.member_bytes(),
-                c.free_bytes()
-            );
-        }
+    println!(
+        "members: {}, commit {}, {} member bytes, {} free bytes",
+        c.len(),
+        c.seq(),
+        c.member_bytes(),
+        c.free_bytes()
+    );
+    let snaps = turndb::store::retained_commits_file(path)?;
+    if !snaps.is_empty() {
+        println!(
+            "snapshots: {}",
+            snaps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+        );
     }
     Ok(())
 }
 
 fn verify(path: &Path, deep: bool) -> Result<()> {
-    // Structural first: every checksum that exists gets checked.
-    match classify(path) {
-        Source::Pack => {
-            let pk = turndb::pack::Pack::open(path)?;
-            let n = pk.verify().context("pack verification failed")?;
-            println!("pack: {n} files pass their checksums");
-        }
-        Source::Container => {
-            let c = turndb::container::Container::open(path)?;
-            let n = c.verify().context("container verification failed")?;
-            println!("container: {n} members pass their checksums");
-        }
-        Source::Directory => {}
-    }
+    // Structural first: every member checksum the file records.
     let rs = open_read(path)?;
+    {
+        let c = turndb::container::Container::open(path)?;
+        let n = c.verify().context("member verification failed")?;
+        println!("members: {n} pass their checksums");
+    }
     let mut sections = 0usize;
     for p in rs.parts() {
         sections += p.verify_sections()?;
     }
     println!("parts: {} sections pass their checksums", sections);
-    if path.is_dir() {
-        let chain = turndb::store::verify_chain(path).context("chain verification failed")?;
-        println!(
-            "chain: {} links and {} part pins verified{}",
-            chain.links,
-            chain.part_digests,
-            if chain.undigested > 0 {
-                format!(" ({} parts predate digests)", chain.undigested)
-            } else {
-                String::new()
-            }
-        );
-    } else {
-        // A single-file store carries its manifest verbatim, so there is no retained chain to walk;
-        // what can be checked is each part pin against the extent the file actually holds.
-        let (kind, digest_member): (&str, MemberDigest) = match classify(path) {
-            Source::Container => {
-                let c = turndb::container::Container::open(path)?;
-                let digest = move |name: &str| {
-                    let extent = c
-                        .extent(name)
-                        .ok_or_else(|| anyhow::anyhow!("container does not hold {name}"))?;
-                    digest_reader(&extent)
-                };
-                ("container", Box::new(digest))
-            }
-            _ => {
-                let pk = turndb::pack::Pack::open(path)?;
-                let digest = move |name: &str| {
-                    let extent = pk
-                        .file(name)
-                        .ok_or_else(|| anyhow::anyhow!("pack does not hold {name}"))?;
-                    digest_reader(&extent)
-                };
-                ("pack", Box::new(digest))
-            }
-        };
-        let mut pins = 0usize;
+    // The chain: prev-links across the retained window and every part pin hashed against the
+    // extents the file actually holds. A sealed snapshot carries no retained log, so its chain
+    // is the live manifest's pins alone — and those are checked either way.
+    let chain = turndb::store::verify_chain_file(path).context("chain verification failed")?;
+    let mut pins = 0usize;
+    {
+        let c = turndb::container::Container::open(path)?;
         for p in &rs.manifest().parts {
             if let Some(want) = &p.b3 {
-                let got = digest_member(&p.file)?;
-                if *want != got {
-                    bail!("{kind} part {} drifted from its manifest pin", p.file);
+                let extent = c
+                    .extent(&p.file)
+                    .ok_or_else(|| anyhow::anyhow!("the store does not hold {}", p.file))?;
+                if digest_reader(&extent)? != *want {
+                    bail!("part {} drifted from its manifest pin", p.file);
                 }
                 pins += 1;
             }
         }
-        println!("chain: {pins} part pins verified inside the {kind}");
     }
+    println!(
+        "chain: {} retained links, {} retained pins, {pins} live pins verified{}",
+        chain.links,
+        chain.part_digests,
+        if chain.undigested > 0 {
+            format!(" ({} parts predate digests)", chain.undigested)
+        } else {
+            String::new()
+        }
+    );
     if deep {
         // The strongest check the format offers: reconstruct every live record, which verifies
         // every referenced piece against its BLAKE3 identity.
@@ -538,12 +510,6 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
 /// JSONL in, records out: `body` is the record body (carved by the default opinion), every other
 /// scalar field is an attribute, and `id` (or trace_id:span_id#kind, or a line counter) names it.
 /// Batched per 1000 lines — each batch replays all-or-nothing — and flushed at the end.
-fn import(dir: &Path, src: &Path) -> Result<()> {
-    let mut s = Store::open(dir, FoldCfg::default())?;
-    import_into(&mut s, src)?;
-    Ok(())
-}
-
 /// The ingest itself, over a store someone else opened — a directory writer or a container's.
 fn import_into(s: &mut Store, src: &Path) -> Result<u64> {
     use std::io::BufRead;

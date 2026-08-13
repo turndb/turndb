@@ -217,7 +217,7 @@ fn run_seed(seed: u64, steps: usize) -> usize {
         .collect();
 
     let mut m = Model::default();
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut applied = 0usize;
 
     for step in 0..steps {
@@ -275,7 +275,7 @@ fn run_seed(seed: u64, steps: usize) -> usize {
                 s.sync().unwrap();
                 m.sync();
                 drop(s);
-                s = Store::open(&dir, cfg()).unwrap();
+                s = Store::open_file(&store_file(&dir), cfg()).unwrap();
             }
             // refold — the one operation that rewrites content, so the model must survive it exactly
             97 => {
@@ -287,7 +287,7 @@ fn run_seed(seed: u64, steps: usize) -> usize {
             // CRASH: drop with no sync.
             _ => {
                 drop(s);
-                s = Store::open(&dir, cfg()).unwrap();
+                s = Store::open_file(&store_file(&dir), cfg()).unwrap();
                 m.reconcile(&s, &ctx);
             }
         }
@@ -300,11 +300,11 @@ fn run_seed(seed: u64, steps: usize) -> usize {
     m.sync();
     s.flush().unwrap();
     drop(s);
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     verify(&s, &m, &format!("seed {seed} final reopen"));
 
     // a reader with no lock sees the same committed state
-    let rs = Store::open_read(&dir, cfg()).unwrap();
+    let rs = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     for (id, v) in &m.acked {
         match v {
             Some((body, _)) => assert_eq!(
@@ -354,7 +354,7 @@ fn crash_never_resurrects_and_never_corrupts() {
     let dir = tmp("crashcontract");
     let mut r = Rng(7);
     let mut m = Model::default();
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let pool: Vec<Vec<u8>> = (0..8)
         .map(|i| {
             (0..200)
@@ -381,7 +381,7 @@ fn crash_never_resurrects_and_never_corrupts() {
         }
         // hard stop, no sync
         drop(s);
-        s = Store::open(&dir, cfg()).unwrap();
+        s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         m.reconcile(&s, &format!("round {round}"));
 
         for (id, v) in &m.acked {
@@ -408,4 +408,11 @@ fn crash_never_resurrects_and_never_corrupts() {
         }
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

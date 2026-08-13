@@ -6,7 +6,8 @@
 //! renamed, or unlinked NAME is volatile until its parent directory's fsync; and the two are
 //! independent, which is where real filesystems hide their sharpest teeth.
 //!
-//! Each crash state is materialized into a real directory and opened by the real `Store::open`.
+//! Each crash state is materialized for real and opened by the real writer — the single-file
+//! store for the main workload, the directory forms where a protocol sweep still tests them.
 //! The invariants are absolute:
 //!   * opening NEVER panics, and never refuses — every reachable crash state is a documented
 //!     recovery, not an error;
@@ -437,13 +438,16 @@ fn corner_attrs() -> Vec<(String, AttrValue)> {
 /// A deterministic mixed workload. Returns the op log, the issued-write timeline, and the acks.
 fn run_workload(dir: &Path) -> (Vec<Op>, Vec<Issued>, Vec<Ack>) {
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // The parent directory is the given world, not part of the recorded protocol — the store
+    // FILE and its sidecar are what the crash model owns.
+    std::fs::create_dir_all(dir).unwrap();
     record::arm();
     let mut issued: Vec<Issued> = Vec::new();
     let mut acks: Vec<Ack> = Vec::new();
     let mut group = 0usize;
 
     {
-        let mut s = Store::open(dir, cfg).unwrap();
+        let mut s = Store::open_file(&dir.join("s.turndb"), cfg).unwrap();
         // three flush intervals of puts, with a delete and a batch mixed in
         for round in 0..3usize {
             for i in 0..6usize {
@@ -513,7 +517,7 @@ fn run_workload(dir: &Path) -> (Vec<Op>, Vec<Issued>, Vec<Ack>) {
     {
         // Reopen mid-workload: RECOVERY ITSELF is part of the recorded op stream, so crash points
         // inside recovery-after-a-crash get tested too.
-        let mut s = Store::open(dir, cfg).unwrap();
+        let mut s = Store::open_file(&dir.join("s.turndb"), cfg).unwrap();
         s.delete("r2:5").unwrap();
         group += 1;
         issued.push((group, "r2:5".into(), None));
@@ -652,7 +656,7 @@ fn check_state(
     // open below sweeps, promotes, and replays; a reader must cope with the state as the crash
     // left it.)
     {
-        if let Ok(rs) = Store::open_read(stage, cfg) {
+        if let Ok(rs) = turndb::store::open_read_container(&stage.join("s.turndb"), cfg) {
             let _ = rs.ids().map(|ids| {
                 for id in ids.iter().take(64) {
                     if let Ok(Some(rec)) = rs.get(id) {
@@ -664,7 +668,7 @@ fn check_state(
             });
         }
     }
-    let store = match Store::open(stage, cfg) {
+    let store = match Store::open_file(&stage.join("s.turndb"), cfg) {
         Ok(s) => s,
         Err(e) => {
             panic!("crash point {k} {variant:?}: open REFUSED a reachable crash state: {e:#}")

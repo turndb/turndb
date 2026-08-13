@@ -57,7 +57,7 @@ fn cfg() -> FoldCfg {
 
 /// A store of `n` records per flush over `flushes` flushes, with a realistic attribute mix.
 fn build(dir: &Path, flushes: usize, per: usize) -> Vec<(String, Vec<u8>)> {
-    let mut s = Store::open(dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(dir), cfg()).unwrap();
     let mut want = Vec::new();
     for f in 0..flushes {
         for i in 0..per {
@@ -82,15 +82,12 @@ fn build(dir: &Path, flushes: usize, per: usize) -> Vec<(String, Vec<u8>)> {
     want
 }
 
-fn parts_of(dir: &PathBuf) -> Vec<Arc<Part>> {
-    let mut ps: Vec<PathBuf> = std::fs::read_dir(dir)
+fn parts_of(dir: &Path) -> Vec<Arc<Part>> {
+    // The committed parts, in manifest order, straight off the single file's extents.
+    turndb::store::open_read_container(&store_file(dir), FoldCfg::default())
         .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "part").unwrap_or(false))
-        .collect();
-    ps.sort();
-    ps.iter().map(|p| Arc::new(Part::open(p).unwrap())).collect()
+        .parts()
+        .to_vec()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -100,7 +97,7 @@ fn parts_of(dir: &PathBuf) -> Vec<Arc<Part>> {
 #[test]
 fn schema_names_columns_by_key_and_never_merges_two_types() {
     let dir = tmp("schema");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put("a", &[Span::Lit(b"x")], vec![("v".into(), AttrValue::Int(1))]).unwrap();
     // Same key, different type — these are two homogeneous columns, and must stay two fields.
     s.put("b", &[Span::Lit(b"y")], vec![("v".into(), AttrValue::Str("one".into()))]).unwrap();
@@ -124,7 +121,7 @@ async fn extended_scalar_columns_keep_exact_arrow_types_and_null_presence() {
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
     let dir = tmp("extended-scalars");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put(
         "a",
         &[Span::Lit(b"")],
@@ -192,7 +189,7 @@ async fn extended_scalar_columns_keep_exact_arrow_types_and_null_presence() {
             }
         );
     }
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let mut query = SqlQuery::open(
         reader,
         "SELECT id FROM records WHERE u = $1 AND raw = $2 AND at = $3",
@@ -213,7 +210,7 @@ async fn extended_scalar_columns_keep_exact_arrow_types_and_null_presence() {
 #[test]
 fn parts_with_different_columns_share_one_row_shape() {
     let dir = tmp("union");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put("a", &[Span::Lit(b"x")], vec![("early".into(), AttrValue::Int(1))]).unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
@@ -353,7 +350,7 @@ fn columnar_and_row_paths_agree_exactly() {
     );
 
     // And the body column must reconstruct byte-exactly, same as the row path.
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     for (id, body) in want.iter().take(50) {
         assert_eq!(&store.reconstruct(id).unwrap().unwrap(), body);
     }
@@ -494,7 +491,7 @@ async fn assert_differential_filter(
 #[tokio::test]
 async fn point_structured_and_datafusion_paths_agree_on_versioned_general_records() {
     let dir = ScopedDir::new("three-path-differential");
-    let mut writer = Store::open(dir.path(), cfg()).unwrap();
+    let mut writer = Store::open_file(&store_file(dir.path()), cfg()).unwrap();
     let mut expected = BTreeMap::new();
 
     // Seed every key, then retain seven independently flushed mutation layers. The final view has
@@ -523,7 +520,7 @@ async fn point_structured_and_datafusion_paths_agree_on_versioned_general_record
     }
     drop(writer);
 
-    let reader = Store::open_read(dir.path(), cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(dir.path()), cfg()).unwrap();
     assert!(expected.len() > 30, "the deterministic corpus unexpectedly lost most live rows");
 
     // Point reads are checked against the independently maintained mutation model, including
@@ -744,7 +741,7 @@ async fn point_structured_and_datafusion_paths_agree_on_versioned_general_record
 fn the_body_column_is_byte_exact() {
     let dir = tmp("bodycol");
     let want = build(&dir, 2, 100);
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (fold, parts) = store.into_parts();
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id", "body"]).unwrap();
@@ -768,7 +765,7 @@ fn the_body_column_is_byte_exact() {
 #[test]
 fn a_repeated_key_surfaces_its_first_value_and_counts_the_rest() {
     let dir = tmp("shadow");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put(
         "r",
         &[Span::Lit(b"x")],
@@ -812,7 +809,7 @@ fn a_repeated_key_surfaces_its_first_value_and_counts_the_rest() {
 async fn sql_selects_filters_and_aggregates() {
     let dir = tmp("sql");
     build(&dir, 3, 300);
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, _table) = TurndbTable::context(store, "traces").unwrap();
 
     // count(*) projects ZERO columns — the batch must still carry its row count.
@@ -867,7 +864,7 @@ async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
     use std::io::Cursor;
 
     let dir = tmp("embedded-sql");
-    let mut writer = Store::open(&dir, cfg()).unwrap();
+    let mut writer = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for (id, kind, tokens) in [("a", "keep", 1), ("b", "drop", 2), ("c", "keep", 3)] {
         writer
             .put_body(
@@ -882,7 +879,7 @@ async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
     }
     writer.sync().unwrap();
     writer.flush().unwrap();
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
 
     // ReadStore clones retain the same immutable fold and parts rather than reopening files or
     // moving the caller's snapshot into one query.
@@ -975,7 +972,7 @@ async fn embedded_sql_is_read_only_parameterized_bounded_and_arrow_streamed() {
 async fn shared_sql_budget_bounds_concurrent_query_ceilings_and_releases_promptly() {
     let dir = tmp("sql-aggregate-budget");
     build(&dir, 1, 3);
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let budget = SqlBudget::new(48 << 20).unwrap();
     let options = SqlOptions { max_memory_bytes: 32 << 20 };
 
@@ -1018,7 +1015,7 @@ async fn shared_sql_budget_bounds_concurrent_query_ceilings_and_releases_promptl
 async fn sql_over_attributes_reads_no_content() {
     let dir = tmp("sqlproj");
     build(&dir, 3, 300);
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "traces").unwrap();
     table.reset_stats();
 
@@ -1041,7 +1038,7 @@ async fn sql_over_attributes_reads_no_content() {
 async fn sql_can_still_reach_content_when_it_asks_for_it() {
     let dir = tmp("sqlbody");
     let want = build(&dir, 1, 40);
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "traces").unwrap();
 
     let r = ctx
@@ -1062,7 +1059,7 @@ async fn sql_can_still_reach_content_when_it_asks_for_it() {
 #[tokio::test]
 async fn named_content_columns_are_sparse_independent_and_lazy() {
     let dir = tmp("named-content");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put_record(
         "a",
         &[ContentSpans::new("request", vec![Span::Piece(b"request-a")])],
@@ -1088,7 +1085,7 @@ async fn named_content_columns_are_sparse_independent_and_lazy() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
     let schema = table.schema();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -1126,7 +1123,7 @@ async fn named_content_columns_are_sparse_independent_and_lazy() {
 #[tokio::test]
 async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
     let dir = tmp("visibility");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put(
         "x",
         &[Span::Lit(b"old body")],
@@ -1153,7 +1150,7 @@ async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
 
     let count = ctx.sql("SELECT count(*) FROM t").await.unwrap().collect().await.unwrap();
@@ -1188,13 +1185,13 @@ async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
     // Neither ordinary compaction nor the re-folding GC may change the logical SQL answer.
     drop(ctx);
     drop(table);
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let n = s.part_count();
     s.merge_range(0, n).unwrap();
     s.refold().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, _) = TurndbTable::context(store, "t").unwrap();
     let count = ctx.sql("SELECT count(*) FROM t").await.unwrap().collect().await.unwrap();
     assert_eq!(
@@ -1220,7 +1217,7 @@ async fn sql_exposes_one_live_version_and_never_falls_through_a_filter() {
 #[test]
 fn a_limit_counts_visible_rows_not_physical_prefix_rows() {
     let dir = tmp("visiblelimit");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     // In the older part, `a` is row zero and `z` is row one. A newer `a` hides row zero, so a
     // physical-prefix interpretation of fetch=1 would return nothing instead of the visible `z`.
     s.put("a", &[Span::Lit(b"old a")], vec![]).unwrap();
@@ -1232,7 +1229,7 @@ fn a_limit_counts_visible_rows_not_physical_prefix_rows() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (fold, parts) = store.into_parts();
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id"]).unwrap();
@@ -1247,7 +1244,7 @@ fn a_limit_counts_visible_rows_not_physical_prefix_rows() {
 #[test]
 fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     let dir = tmp("batchbytes");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     // 400 records of ~256 KiB each: far under BATCH_ROWS, far over BATCH_BYTES.
     let mut want = Vec::new();
     for i in 0..400u32 {
@@ -1260,7 +1257,7 @@ fn a_body_batch_is_bounded_by_bytes_not_row_count() {
     s.sync().unwrap();
     s.flush().unwrap();
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (fold, parts) = store.into_parts();
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id", "body"]).unwrap();
@@ -1294,7 +1291,7 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
     let dir = tmp("sqlstream");
     // 300 records of ~256 KiB = ~75 MiB of content in ONE part. Eager materialisation would build all
     // of it in the partition before yielding a single row; streaming yields it a batch at a time.
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for i in 0..300u32 {
         let body: Vec<u8> = (0..8192u32)
             .flat_map(|j| blake3::hash(&(i * 77_777 + j).to_le_bytes()).as_bytes()[..32].to_vec())
@@ -1309,7 +1306,7 @@ async fn a_body_query_streams_instead_of_materialising_the_part() {
     s.sync().unwrap();
     s.flush().unwrap();
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
 
     // LIMIT is the observable proof of laziness: an eager plan reconstructs every body in the
@@ -1364,7 +1361,7 @@ async fn limit_cost_does_not_scale_with_part_count() {
     // `LIMIT 1` reconstructs one BATCH of bodies per part — on a 400-part store, thousands of
     // reconstructions to return one row.
     let dir = tmp("limitparts");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for p in 0..8u32 {
         for i in 0..40u32 {
             let body: Vec<u8> = (0..2048u32)
@@ -1381,7 +1378,7 @@ async fn limit_cost_does_not_scale_with_part_count() {
     assert_eq!(s.part_count(), 8);
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
     table.reset_stats();
     let r = ctx.sql("SELECT id, body FROM t LIMIT 1").await.unwrap().collect().await.unwrap();
@@ -1404,7 +1401,7 @@ async fn limit_cost_does_not_scale_with_part_count() {
 #[tokio::test]
 async fn a_filtered_body_query_reconstructs_only_matching_rows() {
     let dir = tmp("filterbody");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for i in 0..600u32 {
         let body: Vec<u8> = (0..512u32)
             .flat_map(|j| blake3::hash(&(i * 4096 + j).to_le_bytes()).as_bytes()[..32].to_vec())
@@ -1425,7 +1422,7 @@ async fn a_filtered_body_query_reconstructs_only_matching_rows() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
     table.reset_stats();
 
@@ -1457,7 +1454,7 @@ async fn a_filtered_body_query_reconstructs_only_matching_rows() {
 #[test]
 fn early_batch_close_does_not_inflate_window_accounting() {
     let dir = ScopedDir::new("early-close-stats");
-    let mut s = Store::open(dir.path(), cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(dir.path()), cfg()).unwrap();
     for (id, x) in [("a", 0), ("b", 1), ("c", 0), ("d", 1)] {
         s.put(id, &[Span::Lit(b"v")], vec![("x".into(), AttrValue::Int(x))]).unwrap();
     }
@@ -1465,7 +1462,7 @@ fn early_batch_close_does_not_inflate_window_accounting() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(dir.path(), cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(dir.path()), cfg()).unwrap();
     let (_fold, parts) = store.into_parts();
     let lens = Lens::new(&parts).unwrap();
     let proj = lens.project(&["id"]).unwrap();
@@ -1492,7 +1489,7 @@ fn early_batch_close_does_not_inflate_window_accounting() {
 #[tokio::test]
 async fn a_full_drain_accounts_for_every_physical_row_exactly_once() {
     let dir = ScopedDir::new("full-drain-stats");
-    let mut s = Store::open(dir.path(), cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(dir.path()), cfg()).unwrap();
     for (id, x) in [("a", 0), ("b", 1), ("c", 0), ("d", 1), ("zz", 0)] {
         s.put(id, &[Span::Lit(b"v")], vec![("x".into(), AttrValue::Int(x))]).unwrap();
     }
@@ -1505,7 +1502,7 @@ async fn a_full_drain_accounts_for_every_physical_row_exactly_once() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(dir.path(), cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(dir.path()), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
     table.reset_stats();
     let batches = ctx.sql("SELECT id FROM t WHERE x = 1").await.unwrap().collect().await.unwrap();
@@ -1520,7 +1517,7 @@ async fn a_full_drain_accounts_for_every_physical_row_exactly_once() {
 #[tokio::test]
 async fn a_predicate_matching_nothing_skips_batches_whole() {
     let dir = tmp("filternone");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for i in 0..500u32 {
         s.put(
             &format!("z{i:04}"),
@@ -1533,7 +1530,7 @@ async fn a_predicate_matching_nothing_skips_batches_whole() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, table) = TurndbTable::context(store, "t").unwrap();
     table.reset_stats();
     // A literal that is not in the dictionary at all: the scan can prove no row matches without
@@ -1551,7 +1548,7 @@ async fn pushdown_never_changes_an_answer() {
     // every predicate shape, the SQL answer must be identical to the same query with the filter
     // applied by hand over a full scan.
     let dir = tmp("filtersame");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let kinds = ["alpha", "beta", "gamma", "delta"];
     for p in 0..3 {
         for i in 0..200u32 {
@@ -1573,7 +1570,7 @@ async fn pushdown_never_changes_an_answer() {
     }
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
 
     for pred in [
@@ -1626,7 +1623,7 @@ async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
     // a loader to produce, and it used to make DataFusion reject the table at REGISTRATION — so not
     // one bad column, but every query including `select count(*)`.
     let dir = tmp("collide");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put(
         "r1",
         &[Span::Lit(b"content")],
@@ -1641,7 +1638,7 @@ async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
     let n = ctx.sql("SELECT count(*) AS n FROM t").await.unwrap().collect().await.unwrap();
     assert_eq!(
@@ -1670,7 +1667,7 @@ async fn an_attribute_named_like_a_builtin_does_not_brick_the_table() {
 async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
     // A key literally named `a#str` beside a multi-typed `a` produces the same collision one level up.
     let dir = tmp("collide2");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     s.put(
         "r1",
         &[Span::Lit(b"x")],
@@ -1688,7 +1685,7 @@ async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
     s.flush().unwrap();
     drop(s);
 
-    let store = Store::open_read(&dir, cfg()).unwrap();
+    let store = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let (ctx, _t) = TurndbTable::context(store, "t").unwrap();
     let n = ctx.sql("SELECT count(*) AS n FROM t").await.unwrap().collect().await.unwrap();
     assert_eq!(
@@ -1707,7 +1704,7 @@ async fn a_key_shaped_like_a_disambiguation_does_not_collide_either() {
 fn zone_maps_prune_a_part_without_decoding_it() {
     use turndb::query::{Cmp, Pred};
     let dir = tmp("zoneprune");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for i in 0..20i64 {
         s.put(&format!("a{i:02}"), &[Span::Lit(b"x")], vec![("tokens".into(), AttrValue::Int(i))])
             .unwrap();
@@ -1751,4 +1748,11 @@ fn zone_maps_prune_a_part_without_decoding_it() {
     }
     assert_eq!(rows, 20, "the matching part must be untouched by pruning");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

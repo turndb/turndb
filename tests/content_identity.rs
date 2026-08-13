@@ -26,7 +26,7 @@ fn whole_value_identity_is_exact_carving_independent_and_metadata_only() {
     let dir = temp();
     let bytes = b"the exact same logical bytes across different carving boundaries";
     let split = 19;
-    let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
 
     store
         .put_record("a", &[ContentSpans::new("payload", vec![Span::Piece(bytes)])], vec![])
@@ -54,7 +54,7 @@ fn whole_value_identity_is_exact_carving_independent_and_metadata_only() {
 
     store.sync().unwrap();
     store.flush().unwrap();
-    let reader = Store::open_read(&dir, FoldCfg::default()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), FoldCfg::default()).unwrap();
     let before = reader.fold().cache_stats();
     let page = reader.scan(&metadata_request()).unwrap();
     assert!(page.rows.iter().all(|row| row.contents[0].identity == Some(expected)));
@@ -67,12 +67,12 @@ fn whole_value_identity_is_exact_carving_independent_and_metadata_only() {
 #[test]
 fn identities_survive_wal_replay_and_streaming_merge() {
     let dir = temp();
-    let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
     store.put_body("a", b"first exact value", vec![]).unwrap();
     store.sync().unwrap();
     drop(store);
 
-    let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
     assert_eq!(
         store
             .scan(&ScanRequest {
@@ -91,7 +91,7 @@ fn identities_survive_wal_replay_and_streaming_merge() {
     store.flush().unwrap();
     store.merge_range(0, 2).unwrap().unwrap();
 
-    let reader = Store::open_read(&dir, FoldCfg::default()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), FoldCfg::default()).unwrap();
     let page = reader
         .scan(&ScanRequest {
             contents: vec![ContentSelect { name: "body".into(), mode: ContentMode::Metadata }],
@@ -102,4 +102,11 @@ fn identities_survive_wal_replay_and_streaming_merge() {
     assert_eq!(page.rows[1].contents[0].identity, Some(ContentHash::of(b"second exact value")));
 
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

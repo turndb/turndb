@@ -15,9 +15,28 @@ first job is to find out which.
 
 ## The shape of a store
 
-A store is a directory. **Reading** one requires nothing but the files — no daemon, no lock, no
-recovery. **Writing** one requires the writer lock described [below](#the-writer-lock). A server is a
-role a process takes when it holds that lock, not something the format depends on.
+A store is **one file**: a [container](#the-container), superblock-addressed, holding every
+committed artifact as a member. **Reading** one requires nothing but that file — no daemon, no
+lock, no recovery. **Writing** one requires the writer lock described [below](#the-writer-lock),
+and keeps the arrangement SQLite settled on — one file at rest, flat working state beside it while
+a writer holds it:
+
+```
+mystore.turndb          the store: manifests, parts, fold segments, as members
+mystore.turndb-wal      while hot: acknowledged records not yet flushed; removed on clean close
+mystore.turndb-tmp/     while a maintenance operation runs: merge spools; removed whole at open
+```
+
+The artifacts inside — the manifest, parts, fold segments — are the byte-identical structures the
+rest of this document specifies, addressed by member extents instead of directory entries. The
+writer's commit is the container's superblock flip; the ordering argument lives in
+[the container's commit protocol](#commit).
+
+### Retired layout: the store directory
+
+The first releases laid the same artifacts out as files in a directory. That layout is **retired**:
+`convert` reads it, the transition keeps it compiled, and nothing else should be built on it. Its
+description remains normative for what the converter consumes:
 
 ```
 mystore/
@@ -52,9 +71,14 @@ replace.
 
 ### The writer lock
 
-`<fold-generation>/WRITER.lock` is an empty file held under an exclusive advisory lock for as long
-as a writer holds the fold open. It carries no content and is never read — the lock is the file's
-whole purpose, and a second writer is refused at open rather than allowed to interleave.
+A single-file store's lock is `flock` **on the store file itself**, exactly where SQLite puts it:
+taken exclusively at writer open, released by the kernel when the descriptor closes — including on
+a crash — and never observed by readers.
+
+The retired directory layout used `<fold-generation>/WRITER.lock`, an empty file held under the
+same exclusive advisory lock for as long as a writer held the fold open. It carries no content and
+is never read — the lock is the file's whole purpose, and a second writer is refused at open
+rather than allowed to interleave.
 
 It is **not** part of a snapshot. A pack excludes it, because a pack has no writer, ever; packing
 works from an allowlist of what belongs in a snapshot rather than a denylist of what does not, so it
@@ -68,9 +92,9 @@ distinguish from a live one.
 **On `wasm32-wasip1` there is no advisory locking.** WASI provides no equivalent, so the lock call
 succeeds unconditionally and the file is created but gates nothing. On that build the single-writer
 invariant is **the embedder's to keep**, and the
-obligation is precise: **at most one open writer per store directory, across all processes and all
+obligation is precise: **at most one open writer per store, across all processes and all
 WASM instances.** One process is not sufficient isolation — a single process can open the same
-directory through two instances or two handles, and the file will not stop it.
+store through two instances or two handles, and the lock call will not stop it.
 
 What two concurrent writers do to a store has been measured in one pattern only. In four
 overlapping-writer runs on the `wasm32-wasip1` build, both writers received successful durability
@@ -468,8 +492,9 @@ otherwise resurrects deleted data.
 
 ## The write-ahead log
 
-`WAL`, in the store root. Truncated at every flush, so it never carries history across a version
-boundary.
+Beside a single-file store as `<store>-wal`; `WAL` in the root of the retired directory layout.
+Truncated at every flush, so it never carries history across a version boundary; removed by a
+clean close, so a store at rest is one file and its presence at open means a crash to replay.
 
 ```
 offset  size  field
@@ -635,9 +660,12 @@ erased. And a **retained** manifest predates every punch that followed it, so a 
 retained snapshot must take `punched` from the **live** manifest, where it is cumulative, rather
 than from the snapshot's own.
 
-Committed with tmp + fsync + rename + fsync-dir, so a crash sees either the old manifest or the new
-one. **An unreadable manifest is an error, not an empty store** — conflating those with a sweep that
-unlinks unnamed files turns one bad byte into an empty directory.
+Committed, in a single-file store, as a restaged `MANIFEST` member published by the container's
+superblock flip — one atomic state carrying the manifest, its retained copy, and everything the
+commit stages. The retired directory layout committed with tmp + fsync + rename + fsync-dir, so a
+crash sees either the old manifest or the new one. **An unreadable manifest is an error, not an
+empty store** — conflating those with a sweep that unlinks unnamed files turns one bad byte into
+an empty store.
 
 ### The commit log
 
@@ -856,9 +884,13 @@ per fresh extent) is deliberate: hole punching deallocates whole filesystem bloc
 extent strands its edges. The padding is structural — a rewrite would recreate it — and is
 therefore **not** free-listed: free space means what a rewrite can return.
 
-Both forms are read-only in the same sense the pack is: a container has no writer role and no lock.
-Writing to one is a directory operation on working state beside it, folded back in at a
-checkpoint — see [ContainerStore](#writing-to-a-container).
+A container IS the store's writable form: the writer takes `flock` on the file, appends parts and
+fold segments as members past the committed tail, and publishes each flush, merge, refold,
+migration step, or erasure declaration as one superblock flip. Acknowledged-but-unflushed records
+live in the `-wal` sidecar and replay at open; recovery needs no truncate and no unlink, because
+the committed extent lists are the truncation. The retiring checkpoint bridge — a working
+directory beside the file, folded back in on close — is described under
+[the hot directory](#writing-through-the-retiring-hot-directory).
 
 ### Superblock — 4096 bytes, two slots at bytes 0 and 4096
 
@@ -989,10 +1021,12 @@ outlives the name. Reclaim is refused while a writer's working directory exists 
 that directory holds state the container has not been told about — and refused for a sealed
 container, whose bytes are final.
 
-### Writing to a container
+### Writing through the retiring hot directory
 
-A container has no writer role, so writing means running an ordinary store on working state beside
-the file and folding it back in:
+The first single-file writer was a checkpoint bridge: an ordinary directory store on working state
+beside the file, folded back in on close. It is **retiring** — the native writer above replaces
+it, and the bridge leaves with the bindings' rebase. Until then, a container it wrote is one the
+native writer opens (upgrading the plane's revision on its first commit), and its shape remains:
 
 ```
 mystore.turndb        the committed store

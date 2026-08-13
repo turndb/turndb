@@ -42,6 +42,9 @@ use crate::container::{Container, HOT_SUFFIX};
 use crate::fold::FoldCfg;
 
 /// A writable store held as one file.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub struct ContainerStore {
     store: Option<Store>,
     container: PathBuf,

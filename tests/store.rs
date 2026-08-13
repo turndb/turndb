@@ -1,7 +1,7 @@
 //! Step-3 gate: durability and recovery. A crash at any point loses nothing that was ACKed, and a
 //! reader works from the files alone — no lock, no writer, no daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
 use turndb::read_limits::ReadLimits;
 use turndb::store::{
@@ -54,7 +54,7 @@ fn put(s: &mut Store, id: &str, extra: &[u8]) -> Vec<u8> {
 #[test]
 fn put_flush_get_is_byte_exact() {
     let dir = tmp("basic");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for i in 0..200 {
         want.push((
@@ -97,7 +97,7 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
         },
         ..StoreOptions::default()
     };
-    let mut store = Store::open_with_options(&dir, options).unwrap();
+    let mut store = Store::open_file_with_options(&store_file(&dir), options).unwrap();
     let health = store.health();
     assert_eq!(health.fold_block_target_bytes, 4096);
     assert_eq!(health.fold_cache_budget, 2 << 20);
@@ -116,14 +116,14 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
     drop(store);
 
     // Reopening with other runtime policy reads the same format without migration.
-    let reopened = Store::open(&dir, cfg()).unwrap();
+    let reopened = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(reopened.health().fold_block_target_bytes, cfg().block_target);
     drop(reopened);
     std::fs::remove_dir_all(&dir).ok();
 
     let invalid = tmp("store-options-invalid");
-    let error = Store::open_with_options(
-        &invalid,
+    let error = Store::open_file_with_options(
+        &store_file(&invalid),
         StoreOptions { part_cache_bytes: 0, ..StoreOptions::default() },
     )
     .err()
@@ -136,7 +136,7 @@ fn store_options_apply_runtime_storage_budgets_without_becoming_format_state() {
 fn named_content_is_independent_sparse_and_content_addressed() {
     let dir = tmp("named-content");
     let shared = b"the same large content appears under request and response";
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
 
     // Deliberately submit names out of order. The semantic record is a map and reads canonically.
     let contents = vec![
@@ -180,7 +180,7 @@ fn named_content_is_independent_sparse_and_content_addressed() {
 
     s.refold().unwrap();
     drop(s);
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.reconstruct_content("mixed:1", "empty").unwrap(), Some(Vec::new()));
     assert_eq!(r.reconstruct_content("mixed:1", "absent").unwrap(), None);
     assert_eq!(r.reconstruct_content("mixed:2", "raw").unwrap().unwrap(), shared);
@@ -190,7 +190,7 @@ fn named_content_is_independent_sparse_and_content_addressed() {
 #[test]
 fn an_invalid_content_map_has_no_storage_side_effects() {
     let dir = tmp("invalid-content-map");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let duplicate = [
         ContentSpans::new("same", vec![Span::Piece(b"first")]),
         ContentSpans::new("same", vec![Span::Piece(b"second")]),
@@ -211,7 +211,7 @@ fn an_invalid_content_map_has_no_storage_side_effects() {
 #[test]
 fn an_invalid_late_batch_member_has_no_storage_side_effects() {
     let dir = tmp("invalid-batch-record");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut batch = turndb::store::Batch::new();
     batch.put("good", &[Span::Piece(b"must not reach the fold")], vec![]);
     // The compatibility staging API cannot return an error, so apply preflights the entire batch.
@@ -228,7 +228,7 @@ fn crash_before_flush_recovers_from_the_log() {
     let dir = tmp("crashwal");
     let mut want = Vec::new();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for i in 0..50 {
             want.push((
                 format!("r{i:03}"),
@@ -240,7 +240,7 @@ fn crash_before_flush_recovers_from_the_log() {
                            // (drop releases the writer lock, which a crash also does.)
         drop(s);
     }
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(s.memtable_len(), 50, "ACKed records must come back in the memtable");
     assert_eq!(s.part_count(), 0);
     for (id, body) in &want {
@@ -258,7 +258,7 @@ fn crash_after_flush_keeps_the_part_and_empties_the_log() {
     let dir = tmp("crashpart");
     let mut want = Vec::new();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for i in 0..40 {
             want.push((
                 format!("p{i:03}"),
@@ -269,7 +269,7 @@ fn crash_after_flush_keeps_the_part_and_empties_the_log() {
         s.flush().unwrap();
         drop(s);
     }
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(s.part_count(), 1);
     assert_eq!(s.memtable_len(), 0, "committed records must not replay into the memtable");
     for (id, body) in &want {
@@ -281,7 +281,7 @@ fn crash_after_flush_keeps_the_part_and_empties_the_log() {
 #[test]
 fn cancelled_sync_and_flush_refuse_before_their_publication_boundaries() {
     let dir = tmp("cancel-durability");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut store, "pending", b"content waiting for controlled durability");
     let cancellation = turndb::control::CancellationToken::new();
     cancellation.cancel();
@@ -290,7 +290,7 @@ fn cancelled_sync_and_flush_refuse_before_their_publication_boundaries() {
 
     let error = store.sync_with_control(&control).unwrap_err();
     assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
-    assert_eq!(std::fs::metadata(dir.join("WAL")).unwrap().len(), 0);
+    assert_eq!(std::fs::metadata(wal_of(&dir)).unwrap().len(), 0);
 
     let error = store.flush_with_control(&control).unwrap_err();
     assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
@@ -302,7 +302,10 @@ fn cancelled_sync_and_flush_refuse_before_their_publication_boundaries() {
         .any(|entry| entry.path().extension().is_some_and(|extension| extension == "part")));
 
     assert!(store.flush().unwrap().is_some());
-    assert_eq!(Store::open_read(&dir, cfg()).unwrap().ids().unwrap(), vec!["pending"]);
+    assert_eq!(
+        turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap().ids().unwrap(),
+        vec!["pending"]
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -336,7 +339,7 @@ fn torn_log_tail_keeps_the_intact_prefix() {
     let dir = tmp("tornwal");
     let mut want = Vec::new();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for i in 0..20 {
             want.push((
                 format!("t{i:03}"),
@@ -348,12 +351,12 @@ fn torn_log_tail_keeps_the_intact_prefix() {
     }
     // a crash mid-append leaves a frame header promising bytes that never landed
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(dir.join("WAL")).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(wal_of(&dir)).unwrap();
         f.write_all(&[0x57, 99, 0, 0, 0, 0, 0, 0, 0, 200, 0, 0, 0]).unwrap();
         f.write_all(b"truncated").unwrap();
         f.sync_all().unwrap();
     }
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(s.memtable_len(), 20, "the intact prefix must survive a torn tail");
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
@@ -364,7 +367,7 @@ fn torn_log_tail_keeps_the_intact_prefix() {
 #[test]
 fn newest_wins_across_parts() {
     let dir = tmp("newest");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "dup", b"first version");
     s.sync().unwrap();
     s.flush().unwrap();
@@ -379,7 +382,7 @@ fn newest_wins_across_parts() {
 #[test]
 fn a_reader_needs_no_lock_no_writer_no_daemon() {
     let dir = tmp("readonly");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for i in 0..30 {
         want.push((
@@ -395,7 +398,7 @@ fn a_reader_needs_no_lock_no_writer_no_daemon() {
     s.sync().unwrap();
 
     // the writer is still live and holding its lock
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.part_count(), 1);
     for (id, body) in &want {
         assert_eq!(&r.reconstruct(id).unwrap().unwrap(), body, "reader lost {id}");
@@ -407,7 +410,7 @@ fn a_reader_needs_no_lock_no_writer_no_daemon() {
     assert_eq!(r.ids().unwrap().len(), 30);
 
     // and a second concurrent reader is fine
-    let r2 = Store::open_read(&dir, cfg()).unwrap();
+    let r2 = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r2.reconstruct(&want[3].0).unwrap().unwrap(), want[3].1);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -415,10 +418,13 @@ fn a_reader_needs_no_lock_no_writer_no_daemon() {
 #[test]
 fn a_second_writer_is_refused() {
     let dir = tmp("twowriters");
-    let _s = Store::open(&dir, cfg()).unwrap();
-    assert!(Store::open(&dir, cfg()).is_err(), "single-writer must be enforced, not assumed");
+    let _s = Store::open_file(&store_file(&dir), cfg()).unwrap();
+    assert!(
+        Store::open_file(&store_file(&dir), cfg()).is_err(),
+        "single-writer must be enforced, not assumed"
+    );
     // but reading is always allowed
-    assert!(Store::open_read(&dir, cfg()).is_ok());
+    assert!(turndb::store::open_read_container(&store_file(&dir), cfg()).is_ok());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -427,7 +433,7 @@ fn dedup_survives_flush_and_reopen() {
     let dir = tmp("dedup");
     let shared = "a system prompt shared by every record. ".repeat(40).into_bytes();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for i in 0..30 {
             s.put(&format!("d{i:03}"), &[Span::Piece(&shared)], Vec::new()).unwrap();
         }
@@ -435,25 +441,15 @@ fn dedup_survives_flush_and_reopen() {
         s.flush().unwrap();
         drop(s);
     }
-    let before = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum::<u64>();
+    let before = fold_disk_bytes(&dir);
 
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for i in 30..60 {
         s.put(&format!("d{i:03}"), &[Span::Piece(&shared)], Vec::new()).unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
-    let after = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum::<u64>();
+    let after = fold_disk_bytes(&dir);
 
     // NOTE: cross-flush dedup currently relies on the in-memory window, which survives within one
     // process but not across a reopen. Tier-1 (per-part Bloom + hash column) is what makes this
@@ -472,7 +468,7 @@ fn dedup_survives_flush_and_reopen() {
 #[test]
 fn merge_consolidates_and_preserves_every_record() {
     let dir = tmp("merge");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for batch in 0..5 {
         for i in 0..20 {
@@ -483,12 +479,7 @@ fn merge_consolidates_and_preserves_every_record() {
         s.flush().unwrap();
     }
     assert_eq!(s.part_count(), 5);
-    let fold_before: u64 = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum();
+    let fold_before: u64 = fold_disk_bytes(&dir);
 
     let st = s.merge_range(0, 5).unwrap().unwrap();
     assert_eq!(st.inputs, 5);
@@ -496,12 +487,7 @@ fn merge_consolidates_and_preserves_every_record() {
     assert_eq!(st.fold_bytes_touched, 0);
     assert_eq!(s.part_count(), 1, "five parts must become one");
 
-    let fold_after: u64 = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum();
+    let fold_after: u64 = fold_disk_bytes(&dir);
     assert_eq!(fold_after, fold_before, "MERGE MUST NOT REWRITE CONTENT");
 
     for (id, body) in &want {
@@ -513,7 +499,7 @@ fn merge_consolidates_and_preserves_every_record() {
 #[test]
 fn merge_keeps_the_newest_version_of_a_reput_id() {
     let dir = tmp("mergedup");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "same", b"version one");
     s.sync().unwrap();
     s.flush().unwrap();
@@ -540,7 +526,7 @@ fn merge_keeps_the_newest_version_of_a_reput_id() {
 #[test]
 fn merge_preserves_every_extended_scalar_type() {
     let dir = tmp("merge-scalars");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let attrs = vec![
         ("u".into(), AttrValue::UInt(u64::MAX)),
         ("raw".into(), AttrValue::Bytes(vec![0, 0xff, 0x80])),
@@ -566,7 +552,7 @@ fn merge_preserves_every_extended_scalar_type() {
     assert_eq!(s.get("a").unwrap().unwrap().attrs, attrs);
     assert_eq!(s.part_count(), 1);
     drop(s);
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(reader.get("a").unwrap().unwrap().attrs, attrs);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -578,17 +564,10 @@ fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
     // sweep when the window prunes past their last naming manifest.
     let dir = tmp("mergereopen");
     let mut want = Vec::new();
-    let part_files = |dir: &std::path::Path| -> Vec<String> {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(".part"))
-            .collect()
-    };
+    let part_files = |dir: &std::path::Path| -> Vec<String> { part_members(dir) };
     let inputs;
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for b in 0..4 {
             for i in 0..10 {
                 let id = format!("s{b}-{i:02}");
@@ -611,13 +590,13 @@ fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
         );
     }
 
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(s.part_count(), 1, "the LIVE view is the merged part alone");
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
     }
     // and a plain reader sees the merged state with no lock
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.ids().unwrap().len(), 40);
     drop(r);
 
@@ -637,7 +616,7 @@ fn a_merged_store_survives_reopen_and_sweeps_its_inputs() {
 #[test]
 fn tiering_bounds_part_count_under_sustained_writes() {
     let dir = tmp("tiering");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     let mut peak = 0usize;
     for b in 0..30 {
@@ -660,7 +639,7 @@ fn tiering_bounds_part_count_under_sustained_writes() {
 #[test]
 fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
     let dir = tmp("bounded-compact");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for batch in 0..5 {
         for i in 0..10 {
@@ -675,7 +654,12 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
         .manifest()
         .parts
         .iter()
-        .map(|part| std::fs::metadata(dir.join(&part.file)).unwrap().len())
+        .map(|part| {
+            turndb::container::Container::open(&store_file(&dir))
+                .unwrap()
+                .member_len(&part.file)
+                .unwrap()
+        })
         .collect();
     let first_two_bytes = part_bytes[0] + part_bytes[1];
     let (smallest_start, smallest_pair_bytes) = part_bytes
@@ -729,13 +713,22 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
     assert_eq!(result.merge.inputs, 2);
     assert_eq!(s.part_count(), 4);
     let output = &s.manifest().parts[result.plan.start_part];
-    assert_eq!(result.output_bytes, std::fs::metadata(dir.join(&output.file)).unwrap().len());
+    assert_eq!(
+        result.output_bytes,
+        turndb::container::Container::open(&store_file(&dir))
+            .unwrap()
+            .member_len(&output.file)
+            .unwrap()
+    );
     assert!(result.output_bytes <= estimate.estimated_stage_bytes);
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "bounded merge lost {id}");
     }
 
-    let manifest_before = std::fs::read(dir.join("MANIFEST")).unwrap();
+    let manifest_before = turndb::container::Container::open(&store_file(&dir))
+        .unwrap()
+        .read_file_bounded("MANIFEST", 1 << 20)
+        .unwrap();
     let parts_before: Vec<_> = s.manifest().parts.iter().map(|part| part.file.clone()).collect();
     let error = s
         .compact_bounded(CompactionBudget {
@@ -753,7 +746,13 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
         parts_before,
         "a rejected budget must not mutate live state"
     );
-    assert_eq!(std::fs::read(dir.join("MANIFEST")).unwrap(), manifest_before);
+    assert_eq!(
+        turndb::container::Container::open(&store_file(&dir))
+            .unwrap()
+            .read_file_bounded("MANIFEST", 1 << 20)
+            .unwrap(),
+        manifest_before
+    );
 
     let error = s
         .plan_compaction(CompactionBudget {
@@ -772,7 +771,7 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
 #[test]
 fn repeated_bounded_compaction_settles_tombstones_only_on_the_total_step() {
     let dir = tmp("bounded-settle");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "gone", b"old");
     put(&mut s, "keep-a", b"a");
     s.sync().unwrap();
@@ -811,18 +810,13 @@ fn repeated_bounded_compaction_settles_tombstones_only_on_the_total_step() {
 
 /// Total bytes of fold segments — the only thing that grows when content is genuinely stored.
 fn fold_bytes(dir: &std::path::Path) -> u64 {
-    std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum()
+    fold_disk_bytes(dir)
 }
 
 #[test]
 fn content_repeated_after_a_flush_costs_nothing() {
     let dir = tmp("tier1");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     // A payload big enough that storing it twice is unmistakable in the segment size.
     let payload: Vec<u8> = (0..200_000u32)
         .flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..4].to_vec())
@@ -862,7 +856,7 @@ fn dedup_survives_a_process_restart() {
         .flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..4].to_vec())
         .collect();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         s.put("a", &[Span::Piece(&payload)], vec![]).unwrap();
         s.sync().unwrap();
         s.flush().unwrap();
@@ -871,7 +865,7 @@ fn dedup_survives_a_process_restart() {
     let before = fold_bytes(&dir);
     {
         // A fresh process has no in-memory window whatsoever. Only the parts on disk can answer.
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         s.put("b", &[Span::Piece(&payload)], vec![]).unwrap();
         s.sync().unwrap();
         s.flush().unwrap();
@@ -886,7 +880,7 @@ fn dedup_survives_a_process_restart() {
 #[test]
 fn dedup_survives_a_merge() {
     let dir = tmp("tier1merge");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let payload: Vec<u8> = (0..80_000u32)
         .flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..4].to_vec())
         .collect();
@@ -912,7 +906,7 @@ fn dedup_survives_a_merge() {
 #[test]
 fn a_heavily_repeated_corpus_stores_one_copy_of_each_distinct_piece() {
     let dir = tmp("tier1corpus");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     // 20 distinct pieces, referenced 500 times across 100 flushes.
     let pieces: Vec<Vec<u8>> = (0..20u32)
         .map(|i| {
@@ -965,20 +959,20 @@ fn a_crash_after_tier1_dedup_does_not_wedge_the_store() {
         .flat_map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[..8].to_vec())
         .collect();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         s.put("first", &[Span::Piece(&payload)], vec![]).unwrap();
         s.sync().unwrap();
         s.flush().unwrap(); // now committed to a part
         drop(s);
     }
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         // Deduped against the part on disk -> no bytes in the WAL, by design.
         s.put("second", &[Span::Piece(&payload)], vec![]).unwrap();
         s.sync().unwrap();
         drop(s); // CRASH: synced but never flushed
     }
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let flushed = s.flush().expect("a crash after a Tier-1 dedup must not wedge the flush path");
     assert!(flushed.is_some(), "the staged record must reach a part");
     assert_eq!(s.reconstruct("first").unwrap().unwrap(), payload);
@@ -993,7 +987,7 @@ fn a_crash_after_tier1_dedup_does_not_wedge_the_store() {
 #[test]
 fn a_batch_is_all_or_nothing_across_a_crash() {
     let dir = tmp("batch");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "x", b"pre-batch");
     s.sync().unwrap();
 
@@ -1006,7 +1000,7 @@ fn a_batch_is_all_or_nothing_across_a_crash() {
     s.sync().unwrap();
     drop(s);
 
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(
         s.reconstruct("a").unwrap().unwrap(),
         b"batch content A, long enough to be worth folding"
@@ -1022,12 +1016,12 @@ fn a_batch_is_all_or_nothing_across_a_crash() {
     s.apply(bt).unwrap();
     s.sync().unwrap();
     drop(s);
-    let wal = dir.join("WAL");
+    let wal = wal_of(&dir);
     let len = std::fs::metadata(&wal).unwrap().len();
     // the marker is the last frame: 13-byte header + 1-byte count + 4-byte crc
     std::fs::OpenOptions::new().write(true).open(&wal).unwrap().set_len(len - 18).unwrap();
 
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert!(s.reconstruct("c").unwrap().is_none(), "an unsealed batch member must not replay");
     assert!(s.reconstruct("d").unwrap().is_none(), "an unsealed batch member must not replay");
     assert_eq!(
@@ -1042,7 +1036,7 @@ fn a_batch_is_all_or_nothing_across_a_crash() {
 #[test]
 fn a_retained_snapshot_reads_the_past() {
     let dir = tmp("timetravel");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let v1 = put(&mut s, "k", b"v1");
     s.sync().unwrap();
     s.flush().unwrap();
@@ -1056,15 +1050,15 @@ fn a_retained_snapshot_reads_the_past() {
     s.flush().unwrap();
     drop(s);
 
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.reconstruct("k").unwrap().unwrap(), v2);
     assert!(r.reconstruct("gone").unwrap().is_none());
     drop(r);
 
     // The snapshot at c1 is the first flush, exactly: the old version, and no `gone` — it did not
     // exist yet, rather than "was deleted".
-    assert!(turndb::store::retained_commits(&dir).unwrap().contains(&c1));
-    let old = Store::open_read_at(&dir, cfg(), c1).unwrap();
+    assert!(turndb::store::retained_commits_file(&store_file(&dir)).unwrap().contains(&c1));
+    let old = turndb::store::open_read_container_at(&store_file(&dir), cfg(), c1).unwrap();
     assert_eq!(old.reconstruct("k").unwrap().unwrap(), v1);
     assert!(old.reconstruct("gone").unwrap().is_none());
     assert_eq!(old.ids().unwrap(), vec!["k".to_string()]);
@@ -1439,7 +1433,7 @@ fn merging_an_interior_run_does_not_unlink_its_own_output() {
     // (seq_hi, len), which is not unique — a collision meant the post-commit sweep deleted the part
     // the manifest had just committed, and the store never opened again.
     let dir = tmp("interior");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for b in 0..6 {
         for i in 0..6 {
@@ -1457,7 +1451,7 @@ fn merging_an_interior_run_does_not_unlink_its_own_output() {
     assert_eq!(s.part_count(), 4);
     drop(s);
 
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(s.part_count(), 4, "the merged part must survive reopen");
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "interior merge lost {id}");
@@ -1472,7 +1466,7 @@ fn the_dedup_window_is_actually_released_at_every_flush() {
     // Sealing was unsafe until flush learned to resolve through both tiers: the window and the part
     // being built were the same bug from two sides.
     let dir = tmp("seal");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut peak = 0usize;
     let mut want = Vec::new();
     for f in 0..25 {
@@ -1495,21 +1489,11 @@ fn the_dedup_window_is_actually_released_at_every_flush() {
     );
 
     // and sealing must not cost dedup — the same content re-put after 25 flushes still costs nothing
-    let fold_before = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum::<u64>();
+    let fold_before = fold_disk_bytes(&dir);
     s.put("echo", &[Span::Piece(&want[0].1)], vec![]).unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
-    let fold_after = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum::<u64>();
+    let fold_after = fold_disk_bytes(&dir);
     assert_eq!(fold_after, fold_before, "sealing Tier 0 must not cost dedup — Tier 1 covers it");
 
     for (id, body) in &want {
@@ -1530,7 +1514,7 @@ fn a_reader_survives_a_writer_merging_and_sweeping_underneath_it() {
     let dir = tmp("readerrace");
     let mut want = Vec::new();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         // Many parts on purpose: open_read's vulnerable window is the time between reading the
         // manifest and finishing the LAST part open, so it widens with part count.
         for b in 0..60 {
@@ -1551,7 +1535,7 @@ fn a_reader_survives_a_writer_merging_and_sweeping_underneath_it() {
         let mut opens = 0usize;
         while !rstop.load(Ordering::Relaxed) {
             // Any error here is the bug: the store is always in a committed, readable state.
-            let rs = Store::open_read(&rdir, cfg())
+            let rs = turndb::store::open_read_container(&store_file(&rdir), cfg())
                 .unwrap_or_else(|e| panic!("open_read failed while a merge ran: {e}"));
             let n = rs.ids().unwrap().len();
             assert_eq!(n, 720, "a reader saw {n} of 720 ids mid-merge");
@@ -1561,7 +1545,7 @@ fn a_reader_survives_a_writer_merging_and_sweeping_underneath_it() {
     });
 
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         // merge repeatedly, each one committing then unlinking its inputs
         while s.part_count() > 1 {
             let n = s.part_count();
@@ -1573,7 +1557,7 @@ fn a_reader_survives_a_writer_merging_and_sweeping_underneath_it() {
     let opens = reader.join().expect("the reader thread must not have panicked");
     assert!(opens > 0, "the reader never got a chance to run");
 
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for (id, body) in &want {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
     }
@@ -1586,7 +1570,7 @@ fn readers_open_a_coherent_snapshot_while_refolding() {
     use std::sync::Arc as StdArc;
 
     let dir = tmp("refoldreaderrace");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for i in 0..24u32 {
         let id = format!("g{i:02}");
@@ -1600,7 +1584,7 @@ fn readers_open_a_coherent_snapshot_while_refolding() {
     s.flush().unwrap();
 
     // A reader opened before the generation swap must remain valid after the old paths are unlinked.
-    let pinned = Store::open_read(&dir, cfg()).unwrap();
+    let pinned = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
 
     let stop = StdArc::new(AtomicBool::new(false));
     let rstop = stop.clone();
@@ -1609,7 +1593,7 @@ fn readers_open_a_coherent_snapshot_while_refolding() {
     let reader = std::thread::spawn(move || {
         let mut opens = 0usize;
         while !rstop.load(Ordering::Relaxed) {
-            let rs = Store::open_read(&rdir, cfg())
+            let rs = turndb::store::open_read_container(&store_file(&rdir), cfg())
                 .unwrap_or_else(|e| panic!("open_read paired different refold generations: {e}"));
             assert_eq!(rs.ids().unwrap().len(), 24);
             assert_eq!(rs.reconstruct(&first.0).unwrap().unwrap(), first.1);
@@ -1669,7 +1653,7 @@ fn a_manifest_naming_a_truly_absent_part_errors_rather_than_spinning() {
 #[test]
 fn a_deleted_record_is_gone_from_every_read_path() {
     let dir = tmp("delete");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let keep = put(&mut s, "keep", b"still here");
     put(&mut s, "gone", b"not for long");
     s.sync().unwrap();
@@ -1689,7 +1673,7 @@ fn a_deleted_record_is_gone_from_every_read_path() {
     assert_eq!(s.ids().unwrap(), vec!["keep".to_string()]);
 
     // a lockless reader agrees
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.reconstruct("gone").unwrap(), None);
     assert_eq!(r.ids().unwrap(), vec!["keep".to_string()]);
     std::fs::remove_dir_all(&dir).ok();
@@ -1699,7 +1683,7 @@ fn a_deleted_record_is_gone_from_every_read_path() {
 fn a_deletion_survives_a_crash() {
     let dir = tmp("delcrash");
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         put(&mut s, "a", b"alpha");
         let beta = put(&mut s, "b", b"beta");
         std::fs::write(dir.join("beta.expect"), &beta).unwrap();
@@ -1709,7 +1693,7 @@ fn a_deletion_survives_a_crash() {
         s.sync().unwrap(); // ACKed, never flushed
         drop(s);
     }
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     assert_eq!(s.reconstruct("a").unwrap(), None, "a SYNCED deletion must survive a crash");
     let beta = std::fs::read(dir.join("beta.expect")).unwrap();
     assert_eq!(s.reconstruct("b").unwrap().unwrap(), beta);
@@ -1721,7 +1705,7 @@ fn a_partial_merge_must_not_resurrect_a_deleted_record() {
     // THE gate. A tombstone exists to shadow older versions of its id. Dropping one while a part
     // outside the merge still holds an older version brings deleted data back.
     let dir = tmp("resurrect");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "victim", b"the original value");
     s.sync().unwrap();
     s.flush().unwrap(); // part 1: victim exists
@@ -1752,7 +1736,7 @@ fn a_partial_merge_must_not_resurrect_a_deleted_record() {
 #[test]
 fn re_putting_a_deleted_id_brings_it_back() {
     let dir = tmp("undelete");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "x", b"first");
     s.sync().unwrap();
     s.flush().unwrap();
@@ -1779,7 +1763,7 @@ fn a_writer_and_a_reader_never_disagree() {
     // read identically — and three separate defects this session were exactly a fix landing in one of
     // these paths and not the other.
     let dir = tmp("agree");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut live: Vec<String> = Vec::new();
 
     for round in 0..8 {
@@ -1803,7 +1787,7 @@ fn a_writer_and_a_reader_never_disagree() {
             s.merge_range(0, 2).unwrap();
         }
 
-        let r = Store::open_read(&dir, cfg()).unwrap();
+        let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
         assert_eq!(s.ids().unwrap(), r.ids().unwrap(), "round {round}: ids() diverged");
         for id in &live {
             assert_eq!(
@@ -1829,18 +1813,8 @@ fn a_writer_and_a_reader_never_disagree() {
 // ---------------------------------------------------------------------------------------------
 
 fn fold_gen_bytes(dir: &std::path::Path) -> u64 {
-    let mut n = 0u64;
-    for e in std::fs::read_dir(dir).unwrap().flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if e.path().is_dir() && (name == "fold" || name.starts_with("fold-")) {
-            for f in std::fs::read_dir(e.path()).unwrap().flatten() {
-                if f.file_name().to_string_lossy().ends_with(".fold") {
-                    n += f.metadata().unwrap().len();
-                }
-            }
-        }
-    }
-    n
+    // Through the readers: the live generation's bytes, wherever the store lives.
+    fold_disk_bytes(dir)
 }
 
 /// A payload big enough that keeping or dropping it is unmistakable on disk.
@@ -1855,7 +1829,7 @@ fn blob(seed: u32) -> Vec<u8> {
 #[test]
 fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
     let dir = tmp("refold");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut keep = Vec::new();
     for i in 0..10u32 {
         let b = blob(i);
@@ -1901,7 +1875,12 @@ fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
         .manifest()
         .parts
         .iter()
-        .map(|part| std::fs::metadata(dir.join(&part.file)).unwrap().len())
+        .map(|part| {
+            turndb::container::Container::open(&store_file(&dir))
+                .unwrap()
+                .member_len(&part.file)
+                .unwrap()
+        })
         .sum();
     assert!(after + rebuilt_part_bytes <= estimate.estimated_stage_bytes);
     // Half the content was deleted, so about half should be gone — "about", because a segment carries
@@ -1933,7 +1912,7 @@ fn a_refolded_store_reopens_and_keeps_working() {
     let dir = tmp("refoldreopen");
     let mut want = Vec::new();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for i in 0..24u32 {
             let b = blob(i + 500);
             s.put(&format!("x{i:02}"), &[Span::Piece(&b)], vec![]).unwrap();
@@ -1955,16 +1934,17 @@ fn a_refolded_store_reopens_and_keeps_working() {
         s.refold().unwrap();
         drop(s);
     }
-    // Exactly one fold generation must remain: the old one is swept.
-    let folds: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n == "fold" || n.starts_with("fold-"))
-        .collect();
+    // Exactly one fold generation must remain: the old one is freed in the refold's own flip.
+    let folds: std::collections::BTreeSet<String> = {
+        let c = turndb::container::Container::open(&store_file(&dir)).unwrap();
+        c.names()
+            .filter_map(|n| n.split_once('/').map(|(prefix, _)| prefix.to_string()))
+            .filter(|p| p == "fold" || p.starts_with("fold-"))
+            .collect()
+    };
     assert_eq!(folds.len(), 1, "stale fold generations must be swept: {folds:?}");
 
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for (i, (id, body)) in want.iter().enumerate() {
         if i % 3 == 0 {
             assert_eq!(s.reconstruct(id).unwrap(), None, "{id} was deleted before the refold");
@@ -1979,7 +1959,7 @@ fn a_refolded_store_reopens_and_keeps_working() {
     s.flush().unwrap();
     assert_eq!(s.reconstruct("after").unwrap().unwrap(), fresh);
 
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.reconstruct("after").unwrap().unwrap(), fresh);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1989,7 +1969,7 @@ fn refold_still_dedups_against_the_new_fold() {
     // The new fold's parts carry fresh dictionaries. If Tier-1 did not follow, every subsequent write
     // of already-stored content would be appended again.
     let dir = tmp("refolddedup");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let b = blob(4242);
     s.put("orig", &[Span::Piece(&b)], vec![]).unwrap();
     s.sync().unwrap();
@@ -2013,7 +1993,7 @@ fn refold_still_dedups_against_the_new_fold() {
 #[test]
 fn refold_refuses_with_a_dirty_memtable() {
     let dir = tmp("refolddirty");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut s, "a", b"x");
     s.sync().unwrap();
     s.flush().unwrap();
@@ -2079,7 +2059,7 @@ fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_gener
 #[test]
 fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
     let dir = tmp("compact-cancel");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for part in 0..3u32 {
         for row in 0..2_000u32 {
             let id = format!("compact-{part}-{row:04}");
@@ -2092,18 +2072,14 @@ fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
     }
     let commit = store.manifest().commit;
     let parts = store.part_count();
-    let output = dir.join(format!(
-        "part-{:08}-{:08}.part",
-        store.manifest().parts.first().unwrap().seq_lo,
-        store.manifest().parts.last().unwrap().seq_hi
-    ));
     let cancellation = turndb::control::CancellationToken::new();
     let cancel = cancellation.clone();
-    let output_watch = output.clone();
+    let output_watch = store_file(&dir);
+    let before_len = std::fs::metadata(&output_watch).unwrap().len();
     let watcher = std::thread::spawn(move || {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !output_watch.exists() {
-            assert!(std::time::Instant::now() < until, "compaction never created its output part");
+        while std::fs::metadata(&output_watch).map(|m| m.len()).unwrap_or(0) <= before_len {
+            assert!(std::time::Instant::now() < until, "compaction never began its output");
             std::thread::yield_now();
         }
         cancel.cancel();
@@ -2121,7 +2097,9 @@ fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
         .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
     assert_eq!(store.manifest().commit, commit);
     assert_eq!(store.part_count(), parts);
-    assert!(!output.exists(), "a cancelled unpublished part must be removed");
+    // The cancelled output is uncommitted noise past the tail: no member carries its name, on
+    // this handle or after a reopen.
+    assert_eq!(part_members(&dir).len(), parts, "a cancelled merge must publish no member");
     assert_eq!(store.ids().unwrap().len(), 6_000);
     std::fs::remove_dir_all(dir).ok();
 }
@@ -2183,7 +2161,7 @@ fn a_crashed_refold_leaves_the_store_exactly_as_it_was() {
 #[test]
 fn auto_compact_settles_the_store_and_its_deletes() {
     let dir = tmp("autocompact");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut want = Vec::new();
     for f in 0..turndb::store::Store::AUTO_COMPACT_K {
         for i in 0..5 {
@@ -2218,7 +2196,7 @@ fn auto_compact_settles_the_store_and_its_deletes() {
 #[test]
 fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
     let dir = tmp("erase");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let mut keep = Vec::new();
     for f in 0..3 {
         for i in 0..8 {
@@ -2259,7 +2237,7 @@ fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
     }
 
     // and TIME TRAVEL cannot resurrect it: the retained log was purged to the erasure's commit
-    let snaps = turndb::store::retained_commits(&dir).unwrap();
+    let snaps = turndb::store::retained_commits_file(&store_file(&dir)).unwrap();
     assert_eq!(snaps.len(), 1, "erasure must purge every snapshot that could still serve the data");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2298,7 +2276,8 @@ fn the_manifest_chain_links_and_pins_and_notices_tampering() {
 #[test]
 fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
     let dir = tmp("punch");
-    let mut s = Store::open(&dir, FoldCfg { block_target: 256 * 1024, ..cfg() }).unwrap();
+    let mut s =
+        Store::open_file(&store_file(&dir), FoldCfg { block_target: 256 * 1024, ..cfg() }).unwrap();
     // INCOMPRESSIBLE bodies: hole punching frees whole filesystem blocks, so a fold that
     // compresses into a single 4 KiB block has nothing observable to free.
     let noise = |seed: u64, len: usize| -> Vec<u8> {
@@ -2331,13 +2310,13 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
     s.flush().unwrap();
     s.merge_range(0, s.part_count()).unwrap().unwrap();
 
-    let before = allocated_bytes(&dir.join("fold"));
+    let before = allocated_bytes(&dir);
     let stats = s.punch_unreferenced().unwrap();
     assert!(stats.blocks_punched > 0, "dead blocks must be punched: {stats:?}");
     assert!(!s.manifest().punched.is_empty(), "the manifest must NAME what was punched");
 
     // bytes actually left the disk, and the file LENGTHS did not change (offsets are stable)
-    let after = allocated_bytes(&dir.join("fold"));
+    let after = allocated_bytes(&dir);
     assert!(after < before, "punching must deallocate: {before} -> {after}");
 
     // everything still live reads byte-exact, through the same unmoved offsets
@@ -2346,7 +2325,7 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
     }
     // and a reopened store agrees
     drop(s);
-    let s = Store::open(&dir, cfg()).unwrap();
+    let s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for (id, body) in &keep {
         assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "{id} damaged across reopen");
     }
@@ -2477,12 +2456,7 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// Blocks actually allocated on disk, in bytes — what punching changes (file LENGTH does not).
 fn allocated_bytes(d: &std::path::Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::read_dir(d)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".fold"))
-        .map(|e| e.metadata().unwrap().blocks() * 512)
-        .sum()
+    std::fs::metadata(store_file(d)).unwrap().blocks() * 512
 }
 
 #[test]
@@ -2493,7 +2467,7 @@ fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
     // Both halves matter: the first is what makes "live" possible, the second is why readers
     // never see a half-written world.
     let dir = tmp("livewrite");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let committed = put(&mut s, "before", b"flushed content");
     s.sync().unwrap();
     s.flush().unwrap();
@@ -2508,13 +2482,13 @@ fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
     assert_eq!(s.part_count(), 1, "still only the earlier part — nothing was committed");
 
     // a concurrent reader sees the committed world only
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.reconstruct("before").unwrap().unwrap(), committed);
     assert!(r.reconstruct("live").unwrap().is_none(), "a reader must not see uncommitted records");
 
     // ... until the flush, which is the visibility boundary
     s.flush().unwrap();
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert_eq!(r.reconstruct("live").unwrap().unwrap(), staged, "flush publishes it");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2528,7 +2502,7 @@ fn the_writer_reads_its_own_unflushed_writes_and_a_reader_does_not() {
 #[test]
 fn scan_ids_fills_the_page_past_staged_deletions() {
     let dir = tmp("scanidsfill");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c", "d", "e"] {
         put(&mut s, id, b"x");
     }
@@ -2550,7 +2524,7 @@ fn scan_ids_fills_the_page_past_staged_deletions() {
     // Deletions at the other end, against a reverse scan — a fix that over-fetches in only one
     // direction passes the forward case and fails here.
     let dir2 = tmp("scanidsfillrev");
-    let mut s2 = Store::open(&dir2, cfg()).unwrap();
+    let mut s2 = Store::open_file(&store_file(&dir2), cfg()).unwrap();
     for id in ["a", "b", "c", "d", "e"] {
         put(&mut s2, id, b"x");
     }
@@ -2606,7 +2580,7 @@ fn scan_ids_fills_the_page_past_staged_deletions() {
 #[test]
 fn an_inverted_scan_range_is_refused_rather_than_panicking() {
     let dir = tmp("scanidsinverted");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         put(&mut s, id, b"x");
     }
@@ -2617,7 +2591,7 @@ fn an_inverted_scan_range_is_refused_rather_than_panicking() {
     // ...and the store still works afterwards, which is the half that was actually lost.
     assert_eq!(s.scan_ids(None, None, 10, false).unwrap(), vec!["a", "b", "c"]);
 
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     assert!(r.scan_ids(Some("z"), Some("a"), 10, false).is_err(), "reader path must refuse too");
     assert_eq!(r.scan_ids(None, None, 10, false).unwrap().len(), 3);
 
@@ -2649,7 +2623,7 @@ fn an_inverted_scan_range_is_refused_rather_than_panicking() {
 #[test]
 fn scan_ids_mixed_overlay_fills_bounded_pages_in_both_directions() {
     let dir = tmp("scanidsmixedoverlay");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c", "d", "e", "f", "g", "h"] {
         put(&mut s, id, b"x");
     }
@@ -2680,7 +2654,7 @@ fn scan_ids_mixed_overlay_fills_bounded_pages_in_both_directions() {
 #[test]
 fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
     let dir = tmp("scanids");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), cfg()).unwrap();
     // ids shaped like the integration's: member/zero-padded-ts/rid — so lexicographic order IS
     // member-then-time order, which is what makes a page one range scan.
     for m in ["alice", "bob"] {
@@ -2715,7 +2689,7 @@ fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
     let page = s.scan_ids(Some("alice/"), Some("alice0"), 3, true).unwrap();
     assert_eq!(page[0], "alice/1785000000099/live", "writer must page its own unflushed write");
     // ... and not to a separate reader
-    let r = Store::open_read(&dir, cfg()).unwrap();
+    let r = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let rpage = r.scan_ids(Some("alice/"), Some("alice0"), 3, true).unwrap();
     assert_eq!(rpage[0], "alice/1785000000029/r29", "a reader sees committed state only");
 
@@ -2738,7 +2712,7 @@ fn scan_ids_pages_a_range_and_honours_every_visibility_rule() {
 fn health_is_cheap_complete_and_tracks_publication() {
     let dir = tmp("health");
     let config = cfg();
-    let mut s = Store::open(&dir, config).unwrap();
+    let mut s = Store::open_file(&store_file(&dir), config).unwrap();
     let empty = s.health();
     assert_eq!(empty.parts, 0);
     assert_eq!(empty.part_rows, 0);
@@ -2826,9 +2800,11 @@ fn space_usage_separates_live_retained_and_unclassified_files_without_double_cou
 #[test]
 fn content_liveness_separates_stranded_dead_bytes_from_whole_reclaimable_blocks() {
     let dir = tmp("content-liveness");
-    let mut store =
-        Store::open(&dir, FoldCfg { block_target: 8, compress_threads: 1, ..Default::default() })
-            .unwrap();
+    let mut store = Store::open_file(
+        &store_file(&dir),
+        FoldCfg { block_target: 8, compress_threads: 1, ..Default::default() },
+    )
+    .unwrap();
     let a = b"aaaa";
     let b = b"bbbb";
     let c = b"cccc";
@@ -2887,7 +2863,7 @@ fn content_liveness_separates_stranded_dead_bytes_from_whole_reclaimable_blocks(
 #[test]
 fn verification_metrics_preserve_typed_cancellation_and_corruption_outcomes() {
     let dir = tmp("verification-metrics");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     put(&mut store, "verified", b"content whose immutable part will later drift");
     store.sync().unwrap();
     store.flush().unwrap();
@@ -2907,10 +2883,14 @@ fn verification_metrics_preserve_typed_cancellation_and_corruption_outcomes() {
         .unwrap_err();
     assert_eq!(turndb::error::classify(&cancelled), turndb::error::ErrorClass::Cancelled);
 
-    let part_path = dir.join(&store.manifest().parts[0].file);
-    let mut bytes = std::fs::read(&part_path).unwrap();
-    bytes[2] ^= 0xff;
-    std::fs::write(&part_path, bytes).unwrap();
+    let file = store_file(&dir);
+    let part_off = {
+        let c = turndb::container::Container::open(&file).unwrap();
+        c.member_extents(&store.manifest().parts[0].file).unwrap()[0].0
+    };
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[part_off as usize + 2] ^= 0xff;
+    std::fs::write(&file, bytes).unwrap();
     let corrupt = store.verify().unwrap_err();
     assert_eq!(turndb::error::classify(&corrupt), turndb::error::ErrorClass::Corruption);
 
@@ -2928,14 +2908,14 @@ fn verification_metrics_preserve_typed_cancellation_and_corruption_outcomes() {
 fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     let dir = tmp("lifecycle-metrics");
     {
-        let mut store = Store::open(&dir, cfg()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
         put(&mut store, "replay", b"recover this frame");
         store.sync().unwrap();
         // The next handle's recovery counter starts at that handle rather than pretending metrics
         // are persisted across opens.
     }
 
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     let opened = store.metrics();
     assert_eq!(opened.open_recovery.attempts, 1);
     assert_eq!(opened.open_recovery.succeeded, 1);
@@ -3423,4 +3403,98 @@ fn a_single_file_store_verifies_backs_up_and_recovers() {
             .unwrap_err();
     assert!(err.to_string().contains("healthy"), "got: {err:#}");
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// The whole legacy road in one walk: a REAL version-one pack converts into a single-file
+/// store, its legacy parts are visible to migration status, each step rewrites one into a
+/// member and publishes with one flip, and the end state verifies whole and answers byte-exact.
+#[test]
+fn a_converted_pack_migrates_its_legacy_parts_inside_the_file() {
+    let root = tmp("convert-migrate");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Decode the checked-in hex dump of the version-one consumer artifact.
+    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+    let pack_bytes: Vec<u8> = digits
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let pack = root.join("revision-one.pack");
+    std::fs::write(&pack, &pack_bytes).unwrap();
+
+    let ct = root.join("converted.turndb");
+    let stats = turndb::store::convert_to_file(&pack, &ct).unwrap();
+    assert!(stats.members > 2, "manifest + parts + fold: {stats:?}");
+
+    let want: [(&str, &[u8]); 2] =
+        [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
+    let cfg = FoldCfg::default();
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for (id, bytes) in &want {
+        assert_eq!(
+            s.reconstruct_content(id, turndb::BODY_CONTENT).unwrap().as_deref(),
+            Some(*bytes),
+            "{id} must convert byte-exact"
+        );
+    }
+    assert_eq!(s.format_migration_status().unwrap().legacy_parts, 2, "fixture shape moved");
+
+    // One legacy part per step, one flip per publication, restartable across a reopen.
+    assert!(s.migrate_format_step().unwrap().is_some());
+    drop(s);
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    assert_eq!(s.format_migration_status().unwrap().legacy_parts, 1, "one step, one part");
+    assert!(s.migrate_format_step().unwrap().is_some());
+    assert!(s.migrate_format_step().unwrap().is_none(), "migration must report completion");
+    assert_eq!(s.format_migration_status().unwrap().legacy_parts, 0);
+
+    let v = s.verify().unwrap();
+    assert_eq!(v.records, 2, "{v:?}");
+    for (id, bytes) in &want {
+        assert_eq!(
+            s.reconstruct_content(id, turndb::BODY_CONTENT).unwrap().as_deref(),
+            Some(*bytes),
+            "{id} must survive migration byte-exact"
+        );
+    }
+    s.close().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
+}
+
+/// Fold bytes measured through the readers — the only form of the question that has an answer
+/// whatever the store lives in.
+fn fold_disk_bytes(dir: &Path) -> u64 {
+    turndb::store::open_read_container(&store_file(dir), FoldCfg::default())
+        .unwrap()
+        .fold()
+        .disk_bytes()
+}
+
+/// The committed part member names, sorted — what "which parts exist" means in one file.
+fn part_members(dir: &Path) -> Vec<String> {
+    let c = turndb::container::Container::open(&store_file(dir)).unwrap();
+    let mut v: Vec<String> = c
+        .names()
+        .filter(|n| n.starts_with("part-") && n.ends_with(".part"))
+        .map(String::from)
+        .collect();
+    v.sort();
+    v
+}
+
+/// The WAL sidecar beside the store file.
+fn wal_of(dir: &Path) -> PathBuf {
+    let mut p = store_file(dir).into_os_string();
+    p.push("-wal");
+    PathBuf::from(p)
 }

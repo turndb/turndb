@@ -104,8 +104,8 @@ fn manifest_recovery_reserves_its_staging_name_before_publication() {
 fn wal_frame_limit_is_enforced_before_writer_and_replay_growth() {
     let dir = ScopedDir::new("wal");
     let limits = with_counts(100, 2, 100);
-    let mut store = Store::open_with_options(
-        &dir,
+    let mut store = Store::open_file_with_options(
+        &store_file(&dir),
         StoreOptions { read_limits: limits, ..StoreOptions::default() },
     )
     .unwrap();
@@ -119,10 +119,14 @@ fn wal_frame_limit_is_enforced_before_writer_and_replay_growth() {
     store.sync().unwrap();
     drop(store);
 
-    let wal = dir.join("WAL");
+    let wal = {
+        let mut p = store_file(&dir).into_os_string();
+        p.push("-wal");
+        std::path::PathBuf::from(p)
+    };
     let before_bytes = std::fs::metadata(&wal).unwrap().len();
-    let error = match Store::open_with_options(
-        &dir,
+    let error = match Store::open_file_with_options(
+        &store_file(&dir),
         StoreOptions { read_limits: with_counts(100, 1, 100), ..StoreOptions::default() },
     ) {
         Ok(_) => panic!("one frame must not admit the two-frame WAL"),
@@ -135,8 +139,8 @@ fn wal_frame_limit_is_enforced_before_writer_and_replay_growth() {
 #[test]
 fn batch_frame_count_is_preflighted_before_fold_mutation() {
     let dir = ScopedDir::new("batch");
-    let mut store = Store::open_with_options(
-        &dir,
+    let mut store = Store::open_file_with_options(
+        &store_file(&dir),
         StoreOptions { read_limits: with_counts(100, 2, 100), ..StoreOptions::default() },
     )
     .unwrap();
@@ -194,24 +198,35 @@ fn sparse_persisted_block_id_is_refused_before_block_directory_resize() {
 #[test]
 fn writer_truncates_a_torn_wal_suffix_before_appending_new_frames() {
     let dir = ScopedDir::new("wal-tail");
-    let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
     store.put("before", &[Span::Lit(b"before")], vec![]).unwrap();
     store.sync().unwrap();
     drop(store);
 
-    let wal = dir.join("WAL");
+    let wal = {
+        let mut p = store_file(&dir).into_os_string();
+        p.push("-wal");
+        std::path::PathBuf::from(p)
+    };
     let mut file = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
     file.write_all(&[0x57, 9, 0, 0, 0, 0, 0, 0, 0, 200, 0, 0, 0]).unwrap();
     file.write_all(b"torn").unwrap();
     file.sync_all().unwrap();
     drop(file);
 
-    let mut recovered = Store::open(&dir, FoldCfg::default()).unwrap();
+    let mut recovered = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
     recovered.put("after", &[Span::Lit(b"after")], vec![]).unwrap();
     recovered.sync().unwrap();
     drop(recovered);
 
-    let reopened = Store::open(&dir, FoldCfg::default()).unwrap();
+    let reopened = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
     assert!(reopened.get("before").unwrap().is_some());
     assert!(reopened.get("after").unwrap().is_some());
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

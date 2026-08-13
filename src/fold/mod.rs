@@ -1034,8 +1034,33 @@ impl Fold {
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Fold> {
         let read_limits = read_limits.validate()?;
+        // An empty fold is a store nothing has flushed yet: readable, answering nothing. A pack
+        // never carries one — its committed snapshot always holds at least the virgin segment —
+        // but a single-file store's first commit is its first flush, and a reader may arrive
+        // before it.
         if segs.is_empty() {
-            bail!("no fold segments under {}", label.display());
+            return Ok(Fold {
+                dir: label.to_path_buf(),
+                cfg,
+                headers: Vec::new(),
+                readers: Vec::new(),
+                dicts: HashMap::new(),
+                active: 0,
+                cur_off: SEG_HDR_LEN as u32,
+                segs: Box::new(segstore::NoSegments),
+                open_block: Vec::new(),
+                dedup: DedupTable::new(),
+                cache: Mutex::new(BlockCache::new(cfg.cache_bytes)),
+                poisoned: false,
+                scratch: Vec::new(),
+                blockdir: Vec::new(),
+                next_block: 0,
+                inflight: HashMap::new(),
+                pool: pipe::Pool::new(nthreads(cfg.compress_threads), cfg.level, None),
+                _lock: None,
+                punched: punched.to_vec(),
+                read_limits,
+            });
         }
         segs.sort_by_key(|s| s.seg);
         // The same density rule the writer applies. A gap means a segment is missing, and reading
