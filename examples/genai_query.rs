@@ -13,15 +13,14 @@ use std::path::PathBuf;
 use std::time::Instant;
 use turndb::fold::FoldCfg;
 use turndb::query::table::TurndbTable;
-use turndb::store::Store;
 
 fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
-    let dir = PathBuf::from(a.next().context("usage: genai_query <store-dir> <genai.jsonl>")?);
+    let dir = PathBuf::from(a.next().context("usage: genai_query <store.turndb> <genai.jsonl>")?);
     let src = PathBuf::from(a.next().context("usage: genai_query <store-dir> <genai.jsonl>")?);
 
     // ---- byte-exactness first: the invariant everything else rests on ----
-    let rs = Store::open_read(&dir, FoldCfg::default())?;
+    let rs = turndb::store::open_read_container(&dir, FoldCfg::default())?;
     let rdr = std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(&src)?);
     let (mut checked, mut bytes) = (0u64, 0u64);
     for line in rdr.lines().take(400) {
@@ -58,7 +57,7 @@ fn main() -> Result<()> {
     );
 
     // ---- the UI's queries ----
-    let rs = Store::open_read(&dir, FoldCfg::default())?;
+    let rs = turndb::store::open_read_container(&dir, FoldCfg::default())?;
     let (ctx, table) = TurndbTable::context(rs, "genai")?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
