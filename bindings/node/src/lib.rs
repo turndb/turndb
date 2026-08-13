@@ -1118,7 +1118,11 @@ impl NativeSnapshot {
             options.as_ref().and_then(|value| value.max_concurrent_sql_memory_bytes.clone()),
         )?;
         let store = napi::tokio::task::spawn_blocking(move || {
-            Store::open_read_with_limits(&PathBuf::from(path), FoldCfg::default(), read_limits)
+            turndb::store::open_read_container_with_limits(
+                &PathBuf::from(path),
+                FoldCfg::default(),
+                read_limits,
+            )
         })
         .await
         .map_err(|error| failure("join TurnDB snapshot open", error))?
@@ -1202,7 +1206,7 @@ impl NativeSnapshot {
             options.as_ref().and_then(|value| value.max_concurrent_sql_memory_bytes.clone()),
         )?;
         let store = napi::tokio::task::spawn_blocking(move || {
-            Store::open_read_at_with_limits(
+            turndb::store::open_read_container_at_with_limits(
                 &PathBuf::from(path),
                 FoldCfg::default(),
                 commit,
@@ -1319,53 +1323,6 @@ impl NativeSnapshot {
     }
 }
 
-/// What one [`checkpoint_into_container`] moved.
-#[napi(object)]
-pub struct NativeCheckpointResult {
-    /// Members the container holds after the checkpoint.
-    pub members: u32,
-    /// Bytes written into the container by this call.
-    pub ingested_bytes: BigInt,
-    /// Members already present byte-for-byte and therefore not rewritten.
-    pub skipped_members: u32,
-    /// The container's committed sequence after this call.
-    pub commit_seq: BigInt,
-    /// Bytes now superseded inside the container, reclaimable only by rewriting it.
-    pub free_bytes: BigInt,
-}
-
-/// Checkpoint a store directory into a growable single file, creating it or growing one in place.
-///
-/// Incremental by construction: parts and rolled fold segments are immutable and uniquely named,
-/// so a member already present under the same name and length is skipped rather than rewritten.
-/// The source must be quiescent — settle it with `sync` and `flush` first — for the same reason a
-/// backup refuses a store with a live WAL.
-#[napi]
-pub async fn checkpoint_into_container(
-    directory_path: String,
-    container_path: String,
-) -> Result<NativeCheckpointResult> {
-    if directory_path.is_empty() || container_path.is_empty() {
-        return Err(Error::new(Status::InvalidArg, "store and container paths must not be empty"));
-    }
-    let stats = napi::tokio::task::spawn_blocking(move || {
-        turndb::store::checkpoint_into_container(
-            &PathBuf::from(directory_path),
-            &PathBuf::from(container_path),
-        )
-    })
-    .await
-    .map_err(|error| failure("join TurnDB checkpoint", error))?
-    .map_err(|error| engine_failure("checkpoint TurnDB store into a container", error))?;
-    Ok(NativeCheckpointResult {
-        members: stats.members as u32,
-        ingested_bytes: BigInt::from(stats.ingested_bytes),
-        skipped_members: stats.skipped_members as u32,
-        commit_seq: BigInt::from(stats.commit_seq),
-        free_bytes: BigInt::from(stats.free_bytes),
-    })
-}
-
 /// Which single-file form a path holds: `"pack"` if sealed, `"container"` if it can still grow,
 /// `null` for a directory or anything carrying neither magic.
 ///
@@ -1387,7 +1344,7 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
         return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
     }
     let commits = napi::tokio::task::spawn_blocking(move || {
-        turndb::store::retained_commits(&PathBuf::from(path))
+        turndb::store::retained_commits_file(&PathBuf::from(path))
     })
     .await
     .map_err(|error| failure("join retained TurnDB commit listing", error))?
@@ -1427,12 +1384,28 @@ pub fn restore_backup<'env>(
     };
     env.spawn_future(async move {
         napi::tokio::task::spawn_blocking(move || {
-            turndb::pack::restore_with_limits_and_control(
-                &PathBuf::from(backup_path),
-                &PathBuf::from(destination_path),
-                read_limits,
-                &control,
-            )
+            let src = PathBuf::from(backup_path);
+            let dst = PathBuf::from(destination_path);
+            // A backup is a sealed single-file store now: restoring is member-verified copying.
+            // Packs remain restorable as the retired artifacts they are.
+            match turndb::store::single_file_kind(&src) {
+                Some(turndb::store::SingleFileKind::Container) => {
+                    turndb::store::restore_file_with_control(&src, &dst, &control)
+                }
+                // A pack is a retired artifact; restoring one births a writable single-file
+                // store through the same door everything retired walks: convert.
+                _ => {
+                    let _ = read_limits;
+                    control.check("backup restore")?;
+                    turndb::store::convert_to_file(&src, &dst).map(|stats| {
+                        turndb::pack::RestoreStats {
+                            files: stats.members,
+                            bytes: stats.bytes,
+                            commit: stats.commit,
+                        }
+                    })
+                }
+            }
         })
         .await
         .map_err(|error| failure("join TurnDB backup restore", error))?
@@ -1478,7 +1451,7 @@ pub fn recover_manifest<'env>(
     };
     env.spawn_future(async move {
         napi::tokio::task::spawn_blocking(move || {
-            turndb::store::recover_manifest_with_limits_and_control(
+            turndb::store::recover_manifest_file_with_limits_and_control(
                 &PathBuf::from(path),
                 FoldCfg::default(),
                 turndb::store::RecoveryOptions { max_rollback_commits },
@@ -1509,7 +1482,6 @@ pub struct NativeStore {
     actor: Actor,
     /// Set when this handle was opened over a single file. The actor drives an ordinary store in
     /// the working directory beside it; this is what closing folds that work back into.
-    container: Option<PathBuf>,
     #[cfg(feature = "sql")]
     sql_budget: SqlBudget,
 }
@@ -1551,10 +1523,10 @@ impl NativeStore {
         .map_err(|error| engine_failure("open TurnDB store", error))?;
         #[cfg(feature = "sql")]
         {
-            Ok(NativeStore { actor, container: None, sql_budget })
+            Ok(NativeStore { actor, sql_budget })
         }
         #[cfg(not(feature = "sql"))]
-        Ok(NativeStore { actor, container: None })
+        Ok(NativeStore { actor })
     }
 
     /// Open a writer over a store held in ONE FILE, creating the file if it does not exist.
@@ -1592,26 +1564,21 @@ impl NativeStore {
             options.as_ref().and_then(|options| options.max_concurrent_sql_memory_bytes.clone()),
         )?;
         let store_options = decode_store_options(options.as_ref())?;
-        let container = PathBuf::from(path);
-        let opened = container.clone();
+        let opened = PathBuf::from(path);
+        // The store IS the file: the same open the ordinary constructor performs, kept as its
+        // own method because the name is the API's promise, not because the path differs.
         let actor = napi::tokio::task::spawn_blocking(move || {
-            // One implementation of the adopt-or-materialize decision, shared with the crate's
-            // own ContainerStore. A second copy of it here is how the two get out of step.
-            //
-            // The whole `Prepared` goes to the actor, not just its path: sealed members stay in the
-            // container, so the directory on its own is a store missing most of itself.
-            let prepared = turndb::store::container_store::prepare(&opened)?;
-            Actor::open_prepared(prepared, capacity as usize, store_options)
+            Actor::open_with_capacity_and_options(&opened, capacity as usize, store_options)
         })
         .await
         .map_err(|error| failure("join TurnDB single-file open", error))?
         .map_err(|error| engine_failure("open TurnDB single-file store", error))?;
         #[cfg(feature = "sql")]
         {
-            Ok(NativeStore { actor, container: Some(container), sql_budget })
+            Ok(NativeStore { actor, sql_budget })
         }
         #[cfg(not(feature = "sql"))]
-        Ok(NativeStore { actor, container: Some(container) })
+        Ok(NativeStore { actor })
     }
 
     /// The bounded backlog configured for this handle.
@@ -2063,33 +2030,13 @@ impl NativeStore {
     /// Close the handle. Durability defaults to true; pass false only for an explicit no-sync close.
     #[napi]
     pub async fn close(&self, durable: Option<bool>) -> Result<()> {
-        // A container close has to SEAL, not merely sync. `close(durable)` makes the WAL durable;
-        // it does not empty it, and a checkpoint refuses a store whose WAL still holds writes no
-        // part names — correctly, since those writes are not in anything the container would
-        // ingest. Flushing first is what `ContainerStore::close` does for the same reason.
-        if self.container.is_some() && durable.unwrap_or(true) {
-            self.actor
-                .flush(OperationControl::default())
-                .await
-                .map_err(|error| engine_failure("seal TurnDB writes before closing", error))?;
-        }
+        // A durable close settles the store to exactly one file inside the actor: writes
+        // synced, memtable flushed, the emptied WAL sidecar removed. There is no fold-back and
+        // no working directory — the store was the file the whole time.
         self.actor
             .close(durable.unwrap_or(true))
             .await
             .map_err(|error| engine_failure("close TurnDB store", error))?;
-        // The actor is down and its writer lock released, so the working directory can be folded
-        // in and removed. A non-durable close deliberately skips it: the caller asked not to
-        // settle, and publishing unsettled state into the file would settle it anyway.
-        if let (Some(container), true) = (self.container.clone(), durable.unwrap_or(true)) {
-            napi::tokio::task::spawn_blocking(move || {
-                turndb::store::container_store::settle(&container)
-            })
-            .await
-            .map_err(|error| failure("join TurnDB single-file close", error))?
-            .map_err(|error| {
-                engine_failure("fold the working directory into its container", error)
-            })?;
-        }
         Ok(())
     }
 }

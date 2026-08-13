@@ -207,7 +207,7 @@ test('qualifies retention, compaction, backup, restore, and physical erasure as 
   const root = temporaryRoot(t, 'turndb-qualification-maintenance-');
   const dir = path.join(root, 'store');
   const artifact = path.join(root, 'before-erasure.turndb');
-  const restoredDir = path.join(root, 'restored');
+  const restoredDir = path.join(root, 'restored.turndb');
   const shared = Buffer.from('shared immutable source context');
   const erasedPayload = Buffer.alloc(64 << 10, 0xa5);
   const store = await NativeStore.open(dir, {
@@ -257,7 +257,8 @@ test('qualifies retention, compaction, backup, restore, and physical erasure as 
   assert.equal((await store.verify()).parts, 1n);
 
   const backup = await store.backup(artifact);
-  assert.equal(backup.bytes, BigInt(fs.statSync(artifact).size));
+  // Member payload bytes: the sealed file adds its superblocks, alignment, and directory.
+  assert(backup.bytes > 0n && backup.bytes <= BigInt(fs.statSync(artifact).size));
   assert.equal(backup.commit, (await store.health()).commit);
   assert.deepEqual((await store.scan()).rows.map(({ id }) => id), expectedIds);
 

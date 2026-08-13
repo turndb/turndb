@@ -162,7 +162,6 @@ module.exports = {
   NativeSnapshot: guardFactories(native.NativeSnapshot),
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),
   retainedCommits: guarded(native.retainedCommits),
-  checkpointIntoContainer: guarded(native.checkpointIntoContainer, 'checkpointIntoContainer'),
   restoreBackup: guarded(native.restoreBackup, 'restoreBackup'),
   recoverManifest: guarded(native.recoverManifest, 'recoverManifest'),
   TurnDbError,

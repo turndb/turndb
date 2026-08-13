@@ -232,25 +232,11 @@ impl Actor {
         Self::open_with_capacity_and_options(path, capacity, StoreOptions::default())
     }
 
+    /// Open the single-file store and give it its dedicated thread. The path names a `.turndb`
+    /// file, created if absent; the bridge's prepared-working-directory machinery has no seat
+    /// here any more — the store IS the file.
     pub fn open_with_capacity_and_options(
         path: &Path,
-        capacity: usize,
-        options: StoreOptions,
-    ) -> Result<Actor> {
-        Self::open_prepared(
-            turndb::store::container_store::Prepared { hot: path.to_path_buf(), sealed: None },
-            capacity,
-            options,
-        )
-    }
-
-    /// Open over a prepared working directory, sealed members and all.
-    ///
-    /// Takes the whole [`Prepared`](turndb::store::container_store::Prepared) rather than its path
-    /// because the path alone is not a complete store when a container is behind it — the members
-    /// that stayed put are reachable only through the other half.
-    pub fn open_prepared(
-        prepared: turndb::store::container_store::Prepared,
         capacity: usize,
         options: StoreOptions,
     ) -> Result<Actor> {
@@ -261,10 +247,10 @@ impl Actor {
         }
         let (tx, rx) = mpsc::sync_channel(capacity);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let path = prepared.hot.clone();
+        let path = path.to_path_buf();
         std::thread::Builder::new()
             .name("turndb-store".into())
-            .spawn(move || match prepared.open(options) {
+            .spawn(move || match Store::open_file_with_options(&path, options) {
                 Ok(store) => {
                     let _ = ready_tx.send(Ok(()));
                     run(store, &path, rx);
@@ -536,7 +522,9 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let fold_cfg = store.fold_cfg();
                 let result = store
                     .flush()
-                    .and_then(|_| Store::open_read_with_limits(path, fold_cfg, read_limits))
+                    .and_then(|_| {
+                        turndb::store::open_read_container_with_limits(path, fold_cfg, read_limits)
+                    })
                     .context("publish immutable reader snapshot");
                 let _ = reply.send(result);
             }
@@ -617,10 +605,19 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let _ = reply.send(store.schema());
             }
             Command::Close { durable, reply } => {
+                // A durable close settles the store to exactly one file: acknowledged writes
+                // synced, the memtable flushed, the emptied WAL sidecar removed. A non-durable
+                // close deliberately leaves the sidecar — the caller asked not to settle, and
+                // the next open replays it exactly as a crash would.
                 let result = if durable { store.sync() } else { Ok(()) };
+                let settled = durable && result.is_ok();
                 // Close acknowledgement includes releasing the OS writer lock. Sending first and
                 // dropping on function exit leaves a real race for immediate reopen/recovery.
-                drop(store);
+                if settled {
+                    let _ = store.close();
+                } else {
+                    drop(store);
+                }
                 let _ = reply.send(result);
                 return;
             }

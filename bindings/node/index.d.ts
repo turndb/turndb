@@ -518,27 +518,6 @@ export declare function retainedCommits(path: string): Promise<bigint[]>;
  * tooling that must know whether a file can still be appended to does.
  */
 export declare function singleFileKind(path: string): 'pack' | 'container' | null;
-export interface CheckpointResult {
-  /** Members the container holds after the checkpoint. */
-  members: number;
-  /** Bytes written into the container by this call. */
-  ingestedBytes: bigint;
-  /** Members already present byte-for-byte and therefore not rewritten. */
-  skippedMembers: number;
-  /** The container's committed sequence after this call. */
-  commitSeq: bigint;
-  /** Bytes now superseded inside the container, reclaimable only by rewriting it. */
-  freeBytes: bigint;
-}
-/**
- * Checkpoint a store directory into a growable single file, creating it or growing one in place.
- * Incremental: immutable members already present at the same length are skipped. The source must
- * be quiescent — `sync()` then `flush()` first.
- */
-export declare function checkpointIntoContainer(
-  directoryPath: string,
-  containerPath: string,
-): Promise<CheckpointResult>;
 export interface RecoveryOptions extends LifecycleOptions {
   /** Maximum number of newer retained commits that recovery may abandon; defaults to zero. */
   maxRollbackCommits?: bigint;
