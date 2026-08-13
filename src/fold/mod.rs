@@ -817,13 +817,24 @@ impl Fold {
         let mut seen_blocks = 0u64;
         for (i, h) in headers.iter().enumerate() {
             let len = crate::readat::ReadAt::len(&readers[i])?;
-            let (_, entries) = segment::scan_tail_with_limits(
+            let (good, entries) = segment::scan_tail_with_limits(
                 &readers[i],
                 len,
                 h.has_dict(),
                 punched,
                 read_limits,
             )?;
+            // Committed extents hold only good frames by construction — the pre-flip barrier
+            // made every byte durable before the directory named it. A scan that ends early is
+            // therefore damage, and the refusal must say so; in the directory layout this same
+            // condition surfaced as a committed tail beyond the last good block.
+            if good != len {
+                bail!(
+                    "fold segment {} scans to {good} of its {len} committed bytes — the fold \
+                     lost durable data",
+                    h.seg
+                );
+            }
             for (id, off) in entries {
                 install_block_location(
                     &mut blockdir,

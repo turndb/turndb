@@ -4,12 +4,9 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/turndb-interop.XXXXXX")"
-portable="$scratch/portable-store"
-native="$scratch/native-store"
+portable="$scratch/portable-store.turndb"
+native="$scratch/native-store.turndb"
 trap 'rm -rf -- "$scratch"' EXIT
-
-# Node's WASI preopen validates the host directory before the guest can run Store::open.
-mkdir -p "$portable" "$native"
 
 if [ ! -f "$here/turndb/turndb.wasm" ]; then
   echo "cross-runtime: npm/turndb/turndb.wasm is absent; run npm/build.sh first" >&2

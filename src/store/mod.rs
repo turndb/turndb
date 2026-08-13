@@ -2795,7 +2795,21 @@ impl Store {
         if part_cache_bytes < crate::part::cache::BUDGET_MIN {
             bail!("part_cache_bytes must be at least {}", crate::part::cache::BUDGET_MIN);
         }
+        if path.is_dir() {
+            bail!(
+                "{} is a directory; a store is one file — the directory layout is retired, and \
+                 `convert` is its one door",
+                path.display()
+            );
+        }
         let container = if !path.exists() {
+            // The parent directories are created exactly as the directory store's open always
+            // created its own — the friendliness embedders relied on, kept.
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    crate::vfs::mkdir_all(parent)?;
+                }
+            }
             crate::container::Container::create(path)?
         } else {
             match crate::container::Container::open(path) {

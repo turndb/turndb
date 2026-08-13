@@ -1168,16 +1168,18 @@ export async function open(dir, opts = {}) {
   const maxDirectoryEntries = openLimit(opts.maxDirectoryEntries, 'maxDirectoryEntries');
   const maxWalFrames = openLimit(opts.maxWalFrames, 'maxWalFrames');
   const maxFoldBlocks = openLimit(opts.maxFoldBlocks, 'maxFoldBlocks');
-  const hostDir = resolve(dir);
-  // `Store::open` creates the store directory, so this binding must too — but WASI preopens the
-  // host directory before the guest runs, so the engine never gets the chance. Without this the
-  // first call a new user makes fails inside `uvwasi_init` with a bare errno that names neither
-  // the path nor the cause.
+  const hostPath = resolve(dir);
+  const hostDir = dirname(hostPath);
+  // The engine creates parent directories exactly as the retired directory open always did — but
+  // WASI preopens the host directory before the guest runs, so the engine never gets the chance.
+  // Without this the first call a new user makes fails inside `uvwasi_init` with a bare errno
+  // that names neither the path nor the cause. The preopen is the PARENT: the store is one file
+  // inside it, and its `-wal` sidecar lives beside it under the same mount.
   try {
     await mkdir(hostDir, { recursive: true });
   } catch (cause) {
     throw new TurndbError(
-      `opening ${hostDir}: the store directory could not be created: ${cause.message}`,
+      `opening ${hostPath}: the store's parent directory could not be created: ${cause.message}`,
       'INVALID_ARGUMENT',
     );
   }
@@ -1185,7 +1187,7 @@ export async function open(dir, opts = {}) {
   const { instance } = runtime;
 
   const enc = new TextEncoder();
-  const path = enc.encode(GUEST_ROOT);
+  const path = enc.encode(`${GUEST_ROOT}/${basename(hostPath)}`);
   let handle;
   try {
     const ptr = instance.exports.tdb_alloc(path.length);

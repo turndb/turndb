@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(64);
     let path = std::path::Path::new(&dir);
 
-    let mut s = Store::open(path, FoldCfg::default())?;
+    let mut s = Store::open_file(path, FoldCfg::default())?;
     for i in 0..n {
         s.put_body(&id(i), &body(i), attrs(i))?;
     }
@@ -72,11 +72,6 @@ fn main() -> Result<()> {
 }
 
 fn du(p: &std::path::Path) -> Result<u64> {
-    let mut total = 0;
-    for e in std::fs::read_dir(p)? {
-        let e = e?;
-        let m = e.metadata()?;
-        total += if m.is_dir() { du(&e.path())? } else { m.len() };
-    }
-    Ok(total)
+    // The store is one file; the settled sidecar beside it is empty after a flush.
+    Ok(std::fs::metadata(p)?.len())
 }

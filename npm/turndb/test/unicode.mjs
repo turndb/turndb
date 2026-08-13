@@ -9,7 +9,7 @@ import './_artifact.mjs';
 import { open, TurndbError, prefixUpperBound } from '../index.mjs';
 
 async function withStore(fn) {
-  const dir = await mkdtemp(join(tmpdir(), 'turndb-uni-'));
+  const dir = join(await mkdtemp(join(tmpdir(), 'turndb-uni-')), 's.turndb');
   const s = await open(dir);
   try {
     return await fn(s);

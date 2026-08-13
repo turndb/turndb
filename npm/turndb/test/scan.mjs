@@ -11,7 +11,7 @@ import './_artifact.mjs';
 import { open, TurndbError } from '../index.mjs';
 
 async function withStore(fn, opts) {
-  const dir = await mkdtemp(join(tmpdir(), 'turndb-scan-'));
+  const dir = join(await mkdtemp(join(tmpdir(), 'turndb-scan-')), 's.turndb');
   const s = await open(dir, opts);
   try {
     return await fn(s, dir);

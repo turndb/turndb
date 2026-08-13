@@ -595,7 +595,7 @@ pub unsafe extern "C" fn tdb_open_v3(
             u64::from(max_fold_blocks)
         },
     };
-    match Store::open_with_options(
+    match Store::open_file_with_options(
         Path::new(dir),
         StoreOptions { fold: cfg, write_limits: limits, read_limits, ..StoreOptions::default() },
     ) {
