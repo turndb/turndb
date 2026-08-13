@@ -795,10 +795,11 @@ fn assert_slot_alternation(tag: &str, ops: &[Op]) {
     }
 }
 
-/// A small settled store under `dir`, closed cleanly, plus the id -> body map it must serve.
-fn build_settled_store(dir: &Path, cfg: FoldCfg, tag: usize) -> BTreeMap<String, Vec<u8>> {
+/// A small settled single-file store at `file`, closed cleanly, plus the id -> body map it must
+/// serve.
+fn build_settled_file_store(file: &Path, cfg: FoldCfg, tag: usize) -> BTreeMap<String, Vec<u8>> {
     let mut want = BTreeMap::new();
-    let mut s = Store::open(dir, cfg).unwrap();
+    let mut s = Store::open_file(file, cfg).unwrap();
     // Two commits, so the snapshot spans two parts and its manifest carries a chain link.
     for (lo, hi) in [(0usize, 5usize), (5, 8)] {
         for i in lo..hi {
@@ -810,37 +811,124 @@ fn build_settled_store(dir: &Path, cfg: FoldCfg, tag: usize) -> BTreeMap<String,
         s.sync().unwrap();
         s.flush().unwrap();
     }
+    s.close().unwrap();
     want
 }
 
+/// Flip one byte inside a member of a single-file store, without truncating anything.
+fn flip_member_byte(store: &Path, name: &str, at_frac: f32) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let (off, len) = {
+        let c = turndb::container::Container::open(store).unwrap();
+        c.member_extents(name).unwrap()[0]
+    };
+    let at = off + ((len as f32 * at_frac) as u64).min(len - 1);
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(store).unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).unwrap();
+    b[0] ^= 0x40;
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(&b).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// Materialize the checked-in 0.1.3 directory-store fixture: the retired layout exactly as its
+/// last writer left it, non-empty WAL included. The conversion sweep drives the ONE door the
+/// layout has left, so its input must be an artifact this codebase can no longer produce.
+fn unpack_dir_fixture(into: &Path) {
+    let hex_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/directory-store-0.1.3.hex");
+    let text = std::fs::read_to_string(&hex_path).unwrap();
+    let mut name: Option<std::path::PathBuf> = None;
+    let mut hex = String::new();
+    let flush = |name: &Option<std::path::PathBuf>, hex: &str| {
+        if let Some(path) = name {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    };
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("== ") {
+            flush(&name, &hex);
+            hex.clear();
+            name = Some(into.join(rest.split_whitespace().next().unwrap()));
+        } else {
+            hex.push_str(line.trim());
+        }
+    }
+    flush(&name, &hex);
+}
+
+/// The fixture generator's body function, byte for byte (xorshift64 over the seed).
+fn fixture_body(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect()
+}
+
+/// Every id -> body the converted 0.1.3 fixture must serve: two flushed rounds minus the
+/// deleted record, plus the WAL-only record whose replay is the conversion's hardest promise.
+fn fixture_expectations() -> BTreeMap<String, Vec<u8>> {
+    let mut want = BTreeMap::new();
+    for round in 0..2u64 {
+        for i in 0..6u64 {
+            let id = format!("fix:{round}:{i}");
+            if id == "fix:0:0" {
+                continue;
+            }
+            let mut body = b"[".to_vec();
+            body.extend_from_slice(&fixture_body(round * 10 + i, 1800));
+            body.extend_from_slice(b"]");
+            want.insert(id, body);
+        }
+    }
+    want.insert("fix:wal:only".to_string(), fixture_body(999, 700));
+    want
+}
+
+/// A backup of a single-file store is a sealed container published by a no-replace rename. The
+/// sweep's claim: the SOURCE file answers identically at every crash point, and the artifact is
+/// all-or-nothing at its final name — absent, or complete, sealed, and byte-exact.
 #[test]
 fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing() {
     let root = tmp("backup");
     std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("store");
+    let file = root.join("store.turndb");
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-    let want = build_settled_store(&work, cfg, 200);
+    let want = build_settled_file_store(&file, cfg, 200);
 
     let out = root.join("backup.turndb");
     let mut base = Fs::default();
     base.seed_durable(&root);
     record::arm();
     {
-        // The real protocol: writer open (its recovery included), then the staged, verified,
-        // hard-linked-no-replace publication.
-        let mut s = Store::open(&work, cfg).unwrap();
+        let mut s = Store::open_file(&file, cfg).unwrap();
         s.backup(&out).unwrap();
+        s.close().unwrap();
     }
     let ops = record::disarm();
-    // Measured at 18 ops: a settled writer open is nearly silent (empty WAL, nothing to sweep),
-    // so the stream is the pack protocol itself — staging writes, fsync, link, unlink, sync-dir.
-    assert!(ops.len() > 12, "the backup must exercise a real op stream, got {}", ops.len());
+    assert!(ops.len() > 8, "the backup must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("backup", &ops);
 
     let stage = tmp("backup-stage");
     let checked = replay_recorded("backup", &base, &root, &ops, &stage, |stage, k, variant| {
         // The SOURCE reopens consistent no matter where the export died: backup is read-only
         // with respect to the store's logical state.
-        let src = Store::open(&stage.join("store"), cfg).unwrap_or_else(|e| {
+        let src = Store::open_file(&stage.join("store.turndb"), cfg).unwrap_or_else(|e| {
             panic!("crash point {k} {variant:?}: source store refused to open: {e:#}")
         });
         for (id, body) in &want {
@@ -856,26 +944,27 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
             "crash point {k} {variant:?}: source store gained or lost records"
         );
         drop(src);
-        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete pack that
-        // verifies and serves every record byte-exact. A torn file at the final name is a
-        // failure even though no acknowledgement covered it. (Staging litter beside it is
-        // allowed — the writer sweep collects it inside a store; here it is inert bytes.)
+        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete SEALED
+        // container that verifies and serves every record byte-exact. (Staging litter beside
+        // it is allowed — it is inert bytes at a name nothing resolves.)
         let dst = stage.join("backup.turndb");
         if dst.exists() {
-            let pack = turndb::pack::Pack::open(&dst).unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: a torn pack sits at the FINAL name: {e:#}")
+            let c = turndb::container::Container::open(&dst).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: a torn artifact sits at the FINAL name: {e:#}")
             });
-            pack.verify().unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: published pack fails verification: {e:#}")
+            assert!(c.sealed(), "crash point {k} {variant:?}: a published backup must be sealed");
+            c.verify().unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: published backup fails verification: {e:#}")
             });
-            let rs = turndb::store::open_read_pack(&dst, cfg).unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: published pack refuses a reader: {e:#}")
+            drop(c);
+            let rs = turndb::store::open_read_container(&dst, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: published backup refuses a reader: {e:#}")
             });
             for (id, body) in &want {
                 assert_eq!(
                     rs.reconstruct(id).unwrap().as_deref(),
                     Some(body.as_slice()),
-                    "crash point {k} {variant:?}: pack record {id} drifted"
+                    "crash point {k} {variant:?}: backup record {id} drifted"
                 );
             }
         }
@@ -885,56 +974,73 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// Restoring is member-verified copying of a sealed backup into a fresh writable file, staged
+/// and published by a no-replace rename. The destination is all-or-nothing at its final name,
+/// and a crash is always recoverable by simply re-running the restore.
 #[test]
 fn every_restore_crash_leaves_the_destination_all_or_nothing() {
     let root = tmp("restore");
     std::fs::create_dir_all(&root).unwrap();
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-    // The source store lives OUTSIDE the modeled root: only the pack and the restore protocol
-    // itself are under test here.
-    let srcdir = tmp("restore-src");
-    let want = build_settled_store(&srcdir, cfg, 400);
-    let pack_path = root.join("origin.turndb");
-    turndb::pack::write(&srcdir, &pack_path).unwrap();
-    std::fs::remove_dir_all(&srcdir).ok();
+    // The source store lives OUTSIDE the modeled root: only the sealed artifact and the restore
+    // protocol itself are under test here.
+    let srcroot = tmp("restore-src");
+    std::fs::create_dir_all(&srcroot).unwrap();
+    let srcfile = srcroot.join("src.turndb");
+    let want = build_settled_file_store(&srcfile, cfg, 400);
+    let origin = root.join("origin.turndb");
+    {
+        let mut s = Store::open_file(&srcfile, cfg).unwrap();
+        s.backup(&origin).unwrap();
+        s.close().unwrap();
+    }
+    std::fs::remove_dir_all(&srcroot).ok();
 
-    let dest = root.join("restored");
+    let dest = root.join("restored.turndb");
     let mut base = Fs::default();
     base.seed_durable(&root);
     record::arm();
-    turndb::pack::restore(&pack_path, &dest).unwrap();
+    turndb::store::restore_file(&origin, &dest).unwrap();
     let ops = record::disarm();
-    assert!(ops.len() > 20, "the restore must exercise a real op stream, got {}", ops.len());
+    assert!(ops.len() > 4, "the restore must exercise a real op stream, got {}", ops.len());
 
     let stage = tmp("restore-stage");
     let checked = replay_recorded("restore", &base, &root, &ops, &stage, |stage, k, variant| {
-        let dst = stage.join("restored");
+        let dst = stage.join("restored.turndb");
         if dst.exists() {
             // Published means COMPLETE: the final name only ever appears via the no-replace
-            // rename of a fully extracted, fully fsynced, validated staging tree.
-            let mut s = Store::open(&dst, cfg).unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: a partial store sits at the FINAL name: {e:#}")
+            // rename of a fully verified, unsealed staging copy.
+            let c = turndb::container::Container::open(&dst).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: a partial file sits at the FINAL name: {e:#}")
+            });
+            assert!(
+                !c.sealed(),
+                "crash point {k} {variant:?}: the restored copy must be born writable"
+            );
+            c.verify().unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: restored store fails verification: {e:#}")
+            });
+            drop(c);
+            let rs = turndb::store::open_read_container(&dst, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: restored store refuses a reader: {e:#}")
             });
             for (id, body) in &want {
                 assert_eq!(
-                    s.reconstruct(id).unwrap().as_deref(),
+                    rs.reconstruct(id).unwrap().as_deref(),
                     Some(body.as_slice()),
                     "crash point {k} {variant:?}: restored record {id} drifted"
                 );
             }
-            assert_eq!(s.ids().unwrap().len(), want.len());
-            s.verify().unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: restored store fails verification: {e:#}")
-            });
+            assert_eq!(rs.ids().unwrap().len(), want.len());
         } else {
             // No destination: the crash must be recoverable by simply RE-RUNNING the restore.
-            // Staging-directory litter is allowed to remain and must not block the retry.
-            turndb::pack::restore(&stage.join("origin.turndb"), &dst).unwrap_or_else(|e| {
+            // Staging litter is allowed to remain and must not block the retry.
+            turndb::store::restore_file(&stage.join("origin.turndb"), &dst).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: restore cannot be re-run: {e:#}")
             });
-            let s = Store::open_read(&dst, cfg).unwrap();
+            let rs = turndb::store::open_read_container(&dst, cfg).unwrap();
             for (id, body) in &want {
-                assert_eq!(s.reconstruct(id).unwrap().as_deref(), Some(body.as_slice()));
+                assert_eq!(rs.reconstruct(id).unwrap().as_deref(), Some(body.as_slice()));
             }
         }
     });
@@ -943,17 +1049,20 @@ fn every_restore_crash_leaves_the_destination_all_or_nothing() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// Checked recovery of a single-file store promotes a retained manifest with ONE slot flip —
+/// so the abandoned timeline and the promoted one are never both durable by construction, and
+/// every crash inside recovery converges on the same promoted commit when re-run.
 #[test]
 fn every_recovery_crash_converges_on_the_promoted_timeline() {
     let root = tmp("recover");
     std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("store");
+    let file = root.join("s.turndb");
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
     // Four commits, tracking the exact logical state at each, so "the promoted prefix" is a
     // concrete map rather than a mood.
     let mut per_commit: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
     {
-        let mut s = Store::open(&work, cfg).unwrap();
+        let mut s = Store::open_file(&file, cfg).unwrap();
         let mut now: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for c in 1usize..=4 {
             for i in 0..3usize {
@@ -966,54 +1075,62 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
             s.flush().unwrap();
             per_commit.push(now.clone());
         }
+        s.close().unwrap();
     }
-    // Damage the live commit pointer AND the two newest retained copies — the shape checked
+    // Damage the live manifest member AND the two newest retained copies — the shape checked
     // recovery exists for. The damage is the operator's starting point, not a protocol step, so
     // it is baseline state rather than recorded ops: what gets crash-swept is recovery itself.
     for name in ["MANIFEST", "MANIFEST.00000004", "MANIFEST.00000003"] {
-        let p = work.join(name);
-        let mut b = std::fs::read(&p).unwrap();
-        let mid = b.len() / 2;
-        b[mid] ^= 0x40;
-        std::fs::write(&p, b).unwrap();
+        flip_member_byte(&file, name, 0.5);
     }
-    let promoted_bytes = std::fs::read(work.join("MANIFEST.00000002")).unwrap();
+    let promoted_bytes = {
+        let c = turndb::container::Container::open(&file).unwrap();
+        c.read_file_bounded("MANIFEST.00000002", turndb::store::MAX_MANIFEST_BYTES).unwrap()
+    };
     let want = per_commit[1].clone(); // the state commit 2 acknowledged
 
     let mut base = Fs::default();
     base.seed_durable(&root);
     record::arm();
-    let report =
-        turndb::store::recover_manifest(&work, cfg, RecoveryOptions { max_rollback_commits: 2 })
-            .unwrap();
+    let report = turndb::store::recover_manifest_file(
+        &file,
+        cfg,
+        RecoveryOptions { max_rollback_commits: 2 },
+    )
+    .unwrap();
     let ops = record::disarm();
     assert_eq!((report.commit, report.rollback_commits), (2, 2));
-    assert!(ops.len() > 5, "the promotion must exercise a real op stream, got {}", ops.len());
+    assert!(ops.len() > 2, "the promotion must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("recovery", &ops);
 
     let stage = tmp("recover-stage");
     let checked = replay_recorded("recovery", &base, &root, &ops, &stage, |stage, k, variant| {
-        let dir = stage.join("store");
-        // The f0f59ad invariant: the two timelines are NEVER both on disk. Once the promoted
-        // manifest is live, every abandoned newer retained name must already be durably gone —
-        // otherwise a re-run of recovery could resurrect the abandoned history, and the next
-        // flush would truncate a part those manifests still pin.
-        if std::fs::read(dir.join("MANIFEST")).ok().as_deref() == Some(promoted_bytes.as_slice()) {
-            for c in [3u64, 4] {
+        let f = stage.join("s.turndb");
+        // The two timelines are never both durable: promotion IS the flip that installs the
+        // promoted manifest and drops the abandoned retained members, atomically.
+        let c = turndb::container::Container::open(&f).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?}: container refused to open: {e:#}")
+        });
+        if c.read_file_bounded("MANIFEST", turndb::store::MAX_MANIFEST_BYTES).ok().as_deref()
+            == Some(promoted_bytes.as_slice())
+        {
+            for commit in [3u64, 4] {
                 assert!(
-                    !dir.join(format!("MANIFEST.{c:08}")).exists(),
+                    !c.contains(&format!("MANIFEST.{commit:08}")),
                     "crash point {k} {variant:?}: promoted MANIFEST and abandoned retained \
-                     commit {c} are BOTH durable"
+                     commit {commit} are BOTH durable"
                 );
             }
         }
+        drop(c);
         // Reopen. Refusal is legitimate only while the damaged manifest is still live — and from
         // that state, RE-RUNNING recovery must converge on the same target, never a different
         // history.
-        let store = match Store::open(&dir, cfg) {
+        let store = match Store::open_file(&f, cfg) {
             Ok(s) => s,
             Err(_) => {
-                let r = turndb::store::recover_manifest(
-                    &dir,
+                let r = turndb::store::recover_manifest_file(
+                    &f,
                     cfg,
                     RecoveryOptions { max_rollback_commits: 2 },
                 )
@@ -1024,7 +1141,7 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
                     r.commit, 2,
                     "crash point {k} {variant:?}: re-run recovery promoted a DIFFERENT commit"
                 );
-                Store::open(&dir, cfg).unwrap_or_else(|e| {
+                Store::open_file(&f, cfg).unwrap_or_else(|e| {
                     panic!("crash point {k} {variant:?}: open refused after recovery: {e:#}")
                 })
             }
@@ -1032,15 +1149,17 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
         // Whichever path got here: the live commit is the promoted one, nothing retained
         // exceeds it, the chain verifies, and the logical state is exactly the promoted prefix.
         assert_eq!(store.manifest().commit, 2, "crash point {k} {variant:?}");
-        let retained = turndb::store::retained_commits(&dir).unwrap();
+        drop(store);
+        let retained = turndb::store::retained_commits_file(&f).unwrap();
         assert!(
             retained.iter().all(|&c| c <= 2),
             "crash point {k} {variant:?}: retained commit newer than live survives: {retained:?}"
         );
-        turndb::store::verify_chain(&dir).unwrap_or_else(|e| {
+        turndb::store::verify_chain_file(&f).unwrap_or_else(|e| {
             panic!("crash point {k} {variant:?}: chain verification failed: {e:#}")
         });
-        let ids = store.ids().unwrap();
+        let rs = turndb::store::open_read_container(&f, cfg).unwrap();
+        let ids = rs.ids().unwrap();
         assert_eq!(
             ids,
             want.keys().cloned().collect::<Vec<_>>(),
@@ -1048,7 +1167,7 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
         );
         for (id, body) in &want {
             assert_eq!(
-                store.reconstruct(id).unwrap().as_deref(),
+                rs.reconstruct(id).unwrap().as_deref(),
                 Some(body.as_slice()),
                 "crash point {k} {variant:?}: promoted record {id} drifted"
             );
@@ -1059,16 +1178,12 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
-/// Hole punching needs `fallocate(PUNCH_HOLE)`, which only Linux provides — the same gate the
-/// operation itself lives behind. Elsewhere the punch path is unreachable, so there is nothing
-/// to crash-sweep; the declare-then-deallocate MANIFEST commit it shares with every other commit
-/// is covered by the sweeps above.
 #[cfg(target_os = "linux")]
 #[test]
 fn every_punch_crash_leaves_declared_blocks_retryable() {
     let root = tmp("punch");
     std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("store");
+    let file = root.join("live.turndb");
     // A tiny block target so the superseded piece occupies its own punchable block, and
     // INCOMPRESSIBLE content so the punched range is extent-scale (~32 KiB stored) — the size a
     // real deallocation tears at — rather than an 18-byte zstd run.
@@ -1087,19 +1202,20 @@ fn every_punch_crash_leaves_declared_blocks_retryable() {
     let old = noise(32 * 1024);
     let live = noise(32 * 1024);
     {
-        let mut s = Store::open(&work, cfg).unwrap();
+        let mut s = Store::open_file(&file, cfg).unwrap();
         s.put("k", &[Span::Piece(&old)], vec![]).unwrap();
         s.sync().unwrap();
         s.flush().unwrap();
         s.put("k", &[Span::Piece(&live)], vec![]).unwrap();
         s.sync().unwrap();
         s.flush().unwrap();
+        s.close().unwrap();
     }
     let mut base = Fs::default();
     base.seed_durable(&root);
     record::arm();
     let stats = {
-        let mut s = Store::open(&work, cfg).unwrap();
+        let mut s = Store::open_file(&file, cfg).unwrap();
         s.punch_unreferenced().unwrap()
     };
     let ops = record::disarm();
@@ -1108,17 +1224,18 @@ fn every_punch_crash_leaves_declared_blocks_retryable() {
         ops.iter().any(|op| matches!(op, Op::PunchHole { .. })),
         "the recording must see the punches — the vfs seam is the crash-safety argument"
     );
+    assert_slot_alternation("punch", &ops);
 
     let stage = tmp("punch-stage");
     let checked = replay_recorded("punch", &base, &root, &ops, &stage, |stage, k, variant| {
-        let dir = stage.join("store");
+        let f = stage.join("live.turndb");
         // Erasure-in-place never endangers opening: declare-before-deallocate means every hole
         // the crash left behind is already accounted for by the manifest. The sharpest state is
         // the TORN punch — fallocate landed on only part of the range before power loss, so the
         // declared block's payload is neither intact nor all zeros — and recovery must step over
         // that frame exactly as it steps over a fully-zeroed one, because the manifest's punched
         // declaration, not the payload's content, is the erasure authority.
-        let mut s = Store::open(&dir, cfg).unwrap_or_else(|e| {
+        let mut s = Store::open_file(&f, cfg).unwrap_or_else(|e| {
             panic!("crash point {k} {variant:?}: open refused after a punch crash: {e:#}")
         });
         assert_eq!(
@@ -1165,12 +1282,12 @@ fn revision_one_pack_bytes() -> Vec<u8> {
 fn every_format_migration_crash_preserves_contents_and_resumes() {
     let root = tmp("migrate");
     std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("store");
-    // Materialize the REAL version-1 artifact — not a synthetic fixture — and restore it into
-    // the modeled root. The restore protocol has its own sweep above; here it is baseline.
+    let work = root.join("legacy.turndb");
+    // Materialize the REAL version-1 artifact — not a synthetic fixture — and convert it into
+    // the modeled root. The conversion protocol has its own sweep below; here it is baseline.
     let pack_path = tmp("migrate-pack");
     std::fs::write(&pack_path, revision_one_pack_bytes()).unwrap();
-    turndb::pack::restore(&pack_path, &work).unwrap();
+    turndb::store::convert_to_file(&pack_path, &work).unwrap();
     std::fs::remove_file(&pack_path).ok();
     let cfg = FoldCfg::default();
     let want: [(&str, &[u8]); 2] =
@@ -1180,7 +1297,7 @@ fn every_format_migration_crash_preserves_contents_and_resumes() {
     base.seed_durable(&root);
     record::arm();
     {
-        let mut s = Store::open(&work, cfg).unwrap();
+        let mut s = Store::open_file(&work, cfg).unwrap();
         assert_eq!(s.format_migration_status().unwrap().legacy_parts, 2, "fixture shape moved");
         // One legacy part rewritten and atomically published per step, twice, to completion.
         assert!(s.migrate_format_step().unwrap().is_some());
@@ -1192,10 +1309,10 @@ fn every_format_migration_crash_preserves_contents_and_resumes() {
 
     let stage = tmp("migrate-stage");
     let checked = replay_recorded("migration", &base, &root, &ops, &stage, |stage, k, variant| {
-        let dir = stage.join("store");
+        let dir = stage.join("legacy.turndb");
         // Migration is commit-protocol work throughout: no crash point may leave a store that
         // refuses to open.
-        let mut s = Store::open(&dir, cfg).unwrap_or_else(|e| {
+        let mut s = Store::open_file(&dir, cfg).unwrap_or_else(|e| {
             panic!("crash point {k} {variant:?}: open refused mid-migration: {e:#}")
         });
         let check_contents = |s: &Store, when: &str| {
@@ -1258,219 +1375,67 @@ fn every_format_migration_crash_preserves_contents_and_resumes() {
 #[allow(dead_code)]
 fn _model_is_deterministic(_: &HashMap<(), ()>) {}
 
-/// A container's crash model is not the directory's: it has no directory entries to lose, and its
-/// commit point is a superblock write rather than a rename. What replaces rename-atomicity is slot
-/// alternation — the state a reader would resolve is never the slot a writer is touching — so the
-/// claim under test is that a crash anywhere in a checkpoint leaves the container serving the
-/// PREVIOUS committed state or the NEW one, and never a mixture of the two.
-///
-/// The two states are made observably different on purpose: records exist at commit 2 that do not
-/// exist at commit 1, so a torn commit that half-published cannot pass by serving the same answer
-/// either way.
-///
-/// Mutation-checked, because a sweep that has never failed has not been shown to work: removing
-/// the fsync that orders the members and directory ahead of the superblock fails this at crash
-/// point 5 under `LastPendingOnly`, with the superblock naming a tail past the end of the file.
-///
-/// Alternation itself is covered twice over. `TornHead` cuts a slot write inside its 56 defined
-/// bytes, so a torn claim actually fails its checksum here rather than surviving whole; and
-/// `assert_slot_alternation` proves from the recorded trace that no claim ever lands in the slot
-/// the previous claim occupies — the property whose violating race (a reader resolving a slot
-/// while the writer rewrites it) no crash model can express.
+/// Conversion is the retired directory layout's ONE remaining door, and its input is by
+/// definition an artifact this codebase can no longer produce — so the sweep drives it over the
+/// checked-in 0.1.3 fixture, unsettled WAL included. The claim: the destination is
+/// all-or-nothing at its final name, and every crash state — including any state the settle
+/// left the SOURCE directory in — is recovered by simply re-running the conversion.
 #[test]
-fn every_container_checkpoint_crash_lands_on_one_committed_state() {
-    let root = tmp("container");
+fn every_conversion_crash_is_recovered_by_rerunning_the_conversion() {
+    let root = tmp("convert");
     std::fs::create_dir_all(&root).unwrap();
     let work = root.join("store");
-    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-
-    // Commit 1: the store as it stands after the first settle.
-    let first = build_settled_store(&work, cfg, 400);
+    unpack_dir_fixture(&work);
+    let want = fixture_expectations();
+    let cfg = FoldCfg::default();
     let container = root.join("state.turndb");
-    turndb::store::checkpoint_into_container(&work, &container).unwrap();
-
-    // Records that exist only at commit 2, so the two states cannot be confused.
-    let mut second = first.clone();
-    {
-        let mut s = Store::open(&work, cfg).unwrap();
-        for i in 0..4 {
-            let id = format!("grown:{i}");
-            let body = body_for(900 + i);
-            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-            second.insert(id, body);
-        }
-        s.sync().unwrap();
-        s.flush().unwrap();
-    }
-    assert!(second.len() > first.len(), "the two commits must differ observably");
 
     let mut base = Fs::default();
     base.seed_durable(&root);
     record::arm();
-    turndb::store::checkpoint_into_container(&work, &container).unwrap();
+    turndb::store::convert_to_file(&work, &container).unwrap();
     let ops = record::disarm();
-    assert!(ops.len() > 4, "the checkpoint must exercise a real op stream, got {}", ops.len());
-    assert_slot_alternation("container checkpoint", &ops);
+    assert!(ops.len() > 10, "the conversion must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("conversion", &ops);
 
-    let stage = tmp("container-stage");
-    let checked = replay_recorded("container", &base, &root, &ops, &stage, |stage, k, variant| {
+    let stage = tmp("convert-stage");
+    let checked = replay_recorded("conversion", &base, &root, &ops, &stage, |stage, k, variant| {
         let file = stage.join("state.turndb");
         if !file.exists() {
-            return;
+            // The crash landed before publication: re-running the conversion is the whole
+            // recovery story — the settle resumes from whatever state the source directory is
+            // in (its own recovery included), and stale staging must never block the retry.
+            turndb::store::convert_to_file(&stage.join("store"), &file).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: conversion cannot be re-run: {e:#}")
+            });
         }
-        // Opening never panics and never refuses: the container was already committed once, so
-        // every reachable crash state is a documented recovery rather than an error.
+        // Published means COMPLETE: a whole, verified container serving the fixture's entire
+        // contents — the WAL-only record included, because the settle replays it before the
+        // copy walks the members.
         let c = turndb::container::Container::open(&file).unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: container refused to open: {e:#}")
+            panic!("crash point {k} {variant:?}: a torn file sits at the FINAL name: {e:#}")
         });
-        let seq = c.seq();
-        assert!(
-            seq == 1 || seq == 2,
-            "crash point {k} {variant:?}: container resolved to commit {seq}, not 1 or 2"
-        );
-        // Whatever state it resolved to must be whole: every member it names checksums.
         c.verify().unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: recovered commit {seq} fails verification: {e:#}")
+            panic!("crash point {k} {variant:?}: converted store fails verification: {e:#}")
         });
         drop(c);
-
-        // And it must serve exactly one of the two timelines, byte-exact — never a mixture.
         let rs = turndb::store::open_read_container(&file, cfg).unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: commit {seq} refuses a reader: {e:#}")
+            panic!("crash point {k} {variant:?}: converted store refuses a reader: {e:#}")
         });
-        let want = if seq == 1 { &first } else { &second };
-        let got = rs.ids().unwrap();
         assert_eq!(
-            got.len(),
+            rs.ids().unwrap().len(),
             want.len(),
-            "crash point {k} {variant:?}: commit {seq} serves {} records, its timeline has {}",
-            got.len(),
-            want.len()
+            "crash point {k} {variant:?}: converted store gained or lost records"
         );
-        for (id, body) in want {
+        for (id, body) in &want {
             assert_eq!(
                 rs.reconstruct(id).unwrap().as_deref(),
                 Some(body.as_slice()),
-                "crash point {k} {variant:?}: commit {seq} record {id} drifted"
+                "crash point {k} {variant:?}: converted record {id} drifted"
             );
         }
     });
-    println!("dst container: {checked} crash states checked across {} ops", ops.len());
-
-    // The source directory is untouched by a checkpoint, at every crash point.
-    let src = Store::open_read(&work, cfg).unwrap();
-    assert_eq!(src.ids().unwrap().len(), second.len(), "checkpoint must not disturb its source");
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&stage).ok();
-}
-
-/// The lifecycle around a container, which is where its ordering claims actually live.
-///
-/// The commit sweep above covers publishing one state inside the file. This covers the cycle a
-/// writer performs on it: materialize a working directory, write, settle, ingest what changed, and
-/// remove the directory. Two of those steps are orderings that reasoning gets wrong quietly —
-/// removing the working directory before the checkpoint is durable loses acknowledged writes, and
-/// adopting a partially materialized directory serves a store that was never committed.
-///
-/// The contract is the main workload sweep's, unchanged: every write whose `sync()` returned
-/// before the crash is present afterwards and byte-exact. Recovery is `ContainerStore::open`,
-/// which is the code under test — it decides between adopting the directory it finds and rebuilding
-/// from the file.
-///
-/// This one needed no mutation check to show it bites: it failed on its first run, at crash point
-/// 15 under `DurableOnly`, with a record that predated the session gone. Materialization fsynced
-/// each member's CONTENT and never the staging directory, so the member dirents stayed volatile
-/// while the rename made the working directory's own name durable — publishing a directory that
-/// looked complete, was adopted on the next open, and was missing files. Content durability is not
-/// name durability, and a working directory is worse than a missing one precisely because it is
-/// trusted.
-#[test]
-fn every_container_session_crash_keeps_every_acknowledged_write() {
-    use turndb::store::ContainerStore;
-
-    let root = tmp("container-session");
-    std::fs::create_dir_all(&root).unwrap();
-    let file = root.join("live.turndb");
-    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-
-    // A committed container to start from, so the sweep exercises materialize-and-adopt rather
-    // than first creation.
-    let mut before = BTreeMap::new();
-    {
-        let mut cs = ContainerStore::open(&file, cfg).unwrap();
-        for i in 0..5 {
-            let id = format!("before:{i}");
-            let body = body_for(700 + i);
-            cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-            before.insert(id, body);
-        }
-        cs.close().unwrap();
-    }
-    assert!(!hot_of(&file).exists(), "a clean close leaves only the file");
-
-    // The session under test: open, write, acknowledge, close. Everything acked here must survive
-    // a crash at any point in it.
-    let mut acked = before.clone();
-    let mut base = Fs::default();
-    base.seed_durable(&root);
-    record::arm();
-    {
-        let mut cs = ContainerStore::open(&file, cfg).unwrap();
-        for i in 0..4 {
-            let id = format!("acked:{i}");
-            let body = body_for(800 + i);
-            cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-            acked.insert(id, body);
-        }
-        cs.store().sync().unwrap(); // the ACK point — everything above is durable from here
-        cs.close().unwrap();
-    }
-    let ops = record::disarm();
-    assert!(ops.len() > 20, "a session must exercise a real op stream, got {}", ops.len());
-    assert_slot_alternation("container session", &ops);
-
-    let stage = tmp("container-session-stage");
-    let checked =
-        replay_recorded("container-session", &base, &root, &ops, &stage, |stage, k, variant| {
-            let file = stage.join("live.turndb");
-            if !file.exists() && !hot_of(&file).exists() {
-                return; // crashed before anything of this session reached the disk
-            }
-            // Recovery is the real open, adopt logic included. It must never refuse: every state
-            // reachable here is one this code is responsible for reading.
-            let mut cs = ContainerStore::open(&file, cfg).unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: the session refused to reopen: {e:#}")
-            });
-
-            // Which writes are guaranteed depends on whether the acking write reached the disk,
-            // so the floor is the pre-session state and the ceiling is everything acked. What is
-            // NOT allowed is a record that is present but wrong.
-            let store = cs.store();
-            let mut found = 0usize;
-            for (id, body) in &acked {
-                match store.reconstruct(id).unwrap() {
-                    Some(got) => {
-                        assert_eq!(
-                            got, *body,
-                            "crash point {k} {variant:?}: {id} came back but drifted"
-                        );
-                        found += 1;
-                    }
-                    None => assert!(
-                        !before.contains_key(id),
-                        "crash point {k} {variant:?}: {id} predates this session and vanished"
-                    ),
-                }
-            }
-            assert!(
-                found >= before.len(),
-                "crash point {k} {variant:?}: recovered {found} records, fewer than the {} \
-                 committed before the session began",
-                before.len()
-            );
-        });
-    println!("dst container session: {checked} crash states checked across {} ops", ops.len());
+    println!("dst conversion: {checked} crash states checked across {} ops", ops.len());
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&stage).ok();
 }
@@ -1845,12 +1810,5 @@ fn every_single_file_punch_crash_disturbs_nothing() {
 fn wal_of(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_os_string();
     name.push("-wal");
-    PathBuf::from(name)
-}
-
-/// The working directory beside a container, by the same rule the engine uses.
-fn hot_of(file: &Path) -> PathBuf {
-    let mut name = file.as_os_str().to_os_string();
-    name.push(turndb::container::HOT_SUFFIX);
     PathBuf::from(name)
 }

@@ -124,7 +124,7 @@ pub(crate) struct SinkBuilder<S: crate::vfs::ArtifactSink> {
 }
 
 /// The streaming builder's public, file-backed face: exactly the surface it always had. The
-/// sink-generic engine underneath is [`SinkBuilder`], a crate concern — public callers build
+/// sink-generic engine underneath is `SinkBuilder`, a crate concern — public callers build
 /// parts as files; the engine builds them wherever its store lives.
 pub struct StreamBuilder(SinkBuilder<FilePartSink>);
 

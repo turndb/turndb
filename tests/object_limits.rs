@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use turndb::error::{classify, ErrorClass};
 use turndb::fold::{block, segment, Fold, FoldCfg};
-use turndb::read_limits::{ReadAdmissionError, ReadLimits};
+use turndb::read_limits::ReadLimits;
 use turndb::store::{Span, Store, StoreOptions};
 
 struct ScopedDir(PathBuf);
@@ -42,62 +42,10 @@ fn with_counts(directory: u64, wal: u64, fold: u64) -> ReadLimits {
 }
 
 #[test]
-fn store_directory_enumeration_refuses_before_collecting_unbounded_junk() {
-    let dir = ScopedDir::new("directory");
-    drop(Store::open(&dir, FoldCfg::default()).unwrap());
-    std::fs::write(dir.join("junk-a"), []).unwrap();
-    std::fs::write(dir.join("junk-b"), []).unwrap();
-
-    let error = match Store::open_with_options(
-        &dir,
-        StoreOptions { read_limits: with_counts(2, 100, 100), ..StoreOptions::default() },
-    ) {
-        Ok(_) => panic!("two entries must not admit a store directory containing more"),
-        Err(error) => error,
-    };
-    assert_eq!(classify(&error), ErrorClass::ResourceExhausted);
-    assert!(matches!(
-        error.downcast_ref::<ReadAdmissionError>(),
-        Some(ReadAdmissionError::ObjectCountTooLarge { collection, actual: 3, allowed: 2 })
-            if collection.contains("store directory")
-    ));
-}
-
-#[test]
-fn retained_manifest_listing_propagates_directory_open_failure() {
+fn retained_manifest_listing_propagates_store_open_failure() {
     let dir = ScopedDir::new("retained-io");
-    std::fs::remove_dir_all(&*dir).unwrap();
-    let error = turndb::store::retained_commits(&dir).unwrap_err();
+    let error = turndb::store::retained_commits_file(&dir.join("absent.turndb")).unwrap_err();
     assert_eq!(classify(&error), ErrorClass::NotFound);
-    assert!(error.to_string().contains("retained manifests"));
-}
-
-#[test]
-fn manifest_recovery_reserves_its_staging_name_before_publication() {
-    let dir = ScopedDir::new("manifest-recovery");
-    let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
-    store.put("one", &[Span::Lit(b"one")], vec![]).unwrap();
-    store.flush().unwrap();
-    drop(store);
-
-    let manifest = dir.join("MANIFEST");
-    let mut damaged = std::fs::read(&manifest).unwrap();
-    damaged[0] ^= 0xff;
-    std::fs::write(&manifest, &damaged).unwrap();
-    let root_entries = std::fs::read_dir(&*dir).unwrap().count() as u64;
-    let limits = with_counts(root_entries, 100, 100);
-
-    let error = turndb::store::recover_manifest_with_limits_and_control(
-        &dir,
-        FoldCfg::default(),
-        turndb::store::RecoveryOptions::default(),
-        limits,
-        &turndb::control::OperationControl::default(),
-    )
-    .unwrap_err();
-    assert_eq!(classify(&error), ErrorClass::ResourceExhausted);
-    assert_eq!(std::fs::read(&manifest).unwrap(), damaged);
-    assert!(!dir.join("MANIFEST.tmp").exists());
 }
 
 #[test]

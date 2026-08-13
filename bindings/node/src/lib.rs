@@ -34,7 +34,7 @@ use turndb::scan::{
     ScanExplanation, ScanPage, ScanRequest, ScanRow, DEFAULT_MAX_RECONSTRUCTED_BYTES,
     DEFAULT_MAX_RESOLUTION_ENTRIES, MAX_RESOLUTION_ENTRIES,
 };
-use turndb::store::{CompactionBudget, ReadStore, Store, StoreOptions, WriteLimits};
+use turndb::store::{CompactionBudget, ReadStore, StoreOptions, WriteLimits};
 use turndb::types::AttrValue;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> Error {
