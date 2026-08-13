@@ -2363,6 +2363,59 @@ pub fn verify_chain_file(path: &Path) -> Result<ChainReport> {
     verify_chain_container(&c, &crate::control::OperationControl::default())
 }
 
+/// Restore a single-file backup: verify every member of `src` against its recorded checksums,
+/// then publish a byte-identical copy at `dst` with a rename that refuses to replace. The
+/// backup IS a store — sealed by `backup`, final by flag — so restoring is verified copying,
+/// and a crash leaves staging litter and an untouched destination.
+pub fn restore_file(src: &Path, dst: &Path) -> Result<crate::pack::RestoreStats> {
+    restore_file_with_control(src, dst, &crate::control::OperationControl::default())
+}
+
+/// [`restore_file`] with cooperative cancellation; the last checkpoint is immediately before the
+/// publishing rename, and a cancelled restore removes its staging and never publishes.
+pub fn restore_file_with_control(
+    src: &Path,
+    dst: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<crate::pack::RestoreStats> {
+    control.check("backup restore")?;
+    crate::pack::ensure_destination_available(dst)?;
+    let c = crate::container::Container::open(src)?;
+    // A member failing its checksum is CORRUPTION, and the refusal must classify as such —
+    // the same integrity wrapper every verification path speaks through.
+    let members = verification_integrity("verify backup before restoring", c.verify())?;
+    drop(c);
+    control.check("backup restore")?;
+    let mut staging = dst.as_os_str().to_os_string();
+    staging.push(".restoring");
+    let staging = PathBuf::from(staging);
+    let _ = crate::vfs::unlink(&staging);
+    std::fs::copy(src, &staging)
+        .with_context(|| format!("copy {} to {}", src.display(), staging.display()))?;
+    // Restoring births a WRITABLE store: the backup stays sealed forever, and the copy is a new
+    // file whose life is just starting. The unseal happens on the staging side of the rename, so
+    // the destination is never observable sealed.
+    {
+        let mut fresh = crate::container::Container::open(&staging)?;
+        fresh.clear_seal_for_restore()?;
+    }
+    if let Err(interrupted) = control.check("backup restore publication") {
+        let _ = crate::vfs::unlink(&staging);
+        return Err(interrupted.into());
+    }
+    crate::vfs::rename_noreplace(&staging, dst)?;
+    if let Some(parent) = dst.parent() {
+        let _ = crate::vfs::sync_dir(parent);
+    }
+    // Member bytes, not file length: the same accounting the backup reported, so a consumer can
+    // compare the two stats and see the identity they describe.
+    let restored = crate::container::Container::open(dst)?;
+    let bytes = restored.member_bytes();
+    let commit =
+        Manifest::parse(&restored.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?.commit;
+    Ok(crate::pack::RestoreStats { files: members, bytes, commit })
+}
+
 /// What a conversion carried forward.
 #[derive(Clone, Copy, Debug)]
 pub struct ConvertStats {
@@ -2388,6 +2441,13 @@ pub struct ConvertStats {
 /// converted file starts its history at the commit it carries — the same posture a pack has
 /// always taken.
 pub fn convert_to_file(src: &Path, out: &Path) -> Result<ConvertStats> {
+    if !src.exists() {
+        // Typed absence: a missing source is NOT_FOUND, never a shrug about unrecognized layouts.
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} does not exist", src.display()),
+        )));
+    }
     crate::pack::ensure_destination_available(out)?;
     if src.is_dir() {
         // The writer role settles the WAL and replays acknowledged records into the memtable;
@@ -6119,9 +6179,14 @@ fn container_space_usage(
     }
     // The free list: bytes present under no reachable name. Zero files — extents are not files.
     usage.unclassified.logical_bytes += c.free_bytes();
+    // Totals stay bucket-additive — the accounting identity every consumer of this struct
+    // checks. Structural overhead (superblocks, the directory, alignment padding) is uncounted,
+    // exactly as the directory layout never counted its inodes; the file's own length is one
+    // stat away for anyone asking the other question.
     usage.total.files = usage.live.files + usage.retained_only.files + usage.unclassified.files;
-    usage.total.logical_bytes =
-        std::fs::metadata(path)?.len() + std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    usage.total.logical_bytes = usage.live.logical_bytes
+        + usage.retained_only.logical_bytes
+        + usage.unclassified.logical_bytes;
     Ok(usage)
 }
 

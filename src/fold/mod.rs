@@ -82,7 +82,9 @@ pub struct WriterLocked {
 
 impl std::fmt::Display for WriterLocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "fold at {} is already open by another writer", self.path.display())
+        // The path speaks for itself — a store file or a fold directory — so the message must
+        // not name either layout.
+        write!(f, "{} is already open by another writer", self.path.display())
     }
 }
 

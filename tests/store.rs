@@ -3031,12 +3031,16 @@ fn a_single_file_store_lives_its_whole_life_against_one_file() {
     s.sync().unwrap();
     s.flush().unwrap();
 
-    // A second writer refuses while this one holds the file.
+    // A second writer refuses while this one holds the file — with the TYPED contention error,
+    // because a consumer retries contention and must be able to tell it from a failure.
     let second_err = match Store::open_file(&ct, cfg) {
         Ok(_) => panic!("a second writer must refuse while the first holds the file"),
-        Err(e) => e.to_string(),
+        Err(e) => e,
     };
-    assert!(second_err.contains("already has a writer"), "flock on the file is the gate");
+    assert!(
+        second_err.downcast_ref::<turndb::fold::WriterLocked>().is_some(),
+        "flock on the file is the gate, and it speaks the typed refusal: {second_err:#}"
+    );
 
     // Second flush: the retained log grows as members, parts accumulate.
     for i in 24..40u8 {

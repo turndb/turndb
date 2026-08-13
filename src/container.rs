@@ -358,7 +358,9 @@ impl Container {
         if !crate::sys::lock_exclusive(&self.f)
             .with_context(|| format!("locking {}", self.path.display()))?
         {
-            bail!("{} already has a writer; a store takes exactly one", self.path.display());
+            // The TYPED refusal, same as the fold's lock file carried: contention is a state a
+            // consumer retries, and it must classify as one — never as an internal failure.
+            return Err(crate::fold::WriterLocked { path: self.path.clone() }.into());
         }
         Ok(())
     }
@@ -947,6 +949,22 @@ impl crate::readat::ReadAt for MemberReader {
     fn len(&self) -> std::io::Result<u64> {
         let c = self.container.lock().expect("container lock poisoned");
         Ok(c.dir.get(&self.name).map(|m| m.len).unwrap_or(0))
+    }
+}
+
+impl Container {
+    /// Clear the sealed flag on a restore's staging copy — the one deliberate exception to
+    /// "sealed is final". Finality binds the ARTIFACT: the backup stays sealed forever, and a
+    /// verified copy being restored is a different file being born writable, which is the whole
+    /// point of restoring. Crate-private and reachable only from the restore path, so nothing
+    /// else can talk itself into unsealing in place.
+    pub(crate) fn clear_seal_for_restore(&mut self) -> Result<u64> {
+        if !self.sealed {
+            return Ok(self.sb.seq);
+        }
+        self.sealed = false;
+        let sb = Superblock { seq: self.sb.seq + 1, flags: 0, ..self.sb };
+        self.flip(sb)
     }
 }
 
