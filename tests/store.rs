@@ -3017,3 +3017,410 @@ fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     assert_eq!(tail.events, [*cancelled]);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The single-file writer's whole life: born from an absent path, records in, three-fsync
+/// flushes, crash recovery from the WAL sidecar alone, reader parity, exclusion by flock on the
+/// file itself, and a clean close that leaves exactly one file at rest.
+#[test]
+fn a_single_file_store_lives_its_whole_life_against_one_file() {
+    let root = tmp("single-file-life");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_mul(31).wrapping_add((i % 251) as u8)).collect()
+    };
+
+    // Born from an absent path, exactly as a directory store is.
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    let mut want: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..24u8 {
+        let id = format!("r:{i:02}");
+        let b = body(i, 1500);
+        s.put(
+            &id,
+            &[Span::Lit(b"["), Span::Piece(&b), Span::Lit(b"]")],
+            vec![("n".into(), AttrValue::Int(i64::from(i)))],
+        )
+        .unwrap();
+        let mut w = b"[".to_vec();
+        w.extend_from_slice(&b);
+        w.extend_from_slice(b"]");
+        want.push((id, w));
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // A second writer refuses while this one holds the file.
+    let second_err = match Store::open_file(&ct, cfg) {
+        Ok(_) => panic!("a second writer must refuse while the first holds the file"),
+        Err(e) => e.to_string(),
+    };
+    assert!(second_err.contains("already has a writer"), "flock on the file is the gate");
+
+    // Second flush: the retained log grows as members, parts accumulate.
+    for i in 24..40u8 {
+        let id = format!("r:{i:02}");
+        let b = body(i, 1500);
+        s.put(&id, &[Span::Lit(b"["), Span::Piece(&b), Span::Lit(b"]")], vec![]).unwrap();
+        let mut w = b"[".to_vec();
+        w.extend_from_slice(&b);
+        w.extend_from_slice(b"]");
+        want.push((id, w));
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    for (id, w) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), w, "{id} through the live writer");
+    }
+    drop(s);
+
+    // While hot: the file and its WAL sidecar, nothing else.
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["live.turndb".to_string(), "live.turndb-wal".to_string()]);
+
+    // Reopen: everything back, including through an independent reader of the same file.
+    let s = Store::open_file(&ct, cfg).unwrap();
+    for (id, w) in &want {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), w, "{id} after reopen");
+    }
+    drop(s);
+    let r = turndb::store::open_read_container(&ct, cfg).unwrap();
+    assert_eq!(r.ids().unwrap().len(), want.len());
+    for (id, w) in &want {
+        assert_eq!(&r.reconstruct(id).unwrap().unwrap(), w, "{id} through a plain reader");
+    }
+    drop(r);
+
+    // The crash story: acknowledged but never flushed. The WAL sidecar alone must carry it.
+    {
+        let mut s = Store::open_file(&ct, cfg).unwrap();
+        let b = body(99, 2000);
+        s.put("crash:1", &[Span::Piece(&b)], vec![("late".into(), AttrValue::Bool(true))]).unwrap();
+        s.delete("r:00").unwrap();
+        s.sync().unwrap(); // the ACK — and then the writer dies without ever flushing
+                           // (drop releases the flock as process death would; only flush truncates the WAL, so the
+                           // sidecar still carries everything acknowledged — the state a crash leaves)
+    }
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    assert_eq!(s.reconstruct("crash:1").unwrap().unwrap(), body(99, 2000), "acked writes replay");
+    assert!(s.reconstruct("r:00").unwrap().is_none(), "acked deletes replay");
+    s.sync().unwrap();
+    s.flush().unwrap();
+    for (id, w) in want.iter().skip(1) {
+        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), w, "{id} across the crash");
+    }
+
+    // Clean close: exactly one file at rest.
+    s.close().unwrap();
+    let names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["live.turndb".to_string()], "a closed store is one file");
+
+    // Sealed is final for writers too.
+    {
+        let mut c = turndb::container::Container::open(&ct).unwrap();
+        c.commit_sealed().unwrap();
+    }
+    let err = match Store::open_file(&ct, cfg) {
+        Ok(_) => panic!("a sealed container must refuse a writer"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("sealed"), "a sealed container refuses a writer: {err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Compaction inside the live file: a total merge streams the winners into a new member, one
+/// flip publishes the splice, superseded inputs age out of the retention window, and the sweep's
+/// frees are visible as reclaimable space in the file itself.
+#[test]
+fn a_single_file_store_compacts_in_place() {
+    let root = tmp("single-file-compact");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("compact.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body =
+        |seed: usize| -> Vec<u8> { (0..1200).map(|i| ((seed * 31 + i) % 251) as u8).collect() };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    // Three flush rounds with overlapping ids, so the merge has versions to supersede.
+    for round in 0..3usize {
+        for i in 0..10usize {
+            let id = format!("k:{:02}", (round * 5 + i) % 20);
+            s.put(&id, &[Span::Piece(&body(round * 100 + i))], vec![]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    s.delete("k:03").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    // The winners as the store answers them before compaction — the oracle for after.
+    let before: Vec<(String, Option<Vec<u8>>)> = (0..20usize)
+        .map(|i| {
+            let id = format!("k:{i:02}");
+            (id.clone(), s.reconstruct(&id).unwrap())
+        })
+        .collect();
+    assert!(before.iter().any(|(_, v)| v.is_none()), "the delete must be visible");
+
+    // Total merge: four parts become one, tombstones may drop, one flip publishes the splice.
+    let stats = s.merge_range(0, 4).unwrap().expect("four parts is a mergeable run");
+    assert_eq!(stats.inputs, 4);
+    assert_eq!(stats.fold_bytes_touched, 0, "a merge must never touch content");
+    for (id, want) in &before {
+        assert_eq!(&s.reconstruct(id).unwrap(), want, "{id} must answer identically post-merge");
+    }
+
+    // Age the merge inputs out of the retention window; the sweep frees them inside the file.
+    for round in 0..5usize {
+        s.put(&format!("late:{round}"), &[Span::Piece(&body(900 + round))], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    for (id, want) in &before {
+        assert_eq!(&s.reconstruct(id).unwrap(), want, "{id} across retention aging");
+    }
+    s.close().unwrap();
+
+    // The frees are real: the file carries reclaimable space where the superseded parts were,
+    // and an independent reader answers the merged truth.
+    let c = turndb::container::Container::open(&ct).unwrap();
+    assert!(c.free_bytes() > 0, "superseded members must be free-listed, not forgotten");
+    c.verify().unwrap();
+    drop(c);
+    let r = turndb::store::open_read_container(&ct, cfg).unwrap();
+    for (id, want) in &before {
+        assert_eq!(&r.reconstruct(id).unwrap(), want, "{id} through a plain reader");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Erasure inside the live file: tombstone → flush → total merge → refold, ending in ONE flip
+/// that swaps the generation, purges the retained log, and frees the old generation's members.
+/// Reachability ends atomically; the freed bytes await punch or reclaim, which is the free
+/// list's job to account for.
+#[test]
+fn a_single_file_store_erases_content_and_purges_history() {
+    let root = tmp("single-file-erase");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("erase.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    // Incompressible bodies, so dropped content is a visible fraction of the fold.
+    let body = |seed: u64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(3000);
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        while out.len() < 3000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(3000);
+        out
+    };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for i in 0..8u64 {
+        s.put(&format!("e:{i:02}"), &[Span::Piece(&body(i))], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+
+    let stats = s.erase_ids(&["e:03".to_string()]).unwrap();
+    let refold = stats.refold.as_ref().expect("an erase that dropped a record must refold");
+    assert!(refold.pieces_dropped > 0, "the erased body's pieces must drop: {stats:?}");
+    assert!(s.reconstruct("e:03").unwrap().is_none(), "erased means unreachable");
+    for i in (0..8u64).filter(|&i| i != 3) {
+        assert_eq!(
+            s.reconstruct(&format!("e:{i:02}")).unwrap().unwrap(),
+            body(i),
+            "e:{i:02} must survive the erasure byte-exact"
+        );
+    }
+    s.close().unwrap();
+
+    // The file's own testimony: generation 1 lives, generation 0 is freed, the retained log is
+    // purged to one commit, and the superseded bytes are on the free list.
+    let c = turndb::container::Container::open(&ct).unwrap();
+    let names: Vec<String> = c.names().map(String::from).collect();
+    assert!(
+        names.iter().any(|n| n.starts_with("fold-0001/")),
+        "the new generation's members must exist: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("fold/")),
+        "the old generation must be freed in the same flip: {names:?}"
+    );
+    let retained: Vec<&String> = names.iter().filter(|n| n.starts_with("MANIFEST.")).collect();
+    assert_eq!(retained.len(), 1, "time travel does not cross a refold: {names:?}");
+    assert!(
+        names.iter().all(|n| !n.starts_with("part-") || n.starts_with("part-r0001-")),
+        "only the rebuilt parts survive: {names:?}"
+    );
+    assert!(c.free_bytes() > 0, "the abandoned generation is free space, accounted for");
+    c.verify().unwrap();
+    drop(c);
+
+    // And the store still answers, through the writer and through a plain reader.
+    let s = Store::open_file(&ct, cfg).unwrap();
+    assert!(s.reconstruct("e:03").unwrap().is_none());
+    assert_eq!(s.reconstruct("e:07").unwrap().unwrap(), body(7));
+    s.close().unwrap();
+    let r = turndb::store::open_read_container(&ct, cfg).unwrap();
+    assert_eq!(r.ids().unwrap().len(), 7);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The free-space punch: what the sweep free-listed comes back as real filesystem blocks, in
+/// place, offsets unmoved — after the grace window, never inside it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_single_file_store_returns_freed_space_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tmp("single-file-punch");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("punch.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body = |seed: u64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(20_000);
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        while out.len() < 20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for i in 0..6u64 {
+        s.put(&format!("p:{i}"), &[Span::Piece(&body(i))], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.erase_ids(&["p:1".to_string(), "p:2".to_string()]).unwrap();
+
+    // Inside the grace window nothing may be destroyed: a reader could still hold a superblock
+    // that predates the freeing.
+    let early = s.punch_free_space().unwrap();
+    assert_eq!(early.punched_extents, 0, "the grace window must defer: {early:?}");
+    assert!(early.deferred_extents > 0, "the freed generation is there, waiting: {early:?}");
+
+    // Age past the window, then the interior blocks come back.
+    for round in 0..4u64 {
+        s.put(&format!("age:{round}"), &[Span::Piece(&body(100 + round))], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let before_blocks = std::fs::metadata(&ct).unwrap().blocks();
+    let punched = s.punch_free_space().unwrap();
+    assert!(punched.punched_bytes > 0, "aged free extents must deallocate: {punched:?}");
+    let after_blocks = std::fs::metadata(&ct).unwrap().blocks();
+    assert!(
+        after_blocks < before_blocks,
+        "the filesystem must hold fewer blocks after the punch: {before_blocks} -> {after_blocks}"
+    );
+
+    // Offsets unmoved, answers exact — on the live handle and after a reopen.
+    assert!(s.reconstruct("p:1").unwrap().is_none());
+    for i in [0u64, 3, 4, 5] {
+        assert_eq!(s.reconstruct(&format!("p:{i}")).unwrap().unwrap(), body(i));
+    }
+    s.close().unwrap();
+    let s = Store::open_file(&ct, cfg).unwrap();
+    for i in [0u64, 3, 4, 5] {
+        assert_eq!(s.reconstruct(&format!("p:{i}")).unwrap().unwrap(), body(i));
+    }
+    s.close().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The last three operations learn the single file: verification walks members instead of
+/// files, backup publishes a SEALED container, and recovery promotes a retained member with one
+/// flip — the prune of the abandoned timeline riding the same atomic state.
+#[test]
+fn a_single_file_store_verifies_backs_up_and_recovers() {
+    let root = tmp("single-file-vbr");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("vbr.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body =
+        |seed: u64| -> Vec<u8> { (0..1400).map(|i| ((seed * 37 + i) % 251) as u8).collect() };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for round in 0..2u64 {
+        for i in 0..8u64 {
+            s.put(&format!("v:{}", round * 8 + i), &[Span::Piece(&body(round * 8 + i))], vec![])
+                .unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+
+    // Verification: the chain walk runs over members — links, digests, and every record whole.
+    let v = s.verify().unwrap();
+    assert!(v.chain.retained_manifests >= 2, "{:?}", v.chain);
+    assert!(v.chain.links >= 2, "prev-links and the live==newest check must run: {:?}", v.chain);
+    assert_eq!(v.chain.part_digests, v.chain.retained_manifests * 2 - 1, "{:?}", v.chain);
+    assert_eq!(v.records, 16);
+
+    // Backup: a sealed container, byte-for-byte answerable, refusing writers and replacement.
+    let out = root.join("backup.turndb");
+    let stats = s.backup(&out).unwrap();
+    assert!(stats.files > 3 && stats.bytes > 0, "{stats:?}");
+    let sealed = turndb::container::Container::open(&out).unwrap();
+    assert!(sealed.sealed(), "a backup of a single-file store is a sealed container");
+    assert!(!sealed.names().any(|n| n.starts_with("MANIFEST.")), "no retained log in a snapshot");
+    sealed.verify().unwrap();
+    drop(sealed);
+    let r = turndb::store::open_read_container(&out, cfg).unwrap();
+    for i in 0..16u64 {
+        assert_eq!(r.reconstruct(&format!("v:{i}")).unwrap().unwrap(), body(i));
+    }
+    drop(r);
+    assert!(Store::open_file(&out, cfg).is_err(), "sealed refuses a writer");
+    assert!(s.backup(&out).is_err(), "an existing destination is never replaced");
+    s.close().unwrap();
+
+    // Recovery: damage the MANIFEST member in place; open refuses; promotion is one flip.
+    let (m_off, m_len) = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        let extents = c.member_extents("MANIFEST").unwrap();
+        assert_eq!(extents.len(), 1);
+        extents[0]
+    };
+    let mut bytes = std::fs::read(&ct).unwrap();
+    bytes[m_off as usize + (m_len as usize / 2)] ^= 0xff;
+    std::fs::write(&ct, &bytes).unwrap();
+    assert!(Store::open_file(&ct, cfg).is_err(), "a damaged manifest member must refuse");
+
+    // Healthy stores refuse recovery; this one is not healthy, and the newest retained copy
+    // carries the same commit, so promotion needs no rollback allowance at all.
+    let report =
+        turndb::store::recover_manifest_file(&ct, cfg, turndb::store::RecoveryOptions::default())
+            .unwrap();
+    assert_eq!(report.rollback_commits, 0, "{report:?}");
+    assert_eq!(report.records, 16, "{report:?}");
+
+    let s = Store::open_file(&ct, cfg).unwrap();
+    for i in 0..16u64 {
+        assert_eq!(s.reconstruct(&format!("v:{i}")).unwrap().unwrap(), body(i));
+    }
+    // And now that it is healthy, recovery refuses to touch it.
+    drop(s);
+    let err =
+        turndb::store::recover_manifest_file(&ct, cfg, turndb::store::RecoveryOptions::default())
+            .map(|_| ())
+            .unwrap_err();
+    assert!(err.to_string().contains("healthy"), "got: {err:#}");
+    std::fs::remove_dir_all(&root).ok();
+}

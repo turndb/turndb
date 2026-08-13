@@ -17,8 +17,10 @@
 //!     or drifted content is a failure even if no ack covered it.
 //!
 //! Beyond the write path, each PUBLICATION PROTOCOL gets its own crash sweep: backup, restore,
-//! manifest recovery promotion, hole punching, and format migration each run once for real, and
-//! then every op prefix × durability variant is replayed against protocol-specific invariants.
+//! manifest recovery promotion, hole punching, format migration, container checkpointing, and the
+//! container session cycle each run once for real, and then every op prefix × durability variant
+//! is replayed against protocol-specific invariants. Container superblock alternation is also
+//! proven from each recorded trace directly — see `assert_slot_alternation`.
 //!
 //! Run with: `cargo test --features dst --test dst`
 #![cfg(feature = "dst")]
@@ -256,6 +258,14 @@ enum Variant {
     /// AllLanded, except the very last pending write of the last-touched file is TORN at a
     /// fraction of its length.
     TornTail(u8),
+    /// TornTail's cut, but at a fraction of the write's first 64 bytes rather than its whole
+    /// length. Length-proportional cuts never land inside the defined region of a page-sized
+    /// write — for a 4 KiB superblock slot, thirds fall at 1365 and 2730 while everything the
+    /// format defines sits in the first 56 bytes, so every TornTail leaves the slot's claim
+    /// intact and checksum-valid. This variant cuts at 21 and 42: through the sequence, the
+    /// directory pointer, and the tail, which is what forces the slot checksum to actually
+    /// carry the crash-safety argument.
+    TornHead(u8),
     /// Only the LAST pending write to each file landed; every earlier unsynced write to that file
     /// did not.
     ///
@@ -275,6 +285,8 @@ const VARIANTS: &[Variant] = &[
     Variant::ContentLag,
     Variant::TornTail(1),
     Variant::TornTail(2),
+    Variant::TornHead(1),
+    Variant::TornHead(2),
     Variant::LastPendingOnly,
 ];
 
@@ -293,7 +305,7 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
     // truncate" is a state no crash can produce, and simulating it would demand recovery from
     // the impossible. (The SetLen-never-happened case is DurableOnly's job.)
     let torn: Option<(usize, usize)> = match variant {
-        Variant::TornTail(frac) => fs
+        Variant::TornTail(frac) | Variant::TornHead(frac) => fs
             .inodes
             .iter()
             .enumerate()
@@ -301,7 +313,11 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
             .find(|(_, n)| n.pending.last().is_some_and(|(off, _)| *off != u64::MAX))
             .map(|(i, n)| {
                 let (_, data) = n.pending.last().unwrap();
-                (i, data.len() * frac as usize / 3)
+                let span = match variant {
+                    Variant::TornHead(_) => data.len().min(64),
+                    _ => data.len(),
+                };
+                (i, span * frac as usize / 3)
             }),
         _ => None,
     };
@@ -334,7 +350,7 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
                         }
                         img
                     }
-                    Variant::TornTail(_) => {
+                    Variant::TornTail(_) | Variant::TornHead(_) => {
                         if torn.map(|(ti, _)| ti) == Some(i) {
                             // durable + all pending except the last, torn
                             let mut img = node.durable.clone();
@@ -560,6 +576,7 @@ fn every_crash_state_recovers_to_an_acked_consistent_store() {
     let work = root.join("store");
     let (ops, issued, acks) = run_workload(&work);
     assert!(ops.len() > 100, "the workload must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("workload", &ops);
     let boundaries = group_boundaries(&issued);
 
     let stage = root.join("stage");
@@ -741,6 +758,37 @@ fn replay_recorded(
         }
     }
     checked
+}
+
+/// Slot alternation, proven from the trace rather than hoped for from a crash.
+///
+/// The crash sweep alone cannot establish that superblock writes alternate: a slot overwritten in
+/// place still passes every crash state whose tear spares its checksummed prefix, and the reader
+/// race alternation exists for — resolving a slot while the writer rewrites it — is a race no
+/// crash model expresses. But the invariant is a property of the write *sequence*, so it is
+/// checked on the recorded op log directly: consecutive superblock claims (magic-bearing,
+/// whole-slot positioned writes at slot offsets) on one file may never target the same slot,
+/// deterministically, at every recording.
+fn assert_slot_alternation(tag: &str, ops: &[Op]) {
+    let slot_len = turndb::container::SLOT_LEN;
+    let mut last: BTreeMap<&Path, u64> = BTreeMap::new();
+    for op in ops {
+        let Op::WriteAt { path, off, data } = op else { continue };
+        if (*off == 0 || *off == slot_len)
+            && data.len() as u64 == slot_len
+            && data.starts_with(turndb::container::MAGIC)
+        {
+            if let Some(prev) = last.insert(path.as_path(), *off) {
+                assert_ne!(
+                    prev,
+                    *off,
+                    "{tag}: {} wrote a superblock claim into the slot the previous claim \
+                     occupies — the live slot was overwritten instead of alternated",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 /// A small settled store under `dir`, closed cleanly, plus the id -> body map it must serve.
@@ -1220,12 +1268,11 @@ fn _model_is_deterministic(_: &HashMap<(), ()>) {}
 /// the fsync that orders the members and directory ahead of the superblock fails this at crash
 /// point 5 under `LastPendingOnly`, with the superblock naming a tail past the end of the file.
 ///
-/// What this sweep does NOT establish is the other half of why the slots alternate. A superblock's
-/// meaningful content is its first 56 bytes inside a 4 KiB aligned write, so every tear this model
-/// produces leaves those bytes whole and the record valid — overwriting the live slot instead of
-/// alternating survives this sweep unchanged. Alternation earns its keep against a tear *within*
-/// that prefix, which needs sub-sector atomicity to fail, and against a concurrent reader
-/// resolving a slot while the writer rewrites it, which is a race no crash model expresses.
+/// Alternation itself is covered twice over. `TornHead` cuts a slot write inside its 56 defined
+/// bytes, so a torn claim actually fails its checksum here rather than surviving whole; and
+/// `assert_slot_alternation` proves from the recorded trace that no claim ever lands in the slot
+/// the previous claim occupies — the property whose violating race (a reader resolving a slot
+/// while the writer rewrites it) no crash model can express.
 #[test]
 fn every_container_checkpoint_crash_lands_on_one_committed_state() {
     let root = tmp("container");
@@ -1259,6 +1306,7 @@ fn every_container_checkpoint_crash_lands_on_one_committed_state() {
     turndb::store::checkpoint_into_container(&work, &container).unwrap();
     let ops = record::disarm();
     assert!(ops.len() > 4, "the checkpoint must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("container checkpoint", &ops);
 
     let stage = tmp("container-stage");
     let checked = replay_recorded("container", &base, &root, &ops, &stage, |stage, k, variant| {
@@ -1376,6 +1424,7 @@ fn every_container_session_crash_keeps_every_acknowledged_write() {
     }
     let ops = record::disarm();
     assert!(ops.len() > 20, "a session must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("container session", &ops);
 
     let stage = tmp("container-session-stage");
     let checked =
@@ -1420,6 +1469,379 @@ fn every_container_session_crash_keeps_every_acknowledged_write() {
     println!("dst container session: {checked} crash states checked across {} ops", ops.len());
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The NATIVE single-file session: `Store::open_file`, writes, an ACK, a flush — the protocol
+/// whose superblock flip is the linearization point — more writes, another ACK that is never
+/// flushed, and a session end with the `-wal` sidecar left behind. Every crash state must reopen
+/// from the file plus that sidecar alone: opening never refuses, an acknowledged record that
+/// comes back is byte-exact, and nothing committed before the session can vanish. This is the
+/// sweep the hot-directory session sweep retires into once the bridge is deleted.
+#[test]
+fn every_single_file_session_crash_keeps_every_acknowledged_write() {
+    let root = tmp("native-session");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(600);
+        let mut seed = [i as u8; 32];
+        while b.len() < 600 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(600);
+        b
+    };
+
+    // A committed baseline from an earlier, cleanly closed session: exactly one file at rest.
+    let mut before = BTreeMap::new();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..5 {
+            let id = format!("before:{i}");
+            let body = body_for(700 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            before.insert(id, body);
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    assert!(!wal_of(&file).exists(), "a clean close leaves only the file");
+
+    let mut acked = before.clone();
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..3 {
+            let id = format!("acked:a{i}");
+            let body = body_for(800 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            acked.insert(id, body);
+        }
+        s.sync().unwrap(); // ACK — durable in the sidecar from here
+        s.flush().unwrap(); // the flip: fold delta, part, manifests, one barrier, one slot
+        for i in 0..3 {
+            let id = format!("acked:b{i}");
+            let body = body_for(900 + i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            acked.insert(id, body);
+        }
+        s.sync().unwrap(); // ACKed and never flushed: the sidecar alone carries these
+        drop(s); // the session dies without closing — the -wal stays behind
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 20, "a session must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file session", &ops);
+
+    let stage = tmp("native-session-stage");
+    let checked =
+        replay_recorded("single-file-session", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!(
+                    "crash point {k} {variant:?}: the single-file store refused to reopen: {e:#}"
+                )
+            });
+            let mut found = 0usize;
+            for (id, body) in &acked {
+                match s.reconstruct(id).unwrap() {
+                    Some(got) => {
+                        assert_eq!(
+                            got, *body,
+                            "crash point {k} {variant:?}: {id} came back but drifted"
+                        );
+                        found += 1;
+                    }
+                    None => assert!(
+                        !before.contains_key(id),
+                        "crash point {k} {variant:?}: {id} predates this session and vanished"
+                    ),
+                }
+            }
+            assert!(
+                found >= before.len(),
+                "crash point {k} {variant:?}: recovered {found} records, fewer than the {} \
+                 committed before the session began",
+                before.len()
+            );
+        });
+    println!("dst single-file session: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The native merge: answer-preserving by definition, so the sweep's invariant is total — at
+/// EVERY crash state, every record answers exactly as it did before the merge began. There is no
+/// window where the store may serve anything else: the splice publishes in one flip, and until
+/// it does, the merged member is uncommitted noise.
+#[test]
+fn every_single_file_merge_crash_answers_identically() {
+    let root = tmp("native-merge");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(500);
+        let mut seed = [i as u8; 32];
+        while b.len() < 500 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(500);
+        b
+    };
+
+    // Three parts with overlapping ids and one delete — versions to supersede, a tombstone to
+    // carry, and a mergeable run.
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for round in 0..3usize {
+            for i in 0..6usize {
+                let id = format!("m:{:02}", (round * 3 + i) % 9);
+                s.put(&id, &[Span::Piece(&body_for(round * 50 + i))], vec![]).unwrap();
+            }
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        s.delete("m:02").unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let oracle: BTreeMap<String, Option<Vec<u8>>> = {
+        let s = Store::open_file(&file, cfg).unwrap();
+        (0..9usize)
+            .map(|i| {
+                let id = format!("m:{i:02}");
+                let v = s.reconstruct(&id).unwrap();
+                (id, v)
+            })
+            .collect()
+    };
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        s.merge_range(0, 4).unwrap().expect("four parts merge");
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 4, "a merge must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file merge", &ops);
+
+    let stage = tmp("native-merge-stage");
+    let checked =
+        replay_recorded("single-file-merge", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the merge left a store that refuses: {e:#}")
+            });
+            for (id, want) in &oracle {
+                let got = s.reconstruct(id).unwrap();
+                assert_eq!(
+                    &got, want,
+                    "crash point {k} {variant:?}: {id} must answer identically on both sides \
+                     of a merge"
+                );
+            }
+        });
+    println!("dst single-file merge: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The native erase pipeline — tombstone flush, total merge, refold — is THREE flips, and every
+/// crash point between and inside them must leave a store that opens and answers honestly:
+/// survivors answer their exact bytes at every state; the erased id answers its pre-erase bytes
+/// or nothing, never garbage; and once any state shows it gone, that is a committed flip's doing.
+/// The directory refold's hardest window — committed swap, crashed purge — has no analogue here,
+/// and this sweep is what says so.
+#[test]
+fn every_single_file_erase_crash_answers_honestly() {
+    let root = tmp("native-erase");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(800);
+        let mut seed = [i as u8; 32];
+        while b.len() < 800 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(800);
+        b
+    };
+
+    let mut bodies = BTreeMap::new();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..6usize {
+            let id = format!("e:{i}");
+            let body = body_for(i);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            bodies.insert(id, body);
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        s.erase_ids(&["e:2".to_string()]).unwrap();
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 10, "an erase must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file erase", &ops);
+
+    let stage = tmp("native-erase-stage");
+    let checked =
+        replay_recorded("single-file-erase", &base, &root, &ops, &stage, |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the erase left a store that refuses: {e:#}")
+            });
+            for (id, body) in &bodies {
+                let got = s.reconstruct(id).unwrap();
+                if id == "e:2" {
+                    // Pre-erase bytes or gone — a committed flip decides which; drifted is the
+                    // one answer no crash state may give.
+                    if let Some(got) = got {
+                        assert_eq!(
+                            got, *body,
+                            "crash point {k} {variant:?}: the erased id drifted instead of \
+                             answering or vanishing"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        got.as_ref(),
+                        Some(body),
+                        "crash point {k} {variant:?}: {id} is a survivor and must answer exactly"
+                    );
+                }
+            }
+        });
+    println!("dst single-file erase: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The free-space punch is physical-only — no commit, no declaration, nothing referenced — so
+/// its whole crash contract is: at every crash state, every record answers exactly as before,
+/// and reopening never refuses. A punch that could disturb an answer would mean the free list
+/// lied about a byte being free.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_single_file_punch_crash_disturbs_nothing() {
+    let root = tmp("native-free-punch");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(9000);
+        let mut seed = [i as u8; 32];
+        while b.len() < 9000 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(9000);
+        b
+    };
+
+    // Erase two records, then age the frees past the grace window, so the recorded punch has
+    // real interiors to deallocate.
+    let mut oracle = BTreeMap::new();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..5usize {
+            s.put(&format!("f:{i}"), &[Span::Piece(&body_for(i))], vec![]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.erase_ids(&["f:1".to_string()]).unwrap();
+        for round in 0..4usize {
+            s.put(&format!("age:{round}"), &[Span::Piece(&body_for(50 + round))], vec![]).unwrap();
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        for i in 0..5usize {
+            oracle.insert(format!("f:{i}"), s.reconstruct(&format!("f:{i}")).unwrap());
+        }
+        for round in 0..4usize {
+            let id = format!("age:{round}");
+            oracle.insert(id.clone(), s.reconstruct(&id).unwrap());
+        }
+        s.close().unwrap();
+    }
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let stats = s.punch_free_space().unwrap();
+        assert!(stats.punched_bytes > 0, "the fixture must actually punch: {stats:?}");
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 3, "a punch must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file free punch", &ops);
+
+    let stage = tmp("native-free-punch-stage");
+    let checked = replay_recorded(
+        "single-file-free-punch",
+        &base,
+        &root,
+        &ops,
+        &stage,
+        |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the punch left a store that refuses: {e:#}")
+            });
+            for (id, want) in &oracle {
+                let got = s.reconstruct(id).unwrap();
+                assert_eq!(
+                    &got, want,
+                    "crash point {k} {variant:?}: {id} must be untouched by a free-space punch"
+                );
+            }
+        },
+    );
+    println!("dst single-file free punch: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// The WAL sidecar beside a single-file store, by the same rule the engine uses.
+fn wal_of(file: &Path) -> PathBuf {
+    let mut name = file.as_os_str().to_os_string();
+    name.push("-wal");
+    PathBuf::from(name)
 }
 
 /// The working directory beside a container, by the same rule the engine uses.

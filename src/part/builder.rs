@@ -11,7 +11,7 @@
 //! **The output is byte-identical to `build_full` given the same rows** — asserted by test, not
 //! assumed — which is what makes the old builder the streaming builder's oracle.
 
-use super::{PartMeta, Writer};
+use super::{FilePartSink, PartMeta, Writer};
 use crate::fold::Loc;
 use crate::part::attrs::{encode_zones, ZoneAcc, RID_DELTA, RID_DENSE};
 use crate::part::bloom;
@@ -24,6 +24,13 @@ use std::path::{Path, PathBuf};
 
 /// An append-only overflow file for one unbounded section. Named `<part>.s<N>.tmp`, so a crash
 /// leaves only `*.tmp` litter for the store's sweep; deleted on `finish` and best-effort on drop.
+///
+/// Creation and removal go through the vfs seam so the crash simulator materializes the litter
+/// the writer-open sweep must handle. The CONTENT writes deliberately do not: a spool's bytes are
+/// never read by recovery, never claimed durable, and never named by anything committed — while
+/// recording them would push every appended byte into the op log and multiply every sweep by the
+/// data volume. The simulator sees spools as the empty files whose names must be swept, which is
+/// the whole of what any invariant asks of them.
 struct Spool {
     path: PathBuf,
     w: std::io::BufWriter<std::fs::File>,
@@ -33,7 +40,7 @@ struct Spool {
 impl Spool {
     fn new(base: &Path, n: usize) -> Result<Spool> {
         let path = base.with_extension(format!("s{n}.tmp"));
-        let f = std::fs::File::create(&path)
+        let f = crate::vfs::create(&path)
             .with_context(|| format!("create spool {}", path.display()))?;
         Ok(Spool { path, w: std::io::BufWriter::new(f), len: 0 })
     }
@@ -51,14 +58,14 @@ impl Spool {
         read_limits.admit_decoded(format!("new part section {section:?}"), self.len)?;
         self.w.flush()?;
         let b = std::fs::read(&self.path)?;
-        let _ = std::fs::remove_file(&self.path);
+        let _ = crate::vfs::unlink(&self.path);
         Ok(b)
     }
 }
 
 impl Drop for Spool {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = crate::vfs::unlink(&self.path);
     }
 }
 
@@ -90,8 +97,8 @@ struct ContentCol {
     prog_len: u64,
 }
 
-pub struct StreamBuilder {
-    w: Writer,
+pub(crate) struct SinkBuilder<S: crate::vfs::ArtifactSink> {
+    w: Writer<S>,
     dict: Vec<(Loc, PieceHash)>,
     dict_index: HashMap<PieceHash, u32>,
     cols: Vec<Col>,
@@ -115,6 +122,11 @@ pub struct StreamBuilder {
     rows: u64,
     read_limits: crate::read_limits::ReadLimits,
 }
+
+/// The streaming builder's public, file-backed face: exactly the surface it always had. The
+/// sink-generic engine underneath is [`SinkBuilder`], a crate concern — public callers build
+/// parts as files; the engine builds them wherever its store lives.
+pub struct StreamBuilder(SinkBuilder<FilePartSink>);
 
 impl StreamBuilder {
     /// `dict` is the full piece dictionary the part will carry (referenced plus retained), in ANY
@@ -144,12 +156,58 @@ impl StreamBuilder {
     pub fn new_with_limits(
         path: &Path,
         level: i32,
+        dict: Vec<(Loc, PieceHash)>,
+        content_names: Vec<String>,
+        columns: Vec<(String, u8)>,
+        value_dicts: Vec<Vec<Vec<u8>>>,
+        read_limits: crate::read_limits::ReadLimits,
+    ) -> Result<StreamBuilder> {
+        Ok(StreamBuilder(SinkBuilder::over(
+            FilePartSink::create(path)?,
+            path,
+            level,
+            dict,
+            content_names,
+            columns,
+            value_dicts,
+            read_limits,
+        )?))
+    }
+
+    /// Append one row. Rows must arrive in strictly increasing id order.
+    pub fn push(
+        &mut self,
+        id: &[u8],
+        tomb: bool,
+        contents: &[Content],
+        attrs: &[(String, AttrValue)],
+    ) -> Result<()> {
+        self.0.push(id, tomb, contents, attrs)
+    }
+
+    /// Assemble the part; the file is fsynced before this returns.
+    pub fn finish(self, seq_lo: u64, seq_hi: u64) -> Result<PartMeta> {
+        let (meta, _sink) = self.0.finish(seq_lo, seq_hi)?;
+        Ok(meta)
+    }
+}
+
+impl<S: crate::vfs::ArtifactSink> SinkBuilder<S> {
+    /// Stream into any sink. `spool_base` is where the unbounded-section overflow files live —
+    /// beside the output for a file part, inside the store's transient `-tmp` directory for a
+    /// member of the live file. Spools are scratch either way: never durable, never read by
+    /// recovery, swept as litter after a crash.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn over(
+        sink: S,
+        spool_base: &Path,
+        level: i32,
         mut dict: Vec<(Loc, PieceHash)>,
         mut content_names: Vec<String>,
         columns: Vec<(String, u8)>,
         value_dicts: Vec<Vec<Vec<u8>>>,
         read_limits: crate::read_limits::ReadLimits,
-    ) -> Result<StreamBuilder> {
+    ) -> Result<SinkBuilder<S>> {
         let read_limits = read_limits.validate()?;
         if columns.len() != value_dicts.len() {
             bail!("every column needs its value dictionary slot");
@@ -164,9 +222,9 @@ impl StreamBuilder {
         order.sort_by(|&a, &b| columns[a].cmp(&columns[b]));
 
         let mut spool_n = 0usize;
-        let mut spool = |base: &Path| -> Result<Spool> {
+        let mut spool = |_ignored: &Path| -> Result<Spool> {
             spool_n += 1;
-            Spool::new(base, spool_n)
+            Spool::new(spool_base, spool_n)
         };
         let mut cols = Vec::with_capacity(columns.len());
         let mut col_of = HashMap::with_capacity(columns.len());
@@ -181,8 +239,8 @@ impl StreamBuilder {
                 dense: true,
                 prev_rid: 0,
                 zone: ZoneAcc::new(tag),
-                val: spool(path)?,
-                rid: spool(path)?,
+                val: spool(spool_base)?,
+                rid: spool(spool_base)?,
             });
         }
 
@@ -202,28 +260,28 @@ impl StreamBuilder {
                 occurrences: 0,
                 dense: true,
                 prev_rid: 0,
-                prog: spool(path)?,
-                off: spool(path)?,
-                rid: spool(path)?,
-                identity: spool(path)?,
+                prog: spool(spool_base)?,
+                off: spool(spool_base)?,
+                rid: spool(spool_base)?,
+                identity: spool(spool_base)?,
                 prog_len: 0,
             });
         }
 
-        Ok(StreamBuilder {
-            w: Writer::new_with_limits(path, level, read_limits)?,
+        Ok(SinkBuilder {
+            w: Writer::over(sink, level, read_limits)?,
             dict,
             dict_index,
             cols,
             col_of,
             content_cols,
             content_of,
-            ids: spool(path)?,
+            ids: spool(spool_base)?,
             id_restarts: Vec::new(),
             id_stream_len: 0,
             prev_id: Vec::new(),
-            layout: spool(path)?,
-            layout_off: spool(path)?,
+            layout: spool(spool_base)?,
+            layout_off: spool(spool_base)?,
             layout_len: 0,
             tomb: Vec::new(),
             tomb_n: 0,
@@ -356,8 +414,9 @@ impl StreamBuilder {
     }
 
     /// Assemble the part: sections in the canonical order `build_full` writes them, one spool
-    /// resident at a time.
-    pub fn finish(mut self, seq_lo: u64, seq_hi: u64) -> Result<PartMeta> {
+    /// resident at a time. Returns the sink so a member handle can be carried back to the
+    /// registration that names it.
+    pub fn finish(mut self, seq_lo: u64, seq_hi: u64) -> Result<(PartMeta, S)> {
         if self.rows > u32::MAX as u64 {
             bail!("{} records exceeds the u32 record count a part footer can name", self.rows);
         }
@@ -458,7 +517,7 @@ impl StreamBuilder {
         }
 
         let meta = PartMeta { n_records: n as u32, seq_lo, seq_hi };
-        self.w.finish(meta)?;
-        Ok(meta)
+        let sink = self.w.finish(meta)?;
+        Ok((meta, sink))
     }
 }

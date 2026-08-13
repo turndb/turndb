@@ -341,6 +341,16 @@ pub fn dir_path(dir: &Path, n: u32) -> PathBuf {
 /// sidecar lost to a crash costs one rescan at the next open, and a torn one fails its checksum
 /// and costs the same. Nothing durable depends on it.
 pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
+    let b = encode_dir_sidecar(n, tail, entries);
+    let tmp = dir.join(format!("seg-{n:08}.dir.tmp"));
+    crate::vfs::write_file(&tmp, &b)?;
+    crate::vfs::rename(&tmp, &dir_path(dir, n))?;
+    Ok(())
+}
+
+/// The sidecar bytes alone — one encoding whether it lands as a file beside a segment or as a
+/// member beside a segment member.
+pub fn encode_dir_sidecar(n: u32, tail: u32, entries: &[(u32, u32)]) -> Vec<u8> {
     let mut b = Vec::with_capacity(24 + entries.len() * 8);
     b.extend_from_slice(DIR_MAGIC);
     b.extend_from_slice(&n.to_le_bytes());
@@ -352,10 +362,7 @@ pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) 
     }
     let crc = crc32fast::hash(&b);
     b.extend_from_slice(&crc.to_le_bytes());
-    let tmp = dir.join(format!("seg-{n:08}.dir.tmp"));
-    crate::vfs::write_file(&tmp, &b)?;
-    crate::vfs::rename(&tmp, &dir_path(dir, n))?;
-    Ok(())
+    b
 }
 
 /// The sidecar's entries, or `None` — absent, damaged, or not describing this file's bytes. The

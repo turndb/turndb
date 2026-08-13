@@ -20,15 +20,26 @@
 //! What a container holds is what a pack holds — `MANIFEST`, the parts a manifest names, and the
 //! live fold generation's segments and sidecars — under the same flat `/`-joined names. Because
 //! [every offset inside a part or fold segment is relative to that artifact's start](../FORMAT.md),
-//! the members are byte-identical to their directory and pack forms, and
-//! [`Container::extent`] hands them to [`Part::open_reader`](crate::part::Part::open_reader) and
-//! [`Fold::open_read_from`](crate::fold::Fold::open_read_from) with no translation.
+//! the members are byte-identical to their directory and pack forms.
 //!
-//! **Space is reclaimed by rewriting, not by reuse.** Freed extents are recorded so the waste is
-//! reportable, but allocation only ever appends. Reusing a freed extent would hand a reader holding
-//! an older superblock a range whose bytes are now something else — silent corruption rather than a
-//! detected fault — and nothing here tracks reader generations yet. The same posture the engine
-//! takes with `refold`.
+//! **A member is a list of extents, not one range.** A member staged whole has exactly one, but a
+//! member that grows across commits — the active fold segment — gains an extent per commit that
+//! extended it, with other members' bytes between. [`Container::extent`] stitches the list into
+//! one logical range through [`Extents`](crate::readat::Extents), so
+//! [`Part::open_reader`](crate::part::Part::open_reader) and
+//! [`Fold::open_read_from`](crate::fold::Fold::open_read_from) never learn the bytes are
+//! scattered. Physically adjacent extents coalesce as they are staged, so a member extended by
+//! consecutive commits with nothing between them stays one extent.
+//!
+//! **Space is reclaimed by rewriting, not by reuse.** Freed extents are recorded — stamped with
+//! the commit that freed them — so the waste is reportable and its age is provable, but allocation
+//! only ever appends. Reusing a freed extent would hand a reader holding an older superblock a
+//! range whose bytes are now something else — silent corruption rather than a detected fault. The
+//! same posture the engine takes with `refold`.
+//!
+//! **A sealed container is final.** The sealed flag in the superblock refuses every further
+//! commit; what remains is a single-file artifact that reads like any other container and can
+//! never again be a writer's target.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -39,13 +50,22 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 
 use crate::part::idcol::{get_varint, put_varint};
-use crate::readat::Slice;
+use crate::readat::Extents;
 
 /// Head of every superblock. A file that does not start with it is not a container.
 pub const MAGIC: &[u8; 8] = b"TURNCTNR";
 
-/// The container plane's reject-forward lever, independent of the record format version.
-pub const CONTAINER_VERSION: u8 = 1;
+/// The container plane's reject-forward lever, independent of the record format version. This
+/// revision writes 2; revision 1 — the pre-extent-list layout — is read for upgrade and never
+/// written.
+pub const CONTAINER_VERSION: u8 = 2;
+
+/// The revision the first published containers carried: single-extent members, unstamped free
+/// list, no flags. Read-only; the first commit over one publishes the current revision.
+const LEGACY_VERSION: u8 = 1;
+
+/// Superblock flags, byte 50. Every undefined bit MUST be zero and a reader must refuse otherwise.
+pub const SB_FLAG_SEALED: u8 = 1;
 
 /// Each superblock slot is a whole page: a slot write is one `pwrite` that cannot straddle two.
 pub const SLOT_LEN: u64 = 4096;
@@ -55,6 +75,12 @@ pub const REGION_START: u64 = SLOT_LEN * 2;
 
 /// Bytes of a slot the format actually defines; the rest is zero and reserved.
 const SB_LEN: usize = 56;
+
+/// Members and fresh extents start on this boundary. Hole punching deallocates whole filesystem
+/// blocks, so an unaligned extent strands its edges; the padding this costs (< 4 KiB per fresh
+/// extent, structural and deliberately not free-listed) is what makes a freed extent's bytes
+/// actually returnable in place.
+pub const ALIGN: u64 = 4096;
 
 /// Suffix of the working directory a writer keeps beside a container, mirroring SQLite's `-wal`.
 /// Named here because file-level operations on a container have to know whether one exists.
@@ -66,11 +92,22 @@ const MAX_DIR_STORED: u32 = 64 << 20;
 const MAX_DIR_RAW: u32 = 256 << 20;
 /// Refuse a container claiming more members than a store could plausibly have.
 const MAX_MEMBERS: u32 = 1_000_000;
+/// Refuse a member scattered across more extents than commits could plausibly have staged.
+const MAX_MEMBER_EXTENTS: u64 = 1 << 16;
 /// Longest member name accepted.
 const MAX_NAME: u64 = 16 << 10;
 
-/// `(offset, length, crc32)` — the same shape a pack TOC entry carries.
-type Entry = (u64, u64, u32);
+fn align_up(x: u64) -> u64 {
+    x.div_ceil(ALIGN) * ALIGN
+}
+
+/// One member: its extents in logical order, its logical length, and crc32 over its logical bytes.
+#[derive(Clone, Debug)]
+struct Member {
+    extents: Vec<(u64, u64)>,
+    len: u64,
+    xsum: u32,
+}
 
 /// One committed state of a container.
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +120,8 @@ struct Superblock {
     dir_xsum: u32,
     tail: u64,
     dir_codec: u8,
+    version: u8,
+    flags: u8,
 }
 
 impl Superblock {
@@ -96,6 +135,8 @@ impl Superblock {
             dir_xsum: 0,
             tail: REGION_START,
             dir_codec: 0,
+            version: CONTAINER_VERSION,
+            flags: 0,
         }
     }
 
@@ -111,7 +152,8 @@ impl Superblock {
         slot[40..48].copy_from_slice(&self.tail.to_le_bytes());
         slot[48] = self.dir_codec;
         slot[49] = CONTAINER_VERSION;
-        // slot[50..52] reserved, already zero
+        slot[50] = self.flags;
+        // slot[51] reserved, already zero
         let digest = blake3::hash(&slot[0..52]);
         slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
         slot
@@ -133,14 +175,26 @@ impl Superblock {
         if slot[52..56] != digest.as_bytes()[0..4] {
             return Ok(None);
         }
-        if slot[49] != CONTAINER_VERSION {
+        let version = slot[49];
+        if version == 0 || version > CONTAINER_VERSION {
             bail!(
-                "container superblock declares version {}, and this build reads {CONTAINER_VERSION}",
-                slot[49]
+                "container superblock declares version {version}, and this build reads up to \
+                 {CONTAINER_VERSION}"
             );
         }
-        if slot[50..52] != [0, 0] {
-            bail!("container superblock sets reserved bits that must be zero");
+        let flags = slot[50];
+        if version == LEGACY_VERSION {
+            // The legacy revision defined no flags; a nonzero byte is a claim it could not make.
+            if slot[50..52] != [0, 0] {
+                bail!("container superblock sets reserved bits that must be zero");
+            }
+        } else {
+            if flags & !SB_FLAG_SEALED != 0 {
+                bail!("container superblock sets flags this build does not know: {flags:#04x}");
+            }
+            if slot[51] != 0 {
+                bail!("container superblock sets reserved bits that must be zero");
+            }
         }
         Ok(Some(Superblock {
             seq: u64::from_le_bytes(slot[8..16].try_into()?),
@@ -151,6 +205,8 @@ impl Superblock {
             dir_xsum: u32::from_le_bytes(slot[36..40].try_into()?),
             tail: u64::from_le_bytes(slot[40..48].try_into()?),
             dir_codec: slot[48],
+            version,
+            flags,
         }))
     }
 }
@@ -159,14 +215,21 @@ impl Superblock {
 pub struct Container {
     f: Arc<File>,
     path: PathBuf,
-    dir: BTreeMap<String, Entry>,
-    free: Vec<(u64, u64)>,
+    dir: BTreeMap<String, Member>,
+    /// `(off, len, freed_seq)` — extents nothing names any more, stamped with the commit that
+    /// freed them. Recorded, reported, never reused.
+    free: Vec<(u64, u64, u64)>,
+    /// The committed state this handle grew from; `seq`/`tail`/directory pointer live here.
+    sb: Superblock,
+    /// The staging cursor — first byte past everything written, committed or staged.
     tail: u64,
-    seq: u64,
     /// The slot the live state was read from; the next commit writes the other one.
     slot: u8,
     /// Staged members exist in the file but in no committed superblock until `commit`.
     staged: bool,
+    sealed: bool,
+    /// Whether a [`MemberWrite`] handle is outstanding — it owns the tail while it lives.
+    member_open: bool,
 }
 
 impl Container {
@@ -189,10 +252,12 @@ impl Container {
             path: path.to_path_buf(),
             dir: BTreeMap::new(),
             free: Vec::new(),
+            sb,
             tail: REGION_START,
-            seq: 0,
             slot: 0,
             staged: false,
+            sealed: false,
+            member_open: false,
         })
     }
 
@@ -247,15 +312,37 @@ impl Container {
             dir,
             free,
             tail: live.tail,
-            seq: live.seq,
             slot,
             staged: false,
+            sealed: live.flags & SB_FLAG_SEALED != 0,
+            member_open: false,
+            sb: live,
         })
+    }
+
+    /// Take the single-writer role on this container: an exclusive advisory lock on the file
+    /// itself, exactly where SQLite puts it. The kernel releases it when the descriptor closes —
+    /// including on a crash — so a stale lock cannot outlive its owner. On `wasm32-wasip1` the
+    /// call succeeds unconditionally and gates nothing; the single-writer invariant is the
+    /// embedder's to keep, unchanged from the directory store's statement of the same caveat.
+    pub fn lock_writer(&self) -> Result<()> {
+        if !crate::sys::lock_exclusive(&self.f)
+            .with_context(|| format!("locking {}", self.path.display()))?
+        {
+            bail!("{} already has a writer; a store takes exactly one", self.path.display());
+        }
+        Ok(())
     }
 
     /// The committed sequence this handle is reading.
     pub fn seq(&self) -> u64 {
-        self.seq
+        self.sb.seq
+    }
+
+    /// Whether the committed state carries the sealed flag. Sealed is final: every staging or
+    /// commit call on this handle refuses.
+    pub fn sealed(&self) -> bool {
+        self.sealed
     }
 
     /// Member names in sorted order.
@@ -278,43 +365,186 @@ impl Container {
         self.dir.is_empty()
     }
 
-    /// Bytes occupied by superseded members — reclaimable only by rewriting the container.
+    /// Bytes occupied by superseded extents and alignment padding — reclaimable only by rewriting
+    /// the container, or in place where the platform can punch holes.
     pub fn free_bytes(&self) -> u64 {
-        self.free.iter().map(|(_, len)| *len).sum()
+        self.free.iter().map(|(_, len, _)| *len).sum()
     }
 
     /// Bytes the members themselves occupy.
     pub fn member_bytes(&self) -> u64 {
-        self.dir.values().map(|(_, len, _)| *len).sum()
+        self.dir.values().map(|m| m.len).sum()
     }
 
-    /// A member as a positioned reader. This is the seam: the returned range is exactly the
-    /// artifact's bytes, so a part or fold segment opens from it with no translation.
-    pub fn extent(&self, name: &str) -> Option<Slice<Arc<File>>> {
-        let &(off, len, _) = self.dir.get(name)?;
-        Some(Slice::new(self.f.clone(), off, len))
+    /// A member's physical layout: its `(offset, length)` extents in logical order. Diagnostic —
+    /// readers go through [`Container::extent`], which hides exactly this.
+    pub fn member_extents(&self, name: &str) -> Option<Vec<(u64, u64)>> {
+        self.dir.get(name).map(|m| m.extents.clone())
+    }
+
+    /// A member's logical length, staged view included.
+    pub fn member_len(&self, name: &str) -> Option<u64> {
+        self.dir.get(name).map(|m| m.len)
+    }
+
+    /// Deallocate a logical byte range of a member in place: each physical run it maps to is
+    /// hole-punched, offsets unmoved, then the file is fsynced so the destruction is not left
+    /// pending behind checksummed bytes a reader would still trust. The caller owes the same
+    /// truth `Fold::punch_blocks` owes — the range must be declared dead by the manifest before
+    /// any byte goes.
+    pub fn punch_within_member(&self, name: &str, off: u64, len: u64) -> Result<()> {
+        let m = self
+            .dir
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("container member not found: {name}"))?;
+        if off.checked_add(len).is_none_or(|end| end > m.len) {
+            bail!("punch of {len} bytes at {off} exceeds member {name}'s {} bytes", m.len);
+        }
+        let mut remaining = len;
+        let mut at = off;
+        let mut logical = 0u64;
+        for &(phys, elen) in &m.extents {
+            if remaining == 0 {
+                break;
+            }
+            let start = logical;
+            logical += elen;
+            if at >= logical {
+                continue;
+            }
+            let within = at - start;
+            let take = remaining.min(elen - within);
+            crate::vfs::punch_hole(&self.f, &self.path, phys + within, take).with_context(
+                || {
+                    format!(
+                        "punching {take} bytes of member {name}; this filesystem may not support                          hole punching — re-fold instead"
+                    )
+                },
+            )?;
+            at += take;
+            remaining -= take;
+        }
+        crate::vfs::sync_file(&self.f, &self.path)?;
+        Ok(())
+    }
+
+    /// A member as a positioned reader over its logical bytes. This is the seam: a part or fold
+    /// segment opens from it with no translation and no idea whether its bytes are one extent or
+    /// many.
+    pub fn extent(&self, name: &str) -> Option<Extents<Arc<File>>> {
+        let m = self.dir.get(name)?;
+        Some(Extents::new(self.f.clone(), &m.extents))
     }
 
     /// Read a small member whole, refusing anything larger than `max_bytes` before allocating.
     pub fn read_file_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let &(off, len, _) = self
+        let m = self
             .dir
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("container member not found: {name}"))?;
-        if len > max_bytes {
-            bail!("container member {name} is {len} bytes, over the {max_bytes} byte ceiling");
+        if m.len > max_bytes {
+            bail!("container member {name} is {} bytes, over the {max_bytes} byte ceiling", m.len);
         }
+        let reader = Extents::new(self.f.clone(), &m.extents);
         let mut buf = Vec::new();
-        buf.try_reserve_exact(len as usize)?;
-        buf.resize(len as usize, 0);
-        crate::sys::read_exact_at(&self.f, &mut buf, off)?;
+        buf.try_reserve_exact(m.len as usize)?;
+        buf.resize(m.len as usize, 0);
+        crate::readat::ReadAt::read_exact_at(&reader, &mut buf, 0)?;
         Ok(buf)
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.sealed {
+            bail!("container {} is sealed; sealed is final", self.path.display());
+        }
+        if self.member_open {
+            bail!(
+                "container {} has a member write in progress; finish or abandon it first",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Begin staging one member incrementally. The returned handle owns the write position and
+    /// hashes the member in the same pass that writes it — crc32 for the directory entry, BLAKE3
+    /// for whatever pin the caller keeps — so nothing is reread to register it.
+    ///
+    /// Exactly one member write may be open at a time, and every other staging call — including
+    /// `commit` — refuses while it is: the handle owns the tail, and a second writer would land
+    /// bytes inside the member being assembled. [`Container::finish_member`] registers the entry;
+    /// [`Container::abandon_member`] releases the tail and leaves the bytes as uncommitted noise,
+    /// which is exactly what they already are.
+    pub fn begin_member(&mut self, name: &str) -> Result<MemberWrite> {
+        self.ensure_writable()?;
+        validate_name(name)?;
+        let off = self.aligned_start();
+        self.member_open = true;
+        Ok(MemberWrite {
+            f: self.f.clone(),
+            path: self.path.clone(),
+            name: name.to_string(),
+            off,
+            written: 0,
+            crc: crc32fast::Hasher::new(),
+            b3: blake3::Hasher::new(),
+        })
+    }
+
+    /// Register the finished member and return the BLAKE3 of its bytes, computed while they were
+    /// written. Visible only after [`Container::commit`], durable only after that commit's
+    /// barrier — finishing a member fsyncs nothing.
+    pub fn finish_member(&mut self, w: MemberWrite) -> Result<[u8; 32]> {
+        if !self.member_open {
+            bail!("container {} has no member write in progress", self.path.display());
+        }
+        self.member_open = false;
+        let digest = *w.b3.finalize().as_bytes();
+        self.stage_entry(&w.name, w.off, w.written, w.crc.finalize());
+        Ok(digest)
+    }
+
+    /// Release an in-progress member write without registering it. Its bytes sit past the last
+    /// committed tail where no directory names them — the container's ordinary uncommitted noise,
+    /// overwritten by whatever stages next.
+    pub fn abandon_member(&mut self, w: MemberWrite) {
+        drop(w);
+        self.abandon_open_member();
+    }
+
+    /// Throw away every staged change and return to the committed state — the in-memory
+    /// equivalent of dropping the handle and reopening. For a failed multi-member staging run (a
+    /// refold stages a whole generation), this is the unwind: the bytes written stay where they
+    /// are as uncommitted noise, and the directory view snaps back to what the superblock says.
+    pub fn discard_staged(&mut self) -> Result<()> {
+        let (dir, free) = read_directory(&self.f, &self.path, &self.sb)?;
+        self.dir = dir;
+        self.free = free;
+        self.tail = self.sb.tail;
+        self.staged = false;
+        self.member_open = false;
+        Ok(())
+    }
+
+    /// [`Container::abandon_member`] for the caller whose handle was consumed by the failure —
+    /// an assembly that errored owns no `MemberWrite` to hand back, only the duty to release
+    /// the tail. Single-writer makes this unambiguous: an open member write is always ours.
+    pub fn abandon_open_member(&mut self) {
+        self.member_open = false;
+    }
+
+    /// Align the staging cursor for a fresh extent. The padding this skips is structural — a
+    /// rewrite would recreate it — so it is deliberately NOT free-listed: `free_bytes` reports
+    /// what a reclaim can return, and alignment padding is not that.
+    fn aligned_start(&mut self) -> u64 {
+        align_up(self.tail)
     }
 
     /// Stage a member from bytes. Visible only after [`Container::commit`].
     pub fn put_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         validate_name(name)?;
-        let off = self.tail;
+        let off = self.aligned_start();
         crate::vfs::write_all_at(&self.f, &self.path, bytes, off)?;
         self.stage_entry(name, off, bytes.len() as u64, crc32fast::hash(bytes));
         Ok(())
@@ -330,8 +560,9 @@ impl Container {
         len: u64,
         mut fill: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
     ) -> Result<()> {
+        self.ensure_writable()?;
         validate_name(name)?;
-        let off = self.tail;
+        let off = self.aligned_start();
         let mut hasher = crc32fast::Hasher::new();
         let mut buf = vec![0u8; (1 << 20).min(len.max(1)) as usize];
         let mut at = 0u64;
@@ -348,10 +579,11 @@ impl Container {
 
     /// Stage a member by streaming a file in. Returns the byte count ingested.
     pub fn ingest(&mut self, name: &str, from: &Path) -> Result<u64> {
+        self.ensure_writable()?;
         validate_name(name)?;
         let mut src =
             File::open(from).with_context(|| format!("ingest source {}", from.display()))?;
-        let off = self.tail;
+        let off = self.aligned_start();
         let mut hasher = crc32fast::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
         let mut written = 0u64;
@@ -368,11 +600,64 @@ impl Container {
         Ok(written)
     }
 
-    /// Stage a removal. The extent is recorded as free but never reused by this handle.
+    /// Extend an existing member, filled a window at a time by `fill(offset_within_delta, into)`.
+    ///
+    /// This is how a member grows across commits without ever being copied: the delta lands at
+    /// the staging cursor and becomes the member's next extent — or, when the member's last extent
+    /// already ends at the cursor, no extent at all, because physically adjacent runs coalesce.
+    /// The member's checksum extends by CRC combination; nothing already written is reread.
+    pub fn append_stream(
+        &mut self,
+        name: &str,
+        len: u64,
+        mut fill: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(m) = self.dir.get(name) else {
+            bail!("container member not found: {name}");
+        };
+        // Coalesce when the member's last extent physically ends at the staging cursor — the
+        // common case of consecutive extensions with nothing staged between them.
+        let coalesce = matches!(m.extents.last(), Some(&(off, l)) if off + l == self.tail);
+        let write_off = if coalesce { self.tail } else { self.aligned_start() };
+
+        let mut delta = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; (1 << 20).min(len) as usize];
+        let mut at = 0u64;
+        while at < len {
+            let take = buf.len().min((len - at) as usize);
+            fill(at, &mut buf[..take])?;
+            crate::vfs::write_all_at(&self.f, &self.path, &buf[..take], write_off + at)?;
+            delta.update(&buf[..take]);
+            at += take as u64;
+        }
+
+        let m = self.dir.get_mut(name).expect("presence checked above");
+        if coalesce {
+            let last = m.extents.last_mut().expect("coalesce implies a last extent");
+            last.1 += len;
+        } else {
+            m.extents.push((write_off, len));
+        }
+        let mut whole = crc32fast::Hasher::new_with_initial_len(m.xsum, m.len);
+        whole.combine(&delta);
+        m.xsum = whole.finalize();
+        m.len += len;
+        self.tail = write_off + len;
+        self.staged = true;
+        Ok(())
+    }
+
+    /// Stage a removal. The member's extents are recorded as free but never reused by this handle.
     pub fn remove(&mut self, name: &str) -> Result<bool> {
+        self.ensure_writable()?;
         match self.dir.remove(name) {
-            Some((off, len, _)) => {
-                self.free.push((off, len));
+            Some(m) => {
+                let freed_seq = self.sb.seq + 1;
+                self.free.extend(m.extents.iter().map(|&(off, len)| (off, len, freed_seq)));
                 self.staged = true;
                 Ok(true)
             }
@@ -381,8 +666,10 @@ impl Container {
     }
 
     fn stage_entry(&mut self, name: &str, off: u64, len: u64, xsum: u32) {
-        if let Some((old_off, old_len, _)) = self.dir.insert(name.to_string(), (off, len, xsum)) {
-            self.free.push((old_off, old_len));
+        let extents = if len == 0 { Vec::new() } else { vec![(off, len)] };
+        if let Some(old) = self.dir.insert(name.to_string(), Member { extents, len, xsum }) {
+            let freed_seq = self.sb.seq + 1;
+            self.free.extend(old.extents.iter().map(|&(o, l)| (o, l, freed_seq)));
         }
         self.tail = off + len;
         self.staged = true;
@@ -395,8 +682,35 @@ impl Container {
     /// read from. A crash before the slot write leaves the previous state entire; a torn slot write
     /// fails its checksum and loses to the previous slot on the next open.
     pub fn commit(&mut self) -> Result<u64> {
+        self.ensure_writable()?;
         if !self.staged {
-            return Ok(self.seq);
+            return Ok(self.sb.seq);
+        }
+        self.commit_with_flags(0)
+    }
+
+    /// Publish and seal in one flip. With staged changes they are committed sealed; without any,
+    /// the new superblock re-points at the committed directory and adds only the flag. Either way
+    /// this handle — and every handle after it — refuses further writes.
+    pub fn commit_sealed(&mut self) -> Result<u64> {
+        self.ensure_writable()?;
+        let seq = if self.staged {
+            self.commit_with_flags(SB_FLAG_SEALED)?
+        } else {
+            // Nothing staged: the committed directory is already durable, so the flip needs no
+            // new directory and no ordering fsync — only the slot write and its barrier.
+            let sb = Superblock { seq: self.sb.seq + 1, flags: SB_FLAG_SEALED, ..self.sb };
+            self.flip(sb)?
+        };
+        self.sealed = true;
+        Ok(seq)
+    }
+
+    fn commit_with_flags(&mut self, flags: u8) -> Result<u64> {
+        // The committed directory is superseded by the one this commit writes; its extent joins
+        // the free list so dead space from past commits stays answerable.
+        if self.sb.dir_stored > 0 {
+            self.free.push((self.sb.dir_off, u64::from(self.sb.dir_stored), self.sb.seq + 1));
         }
         let payload = encode_directory(&self.dir, &self.free);
         let (dir_codec, stored) = crate::fold::codec::encode(&payload, None, 3)?;
@@ -411,7 +725,7 @@ impl Container {
         crate::vfs::sync_file(&self.f, &self.path)?;
 
         let sb = Superblock {
-            seq: self.seq + 1,
+            seq: self.sb.seq + 1,
             dir_off,
             dir_stored: stored.len() as u32,
             dir_raw: payload.len() as u32,
@@ -419,7 +733,14 @@ impl Container {
             dir_xsum: crc32fast::hash(&stored),
             tail,
             dir_codec,
+            version: CONTAINER_VERSION,
+            flags,
         };
+        self.flip(sb)
+    }
+
+    /// Write `sb` into the slot the live state was not read from, make it durable, adopt it.
+    fn flip(&mut self, sb: Superblock) -> Result<u64> {
         let next_slot = 1 - self.slot;
         crate::vfs::write_all_at(
             &self.f,
@@ -428,33 +749,194 @@ impl Container {
             u64::from(next_slot) * SLOT_LEN,
         )?;
         crate::vfs::sync_file(&self.f, &self.path)?;
-
-        self.seq = sb.seq;
-        self.tail = tail;
+        self.sb = sb;
+        self.tail = sb.tail;
         self.slot = next_slot;
         self.staged = false;
-        Ok(self.seq)
+        Ok(sb.seq)
     }
 
-    /// Re-read every member and check it against the checksum recorded for it.
+    /// Deallocate the aligned interior of every free extent old enough that no supported reader
+    /// can still be holding a superblock that names its bytes — `freed_seq + grace <= seq`, with
+    /// the grace window measured in commits, matching the manifest retention window's meaning.
+    ///
+    /// This is physical-only: the free list is already committed state, nothing in the committed
+    /// present references these bytes, and no declaration is needed the way block erasure needs
+    /// one — a reader old enough to resolve into a punched extent reads zeros, fails the member
+    /// or frame checksums above, and reports detected corruption, never silent wrong data. The
+    /// file is fsynced once after the last hole so the destruction is not left pending.
+    ///
+    /// Linux only, exactly as the fold's block punch is; everywhere else the first extent refuses
+    /// with `Unsupported` and a rewrite (`reclaim`) is the road that exists on every platform.
+    pub fn punch_free_extents(&self, grace: u64) -> Result<FreePunchStats> {
+        let mut stats = FreePunchStats::default();
+        let mut punched_any = false;
+        for &(off, len, freed_seq) in &self.free {
+            stats.examined += 1;
+            if freed_seq.saturating_add(grace) > self.sb.seq {
+                stats.deferred_extents += 1;
+                continue;
+            }
+            let lo = align_up(off);
+            let hi = (off + len) / ALIGN * ALIGN;
+            stats.edge_bytes += (lo - off).min(len) + (off + len).saturating_sub(hi.max(lo));
+            if hi <= lo {
+                continue; // smaller than one block: edges only, a rewrite's job
+            }
+            crate::vfs::punch_hole(&self.f, &self.path, lo, hi - lo).with_context(|| {
+                format!(
+                    "punching {} free bytes at {lo} in {}; this filesystem may not support hole                      punching — reclaim (rewrite) instead",
+                    hi - lo,
+                    self.path.display()
+                )
+            })?;
+            stats.punched_extents += 1;
+            stats.punched_bytes += hi - lo;
+            punched_any = true;
+        }
+        if punched_any {
+            crate::vfs::sync_file(&self.f, &self.path)?;
+        }
+        Ok(stats)
+    }
+
+    /// Re-read every member's logical bytes and check them against the checksum recorded for it.
     pub fn verify(&self) -> Result<usize> {
         let mut buf = vec![0u8; 1 << 20];
-        for (name, &(off, len, want)) in &self.dir {
+        for (name, m) in &self.dir {
+            let reader = Extents::new(self.f.clone(), &m.extents);
             let mut hasher = crc32fast::Hasher::new();
             let mut at = 0u64;
-            while at < len {
-                let take = std::cmp::min(buf.len() as u64, len - at) as usize;
-                crate::sys::read_exact_at(&self.f, &mut buf[..take], off + at)?;
+            while at < m.len {
+                let take = std::cmp::min(buf.len() as u64, m.len - at) as usize;
+                crate::readat::ReadAt::read_exact_at(&reader, &mut buf[..take], at)?;
                 hasher.update(&buf[..take]);
                 at += take as u64;
             }
             let got = hasher.finalize();
-            if got != want {
-                bail!("container member {name} fails its checksum: {got:08x} != {want:08x}");
+            if got != m.xsum {
+                bail!("container member {name} fails its checksum: {got:08x} != {:08x}", m.xsum);
             }
         }
         Ok(self.dir.len())
     }
+}
+
+/// One member being staged incrementally: the write position, and the member's checksums
+/// accumulated in the same pass. Created by [`Container::begin_member`], consumed by
+/// [`Container::finish_member`] or [`Container::abandon_member`].
+///
+/// The handle owns no borrow of the container — exclusivity is enforced by the container
+/// refusing every other staging call while one is outstanding — so an artifact builder can hold
+/// it across its whole assembly.
+pub struct MemberWrite {
+    f: Arc<File>,
+    path: PathBuf,
+    name: String,
+    off: u64,
+    written: u64,
+    crc: crc32fast::Hasher,
+    b3: blake3::Hasher,
+}
+
+impl MemberWrite {
+    /// Bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl crate::vfs::ArtifactSink for MemberWrite {
+    fn write_all_at(&mut self, data: &[u8], off: u64) -> std::io::Result<()> {
+        // Sequential by contract: the hashers below are only meaningful if every byte passes
+        // through exactly once, in order.
+        if off != self.written {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "member {} write at {off} but {} bytes are written — sinks are sequential",
+                    self.name, self.written
+                ),
+            ));
+        }
+        crate::vfs::write_all_at(&self.f, &self.path, data, self.off + off)?;
+        self.crc.update(data);
+        self.b3.update(data);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    /// Deliberately a no-op: a member's durability belongs to the container commit that names
+    /// it — the fsync before the superblock flip is the barrier, and an artifact-level fsync here
+    /// would be a second, redundant one per part.
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        format!("member {} of container {}", self.name, self.path.display())
+    }
+}
+
+/// A member read through a writer's own staged view.
+///
+/// The committed directory cannot serve the fold's active segment: the writer reads blocks it
+/// appended moments ago, and those extents exist only in the staged state until the next commit.
+/// This reader resolves the member's extents at every read, under the same lock the writer
+/// stages through — so it always sees exactly what has been appended, and nothing that has not.
+pub struct MemberReader {
+    container: std::sync::Arc<std::sync::Mutex<Container>>,
+    name: String,
+}
+
+impl MemberReader {
+    pub fn new(
+        container: std::sync::Arc<std::sync::Mutex<Container>>,
+        name: String,
+    ) -> MemberReader {
+        MemberReader { container, name }
+    }
+}
+
+impl crate::readat::ReadAt for MemberReader {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        // Resolve under the lock, read outside it: extents are never reused or moved once
+        // staged, and the file handle outlives the lock, so a resolved view stays valid.
+        let reader = {
+            let c = self.container.lock().expect("container lock poisoned");
+            let m = c.dir.get(&self.name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("container member not found: {}", self.name),
+                )
+            })?;
+            Extents::new(c.f.clone(), &m.extents)
+        };
+        crate::readat::ReadAt::read_exact_at(&reader, buf, off)
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        let c = self.container.lock().expect("container lock poisoned");
+        Ok(c.dir.get(&self.name).map(|m| m.len).unwrap_or(0))
+    }
+}
+
+/// What one [`Container::punch_free_extents`] returned in place, and what it left.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FreePunchStats {
+    /// Free extents examined.
+    pub examined: usize,
+    /// Extents whose aligned interior was deallocated this call. Re-punching an already-punched
+    /// extent is indistinguishable from punching it — the filesystem call is idempotent — so a
+    /// second call reports the same extents again rather than pretending to know better.
+    pub punched_extents: usize,
+    /// Bytes deallocated: the sum of aligned interiors.
+    pub punched_bytes: u64,
+    /// Extents younger than the grace window, left untouched for readers that may still hold a
+    /// superblock predating their freeing.
+    pub deferred_extents: usize,
+    /// Bytes stranded at unaligned extent edges — returnable only by a rewrite.
+    pub edge_bytes: u64,
 }
 
 /// What one [`reclaim`] recovered.
@@ -476,7 +958,8 @@ pub struct ReclaimStats {
 /// it, and freed extents are deliberately never reused — a reader that resolved an older
 /// superblock still holds offsets into them, so handing those bytes to a new member would be
 /// silent corruption rather than a detected fault. The cost of that guarantee is that a container
-/// checkpointed daily accumulates dead space forever, and this is the only thing that returns it.
+/// checkpointed daily accumulates dead space forever, and this is the only thing that returns it
+/// whole. Every member comes out a single aligned extent.
 ///
 /// The rewrite is a copy to a fresh file and an atomic rename, not an edit: at no point is the
 /// container being read half-rewritten, and a crash leaves the original untouched. A reader
@@ -484,7 +967,8 @@ pub struct ReclaimStats {
 ///
 /// Refused while a writer's working directory exists beside the file, because that directory holds
 /// state the container has not been told about and rewriting would publish a version of the
-/// container that is about to be superseded by a checkpoint of writes it never saw.
+/// container that is about to be superseded by a checkpoint of writes it never saw. Refused for a
+/// sealed container, whose bytes are final — copy it instead.
 pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     let mut hot = path.as_os_str().to_os_string();
     hot.push(HOT_SUFFIX);
@@ -496,6 +980,9 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     }
 
     let source = Container::open(path)?;
+    if source.sealed() {
+        bail!("container {} is sealed; sealed is final", path.display());
+    }
     let bytes_before = std::fs::metadata(path)?.len();
     if source.free_bytes() == 0 {
         return Ok(ReclaimStats {
@@ -557,30 +1044,33 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn encode_directory(dir: &BTreeMap<String, Entry>, free: &[(u64, u64)]) -> Vec<u8> {
+fn encode_directory(dir: &BTreeMap<String, Member>, free: &[(u64, u64, u64)]) -> Vec<u8> {
     let mut out = Vec::new();
     put_varint(&mut out, dir.len() as u64);
-    for (name, &(off, len, xsum)) in dir {
+    for (name, m) in dir {
         put_varint(&mut out, name.len() as u64);
         out.extend_from_slice(name.as_bytes());
-        put_varint(&mut out, off);
-        put_varint(&mut out, len);
-        out.extend_from_slice(&xsum.to_le_bytes());
+        put_varint(&mut out, m.extents.len() as u64);
+        for &(off, len) in &m.extents {
+            put_varint(&mut out, off);
+            put_varint(&mut out, len);
+        }
+        out.extend_from_slice(&m.xsum.to_le_bytes());
     }
     put_varint(&mut out, free.len() as u64);
-    for &(off, len) in free {
+    for &(off, len, freed_seq) in free {
         put_varint(&mut out, off);
         put_varint(&mut out, len);
+        put_varint(&mut out, freed_seq);
     }
     out
 }
 
-type Directory = (BTreeMap<String, Entry>, Vec<(u64, u64)>);
+type Directory = (BTreeMap<String, Member>, Vec<(u64, u64, u64)>);
 
 fn read_directory(f: &Arc<File>, path: &Path, sb: &Superblock) -> Result<Directory> {
-    let mut dir = BTreeMap::new();
     if sb.n_entries == 0 && sb.dir_stored == 0 {
-        return Ok((dir, Vec::new()));
+        return Ok((BTreeMap::new(), Vec::new()));
     }
     if sb.dir_stored > MAX_DIR_STORED || sb.dir_raw > MAX_DIR_RAW || sb.n_entries > MAX_MEMBERS {
         bail!("container {} declares a directory over the admission ceilings", path.display());
@@ -598,6 +1088,7 @@ fn read_directory(f: &Arc<File>, path: &Path, sb: &Superblock) -> Result<Directo
     let payload = crate::fold::codec::decode(sb.dir_codec, &stored, sb.dir_raw, None)?;
 
     let mut at = 0usize;
+    let mut dir = BTreeMap::new();
     let n = get_varint(&payload, &mut at)?;
     if n != u64::from(sb.n_entries) {
         bail!(
@@ -614,19 +1105,53 @@ fn read_directory(f: &Arc<File>, path: &Path, sb: &Superblock) -> Result<Directo
         )?
         .to_string();
         at = end;
-        let off = get_varint(&payload, &mut at)?;
-        let len = get_varint(&payload, &mut at)?;
-        let xsum_bytes =
-            payload.get(at..at + 4).context("container directory checksum truncated")?;
-        let xsum = u32::from_le_bytes(xsum_bytes.try_into()?);
-        at += 4;
         validate_name(&name)?;
-        // Every member must lie inside the committed region: a directory that points past the
+
+        let m = if sb.version == LEGACY_VERSION {
+            // The legacy revision stores one `(off, len)` pair per member, no extent count.
+            let off = get_varint(&payload, &mut at)?;
+            let len = get_varint(&payload, &mut at)?;
+            let extents = if len == 0 { Vec::new() } else { vec![(off, len)] };
+            let xsum = read_xsum(&payload, &mut at)?;
+            Member { extents, len, xsum }
+        } else {
+            let n_extents = get_varint(&payload, &mut at)?;
+            if n_extents > MAX_MEMBER_EXTENTS {
+                bail!(
+                    "container {} member {name} claims {n_extents} extents, over the ceiling",
+                    path.display()
+                );
+            }
+            let mut extents = Vec::with_capacity(n_extents as usize);
+            let mut len = 0u64;
+            for _ in 0..n_extents {
+                let off = get_varint(&payload, &mut at)?;
+                let ext_len = get_varint(&payload, &mut at)?;
+                if ext_len == 0 {
+                    bail!("container {} member {name} carries an empty extent", path.display());
+                }
+                extents.push((off, ext_len));
+                len = len
+                    .checked_add(ext_len)
+                    .with_context(|| format!("container member {name} length overflows"))?;
+            }
+            let xsum = read_xsum(&payload, &mut at)?;
+            Member { extents, len, xsum }
+        };
+        // Every extent must lie inside the committed region: a directory that points past the
         // tail is corruption, and it must be refused before anything reads through it.
-        if off < REGION_START || off + len > sb.tail {
-            bail!("container {} member {name} lies outside its committed region", path.display());
+        for &(off, len) in &m.extents {
+            let end = off
+                .checked_add(len)
+                .with_context(|| format!("container member {name} extent overflows"))?;
+            if off < REGION_START || end > sb.tail {
+                bail!(
+                    "container {} member {name} lies outside its committed region",
+                    path.display()
+                );
+            }
         }
-        if dir.insert(name.clone(), (off, len, xsum)).is_some() {
+        if dir.insert(name.clone(), m).is_some() {
             bail!("container {} names {name} twice", path.display());
         }
     }
@@ -641,7 +1166,46 @@ fn read_directory(f: &Arc<File>, path: &Path, sb: &Superblock) -> Result<Directo
     for _ in 0..n_free {
         let off = get_varint(&payload, &mut at)?;
         let len = get_varint(&payload, &mut at)?;
-        free.push((off, len));
+        let freed_seq =
+            if sb.version == LEGACY_VERSION { 0 } else { get_varint(&payload, &mut at)? };
+        if freed_seq > sb.seq {
+            bail!(
+                "container {} free extent claims it was freed by commit {freed_seq}, \
+                 which has not happened",
+                path.display()
+            );
+        }
+        let end = off.checked_add(len).context("container free extent overflows")?;
+        if len == 0 || off < REGION_START || end > sb.tail {
+            bail!("container {} free extent lies outside its committed region", path.display());
+        }
+        free.push((off, len, freed_seq));
     }
+
+    // No byte may be claimed twice. Every committed range — member extents, free extents, and the
+    // directory itself — must be disjoint, or a reader can be served bytes that are
+    // simultaneously someone else's. A checksum-valid directory can still lie about this, so it
+    // is validated as meaning, not trusted as bytes.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for m in dir.values() {
+        ranges.extend(m.extents.iter().copied());
+    }
+    ranges.extend(free.iter().map(|&(off, len, _)| (off, len)));
+    ranges.push((sb.dir_off, u64::from(sb.dir_stored)));
+    ranges.sort_unstable();
+    for w in ranges.windows(2) {
+        let (a_off, a_len) = w[0];
+        if a_off + a_len > w[1].0 {
+            bail!("container {} claims overlapping extents", path.display());
+        }
+    }
+
     Ok((dir, free))
+}
+
+fn read_xsum(payload: &[u8], at: &mut usize) -> Result<u32> {
+    let bytes = payload.get(*at..*at + 4).context("container directory checksum truncated")?;
+    let xsum = u32::from_le_bytes(bytes.try_into()?);
+    *at += 4;
+    Ok(xsum)
 }

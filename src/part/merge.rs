@@ -178,6 +178,32 @@ pub(crate) fn merge_opts_with_control_for_operation(
     operation: &'static str,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(PartMeta, MergeStats)> {
+    let sink = crate::part::FilePartSink::create(out)?;
+    let (meta, stats, _sink) = merge_into_with_control_for_operation(
+        sink,
+        out,
+        inputs,
+        level,
+        drop_tombstones,
+        control,
+        operation,
+        read_limits,
+    )?;
+    Ok((meta, stats))
+}
+
+/// The same engine into any sink — how a merged part lands as a member of the live file.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_into_with_control_for_operation<S: crate::vfs::ArtifactSink>(
+    sink: S,
+    spool_base: &Path,
+    inputs: &[Arc<Part>],
+    level: i32,
+    drop_tombstones: bool,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(PartMeta, MergeStats, S)> {
     control.check(operation)?;
     if inputs.is_empty() {
         bail!("merge needs at least one input part");
@@ -267,8 +293,9 @@ pub(crate) fn merge_opts_with_control_for_operation(
     // stored and still worth deduping against — and a record staged but not yet flushed may have
     // matched against an entry that would otherwise stop being referenced here.
     let dict: Vec<(Loc, PieceHash)> = locs.iter().map(|(h, l)| (*l, *h)).collect();
-    let mut b = crate::part::builder::StreamBuilder::new_with_limits(
-        out,
+    let mut b = crate::part::builder::SinkBuilder::over(
+        sink,
+        spool_base,
         level,
         dict,
         content_names.into_iter().collect(),
@@ -288,7 +315,7 @@ pub(crate) fn merge_opts_with_control_for_operation(
         b.push(&id, false, &parts[pi].contents(row)?, &parts[pi].attrs(row)?)?;
     }
     control.check(operation)?;
-    let meta = b.finish(seq_lo, seq_hi)?;
+    let (meta, sink) = b.finish(seq_lo, seq_hi)?;
 
     let stats = MergeStats {
         inputs: parts.len(),
@@ -299,7 +326,7 @@ pub(crate) fn merge_opts_with_control_for_operation(
         tombstones_dropped: tombs_dropped,
         fold_bytes_touched: 0,
     };
-    Ok((meta, stats))
+    Ok((meta, stats, sink))
 }
 
 #[cfg(test)]
