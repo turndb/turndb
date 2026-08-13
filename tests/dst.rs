@@ -1544,7 +1544,7 @@ fn every_single_file_session_crash_keeps_every_acknowledged_write() {
             if !file.exists() {
                 return;
             }
-            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
                 panic!(
                     "crash point {k} {variant:?}: the single-file store refused to reopen: {e:#}"
                 )
@@ -1616,7 +1616,7 @@ fn every_single_file_merge_crash_answers_identically() {
         s.close().unwrap();
     }
     let oracle: BTreeMap<String, Option<Vec<u8>>> = {
-        let mut s = Store::open_file(&file, cfg).unwrap();
+        let s = Store::open_file(&file, cfg).unwrap();
         (0..9usize)
             .map(|i| {
                 let id = format!("m:{i:02}");
@@ -1645,7 +1645,7 @@ fn every_single_file_merge_crash_answers_identically() {
             if !file.exists() {
                 return;
             }
-            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: the merge left a store that refuses: {e:#}")
             });
             for (id, want) in &oracle {
@@ -1718,7 +1718,7 @@ fn every_single_file_erase_crash_answers_honestly() {
             if !file.exists() {
                 return;
             }
-            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: the erase left a store that refuses: {e:#}")
             });
             for (id, body) in &bodies {
@@ -1820,7 +1820,7 @@ fn every_single_file_punch_crash_disturbs_nothing() {
             if !file.exists() {
                 return;
             }
-            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+            let s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: the punch left a store that refuses: {e:#}")
             });
             for (id, want) in &oracle {
