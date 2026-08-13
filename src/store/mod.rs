@@ -2771,10 +2771,22 @@ impl Store {
         if part_cache_bytes < crate::part::cache::BUDGET_MIN {
             bail!("part_cache_bytes must be at least {}", crate::part::cache::BUDGET_MIN);
         }
-        let container = if path.exists() {
-            crate::container::Container::open(path)?
-        } else {
+        let container = if !path.exists() {
             crate::container::Container::create(path)?
+        } else {
+            match crate::container::Container::open(path) {
+                Ok(c) => c,
+                // A crash inside creation leaves a file no longer than the superblock region —
+                // short slots, torn slots, or both dropped entirely — and such a file provably
+                // names no member byte: nothing durable lives below REGION_START. The writer's
+                // create-if-absent contract finishes the birth. One byte longer and the refusal
+                // stands: a mature store with both slots smashed holds someone's members, and
+                // re-birthing it would be data loss wearing recovery's clothes.
+                Err(_) if std::fs::metadata(path)?.len() <= crate::container::REGION_START => {
+                    crate::container::Container::recreate_interrupted(path)?
+                }
+                Err(e) => return Err(e),
+            }
         };
         if container.sealed() {
             bail!("{} is sealed; sealed is final — a writer cannot open it", path.display());

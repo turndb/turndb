@@ -128,6 +128,13 @@ pub(crate) trait ArtifactSink {
     fn describe(&self) -> String;
 }
 
+/// Open an existing file read-write without truncation — the reopen an interrupted creation
+/// needs. Records nothing: opening mutates no state the crash model tracks.
+#[inline]
+pub(crate) fn open_rw(path: &Path) -> Result<File> {
+    std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(path)
+}
+
 #[inline]
 pub(crate) fn create(path: &Path) -> Result<File> {
     let f = File::create(path)?;
