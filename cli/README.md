@@ -30,13 +30,14 @@ source with `cargo install turndb`.
 
 ## Reading a store the library wrote
 
-Every read verb accepts a store directory, a sealed `pack`, or a growable `.turndb` container, and
-tells them apart by magic rather than by extension. A store written by the
+Every read verb accepts a `.turndb` store file — live or sealed, plus the retired version-1
+`pack` — and tells them apart by magic rather than by extension. A store written by the
 [`turndb`](https://www.npmjs.com/package/turndb) wasm package or
 [`@turndb/native`](https://www.npmjs.com/package/@turndb/native) reads here identically — the
-format is one format.
+format is one format. A store directory from an earlier release converts once with
+`turndb convert`.
 
-Operating verbs (`compact`, `refold`, `punch`, `recover`, `erase`) take the writer role and so
-require a store directory.
+Operating verbs (`compact`, `refold`, `punch`, `recover`, `erase`) take the writer role — `flock`
+on the store file.
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

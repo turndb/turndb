@@ -17,10 +17,11 @@ Controlled operations currently include:
 - In-place punching through `punch_unreferenced_with_control`.
 - Generational content rewriting through `refold_with_control`.
 - The read-only planning phase of strong record erasure through `erase_ids_with_control`.
-- Backup packing/verification through `Store::backup_with_control` and
-  `pack::write_with_control`.
-- Validated extraction/publication through `pack::restore_with_control`.
-- Offline candidate validation/publication through `store::recover_manifest_with_control`.
+- Backup sealing/verification through `Store::backup_with_control`; validation of retired pack
+  artifacts through `Pack::open_with_control` and `Pack::verify_with_control`.
+- Member-verified restore publication through `store::restore_file_with_control`.
+- Offline candidate validation/publication through
+  `store::recover_manifest_file_with_limits_and_control`.
 - Store inventory and Node maintenance-space preflight while traversing or settling the
   actor-ordered store cut.
 - Format migration status, preflight, and one-part atomic publication.
@@ -57,12 +58,13 @@ Each operation deliberately interprets interruption according to its publication
   atomic tombstone batch is applied, cancellation is deferred until total merge and refold complete.
   Returning `cancelled` after logical deletion but before physical removal would make a retry mistake
   those ids for previously absent records and falsely report success.
-- **Backup** copies and verifies into a private sibling file. Cancellation removes unpublished
-  staging and leaves the requested artifact absent. The hard link is the final checkpoint; once it
-  exists, TurnDB reports the publication outcome rather than cancellation.
-- **Restore** validates and extracts into a private sibling directory. Cancellation removes staging
-  and leaves the destination absent. The atomic no-replace rename is its final checkpoint.
-- **Manifest recovery** takes the writer lock for every fold generation while it discovers and
+- **Backup** seals and verifies into a private sibling file. Cancellation removes unpublished
+  staging and leaves the requested artifact absent. The no-replace publication is the final
+  checkpoint; once the artifact exists, TurnDB reports the publication outcome rather than
+  cancellation.
+- **Restore** verifies the backup and copies it into a private sibling file. Cancellation removes
+  staging and leaves the destination absent. The atomic no-replace rename is its final checkpoint.
+- **Manifest recovery** takes the writer lock — `flock` on the store file — while it discovers and
   completely validates retained candidates. **That lock excludes a live writer only on Unix**; on
   `wasm32-wasip1` it always succeeds, so recovery is not protected from a concurrent writer and the
   exclusion is the embedder's, exactly as for ordinary writes — see

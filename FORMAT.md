@@ -35,7 +35,7 @@ writer's commit is the container's superblock flip; the ordering argument lives 
 ### Retired layout: the store directory
 
 The first releases laid the same artifacts out as files in a directory. That layout is **retired**:
-`convert` reads it, the transition keeps it compiled, and nothing else should be built on it. Its
+`convert` reads it, and nothing else exists for it — no public writer, no reader, no backup. Its
 description remains normative for what the converter consumes:
 
 ```
@@ -845,12 +845,12 @@ Names are paths, which is the multi-store door: a future pack may carry several 
 name prefixes with no format change — the TOC neither knows nor cares. This revision writes and
 reads single-store packs.
 
-### Unpacking
+### Leaving the pack
 
-Extraction is byte copying — every inner file lands exactly as it was, and the directory opens as
-an ordinary store, writer role available again. The safe restore API verifies all member checksums,
-extracts and opens a staged store, then atomically publishes it with a no-replace rename. Both
-crossings are mechanical; nothing is reinterpreted in either direction.
+Nothing writes packs any more, and nothing unpacks them into directories. The one crossing left
+is **conversion**: every inner file is copied byte-verbatim into a fresh container — built in
+staging, committed, verified, published with a no-replace rename — and the result is an ordinary
+writable single-file store. The crossing is mechanical; nothing is reinterpreted.
 
 ---
 
@@ -888,9 +888,7 @@ A container IS the store's writable form: the writer takes `flock` on the file, 
 fold segments as members past the committed tail, and publishes each flush, merge, refold,
 migration step, or erasure declaration as one superblock flip. Acknowledged-but-unflushed records
 live in the `-wal` sidecar and replay at open; recovery needs no truncate and no unlink, because
-the committed extent lists are the truncation. The retiring checkpoint bridge — a working
-directory beside the file, folded back in on close — is described under
-[the hot directory](#writing-through-the-retiring-hot-directory).
+the committed extent lists are the truncation.
 
 ### Superblock — 4096 bytes, two slots at bytes 0 and 4096
 
@@ -1011,36 +1009,16 @@ deallocated only when every superblock a supported reader could still be holding
 commit that freed it. Version-1 free lists carry no stamp and read as `freed_seq` 0 — freed before
 anything a reader could still hold.
 
-A container consequently only grows, and a checkpoint restages `MANIFEST` whether or not anything
+A container consequently only grows, and every flush restages `MANIFEST` whether or not anything
 else changed — so dead space accumulates with sessions, not with writes. **Reclaim** is the
 operation that returns it whole: every live member copied to a fresh container as one aligned
 extent, committed, verified, and published over the original with an atomic rename. It is a copy
 and a rename rather than an edit, so the container being read is never half-rewritten and a crash
 leaves the original untouched; a reader holding the old file keeps reading it, because the inode
-outlives the name. Reclaim is refused while a writer's working directory exists beside the file —
-that directory holds state the container has not been told about — and refused for a sealed
+outlives the name. Reclaim takes the writer `flock` for the whole rewrite — a live writer would
+keep committing to the renamed-away inode — and is refused while an unsettled `-wal` sidecar
+sits beside the file (acknowledged records only their writer can settle) or for a sealed
 container, whose bytes are final.
-
-### Writing through the retiring hot directory
-
-The first single-file writer was a checkpoint bridge: an ordinary directory store on working state
-beside the file, folded back in on close. It is **retiring** — the native writer above replaces
-it, and the bridge leaves with the bindings' rebase. Until then, a container it wrote is one the
-native writer opens (upgrading the plane's revision on its first commit), and its shape remains:
-
-```
-mystore.turndb        the committed store
-mystore.turndb-hot/   working state while a writer holds it
-```
-
-Exclusion is unchanged — the working directory carries the fold's ordinary advisory lock, and two
-writers of one container contend for it. A checkpoint settles the directory and ingests what
-changed; because parts and rolled segments are immutable and uniquely named, a member already
-present at the same name and length is not rewritten.
-
-**A working directory that outlives its writer is adopted, not rebuilt.** It holds writes the
-container was never told about, so materializing over it would replace acknowledged data with an
-older committed snapshot.
 
 ---
 

@@ -9,7 +9,7 @@ must update both this review and their adversarial tests.
 
 In scope:
 
-- a store directory, retained manifest, or pack whose bytes are malformed or adversarial;
+- a store file, retained manifest member, or pack whose bytes are malformed or adversarial;
 - accidental corruption, torn writes, future-version bytes, decompression bombs, extreme counts and
   lengths, path traversal, symlinks in an offline store supplied for backup, and parser panics;
 - untrusted values crossing the Node or WASI API boundary, including out-of-range integers,
@@ -19,7 +19,7 @@ In scope:
 
 Out of scope:
 
-- an attacker who can write the live store directory concurrently with TurnDB. Writer locking
+- an attacker who can write the live store file concurrently with TurnDB. Writer locking
   coordinates cooperating writers; it is not a sandbox against a malicious filesystem peer, and
   path inspection cannot close arbitrary time-of-check/time-of-use replacement races;
 - authentication or confidentiality of store contents. CRC32 and BLAKE3 detect drift and bind
@@ -162,7 +162,7 @@ enforce the single-writer lock, which is a capability reduction rather than a pa
 
 1. **Concurrent hostile filesystem mutation is not contained.** Canonical backup checks protect an
    offline supplied store but are not an `openat2(RESOLVE_BENEATH)` sandbox. Applications must not
-   grant untrusted writers access to an actively opened store directory. A future hardened Linux
+   grant untrusted writers access to an actively opened store file. A future hardened Linux
    profile may use directory descriptors and no-follow/beneath resolution throughout.
 2. **Dependency and supply-chain review remains external.** Rust/Node lockfiles pin the resolved
    graph and CI builds all feature profiles, but this review did not independently audit DataFusion,
