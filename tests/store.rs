@@ -3343,3 +3343,84 @@ fn a_single_file_store_returns_freed_space_in_place() {
     s.close().unwrap();
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The last three operations learn the single file: verification walks members instead of
+/// files, backup publishes a SEALED container, and recovery promotes a retained member with one
+/// flip — the prune of the abandoned timeline riding the same atomic state.
+#[test]
+fn a_single_file_store_verifies_backs_up_and_recovers() {
+    let root = tmp("single-file-vbr");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("vbr.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body =
+        |seed: u64| -> Vec<u8> { (0..1400).map(|i| ((seed * 37 + i) % 251) as u8).collect() };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for round in 0..2u64 {
+        for i in 0..8u64 {
+            s.put(&format!("v:{}", round * 8 + i), &[Span::Piece(&body(round * 8 + i))], vec![])
+                .unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+
+    // Verification: the chain walk runs over members — links, digests, and every record whole.
+    let v = s.verify().unwrap();
+    assert!(v.chain.retained_manifests >= 2, "{:?}", v.chain);
+    assert!(v.chain.links >= 2, "prev-links and the live==newest check must run: {:?}", v.chain);
+    assert_eq!(v.chain.part_digests, v.chain.retained_manifests * 2 - 1, "{:?}", v.chain);
+    assert_eq!(v.records, 16);
+
+    // Backup: a sealed container, byte-for-byte answerable, refusing writers and replacement.
+    let out = root.join("backup.turndb");
+    let stats = s.backup(&out).unwrap();
+    assert!(stats.files > 3 && stats.bytes > 0, "{stats:?}");
+    let sealed = turndb::container::Container::open(&out).unwrap();
+    assert!(sealed.sealed(), "a backup of a single-file store is a sealed container");
+    assert!(!sealed.names().any(|n| n.starts_with("MANIFEST.")), "no retained log in a snapshot");
+    sealed.verify().unwrap();
+    drop(sealed);
+    let r = turndb::store::open_read_container(&out, cfg).unwrap();
+    for i in 0..16u64 {
+        assert_eq!(r.reconstruct(&format!("v:{i}")).unwrap().unwrap(), body(i));
+    }
+    drop(r);
+    assert!(Store::open_file(&out, cfg).is_err(), "sealed refuses a writer");
+    assert!(s.backup(&out).is_err(), "an existing destination is never replaced");
+    s.close().unwrap();
+
+    // Recovery: damage the MANIFEST member in place; open refuses; promotion is one flip.
+    let (m_off, m_len) = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        let extents = c.member_extents("MANIFEST").unwrap();
+        assert_eq!(extents.len(), 1);
+        extents[0]
+    };
+    let mut bytes = std::fs::read(&ct).unwrap();
+    bytes[m_off as usize + (m_len as usize / 2)] ^= 0xff;
+    std::fs::write(&ct, &bytes).unwrap();
+    assert!(Store::open_file(&ct, cfg).is_err(), "a damaged manifest member must refuse");
+
+    // Healthy stores refuse recovery; this one is not healthy, and the newest retained copy
+    // carries the same commit, so promotion needs no rollback allowance at all.
+    let report =
+        turndb::store::recover_manifest_file(&ct, cfg, turndb::store::RecoveryOptions::default())
+            .unwrap();
+    assert_eq!(report.rollback_commits, 0, "{report:?}");
+    assert_eq!(report.records, 16, "{report:?}");
+
+    let s = Store::open_file(&ct, cfg).unwrap();
+    for i in 0..16u64 {
+        assert_eq!(s.reconstruct(&format!("v:{i}")).unwrap().unwrap(), body(i));
+    }
+    // And now that it is healthy, recovery refuses to touch it.
+    drop(s);
+    let err =
+        turndb::store::recover_manifest_file(&ct, cfg, turndb::store::RecoveryOptions::default())
+            .map(|_| ())
+            .unwrap_err();
+    assert!(err.to_string().contains("healthy"), "got: {err:#}");
+    std::fs::remove_dir_all(&root).ok();
+}

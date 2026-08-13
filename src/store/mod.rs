@@ -1478,6 +1478,119 @@ pub fn verify_chain_with_limits_and_control(
     Ok(report)
 }
 
+/// Copy a single-file store's committed snapshot into a fresh, SEALED container at `out`.
+///
+/// What a pack carries, in the pack's spirit: `MANIFEST`, every part it names, and the live
+/// generation's members — no retained log (snapshots of an immutable artifact are meaningless),
+/// no writer state. Staged beside the destination, committed sealed, verified member by member,
+/// then published with a rename that refuses to replace. A crash leaves staging litter and an
+/// untouched destination.
+fn seal_container_copy(
+    container: &std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
+    manifest: &Manifest,
+    out: &Path,
+    control: &crate::control::OperationControl,
+) -> Result<crate::pack::BackupStats> {
+    let mut staging = out.as_os_str().to_os_string();
+    staging.push(".sealing");
+    let staging = PathBuf::from(staging);
+    let _ = crate::vfs::unlink(&staging);
+    let mut fresh = crate::container::Container::create(&staging)?;
+
+    let c = container.lock().expect("container lock poisoned");
+    let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
+    let mut names: Vec<String> = vec!["MANIFEST".to_string()];
+    names.extend(manifest.parts.iter().map(|p| p.file.clone()));
+    let mut fold_members: Vec<String> =
+        c.names().filter(|n| n.starts_with(&format!("{prefix}/"))).map(String::from).collect();
+    fold_members.sort();
+    names.extend(fold_members);
+
+    let mut bytes = 0u64;
+    for name in &names {
+        control.check("backup")?;
+        let reader = c.extent(name).ok_or_else(|| {
+            anyhow::anyhow!("the committed snapshot names {name} but the container lost it")
+        })?;
+        let len = crate::readat::ReadAt::len(&reader)?;
+        fresh.put_stream(name, len, |at, into| {
+            crate::control::OperationControl::check(control, "backup")
+                .map_err(std::io::Error::other)?;
+            crate::readat::ReadAt::read_exact_at(&reader, into, at)
+        })?;
+        bytes += len;
+    }
+    drop(c);
+    control.check("backup")?;
+    fresh.commit_sealed()?;
+    fresh.verify()?;
+    drop(fresh);
+    crate::vfs::rename_noreplace(&staging, out)?;
+    if let Some(parent) = out.parent() {
+        let _ = crate::vfs::sync_dir(parent);
+    }
+    Ok(crate::pack::BackupStats { files: names.len(), bytes, commit: manifest.commit })
+}
+
+/// [`verify_chain`] over a single-file store's members: the same walk, the same claims, with
+/// files replaced by members and no filesystem between the evidence and the check.
+fn verify_chain_container(
+    c: &crate::container::Container,
+    control: &crate::control::OperationControl,
+) -> Result<ChainReport> {
+    let mut report = ChainReport::default();
+    let commits = container_retained_commits(c);
+    report.retained_manifests = commits.len();
+    let mut prev_bytes: Option<Vec<u8>> = None;
+    for &commit in &commits {
+        control.check("manifest verification")?;
+        let bytes = c.read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)?;
+        let m = Manifest::parse(&bytes)
+            .with_context(|| format!("retained manifest {commit} is corrupt"))?;
+        if let (Some(want), Some(pb)) = (&m.prev, &prev_bytes) {
+            let got = blake3::hash(pb).to_hex().to_string();
+            if *want != got {
+                bail!(
+                    "manifest chain broken: commit {commit} names prev {want} but the previous \
+                     retained commit hashes to {got}"
+                );
+            }
+            report.links += 1;
+        }
+        for p in &m.parts {
+            control.check("manifest verification")?;
+            match &p.b3 {
+                Some(want) => {
+                    let reader = c.extent(&p.file).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "part {} named by commit {commit} is not held by the container",
+                            p.file
+                        )
+                    })?;
+                    let got = hash_reader_with_control(&reader, control, "manifest verification")
+                        .with_context(|| format!("part {} named by commit {commit}", p.file))?
+                        .to_hex()
+                        .to_string();
+                    if *want != got {
+                        bail!("part {} drifted from the digest commit {commit} pinned", p.file);
+                    }
+                    report.part_digests += 1;
+                }
+                None => report.undigested += 1,
+            }
+        }
+        prev_bytes = Some(bytes);
+    }
+    if let (Some(&newest), Some(pb)) = (commits.last(), &prev_bytes) {
+        let live = c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
+        if live != *pb {
+            bail!("MANIFEST diverges from its retained copy at commit {newest}");
+        }
+        report.links += 1;
+    }
+    Ok(report)
+}
+
 fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
     result.map_err(|error| {
         if crate::error::classify(&error) == crate::error::ErrorClass::Internal {
@@ -1664,6 +1777,121 @@ pub fn recover_manifest_with_limits_and_control(
     Err(RecoveryError::NoUsableCandidate { examined, reason: last_reason }.into())
 }
 
+/// [`recover_manifest`] for a single-file store: writer role by `flock` on the file itself, a
+/// healthy refusal by the same rule, candidates validated whole at their exact tails, and
+/// promotion as ONE flip that restages `MANIFEST` verbatim and removes the abandoned newer
+/// retained members in the same atomic state. The directory protocol's prune-before-promote
+/// ordering — two durable steps a crash could land between — has nothing to order here.
+pub fn recover_manifest_file(
+    path: &Path,
+    cfg: FoldCfg,
+    options: RecoveryOptions,
+) -> Result<RecoveryReport> {
+    recover_manifest_file_with_limits_and_control(
+        path,
+        cfg,
+        options,
+        ReadLimits::default(),
+        &crate::control::OperationControl::default(),
+    )
+}
+
+/// [`recover_manifest_file`] with explicit admission and cooperative cancellation; the last
+/// checkpoint is immediately before the publishing flip.
+pub fn recover_manifest_file_with_limits_and_control(
+    path: &Path,
+    cfg: FoldCfg,
+    options: RecoveryOptions,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<RecoveryReport> {
+    let read_limits = read_limits.validate()?;
+    control.check("manifest recovery")?;
+    let mut container = crate::container::Container::open(path)?;
+    if container.sealed() {
+        bail!(
+            "{} is sealed; sealed is final — recovery mutates, so recover a copy instead",
+            path.display()
+        );
+    }
+    container.lock_writer()?;
+    control.check("manifest recovery")?;
+    if container
+        .read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)
+        .ok()
+        .and_then(|b| Manifest::parse(&b).ok())
+        .is_some()
+    {
+        return Err(RecoveryError::Healthy(path.to_path_buf()).into());
+    }
+    let commits = container_retained_commits(&container);
+    let newest = commits.last().copied().unwrap_or(0);
+    let mut examined = 0usize;
+    let mut last_reason = "no retained manifests exist".to_string();
+    for c in commits.into_iter().rev() {
+        control.check("manifest recovery validation")?;
+        examined += 1;
+        let bytes =
+            match container.read_file_bounded(&format!("MANIFEST.{c:08}"), MAX_MANIFEST_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    last_reason = error.to_string();
+                    continue;
+                }
+            };
+        let manifest = match Manifest::parse(&bytes) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                last_reason = error.to_string();
+                continue;
+            }
+        };
+        match validate_recovery_candidate_container(
+            &container,
+            path,
+            cfg,
+            manifest,
+            read_limits,
+            control,
+        ) {
+            Ok(mut report) => {
+                let rollback_commits = newest.saturating_sub(c);
+                if rollback_commits > options.max_rollback_commits {
+                    return Err(RecoveryError::RollbackLimit {
+                        needed: rollback_commits,
+                        allowed: options.max_rollback_commits,
+                    }
+                    .into());
+                }
+                // No cancellation checkpoint after this point: promotion is one flip, and its
+                // actual outcome must be reported.
+                control.check("manifest recovery publication")?;
+                container.put_bytes("MANIFEST", &bytes)?;
+                for newer in container_retained_commits(&container) {
+                    if newer > c {
+                        let _ = container.remove(&format!("MANIFEST.{newer:08}"));
+                    }
+                }
+                container.commit()?;
+                report.commit = c;
+                report.rollback_commits = rollback_commits;
+                return Ok(report);
+            }
+            Err(error) => {
+                if matches!(
+                    crate::error::classify(&error),
+                    crate::error::ErrorClass::Cancelled
+                        | crate::error::ErrorClass::ResourceExhausted
+                ) {
+                    return Err(error);
+                }
+                last_reason = error.to_string();
+            }
+        }
+    }
+    Err(RecoveryError::NoUsableCandidate { examined, reason: last_reason }.into())
+}
+
 fn recovery_locks(
     dir: &Path,
     read_limits: ReadLimits,
@@ -1733,6 +1961,25 @@ fn validate_recovery_candidate(
         parts.push(part);
     }
     let reader = ReadStore { fold: Arc::new(fold), parts, manifest, read_limits };
+    let (records, content_values) = validate_candidate_records(&reader, control)?;
+    Ok(RecoveryReport {
+        records,
+        content_values,
+        parts: reader.parts.len(),
+        part_sections,
+        fold_segments: scrub.segments,
+        fold_blocks: scrub.blocks,
+        fold_bytes: scrub.bytes,
+        ..RecoveryReport::default()
+    })
+}
+
+/// The home-neutral half of candidate validation: every visible record's every content value
+/// reconstructed piece by piece, lengths checked, whole-value identities checked where carried.
+fn validate_candidate_records(
+    reader: &ReadStore,
+    control: &crate::control::OperationControl,
+) -> Result<(usize, usize)> {
     let ids = reader.ids()?;
     let mut content_values = 0usize;
     for id in &ids {
@@ -1783,8 +2030,102 @@ fn validate_recovery_candidate(
             content_values += 1;
         }
     }
+    Ok((ids.len(), content_values))
+}
+
+/// [`validate_recovery_candidate`] for a candidate held as members: the fold opens over extent
+/// readers bounded to the candidate's EXACT tail — the active segment sliced to `fold_off`,
+/// segments above it excluded entirely — so validation sees precisely the fold the candidate
+/// committed, not whatever later commits appended to the same members.
+fn validate_recovery_candidate_container(
+    c: &crate::container::Container,
+    path: &Path,
+    cfg: FoldCfg,
+    manifest: Manifest,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<RecoveryReport> {
+    control.check("manifest recovery validation")?;
+    let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
+    let tail = manifest.fold_tail();
+    let mut segs = Vec::new();
+    let mut dict_files = Vec::new();
+    for name in c.names().map(String::from).collect::<Vec<_>>() {
+        let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else { continue };
+        if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            let extent = c.extent(&name).expect("name came from this container");
+            let full_len = crate::readat::ReadAt::len(&extent)?;
+            let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
+                Some(t) if n > t.seg => continue,
+                Some(t) if n == t.seg => (
+                    Arc::new(crate::readat::Slice::new(extent, 0, u64::from(t.off))),
+                    u64::from(t.off),
+                    u64::from(t.off) == full_len,
+                ),
+                _ => (Arc::new(extent), full_len, true),
+            };
+            segs.push(crate::fold::SegmentInput {
+                seg: n,
+                reader,
+                // A sidecar describes a segment's full length; for a candidate-bounded segment
+                // it would fail its own staleness gate, so it is only offered when whole.
+                sidecar: if whole {
+                    c.read_file_bounded(
+                        &format!("{prefix}/seg-{n:08}.dir"),
+                        crate::fold::segment::max_dir_sidecar_bytes(len)
+                            .min(read_limits.max_stored_frame_bytes),
+                    )
+                    .ok()
+                } else {
+                    None
+                },
+            });
+        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
+            dict_files.push(c.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        }
+    }
+    let fold = Fold::open_read_from_with_limits(
+        segs,
+        dict_files,
+        cfg,
+        path,
+        &manifest.punched,
+        read_limits,
+    )?;
+    let scrub = fold.scrub_with_control(control)?;
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    let mut part_sections = 0usize;
+    for part_ref in &manifest.parts {
+        control.check("manifest recovery validation")?;
+        let reader = c.extent(&part_ref.file).ok_or_else(|| {
+            anyhow::anyhow!(
+                "candidate commit {} names part {} but the container does not hold it",
+                manifest.commit,
+                part_ref.file
+            )
+        })?;
+        if let Some(want) = &part_ref.b3 {
+            let got = hash_reader_with_control(&reader, control, "manifest recovery validation")?
+                .to_hex()
+                .to_string();
+            if &got != want {
+                bail!(
+                    "candidate commit {} names part {} with the wrong digest",
+                    manifest.commit,
+                    part_ref.file
+                );
+            }
+        }
+        let part =
+            Arc::new(Part::open_reader_with_limits(Box::new(reader), pcache.clone(), read_limits)?);
+        part_sections += part.verify_sections_with_control(control)?;
+        parts.push(part);
+    }
+    let reader = ReadStore { fold: Arc::new(fold), parts, manifest, read_limits };
+    let (records, content_values) = validate_candidate_records(&reader, control)?;
     Ok(RecoveryReport {
-        records: ids.len(),
+        records,
         content_values,
         parts: reader.parts.len(),
         part_sections,
@@ -1793,6 +2134,26 @@ fn validate_recovery_candidate(
         fold_bytes: scrub.bytes,
         ..RecoveryReport::default()
     })
+}
+
+/// [`hash_file_with_control`] for bytes that live behind a reader — a member of the live file.
+fn hash_reader_with_control(
+    reader: &dyn crate::readat::ReadAt,
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+) -> Result<blake3::Hash> {
+    let len = reader.len()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    while at < len {
+        control.check(operation)?;
+        let take = buf.len().min((len - at) as usize);
+        reader.read_exact_at(&mut buf[..take], at)?;
+        hasher.update(&buf[..take]);
+        at += take as u64;
+    }
+    Ok(hasher.finalize())
 }
 
 fn hash_file_with_control(
@@ -2711,7 +3072,15 @@ impl Store {
         control.check("store verification")?;
         let chain = verification_integrity(
             "verify retained manifest chain",
-            verify_chain_with_limits_and_control(self.home.dir()?, self.read_limits, control),
+            match &self.home {
+                Home::Dir(dir) => {
+                    verify_chain_with_limits_and_control(dir, self.read_limits, control)
+                }
+                Home::File { container, .. } => {
+                    let c = container.lock().expect("container lock poisoned");
+                    verify_chain_container(&c, control)
+                }
+            },
         )?;
         let fold =
             verification_integrity("verify fold frames", self.fold.scrub_with_control(control))?;
@@ -3427,6 +3796,12 @@ impl Store {
         self.sync_with_control(control)?;
         self.flush_with_control(control)?;
         control.check("backup")?;
+        if let Home::File { container, .. } = &self.home {
+            // A backup of a single-file store IS a sealed container: the members a pack would
+            // carry — MANIFEST, the live parts, the live generation — one aligned extent each,
+            // flagged final, verified whole, and published only with a no-replace rename.
+            return seal_container_copy(container, &self.manifest, out, control);
+        }
         let stats = crate::pack::write_committed_with_control(
             self.home.dir()?,
             out,
