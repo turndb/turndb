@@ -30,13 +30,45 @@ The phases are gates, not dates, and the order is forced by dependencies:
    re-proving twice.
 2. The **proof** comes second, because the offline runs on public datasets already happened — what's
    missing is the reproducible, published form, and it should measure the layout we're keeping.
-3. The **browser** comes third, because it reads what phases 1–2 produced, and because its remote
-   read pattern (range requests against a CDN) must inform container layout decisions *before* those
-   calcify — which is why Phase 1 carries a read-locality deliverable on the browser's behalf.
+3. The **interfaces** come third, split in two. First the SDK baseline — one capability
+   contract, one serializable query contract, one trace-mapping spec, each binding a thin shell
+   over them, Node ahead of Python because CommandSuite is the first production consumer. Then
+   the **browser**, which is deliberately not a new API: the same contract over one more
+   transport, reading what phases 1–2 produced. Its remote read pattern (range requests against
+   a CDN) must still inform container layout *before* it calcifies — which is why Phase 1
+   carries a read-locality deliverable on the browser's behalf.
 4. The **trace vocabulary** and the **server** close the loop: raw logs in at one end, a shareable
    queryable file at the other.
 
 Work may overlap; gates may not be reordered.
+
+## The entrances
+
+The product has several entrances, and they serve different people. The CLI is the **operator's
+porch** — evaluate, inspect, seal, recover; "point turndb at your traces and measure" lives
+there. The viewer is the **reader's porch**: a link someone opens. The server is the
+**deployment's porch**. The entrance that decides adoption is none of these: it is the **SDKs** —
+npm install, pip install, open a path, write — the way SQLite is adopted, by being everywhere and
+boring to integrate. Node leads because CommandSuite, the first production consumer, is
+TypeScript; Python follows because the agent ecosystem's center of gravity lives there. Neither
+may grow a bespoke surface. Every binding is a thin shell over one baseline:
+
+* one **capability contract** — what every Tier-1 binding exposes: open/put/sync/flush,
+  structured scan, content reads, seal, maintenance, typed error classes, explicit capability
+  reporting where a platform gives something up;
+* one **query contract, serializable as data** — the structured scan request and its Arrow IPC
+  and row results, the same shape in-process, over N-API, over wasm, over HTTP. SQL stays an
+  optional lens where DataFusion fits, never the hot-path contract;
+* one **trace-mapping spec** — the gen_ai/agent-activity mapping defined once, implemented by
+  every tracer and importer rather than reinvented per language.
+
+Two tiers per language. **Tier 1 is the store API** — explicit records, explicit durability, for
+people building trace systems. **Tier 2 is the market's expected motion — wrap or export**: an
+OpenTelemetry span exporter that writes a `.turndb` file, thin client wrappers, and cadence
+policy. A tracer cannot ask its host to call flush, so batching and flush policy live in Tier 2,
+never in the engine: the engine's explicitness is its honesty; the SDK's policy is its
+ergonomics. The pitch this tier carries against the incumbents is the file itself — they need a
+server and an account; this is two lines and a local file with the collapse ratios on the label.
 
 Release machinery changes only when a phase demands it — new artifacts, new SDK packaging, a
 renamed surface — never as its own workstream. The full freeze is a 1.0 property, not a today
@@ -169,7 +201,30 @@ finished.
 A stranger clones the repository and reproduces every published table within stated tolerance
 without asking us anything. The README carries no number the harness cannot regenerate.
 
-## Phase 3: the browser — query a `.turndb` anywhere
+## Phase 3a: the SDK baseline
+
+The contracts above, written down and enforced, then the bindings rebased onto them.
+
+### Deliverables
+
+- The capability contract and the query contract as documents with conformance tests — the
+  three-path differential gate extended to run per binding, so a binding cannot drift from the
+  engine's answers.
+- The Node binding rebased onto the single-file store: `open_file` semantics, seal, the space
+  operations, the query contract as its query surface. CommandSuite-ready, and CommandSuite is
+  the gate's consumer.
+- Python Tier 1: a PyO3 binding on the actor discipline the Node binding proved, same contract,
+  same conformance suite.
+- Tier 2 for both: the OTel span exporter writing `.turndb`, thin client wrappers, cadence
+  policy, all implementing the one trace-mapping spec.
+
+### Maturity gate
+
+CommandSuite writes and reads production traffic through the Node package with no reach into
+engine internals. A Python agent traces itself into a local file with two lines. Both speak the
+same query contract the browser and server will.
+
+## Phase 3b: the browser — query a `.turndb` anywhere
 
 The dream, stated plainly: a precompiled HTML page, served from any static host or CDN, that opens a
 `.turndb` file — dragged in, picked from disk, or fetched by URL with range requests — and lets the
@@ -211,8 +266,10 @@ local file with no network at all.
 ## Phase 4: the trace vocabulary — one-stop shop
 
 `examples/genai_dogfood.rs` is the working mapping and stays the reference for *why*; this phase
-makes the mapping a supported surface rather than an example. The format learns nothing; the
-adapter layer and the viewer learn everything.
+makes the mapping a supported surface rather than an example. The live motion — tracers and
+exporters — landed with Phase 3a on the shared mapping spec; this phase completes the vocabulary
+around it: importers for the logs that already exist, the canned queries, and the viewer's
+rendering of them. The format learns nothing; the adapter layer and the viewer learn everything.
 
 ### Deliverables
 
