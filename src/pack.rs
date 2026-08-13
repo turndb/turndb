@@ -323,6 +323,9 @@ impl Pack {
 /// [the writer lock](https://github.com/turndb/turndb/blob/main/FORMAT.md#the-writer-lock), which is
 /// normative. The completed temporary artifact is fully verified, then hard-linked under the final
 /// name. That publication is atomic and refuses an existing destination.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn write(dir: &Path, out: &Path) -> Result<PackStats> {
     write_with_control(dir, out, &crate::control::OperationControl::default())
 }
@@ -480,11 +483,17 @@ pub(crate) fn write_committed_with_control(
 /// ordinary store, writer role available again. This is the safe restore operation: it verifies
 /// the complete pack first, stages and validates the store beside the destination, then atomically
 /// publishes it without replacing any existing filesystem object.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn unpack(pack_path: &Path, out_dir: &Path) -> Result<usize> {
     Ok(restore(pack_path, out_dir)?.files)
 }
 
 /// Restore a verified pack to a new ordinary store directory.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn restore(pack_path: &Path, out_dir: &Path) -> Result<RestoreStats> {
     restore_with_control(pack_path, out_dir, &crate::control::OperationControl::default())
 }

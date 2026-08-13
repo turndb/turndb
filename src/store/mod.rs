@@ -946,6 +946,9 @@ fn count_directory_entries(
 }
 
 /// The snapshot commits currently available to [`Store::open_read_at`], ascending.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn retained_commits(dir: &Path) -> Result<Vec<u64>> {
     list_retained(dir)
 }
@@ -1296,6 +1299,9 @@ pub fn open_read_file_with_limits(
 ///
 /// The source must be quiescent — a non-empty WAL means writes exist that no manifest names yet,
 /// exactly the condition [`crate::pack::write`] refuses for the same reason.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn checkpoint_into_container(dir: &Path, out: &Path) -> Result<CheckpointStats> {
     let wal = dir.join("WAL");
     if wal.metadata().map(|m| m.len()).unwrap_or(0) != 0 {
@@ -1526,6 +1532,9 @@ pub struct StoreVerification {
 /// manifest restored out of order, a file replaced wholesale. Each of those is internally
 /// consistent and only the chain notices. Verifiable across the retained window; silent about
 /// commits whose bytes have been pruned.
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn verify_chain(dir: &Path) -> Result<ChainReport> {
     verify_chain_with_control(dir, &crate::control::OperationControl::default())
 }
@@ -1806,6 +1815,9 @@ impl std::error::Error for RecoveryError {}
 /// recovery can promote a manifest underneath one. There the exclusion is the embedder's to provide
 /// for recovery exactly as for ordinary writes — see
 /// [the writer lock](https://github.com/turndb/turndb/blob/main/FORMAT.md#the-writer-lock).
+/// **Retired layout.** Exists for the transition and the converter; new integrations use the
+/// single-file forms. Leaves with the bindings' rebase onto the single-file store.
+#[doc(hidden)]
 pub fn recover_manifest(
     dir: &Path,
     cfg: FoldCfg,
@@ -2708,11 +2720,19 @@ impl Store {
     /// enforced at all** — WASI has no advisory locking, so the lock file is created and gates
     /// nothing, and the single-writer invariant becomes the embedder's: at most one open writer per
     /// store directory, across every process and every instance. See `src/sys.rs` and FORMAT.md.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
         Self::open_with_options(dir, StoreOptions { fold: cfg, ..StoreOptions::default() })
     }
 
     /// Open a writer with explicit runtime admission policy.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open_with_limits(dir: &Path, cfg: FoldCfg, write_limits: WriteLimits) -> Result<Store> {
         Self::open_with_options(
             dir,
@@ -2721,6 +2741,10 @@ impl Store {
     }
 
     /// Open a writer with explicit storage, cache, and admission configuration.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
         Self::open_over(dir, options, None)
     }
@@ -3536,11 +3560,19 @@ impl Store {
     /// Sees exactly the committed manifest — uncommitted records in some writer's memtable are
     /// invisible, which is the correct snapshot. Safe alongside a live writer because parts are
     /// immutable and the fold is append-only.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open_read(dir: &Path, cfg: FoldCfg) -> Result<ReadStore> {
         Self::open_read_with_limits(dir, cfg, ReadLimits::default())
     }
 
     /// Open the published snapshot with explicit frame and object-count admission.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open_read_with_limits(
         dir: &Path,
         cfg: FoldCfg,
@@ -3639,11 +3671,19 @@ impl Store {
     /// can be superseded while opening them, but a retained snapshot's files are pinned on disk by
     /// its manifest, and the one way they vanish is the window advancing past it — a real error,
     /// reported as one.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open_read_at(dir: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
         Self::open_read_at_with_limits(dir, cfg, commit, ReadLimits::default())
     }
 
     /// Open a retained snapshot with explicit frame and object-count admission.
+    /// **Retired layout.** The directory store is the layout `convert` reads and the transition
+    /// keeps compiled; new integrations open a `.turndb` file. This surface leaves with the
+    /// bindings' rebase onto the single-file store.
+    #[doc(hidden)]
     pub fn open_read_at_with_limits(
         dir: &Path,
         cfg: FoldCfg,
