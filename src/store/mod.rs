@@ -4563,10 +4563,41 @@ impl Store {
         let live_files: HashSet<&str> =
             self.manifest.parts.iter().map(|part| part.file.as_str()).collect();
         let mut retained_seen = HashSet::new();
-        for commit in list_retained_with_limits(self.home.dir()?, self.read_limits)? {
-            control.check("format migration status")?;
-            let manifest = load_retained(self.home.dir()?, commit)
-                .with_context(|| format!("inspect migration state at retained commit {commit}"))?;
+        let retained_manifests: Vec<(u64, Manifest)> = match &self.home {
+            Home::Dir(dir) => {
+                let mut v = Vec::new();
+                for commit in list_retained_with_limits(dir, self.read_limits)? {
+                    control.check("format migration status")?;
+                    v.push((
+                        commit,
+                        load_retained(dir, commit).with_context(|| {
+                            format!("inspect migration state at retained commit {commit}")
+                        })?,
+                    ));
+                }
+                v
+            }
+            Home::File { container, .. } => {
+                let c = container.lock().expect("container lock poisoned");
+                let mut v = Vec::new();
+                for commit in container_retained_commits(&c) {
+                    control.check("format migration status")?;
+                    let bytes = c
+                        .read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)
+                        .with_context(|| {
+                            format!("inspect migration state at retained commit {commit}")
+                        })?;
+                    v.push((
+                        commit,
+                        Manifest::parse(&bytes).with_context(|| {
+                            format!("inspect migration state at retained commit {commit}")
+                        })?,
+                    ));
+                }
+                v
+            }
+        };
+        for (_, manifest) in retained_manifests {
             for part_ref in manifest.parts {
                 control.check("format migration status")?;
                 if live_files.contains(part_ref.file.as_str())
@@ -4574,8 +4605,30 @@ impl Store {
                 {
                     continue;
                 }
-                let path = self.home.dir()?.join(&part_ref.file);
-                let part = Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
+                let part = match &self.home {
+                    Home::Dir(dir) => Part::open_in_with_limits(
+                        &dir.join(&part_ref.file),
+                        self.pcache.clone(),
+                        self.read_limits,
+                    )?,
+                    Home::File { container, .. } => {
+                        let reader = container
+                            .lock()
+                            .expect("container lock poisoned")
+                            .extent(&part_ref.file)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "retained manifest names {} but the container does not hold it",
+                                    part_ref.file
+                                )
+                            })?;
+                        Part::open_reader_with_limits(
+                            Box::new(reader),
+                            self.pcache.clone(),
+                            self.read_limits,
+                        )?
+                    }
+                };
                 if part.format_version() == crate::part::PART_VERSION {
                     continue;
                 }
@@ -4589,7 +4642,7 @@ impl Store {
                     .ok_or_else(|| anyhow::anyhow!("retained legacy row count overflow"))?;
                 status.retained_legacy_bytes = status
                     .retained_legacy_bytes
-                    .checked_add(std::fs::metadata(path)?.len())
+                    .checked_add(self.part_file_bytes(&part_ref.file)?)
                     .ok_or_else(|| anyhow::anyhow!("retained legacy byte count overflow"))?;
             }
         }
@@ -4706,43 +4759,95 @@ impl Store {
             plan.seq_lo,
             plan.seq_hi
         );
-        let path = self.home.dir()?.join(&file);
-        if path.exists() {
-            bail!("format migration staging path already exists: {}", path.display());
-        }
-        let (meta, rewrite) = match crate::part::merge::merge_opts_with_control_for_operation(
-            &path,
-            &[input],
-            self.cfg.level,
-            false,
-            control,
-            "format migration",
-            self.read_limits,
-        ) {
-            Ok(built) => built,
-            Err(error) => {
-                let _ = crate::vfs::unlink(&path);
-                return Err(error);
+        let (meta, rewrite, digest, opened) = match &self.home {
+            Home::Dir(dir) => {
+                let path = dir.join(&file);
+                if path.exists() {
+                    bail!("format migration staging path already exists: {}", path.display());
+                }
+                let (meta, rewrite) =
+                    match crate::part::merge::merge_opts_with_control_for_operation(
+                        &path,
+                        &[input],
+                        self.cfg.level,
+                        false,
+                        control,
+                        "format migration",
+                        self.read_limits,
+                    ) {
+                        Ok(built) => built,
+                        Err(error) => {
+                            let _ = crate::vfs::unlink(&path);
+                            return Err(error);
+                        }
+                    };
+                let digest = match hash_file_with_control(&path, control, "format migration") {
+                    Ok(hash) => hash.to_hex().to_string(),
+                    Err(error) => {
+                        let _ = crate::vfs::unlink(&path);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = control.check("format migration publication") {
+                    let _ = crate::vfs::unlink(&path);
+                    return Err(error.into());
+                }
+                let opened =
+                    Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
+                (meta, rewrite, digest, opened)
+            }
+            Home::File { container, path } => {
+                // One live legacy part rewritten into a member and spliced with one flip — the
+                // merge's placement discipline, applied to the migration's one-part rewrite.
+                if container.lock().expect("container lock poisoned").contains(&file) {
+                    bail!("format migration staging member already exists: {file}");
+                }
+                let tmp = file_tmp_dir(path);
+                crate::vfs::mkdir_all(&tmp)?;
+                let member =
+                    container.lock().expect("container lock poisoned").begin_member(&file)?;
+                let built = crate::part::merge::merge_into_with_control_for_operation(
+                    member,
+                    &tmp.join("m"),
+                    &[input],
+                    self.cfg.level,
+                    false,
+                    control,
+                    "format migration",
+                    self.read_limits,
+                );
+                let (meta, rewrite, member) = match built {
+                    Ok(v) => v,
+                    Err(error) => {
+                        container.lock().expect("container lock poisoned").abandon_open_member();
+                        let _ = crate::vfs::remove_tree(&tmp);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = control.check("format migration publication") {
+                    container.lock().expect("container lock poisoned").abandon_open_member();
+                    let _ = crate::vfs::remove_tree(&tmp);
+                    return Err(error.into());
+                }
+                let digest = {
+                    let mut c = container.lock().expect("container lock poisoned");
+                    PieceHash(c.finish_member(member)?).to_hex()
+                };
+                let _ = crate::vfs::remove_tree(&tmp);
+                let reader = container
+                    .lock()
+                    .expect("container lock poisoned")
+                    .extent(&file)
+                    .expect("the member was staged a moment ago");
+                let opened = Part::open_reader_with_limits(
+                    Box::new(reader),
+                    self.pcache.clone(),
+                    self.read_limits,
+                )?;
+                (meta, rewrite, digest, opened)
             }
         };
-        let digest = match hash_file_with_control(&path, control, "format migration") {
-            Ok(hash) => hash.to_hex().to_string(),
-            Err(error) => {
-                let _ = crate::vfs::unlink(&path);
-                return Err(error);
-            }
-        };
-        if let Err(error) = control.check("format migration publication") {
-            let _ = crate::vfs::unlink(&path);
-            return Err(error.into());
-        }
-        let output_bytes = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                let _ = crate::vfs::unlink(&path);
-                return Err(error.into());
-            }
-        };
+        let output_bytes = self.part_file_bytes(&file)?;
         let mut manifest = self.manifest.clone();
         manifest.parts[plan.part_index] = PartRef {
             file,
@@ -4751,12 +4856,21 @@ impl Store {
             records: meta.n_records,
             b3: Some(digest),
         };
-        manifest.commit_with_limits(self.home.dir()?, self.read_limits)?;
-        self.parts[plan.part_index] =
-            Arc::new(Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?);
+        match &self.home {
+            Home::Dir(dir) => {
+                manifest.commit_with_limits(dir, self.read_limits)?;
+                sweep_unreachable_with_limits(dir, self.read_limits)?;
+            }
+            Home::File { container, .. } => {
+                let mut c = container.lock().expect("container lock poisoned");
+                manifest.commit_into_container(&mut c)?;
+                sweep_unreachable_container(&mut c, &manifest, self.read_limits)?;
+                c.commit()?; // <- the step's publication: one flip, restartable as ever
+            }
+        }
+        self.parts[plan.part_index] = Arc::new(opened);
         self.manifest = manifest;
         self.note_manifest_commit();
-        sweep_unreachable_with_limits(self.home.dir()?, self.read_limits)?;
         let remaining_legacy_parts = self
             .parts
             .iter()

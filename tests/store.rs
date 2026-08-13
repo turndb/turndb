@@ -3424,3 +3424,62 @@ fn a_single_file_store_verifies_backs_up_and_recovers() {
     assert!(err.to_string().contains("healthy"), "got: {err:#}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The whole legacy road in one walk: a REAL version-one pack converts into a single-file
+/// store, its legacy parts are visible to migration status, each step rewrites one into a
+/// member and publishes with one flip, and the end state verifies whole and answers byte-exact.
+#[test]
+fn a_converted_pack_migrates_its_legacy_parts_inside_the_file() {
+    let root = tmp("convert-migrate");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Decode the checked-in hex dump of the version-one consumer artifact.
+    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+    let pack_bytes: Vec<u8> = digits
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let pack = root.join("revision-one.pack");
+    std::fs::write(&pack, &pack_bytes).unwrap();
+
+    let ct = root.join("converted.turndb");
+    let stats = turndb::store::convert_to_file(&pack, &ct).unwrap();
+    assert!(stats.members > 2, "manifest + parts + fold: {stats:?}");
+
+    let want: [(&str, &[u8]); 2] =
+        [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
+    let cfg = FoldCfg::default();
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for (id, bytes) in &want {
+        assert_eq!(
+            s.reconstruct_content(id, turndb::BODY_CONTENT).unwrap().as_deref(),
+            Some(*bytes),
+            "{id} must convert byte-exact"
+        );
+    }
+    assert_eq!(s.format_migration_status().unwrap().legacy_parts, 2, "fixture shape moved");
+
+    // One legacy part per step, one flip per publication, restartable across a reopen.
+    assert!(s.migrate_format_step().unwrap().is_some());
+    drop(s);
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    assert_eq!(s.format_migration_status().unwrap().legacy_parts, 1, "one step, one part");
+    assert!(s.migrate_format_step().unwrap().is_some());
+    assert!(s.migrate_format_step().unwrap().is_none(), "migration must report completion");
+    assert_eq!(s.format_migration_status().unwrap().legacy_parts, 0);
+
+    let v = s.verify().unwrap();
+    assert_eq!(v.records, 2, "{v:?}");
+    for (id, bytes) in &want {
+        assert_eq!(
+            s.reconstruct_content(id, turndb::BODY_CONTENT).unwrap().as_deref(),
+            Some(*bytes),
+            "{id} must survive migration byte-exact"
+        );
+    }
+    s.close().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
