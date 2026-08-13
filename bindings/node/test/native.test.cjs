@@ -7,15 +7,15 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
-  capabilities, checkpointIntoContainer, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest,
+  capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest,
   retainedCommits, singleFileKind,
   restoreBackup, TurnDbError,
 } = require('..');
 
 function temporaryStore(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  return dir;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return path.join(root, 's.turndb');
 }
 
 test('reports the native capability profile without a portable fallback', () => {
@@ -802,9 +802,9 @@ test('publishes exact immutable cuts and reopens retained commits', async (t) =>
 test('backs up an actor-ordered cut and safely restores a writable store', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-backup-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const dir = path.join(root, 'store');
+  const dir = path.join(root, 'store.turndb');
   const artifact = path.join(root, 'snapshot.turndb');
-  const restoredDir = path.join(root, 'restored');
+  const restoredDir = path.join(root, 'restored.turndb');
   const store = await NativeStore.open(dir);
   t.after(async () => {
     try { await store.close(); } catch {}
@@ -825,7 +825,8 @@ test('backs up an actor-ordered cut and safely restores a writable store', async
   );
   const backup = await store.backup(artifact);
   assert(backup.files >= 3n);
-  assert.equal(backup.bytes, BigInt(fs.statSync(artifact).size));
+  // Member payload bytes: the sealed file adds its superblocks, alignment, and directory.
+  assert(backup.bytes > 0n && backup.bytes <= BigInt(fs.statSync(artifact).size));
   assert(backup.commit > 0n);
 
   await store.write([{ kind: 'put', id: 'after' }], true);
@@ -862,7 +863,9 @@ test('backs up an actor-ordered cut and safely restores a writable store', async
   );
 
   const corrupt = Buffer.from(fs.readFileSync(artifact));
-  corrupt[0] ^= 1;
+  // Damage a MEMBER byte, not slot 0's magic: the superblocks alternate precisely so that one
+  // torn slot loses quietly to the other, and a first-byte flip proves resilience, not damage.
+  corrupt[2 * 4096 + 52] ^= 1;
   const corruptPath = path.join(root, 'corrupt.turndb');
   const absent = path.join(root, 'corrupt-restore');
   fs.writeFileSync(corruptPath, corrupt);
@@ -888,11 +891,15 @@ test('recovers only a fully validated retained manifest under writer exclusion',
   await store.flush();
   await store.close();
 
-  const manifestPath = path.join(dir, 'MANIFEST');
+  // Member surgery on the single file: the live slot is the one with the higher seq (u64 LE at
+  // slot+8); its directory begins at dir_off (u64 LE at slot+16); the MANIFEST member is
+  // restaged immediately before the directory each commit, so its tail sits at dir_off.
   const damageManifest = () => {
-    const bytes = Buffer.from(fs.readFileSync(manifestPath));
-    bytes[10] ^= 0xff;
-    fs.writeFileSync(manifestPath, bytes);
+    const bytes = Buffer.from(fs.readFileSync(dir));
+    const slot = bytes.readBigUInt64LE(4096 + 8) > bytes.readBigUInt64LE(8) ? 4096 : 0;
+    const dirOff = Number(bytes.readBigUInt64LE(slot + 16));
+    bytes[dirOff - 2] ^= 0xff;
+    fs.writeFileSync(dir, bytes);
     return bytes;
   };
   const damagedManifest = damageManifest();
@@ -906,7 +913,7 @@ test('recovers only a fully validated retained manifest under writer exclusion',
     recoverManifest(dir, { signal: abort.signal }),
     (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
   );
-  assert.deepEqual(fs.readFileSync(manifestPath), damagedManifest);
+  assert.deepEqual(fs.readFileSync(dir), damagedManifest);
   const report = await recoverManifest(dir);
   assert.equal(report.rollbackCommits, 0n);
   assert.equal(report.records, 1n);
@@ -1201,14 +1208,16 @@ test('classifies verified persisted-byte damage as corruption', async (t) => {
   ] }]);
   await store.flush();
 
-  const part = fs.readdirSync(dir).find((name) => name.endsWith('.part'));
-  assert(part);
-  const partPath = path.join(dir, part);
-  const fd = fs.openSync(partPath, 'r+');
+  // The part member's aligned start, anchored by its footer magic inside the store file.
+  const image = fs.readFileSync(dir);
+  const footer = image.indexOf(Buffer.from('TURNPART'));
+  assert(footer > 0, 'the flushed part must exist in the store file');
+  const partStart = Math.floor(footer / 4096) * 4096;
+  const fd = fs.openSync(dir, 'r+');
   const byte = Buffer.alloc(1);
-  fs.readSync(fd, byte, 0, 1, 0);
+  fs.readSync(fd, byte, 0, 1, partStart);
   byte[0] ^= 0xff;
-  fs.writeSync(fd, byte, 0, 1, 0);
+  fs.writeSync(fd, byte, 0, 1, partStart);
   fs.closeSync(fd);
 
   await assert.rejects(
@@ -1308,11 +1317,13 @@ test('reports cheap health across staging and publication', async (t) => {
   assert.equal(liveness.liveBlocks.blocks, 1n);
   assert.equal(liveness.reclaimableBlocks.blocks, 0n);
 
-  fs.writeFileSync(path.join(dir, 'operator-note'), 'not owned by TurnDB');
   const space = await store.spaceUsage();
   assert(space.live.files > 0n);
   assert(space.retainedOnly.files > 0n);
-  assert(space.unclassified.logicalBytes >= BigInt(Buffer.byteLength('not owned by TurnDB')));
+  // The unclassified bucket answers for bytes no reachable name claims — the free list. One
+  // commit frees nothing (there is no predecessor to supersede), so after this test's single
+  // flush it is exactly empty; churn is what fills it, and the store suite proves that side.
+  assert.equal(space.unclassified.logicalBytes, 0n);
   assert.equal(
     space.total.files,
     space.live.files + space.retainedOnly.files + space.unclassified.files,
@@ -1420,7 +1431,7 @@ test('discovers typed field and content namespaces without reading values', asyn
   });
 });
 
-test('serves a store held in one file, produced and read entirely from Node', async (t) => {
+test('serves a store held in one file, live or sealed, entirely from Node', async (t) => {
   const dir = temporaryStore(t);
   const store = await NativeStore.open(dir);
   const body = Buffer.from(JSON.stringify([{ role: 'user', content: 'single file' }]));
@@ -1437,50 +1448,43 @@ test('serves a store held in one file, produced and read entirely from Node', as
   );
   await store.flush();
 
-  assert.equal(singleFileKind(dir), null, 'a directory carries neither magic');
+  assert.equal(singleFileKind(dir), 'container', 'the store IS the single-file form');
 
-  const pack = path.join(os.tmpdir(), `${path.basename(dir)}.pack`);
-  t.after(() => fs.rmSync(pack, { force: true }));
-  await store.backup(pack);
+  const sealed = path.join(os.tmpdir(), `${path.basename(dir)}.sealed.turndb`);
+  t.after(() => fs.rmSync(sealed, { force: true }));
+  await store.backup(sealed);
   await store.close(false);
+  assert.equal(singleFileKind(sealed), 'container', 'a sealed snapshot is a container by magic');
 
-  const container = path.join(os.tmpdir(), `${path.basename(dir)}.turndb`);
-  t.after(() => fs.rmSync(container, { force: true }));
-  const first = await checkpointIntoContainer(dir, container);
-  assert.ok(first.members >= 3, 'manifest, part, and segment at least');
-  assert.equal(first.commitSeq, 1n);
-  assert.equal(first.skippedMembers, 0);
-  assert.equal(singleFileKind(container), 'container');
-  assert.equal(singleFileKind(pack), 'pack');
+  // The live file and its sealed snapshot answer identically, read directly as files.
+  const fromLive = await NativeSnapshot.openFile(dir);
+  const want = await fromLive.scan();
+  const snapshot = await NativeSnapshot.openFile(sealed);
+  const got = await snapshot.scan();
+  assert.deepEqual(
+    got.rows.map((row) => row.id),
+    want.rows.map((row) => row.id),
+    'the sealed snapshot must page the same ids',
+  );
+  assert.deepEqual(
+    await snapshot.readContent('trace/0001#input', 'body'),
+    body,
+    'the sealed snapshot must reconstruct byte-exact',
+  );
+  await snapshot.close();
+  await fromLive.close();
 
-  // Both single-file forms answer exactly as the directory does, byte for byte.
-  const fromDir = await NativeSnapshot.open(dir);
-  const want = await fromDir.scan();
-  for (const [label, file] of [['container', container], ['pack', pack]]) {
-    const snapshot = await NativeSnapshot.openFile(file);
-    const got = await snapshot.scan();
-    assert.deepEqual(
-      got.rows.map((row) => row.id),
-      want.rows.map((row) => row.id),
-      `${label} must page the same ids`,
-    );
-    assert.deepEqual(
-      await snapshot.readContent('trace/0001#input', 'body'),
-      body,
-      `${label} must reconstruct byte-exact`,
-    );
-    await snapshot.close();
-  }
-  await fromDir.close();
-
-  // A second checkpoint with no writes between re-ingests strictly less.
-  const second = await checkpointIntoContainer(dir, container);
-  assert.equal(second.commitSeq, 2n);
-  assert.ok(second.skippedMembers > 0, 'immutable members skip');
-  assert.ok(second.ingestedBytes < first.ingestedBytes);
-
+  // Sealed is final: no writer, ever.
   await assert.rejects(
-    NativeSnapshot.openFile(path.join(dir, 'MANIFEST')),
+    NativeStore.open(sealed),
+    (error) => error instanceof TurnDbError && /sealed/.test(error.message),
+    'a sealed snapshot must refuse a writer',
+  );
+
+  const plain = `${dir}.plain`;
+  fs.writeFileSync(plain, Buffer.alloc(16384, 0x2e));
+  await assert.rejects(
+    NativeSnapshot.openFile(plain),
     (error) => error instanceof TurnDbError,
     'a file carrying neither magic must refuse',
   );

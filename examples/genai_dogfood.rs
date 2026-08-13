@@ -56,15 +56,15 @@ fn push_int(attrs: &mut Vec<(String, AttrValue)>, k: &str, v: &Value) {
 
 fn main() -> Result<()> {
     let mut a = std::env::args().skip(1);
-    let src = PathBuf::from(a.next().context("usage: genai_dogfood <genai.jsonl> <store-dir>")?);
-    let dir = PathBuf::from(a.next().context("usage: genai_dogfood <genai.jsonl> <store-dir>")?);
+    let src = PathBuf::from(a.next().context("usage: genai_dogfood <genai.jsonl> <store.turndb>")?);
+    let dir = PathBuf::from(a.next().context("usage: genai_dogfood <genai.jsonl> <store.turndb>")?);
     // Calls per flush. THE live-ness dial: a flush is when records become visible to a separate
     // reader, and also when the open fold block seals — and blocks sealed short compress worse.
     // The tradeoff is real and is measured rather than assumed; see the sweep in the session log.
     let flush_every: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(512);
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&dir);
 
-    let mut s = Store::open(&dir, FoldCfg::default())?;
+    let mut s = Store::open_file(&dir, FoldCfg::default())?;
     let rdr = std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(&src)?);
     let (mut calls, mut records, mut logical) = (0u64, 0u64, 0u64);
     let t0 = std::time::Instant::now();

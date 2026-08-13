@@ -10,7 +10,8 @@ import './_artifact.mjs';
 import { open } from '../index.mjs';
 
 async function tempStore(prefix = 'turndb-generic-write-') {
-  const dir = await mkdtemp(join(tmpdir(), prefix));
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const dir = join(root, 's.turndb');
   return { dir, store: await open(dir) };
 }
 

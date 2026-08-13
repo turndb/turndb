@@ -236,15 +236,6 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Atomically install a second name for a file, refusing an existing destination.
-#[inline]
-pub(crate) fn link(from: &Path, to: &Path) -> Result<()> {
-    std::fs::hard_link(from, to)?;
-    #[cfg(feature = "dst")]
-    push(Op::Link { from: from.to_path_buf(), to: to.to_path_buf() });
-    Ok(())
-}
-
 #[inline]
 pub(crate) fn unlink(path: &Path) -> Result<()> {
     std::fs::remove_file(path)?;
@@ -269,15 +260,6 @@ pub(crate) fn punch_hole(f: &File, path: &Path, off: u64, len: u64) -> Result<()
 #[inline]
 pub(crate) fn mkdir_all(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
-    #[cfg(feature = "dst")]
-    push(Op::Mkdir { path: path.to_path_buf() });
-    Ok(())
-}
-
-/// Create exactly one directory and refuse if that name already exists.
-#[inline]
-pub(crate) fn mkdir_new(path: &Path) -> Result<()> {
-    std::fs::create_dir(path)?;
     #[cfg(feature = "dst")]
     push(Op::Mkdir { path: path.to_path_buf() });
     Ok(())

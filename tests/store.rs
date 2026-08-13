@@ -4,9 +4,7 @@
 use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
 use turndb::read_limits::ReadLimits;
-use turndb::store::{
-    CompactionBudget, CompactionError, ContentSpans, Manifest, PartRef, Span, Store, StoreOptions,
-};
+use turndb::store::{CompactionBudget, CompactionError, ContentSpans, Span, Store, StoreOptions};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -23,6 +21,29 @@ const M1: &[u8] =
     b"{\"role\":\"user\",\"content\":\"the first message, long enough to be worth folding\"}";
 const M2: &[u8] =
     b"{\"role\":\"assistant\",\"content\":\"the second message, also reasonably long\"}";
+
+/// The first extent of a member — where its bytes physically live in the store file — for the
+/// tests that damage members in place.
+fn member_extent(store: &std::path::Path, name: &str) -> (u64, u64) {
+    let c = turndb::container::Container::open(store).unwrap();
+    let extents = c.member_extents(name).unwrap();
+    extents[0]
+}
+
+/// Flip one byte inside a member without truncating the store file.
+fn flip_member_byte(store: &std::path::Path, name: &str, at: u64) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let (off, len) = member_extent(store, name);
+    assert!(at < len, "flip lands inside the member");
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(store).unwrap();
+    f.seek(SeekFrom::Start(off + at)).unwrap();
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).unwrap();
+    b[0] ^= 0xff;
+    f.seek(SeekFrom::Start(off + at)).unwrap();
+    f.write_all(&b).unwrap();
+    f.sync_all().unwrap();
+}
 
 fn put(s: &mut Store, id: &str, extra: &[u8]) -> Vec<u8> {
     let spans = vec![
@@ -306,30 +327,6 @@ fn cancelled_sync_and_flush_refuse_before_their_publication_boundaries() {
         turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap().ids().unwrap(),
         vec!["pending"]
     );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn a_part_the_manifest_never_named_is_ignored() {
-    // The manifest is the only commit point: a part file on disk that the manifest does not name was
-    // written by a flush that crashed before committing, and must be invisible.
-    let dir = tmp("orphan");
-    {
-        let mut s = Store::open(&dir, cfg()).unwrap();
-        put(&mut s, "kept", b"x");
-        s.sync().unwrap();
-        s.flush().unwrap();
-        drop(s);
-    }
-    let real = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.to_string_lossy().ends_with(".part"))
-        .expect("a committed part exists");
-    std::fs::copy(&real, dir.join("part-99999999.part")).unwrap();
-    let s = Store::open(&dir, cfg()).unwrap();
-    assert_eq!(s.part_count(), 1, "an uncommitted part file must be ignored");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1066,100 +1063,52 @@ fn a_retained_snapshot_reads_the_past() {
 }
 
 #[test]
-fn a_corrupt_manifest_recovers_from_the_commit_log() {
-    let dir = tmp("manrecover");
-    let mut want = Vec::new();
-    {
-        let mut s = Store::open(&dir, cfg()).unwrap();
-        for i in 0..10 {
-            let id = format!("k{i}");
-            want.push((id.clone(), put(&mut s, &id, format!("v{i}").as_bytes())));
-        }
-        s.sync().unwrap();
-        s.flush().unwrap();
-        drop(s);
-    }
-    let man = dir.join("MANIFEST");
-    let mut b = std::fs::read(&man).unwrap();
-    b[10] ^= 0xFF;
-    std::fs::write(&man, &b).unwrap();
-
-    assert!(Store::open(&dir, cfg()).is_err(), "a corrupt manifest must refuse, not open empty");
-    let cancellation = turndb::control::CancellationToken::new();
-    cancellation.cancel();
-    let error = turndb::store::recover_manifest_with_control(
-        &dir,
-        cfg(),
-        turndb::store::RecoveryOptions::default(),
-        &turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) },
-    )
-    .unwrap_err();
-    assert!(error.downcast_ref::<turndb::control::OperationInterrupted>().is_some());
-    assert_eq!(std::fs::read(&man).unwrap(), b, "cancelled recovery promoted a manifest");
-
-    let recovered =
-        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
-            .unwrap();
-    assert!(recovered.commit > 0);
-    assert_eq!(recovered.rollback_commits, 0);
-    assert_eq!(recovered.records, want.len());
-    assert!(recovered.content_values >= want.len());
-
-    // The newest retained copy carried the same commit, so recovery lost nothing — and the store
-    // is a working store again, not merely a readable one.
-    let mut s = Store::open(&dir, cfg()).unwrap();
-    for (id, body) in &want {
-        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body, "recovery lost {id}");
-    }
-    let after = put(&mut s, "after", b"recovery");
-    s.sync().unwrap();
-    s.flush().unwrap();
-    assert_eq!(s.reconstruct("after").unwrap().unwrap(), after);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 fn checked_recovery_excludes_a_live_writer_and_never_promotes_an_unreadable_candidate() {
     let dir = tmp("checked-recovery");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ct = dir.join("s.turndb");
+    let mut store = Store::open_file(&ct, cfg()).unwrap();
     put(&mut store, "one", b"content large enough to live in the fold");
     store.sync().unwrap();
     store.flush().unwrap();
-    let manifest_path = dir.join("MANIFEST");
-    let mut damaged = std::fs::read(&manifest_path).unwrap();
-    damaged[10] ^= 0xff;
-    std::fs::write(&manifest_path, &damaged).unwrap();
+    flip_member_byte(&ct, "MANIFEST", 10);
 
+    // The writer still holds the flock: recovery must refuse with the TYPED contention error
+    // rather than flip a slot under a live session.
     let error =
-        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+        turndb::store::recover_manifest_file(&ct, cfg(), turndb::store::RecoveryOptions::default())
             .unwrap_err();
     assert!(error.downcast_ref::<turndb::fold::WriterLocked>().is_some());
     drop(store);
 
-    let part = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "part"))
-        .unwrap();
-    let mut bytes = std::fs::read(&part).unwrap();
-    bytes[0] ^= 1;
-    std::fs::write(&part, bytes).unwrap();
+    // Every candidate validates against the parts the store actually holds; damage the one part
+    // and no candidate is promotable — and the failed recovery must leave the damage untouched.
+    let part_name = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        c.names().map(String::from).collect::<Vec<_>>()
+    }
+    .into_iter()
+    .find(|n| n.ends_with(".part"))
+    .unwrap();
+    flip_member_byte(&ct, &part_name, 0);
+    let before = std::fs::read(&ct).unwrap();
     let error =
-        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+        turndb::store::recover_manifest_file(&ct, cfg(), turndb::store::RecoveryOptions::default())
             .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<turndb::store::RecoveryError>(),
         Some(turndb::store::RecoveryError::NoUsableCandidate { .. })
     ));
-    assert_eq!(std::fs::read(&manifest_path).unwrap(), damaged);
+    assert_eq!(std::fs::read(&ct).unwrap(), before, "a refused recovery promotes nothing");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn checked_recovery_requires_an_explicit_rollback_allowance() {
     let dir = tmp("checked-rollback");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ct = dir.join("s.turndb");
+    let mut store = Store::open_file(&ct, cfg()).unwrap();
     put(&mut store, "first", b"first committed value long enough to fold");
     store.sync().unwrap();
     store.flush().unwrap();
@@ -1168,262 +1117,86 @@ fn checked_recovery_requires_an_explicit_rollback_allowance() {
     store.sync().unwrap();
     store.flush().unwrap();
     let newest = store.manifest().commit;
-    drop(store);
+    store.close().unwrap();
 
-    let manifest_path = dir.join("MANIFEST");
-    let mut damaged = std::fs::read(&manifest_path).unwrap();
-    damaged[10] ^= 0xff;
-    std::fs::write(&manifest_path, &damaged).unwrap();
-    std::fs::write(dir.join(format!("MANIFEST.{newest:08}")), b"damaged retained copy").unwrap();
+    // The live manifest AND the newest retained copy both damaged: promotion has to abandon a
+    // commit, and abandoning a commit is the caller's call, never a default.
+    flip_member_byte(&ct, "MANIFEST", 10);
+    flip_member_byte(&ct, &format!("MANIFEST.{newest:08}"), 10);
 
     let error =
-        turndb::store::recover_manifest(&dir, cfg(), turndb::store::RecoveryOptions::default())
+        turndb::store::recover_manifest_file(&ct, cfg(), turndb::store::RecoveryOptions::default())
             .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<turndb::store::RecoveryError>(),
         Some(turndb::store::RecoveryError::RollbackLimit { needed: 1, allowed: 0 })
     ));
-    let report = turndb::store::recover_manifest(
-        &dir,
+    let report = turndb::store::recover_manifest_file(
+        &ct,
         cfg(),
         turndb::store::RecoveryOptions { max_rollback_commits: 1 },
     )
     .unwrap();
     assert_eq!(report.commit, first_commit);
     assert_eq!(report.rollback_commits, 1);
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&ct, cfg()).unwrap();
     assert!(reader.get("first").unwrap().is_some());
     assert!(reader.get("second").unwrap().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A rollback's abandoned timeline must not survive a crash. Recovery now durably prunes the
-/// abandoned retained manifests BEFORE publishing the rolled-back one, so the two timelines are
-/// never both durable — but a store recovered by a build predating that ordering (or restored from
-/// a backup taken mid-recovery) can still present resurrected residue. Writer open must remove it
-/// by NUMBER, without parsing: one resurrected copy here is valid bytes and one is damage, and both
-/// must go, because a retained commit newer than the live one is residue whatever its bytes say.
-/// The assertions are completeness-shaped: verification passes, the rolled-back record is byte-exact,
-/// and a fresh flush — which restarts part numbering below names the residue pinned — round-trips.
-#[test]
-fn a_crashed_rollbacks_resurrected_timeline_cannot_outlive_writer_open() {
-    let dir = tmp("resurrected-rollback");
-    let mut store = Store::open(&dir, cfg()).unwrap();
-    let want_first = put(&mut store, "first", b"the surviving record, long enough to fold");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    let first_commit = store.manifest().commit;
-    put(&mut store, "second", b"abandoned by rollback, long enough to fold");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    let second_commit = store.manifest().commit;
-    put(&mut store, "third", b"also abandoned by rollback, long enough to fold");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    let third_commit = store.manifest().commit;
-    drop(store);
-
-    let second_path = dir.join(format!("MANIFEST.{second_commit:08}"));
-    let third_path = dir.join(format!("MANIFEST.{third_commit:08}"));
-    let second_valid_bytes = std::fs::read(&second_path).unwrap();
-
-    // Damage the two newest retained copies and the live manifest, forcing a two-commit rollback.
-    for path in [&second_path, &third_path, &dir.join("MANIFEST")] {
-        let mut b = std::fs::read(path).unwrap();
-        b[10] ^= 0xff;
-        std::fs::write(path, &b).unwrap();
-    }
-    let third_damaged_bytes = std::fs::read(&third_path).unwrap();
-    let report = turndb::store::recover_manifest(
-        &dir,
-        cfg(),
-        turndb::store::RecoveryOptions { max_rollback_commits: 2 },
-    )
-    .unwrap();
-    assert_eq!(report.commit, first_commit);
-    assert!(!second_path.exists() && !third_path.exists(), "rollback must prune what it abandons");
-
-    // Resurrect the abandoned timeline: valid bytes at one commit, damage at the other.
-    std::fs::write(&second_path, &second_valid_bytes).unwrap();
-    std::fs::write(&third_path, &third_damaged_bytes).unwrap();
-
-    let mut store = Store::open(&dir, cfg()).unwrap();
-    assert!(!second_path.exists(), "open must remove a resurrected VALID newer retained manifest");
-    assert!(!third_path.exists(), "open must remove a resurrected DAMAGED newer retained manifest");
-    assert_eq!(store.reconstruct("first").unwrap().unwrap(), want_first);
-    assert!(store.reconstruct("second").unwrap().is_none(), "rolled-back records stay rolled back");
-    let want_fourth = put(&mut store, "fourth", b"written after the reconciled open");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    drop(store);
-
-    turndb::store::verify_chain(&dir).unwrap();
-    let reader = Store::open_read(&dir, cfg()).unwrap();
-    assert_eq!(reader.reconstruct("first").unwrap().unwrap(), want_first);
-    assert_eq!(reader.reconstruct("fourth").unwrap().unwrap(), want_fourth);
-    assert!(reader.reconstruct("third").unwrap().is_none());
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// The commit protocol's own crash window: the retained copy of a commit lands before the rename
-/// that gives it authority, so a crash between the two leaves live = c, retained = {.., c+1}, the
-/// new part file durable, and the acknowledged records still in the WAL. Writer open must treat the
-/// newer retained name as residue — remove it durably, sweep the part it alone pinned, and replay
-/// the WAL — rather than leave a retained manifest whose pinned file the next flush rewrites in
-/// place. Both records must come back byte-exact and verification must pass after the re-flush
-/// reuses the crashed commit's part name.
-#[test]
-fn writer_open_completes_a_commits_crash_residue() {
-    let dir = tmp("commit-residue");
-    let mut store = Store::open(&dir, cfg()).unwrap();
-    let want_first = put(&mut store, "first", b"committed before the crash window opens");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    let live_commit = store.manifest().commit;
-    let manifest_live_bytes = std::fs::read(dir.join("MANIFEST")).unwrap();
-    let want_second = put(&mut store, "second", b"acknowledged, then caught in the crash window");
-    store.sync().unwrap();
-    let wal_bytes = std::fs::read(dir.join("WAL")).unwrap();
-    store.flush().unwrap();
-    let crashed_commit = store.manifest().commit;
-    drop(store);
-
-    // Wind the commit back to the moment before its rename: live manifest and WAL as they were,
-    // the retained copy and the part file as the crashed commit left them.
-    std::fs::write(dir.join("MANIFEST"), &manifest_live_bytes).unwrap();
-    std::fs::write(dir.join("WAL"), &wal_bytes).unwrap();
-    let residue_path = dir.join(format!("MANIFEST.{crashed_commit:08}"));
-    assert!(residue_path.exists(), "the construction must leave the crashed commit's residue");
-
-    let mut store = Store::open(&dir, cfg()).unwrap();
-    assert_eq!(store.manifest().commit, live_commit);
-    assert!(!residue_path.exists(), "open must durably remove the crashed commit's residue");
-    // The nearest VALID retained state — the live commit's own copy, same generation — must
-    // survive the same reconciliation untouched.
-    assert!(
-        dir.join(format!("MANIFEST.{live_commit:08}")).exists(),
-        "reconciliation must not remove retained manifests the live commit dominates"
-    );
-    assert_eq!(store.reconstruct("first").unwrap().unwrap(), want_first);
-    assert_eq!(
-        store.reconstruct("second").unwrap().unwrap(),
-        want_second,
-        "the acknowledged record must replay from the WAL, not depend on the residue"
-    );
-    store.flush().unwrap();
-    drop(store);
-
-    turndb::store::verify_chain(&dir).unwrap();
-    let reader = Store::open_read(&dir, cfg()).unwrap();
-    assert_eq!(reader.reconstruct("first").unwrap().unwrap(), want_first);
-    assert_eq!(reader.reconstruct("second").unwrap().unwrap(), want_second);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A re-fold purges the retained log because erasure trumps snapshots — and that purge must hold
-/// across a crash. If a pre-purge retained manifest resurrects, it names the OLD fold generation:
-/// writer open must remove it durably (its erasure declarations do not exist in the new
-/// generation), time travel to it must refuse rather than serve erased content, and the surviving
-/// records must remain byte-exact.
-#[test]
-fn a_crashed_refold_purge_is_completed_at_writer_open() {
-    let dir = tmp("refold-purge-residue");
-    let mut store = Store::open(&dir, cfg()).unwrap();
-    put(&mut store, "erase-me", b"content that must be gone after the re-fold, and long");
-    let want_keep = put(&mut store, "keep", b"content that must survive the re-fold, and long");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    let old_commit = store.manifest().commit;
-    put(&mut store, "keep-2", b"a second commit so the retained log has depth");
-    store.sync().unwrap();
-    store.flush().unwrap();
-    let old_retained_path = dir.join(format!("MANIFEST.{old_commit:08}"));
-    let old_retained_bytes = std::fs::read(&old_retained_path).unwrap();
-
-    let stats = store.erase_ids(&["erase-me".into()]).unwrap();
-    assert!(stats.refold.is_some(), "unique content existed, so the fold must be rewritten");
-    assert!(!old_retained_path.exists(), "the purge must have removed the pre-refold log");
-    drop(store);
-
-    // Resurrect the pre-refold retained manifest, as a crash between the purge's unlink and its
-    // directory fsync could.
-    std::fs::write(&old_retained_path, &old_retained_bytes).unwrap();
-
-    let store = Store::open(&dir, cfg()).unwrap();
-    assert!(!old_retained_path.exists(), "open must remove a resurrected old-generation manifest");
-    assert!(store.reconstruct("erase-me").unwrap().is_none(), "erased content stays erased");
-    assert_eq!(store.reconstruct("keep").unwrap().unwrap(), want_keep);
-    drop(store);
-
-    turndb::store::verify_chain(&dir).unwrap();
-    assert!(
-        Store::open_read_at(&dir, cfg(), old_commit).is_err(),
-        "time travel must not cross the re-fold through resurrected residue"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 #[test]
 fn an_unreadable_manifest_is_an_error_not_an_empty_store() {
-    // The orphan sweep made this destructive: an unreadable manifest yielded the DEFAULT manifest,
-    // and the sweep then unlinked every part it did not name.
+    // The orphan sweep once made this destructive: an unreadable manifest yielded the DEFAULT
+    // manifest, and the sweep then unlinked every part it did not name. In the file store the
+    // same wrong reading would let the sweep free every extent the default manifest ignores.
     let dir = tmp("badmanifest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ct = dir.join("s.turndb");
     let mut want = Vec::new();
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&ct, cfg()).unwrap();
         for i in 0..20 {
             let id = format!("k{i:02}");
             want.push((id.clone(), put(&mut s, &id, format!("v{i}").as_bytes())));
         }
         s.sync().unwrap();
         s.flush().unwrap();
-        drop(s);
+        s.close().unwrap();
     }
-    let parts_before = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
-        .count();
-    assert_eq!(parts_before, 1);
+    let part_name = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        c.names().map(String::from).collect::<Vec<_>>()
+    }
+    .into_iter()
+    .find(|n| n.ends_with(".part"))
+    .unwrap();
+    let part_bytes_before = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        c.read_file_bounded(&part_name, 1 << 30).unwrap()
+    };
 
-    // A read that fails for a reason OTHER than absence. A directory reads as EISDIR everywhere.
-    let man = dir.join("MANIFEST");
-    std::fs::remove_file(&man).unwrap();
-    std::fs::create_dir(&man).unwrap();
-
-    assert!(Store::open(&dir, cfg()).is_err(), "an unreadable manifest must refuse to open");
-    let parts_after = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
-        .count();
-    assert_eq!(parts_after, 1, "REFUSING TO OPEN MUST NOT DELETE DATA");
+    flip_member_byte(&ct, "MANIFEST", 10);
+    assert!(Store::open_file(&ct, cfg()).is_err(), "an unreadable manifest must refuse to open");
+    assert!(
+        turndb::store::open_read_container(&ct, cfg()).is_err(),
+        "and must refuse the reader too, never serving an empty store"
+    );
+    let c = turndb::container::Container::open(&ct).unwrap();
+    assert_eq!(
+        c.read_file_bounded(&part_name, 1 << 30).unwrap(),
+        part_bytes_before,
+        "REFUSING TO OPEN MUST NOT DELETE DATA"
+    );
+    drop(c);
 
     // and once the manifest is readable again the store is intact
-    std::fs::remove_dir(&man).unwrap();
-    std::fs::write(
-        &man,
-        serde_json::to_vec(&Manifest {
-            parts: vec![PartRef {
-                file: "part-00000001.part".into(),
-                seq_lo: 1,
-                seq_hi: 1,
-                records: 20,
-                b3: None,
-            }],
-            fold_seg: 0,
-            fold_off: 0,
-            next_seq: 1,
-            fold_gen: 0,
-            commit: 1,
-            prev: None,
-            punched: Vec::new(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let s = Store::open(&dir, cfg()).unwrap();
+    flip_member_byte(&ct, "MANIFEST", 10);
+    let s = Store::open_file(&ct, cfg()).unwrap();
     assert_eq!(s.part_count(), 1);
+    for (id, body) in &want {
+        assert_eq!(s.reconstruct(id).unwrap().unwrap(), *body);
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1623,26 +1396,40 @@ fn readers_open_a_coherent_snapshot_while_refolding() {
 
 #[test]
 fn a_manifest_naming_a_truly_absent_part_errors_rather_than_spinning() {
-    // The retry that closes the reader race must be bounded: a part that is genuinely gone is a
-    // corrupt store, and it has to surface as an error rather than a loop.
+    // A part that is genuinely gone is a corrupt store, and it has to surface as an error —
+    // fast, bounded, and by name.
     let dir = tmp("absentpart");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ct = dir.join("s.turndb");
     {
-        let mut s = Store::open(&dir, cfg()).unwrap();
+        let mut s = Store::open_file(&ct, cfg()).unwrap();
         put(&mut s, "a", b"x");
         s.sync().unwrap();
         s.flush().unwrap();
+        s.close().unwrap();
     }
-    let name = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .find(|n| n.ends_with(".part"))
-        .unwrap();
-    std::fs::remove_file(dir.join(&name)).unwrap();
+    // Rebuild the container byte-identical except the part member: a well-formed envelope whose
+    // manifest names storage that does not exist.
+    let source = turndb::container::Container::open(&ct).unwrap();
+    let gapped = dir.join("gapped.turndb");
+    let mut fresh = turndb::container::Container::create(&gapped).unwrap();
+    for name in source.names().map(String::from).collect::<Vec<_>>() {
+        if name.ends_with(".part") {
+            continue;
+        }
+        fresh.put_bytes(&name, &source.read_file_bounded(&name, 1 << 30).unwrap()).unwrap();
+    }
+    fresh.commit().unwrap();
+    drop(fresh);
+    drop(source);
 
     let t = std::time::Instant::now();
-    assert!(Store::open_read(&dir, cfg()).is_err(), "a missing part must be an error");
-    assert!(t.elapsed().as_secs() < 5, "the retry is not bounded");
+    let err = match turndb::store::open_read_container(&gapped, cfg()) {
+        Ok(_) => panic!("a missing part must be an error"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("does not hold"), "the refusal names the gap: {err}");
+    assert!(t.elapsed().as_secs() < 5, "the refusal must be prompt, not a retry loop");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2005,7 +1792,8 @@ fn refold_refuses_with_a_dirty_memtable() {
 #[test]
 fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_generation() {
     let dir = tmp("refold-cancel");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let ct = store_file(&dir);
+    let mut store = Store::open_file(&ct, cfg()).unwrap();
     let mut want = Vec::new();
     for i in 0..24u32 {
         let bytes = blob(20_000 + i);
@@ -2016,16 +1804,24 @@ fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_gener
     store.sync().unwrap();
     store.flush().unwrap();
     let generation = store.manifest().fold_gen;
-    let staged = turndb::store::refold::fold_dir(&dir, generation + 1);
+    let members_before = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        let mut names: Vec<String> = c.names().map(String::from).collect();
+        names.sort();
+        names
+    };
+    // A file store stages the rebuilt generation as UNCOMMITTED extents appended past the
+    // committed tail — so "staging exists" is observable as the file growing.
+    let len_before = std::fs::metadata(&ct).unwrap().len();
     let cancellation = turndb::control::CancellationToken::new();
     let cancel = cancellation.clone();
-    let staged_watch = staged.clone();
+    let watch = ct.clone();
     let watcher = std::thread::spawn(move || {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !staged_watch.exists() {
+        while std::fs::metadata(&watch).map(|m| m.len()).unwrap_or(0) <= len_before {
             assert!(
                 std::time::Instant::now() < until,
-                "refold never created its staged generation"
+                "refold never staged past the committed tail"
             );
             std::thread::yield_now();
         }
@@ -2042,17 +1838,18 @@ fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_gener
         .downcast_ref::<turndb::control::OperationInterrupted>()
         .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
     assert_eq!(store.manifest().fold_gen, generation);
-    assert!(!staged.exists(), "an unpublished cancelled fold generation must be removed");
-    assert!(
-        std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .all(|entry| !entry.file_name().to_string_lossy().starts_with("part-r")),
-        "cancelled rebuilt parts must be removed"
-    );
     for (id, bytes) in want {
         assert_eq!(store.reconstruct(&id).unwrap().unwrap(), bytes);
     }
+    store.close().unwrap();
+    // Nothing of the cancelled generation was published: the member set is exactly as before.
+    let members_after = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        let mut names: Vec<String> = c.names().map(String::from).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(members_after, members_before, "a cancelled refold publishes nothing");
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -2102,60 +1899,6 @@ fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
     assert_eq!(part_members(&dir).len(), parts, "a cancelled merge must publish no member");
     assert_eq!(store.ids().unwrap().len(), 6_000);
     std::fs::remove_dir_all(dir).ok();
-}
-
-#[test]
-fn a_crashed_refold_leaves_the_store_exactly_as_it_was() {
-    // A refold writes a new fold generation and new parts BEFORE the manifest names either. A crash in
-    // that window must leave nothing but orphans, and the store must open on the old generation as
-    // though the refold had never started.
-    let dir = tmp("refoldcrash");
-    let mut want = Vec::new();
-    {
-        let mut s = Store::open(&dir, cfg()).unwrap();
-        for i in 0..12u32 {
-            let b = blob(i + 300);
-            s.put(&format!("c{i:02}"), &[Span::Piece(&b)], vec![]).unwrap();
-            want.push((format!("c{i:02}"), b));
-        }
-        s.sync().unwrap();
-        s.flush().unwrap();
-    }
-    let manifest_before = std::fs::read(dir.join("MANIFEST")).unwrap();
-
-    // Exactly what a refold leaves behind when it dies before committing: a populated next-generation
-    // fold, and part files the manifest does not name.
-    let ghost = dir.join("fold-0001");
-    std::fs::create_dir_all(&ghost).unwrap();
-    std::fs::write(ghost.join("000000.fold"), vec![7u8; 4096]).unwrap();
-    std::fs::write(dir.join("part-r0001-00000001-00000001.part"), vec![9u8; 2048]).unwrap();
-
-    let s = Store::open(&dir, cfg()).unwrap();
-    assert!(!ghost.exists(), "an uncommitted fold generation must be swept");
-    assert!(
-        !dir.join("part-r0001-00000001-00000001.part").exists(),
-        "parts the manifest does not name must be swept"
-    );
-    assert_eq!(
-        std::fs::read(dir.join("MANIFEST")).unwrap(),
-        manifest_before,
-        "the committed state must be untouched"
-    );
-    for (id, body) in &want {
-        assert_eq!(
-            &s.reconstruct(id).unwrap().unwrap(),
-            body,
-            "{id} did not survive a crashed refold"
-        );
-    }
-    // and a refold started afresh still works
-    drop(s);
-    let mut s = Store::open(&dir, cfg()).unwrap();
-    s.refold().unwrap();
-    for (id, body) in &want {
-        assert_eq!(&s.reconstruct(id).unwrap().unwrap(), body);
-    }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -2245,31 +1988,35 @@ fn erase_ids_leaves_no_content_no_metadata_and_no_snapshot_path_back() {
 #[test]
 fn the_manifest_chain_links_and_pins_and_notices_tampering() {
     let dir = tmp("chain");
-    let mut s = Store::open(&dir, cfg()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let ct = dir.join("s.turndb");
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
     for f in 0..3 {
         put(&mut s, &format!("c{f}"), format!("body {f}").as_bytes());
         s.sync().unwrap();
         s.flush().unwrap();
     }
     s.merge_range(0, 2).unwrap().unwrap();
-    drop(s);
+    s.close().unwrap();
 
-    let report = turndb::store::verify_chain(&dir).unwrap();
+    let report = turndb::store::verify_chain_file(&ct).unwrap();
     assert!(report.links >= 3, "commits must chain: {report:?}");
     assert!(report.part_digests >= 4, "every named part must be pinned: {report:?}");
     assert_eq!(report.undigested, 0, "a fresh store has no undigested parts");
 
-    // tamper INSIDE a part (past the footer's own reach): the manifest pin must notice
-    let part = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().map(|e| e == "part").unwrap_or(false))
-        .unwrap();
-    let mut b = std::fs::read(&part).unwrap();
-    b[2] ^= 0xFF;
-    std::fs::write(&part, &b).unwrap();
-    assert!(turndb::store::verify_chain(&dir).is_err(), "a drifted part must break verification");
+    // tamper INSIDE a part member (past the footer's own reach): the manifest pin must notice
+    let part_name = {
+        let c = turndb::container::Container::open(&ct).unwrap();
+        c.names().map(String::from).collect::<Vec<_>>()
+    }
+    .into_iter()
+    .find(|n| n.ends_with(".part"))
+    .unwrap();
+    flip_member_byte(&ct, &part_name, 2);
+    assert!(
+        turndb::store::verify_chain_file(&ct).is_err(),
+        "a drifted part must break verification"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -2333,130 +2080,20 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A crash can land a punch PARTIALLY: fallocate deallocates per extent, so power loss mid-punch
-/// leaves a declared block's payload half zeros, half original bytes — neither of the two residues
-/// (intact, fully zeroed) the happy paths produce. The manifest's punched declaration, committed
-/// before any byte was destroyed, is the erasure authority: recovery must step over that frame.
-/// The identical damage WITHOUT the declaration is nothing but corruption and must still refuse.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_torn_punch_on_a_declared_block_recovers_and_undeclared_damage_refuses() {
-    use std::io::{Seek, SeekFrom, Write};
-    let dir = tmp("punch-torn");
-    let undeclared = tmp("punch-torn-undeclared");
-    // block_target 1 seals a block per piece, so the superseded piece owns a punchable block;
-    // incompressible bodies make the punched range extent-scale, the size a real fallocate tears.
-    let cfg = FoldCfg { block_target: 1, ..Default::default() };
-    let mut x = 0x243F_6A88_85A3_08D3u64;
-    let mut noise = |n: usize| -> Vec<u8> {
-        (0..n)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as u8
-            })
-            .collect()
-    };
-    let old = noise(32 * 1024);
-    let live = noise(32 * 1024);
-    {
-        let mut s = Store::open(&dir, cfg).unwrap();
-        s.put("k", &[Span::Piece(&old)], vec![]).unwrap();
-        s.sync().unwrap();
-        s.flush().unwrap();
-        s.put("k", &[Span::Piece(&live)], vec![]).unwrap();
-        s.sync().unwrap();
-        s.flush().unwrap();
-    }
-    // The nearest-INVALID twin: byte-identical now, and it will never see the punch or its
-    // declaration — only the damage.
-    copy_tree(&dir, &undeclared);
-
-    let seg = dir.join("fold").join("seg-00000000.fold");
-    let before = std::fs::read(&seg).unwrap();
-    {
-        let mut s = Store::open(&dir, cfg).unwrap();
-        let stats = s.punch_unreferenced().unwrap();
-        assert!(stats.blocks_punched > 0, "the setup must actually punch, got {stats:?}");
-    }
-    // Reconstruct the torn crash state. The declaration is already durable (it commits before any
-    // deallocation), the punch zeroed exactly one payload; put the SECOND half of it back from the
-    // pre-punch image, leaving the first half zeros — the fallocate landed on only some extents.
-    let after = std::fs::read(&seg).unwrap();
-    assert_eq!(before.len(), after.len(), "punching must not change the segment length");
-    let lo = (0..before.len()).find(|&i| before[i] != after[i]).expect("a zeroed range");
-    let hi = (0..before.len()).rfind(|&i| before[i] != after[i]).unwrap() + 1;
-    let mid = lo + (hi - lo) / 2;
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
-        f.seek(SeekFrom::Start(mid as u64)).unwrap();
-        f.write_all(&before[mid..hi]).unwrap();
-        f.sync_all().unwrap();
-    }
-
-    {
-        // The writer reopens: the declaration authorizes stepping over the part-zeroed frame.
-        let mut s = Store::open(&dir, cfg).unwrap();
-        assert_eq!(s.reconstruct("k").unwrap().unwrap(), live);
-        s.verify().unwrap();
-        // The declaration stands, and through it the block reads as deliberate ERASURE — not as a
-        // failing disk — even while its payload still holds surviving bytes.
-        let &(punched_lo, _) =
-            s.manifest().punched.first().expect("the punched declaration must survive reopen");
-        let err = s
-            .fold()
-            .read(turndb::fold::Loc { block_id: punched_lo, in_off: 0, raw: 1 })
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("ERASED"),
-            "a declared block must read as erasure, got: {err:#}"
-        );
-        // A retry finishes what the crash interrupted: the declared block is re-punched.
-        let retry = s.punch_unreferenced().unwrap();
-        assert!(retry.blocks_punched > 0, "the declared block must be retried, got {retry:?}");
-        assert!(!s.manifest().punched.is_empty(), "the retry must not lose the declaration");
-        s.verify().unwrap();
-        assert_eq!(s.reconstruct("k").unwrap().unwrap(), live);
-    }
-
-    // The same partial damage with NO declaration: nothing authorizes stepping over nonzero bytes
-    // that fail their checksum, so the committed tail sits beyond the last good block and open
-    // refuses rather than serve a fold that lost durable bytes.
-    let twin_seg = undeclared.join("fold").join("seg-00000000.fold");
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).open(&twin_seg).unwrap();
-        f.seek(SeekFrom::Start(lo as u64)).unwrap();
-        f.write_all(&vec![0u8; mid - lo]).unwrap();
-        f.sync_all().unwrap();
-    }
-    assert!(
-        Store::open(&undeclared, cfg).is_err(),
-        "undeclared partial damage must refuse at open, not be stepped over"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::remove_dir_all(&undeclared).ok();
-}
-
-/// Recursively copy a store directory — a byte-level snapshot for crash-twin tests.
-#[cfg(target_os = "linux")]
-fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        let dst = to.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_tree(&e.path(), &dst);
-        } else {
-            std::fs::copy(e.path(), &dst).unwrap();
-        }
-    }
-}
-
-/// Blocks actually allocated on disk, in bytes — what punching changes (file LENGTH does not).
+/// Allocated (not logical) bytes under a path — what `du` counts. Punching keeps lengths and
+/// offsets stable, so allocation is the only honest measure of bytes leaving the disk.
 fn allocated_bytes(d: &std::path::Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(store_file(d)).unwrap().blocks() * 512
+    let mut total = 0;
+    for entry in std::fs::read_dir(d).unwrap().flatten() {
+        let meta = entry.metadata().unwrap();
+        if meta.is_dir() {
+            total += allocated_bytes(&entry.path());
+        } else {
+            total += meta.blocks() * 512;
+        }
+    }
+    total
 }
 
 #[test]
@@ -2745,59 +2382,6 @@ fn health_is_cheap_complete_and_tracks_publication() {
 }
 
 #[test]
-fn space_usage_separates_live_retained_and_unclassified_files_without_double_counting() {
-    let dir = tmp("space-usage");
-    let mut store = Store::open(&dir, cfg()).unwrap();
-    put(&mut store, "one", b"first retained value long enough to fold");
-    store.flush().unwrap();
-    put(&mut store, "two", b"second retained value long enough to fold");
-    store.flush().unwrap();
-    store.merge_range(0, 2).unwrap();
-
-    std::fs::write(dir.join("operator-note"), b"not owned by TurnDB").unwrap();
-    let usage = store.space_usage().unwrap();
-    assert!(usage.live.files > 0);
-    assert!(usage.retained_only.files > 0, "retained manifests and replaced parts are pinned");
-    assert!(usage.unclassified.logical_bytes >= b"not owned by TurnDB".len() as u64);
-    assert_eq!(
-        usage.total.files,
-        usage.live.files + usage.retained_only.files + usage.unclassified.files
-    );
-    assert_eq!(
-        usage.total.logical_bytes,
-        usage.live.logical_bytes
-            + usage.retained_only.logical_bytes
-            + usage.unclassified.logical_bytes
-    );
-    match (
-        usage.total.allocated_bytes,
-        usage.live.allocated_bytes,
-        usage.retained_only.allocated_bytes,
-        usage.unclassified.allocated_bytes,
-    ) {
-        (Some(total), Some(live), Some(retained), Some(unclassified)) => {
-            assert_eq!(total, live + retained + unclassified);
-            assert!(usage.filesystem_available_bytes.is_some());
-        }
-        (None, None, None, None) => assert!(usage.filesystem_available_bytes.is_none()),
-        other => panic!("space allocation capability was inconsistent: {other:?}"),
-    }
-    let cancellation = turndb::control::CancellationToken::new();
-    cancellation.cancel();
-    let error = store
-        .space_usage_with_control(&turndb::control::OperationControl {
-            deadline: None,
-            cancellation: Some(cancellation),
-        })
-        .unwrap_err();
-    assert!(
-        error.downcast_ref::<turndb::control::OperationInterrupted>().is_some(),
-        "inventory cancellation must remain typed: {error:#}"
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 fn content_liveness_separates_stranded_dead_bytes_from_whole_reclaimable_blocks() {
     let dir = tmp("content-liveness");
     let mut store = Store::open_file(
@@ -3031,12 +2615,16 @@ fn a_single_file_store_lives_its_whole_life_against_one_file() {
     s.sync().unwrap();
     s.flush().unwrap();
 
-    // A second writer refuses while this one holds the file.
+    // A second writer refuses while this one holds the file — with the TYPED contention error,
+    // because a consumer retries contention and must be able to tell it from a failure.
     let second_err = match Store::open_file(&ct, cfg) {
         Ok(_) => panic!("a second writer must refuse while the first holds the file"),
-        Err(e) => e.to_string(),
+        Err(e) => e,
     };
-    assert!(second_err.contains("already has a writer"), "flock on the file is the gate");
+    assert!(
+        second_err.downcast_ref::<turndb::fold::WriterLocked>().is_some(),
+        "flock on the file is the gate, and it speaks the typed refusal: {second_err:#}"
+    );
 
     // Second flush: the retained log grows as members, parts accumulate.
     for i in 24..40u8 {

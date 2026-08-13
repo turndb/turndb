@@ -8,14 +8,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { open, TurndbError } from '../index.mjs';
 
-function dirBytes(dir) {
-  let total = 0;
-  for (const e of readdirSync(dir, { recursive: true })) {
-    const p = join(dir, e.toString());
-    const st = statSync(p);
-    if (st.isFile()) total += st.size;
-  }
-  return total;
+function dirBytes(file) {
+  // The store is one file; the settled WAL sidecar is empty or absent after a clean close.
+  return statSync(file).size;
 }
 
 // Identical structured-but-unique content for every store, generated once. Compressible enough
@@ -29,7 +24,7 @@ const BODIES = [];
 }
 
 async function fillStore(opts) {
-  const dir = mkdtempSync(join(tmpdir(), 'lvl-'));
+  const dir = join(mkdtempSync(join(tmpdir(), 'lvl-')), 's.turndb');
   const store = await open(dir, opts);
   for (let i = 0; i < BODIES.length; i++) {
     store.putBody(`rec-${String(i).padStart(4, '0')}`, BODIES[i], { i });
@@ -61,7 +56,7 @@ test('level 0 selects the engine default (19), documented escape hatch', async (
 });
 
 test('maybeCompact bounds the merge; autoCompact totals it; both keep every record', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'cmp-'));
+  const dir = join(mkdtempSync(join(tmpdir(), 'cmp-')), 's.turndb');
   const store = await open(dir);
   // Nine flushes -> nine parts.
   for (let p = 0; p < 9; p++) {

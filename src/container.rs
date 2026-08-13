@@ -25,7 +25,7 @@
 //! **A member is a list of extents, not one range.** A member staged whole has exactly one, but a
 //! member that grows across commits — the active fold segment — gains an extent per commit that
 //! extended it, with other members' bytes between. [`Container::extent`] stitches the list into
-//! one logical range through [`Extents`](crate::readat::Extents), so
+//! one logical range through [`crate::readat::Extents`], so
 //! [`Part::open_reader`](crate::part::Part::open_reader) and
 //! [`Fold::open_read_from`](crate::fold::Fold::open_read_from) never learn the bytes are
 //! scattered. Physically adjacent extents coalesce as they are staged, so a member extended by
@@ -82,8 +82,10 @@ const SB_LEN: usize = 56;
 /// actually returnable in place.
 pub const ALIGN: u64 = 4096;
 
-/// Suffix of the working directory a writer keeps beside a container, mirroring SQLite's `-wal`.
-/// Named here because file-level operations on a container have to know whether one exists.
+/// Suffix of the working directory the RETIRED checkpoint bridge kept beside a container. No
+/// writer creates one any more; it is named so `reclaim` can refuse a container that still has
+/// an abandoned 0.1.x session beside it, instead of rewriting under unfolded acknowledged writes
+/// only that release can settle.
 pub const HOT_SUFFIX: &str = "-hot";
 
 /// Refuse a directory that claims more than this compressed, before allocating for it.
@@ -292,14 +294,11 @@ impl Container {
 
     /// Open an existing container at its newest committed state.
     pub fn open(path: &Path) -> Result<Container> {
-        let (f, created) = crate::vfs::open_or_create(path)
+        // Plain open, never create: this is a question about an existing store, and an absent
+        // path must refuse TYPED — a NotFound a caller can classify — without ever putting a
+        // transient file at the queried name.
+        let f = crate::vfs::open_rw(path)
             .with_context(|| format!("open container {}", path.display()))?;
-        if created {
-            // `open_or_create` cannot be given O_EXCL semantics here, so an absent file would
-            // otherwise silently become an empty one that reports zero members.
-            let _ = crate::vfs::unlink(path);
-            bail!("not a container: {} does not exist", path.display());
-        }
         let len = f.metadata()?.len();
         if len < REGION_START {
             bail!("not a container: {} is shorter than its superblocks", path.display());
@@ -358,7 +357,9 @@ impl Container {
         if !crate::sys::lock_exclusive(&self.f)
             .with_context(|| format!("locking {}", self.path.display()))?
         {
-            bail!("{} already has a writer; a store takes exactly one", self.path.display());
+            // The TYPED refusal, same as the fold's lock file carried: contention is a state a
+            // consumer retries, and it must classify as one — never as an internal failure.
+            return Err(crate::fold::WriterLocked { path: self.path.clone() }.into());
         }
         Ok(())
     }
@@ -950,6 +951,22 @@ impl crate::readat::ReadAt for MemberReader {
     }
 }
 
+impl Container {
+    /// Clear the sealed flag on a restore's staging copy — the one deliberate exception to
+    /// "sealed is final". Finality binds the ARTIFACT: the backup stays sealed forever, and a
+    /// verified copy being restored is a different file being born writable, which is the whole
+    /// point of restoring. Crate-private and reachable only from the restore path, so nothing
+    /// else can talk itself into unsealing in place.
+    pub(crate) fn clear_seal_for_restore(&mut self) -> Result<u64> {
+        if !self.sealed {
+            return Ok(self.sb.seq);
+        }
+        self.sealed = false;
+        let sb = Superblock { seq: self.sb.seq + 1, flags: 0, ..self.sb };
+        self.flip(sb)
+    }
+}
+
 /// What one [`Container::punch_free_extents`] returned in place, and what it left.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FreePunchStats {
@@ -1011,6 +1028,20 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     let source = Container::open(path)?;
     if source.sealed() {
         bail!("container {} is sealed; sealed is final", path.display());
+    }
+    // The rewrite publishes by renaming over the live name. A writer holding the file would keep
+    // committing to the OLD inode — acknowledged writes vanishing behind a rename — so the flock
+    // is taken for the whole rewrite, and contention refuses typed, exactly as a second writer's
+    // open does. An unsettled WAL sidecar is the same hazard one step earlier: acknowledged
+    // records the container has not been told about yet, which only their writer can settle.
+    source.lock_writer()?;
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) != 0 {
+        bail!(
+            "{} has an unsettled write-ahead log beside it; open the store and settle it first",
+            path.display()
+        );
     }
     let bytes_before = std::fs::metadata(path)?.len();
     if source.free_bytes() == 0 {

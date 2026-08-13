@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { capabilities, compiledCapabilities, open, TurndbError } from '../index.mjs';
 
 async function withStore(tag, fn) {
-  const dir = await mkdtemp(join(tmpdir(), `turndb-observability-${tag}-`));
+  const root = await mkdtemp(join(tmpdir(), `turndb-observability-${tag}-`));
+  const dir = join(root, 's.turndb');
   const store = await open(dir);
   try {
     return await fn(store, dir);
@@ -110,14 +111,17 @@ test('a verification failure is callable through both the result and observabili
       kind: 'put', id: 'corrupt/me', contents: [{ name: 'body', bytes: 'intact' }], attrs: [],
     }], { durable: true });
     store.flush();
-    const part = (await readdir(dir)).find((name) => name.startsWith('part-'));
-    assert.ok(part);
-    const path = join(dir, part);
-    const before = await readFile(path);
+    // The part member's aligned start, anchored by its footer magic — its first section begins
+    // at member offset zero, and the damage lands there so verification exercises the section
+    // checksum rather than the footer.
+    const before = await readFile(dir);
+    const footer = before.indexOf(Buffer.from('TURNPART'));
+    assert.ok(footer > 0, 'the flushed part must exist in the store file');
+    const partStart = Math.floor(footer / 4096) * 4096;
     const after = Buffer.from(before);
-    after[16] ^= 0x40;
-    await writeFile(path, after);
-    assert.notDeepEqual(await readFile(path), before, 'mutation must reach the tested artifact');
+    after[partStart + 16] ^= 0x40;
+    await writeFile(dir, after);
+    assert.notDeepEqual(await readFile(dir), before, 'mutation must reach the tested artifact');
 
     assert.throws(() => store.verify(), (error) => {
       assert.ok(error instanceof TurndbError);

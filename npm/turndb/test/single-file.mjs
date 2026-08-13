@@ -20,25 +20,24 @@ if (!existsSync(CLI)) {
   );
 }
 
-test('reads a store held in one file, pack or container', async () => {
+test('reads a store held in one file, live or sealed', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-wasm-file-'));
-  const dir = join(root, 'store');
+  const container = join(root, 'store.turndb');
   const payload = JSON.stringify([{ role: 'user', content: 'one file' }]);
-  await mkdir(dir, { recursive: true });
-  const store = await open(dir);
+  // The portable writer produces the single file directly now; the CLI seals its snapshot —
+  // the pack's successor, same magic, same reader, finality by flag. (The pack READER survives
+  // for old artifacts; nothing produces new ones, so nothing here does either.)
+  const store = await open(container);
   store.putBody('trace:1#input', payload, { model: 'm0' });
   store.sync();
   store.flush();
   store.close();
 
-  assert.equal(await singleFileKind(dir), null, 'a directory carries neither magic');
+  const plainDir = join(root, 'plain');
+  await mkdir(plainDir, { recursive: true });
+  assert.equal(await singleFileKind(plainDir), null, 'a directory carries neither magic');
 
-  const container = join(root, 'store.turndb');
   const sealed = join(root, 'snapshot.turndb');
-  // The retired directory layout keeps exactly one door, and this walks through it; the sealed
-  // snapshot is the pack's successor — same magic, same reader, finality by flag. (The pack
-  // READER survives for old artifacts; nothing produces new ones, so nothing here does either.)
-  execFileSync(CLI, ['convert', dir, container]);
   execFileSync(CLI, ['seal', container, sealed]);
   assert.equal(await singleFileKind(container), 'container');
   assert.equal(await singleFileKind(sealed), 'container');
@@ -63,9 +62,10 @@ test('reads a store held in one file, pack or container', async () => {
 test('the first call a new user makes reports its own failure', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-first-contact-'));
 
-  // A store directory that does not exist yet is the overwhelmingly common first call, and
-  // `Store::open` creates it — this binding must not diverge just because WASI preopens first.
-  const fresh = join(root, 'deep', 'nested', 'store');
+  // A store path whose parents do not exist yet is the overwhelmingly common first call, and
+  // the engine creates them exactly as the retired directory open always did — this binding must
+  // not diverge just because WASI preopens first.
+  const fresh = join(root, 'deep', 'nested', 'store.turndb');
   const store = await open(fresh);
   store.putBody('x', 'y');
   store.sync();

@@ -17,7 +17,7 @@ fn body(i: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let dir = std::env::args().nth(1).unwrap_or_else(|| "/store".into());
+    let dir = std::env::args().nth(1).unwrap_or_else(|| "/store.turndb".into());
     let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
     let flush_every: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(512);
     let path = std::path::Path::new(&dir);
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     let logical: usize = bodies.iter().map(|b| b.len()).sum();
 
     let t0 = std::time::Instant::now();
-    let mut s = Store::open(path, FoldCfg::default())?;
+    let mut s = Store::open_file(path, FoldCfg::default())?;
     for (i, b) in bodies.iter().enumerate() {
         s.put_body(
             &format!("m/{:013}/{i:06}#input", 1_700_000_000_000u64 + i as u64),

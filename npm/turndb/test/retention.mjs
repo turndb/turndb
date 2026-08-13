@@ -19,7 +19,7 @@ async function snapshot(store) {
 }
 
 test('retention reports query absence, reclamation, and audit evidence separately', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'turndb-retention-cutoff-'));
+  const dir = join(await mkdtemp(join(tmpdir(), 'turndb-retention-cutoff-')), 's.turndb');
   const cutoff = 'trace/2026-08-05T09:00:00Z';
   const records = [
     ['trace/2026-08-05T08:00:00Z/a', 'dead-a'],
@@ -75,7 +75,7 @@ test('retention reports query absence, reclamation, and audit evidence separatel
 });
 
 test('refold is explicitly preflighted and reports logical output without claiming media erasure', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'turndb-retention-refold-'));
+  const dir = join(await mkdtemp(join(tmpdir(), 'turndb-retention-refold-')), 's.turndb');
   const store = await open(dir);
   try {
     store.write([{

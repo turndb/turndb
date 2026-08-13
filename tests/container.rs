@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use turndb::container::{Container, ALIGN, CONTAINER_VERSION, MAGIC, REGION_START, SLOT_LEN};
 use turndb::fold::FoldCfg;
 use turndb::readat::ReadAt as _;
-use turndb::store::{checkpoint_into_container, open_read_container, Span, Store};
+use turndb::store::{convert_to_file, open_read_container, Span, Store};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -48,102 +48,110 @@ fn newest_slot(bytes: &[u8]) -> usize {
     }
 }
 
-/// A store with several parts, a rolled fold, and a delete — the shapes a checkpoint must carry.
-fn build_store(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut s = Store::open(dir, cfg()).unwrap();
-    let mut want = Vec::new();
-    for round in 0..3 {
-        for i in 0..12 {
-            let id = format!("r{round}:{i:02}");
-            let body = noise(round as u64 * 100 + i as u64, 1800);
-            s.put(
-                &id,
-                &[Span::Lit(b"["), Span::Piece(&body), Span::Lit(b"]")],
-                vec![
-                    ("model".into(), AttrValue::Str(format!("m{}", i % 2))),
-                    ("n".into(), AttrValue::Int(i)),
-                ],
-            )
-            .unwrap();
-            let mut w = b"[".to_vec();
-            w.extend_from_slice(&body);
-            w.extend_from_slice(b"]");
-            want.push((id, w));
+/// Materialize the checked-in 0.1.3 directory-store fixture — the retired layout as its last
+/// writer actually left it, non-empty WAL included. See tests/fixtures/directory-store-0.1.3.hex.
+fn unpack_fixture(into: &Path) {
+    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/directory-store-0.1.3.hex");
+    let text = std::fs::read_to_string(&hex_path).unwrap();
+    let mut name: Option<PathBuf> = None;
+    let mut hex = String::new();
+    let flush = |name: &Option<PathBuf>, hex: &str| {
+        if let Some(path) = name {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
         }
-        s.sync().unwrap();
-        s.flush().unwrap();
+    };
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("== ") {
+            flush(&name, &hex);
+            hex.clear();
+            let rel = rest.split_whitespace().next().unwrap();
+            name = Some(into.join(rel));
+        } else {
+            hex.push_str(line.trim());
+        }
     }
-    s.delete("r0:00").unwrap();
-    s.sync().unwrap();
-    s.flush().unwrap();
-    want.retain(|(id, _)| id != "r0:00");
-    assert!(s.fold().segment_count() > 1, "the fixture must roll at least one segment");
-    want
+    flush(&name, &hex);
+}
+
+/// The generator's body function, byte for byte (xorshift64 over the seed).
+fn fixture_body(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect()
 }
 
 #[test]
-fn a_container_answers_identically_to_the_directory_it_came_from() {
-    let root = tmp("roundtrip");
+fn a_retired_directory_store_converts_whole_including_its_unflushed_wal() {
+    let root = tmp("convert-dir");
     std::fs::create_dir_all(&root).unwrap();
     let dir = root.join("store");
-    let want = build_store(&dir);
+    unpack_fixture(&dir);
+    assert!(
+        std::fs::metadata(dir.join("WAL")).unwrap().len() > 0,
+        "the fixture must carry an acknowledged, unflushed record in its WAL"
+    );
 
     let ct = root.join("store.turndb");
-    let stats = checkpoint_into_container(&dir, &ct).unwrap();
+    let stats = convert_to_file(&dir, &ct).unwrap();
     assert!(stats.members > 3, "manifest + parts + segments: {stats:?}");
-    assert_eq!(stats.commit_seq, 1, "the first checkpoint is commit 1");
     assert_eq!(Container::open(&ct).unwrap().verify().unwrap(), stats.members);
 
-    let from_dir = Store::open_read(&dir, cfg()).unwrap();
-    let from_container = open_read_container(&ct, cfg()).unwrap();
-    assert_eq!(from_dir.ids().unwrap(), from_container.ids().unwrap());
-    for (id, body) in &want {
-        assert_eq!(
-            from_container.reconstruct(id).unwrap().unwrap(),
-            *body,
-            "{id} must reconstruct byte-exact out of the container"
-        );
-        assert_eq!(
-            from_dir.get(id).unwrap().unwrap(),
-            from_container.get(id).unwrap().unwrap(),
-            "{id} record must match field for field"
-        );
+    let rs = open_read_container(&ct, cfg()).unwrap();
+    for round in 0..2u64 {
+        for i in 0..6u64 {
+            let id = format!("fix:{round}:{i}");
+            if id == "fix:0:0" {
+                assert!(
+                    rs.reconstruct(&id).unwrap().is_none(),
+                    "the delete must hold through conversion"
+                );
+                continue;
+            }
+            let mut want = b"[".to_vec();
+            want.extend_from_slice(&fixture_body(round * 10 + i, 1800));
+            want.extend_from_slice(b"]");
+            assert_eq!(
+                rs.reconstruct(&id).unwrap().unwrap(),
+                want,
+                "{id} must reconstruct byte-exact out of the converted file"
+            );
+            let record = rs.get(&id).unwrap().unwrap();
+            assert_eq!(
+                record.attrs.iter().find(|(k, _)| k == "model").map(|(_, v)| v.clone()),
+                Some(AttrValue::Str(format!("m{}", i % 2))),
+                "{id} scalar metadata must survive"
+            );
+        }
     }
-    assert!(
-        from_container.reconstruct("r0:00").unwrap().is_none(),
-        "the delete holds inside the container"
+    // The record that lived ONLY in the WAL: synced by 0.1.3, never flushed. Conversion opens
+    // the writer role, which replays it — losing it would be losing an acknowledged write.
+    assert_eq!(
+        rs.reconstruct("fix:wal:only").unwrap().unwrap(),
+        fixture_body(999, 700),
+        "conversion must replay the acknowledged WAL record"
     );
-    std::fs::remove_dir_all(&root).ok();
-}
+    drop(rs);
 
-#[test]
-fn a_second_checkpoint_reingests_only_what_changed() {
-    let root = tmp("incremental");
-    std::fs::create_dir_all(&root).unwrap();
-    let dir = root.join("store");
-    build_store(&dir);
-
-    let ct = root.join("store.turndb");
-    let first = checkpoint_into_container(&dir, &ct).unwrap();
-    assert_eq!(first.skipped_members, 0, "nothing exists to skip on the first pass");
-
-    // No writes between the two: every immutable member is already present at the same length, so
-    // only MANIFEST and the advisory sidecars are restaged.
-    let second = checkpoint_into_container(&dir, &ct).unwrap();
-    assert_eq!(second.commit_seq, 2, "each checkpoint publishes one new state");
-    assert!(
-        second.skipped_members > 0 && second.skipped_members < second.members,
-        "immutable members skip, mutable ones restage: {second:?}"
-    );
-    assert!(
-        second.ingested_bytes < first.ingested_bytes,
-        "an incremental checkpoint writes strictly less: {second:?} vs {first:?}"
-    );
-    assert!(second.free_bytes > 0, "restaged members supersede their old extents");
-
-    // And the container still answers.
-    let read = open_read_container(&ct, cfg()).unwrap();
-    assert!(!read.ids().unwrap().is_empty());
+    // And the converted file is an ordinary live store: writable, and done with the directory.
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
+    s.put("after:convert", &[Span::Piece(b"life goes on")], vec![]).unwrap();
+    s.sync().unwrap();
+    s.close().unwrap();
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -335,234 +343,32 @@ fn the_container_plane_versions_independently() {
 }
 
 #[test]
-fn a_container_can_be_written_to_and_stays_one_file() {
-    use turndb::store::ContainerStore;
-
-    let root = tmp("writer");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("live.turndb");
-
-    // Nothing exists yet: opening for writing creates the container and its working directory.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let hot = cs.hot_directory().to_path_buf();
-    let mut want = Vec::new();
-    for i in 0..8 {
-        let id = format!("w:{i:02}");
-        let body = noise(i, 1500);
-        cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-        want.push((id, body));
-    }
-    let stats = cs.close().unwrap();
-    assert!(stats.members >= 3, "the container must hold a real store: {stats:?}");
-
-    // The promise of the single-file shape: after a clean close, the file is the only artifact.
-    assert!(ct.is_file(), "the container must be a file");
-    assert!(!hot.exists(), "a clean close removes the working directory");
-
-    // And it reads as a store, byte-exact, with no directory anywhere.
-    let rs = open_read_container(&ct, cfg()).unwrap();
-    for (id, body) in &want {
-        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the round trip");
-    }
-    drop(rs);
-
-    // Reopening materializes, appends, and folds back in.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let extra = noise(99, 1500);
-    cs.store().put("w:99", &[Span::Piece(&extra)], vec![]).unwrap();
-    cs.close().unwrap();
-
-    let rs = open_read_container(&ct, cfg()).unwrap();
-    assert_eq!(
-        rs.reconstruct("w:99").unwrap().unwrap(),
-        extra,
-        "the appended record must be there"
-    );
-    assert_eq!(rs.ids().unwrap().len(), want.len() + 1, "and nothing earlier may be lost");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
 fn a_session_that_writes_nothing_still_leaves_a_container_that_opens() {
-    use turndb::store::ContainerStore;
-
     let root = tmp("empty-writer");
     std::fs::create_dir_all(&root).unwrap();
     let ct = root.join("empty.turndb");
 
-    // Applying no records is not an error. `turndb write new.turndb input.jsonl` reaches exactly
+    // Applying no records is not an error. `turndb import new.turndb input.jsonl` reaches exactly
     // this state whenever every line of the input is skipped — a mistyped schema, an empty file —
-    // and it used to leave an 8 KiB container holding no members at all, because a store that
-    // never commits never writes a MANIFEST and the checkpoint ingested that name unconditionally.
-    let cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let hot = cs.hot_directory().to_path_buf();
-    cs.close().unwrap();
-
+    // and the file left behind must open as an empty store, not refuse as a memberless husk.
+    let s = Store::open_file(&ct, cfg()).unwrap();
+    s.close().unwrap();
     assert!(ct.is_file(), "the container must exist");
-    assert!(!hot.exists(), "a clean close removes the working directory");
 
     let rs = open_read_container(&ct, cfg()).unwrap();
     assert!(rs.ids().unwrap().is_empty(), "an empty store holds no ids");
     drop(rs);
 
     // And it must take writes afterwards rather than stay poisoned by its own first session.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
     let body = noise(7, 900);
-    cs.store().put("later", &[Span::Piece(&body)], vec![]).unwrap();
-    cs.close().unwrap();
+    s.put("later", &[Span::Piece(&body)], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.close().unwrap();
 
     let rs = open_read_container(&ct, cfg()).unwrap();
     assert_eq!(rs.reconstruct("later").unwrap().unwrap(), body, "the later write must survive");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn reopening_leaves_the_sealed_parts_in_the_container() {
-    use turndb::store::ContainerStore;
-
-    let root = tmp("no-copy");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("big.turndb");
-
-    // Enough records, flushed repeatedly, to put several sealed parts in the container.
-    let mut want = Vec::new();
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    for round in 0..4u64 {
-        for i in 0..6u64 {
-            let id = format!("r:{round}:{i:02}");
-            let body = noise(round * 100 + i, 4000);
-            cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-            want.push((id, body));
-        }
-        cs.store().flush().unwrap();
-    }
-    cs.close().unwrap();
-
-    let sealed: Vec<String> = {
-        let c = Container::open(&ct).unwrap();
-        c.names().filter(|n| n.starts_with("part-")).map(String::from).collect()
-    };
-    assert!(sealed.len() >= 2, "the container must hold several sealed parts: {sealed:?}");
-
-    // Reopening for writing must not copy them out. This is the whole point: the cost of opening
-    // a store to append one record was the size of its entire history.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let hot = cs.hot_directory().to_path_buf();
-    let copied: Vec<String> = std::fs::read_dir(&hot)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("part-"))
-        .collect();
-    assert!(
-        copied.is_empty(),
-        "no sealed part may be copied into the working directory: {copied:?}"
-    );
-
-    // And the writer must still read every one of them, through the container, while open.
-    for (id, body) in &want {
-        assert_eq!(
-            cs.store().reconstruct(id).unwrap().unwrap(),
-            *body,
-            "{id} must be readable from the container extent"
-        );
-    }
-
-    // A further write folds back in without losing the members it never copied.
-    let extra = noise(9999, 4000);
-    cs.store().put("r:later", &[Span::Piece(&extra)], vec![]).unwrap();
-    cs.close().unwrap();
-
-    let rs = open_read_container(&ct, cfg()).unwrap();
-    for (id, body) in &want {
-        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the reopen");
-    }
-    assert_eq!(rs.reconstruct("r:later").unwrap().unwrap(), extra);
-    assert!(!hot.exists(), "a clean close removes the working directory");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn reopening_leaves_the_sealed_fold_segments_in_the_container() {
-    use turndb::store::ContainerStore;
-
-    let root = tmp("no-copy-fold");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("deep.turndb");
-
-    // `cfg()` rolls at 16 KiB, so this leaves a fold several segments deep.
-    let mut want = Vec::new();
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    for i in 0..40u64 {
-        let id = format!("s:{i:03}");
-        let body = noise(i, 2000);
-        cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-        want.push((id, body));
-    }
-    cs.close().unwrap();
-
-    let in_container: Vec<String> = {
-        let c = Container::open(&ct).unwrap();
-        c.names().filter(|n| n.ends_with(".fold")).map(String::from).collect()
-    };
-    assert!(
-        in_container.len() >= 3,
-        "the fixture must leave a multi-segment fold: {in_container:?}"
-    );
-
-    // Reopening copies out the segment the committed tail is in, and nothing below it. Those are
-    // sealed: the tail is strictly beyond them, so no truncation can ever apply.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let hot = cs.hot_directory().to_path_buf();
-    let copied: Vec<String> = std::fs::read_dir(hot.join("fold"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".fold"))
-        .collect();
-    assert!(
-        copied.len() < in_container.len(),
-        "sealed segments must stay in the container: copied {copied:?} of {in_container:?}"
-    );
-    assert_eq!(copied.len(), 1, "only the segment holding the committed tail: {copied:?}");
-    {
-        let container_fold: u64 = {
-            let c = Container::open(&ct).unwrap();
-            in_container.iter().map(|n| c.extent(n).unwrap().len().unwrap()).sum()
-        };
-        let copied_bytes: u64 =
-            copied.iter().map(|n| std::fs::metadata(hot.join("fold").join(n)).unwrap().len()).sum();
-        // The win, in bytes rather than in file counts: what a reopen costs must be a fraction of
-        // what the store holds, and it is bounded by one segment however deep the history gets.
-        assert!(
-            copied_bytes * 4 < container_fold,
-            "reopening must copy a fraction of the fold: {copied_bytes} of {container_fold} \
-             across {} of {} segments",
-            copied.len(),
-            in_container.len()
-        );
-    }
-
-    // Every record must still reconstruct, which means the writer is reading the segments it did
-    // not copy — through the container, block by block.
-    for (id, body) in &want {
-        assert_eq!(
-            cs.store().reconstruct(id).unwrap().unwrap(),
-            *body,
-            "{id} must be readable from a sealed segment extent"
-        );
-    }
-
-    // Appending must land in the live segment and fold back in without losing the sealed ones.
-    let extra = noise(4242, 2000);
-    cs.store().put("s:extra", &[Span::Piece(&extra)], vec![]).unwrap();
-    cs.close().unwrap();
-
-    let rs = open_read_container(&ct, cfg()).unwrap();
-    for (id, body) in &want {
-        assert_eq!(rs.reconstruct(id).unwrap().unwrap(), *body, "{id} must survive the reopen");
-    }
-    assert_eq!(rs.reconstruct("s:extra").unwrap().unwrap(), extra);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -637,78 +443,32 @@ fn a_committed_tail_inside_a_sealed_segment_is_refused_not_rolled_back() {
 }
 
 #[test]
-fn an_abandoned_working_directory_is_resumed_rather_than_discarded() {
-    use turndb::store::ContainerStore;
-
-    let root = tmp("resume");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("crash.turndb");
-
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let first = noise(1, 900);
-    cs.store().put("kept:1", &[Span::Piece(&first)], vec![]).unwrap();
-    cs.close().unwrap();
-
-    // A session that acknowledges a write and then dies: the hot directory outlives it holding
-    // state the container was never told about.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    let hot = cs.hot_directory().to_path_buf();
-    let second = noise(2, 900);
-    cs.store().put("kept:2", &[Span::Piece(&second)], vec![]).unwrap();
-    cs.store().sync().unwrap();
-    // Dropping without close() is the abandoned session: there is deliberately no Drop that
-    // checkpoints, so the container learns nothing and the working directory stays behind. The
-    // kernel releases the fold's flock the same way it would on a real crash.
-    drop(cs);
-    assert!(hot.exists(), "the fixture must leave a working directory behind");
-
-    // The container alone has only the first record — proving the second exists solely in hot.
-    let stale = open_read_container(&ct, cfg()).unwrap();
-    assert!(stale.reconstruct("kept:2").unwrap().is_none(), "the fixture must be a real gap");
-    drop(stale);
-
-    // Resuming must adopt that directory, not materialize over it: re-materializing would replace
-    // acknowledged writes with an older committed snapshot.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    assert_eq!(
-        cs.store().reconstruct("kept:2").unwrap().unwrap(),
-        second,
-        "an acknowledged write must survive the abandoned session"
-    );
-    cs.close().unwrap();
-
-    let rs = open_read_container(&ct, cfg()).unwrap();
-    assert_eq!(rs.reconstruct("kept:1").unwrap().unwrap(), first);
-    assert_eq!(rs.reconstruct("kept:2").unwrap().unwrap(), second);
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn reclaim_returns_the_space_repeated_checkpoints_leak() {
+fn reclaim_returns_the_space_repeated_sessions_leak() {
     use turndb::container::reclaim;
-    use turndb::store::ContainerStore;
 
     let root = tmp("reclaim");
     std::fs::create_dir_all(&root).unwrap();
     let ct = root.join("grows.turndb");
 
-    // Every session restages MANIFEST and the sidecars, so waste accumulates whether or not the
-    // store grows. Ten sessions is a fortnight of daily checkpoints, not an abusive fixture.
+    // Every flush restages MANIFEST and the live segment, so waste accumulates whether or not
+    // the store grows. Ten sessions is a fortnight of daily use, not an abusive fixture.
     let mut want = Vec::new();
     for round in 0..10 {
-        let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
+        let mut s = Store::open_file(&ct, cfg()).unwrap();
         let id = format!("r:{round:02}");
         let body = noise(round, 1200);
-        cs.store().put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
         want.push((id, body));
-        cs.close().unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
     }
 
     let before = Container::open(&ct).unwrap();
     let waste = before.free_bytes();
     let live = before.member_bytes();
     let members = before.len();
-    assert!(waste > 0, "repeated checkpoints must leave superseded extents to reclaim");
+    assert!(waste > 0, "repeated sessions must leave superseded extents to reclaim");
     drop(before);
 
     let stats = reclaim(&ct).unwrap();
@@ -735,9 +495,11 @@ fn reclaim_returns_the_space_repeated_checkpoints_leak() {
     assert_eq!(again.bytes_after, again.bytes_before);
 
     // And it stays writable afterwards.
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    cs.store().put("after:1", &[Span::Piece(b"still writable")], vec![]).unwrap();
-    cs.close().unwrap();
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
+    s.put("after:1", &[Span::Piece(b"still writable")], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.close().unwrap();
     assert_eq!(
         open_read_container(&ct, cfg()).unwrap().reconstruct("after:1").unwrap().unwrap(),
         b"still writable"
@@ -748,26 +510,51 @@ fn reclaim_returns_the_space_repeated_checkpoints_leak() {
 #[test]
 fn reclaim_refuses_a_container_a_writer_may_be_holding() {
     use turndb::container::reclaim;
-    use turndb::store::ContainerStore;
 
     let root = tmp("reclaim-busy");
     std::fs::create_dir_all(&root).unwrap();
     let ct = root.join("busy.turndb");
 
-    let mut cs = ContainerStore::open(&ct, cfg()).unwrap();
-    cs.store().put("held:1", &[Span::Piece(b"in flight")], vec![]).unwrap();
-    cs.store().sync().unwrap();
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
+    s.put("held:1", &[Span::Piece(b"in flight")], vec![]).unwrap();
+    s.sync().unwrap();
 
-    // Rewriting now would publish a container about to be superseded by a checkpoint of writes it
-    // never saw — and the writer's own working directory is the evidence that is happening.
+    // Reclaim publishes by renaming over the live name; a writer holding the flock would keep
+    // committing to the old inode, so contention must refuse — typed, the way a second writer's
+    // open refuses.
     let err = match reclaim(&ct) {
-        Ok(s) => panic!("reclaim must refuse a container with a live writer, got {s:?}"),
+        Ok(stats) => panic!("reclaim must refuse a container with a live writer, got {stats:?}"),
+        Err(e) => e,
+    };
+    assert!(
+        err.downcast_ref::<turndb::fold::WriterLocked>().is_some(),
+        "the refusal must be the typed contention error: {err:#}"
+    );
+
+    // Closed but NOT settled: sync() then a plain drop leaves the acknowledged record in the WAL
+    // sidecar, and rewriting under it would strand what only its writer can settle.
+    drop(s);
+    let wal = {
+        let mut p = ct.clone().into_os_string();
+        p.push("-wal");
+        PathBuf::from(p)
+    };
+    assert!(
+        std::fs::metadata(&wal).unwrap().len() > 0,
+        "the fixture must leave an unsettled WAL sidecar"
+    );
+    let err = match reclaim(&ct) {
+        Ok(stats) => panic!("reclaim must refuse an unsettled WAL, got {stats:?}"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("working directory"), "the refusal must name why, got: {err}");
+    assert!(err.contains("write-ahead log"), "the refusal must name why, got: {err}");
 
-    cs.close().unwrap();
-    reclaim(&ct).expect("once the writer is gone, reclaim proceeds");
+    // Settle it properly and reclaim proceeds.
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.close().unwrap();
+    reclaim(&ct).expect("once the writer is gone and the WAL settled, reclaim proceeds");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -775,34 +562,35 @@ fn reclaim_refuses_a_container_a_writer_may_be_holding() {
 fn space_accounting_answers_for_a_single_file_store_too() {
     let root = tmp("space");
     std::fs::create_dir_all(&root).unwrap();
-    let dir = root.join("store");
-    build_store(&dir);
-
-    // The directory's own answer is the reference: whatever it reports, the same store served out
-    // of a file must report too. A fold that cannot measure itself returns zero rather than
-    // failing, so this is the shape of bug that hides in a report nobody cross-checks.
-    let from_dir = Store::open_read(&dir, cfg()).unwrap();
-    let want = from_dir.fold().disk_bytes();
-    assert!(want > 0, "the fixture must have fold bytes to account for");
-    drop(from_dir);
-
     let ct = root.join("space.turndb");
-    checkpoint_into_container(&dir, &ct).unwrap();
+
+    // The writer's own answer is the reference: whatever the live session reports, the same
+    // store served back out of the container's members must report too. A fold that cannot
+    // measure itself returns zero rather than failing, so this is the shape of bug that hides
+    // in a report nobody cross-checks.
+    let mut s = Store::open_file(&ct, cfg()).unwrap();
+    for round in 0..3u64 {
+        for i in 0..12u64 {
+            s.put(
+                &format!("r{round}:{i:02}"),
+                &[Span::Piece(&noise(round * 100 + i, 1800))],
+                vec![],
+            )
+            .unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    assert!(s.fold().segment_count() > 1, "the fixture must roll at least one segment");
+    let want = s.fold().disk_bytes();
+    assert!(want > 0, "the fixture must have fold bytes to account for");
+    s.close().unwrap();
+
     let from_container = open_read_container(&ct, cfg()).unwrap();
     assert_eq!(
         from_container.fold().disk_bytes(),
         want,
-        "a container-backed fold must account for the same bytes as the directory it came from"
-    );
-    drop(from_container);
-
-    let pk = root.join("space.pack");
-    turndb::pack::write(&dir, &pk).unwrap();
-    let from_pack = turndb::store::open_read_pack(&pk, cfg()).unwrap();
-    assert_eq!(
-        from_pack.fold().disk_bytes(),
-        want,
-        "a pack-backed fold must account for the same bytes too"
+        "a container-backed fold must account for the same bytes the live session did"
     );
     std::fs::remove_dir_all(&root).ok();
 }

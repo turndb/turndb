@@ -54,9 +54,9 @@ fn main() -> anyhow::Result<()> {
 
     for s in &specs {
         let carve = spec(s);
-        let dir = work.join(s.replace(':', "-"));
+        let dir = work.join(format!("{}.turndb", s.replace(':', "-")));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut st = Store::open(&dir, FoldCfg::default())?;
+        let mut st = Store::open_file(&dir, FoldCfg::default())?;
         let t = std::time::Instant::now();
         let mut logical = 0u64;
         for (i, line) in lines.iter().enumerate() {

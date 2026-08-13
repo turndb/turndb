@@ -271,23 +271,16 @@ fn fold_open_never_panics_on_damage() {
 fn pack_open_never_panics_on_damage() {
     let dir = tmp("pack");
     std::fs::create_dir_all(&dir).unwrap();
-    let store_dir = dir.join("store");
-    {
-        let mut s = Store::open(&store_dir, FoldCfg::default()).unwrap();
-        for i in 0..8 {
-            s.put(
-                &format!("p:{i}"),
-                &[Span::Piece(format!("pack storm body {i} {}", "q".repeat(i * 31)).as_bytes())],
-                vec![("n".into(), AttrValue::Int(i as i64))],
-            )
-            .unwrap();
-        }
-        s.sync().unwrap();
-        s.flush().unwrap();
-    }
-    let pk = dir.join("p.turndb");
-    turndb::pack::write(&store_dir, &pk).unwrap();
-    let pristine = std::fs::read(&pk).unwrap();
+    // The pack WRITER is gone; the checked-in version-one consumer artifact is the pack every
+    // surviving reader must still take, so it is also the pack the storm mutates.
+    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+    let pristine: Vec<u8> = digits
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
     let target = dir.join("mutant.turndb");
     storm("pack", &pristine, &target, 2500, 0x9AC4, |p| {
         // the full read stack over a damaged pack: footer, TOC, manifest, fold, parts
@@ -295,27 +288,10 @@ fn pack_open_never_panics_on_damage() {
         let _ = pack.verify();
         let Ok(rs) = turndb::store::open_read_pack(p, FoldCfg::default()) else { return };
         let _ = rs.ids();
-        let _ = rs.reconstruct("p:3");
-    });
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn store_open_never_panics_on_manifest_damage() {
-    let dir = tmp("manifest");
-    std::fs::create_dir_all(&dir).unwrap();
-    {
-        let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
-        s.put("k", &[Span::Piece(b"manifest storm body, long enough to fold")], vec![]).unwrap();
-        s.sync().unwrap();
-        s.flush().unwrap();
-    }
-    let man = dir.join("MANIFEST");
-    let pristine = std::fs::read(&man).unwrap();
-    // Mutate MANIFEST in place and open READ-ONLY: a reader must refuse damage without panicking —
-    // and without mutating anything, which is why the writer's open is not the probe here.
-    storm("manifest", &pristine, &man, 3000, 0x3A21F & 0xFFFF, |_| {
-        let _ = Store::open_read(&dir, FoldCfg::default());
+        let _ = rs.reconstruct("legacy/0001");
+        // And the surviving write-side door a pack still walks through: conversion.
+        let _ = turndb::store::convert_to_file(p, &p.with_extension("converted"));
+        let _ = std::fs::remove_file(p.with_extension("converted"));
     });
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -332,18 +308,16 @@ fn container_parsers_never_panic_on_damage() {
 
     // A container with several members, so the directory carries real entries to damage: a
     // one-member container would never exercise the walk past its first iteration.
-    let source = dir.join("store");
-    let mut s = Store::open(&source, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+    let built = dir.join("built.turndb");
+    let mut s =
+        Store::open_file(&built, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
     for i in 0..12 {
         let body = vec![b'a' + (i % 26) as u8; 900];
         s.put(&format!("c:{i:02}"), &[Span::Piece(&body)], vec![]).unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
-    drop(s);
-
-    let built = dir.join("built.turndb");
-    turndb::store::checkpoint_into_container(&source, &built).unwrap();
+    s.close().unwrap();
     let pristine = std::fs::read(&built).unwrap();
     assert!(pristine.len() > 8192, "the fixture must have members past the superblocks");
 
@@ -388,18 +362,16 @@ fn a_checksum_valid_directory_with_hostile_contents_is_refused_not_trusted() {
     let dir = tmp("container-dir");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let source = dir.join("store");
-    let mut s = Store::open(&source, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
+    let built = dir.join("built.turndb");
+    let mut s =
+        Store::open_file(&built, FoldCfg { block_target: 4096, ..Default::default() }).unwrap();
     for i in 0..8 {
         let body = vec![b'x'; 700];
         s.put(&format!("d:{i:02}"), &[Span::Piece(&body)], vec![]).unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
-    drop(s);
-
-    let built = dir.join("built.turndb");
-    turndb::store::checkpoint_into_container(&source, &built).unwrap();
+    s.close().unwrap();
     let pristine = std::fs::read(&built).unwrap();
 
     // The live slot is the one with the higher sequence; both carry the magic.

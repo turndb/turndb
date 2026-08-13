@@ -5,7 +5,6 @@
 //! use different zstd implementations of the same format, so shared source types are not proof.
 use anyhow::Result;
 use turndb::fold::FoldCfg;
-use turndb::store::Store;
 use turndb::types::AttrValue;
 
 fn body(i: usize) -> Vec<u8> {
@@ -35,7 +34,7 @@ fn id(i: usize) -> String {
 fn main() -> Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "/store".into());
     let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(64);
-    let s = Store::open_read(std::path::Path::new(&dir), FoldCfg::default())?;
+    let s = turndb::store::open_read_container(std::path::Path::new(&dir), FoldCfg::default())?;
 
     let ids = s.ids()?;
     let expected_ids: Vec<String> = (0..n).map(id).collect();

@@ -206,7 +206,7 @@ in the [security review](docs/security-review.md); checksums are integrity evide
 the engine enforces this with `flock`, which the kernel releases when the process dies — so a
 stale lock cannot outlive its owner. **Under WASI there is no advisory locking and the engine
 cannot enforce it**: the lock file is created and gates nothing, so the obligation is the
-embedder's — at most one open writer per store directory, across every process and every WASM
+embedder's — at most one open writer per store file, across every process and every WASM
 instance. The guest cannot enforce or detect a violation. In four measured
 overlapping-writer runs on Node 24, both writers received successful `sync()` acknowledgements and
 one writer's complete record set was silently discarded. The surviving store was internally

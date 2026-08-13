@@ -9,9 +9,7 @@ import { open, TurndbError } from '../index.mjs';
 test('sequential opens reuse one WASI instance without external-memory accumulation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-reuse-'));
   try {
-    const firstDir = join(root, 'store-0');
-    await mkdir(firstDir);
-    const first = await open(firstDir);
+    const first = await open(join(root, 'store-0.turndb'));
     first.close();
     const oneInstance = process.memoryUsage().external;
     let peak = oneInstance;
@@ -21,9 +19,7 @@ test('sequential opens reuse one WASI instance without external-memory accumulat
     // not a budget: every iteration must reuse the same instance, so increasing it cannot create
     // another step in external-memory accounting.
     for (let i = 0; i < 64; i++) {
-      const dir = join(root, `store-${i + 1}`);
-      await mkdir(dir);
-      const store = await open(dir);
+      const store = await open(join(root, `store-${i + 1}.turndb`));
       store.putBody(`record/${i}`, `body/${i}`);
       store.sync();
       store.close();
@@ -42,12 +38,12 @@ test('sequential opens reuse one WASI instance without external-memory accumulat
       );
     }
 
-    const firstReopened = await open(join(root, 'store-1'));
+    const firstReopened = await open(join(root, 'store-1.turndb'));
     assert.equal(firstReopened.getText('record/0'), 'body/0');
     assert.equal(firstReopened.get('record/63'), null, 'switching capabilities must not expose another store');
     firstReopened.close();
 
-    const lastReopened = await open(join(root, 'store-64'));
+    const lastReopened = await open(join(root, 'store-64.turndb'));
     assert.equal(lastReopened.getText('record/63'), 'body/63');
     lastReopened.close();
   } finally {
@@ -58,10 +54,8 @@ test('sequential opens reuse one WASI instance without external-memory accumulat
 test('a live handle prevents a second handle in the process', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-one-handle-'));
   try {
-    const firstDir = join(root, 'first');
-    const secondDir = join(root, 'second');
-    await mkdir(firstDir);
-    await mkdir(secondDir);
+    const firstDir = join(root, 'first.turndb');
+    const secondDir = join(root, 'second.turndb');
     const store = await open(firstDir);
     await assert.rejects(open(secondDir), (e) => {
       assert.ok(e instanceof TurndbError);
@@ -80,8 +74,7 @@ test('a live handle prevents a second handle in the process', async () => {
 test('concurrent opens cannot switch the directory capability under a live handle', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-concurrent-open-'));
   try {
-    const dirs = [join(root, 'first'), join(root, 'second')];
-    await Promise.all(dirs.map((dir) => mkdir(dir)));
+    const dirs = [join(root, 'first.turndb'), join(root, 'second.turndb')];
     const results = await Promise.allSettled(dirs.map((dir) => open(dir)));
     assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
     assert.equal(results.filter((r) => r.status === 'rejected').length, 1);
@@ -103,11 +96,11 @@ test('concurrent opens cannot switch the directory capability under a live handl
 test('failed opens release their directory capability', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-failed-open-'));
   try {
-    const badDir = join(root, 'bad');
-    const goodDir = join(root, 'good');
-    await mkdir(badDir);
-    await mkdir(goodDir);
-    await writeFile(join(badDir, 'MANIFEST'), 'not a manifest');
+    const badDir = join(root, 'bad.turndb');
+    const goodDir = join(root, 'good.turndb');
+    // Long enough that the writer cannot mistake it for its own interrupted creation: past the
+    // superblock region, dead slots are a refusal, never a re-birth.
+    await writeFile(badDir, Buffer.alloc(16384, 0x78));
     const fdBaseline = process.platform === 'linux' ? (await readdir('/proc/self/fd')).length : null;
 
     for (let i = 0; i < 16; i++) {

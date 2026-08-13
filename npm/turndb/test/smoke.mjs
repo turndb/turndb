@@ -8,7 +8,7 @@ import { open, capabilities, compiledCapabilities, TurndbError } from '../index.
 
 async function withStore(fn, opts) {
   const dir = await mkdtemp(join(tmpdir(), 'turndb-test-'));
-  const s = await open(dir, opts);
+  const s = await open(join(dir, 's.turndb'), opts);
   try { return await fn(s, dir); } finally { try { s.close(); } catch {} await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -249,7 +249,7 @@ test('errors carry the engine message, not a generic one', async () => {
 });
 
 test('data survives close and reopen', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'turndb-reopen-'));
+  const dir = join(await mkdtemp(join(tmpdir(), 'turndb-reopen-')), 's.turndb');
   try {
     let s = await open(dir);
     s.putBody('persist/1', 'durable');

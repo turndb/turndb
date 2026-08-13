@@ -59,9 +59,9 @@ fn main() -> anyhow::Result<()> {
 
     for s in &specs {
         let policy = parse(s);
-        let dir = work.join(s.replace([':', ','], "-"));
+        let dir = work.join(format!("{}.turndb", s.replace([':', ','], "-")));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut st = Store::open(&dir, FoldCfg::default())?;
+        let mut st = Store::open_file(&dir, FoldCfg::default())?;
         let t0 = Instant::now();
         let (mut merges, mut merge_wall, mut merge_meta_bytes) = (0usize, 0.0f64, 0u64);
         for (i, body) in bodies.iter().enumerate() {

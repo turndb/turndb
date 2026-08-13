@@ -82,7 +82,9 @@ pub struct WriterLocked {
 
 impl std::fmt::Display for WriterLocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "fold at {} is already open by another writer", self.path.display())
+        // The path speaks for itself — a store file or a fold directory — so the message must
+        // not name either layout.
+        write!(f, "{} is already open by another writer", self.path.display())
     }
 }
 
@@ -817,13 +819,24 @@ impl Fold {
         let mut seen_blocks = 0u64;
         for (i, h) in headers.iter().enumerate() {
             let len = crate::readat::ReadAt::len(&readers[i])?;
-            let (_, entries) = segment::scan_tail_with_limits(
+            let (good, entries) = segment::scan_tail_with_limits(
                 &readers[i],
                 len,
                 h.has_dict(),
                 punched,
                 read_limits,
             )?;
+            // Committed extents hold only good frames by construction — the pre-flip barrier
+            // made every byte durable before the directory named it. A scan that ends early is
+            // therefore damage, and the refusal must say so; in the directory layout this same
+            // condition surfaced as a committed tail beyond the last good block.
+            if good != len {
+                bail!(
+                    "fold segment {} scans to {good} of its {len} committed bytes — the fold \
+                     lost durable data",
+                    h.seg
+                );
+            }
             for (id, off) in entries {
                 install_block_location(
                     &mut blockdir,

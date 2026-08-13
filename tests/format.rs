@@ -12,7 +12,7 @@
 //! test that used `parse_hdr` to check `parse_hdr`'s layout would pass no matter what the layout
 //! became; that is the whole failure mode being guarded against.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use turndb::fold::{FoldCfg, Loc};
 use turndb::store::{Batch, ContentSpans, Span, Store};
 use turndb::types::ContentHash;
@@ -23,10 +23,18 @@ fn tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("turndb-format-{tag}-{}-{n}", std::process::id()))
 }
 
-/// A store with one flushed part and real content in the fold.
+fn wal_sidecar(store: &Path) -> PathBuf {
+    let mut p = store.as_os_str().to_os_string();
+    p.push("-wal");
+    PathBuf::from(p)
+}
+
+/// A store with one flushed part and real content in the fold, laid out for raw parsing.
 fn built(tag: &str) -> PathBuf {
     let dir = tmp(tag);
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     for i in 0..30u32 {
         let body: Vec<u8> = (0..400u32)
             .flat_map(|j| blake3::hash(&(i * 1000 + j).to_le_bytes()).as_bytes()[..8].to_vec())
@@ -43,7 +51,27 @@ fn built(tag: &str) -> PathBuf {
     }
     s.sync().unwrap();
     s.flush().unwrap();
+    s.close().unwrap();
+    materialize(&store, &dir);
     dir
+}
+
+/// Lay a store's members out as loose files under `dir` — the artifacts ARE the members, and
+/// these tests parse artifacts raw, so deconstruction is all the envelope owes them. The WAL
+/// sidecar, when present, lands under its retired in-directory name for the same reason.
+fn materialize(store: &Path, dir: &std::path::Path) {
+    let c = turndb::container::Container::open(store).unwrap();
+    for name in c.names().map(String::from).collect::<Vec<_>>() {
+        let bytes = c.read_file_bounded(&name, 1 << 30).unwrap();
+        let out = dir.join(&name);
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        std::fs::write(&out, bytes).unwrap();
+    }
+    let mut wal = store.as_os_str().to_os_string();
+    wal.push("-wal");
+    if let Ok(bytes) = std::fs::read(&wal) {
+        std::fs::write(dir.join("WAL"), bytes).unwrap();
+    }
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
@@ -262,13 +290,17 @@ fn merged_part_footer_distinguishes_seq_lo_from_seq_hi() {
     // fixture flushes once, so seq_lo == seq_hi and the two are indistinguishable in the bytes.
     // Merging three parts gives a footer whose range is genuinely [1,3].
     let dir = tmp("seqrange");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     for i in 0..3u32 {
         s.put(&format!("m{i}"), &[Span::Lit(b"x")], vec![]).unwrap();
         s.sync().unwrap();
         s.flush().unwrap();
     }
     s.merge_range(0, 3).unwrap().unwrap();
+    s.close().unwrap();
+    materialize(&store, &dir);
 
     // The three merged-away originals remain on disk until the sweep, so the directory holds four
     // `.part` files and `read_dir` order — filesystem-dependent — must not pick one. FORMAT.md
@@ -355,10 +387,12 @@ fn a_part_declares_the_sections_the_document_lists() {
 #[test]
 fn wal_frame_matches_the_document() {
     let dir = tmp("wal");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     s.put("only", &[Span::Lit(b"body")], vec![]).unwrap();
     s.sync().unwrap();
-    let b = std::fs::read(dir.join("WAL")).unwrap();
+    let b = std::fs::read(wal_sidecar(&store)).unwrap();
 
     assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a version-2 record");
     assert_eq!(le64(&b, 1), 0, "seq at 1");
@@ -374,7 +408,7 @@ fn wal_frame_matches_the_document() {
     // a deletion is tagged differently and carries the id alone
     s.delete("only").unwrap();
     s.sync().unwrap();
-    let b = std::fs::read(dir.join("WAL")).unwrap();
+    let b = std::fs::read(wal_sidecar(&store)).unwrap();
     let t = 13 + len + 4;
     assert_eq!(b[t], 0x58, "tag 0x58 for a tombstone");
     assert_eq!(&b[t + 13..t + 13 + 4], b"only", "a tombstone payload is the id alone");
@@ -384,7 +418,9 @@ fn wal_frame_matches_the_document() {
 #[test]
 fn wal_batch_frames_carry_the_documented_tags() {
     let dir = tmp("walbatchtags");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     s.put("seed", &[Span::Lit(b"z")], vec![]).unwrap();
     s.sync().unwrap();
     s.flush().unwrap(); // truncates the WAL, so the batch frames start at offset 0
@@ -395,7 +431,7 @@ fn wal_batch_frames_carry_the_documented_tags() {
     s.apply(batch).unwrap();
     s.sync().unwrap();
     drop(s);
-    let b = std::fs::read(dir.join("WAL")).unwrap();
+    let b = std::fs::read(wal_sidecar(&store)).unwrap();
 
     assert_eq!(b[0], 0x5D, "tag at 0 is 0x5D for a version-2 record inside a batch");
     let len0 = le32(&b, 9) as usize;
@@ -418,7 +454,9 @@ fn wal_record_payload_matches_the_documented_layout() {
     // from calling the encoder: identity marker placement, the plain-u8 op tag, and the value
     // widths of attribute tags 4 (u64), 5 (binary), 6 (timestamp), 7 (explicit null).
     let dir = tmp("walpayload");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     s.put(
         "rec",
         &[Span::Lit(b"xy")],
@@ -432,7 +470,7 @@ fn wal_record_payload_matches_the_documented_layout() {
     .unwrap();
     s.sync().unwrap();
     drop(s);
-    let b = std::fs::read(dir.join("WAL")).unwrap();
+    let b = std::fs::read(wal_sidecar(&store)).unwrap();
 
     assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a version-2 record");
     let len = le32(&b, 9) as usize;
@@ -492,13 +530,16 @@ fn binary_attribute_dictionary_matches_the_documented_layout() {
     // distinct dictionary — varint count, then varint len + bytes per entry — and its value
     // column is u32 ordinals into that dictionary, one per occurrence in row order.
     let dir = tmp("bindict");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     for (id, raw) in [("a", vec![0xBB]), ("b", vec![0xAA]), ("c", vec![0xBB])] {
         s.put(id, &[Span::Lit(b"x")], vec![("raw".into(), AttrValue::Bytes(raw))]).unwrap();
     }
     s.sync().unwrap();
     s.flush().unwrap();
-    drop(s);
+    s.close().unwrap();
+    materialize(&store, &dir);
     let b = part(&dir);
 
     let dict = raw_section(&b, "col.dict.0");
@@ -518,7 +559,9 @@ fn con_off_matches_the_documented_layout_for_a_multi_content_record() {
     // FORMAT.md § Named content columns: con.off.N holds occurrences + 1 little-endian u64
     // offsets into con.prog.N, cumulative from 0, and columns are ordered by UTF-8 name.
     let dir = tmp("conoff");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     s.put_record(
         "m0",
         &[
@@ -539,7 +582,8 @@ fn con_off_matches_the_documented_layout_for_a_multi_content_record() {
     .unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
-    drop(s);
+    s.close().unwrap();
+    materialize(&store, &dir);
     let b = part(&dir);
 
     // cmeta names the columns in UTF-8 order: alpha is column 0, beta is column 1.
@@ -702,20 +746,27 @@ fn a_truncated_part_is_refused() {
 #[test]
 fn a_segment_with_unknown_flags_is_refused() {
     let dir = built("flags");
-    let mut sp: Vec<PathBuf> = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false))
-        .collect();
-    sp.sort();
-    let mut b = std::fs::read(&sp[0]).unwrap();
+    let store = dir.join("s.turndb");
     // Bit 0 is ENCRYPTED and KNOWN — a known bit is acted on, not refused. Pick a bit no
     // revision has claimed, which is what "unknown means stop, not adapt" is actually about.
-    b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
-    std::fs::write(&sp[0], &b).unwrap();
+    // The segment lives as a member now; its extent is where the header bytes are.
+    let (seg_off, _) = {
+        let c = turndb::container::Container::open(&store).unwrap();
+        let name = c
+            .names()
+            .map(String::from)
+            .filter(|n| n.starts_with("fold/") && n.ends_with(".fold"))
+            .min()
+            .expect("a fold segment member");
+        let extents = c.member_extents(&name).unwrap();
+        extents[0]
+    };
+    let mut b = std::fs::read(&store).unwrap();
+    let at = seg_off as usize + 12;
+    b[at..at + 4].copy_from_slice(&(1u32 << 17).to_le_bytes());
+    std::fs::write(&store, &b).unwrap();
 
-    let e = match Store::open_read(&dir, FoldCfg::default()) {
+    let e = match turndb::store::open_read_container(&store, FoldCfg::default()) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("an unknown segment flag must not open"),
     };
@@ -728,8 +779,10 @@ fn a_fold_with_a_missing_segment_is_refused_by_readers_too() {
     // The writer always refused a gap. A reader that did not would serve a fold with a hole in its
     // block space instead of refusing — the worse half of an asymmetry.
     let dir = tmp("gap");
-    let mut s = Store::open(
-        &dir,
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(
+        &store,
         FoldCfg { seg_max: 1 << 17, block_target: 1 << 14, ..FoldCfg::default() },
     )
     .unwrap();
@@ -741,20 +794,32 @@ fn a_fold_with_a_missing_segment_is_refused_by_readers_too() {
     }
     s.sync().unwrap();
     s.flush().unwrap();
-    drop(s);
+    s.close().unwrap();
 
-    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir.join("fold"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "fold").unwrap_or(false))
+    // Rebuild the store byte-identical except for segment 0 — a hole punched with the public
+    // container writer, so the fixture is a well-formed CONTAINER whose FOLD is not dense.
+    let source = turndb::container::Container::open(&store).unwrap();
+    let seg_names: Vec<String> = source
+        .names()
+        .map(String::from)
+        .filter(|n| n.starts_with("fold/") && n.ends_with(".fold"))
         .collect();
-    segs.sort();
-    assert!(segs.len() >= 3, "the fixture must produce several segments; got {}", segs.len());
-    std::fs::remove_file(&segs[0]).unwrap(); // punch a hole at seg 0
+    assert!(seg_names.len() >= 3, "the fixture must produce several segments: {seg_names:?}");
+    let hole = seg_names.iter().min().unwrap().clone();
+    let gapped = dir.join("gapped.turndb");
+    let mut fresh = turndb::container::Container::create(&gapped).unwrap();
+    for name in source.names().map(String::from).collect::<Vec<_>>() {
+        if name == hole {
+            continue;
+        }
+        let bytes = source.read_file_bounded(&name, 1 << 30).unwrap();
+        fresh.put_bytes(&name, &bytes).unwrap();
+    }
+    fresh.commit().unwrap();
+    drop(fresh);
 
     assert!(
-        Store::open_read(&dir, FoldCfg::default()).is_err(),
+        turndb::store::open_read_container(&gapped, FoldCfg::default()).is_err(),
         "a reader must refuse a fold whose segments are not dense"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -788,7 +853,9 @@ fn the_body_op_escape_is_reserved_and_never_written() {
     // an unbounded future op space for zero bytes — but only if today's reader refuses it, since
     // otherwise it would parse a future escape's payload as ops.
     let dir = tmp("escape");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     // an empty literal is dropped rather than encoded, so the reserved codepoint never appears
     s.put("r", &[Span::Lit(b""), Span::Lit(b"real"), Span::Lit(b"")], vec![]).unwrap();
     s.sync().unwrap();
@@ -798,7 +865,8 @@ fn the_body_op_escape_is_reserved_and_never_written() {
         b"real".to_vec(),
         "dropping an empty literal must preserve the body exactly"
     );
-    drop(s);
+    s.close().unwrap();
+    materialize(&store, &dir);
 
     // and the encoded program contains no zero tag
     let p = turndb::part::Part::open(&part_path(&dir)).unwrap();
@@ -814,13 +882,15 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     // log" meant a future frame type would silently discard every committed record after it. The crc
     // disambiguates — a torn tail does not checksum, a deliberate frame does.
     let dir = tmp("walfuture");
-    let mut s = Store::open(&dir, FoldCfg::default()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.turndb");
+    let mut s = Store::open_file(&store, FoldCfg::default()).unwrap();
     s.put("a", &[Span::Lit(b"first")], vec![]).unwrap();
     s.sync().unwrap();
     drop(s);
 
     // append a well-formed frame with an unknown tag
-    let path = dir.join("WAL");
+    let path = wal_sidecar(&store);
     let mut b = std::fs::read(&path).unwrap();
     let payload = b"a frame type this build does not know";
     let mut hdr = vec![0x5Eu8];
@@ -834,7 +904,7 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     b.extend_from_slice(&h.finalize().to_le_bytes());
     std::fs::write(&path, &b).unwrap();
 
-    let e = match Store::open(&dir, FoldCfg::default()) {
+    let e = match Store::open_file(&store, FoldCfg::default()) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("a checksumming frame with an unknown tag must be refused"),
     };
@@ -845,7 +915,7 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     let n = torn.len();
     torn[n - 1] ^= 0xFF; // break the crc
     std::fs::write(&path, &torn).unwrap();
-    let s = Store::open(&dir, FoldCfg::default())
+    let s = Store::open_file(&store, FoldCfg::default())
         .expect("a torn tail is the end of the log, not an error");
     assert_eq!(s.reconstruct("a").unwrap().unwrap(), b"first".to_vec());
     std::fs::remove_dir_all(&dir).ok();
@@ -857,10 +927,16 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
 
 #[test]
 fn pack_footer_matches_the_documented_layout() {
-    let dir = built("packfmt");
-    let pk = dir.join("snapshot.turndb");
-    turndb::pack::write(&dir, &pk).unwrap();
-    let b = std::fs::read(&pk).unwrap();
+    // Nothing writes packs any more; the checked-in version-one artifact is the layout's whole
+    // population, so it is also what the document is held against.
+    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+    let b: Vec<u8> = digits
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
     let f = &b[b.len() - 40..];
 
     assert_eq!(&f[0..8], b"TURNPACK", "magic at footer+0");
@@ -883,12 +959,17 @@ fn pack_footer_matches_the_documented_layout() {
     assert!(toc_off as usize + toc_stored as usize <= b.len() - 40);
     assert!(n_files >= 3, "manifest + a part + a segment at minimum");
 
-    // and MANIFEST comes back verbatim through the reader
+    // and MANIFEST comes back intact through the reader — its own crc32 trailer is the proof
+    // of byte-fidelity when no loose original exists to compare against.
+    let tmp_pk = tmp("packfmt");
+    std::fs::create_dir_all(&tmp_pk).unwrap();
+    let pk = tmp_pk.join("revision-one.turndb");
+    std::fs::write(&pk, &b).unwrap();
     let pack = turndb::pack::Pack::open(&pk).unwrap();
-    assert_eq!(
-        pack.read_file("MANIFEST").unwrap(),
-        std::fs::read(dir.join("MANIFEST")).unwrap(),
-        "inner files are byte-verbatim"
-    );
-    std::fs::remove_dir_all(&dir).ok();
+    let manifest = pack.read_file("MANIFEST").unwrap();
+    let text = std::str::from_utf8(&manifest).unwrap();
+    let (json, trailer) = text.split_once('\n').expect("manifest carries its trailer line");
+    let want = format!("crc32={:08x}", crc32fast::hash(json.as_bytes()));
+    assert_eq!(trailer.trim_end(), want, "the inner MANIFEST verifies against its own trailer");
+    std::fs::remove_dir_all(&tmp_pk).ok();
 }

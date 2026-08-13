@@ -11,7 +11,7 @@ import { capabilities, open, TurndbError } from '../index.mjs';
 const HEAVY_BYTES = 819_200;
 
 async function directory(tag) {
-  return mkdtemp(join(tmpdir(), `turndb-deadline-${tag}-`));
+  return mkdtemp(join(tmpdir(), `turndb-deadline-${tag}-`)).then((d) => join(d, 's.turndb'));
 }
 
 function cancelled(call) {
