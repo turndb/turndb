@@ -756,6 +756,50 @@ impl Container {
         Ok(sb.seq)
     }
 
+    /// Deallocate the aligned interior of every free extent old enough that no supported reader
+    /// can still be holding a superblock that names its bytes — `freed_seq + grace <= seq`, with
+    /// the grace window measured in commits, matching the manifest retention window's meaning.
+    ///
+    /// This is physical-only: the free list is already committed state, nothing in the committed
+    /// present references these bytes, and no declaration is needed the way block erasure needs
+    /// one — a reader old enough to resolve into a punched extent reads zeros, fails the member
+    /// or frame checksums above, and reports detected corruption, never silent wrong data. The
+    /// file is fsynced once after the last hole so the destruction is not left pending.
+    ///
+    /// Linux only, exactly as the fold's block punch is; everywhere else the first extent refuses
+    /// with `Unsupported` and a rewrite (`reclaim`) is the road that exists on every platform.
+    pub fn punch_free_extents(&self, grace: u64) -> Result<FreePunchStats> {
+        let mut stats = FreePunchStats::default();
+        let mut punched_any = false;
+        for &(off, len, freed_seq) in &self.free {
+            stats.examined += 1;
+            if freed_seq.saturating_add(grace) > self.sb.seq {
+                stats.deferred_extents += 1;
+                continue;
+            }
+            let lo = align_up(off);
+            let hi = (off + len) / ALIGN * ALIGN;
+            stats.edge_bytes += (lo - off).min(len) + (off + len).saturating_sub(hi.max(lo));
+            if hi <= lo {
+                continue; // smaller than one block: edges only, a rewrite's job
+            }
+            crate::vfs::punch_hole(&self.f, &self.path, lo, hi - lo).with_context(|| {
+                format!(
+                    "punching {} free bytes at {lo} in {}; this filesystem may not support hole                      punching — reclaim (rewrite) instead",
+                    hi - lo,
+                    self.path.display()
+                )
+            })?;
+            stats.punched_extents += 1;
+            stats.punched_bytes += hi - lo;
+            punched_any = true;
+        }
+        if punched_any {
+            crate::vfs::sync_file(&self.f, &self.path)?;
+        }
+        Ok(stats)
+    }
+
     /// Re-read every member's logical bytes and check them against the checksum recorded for it.
     pub fn verify(&self) -> Result<usize> {
         let mut buf = vec![0u8; 1 << 20];
@@ -875,6 +919,24 @@ impl crate::readat::ReadAt for MemberReader {
         let c = self.container.lock().expect("container lock poisoned");
         Ok(c.dir.get(&self.name).map(|m| m.len).unwrap_or(0))
     }
+}
+
+/// What one [`Container::punch_free_extents`] returned in place, and what it left.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FreePunchStats {
+    /// Free extents examined.
+    pub examined: usize,
+    /// Extents whose aligned interior was deallocated this call. Re-punching an already-punched
+    /// extent is indistinguishable from punching it — the filesystem call is idempotent — so a
+    /// second call reports the same extents again rather than pretending to know better.
+    pub punched_extents: usize,
+    /// Bytes deallocated: the sum of aligned interiors.
+    pub punched_bytes: u64,
+    /// Extents younger than the grace window, left untouched for readers that may still hold a
+    /// superblock predating their freeing.
+    pub deferred_extents: usize,
+    /// Bytes stranded at unaligned extent edges — returnable only by a rewrite.
+    pub edge_bytes: u64,
 }
 
 /// What one [`reclaim`] recovered.

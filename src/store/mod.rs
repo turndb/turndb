@@ -5149,6 +5149,30 @@ impl Store {
         Ok(stats)
     }
 
+    /// Return the space this file's history has already abandoned: deallocate the aligned
+    /// interior of free extents older than the retention window, in place, offsets unmoved.
+    ///
+    /// The single-file complement to [`Store::punch_unreferenced`]: that one destroys dead
+    /// CONTENT blocks under a manifest declaration; this one destroys extents the sweep already
+    /// free-listed — superseded parts, purged manifests, abandoned fold generations — whose only
+    /// remaining claim is the free list itself. The grace window (the manifest retention window,
+    /// in commits) is what keeps a reader holding a recent superblock exact rather than erroring;
+    /// a reader older than that reads zeros and fails checksums — detected, never silent.
+    ///
+    /// A directory store refuses: it returns space by unlinking, and has nothing to punch.
+    pub fn punch_free_space(&mut self) -> Result<crate::container::FreePunchStats> {
+        match &self.home {
+            Home::Dir(_) => bail!(
+                "a directory store returns freed space by unlinking; punch_free_space is the \
+                 single-file store's reclamation"
+            ),
+            Home::File { container, .. } => {
+                let c = container.lock().expect("container lock poisoned");
+                c.punch_free_extents(MANIFEST_RETAIN as u64)
+            }
+        }
+    }
+
     /// Bytes pinned by every open part's section caches, against their shared budget.
     pub fn part_cache_bytes(&self) -> (usize, usize) {
         (self.pcache.bytes(), self.pcache.budget())

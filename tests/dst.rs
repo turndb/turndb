@@ -1747,6 +1747,96 @@ fn every_single_file_erase_crash_answers_honestly() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// The free-space punch is physical-only — no commit, no declaration, nothing referenced — so
+/// its whole crash contract is: at every crash state, every record answers exactly as before,
+/// and reopening never refuses. A punch that could disturb an answer would mean the free list
+/// lied about a byte being free.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_single_file_punch_crash_disturbs_nothing() {
+    let root = tmp("native-free-punch");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("live.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let body_for = |i: usize| -> Vec<u8> {
+        let mut b = Vec::with_capacity(9000);
+        let mut seed = [i as u8; 32];
+        while b.len() < 9000 {
+            seed = blake3::hash(&seed).into();
+            b.extend_from_slice(&seed);
+        }
+        b.truncate(9000);
+        b
+    };
+
+    // Erase two records, then age the frees past the grace window, so the recorded punch has
+    // real interiors to deallocate.
+    let mut oracle = BTreeMap::new();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        for i in 0..5usize {
+            s.put(&format!("f:{i}"), &[Span::Piece(&body_for(i))], vec![]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.erase_ids(&["f:1".to_string()]).unwrap();
+        for round in 0..4usize {
+            s.put(&format!("age:{round}"), &[Span::Piece(&body_for(50 + round))], vec![]).unwrap();
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        for i in 0..5usize {
+            oracle.insert(format!("f:{i}"), s.reconstruct(&format!("f:{i}")).unwrap());
+        }
+        for round in 0..4usize {
+            let id = format!("age:{round}");
+            oracle.insert(id.clone(), s.reconstruct(&id).unwrap());
+        }
+        s.close().unwrap();
+    }
+
+    let mut base = Fs::default();
+    base.seed_durable(&root);
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let stats = s.punch_free_space().unwrap();
+        assert!(stats.punched_bytes > 0, "the fixture must actually punch: {stats:?}");
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    assert!(ops.len() > 3, "a punch must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("single-file free punch", &ops);
+
+    let stage = tmp("native-free-punch-stage");
+    let checked = replay_recorded(
+        "single-file-free-punch",
+        &base,
+        &root,
+        &ops,
+        &stage,
+        |stage, k, variant| {
+            let file = stage.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let mut s = Store::open_file(&file, cfg).unwrap_or_else(|e| {
+                panic!("crash point {k} {variant:?}: the punch left a store that refuses: {e:#}")
+            });
+            for (id, want) in &oracle {
+                let got = s.reconstruct(id).unwrap();
+                assert_eq!(
+                    &got, want,
+                    "crash point {k} {variant:?}: {id} must be untouched by a free-space punch"
+                );
+            }
+        },
+    );
+    println!("dst single-file free punch: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
 /// The WAL sidecar beside a single-file store, by the same rule the engine uses.
 fn wal_of(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_os_string();

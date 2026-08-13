@@ -3278,3 +3278,68 @@ fn a_single_file_store_erases_content_and_purges_history() {
     assert_eq!(r.ids().unwrap().len(), 7);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The free-space punch: what the sweep free-listed comes back as real filesystem blocks, in
+/// place, offsets unmoved — after the grace window, never inside it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_single_file_store_returns_freed_space_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tmp("single-file-punch");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("punch.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() };
+    let body = |seed: u64| -> Vec<u8> {
+        let mut out = Vec::with_capacity(20_000);
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        while out.len() < 20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    };
+
+    let mut s = Store::open_file(&ct, cfg).unwrap();
+    for i in 0..6u64 {
+        s.put(&format!("p:{i}"), &[Span::Piece(&body(i))], vec![]).unwrap();
+    }
+    s.sync().unwrap();
+    s.flush().unwrap();
+    s.erase_ids(&["p:1".to_string(), "p:2".to_string()]).unwrap();
+
+    // Inside the grace window nothing may be destroyed: a reader could still hold a superblock
+    // that predates the freeing.
+    let early = s.punch_free_space().unwrap();
+    assert_eq!(early.punched_extents, 0, "the grace window must defer: {early:?}");
+    assert!(early.deferred_extents > 0, "the freed generation is there, waiting: {early:?}");
+
+    // Age past the window, then the interior blocks come back.
+    for round in 0..4u64 {
+        s.put(&format!("age:{round}"), &[Span::Piece(&body(100 + round))], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+    }
+    let before_blocks = std::fs::metadata(&ct).unwrap().blocks();
+    let punched = s.punch_free_space().unwrap();
+    assert!(punched.punched_bytes > 0, "aged free extents must deallocate: {punched:?}");
+    let after_blocks = std::fs::metadata(&ct).unwrap().blocks();
+    assert!(
+        after_blocks < before_blocks,
+        "the filesystem must hold fewer blocks after the punch: {before_blocks} -> {after_blocks}"
+    );
+
+    // Offsets unmoved, answers exact — on the live handle and after a reopen.
+    assert!(s.reconstruct("p:1").unwrap().is_none());
+    for i in [0u64, 3, 4, 5] {
+        assert_eq!(s.reconstruct(&format!("p:{i}")).unwrap().unwrap(), body(i));
+    }
+    s.close().unwrap();
+    let s = Store::open_file(&ct, cfg).unwrap();
+    for i in [0u64, 3, 4, 5] {
+        assert_eq!(s.reconstruct(&format!("p:{i}")).unwrap().unwrap(), body(i));
+    }
+    s.close().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
