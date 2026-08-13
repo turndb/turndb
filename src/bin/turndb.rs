@@ -417,7 +417,7 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
 /// can be certified, worded to claim exactly what is true and nothing more. Signing is the
 /// operator's PKI's job (`ssh-keygen -Y sign` works on any file); building a signer in would add
 /// a crypto dependency to buy nothing a detached signature does not already provide.
-fn erase(dir: &Path, args: &[&str]) -> Result<()> {
+fn erase(store: &Path, args: &[&str]) -> Result<()> {
     // ---- parse the request ----
     let mut ids: Vec<String> = Vec::new();
     let mut attr: Option<(String, String)> = None;
@@ -441,9 +441,16 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
         bail!("erase needs exactly one of --id ... or --attr KEY=VALUE\n\n{USAGE}");
     }
 
-    let pre_manifest = blake3::hash(&std::fs::read(dir.join("MANIFEST"))?).to_hex().to_string();
+    // The audit line hashes the MANIFEST member — the store's committed identity — read through
+    // the container so the same line works before the writer role is taken and after it is gone.
+    let manifest_hex = |path: &Path| -> Result<String> {
+        let c = turndb::container::Container::open(path)?;
+        let bytes = c.read_file_bounded("MANIFEST", turndb::store::MAX_MANIFEST_BYTES)?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    };
+    let pre_manifest = manifest_hex(store)?;
 
-    let mut s = Store::open(dir, FoldCfg::default())?;
+    let mut s = open_writer(store)?;
     // ---- resolve an attribute request against the committed state ----
     if let Some((k, v)) = &attr {
         for id in s.ids()? {
@@ -484,7 +491,7 @@ fn erase(dir: &Path, args: &[&str]) -> Result<()> {
 
     let stats = s.erase_ids(&ids)?;
     drop(s);
-    let post_manifest = blake3::hash(&std::fs::read(dir.join("MANIFEST"))?).to_hex().to_string();
+    let post_manifest = manifest_hex(store)?;
 
     println!(
         "erased {} of {} requested ({} already absent)",
