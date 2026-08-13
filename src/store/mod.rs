@@ -1106,6 +1106,109 @@ pub fn open_read_container_with_limits(
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
+/// Open a retained snapshot of a single-file store — the file form of [`Store::open_read_at`].
+///
+/// The retained manifest names the state; `punched` comes from the LIVE manifest, exactly as the
+/// directory form insists, because erasure is declared by the live commit and a retained copy
+/// predates every punch that followed it. Fold readers are bounded to the snapshot's exact tail,
+/// so nothing this handle serves can wander into bytes its commit never named.
+pub fn open_read_container_at(path: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
+    open_read_container_at_with_limits(path, cfg, commit, ReadLimits::default())
+}
+
+/// [`open_read_container_at`] with explicit frame and object-count admission.
+pub fn open_read_container_at_with_limits(
+    path: &Path,
+    cfg: FoldCfg,
+    commit: u64,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    let read_limits = read_limits.validate()?;
+    let c = crate::container::Container::open(path)?;
+    let bytes = c
+        .read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)
+        .with_context(|| format!("retained commit {commit} is not held by {}", path.display()))?;
+    let mut manifest = Manifest::parse(&bytes)?;
+    let live = Manifest::parse(&c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)
+        .with_context(|| {
+            format!(
+                "retained snapshot at commit {commit} needs the live manifest in {} to tell \
+                 erased blocks from damaged ones, and it could not be read",
+                path.display()
+            )
+        })?;
+    if live.fold_gen != manifest.fold_gen {
+        bail!(
+            "retained commit {commit} is from fold generation {} but the live store is at {} — \
+             a re-fold purges the retained log, so this snapshot has no erasure authority",
+            manifest.fold_gen,
+            live.fold_gen
+        );
+    }
+    manifest.punched = live.punched;
+
+    let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
+    let tail = manifest.fold_tail();
+    let mut segs = Vec::new();
+    let mut dict_files = Vec::new();
+    for name in c.names().map(String::from).collect::<Vec<_>>() {
+        let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else { continue };
+        if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            let extent = c.extent(&name).expect("name came from this container");
+            let full_len = crate::readat::ReadAt::len(&extent)?;
+            let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
+                Some(t) if n > t.seg => continue,
+                Some(t) if n == t.seg => (
+                    Arc::new(crate::readat::Slice::new(extent, 0, u64::from(t.off))),
+                    u64::from(t.off),
+                    u64::from(t.off) == full_len,
+                ),
+                _ => (Arc::new(extent), full_len, true),
+            };
+            segs.push(crate::fold::SegmentInput {
+                seg: n,
+                reader,
+                sidecar: if whole {
+                    c.read_file_bounded(
+                        &format!("{prefix}/seg-{n:08}.dir"),
+                        crate::fold::segment::max_dir_sidecar_bytes(len)
+                            .min(read_limits.max_stored_frame_bytes),
+                    )
+                    .ok()
+                } else {
+                    None
+                },
+            });
+        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
+            dict_files.push(c.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        }
+    }
+    let fold = Fold::open_read_from_with_limits(
+        segs,
+        dict_files,
+        cfg,
+        path,
+        &manifest.punched,
+        read_limits,
+    )?;
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    for p in &manifest.parts {
+        let ext = c.extent(&p.file).ok_or_else(|| {
+            anyhow::anyhow!(
+                "retained commit {commit} names {} but the container does not hold it",
+                p.file
+            )
+        })?;
+        parts.push(Arc::new(Part::open_reader_with_limits(
+            Box::new(ext),
+            pcache.clone(),
+            read_limits,
+        )?));
+    }
+    Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
+}
+
 /// Which single-file form a path holds.
 ///
 /// Told apart by magic rather than by extension, because the extension is the user's to choose and
@@ -2633,6 +2736,18 @@ impl Store {
     /// nothing else. Writer exclusion is `flock` on the file itself, kernel-released on death.
     pub fn open_file(path: &Path, cfg: FoldCfg) -> Result<Store> {
         Self::open_file_with_options(path, StoreOptions { fold: cfg, ..StoreOptions::default() })
+    }
+
+    /// [`Store::open_file`] with explicit write-admission policy.
+    pub fn open_file_with_limits(
+        path: &Path,
+        cfg: FoldCfg,
+        write_limits: WriteLimits,
+    ) -> Result<Store> {
+        Self::open_file_with_options(
+            path,
+            StoreOptions { fold: cfg, write_limits, ..StoreOptions::default() },
+        )
     }
 
     /// [`Store::open_file`] with explicit storage, cache, and admission configuration.
@@ -4286,6 +4401,14 @@ impl Store {
                 sweep_unreachable_with_limits(dir, self.read_limits)?;
             }
             Home::File { container, .. } => {
+                // A flip publishes EVERYTHING staged — including fold-delta extents appended by
+                // puts since the last flush. The manifest must therefore claim the tail the flip
+                // is about to make durable, or the committed member outgrows the manifest's
+                // claim and the next open refuses the disagreement. (The reopen check that
+                // demands this agreement is what caught the omission.)
+                let t = self.fold.sync()?;
+                m.fold_seg = t.seg;
+                m.fold_off = t.off;
                 let mut c = container.lock().expect("container lock poisoned");
                 m.commit_into_container(&mut c)?;
                 sweep_unreachable_container(&mut c, &m, self.read_limits)?;
@@ -4862,6 +4985,11 @@ impl Store {
                 sweep_unreachable_with_limits(dir, self.read_limits)?;
             }
             Home::File { container, .. } => {
+                // Same rule as the merge: the flip publishes staged fold deltas too, so the
+                // manifest claims the tail it makes durable.
+                let t = self.fold.sync()?;
+                manifest.fold_seg = t.seg;
+                manifest.fold_off = t.off;
                 let mut c = container.lock().expect("container lock poisoned");
                 manifest.commit_into_container(&mut c)?;
                 sweep_unreachable_container(&mut c, &manifest, self.read_limits)?;
@@ -5385,6 +5513,9 @@ impl Store {
             match &self.home {
                 Home::Dir(dir) => m.commit_with_limits(dir, self.read_limits)?,
                 Home::File { container, .. } => {
+                    let t = self.fold.sync()?;
+                    m.fold_seg = t.seg;
+                    m.fold_off = t.off;
                     let mut c = container.lock().expect("container lock poisoned");
                     m.commit_into_container(&mut c)?;
                     c.commit()?; // the declaration is durable BEFORE any byte is destroyed

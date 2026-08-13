@@ -28,13 +28,19 @@ fn status(value: &str) -> Vec<(String, AttrValue)> {
     vec![("status".into(), AttrValue::Str(value.into()))]
 }
 
-fn part_path(dir: &std::path::Path) -> PathBuf {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "part"))
+/// The flushed part's home inside the single file: `(store path, extent offset, length)` of the
+/// first part member, so read-fatal damage lands on the member's exact bytes.
+fn part_span(dir: &std::path::Path) -> (PathBuf, u64, u64) {
+    let file = store_file(dir);
+    let c = turndb::container::Container::open(&file).unwrap();
+    let name = c
+        .names()
+        .find(|n| n.starts_with("part-") && n.ends_with(".part"))
         .expect("a flushed part")
+        .to_string();
+    let extents = c.member_extents(&name).unwrap();
+    assert_eq!(extents.len(), 1, "a part is staged whole and stays one extent");
+    (file, extents[0].0, extents[0].1)
 }
 
 fn section_location(bytes: &[u8], wanted: &str) -> (usize, u8) {
@@ -70,20 +76,24 @@ fn section_location(bytes: &[u8], wanted: &str) -> (usize, u8) {
     panic!("part has no section {wanted:?}");
 }
 
-fn corrupt_sections(path: &std::path::Path, names: &[&str]) {
-    let mut bytes = std::fs::read(path).unwrap();
+fn corrupt_sections(span: &(PathBuf, u64, u64), names: &[&str]) {
+    let (path, off, len) = span;
+    let mut file_bytes = std::fs::read(path).unwrap();
+    let (off, len) = (*off as usize, *len as usize);
+    let mut bytes = file_bytes[off..off + len].to_vec();
     for name in names {
         let (offset, codec) = section_location(&bytes, name);
         assert_ne!(codec, 0, "test section {name} must be compressed so damage is read-fatal");
         bytes[offset] ^= 0x80;
     }
-    std::fs::write(path, bytes).unwrap();
+    file_bytes[off..off + len].copy_from_slice(&bytes);
+    std::fs::write(path, file_bytes).unwrap();
 }
 
 #[test]
 fn extended_scalar_predicates_distinguish_explicit_null_from_missing() {
     let dir = tmp("extended-scalars");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     store
         .put_body(
             "a",
@@ -143,7 +153,7 @@ fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
     let dir = tmp("projected-sections");
     let _cleanup = RemoveOnDrop(dir.clone());
     {
-        let mut store = Store::open(&dir, cfg()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
         let request = "request".repeat(100);
         let response = "response".repeat(100);
         let untouched = "never decode this sibling".repeat(20);
@@ -168,8 +178,8 @@ fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
 
     // Column ordinals are sorted by name, as are content ordinals. Damage one sibling in each
     // namespace after open metadata was committed. A whole-record point decode would fail below.
-    corrupt_sections(&part_path(&dir), &["col.val.1", "con.prog.1"]);
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    corrupt_sections(&part_span(&dir), &["col.val.1", "con.prog.1"]);
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let selected = reader
         .scan(&ScanRequest {
             attrs: vec!["selected".into()],
@@ -213,7 +223,7 @@ fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
 #[test]
 fn grouped_projection_restores_cross_part_order_and_exact_row_shape() {
     let dir = tmp("grouped-projection");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     store
         .put_record(
             "a",
@@ -267,7 +277,7 @@ fn grouped_projection_restores_cross_part_order_and_exact_row_shape() {
     store.sync().unwrap();
     store.flush().unwrap();
 
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let request = ScanRequest {
         attrs: vec!["x".into(), "y".into()],
         contents: vec![
@@ -328,7 +338,7 @@ fn grouped_projection_restores_cross_part_order_and_exact_row_shape() {
 fn grouped_projection_does_not_decode_past_a_full_page() {
     let dir = tmp("grouped-projection-demand");
     {
-        let mut store = Store::open(&dir, cfg()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
         store.put_body("a", b"", vec![("x".into(), AttrValue::Int(1))]).unwrap();
         store
             .put_body(
@@ -343,8 +353,8 @@ fn grouped_projection_does_not_decode_past_a_full_page() {
 
     // `(name, type)` columns sort strings before integers. The first page needs only integer col 1;
     // a gather that speculatively included b would open the damaged string dictionary in col 0.
-    corrupt_sections(&part_path(&dir), &["col.dict.0"]);
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    corrupt_sections(&part_span(&dir), &["col.dict.0"]);
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let first = reader
         .scan(&ScanRequest { attrs: vec!["x".into()], limit: 1, ..ScanRequest::default() })
         .unwrap();
@@ -371,7 +381,7 @@ fn grouped_projection_does_not_decode_past_a_full_page() {
 fn read_ahead_chunks_shrink_to_remaining_demand_after_rejections() {
     let dir = tmp("shrinking-chunk-demand");
     {
-        let mut store = Store::open(&dir, cfg()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
         store.put_body("a", b"", vec![("x".into(), AttrValue::Int(1))]).unwrap();
         store.put_body("b", b"", vec![("x".into(), AttrValue::Int(2))]).unwrap();
         store.put_body("c", b"", vec![("x".into(), AttrValue::Int(3))]).unwrap();
@@ -386,8 +396,8 @@ fn read_ahead_chunks_shrink_to_remaining_demand_after_rejections() {
         store.flush().unwrap();
     }
 
-    corrupt_sections(&part_path(&dir), &["col.dict.0"]);
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    corrupt_sections(&part_span(&dir), &["col.dict.0"]);
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let request = ScanRequest {
         attrs: vec!["x".into()],
         predicates: vec![Predicate::Attr {
@@ -411,7 +421,7 @@ fn read_ahead_chunks_shrink_to_remaining_demand_after_rejections() {
 #[test]
 fn scan_explanation_shares_cursor_field_and_physical_scope_planning() {
     let dir = tmp("explain");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         store
             .put_record(
@@ -490,7 +500,7 @@ fn scan_explanation_shares_cursor_field_and_physical_scope_planning() {
     assert_eq!(explanation.physical.immutable_rows_in_bounds, 5);
     assert_eq!(explanation.physical.memtable_entries_in_bounds, 2);
 
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let immutable = reader.explain_scan(&request).unwrap();
     assert_eq!(immutable.physical.memtable_entries_in_bounds, 0);
     assert_eq!(immutable.physical.immutable_rows_in_bounds, 5);
@@ -523,7 +533,7 @@ fn page_io_stats_are_operation_local_and_distinguish_cold_from_cached_reads() {
     let cfg = FoldCfg { block_target: 4 << 10, ..cfg() };
     let payload = vec![b'x'; 8 << 10];
     {
-        let mut store = Store::open(&dir, cfg).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg).unwrap();
         store
             .put_record(
                 "a",
@@ -535,7 +545,7 @@ fn page_io_stats_are_operation_local_and_distinguish_cold_from_cached_reads() {
         store.flush().unwrap();
     }
 
-    let reader = Store::open_read(&dir, cfg).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg).unwrap();
     let request = ScanRequest {
         attrs: vec!["status".into()],
         contents: vec![ContentSelect { name: "payload".into(), mode: ContentMode::Bytes }],
@@ -570,7 +580,7 @@ fn page_io_stats_are_operation_local_and_distinguish_cold_from_cached_reads() {
 #[test]
 fn cancellation_and_deadlines_are_typed_and_return_no_partial_page() {
     let dir = tmp("interruption");
-    let store = Store::open(&dir, cfg()).unwrap();
+    let store = Store::open_file(&store_file(&dir), cfg()).unwrap();
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -595,11 +605,11 @@ fn cancellation_and_deadlines_are_typed_and_return_no_partial_page() {
 #[test]
 fn writer_scan_is_live_projected_bounded_and_newest_first() {
     let dir = tmp("live");
-    let mut writer = Store::open(&dir, cfg()).unwrap();
+    let mut writer = Store::open_file(&store_file(&dir), cfg()).unwrap();
     writer.put_body("b", b"old body", status("old")).unwrap();
     writer.sync().unwrap();
     writer.flush().unwrap();
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
 
     // Unflushed overlay: one new id, one replacement, and one staged deletion.
     writer.put_record("a", &[ContentSpans::new("request", vec![])], status("new")).unwrap();
@@ -675,7 +685,7 @@ fn writer_scan_is_live_projected_bounded_and_newest_first() {
 #[test]
 fn an_examination_budget_returns_a_continuation_even_with_no_matches() {
     let dir = tmp("budget");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for i in 0..10 {
         store
             .put_body(&format!("r{i:02}"), b"body", vec![("n".into(), AttrValue::Int(i))])
@@ -710,7 +720,7 @@ fn an_examination_budget_returns_a_continuation_even_with_no_matches() {
 #[test]
 fn reconstruction_budget_pages_whole_rows_without_gaps() {
     let dir = tmp("content-budget");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         store.put_body(id, b"123456", vec![]).unwrap();
     }
@@ -755,7 +765,7 @@ fn reconstruction_budget_pages_whole_rows_without_gaps() {
 #[test]
 fn reconstruction_budget_admits_one_oversized_row_and_counts_all_selected_content() {
     let dir = tmp("oversized-content-budget");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b"] {
         store
             .put_record(
@@ -795,7 +805,7 @@ fn reconstruction_budget_admits_one_oversized_row_and_counts_all_selected_conten
 #[test]
 fn metadata_only_projection_does_not_spend_the_reconstruction_budget() {
     let dir = tmp("metadata-budget");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         store.put_body(id, b"far larger than one byte", vec![]).unwrap();
     }
@@ -822,7 +832,7 @@ fn metadata_only_projection_does_not_spend_the_reconstruction_budget() {
 #[test]
 fn cursor_tampering_or_request_reuse_is_refused() {
     let dir = tmp("cursor");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         store.put_body(id, b"body", status("x")).unwrap();
     }
@@ -857,7 +867,7 @@ fn cursor_tampering_or_request_reuse_is_refused() {
 #[test]
 fn reverse_pages_are_complete_and_duplicate_free() {
     let dir = tmp("reverse");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c", "d", "e"] {
         store.put_body(id, b"body", vec![]).unwrap();
     }
@@ -877,7 +887,7 @@ fn reverse_pages_are_complete_and_duplicate_free() {
 #[test]
 fn bounded_part_walk_matches_the_materialized_visibility_oracle() {
     let dir = tmp("id-walk-oracle");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for generation in 0..5 {
         for i in 0..20 {
             if (i + generation) % 4 == 0 {
@@ -895,7 +905,7 @@ fn bounded_part_walk_matches_the_materialized_visibility_oracle() {
         store.sync().unwrap();
         store.flush().unwrap();
     }
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let all = reader.ids().unwrap();
     for (from, to) in
         [(None, None), (Some("r03"), None), (None, Some("r17")), (Some("r05"), Some("r14"))]
@@ -927,7 +937,7 @@ fn bounded_part_walk_matches_the_materialized_visibility_oracle() {
 fn resolved_candidates_project_and_reconstruct_the_authoritative_part_rows() {
     let dir = tmp("resolved-rows");
     {
-        let mut store = Store::open(&dir, cfg()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
         store.put_body("a", b"a0", vec![("generation".into(), AttrValue::Int(0))]).unwrap();
         store.put_body("b", b"b0", vec![("generation".into(), AttrValue::Int(0))]).unwrap();
         store.sync().unwrap();
@@ -945,7 +955,7 @@ fn resolved_candidates_project_and_reconstruct_the_authoritative_part_rows() {
         store.flush().unwrap();
     }
 
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     let page = reader
         .scan(&ScanRequest {
             attrs: vec!["generation".into()],
@@ -969,7 +979,7 @@ fn resolved_candidates_project_and_reconstruct_the_authoritative_part_rows() {
 fn resolution_budget_advances_across_tombstone_only_groups_in_both_directions() {
     let dir = tmp("resolution-budget");
     {
-        let mut store = Store::open(&dir, cfg()).unwrap();
+        let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
         for id in ["a", "b", "c", "d"] {
             store.put_body(id, id.as_bytes(), vec![]).unwrap();
         }
@@ -987,7 +997,7 @@ fn resolution_budget_advances_across_tombstone_only_groups_in_both_directions() 
         store.flush().unwrap();
     }
 
-    let reader = Store::open_read(&dir, cfg()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), cfg()).unwrap();
     for direction in [Direction::Forward, Direction::Reverse] {
         let mut request =
             ScanRequest { direction, max_resolution_entries: 2, ..ScanRequest::default() };
@@ -1016,7 +1026,7 @@ fn resolution_budget_advances_across_tombstone_only_groups_in_both_directions() 
 #[test]
 fn resolution_budget_counts_the_writer_overlay_in_the_same_id_group() {
     let dir = tmp("resolution-overlay");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     store.put_body("a", b"committed-a", vec![]).unwrap();
     store.put_body("b", b"committed-b", vec![]).unwrap();
     store.sync().unwrap();
@@ -1048,7 +1058,7 @@ fn resolution_budget_counts_the_writer_overlay_in_the_same_id_group() {
 #[test]
 fn invalid_resolution_budgets_are_refused_before_range_work() {
     let dir = tmp("resolution-budget-validation");
-    let store = Store::open(&dir, cfg()).unwrap();
+    let store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for value in [0, turndb::scan::MAX_RESOLUTION_ENTRIES + 1] {
         assert!(store
             .scan(&ScanRequest { max_resolution_entries: value, ..ScanRequest::default() })
@@ -1066,7 +1076,7 @@ fn invalid_resolution_budgets_are_refused_before_range_work() {
 #[test]
 fn limit_and_examination_ceilings_refuse_extremes_and_accept_the_nearest_valid() {
     let dir = tmp("ceiling-validation");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         store.put_body(id, b"", vec![("x".into(), AttrValue::Int(1))]).unwrap();
     }
@@ -1109,7 +1119,7 @@ fn limit_and_examination_ceilings_refuse_extremes_and_accept_the_nearest_valid()
 #[test]
 fn a_generous_deadline_and_an_uncancelled_token_admit_a_complete_page() {
     let dir = tmp("generous-deadline");
-    let mut store = Store::open(&dir, cfg()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
     for id in ["a", "b", "c"] {
         store.put_body(id, b"payload long enough to fold", vec![]).unwrap();
     }
@@ -1129,4 +1139,11 @@ fn a_generous_deadline_and_an_uncancelled_token_admit_a_complete_page() {
     assert!(page.rows.iter().all(|row| row.contents[0].bytes.is_some()));
     assert!(page.next.is_none(), "the deadline must not shorten a page it never reached");
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

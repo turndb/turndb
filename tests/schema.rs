@@ -17,7 +17,7 @@ fn temp() -> PathBuf {
 #[test]
 fn discovery_is_typed_namespaced_sorted_and_includes_the_live_memtable() {
     let dir = temp();
-    let mut store = Store::open(&dir, FoldCfg::default()).unwrap();
+    let mut store = Store::open_file(&store_file(&dir), FoldCfg::default()).unwrap();
     store
         .put_record(
             "r1",
@@ -77,9 +77,16 @@ fn discovery_is_typed_namespaced_sorted_and_includes_the_live_memtable() {
 
     // Immutable discovery does not see the writer memtable and honestly marks part metadata as a
     // conservative physical superset.
-    let reader = Store::open_read(&dir, FoldCfg::default()).unwrap();
+    let reader = turndb::store::open_read_container(&store_file(&dir), FoldCfg::default()).unwrap();
     let schema = reader.schema().unwrap();
     assert_eq!(schema.contents, ["request", "response"]);
     assert!(schema.may_include_shadowed_fields);
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }

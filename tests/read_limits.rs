@@ -161,8 +161,8 @@ fn strict_fold_profile_splits_for_progress_and_refuses_one_oversized_piece_befor
 fn a_late_oversized_batch_piece_is_refused_before_any_fold_or_wal_mutation() {
     let dir = ScopedDir::new("batch-preflight");
     let strict = limits(64, 64);
-    let mut store = Store::open_with_options(
-        &dir,
+    let mut store = Store::open_file_with_options(
+        &store_file(&dir),
         StoreOptions {
             fold: FoldCfg { block_target: 1024, ..FoldCfg::default() },
             read_limits: strict,
@@ -184,8 +184,8 @@ fn a_late_oversized_batch_piece_is_refused_before_any_fold_or_wal_mutation() {
 fn aggregate_wal_frame_admission_precedes_fold_mutation() {
     let dir = ScopedDir::new("wal-preflight");
     let strict = limits(192, 192);
-    let mut store = Store::open_with_options(
-        &dir,
+    let mut store = Store::open_file_with_options(
+        &store_file(&dir),
         StoreOptions { read_limits: strict, ..StoreOptions::default() },
     )
     .unwrap();
@@ -222,24 +222,35 @@ fn strict_tail_scan_refuses_without_truncating_valid_large_frames() {
 }
 
 #[test]
-fn restore_preserves_frame_budget_refusal_instead_of_calling_the_backup_invalid() {
-    let dir = ScopedDir::new("restore-classification");
+fn a_budget_refusal_never_calls_the_sealed_backup_invalid() {
+    let dir = ScopedDir::new("backup-classification");
     let source = dir.join("source");
-    let artifact = dir.join("backup.tdbpack");
-    let destination = dir.join("restored");
-    let mut store = Store::open(&source, FoldCfg::default()).unwrap();
+    let artifact = dir.join("backup.turndb");
+    let mut store = Store::open_file(&store_file(&source), FoldCfg::default()).unwrap();
     store.put("large", &[Span::Piece(&[0x5a; 256])], vec![]).unwrap();
     store.sync().unwrap();
     store.backup(&artifact).unwrap();
     drop(store);
 
-    let error = turndb::pack::restore_with_limits_and_control(
+    // Under a starved frame budget the sealed backup refuses as exhaustion — a statement about
+    // the BUDGET, and it must classify as one.
+    let error = turndb::store::open_read_container_with_limits(
         &artifact,
-        &destination,
+        FoldCfg::default(),
         limits(64, 64),
-        &Default::default(),
     )
+    .map(|_| ())
     .unwrap_err();
     assert_eq!(classify(&error), ErrorClass::ResourceExhausted);
-    assert!(!destination.exists(), "a refused restore must not publish its staging directory");
+
+    // The artifact was never the problem: ordinary limits open it and read back byte-exact.
+    let rs = turndb::store::open_read_container(&artifact, FoldCfg::default()).unwrap();
+    assert_eq!(rs.reconstruct("large").unwrap().unwrap(), vec![0x5a; 256]);
+}
+
+/// The migrated suites build single-file stores inside their temp directories: the parent is
+/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).ok();
+    dir.join("s.turndb")
 }
