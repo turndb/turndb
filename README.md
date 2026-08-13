@@ -1,7 +1,7 @@
 # turndb
 
 A content-addressed columnar store for AI traces. Embedded, single-writer, no daemon — a store is
-a directory you can `tar`, and reading one needs nothing but the files.
+one file you can `cp`, and reading one needs nothing but that file.
 
 Single-writer enforcement is platform-dependent: the engine enforces it on Unix and cannot on
 `wasm32-wasip1`, where the embedder must guarantee it. See *One writer per store* under
@@ -61,16 +61,15 @@ Everything else is in service of it.
 cargo build --release
 
 # JSONL in: each line needs a "body" string; every other scalar becomes an attribute
-head -4000 traces.jsonl | ./target/release/turndb import mystore -
+head -4000 traces.jsonl | ./target/release/turndb import mystore.turndb -
 
-./target/release/turndb inspect mystore
-./target/release/turndb verify  mystore --deep     # every record, piece, frame, and pin
-./target/release/turndb query   mystore "SELECT model, count(*) FROM t GROUP BY model"
-./target/release/turndb pack    mystore snap.turndb
-./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"   # SQL over one file
-./target/release/turndb unpack  snap.turndb restored                   # validated, no overlay
-# If MANIFEST is damaged: validates the newest retained commit and permits no rollback by default
-./target/release/turndb recover mystore
+./target/release/turndb inspect mystore.turndb
+./target/release/turndb verify  mystore.turndb --deep   # every record, piece, frame, and pin
+./target/release/turndb query   mystore.turndb "SELECT model, count(*) FROM t GROUP BY model"
+./target/release/turndb seal    mystore.turndb snap.turndb   # the committed snapshot, sealed
+./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"
+# If the manifest member is damaged: validates the newest retained commit, no rollback by default
+./target/release/turndb recover mystore.turndb
 ```
 
 As a library:
@@ -78,10 +77,11 @@ As a library:
 ```rust
 use turndb::{fold::FoldCfg, store::Store};
 
-let mut s = Store::open("mystore".as_ref(), FoldCfg::default())?;
+let mut s = Store::open_file("mystore.turndb".as_ref(), FoldCfg::default())?;
 s.put_body("trace:1#input", body, vec![])?;   // carved by the engine's default opinion
 s.sync()?;                                    // the ACK point — durable from here
-s.flush()?;                                   // seal into an immutable part
+s.flush()?;                                   // one superblock flip publishes the flush
+s.close()?;                                   // settles the sidecar; one file remains
 ```
 
 ## Storing gen_ai traces

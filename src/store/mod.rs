@@ -2221,6 +2221,94 @@ fn promote_manifest_with_limits(
     Ok(())
 }
 
+/// The retained commits a single-file store holds, oldest first — the file form of
+/// [`retained_commits`].
+pub fn retained_commits_file(path: &Path) -> Result<Vec<u64>> {
+    let c = crate::container::Container::open(path)?;
+    Ok(container_retained_commits(&c))
+}
+
+/// [`verify_chain`] for a single-file store: prev-links across the retained members, every part
+/// pin hashed against the extents the file actually holds, and the live manifest checked
+/// byte-identical to its newest retained copy.
+pub fn verify_chain_file(path: &Path) -> Result<ChainReport> {
+    let c = crate::container::Container::open(path)?;
+    verify_chain_container(&c, &crate::control::OperationControl::default())
+}
+
+/// What a conversion carried forward.
+#[derive(Clone, Copy, Debug)]
+pub struct ConvertStats {
+    /// Members written into the fresh store.
+    pub members: usize,
+    /// Bytes those members hold.
+    pub bytes: u64,
+    /// The manifest commit the converted store opens at, unchanged from the source.
+    pub commit: u64,
+}
+
+/// Convert an old layout — a store directory, or a sealed pack — into a single-file store.
+///
+/// This is the one door those layouts keep. A directory store is opened with the writer role
+/// (which settles its WAL: acknowledged records ride along, exactly as a reopen would carry
+/// them), flushed if it held staged records, and its committed snapshot copied member by member.
+/// A pack is copied straight from its extents. Either way the output is a fresh, WRITABLE
+/// single-file store carrying the source's manifest verbatim — same commit counter, same part
+/// pins, same punched declaration — verified whole before this returns, refused rather than
+/// replacing anything at `out`.
+///
+/// The retained commit log deliberately does not convert: it pins the source's history, and the
+/// converted file starts its history at the commit it carries — the same posture a pack has
+/// always taken.
+pub fn convert_to_file(src: &Path, out: &Path) -> Result<ConvertStats> {
+    crate::pack::ensure_destination_available(out)?;
+    if src.is_dir() {
+        // The writer role settles the WAL and replays acknowledged records into the memtable;
+        // one flush makes them part of the committed snapshot the copy walks.
+        let mut store = Store::open(src, FoldCfg::default())?;
+        store.sync()?;
+        store.flush()?;
+        drop(store);
+        let stats = checkpoint_into_container(src, out)?;
+        let fresh = crate::container::Container::open(out)?;
+        fresh.verify()?;
+        return Ok(ConvertStats {
+            members: fresh.len(),
+            bytes: fresh.member_bytes(),
+            commit: stats.commit_seq,
+        });
+    }
+    let kind = single_file_kind(src).ok_or_else(|| {
+        anyhow::anyhow!("{} is neither a store directory, a pack, nor a container", src.display())
+    })?;
+    match kind {
+        SingleFileKind::Container => bail!(
+            "{} is already a single-file store; a writer open upgrades its revision in place",
+            src.display()
+        ),
+        SingleFileKind::Pack => {
+            let pack = crate::pack::Pack::open(src)?;
+            let mut fresh = crate::container::Container::create(out)?;
+            let mut members = 0usize;
+            let mut bytes = 0u64;
+            for name in pack.names().map(String::from).collect::<Vec<_>>() {
+                let reader = pack.file(&name).expect("name came from this pack");
+                let len = crate::readat::ReadAt::len(&reader)?;
+                fresh.put_stream(&name, len, |at, into| {
+                    crate::readat::ReadAt::read_exact_at(&reader, into, at)
+                })?;
+                members += 1;
+                bytes += len;
+            }
+            fresh.commit()?;
+            fresh.verify()?;
+            let manifest =
+                Manifest::parse(&fresh.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+            Ok(ConvertStats { members, bytes, commit: manifest.commit })
+        }
+    }
+}
+
 /// Retained commit numbers held as `MANIFEST.NNNNNNNN` members, parsed numerically exactly as
 /// their file forms are, ascending.
 fn container_retained_commits(c: &crate::container::Container) -> Vec<u64> {
