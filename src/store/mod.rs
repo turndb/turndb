@@ -1050,7 +1050,19 @@ pub fn open_read_container_with_limits(
 ) -> Result<ReadStore> {
     let read_limits = read_limits.validate()?;
     let container = crate::container::Container::open(path)?;
-    let manifest = Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+    // Absent means a store nothing has flushed yet — the directory reader's rule, with the same
+    // tripwire: retained commits beside a missing manifest are damage, not emptiness.
+    let manifest = if container.contains("MANIFEST") {
+        Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?
+    } else if container_retained_commits(&container).is_empty() {
+        Manifest::default()
+    } else {
+        bail!(
+            "MANIFEST is missing but retained commits exist in {} — a damaged store, not a new \
+             one",
+            path.display()
+        );
+    };
 
     let fold_rel = if manifest.fold_gen == 0 {
         "fold".to_string()
@@ -5952,7 +5964,13 @@ impl Store {
         &self,
         control: &crate::control::OperationControl,
     ) -> Result<StoreSpaceUsage> {
-        store_space_usage(self.home.dir()?, &self.manifest, self.read_limits, control)
+        match &self.home {
+            Home::Dir(dir) => store_space_usage(dir, &self.manifest, self.read_limits, control),
+            Home::File { container, path } => {
+                let c = container.lock().expect("container lock poisoned");
+                container_space_usage(&c, path, &self.manifest, self.read_limits, control)
+            }
+        }
     }
 
     /// Discover attribute names/types and named-content columns without decoding stored values.
@@ -5964,6 +5982,81 @@ impl Store {
         }
         Ok(schema.finish())
     }
+}
+
+/// [`store_space_usage`]'s single-file form: members classified by the same reachability rules
+/// — live manifest, retained manifests, their fold generations — with the WAL sidecar counted
+/// live and the free list counted unclassified: bytes the file holds that no reachable name
+/// claims, which is exactly what that bucket means. `total` is what the store occupies on disk —
+/// the file itself plus its sidecar — so superblocks, the directory, and alignment padding are
+/// inside it, as they are inside the file.
+fn container_space_usage(
+    c: &crate::container::Container,
+    path: &Path,
+    live_manifest: &Manifest,
+    _read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<StoreSpaceUsage> {
+    control.check("store space inventory")?;
+    let mut live_files: std::collections::HashSet<String> =
+        std::iter::once("MANIFEST".to_string()).collect();
+    live_files.extend(live_manifest.parts.iter().map(|p| p.file.clone()));
+    let live_prefix = crate::fold::fold_member_prefix(live_manifest.fold_gen);
+
+    let mut retained_files: std::collections::HashSet<String> = Default::default();
+    let mut retained_prefixes: std::collections::HashSet<String> = Default::default();
+    for commit in container_retained_commits(c) {
+        control.check("store space inventory")?;
+        let name = format!("MANIFEST.{commit:08}");
+        let bytes = c
+            .read_file_bounded(&name, MAX_MANIFEST_BYTES)
+            .with_context(|| format!("account retained manifest {commit}"))?;
+        let m = Manifest::parse(&bytes)
+            .with_context(|| format!("account retained manifest {commit}"))?;
+        retained_files.insert(name);
+        retained_files.extend(m.parts.into_iter().map(|p| p.file));
+        retained_prefixes.insert(crate::fold::fold_member_prefix(m.fold_gen));
+    }
+
+    let mut usage = StoreSpaceUsage {
+        filesystem_available_bytes: crate::sys::filesystem_available_bytes(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+        )
+        .with_context(|| format!("measure available filesystem bytes at {}", path.display()))?,
+        ..StoreSpaceUsage::default()
+    };
+    let add = |amount: &mut SpaceAmount, bytes: u64| {
+        amount.files += 1;
+        amount.logical_bytes += bytes;
+    };
+    for name in c.names().map(String::from).collect::<Vec<String>>() {
+        control.check("store space inventory")?;
+        let len = c.member_len(&name).unwrap_or(0);
+        let gen = fold_generation_of_member(&name);
+        let is_live = live_files.contains(&name)
+            || gen.map(|g| crate::fold::fold_member_prefix(g) == live_prefix).unwrap_or(false);
+        let is_retained = retained_files.contains(&name)
+            || gen
+                .map(|g| retained_prefixes.contains(&crate::fold::fold_member_prefix(g)))
+                .unwrap_or(false);
+        if is_live {
+            add(&mut usage.live, len);
+        } else if is_retained {
+            add(&mut usage.retained_only, len);
+        } else {
+            add(&mut usage.unclassified, len);
+        }
+    }
+    let wal = file_wal_path(path);
+    if let Ok(meta) = std::fs::metadata(&wal) {
+        add(&mut usage.live, meta.len());
+    }
+    // The free list: bytes present under no reachable name. Zero files — extents are not files.
+    usage.unclassified.logical_bytes += c.free_bytes();
+    usage.total.files = usage.live.files + usage.retained_only.files + usage.unclassified.files;
+    usage.total.logical_bytes =
+        std::fs::metadata(path)?.len() + std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    Ok(usage)
 }
 
 fn store_space_usage(
