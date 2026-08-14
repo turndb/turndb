@@ -7,9 +7,11 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { BrowserDatabase, BufferReadAt, TurnDbError } from '../index.mjs';
+import { reproducibleCargoEnv } from '../cargo-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../../..');
+const cargoEnv = reproducibleCargoEnv(root);
 const scratch = await mkdtemp(join(tmpdir(), 'turndb-browser-conformance-'));
 
 function projected(expected, request) {
@@ -33,7 +35,7 @@ try {
   execFileSync('cargo', [
     'build', '-p', 'turndb-browser', '--target', 'wasm32-unknown-unknown',
     '--profile', 'wasm-release',
-  ], { cwd: root, stdio: 'inherit' });
+  ], { cwd: root, env: cargoEnv, stdio: 'inherit' });
   execFileSync('wasm-bindgen', [
     join(root, 'target/wasm32-unknown-unknown/wasm-release/turndb_browser.wasm'),
     '--target', 'nodejs', '--out-dir', scratch,

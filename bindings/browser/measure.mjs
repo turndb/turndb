@@ -7,8 +7,10 @@ import { createCipheriv } from 'node:crypto';
 
 import { NativeStore } from '../node/index.mjs';
 import { BrowserDatabase, HttpRangeReadAt } from './index.mjs';
+import { reproducibleCargoEnv } from './cargo-env.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
+const cargoEnv = reproducibleCargoEnv(root);
 const scratch = await mkdtemp(join(tmpdir(), 'turndb-browser-measure-'));
 const existingStore = process.env.TURNDB_MEASURE_EXISTING;
 const storePath = existingStore ? resolve(existingStore) : join(scratch, 'large.turndb');
@@ -61,7 +63,7 @@ try {
   execFileSync('cargo', [
     'build', '-p', 'turndb-browser', '--target', 'wasm32-unknown-unknown',
     '--profile', 'wasm-release',
-  ], { cwd: root, stdio: 'inherit' });
+  ], { cwd: root, env: cargoEnv, stdio: 'inherit' });
   execFileSync('wasm-bindgen', [
     join(root, 'target/wasm32-unknown-unknown/wasm-release/turndb_browser.wasm'),
     '--target', 'nodejs', '--out-dir', generated,
