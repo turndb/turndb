@@ -237,7 +237,8 @@ If a candidate check fails after a tag exists, repair the workflow on `main` and
 path verifies both the annotated tag and its GitHub release, then runs only that component's
 workflow; it does not create or move a tag and does not fan out the other publication workflows.
 Dispatching a leaf workflow directly is not equivalent: registry trusted publishing authenticates
-the top-level caller's `workflow_ref`. The selector admits only components with an exercised
+workflow identity, and the Python upload deliberately lives in the top-level workflow so PyPI's
+OIDC and attestation identities agree. The selector admits only components with an exercised
 recovery need; add another deliberately rather than turning recovery into an unrestricted replay.
 
 ### Publishing the portable npm package
@@ -352,13 +353,18 @@ Most of these are enforced by the toolchain and need no remembering; the ones th
 - **Whether `crates.io` and `npm` metadata still describe what ships.** Registry `description`
   fields render standalone, and `package.json` is not in its own `files` list — so no sweep over
   the package payload reaches them.
-- **The registries' trusted publishers.** Every publication workflow runs as a *called* workflow
-  under `.github/workflows/release.yml`. GitHub names the calling workflow in the OIDC token's
-  `workflow_ref` claim — the called one appears only in `job_workflow_ref` — and both crates.io and
-  npm match on the former. So every trusted publisher must name **`release.yml`**, never the leaf
-  that contains the publish step. Publishers pointed at the leaves were correct while releases were
-  dispatched leaf by leaf, and every one of them broke on the first orchestrated run: crates.io said
-  so precisely, npm reported `ENEEDAUTH` as though no credential had been offered at all.
+- **The registries' trusted publishers.** Crate and npm publication workflows run as *called*
+  workflows under `.github/workflows/release.yml`. GitHub names the calling workflow in the OIDC
+  token's `workflow_ref` claim — the called one appears only in `job_workflow_ref` — and crates.io
+  and npm match on the former. PyPI currently exchanges a reusable job's token against
+  `job_workflow_ref`, but verifies its attestation against the `workflow_ref` build-config URI; a
+  publish action inside `release-python.yml` therefore cannot satisfy both identities. The Python
+  candidates are still built and install-tested there, while the privileged upload runs directly in
+  `release.yml`. Every registry trusted publisher must consequently name **`release.yml`**, never a
+  leaf workflow. Publishers pointed at the leaves were correct while releases were dispatched leaf
+  by leaf, and every one of them broke on the first orchestrated run: crates.io said so precisely,
+  npm reported `ENEEDAUTH` as though no credential had been offered at all, and PyPI rejected the
+  reusable workflow's mismatched attestation.
 - **The npm releases' external configuration.** The owner must control the `@turndb` scope and every
   published package name, and protect the GitHub `npm` environment with required review. A package
   that does not yet exist on the registry has nowhere to attach a trusted publisher, so its first

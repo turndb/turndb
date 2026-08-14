@@ -245,4 +245,13 @@ fn failed_release_retries_build_the_intended_package_through_the_trusted_caller(
         ci_job_block(&caller, "python").contains("inputs.component == 'python'"),
         "Python recovery must be selected explicitly through the trusted caller"
     );
+    let python_publish = ci_job_block(&caller, "python_publish");
+    assert!(python_publish.contains("needs: [tag, python]"));
+    assert!(python_publish.contains("environment: pypi"));
+    assert!(python_publish.contains("id-token: write"));
+    assert!(python_publish.contains("pypa/gh-action-pypi-publish@release/v1"));
+    assert!(
+        !python_leaf.contains("pypa/gh-action-pypi-publish@release/v1"),
+        "PyPI attestations cannot be issued from a reusable workflow until PyPI supports its split OIDC identities"
+    );
 }

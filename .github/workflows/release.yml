@@ -7,6 +7,9 @@ on:
   # run executes the old workflow again. This dispatch deliberately reaches exactly one selected
   # publication, and accepts only an existing annotated tag with an existing GitHub release. It
   # stays in this caller because registry trusted publishers authenticate release.yml's workflow_ref.
+  # PyPI publication also runs directly in this file: its current OIDC exchange identifies the
+  # called workflow, while its attestation identifies this caller, so a reusable publish job cannot
+  # satisfy both checks.
   workflow_dispatch:
     inputs:
       release_ref:
@@ -147,11 +150,32 @@ jobs:
     if: github.event_name == 'pull_request' || inputs.component == 'python'
     permissions:
       contents: read
-      id-token: write
     uses: ./.github/workflows/release-python.yml
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
     secrets: inherit
+
+  # Keep the privileged upload in the top-level workflow. PyPI currently authenticates a reusable
+  # job with job_workflow_ref but verifies its Sigstore certificate against workflow_ref; those are
+  # release-python.yml and release.yml respectively when the action lives in the called workflow.
+  # Running the action here makes both identities release.yml and preserves attestations.
+  python_publish:
+    name: Python / publish to PyPI
+    needs: [tag, python]
+    if: github.event_name == 'pull_request' || inputs.component == 'python'
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: turndb-python-*-${{ needs.tag.outputs.release_ref }}
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
 
   browser:
     needs: tag
