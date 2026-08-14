@@ -242,6 +242,13 @@ exact audited tarball through npm trusted publishing behind the protected `npm` 
 Publication therefore requires an npm trusted publisher configured for that workflow — an owner
 action; see the publication gate below.
 
+If a portable-WASM candidate check fails after a tag exists, repair the workflow on `main` and
+manually dispatch `.github/workflows/release.yml` with that exact existing tag. The manual path
+verifies both the annotated tag and its GitHub release, then runs only the portable-WASM workflow;
+it does not create or move a tag and does not fan out the other publication workflows. Dispatching
+the leaf workflow directly is not equivalent: registry trusted publishing authenticates the
+top-level caller's `workflow_ref`.
+
 If the workflow cannot be used, the fallback is a manual publish by the repository owner from a
 clean local checkout, under the owner's npm credentials. For a release `X.Y.Z`, the publisher:
 

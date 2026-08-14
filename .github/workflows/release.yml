@@ -1,12 +1,24 @@
-name: Release merged version PR
+name: Release
 
 on:
   pull_request:
     types: [closed]
+  # A failed candidate check must be repaired on main before it is retried: rerunning the original
+  # run executes the old workflow again. This dispatch deliberately reaches only the portable wasm
+  # publication, and accepts only an existing annotated tag with an existing GitHub release. It
+  # stays in this caller because registry trusted publishers authenticate release.yml's workflow_ref.
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Existing annotated release tag whose portable wasm publication should retry
+        required: true
+        type: string
 
 jobs:
   tag:
-    if: github.head_ref == 'release' && github.event.pull_request.merged == true
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.head_ref == 'release' && github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -17,7 +29,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.event.pull_request.merge_commit_sha }}
       - name: verify lockstep release metadata
         run: python3 scripts/check-release-metadata.py
       # The extraction is captured and tested rather than inlined into echo: a jq failure inside a
@@ -29,22 +41,37 @@ jobs:
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "turndb") | .version')"
           test -n "$version"
           echo "release_ref=v${version}" >> "$GITHUB_OUTPUT"
+      - name: verify the existing release retry target
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ steps.version.outputs.release_ref }}
+          REQUESTED_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$RELEASE_REF" = "$REQUESTED_REF"
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+          gh release view "$RELEASE_REF" >/dev/null
       # Ahead of the tag on purpose. A release with nothing to say is a defect, and the cheapest
       # place to discover it is before an immutable tag exists to describe.
       - name: extract the release notes
+        if: github.event_name == 'pull_request'
         env:
           RELEASE_REF: ${{ steps.version.outputs.release_ref }}
         run: python3 scripts/release-notes.py "${RELEASE_REF#v}" > "$RUNNER_TEMP/notes.md"
       - name: configure annotated tagger
+        if: github.event_name == 'pull_request'
         run: |
           git config user.name 'turndb-release'
           git config user.email 'turndb-release@users.noreply.github.com'
       - name: ensure the annotated tag exists at this exact merge
+        if: github.event_name == 'pull_request'
         env:
           RELEASE_REF: ${{ steps.version.outputs.release_ref }}
         run: bash scripts/ensure-release-tag.sh "$RELEASE_REF"
       - id: github_release
         name: detect an already-created GitHub release
+        if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REF: ${{ steps.version.outputs.release_ref }}
@@ -63,7 +90,7 @@ jobs:
       # publication workflows verify. So the release is created here against the tag that already
       # exists, from notes that must be non-empty. On a retry, an existing release is success.
       - name: create the GitHub release from the changelog entry
-        if: steps.github_release.outputs.exists != 'true'
+        if: github.event_name == 'pull_request' && steps.github_release.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REF: ${{ steps.version.outputs.release_ref }}
@@ -77,6 +104,7 @@ jobs:
   # the whole workflow fails validation at startup, before any job's `if` is evaluated.
   crate:
     needs: tag
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -87,6 +115,7 @@ jobs:
 
   native:
     needs: tag
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -107,6 +136,7 @@ jobs:
 
   python:
     needs: tag
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -117,6 +147,7 @@ jobs:
 
   browser:
     needs: tag
+    if: github.event_name == 'pull_request'
     permissions:
       contents: write
     uses: ./.github/workflows/release-browser.yml
@@ -126,6 +157,7 @@ jobs:
 
   cli:
     needs: tag
+    if: github.event_name == 'pull_request'
     permissions:
       contents: read
       id-token: write

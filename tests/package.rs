@@ -201,3 +201,35 @@ fn native_release_is_explicitly_owner_gated() {
         "platform package must publish before the root selector package"
     );
 }
+
+#[test]
+fn portable_wasm_release_retry_uses_a_file_and_the_trusted_caller() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let leaf = fs::read_to_string(format!("{root}/.github/workflows/release-wasm.yml")).unwrap();
+    assert!(
+        leaf.contains("open(join(dir, \"smoke.turndb\"))"),
+        "the installed package smoke must open a store file, not its temporary parent directory"
+    );
+    assert!(
+        !leaf.contains("open(dir)"),
+        "the retired directory layout must not return through a release smoke"
+    );
+
+    let caller = fs::read_to_string(format!("{root}/.github/workflows/release.yml")).unwrap();
+    assert!(caller.contains("workflow_dispatch:"));
+    assert!(caller.contains("REQUESTED_REF: ${{ inputs.release_ref }}"));
+    assert!(caller.contains("git describe --tags --exact-match HEAD"));
+    assert!(caller.contains("git cat-file -t \"$RELEASE_REF\""));
+    assert!(caller.contains("gh release view \"$RELEASE_REF\""));
+
+    for job in ["crate", "native", "python", "browser", "cli"] {
+        assert!(
+            ci_job_block(&caller, job).contains("if: github.event_name == 'pull_request'"),
+            "a portable wasm retry must not fan out the {job} release"
+        );
+    }
+    assert!(
+        !ci_job_block(&caller, "wasm").contains("if: github.event_name == 'pull_request'"),
+        "the portable wasm release must remain reachable from the trusted top-level caller"
+    );
+}
