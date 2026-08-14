@@ -1,6 +1,6 @@
 [package]
 name = "turndb-wasm"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "WASM ABI for turndb — the layer the npm package calls."

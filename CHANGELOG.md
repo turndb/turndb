@@ -91,6 +91,172 @@ First release, so everything is new.
   as of 2026-08-03 and is not an independent third-party audit.
 
 [0.1.0]: https://github.com/turndb/turndb/releases/tag/v0.1.0
+## 0.1.4 (2026-08-14)
+
+### Features
+
+#### One layout remains
+
+The directory store's write path is gone from the engine: the checkpoint bridge
+(`ContainerStore`), the pack writer and restorer, `checkpoint_into_container`, and every public
+directory-form surface (`Store::open` and its reader family, `recover_manifest`, `verify_chain`,
+`retained_commits`) are deleted. The single-file store is the store; `convert` is the retired
+layout's one remaining door, proven against a checked-in fixture written by 0.1.3 itself —
+unsettled WAL included, because converting must replay acknowledged writes, and now it is proven
+to at every crash point.
+
+Retiring the layout's tests forced its replacements to earn their coverage, and they found real
+gaps, all fixed: conversion now builds in staging and publishes with a no-replace rename, so a
+crash mid-convert is recovered by re-running it; file recovery's promotion flip now also
+truncates the fold to the promoted tail, so a rolled-back store reopens instead of refusing its
+own manifest; restore's copy goes through the recorded write seam and is fsynced before
+publication; `reclaim` takes the writer flock and refuses an unsettled WAL sidecar instead of
+checking for a working directory no writer creates any more; and opening a missing container
+refuses typed (`NOT_FOUND`) without ever creating a transient file at the queried name.
+
+The CLI's `erase` verb, missed in the file-first migration, now opens the store file and reads
+its audit hashes from the manifest member.
+
+#### Phase 3 gets one executable contract
+
+TurnDB now carries versioned, machine-readable capability and structured-query contracts, an
+independent semantic corpus, and a checked physical `.turndb` fixture. The Rust oracle replays the
+write timeline and compares point reads, writer overlays, pinned snapshots, structured pages,
+cursor refusals, exact content, work statistics, and the final container bytes. The native Node
+package runs the same corpus through N-API and opens the same read-only fixture, so its binding tests
+can no longer pass on a parallel hand-written notion of the API.
+
+Python now has the same Tier-1 surface through a bounded single-owner PyO3 actor, including sealing
+and maintenance. Node and Python share one normative OpenTelemetry span mapping and cadence policy.
+Both exporters produce the same record ids, typed metadata, bulk gen_ai content, stable events, and
+links for the language-neutral vector. Dependency-free client-call wrappers create those canonical
+spans around synchronous and asynchronous provider SDK calls without changing their results.
+
+The browser build opens the normal container through an arbitrary `ReadAt` source backed by bytes,
+Blob/File, or strict HTTP Range. Structured predicates prune from part dictionaries and zone maps
+before projection, and every binding reports the avoided rows. A checked, self-contained viewer
+contains its wasm and JavaScript, replays the applicable shared corpus, and is exercised in Chromium
+and Firefox through both local-file and static-host URL paths. SQL remains explicitly absent after a
+documented DataFusion wasm build evaluation.
+
+`capabilities()` adds the contract-v1 profile and operation set without removing its detailed native
+facts. The shared corpus exposed a real loss at the JavaScript boundary: V8 canonicalized non-default
+NaN payloads before Rust received them. Float attributes now accept an exact sixteen-digit lowercase
+`floatBits` lane and emit it for NaNs; ordinary `floatValue` remains unchanged, and contradictory or
+malformed dual representations refuse as `INVALID_ARGUMENT`.
+
+Release automation now builds and smoke-tests Python wheels and a source distribution for PyPI,
+and attaches the byte-rebuilt browser viewer to the matching GitHub release.
+
+#### The CLI speaks one layout, and old layouts keep one door
+
+Every verb now takes a `.turndb` file. `import` creates the file if absent and leaves one file
+behind; `seal` ships the committed snapshot as one sealed file (what `backup` produces, named for
+what it does); `punch` performs both halves of in-place reclamation — dead content blocks under
+the manifest's declaration, and free extents older than the retention window — and reports each;
+`verify` walks member checksums, the retained chain, and every live part pin against the extents
+the file actually holds.
+
+Four verbs are gone. `pack` and `unpack`, because the pack is retired as an artifact — a sealed
+container is the single-file archival form, and extraction has no successor (`cp` copies a
+store). `checkpoint` and `write`, because ingesting into a file **is** the product now, and
+`import` does it.
+
+The retired layouts — store directories, sealed packs — keep exactly one door:
+
+```sh
+turndb convert mystore mystore.turndb      # a directory store, WAL settled, manifest verbatim
+turndb convert snap.pack snap.turndb       # a pack, copied straight from its extents
+```
+
+Reading a retired layout with any other verb refuses and prints the convert line to run. The
+library's directory-store constructors, the checkpoint bridge, and the pack write path remain
+compiled for the transition, carry retirement notices, and leave with the bindings' rebase onto
+the single-file store.
+
+#### The file is the live database
+
+A `.turndb` file was, until now, a checkpoint target: a writer materialized working state into a
+`-hot` directory beside it, ran the directory engine there, and folded the result back in when it
+closed. That bridge proved the format. This release replaces it with the model itself, taken from
+SQLite and applied literally: **the file holds the data plane at every moment a writer runs**, and
+what sits beside it while hot is flat and few — a `-wal` sidecar for acknowledged-but-unflushed
+records, and writer exclusion by `flock` on the file itself, which the kernel releases when the
+process dies. A cleanly closed store is exactly one file.
+
+```rust
+let mut s = Store::open_file("traces.turndb".as_ref(), FoldCfg::default())?;
+s.put_body("trace:1#input", body, vec![])?;
+s.sync()?;      // the ACK — an fsync of the sidecar, never of the store file
+s.flush()?;     // the flip: one superblock write publishes everything above it
+s.close()?;     // settles, removes the sidecar, leaves one file
+```
+
+Parts and fold segments append **into** the file past the committed tail; a commit is one
+superblock flip, which is the crash model the alternating slots were designed for — an interrupted
+write lands in bytes no committed superblock refers to. The protocol collapse is measurable: a
+flush costs three fsyncs where the directory protocol needs six, and a whole session records 31
+filesystem mutations where the checkpoint bridge recorded 66. Recovery gets simpler for the same
+reason it gets safer: a retained commit newer than live cannot exist, manifest staging litter
+cannot exist, and the fold is never truncated at open — the committed extent lists *are* the
+truncation, read rather than performed.
+
+Every documented operation now runs against the file: merge splices its output with one flip;
+re-fold performs its generation swap, its retained-log purge, and its space frees as **one atomic
+state**, so the window where erased content stayed readable through a retained name — which the
+directory protocol closes with propagated unlinks and an open-time reconciliation pass — cannot
+occur; verification walks members with the same chain-and-pin standard; recovery
+(`recover_manifest_file`) validates candidates at their exact tails and promotes with one flip.
+**Backup of a single-file store now produces a sealed container**: the committed snapshot, every
+member one aligned extent, flagged final so no writer will ever open it, verified whole, published
+only through a rename that refuses to replace.
+
+The container plane advances to revision 2 to carry this: members are extent lists (a growing
+segment gains an extent per commit that extended it, and physically adjacent runs coalesce), fresh
+extents start on 4096-byte boundaries, and freed extents carry the commit that freed them. That
+stamp is what makes the new reclamation honest: `punch_free_space` deallocates the aligned
+interior of extents older than the retention window — superseded parts, purged manifests,
+abandoned generations — in place, offsets unmoved, and defers anything a recent reader could still
+be holding. Revision-1 containers open exactly as written and publish revision 2 on their first
+commit.
+
+The proof grew before the engine did, in the order the work was done: the crash simulator gained
+tears that land inside a superblock's 56 defined bytes (the old length-proportional tears provably
+never could), a trace lint that proves slot alternation from the recorded operation log, and four
+new protocol sweeps — session, merge, erase, and free-punch — enumerating 288, 369, 819, and 63
+crash states respectively. Each passed on its first run against the finished engine.
+
+The checkpoint bridge and the directory layout remain in this release and leave in the next: the
+roadmap's Phase 1 ends with the directory store ceasing to be a layout at all, a one-shot
+converter carrying old stores forward, and the CLI reworked around the file. This release is the
+engine underneath that subtraction.
+
+#### The Node binding opens the file
+
+`open(path)` in the native Node binding now opens the single-file store directly: the path IS the
+database, the write-ahead log and lock live beside it, and there is no prepared hot directory and
+no fold-back step. `checkpointIntoContainer` is gone with the layout it served — a flush already
+leaves the file current, so there is nothing left to checkpoint into. Backups restore through
+member-verified copying of the sealed file (packs still restore by conversion, as the retired
+artifacts they are), recovery reads the file's own manifest, and a missing backup source now
+refuses as `NOT_FOUND` instead of a shrug about unrecognized layouts.
+
+Stores created by earlier releases as directories are not opened by this binding any more; convert
+them once with `turndb convert`.
+
+#### The portable package writes one file
+
+`open(path)` in the `turndb` npm package now names a `.turndb` **file**, not a store directory:
+the WASI preopen is the file's parent, the store grows inside the single file, and the `-wal`
+sidecar lives beside it under the same mount. Parent directories are created exactly as the
+directory open always created its own. Opening an existing directory refuses and names `convert`
+as the retired layout's one door.
+
+The whole portable suite — and the two-way native/WASI interoperability proof — now runs on
+single-file stores, which also hardened the engine underneath: a native open now refuses a fold
+segment whose committed bytes scan short ("the fold lost durable data"), the same claim the
+directory layout made through its committed-tail check.
+
 ## 0.1.3 (2026-08-11)
 
 ### Features

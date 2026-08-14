@@ -5,6 +5,7 @@ versioned_files = [
   "bindings/node/Cargo.toml",
   "bindings/wasm/Cargo.toml",
   "bindings/python/Cargo.toml",
+  "bindings/browser/Cargo.toml",
   "bindings/node/package.json",
   "bindings/node/npm/linux-x64-gnu/package.json",
   "npm/turndb/package.json",
@@ -41,6 +42,10 @@ type = "PrepareRelease"
 [[workflows.steps]]
 type = "Command"
 command = "python3 scripts/sync-release-version.py $version"
+
+[[workflows.steps]]
+type = "Command"
+command = "node bindings/browser/build-viewer.mjs"
 
 [[workflows.steps]]
 type = "Command"
