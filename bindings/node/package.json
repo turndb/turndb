@@ -64,7 +64,7 @@
     "@turndb/native-linux-x64-gnu": "0.1.4"
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.7.4",
+    "@napi-rs/cli": "3.8.5",
     "@types/node": "^24.0.0",
     "typescript": "6.0.3"
   },
