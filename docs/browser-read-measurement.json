@@ -1,0 +1,19 @@
+{
+  "contractVersion": 1,
+  "workload": {
+    "records": 56,
+    "bytesPerRecord": 54525952,
+    "logicalContentBytes": 3053453312,
+    "selectedId": "trace/0055"
+  },
+  "storeBytes": 2290598290,
+  "blockBytes": 65536,
+  "openAndPointQuery": {
+    "rangeRequests": 5,
+    "networkBytes": 246163,
+    "cacheHits": 38,
+    "cacheMisses": 10,
+    "cachedBlocks": 4
+  },
+  "fetchedFraction": 0.00010746668286389055
+}

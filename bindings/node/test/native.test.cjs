@@ -20,6 +20,16 @@ function temporaryStore(t) {
 
 test('reports the native capability profile without a portable fallback', () => {
   assert.deepEqual(capabilities(), {
+    contractVersion: 1,
+    profile: 'native',
+    operations: [
+      'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+      'explainScan', 'schema', 'readContent', 'snapshot', 'querySql', 'seal', 'verify', 'spaceUsage',
+      'compactBounded', 'refold', 'erase', 'close',
+    ],
+    partFormat: { write: 2, readMax: 2 },
+    reclamation: process.platform === 'win32' ? 'refold_only' : 'punch_or_refold',
+    cancellation: { scan: true, lifecycle: true },
     partFormatWrite: 2,
     partFormatReadMax: 2,
     writerExclusion: 'os_enforced',

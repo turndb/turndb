@@ -105,6 +105,25 @@ jobs:
       release_ref: ${{ needs.tag.outputs.release_ref }}
     secrets: inherit
 
+  python:
+    needs: tag
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-python.yml
+    with:
+      release_ref: ${{ needs.tag.outputs.release_ref }}
+    secrets: inherit
+
+  browser:
+    needs: tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-browser.yml
+    with:
+      release_ref: ${{ needs.tag.outputs.release_ref }}
+    secrets: inherit
+
   cli:
     needs: tag
     permissions:

@@ -4,6 +4,7 @@ versioned_files = [
   "Cargo.lock",
   "bindings/node/Cargo.toml",
   "bindings/wasm/Cargo.toml",
+  "bindings/python/Cargo.toml",
   "bindings/node/package.json",
   "bindings/node/npm/linux-x64-gnu/package.json",
   "npm/turndb/package.json",

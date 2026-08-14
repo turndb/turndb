@@ -3,7 +3,8 @@
 export type Attr =
   | { name: string; kind: 'string'; stringValue: string }
   | { name: string; kind: 'int'; intValue: bigint }
-  | { name: string; kind: 'float'; floatValue: number }
+  | { name: string; kind: 'float'; floatValue: number; floatBits?: string }
+  | { name: string; kind: 'float'; floatValue?: number; floatBits: string }
   | { name: string; kind: 'bool'; boolValue: boolean }
   | { name: string; kind: 'uint'; uintValue: bigint }
   | { name: string; kind: 'binary'; binaryValue: Buffer }
@@ -70,6 +71,8 @@ export interface ScanPage {
     durationNs: bigint;
     examined: number;
     returned: number;
+    /** Resolved rows rejected from part metadata without projecting column values. */
+    predicatePrunedRows: bigint;
     duplicateAttrOccurrences: number;
     contentValuesReconstructed: number;
     reconstructedBytes: bigint;
@@ -166,6 +169,17 @@ export interface SqlBatch {
 }
 
 export interface Capabilities {
+  /** Language-neutral binding contract; independent of package and part-format versions. */
+  contractVersion: 1;
+  profile: 'native';
+  operations: Array<
+    | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
+    | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal' | 'verify'
+    | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close'
+  >;
+  partFormat: { write: number; readMax: number };
+  reclamation: 'punch_or_refold' | 'refold_only';
+  cancellation: { scan: boolean; lifecycle: boolean };
   partFormatWrite: number;
   partFormatReadMax: number;
   writerExclusion: 'os_enforced' | 'embedder_enforced';
@@ -660,6 +674,11 @@ export declare class NativeStore {
   }>;
   /** Settles prior writes; cancellation never publishes the destination. */
   backup(
+    path: string,
+    options?: LifecycleOptions,
+  ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
+  /** Contract-v1 alias for publishing a verified immutable single-file snapshot. */
+  seal(
     path: string,
     options?: LifecycleOptions,
   ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;

@@ -99,7 +99,7 @@ function guarded(fn, operation) {
     }
     let lifecycleOptions;
     if ([
-      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup',
+      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup', 'seal',
       'recoverManifest',
     ].includes(operation)) {
       lifecycleOptions = args[1];
@@ -134,7 +134,7 @@ for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSql
     'querySql', 'next', 'stats', 'compact', 'compactBounded', 'estimateCompactionSpace',
     'verify', 'erase', 'punch', 'refold', 'estimateRefoldSpace',
     'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
-    'backup', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
+    'backup', 'seal', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
     'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
@@ -156,8 +156,35 @@ function guardFactories(Class) {
   return NativeFacade;
 }
 
+const contractOperations = Object.freeze([
+  'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+  'explainScan', 'schema', 'readContent', 'snapshot',
+  ...(native.capabilities().sql ? ['querySql'] : []),
+  'seal', 'verify', 'spaceUsage', 'compactBounded', 'refold', 'erase', 'close',
+]);
+
+function capabilities() {
+  const compiled = native.capabilities();
+  return {
+    ...compiled,
+    contractVersion: 1,
+    profile: 'native',
+    operations: [...contractOperations],
+    partFormat: {
+      write: compiled.partFormatWrite,
+      readMax: compiled.partFormatReadMax,
+    },
+    reclamation: compiled.allocatedSpaceUsage ? 'punch_or_refold' : 'refold_only',
+    cancellation: {
+      scan: compiled.scanCancellation,
+      lifecycle: compiled.lifecycleCancellation,
+    },
+  };
+}
+
 module.exports = {
   ...native,
+  capabilities,
   NativeStore: guardFactories(native.NativeStore),
   NativeSnapshot: guardFactories(native.NativeSnapshot),
   ...(native.NativeSqlQuery && { NativeSqlQuery: guardFactories(native.NativeSqlQuery) }),

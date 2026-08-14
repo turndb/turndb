@@ -25,12 +25,21 @@
       "import": "./index.mjs",
       "require": "./index.cjs",
       "default": "./index.cjs"
+    },
+    "./otel": {
+      "types": "./otel.d.ts",
+      "import": "./otel.mjs",
+      "require": "./otel.cjs",
+      "default": "./otel.cjs"
     }
   },
   "files": [
     "index.cjs",
     "index.mjs",
     "index.d.ts",
+    "otel.cjs",
+    "otel.mjs",
+    "otel.d.ts",
     "README.md",
     "LICENSE",
     "NOTICE",

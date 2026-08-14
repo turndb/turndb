@@ -1093,6 +1093,91 @@ pub fn open_read_container_with_limits(
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
+/// Open a read-only container over an arbitrary positioned byte source.
+///
+/// The source may be memory, an object-store range cache, or a browser callback. It receives the
+/// same admission checks, part readers, fold readers, visibility, and query implementation as a
+/// filesystem-backed snapshot.
+pub fn open_read_container_source(
+    source: std::sync::Arc<dyn crate::readat::ReadAt>,
+    label: &str,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    let read_limits = read_limits.validate()?;
+    let container = crate::container::ContainerReader::open(source, label)?;
+    if container.len() as u64 > read_limits.max_directory_entries {
+        bail!(
+            "container {label} holds {} directory entries, over the configured limit {}",
+            container.len(),
+            read_limits.max_directory_entries
+        );
+    }
+    let manifest = if container.contains("MANIFEST") {
+        Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?
+    } else if !container.names().any(|name| {
+        name.strip_prefix("MANIFEST.")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+    }) {
+        Manifest::default()
+    } else {
+        bail!(
+            "MANIFEST is missing but retained commits exist in {label} — a damaged store, not a new one"
+        )
+    };
+    let fold_rel = if manifest.fold_gen == 0 {
+        "fold".to_string()
+    } else {
+        format!("fold-{:04}", manifest.fold_gen)
+    };
+    let mut segs = Vec::new();
+    let mut dict_files = Vec::new();
+    for name in container.names().map(String::from).collect::<Vec<_>>() {
+        let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
+        if let Some(number) = crate::fold::segment::parse_seg_name(rest) {
+            let extent = container.extent(&name).expect("name came from this directory");
+            let segment_len = crate::readat::ReadAt::len(&extent)?;
+            segs.push(crate::fold::SegmentInput {
+                seg: number,
+                reader: Arc::new(extent) as Arc<dyn crate::readat::ReadAt>,
+                sidecar: container
+                    .read_file_bounded(
+                        &format!("{fold_rel}/seg-{number:08}.dir"),
+                        crate::fold::segment::max_dir_sidecar_bytes(segment_len)
+                            .min(read_limits.max_stored_frame_bytes),
+                    )
+                    .ok(),
+            });
+        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
+            dict_files.push(container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        }
+    }
+    let fold = Fold::open_read_from_with_limits(
+        segs,
+        dict_files,
+        cfg,
+        Path::new(label),
+        &manifest.punched,
+        read_limits,
+    )?;
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    for part in &manifest.parts {
+        let extent = container.extent(&part.file).ok_or_else(|| {
+            anyhow::anyhow!(
+                "container manifest names {} but the container does not hold it",
+                part.file
+            )
+        })?;
+        parts.push(Arc::new(Part::open_reader_with_limits(
+            Box::new(extent),
+            pcache.clone(),
+            read_limits,
+        )?));
+    }
+    Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
+}
+
 /// Open a retained snapshot of a single-file store: the store exactly as commit `commit` left it.
 ///
 /// The retained manifest names the state; `punched` comes from the LIVE manifest, exactly as the
@@ -4927,6 +5012,25 @@ impl Store {
         crate::scan::scan_store(self, request)
     }
 
+    pub(crate) fn candidate_may_match(
+        &self,
+        candidate: &crate::scan::ScanCandidate,
+        predicates: &[crate::scan::Predicate],
+    ) -> Result<bool> {
+        match candidate {
+            crate::scan::ScanCandidate::Memtable(_) => Ok(true),
+            crate::scan::ScanCandidate::Committed(row) => match row.origin {
+                read::RowOrigin::Part { part, .. } => read::part_may_match(
+                    self.parts
+                        .get(part)
+                        .ok_or_else(|| anyhow::anyhow!("candidate part is outside the store"))?,
+                    predicates,
+                ),
+                read::RowOrigin::Memtable => Ok(true),
+            },
+        }
+    }
+
     /// Explain a structured scan against the current read-your-writes view without resolving rows
     /// or evaluating predicates.
     pub fn explain_scan(
@@ -6036,6 +6140,25 @@ impl ReadStore {
         crate::scan::scan_read_store(self, request)
     }
 
+    pub(crate) fn candidate_may_match(
+        &self,
+        candidate: &crate::scan::ScanCandidate,
+        predicates: &[crate::scan::Predicate],
+    ) -> Result<bool> {
+        let crate::scan::ScanCandidate::Committed(row) = candidate else {
+            return Ok(true);
+        };
+        match row.origin {
+            read::RowOrigin::Part { part, .. } => read::part_may_match(
+                self.parts
+                    .get(part)
+                    .ok_or_else(|| anyhow::anyhow!("candidate part is outside the snapshot"))?,
+                predicates,
+            ),
+            read::RowOrigin::Memtable => Ok(true),
+        }
+    }
+
     /// Explain a structured scan against this immutable snapshot without resolving rows or
     /// evaluating predicates.
     pub fn explain_scan(
@@ -6170,11 +6293,6 @@ pub fn looks_like_store(dir: &Path) -> bool {
 // offset o", and emulating that with seek-then-read is not safe across threads. Unix and WASI both
 // provide it. What WASI does NOT provide — advisory locking and hole punching — is degraded
 // explicitly in `crate::sys` rather than refused here.
-#[cfg(not(any(unix, target_os = "wasi")))]
-compile_error!(
-    "turndb needs positioned file reads (pread). Unix and WASI provide them; \
-     wasm32-unknown-unknown has no filesystem at all — build for wasm32-wasip1 instead."
-);
 
 #[cfg(test)]
 mod tests {

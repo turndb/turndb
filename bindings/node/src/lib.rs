@@ -63,6 +63,9 @@ pub struct NativeAttr {
     pub string_value: Option<String>,
     pub int_value: Option<BigInt>,
     pub float_value: Option<f64>,
+    /// Exact lowercase IEEE-754 bits. This is authoritative when JavaScript would canonicalize a
+    /// NaN payload; ordinary callers may continue to provide only `floatValue`.
+    pub float_bits: Option<String>,
     pub bool_value: Option<bool>,
     pub uint_value: Option<BigInt>,
     pub binary_value: Option<Buffer>,
@@ -177,6 +180,7 @@ pub struct NativeScanStats {
     pub duration_ns: BigInt,
     pub examined: u32,
     pub returned: u32,
+    pub predicate_pruned_rows: BigInt,
     pub duplicate_attr_occurrences: u32,
     pub content_values_reconstructed: u32,
     pub reconstructed_bytes: BigInt,
@@ -1844,6 +1848,17 @@ impl NativeStore {
         })
     }
 
+    /// Contract-v1 name for publishing an immutable single-file snapshot.
+    #[napi]
+    pub fn seal<'env>(
+        &self,
+        env: &'env Env,
+        path: String,
+        options: Option<NativeLifecycleOptions>,
+    ) -> Result<PromiseRaw<'env, NativeBackupResult>> {
+        self.backup(env, path, options)
+    }
+
     /// Physically erase ids from this store, including retained history. External copies are out of scope.
     #[napi]
     pub fn erase<'env>(
@@ -2170,6 +2185,7 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
         string_value,
         int_value,
         float_value,
+        float_bits,
         bool_value,
         uint_value,
         binary_value,
@@ -2178,15 +2194,20 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
     let supplied = u8::from(string_value.is_some())
         + u8::from(int_value.is_some())
         + u8::from(float_value.is_some())
+        + u8::from(float_bits.is_some())
         + u8::from(bool_value.is_some())
         + u8::from(uint_value.is_some())
         + u8::from(binary_value.is_some())
         + u8::from(timestamp_ns_value.is_some());
-    if (kind == "null" && supplied != 0) || (kind != "null" && supplied != 1) {
+    let valid_float_pair = kind == "float" && float_value.is_some() && float_bits.is_some();
+    if (kind == "null" && supplied != 0)
+        || (kind != "null" && supplied != 1 && !(valid_float_pair && supplied == 2))
+    {
         return Err(Error::new(
             Status::InvalidArg,
             format!(
-                "attribute {name:?} must carry exactly one typed value, except null carries none"
+                "attribute {name:?} must carry exactly one typed value, except null carries none; \
+                 a float may carry a consistent floatValue/floatBits pair"
             ),
         ));
     }
@@ -2206,7 +2227,22 @@ fn decode_attr(attr: NativeAttr) -> Result<(String, AttrValue)> {
             }
             AttrValue::Int(value)
         }
-        "float" => AttrValue::Float(float_value.ok_or_else(|| missing("floatValue"))?),
+        "float" => {
+            let from_bits = float_bits.as_deref().map(decode_float_bits).transpose()?;
+            if let (Some(value), Some(exact)) = (float_value, from_bits) {
+                if !value.is_nan() && value.to_bits() != exact.to_bits() {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("attribute {name:?} carries disagreeing floatValue and floatBits"),
+                    ));
+                }
+                AttrValue::Float(exact)
+            } else {
+                AttrValue::Float(
+                    from_bits.or(float_value).ok_or_else(|| missing("floatValue or floatBits"))?,
+                )
+            }
+        }
         "bool" => AttrValue::Bool(bool_value.ok_or_else(|| missing("boolValue"))?),
         "uint" => AttrValue::UInt(decode_u64(
             uint_value.ok_or_else(|| missing("uintValue"))?,
@@ -2693,6 +2729,7 @@ fn encode_attr((name, value): (String, AttrValue)) -> NativeAttr {
         string_value: None,
         int_value: None,
         float_value: None,
+        float_bits: None,
         bool_value: None,
         uint_value: None,
         binary_value: None,
@@ -2710,6 +2747,10 @@ fn encode_attr((name, value): (String, AttrValue)) -> NativeAttr {
         AttrValue::Float(value) => {
             attr.kind = "float".into();
             attr.float_value = Some(value);
+            // Finite values, infinities, and signed zero survive a JavaScript Number round trip.
+            // NaN payloads do not, so only they need the explicit lane on output; keeping it absent
+            // otherwise preserves the established ergonomic object shape.
+            attr.float_bits = value.is_nan().then(|| format!("{:016x}", value.to_bits()));
         }
         AttrValue::Bool(value) => {
             attr.kind = "bool".into();
@@ -2730,6 +2771,20 @@ fn encode_attr((name, value): (String, AttrValue)) -> NativeAttr {
         AttrValue::Null => attr.kind = "null".into(),
     }
     attr
+}
+
+fn decode_float_bits(value: &str) -> Result<f64> {
+    if value.len() != 16
+        || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "floatBits must be exactly sixteen lowercase hexadecimal digits",
+        ));
+    }
+    let bits = u64::from_str_radix(value, 16)
+        .map_err(|_| Error::new(Status::InvalidArg, "floatBits is outside the u64 range"))?;
+    Ok(f64::from_bits(bits))
 }
 
 fn encode_content(content: ProjectedContent) -> NativeProjectedContent {
@@ -2759,6 +2814,7 @@ fn encode_page(page: ScanPage) -> NativeScanPage {
             duration_ns: BigInt::from(page.stats.duration_ns),
             examined: page.stats.examined as u32,
             returned: page.stats.returned as u32,
+            predicate_pruned_rows: BigInt::from(page.stats.predicate_pruned_rows as u64),
             duplicate_attr_occurrences: page.stats.duplicate_attr_occurrences as u32,
             content_values_reconstructed: page.stats.content_values_reconstructed as u32,
             reconstructed_bytes: BigInt::from(page.stats.reconstructed_bytes),

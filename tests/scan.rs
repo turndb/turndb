@@ -149,6 +149,78 @@ fn extended_scalar_predicates_distinguish_explicit_null_from_missing() {
 }
 
 #[test]
+fn structured_predicates_prune_disjoint_part_zones_before_value_reads() {
+    let dir = tmp("predicate-zone-pruning");
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
+    for index in 0..100i64 {
+        store
+            .put_body(
+                &format!("a{index:03}"),
+                b"cold",
+                vec![
+                    ("score".into(), AttrValue::Int(index)),
+                    ("tag".into(), AttrValue::Str("cold".into())),
+                ],
+            )
+            .unwrap();
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+    for index in 200..210i64 {
+        store
+            .put_body(
+                &format!("z{index:03}"),
+                b"hot",
+                vec![
+                    ("score".into(), AttrValue::Int(index)),
+                    ("tag".into(), AttrValue::Str("hot".into())),
+                ],
+            )
+            .unwrap();
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    let page = store
+        .scan(&ScanRequest {
+            limit: 1000,
+            attrs: vec!["score".into()],
+            predicates: vec![Predicate::Attr {
+                name: "score".into(),
+                op: Compare::Gt,
+                value: AttrValue::Int(150),
+            }],
+            ..ScanRequest::default()
+        })
+        .unwrap();
+    assert_eq!(page.rows.len(), 10);
+    assert_eq!(page.stats.examined, 110);
+    assert_eq!(page.stats.predicate_pruned_rows, 100);
+    assert!(page.rows.iter().all(|row| row.id.starts_with('z')));
+
+    for predicate in [
+        Predicate::Attr {
+            name: "tag".into(),
+            op: Compare::Eq,
+            value: AttrValue::Str("dictionary-proof".into()),
+        },
+        Predicate::AttrExists { name: "missing".into(), present: true },
+        Predicate::ContentExists { name: "missing".into(), present: true },
+    ] {
+        let impossible = store
+            .scan(&ScanRequest {
+                limit: 1000,
+                predicates: vec![predicate],
+                ..ScanRequest::default()
+            })
+            .unwrap();
+        assert!(impossible.rows.is_empty());
+        assert_eq!(impossible.stats.predicate_pruned_rows, 110);
+    }
+}
+
+#[test]
 fn structured_projection_never_opens_unselected_attribute_or_content_columns() {
     let dir = tmp("projected-sections");
     let _cleanup = RemoveOnDrop(dir.clone());

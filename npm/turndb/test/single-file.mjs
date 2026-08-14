@@ -10,7 +10,8 @@ import './_artifact.mjs';
 import { open, openFile, singleFileKind, TurndbError } from '../index.mjs';
 
 // npm/build.sh builds the CLI and exports this; it is the producer of the artifacts read below,
-// because this binding deliberately has no convert or seal surface of its own.
+// because atomic no-replace publication is unavailable in WASI Preview1, so this capability is
+// truthfully absent from the portable profile rather than weakened.
 const CLI = process.env.TURNDB_CLI
   ?? new URL('../../../target/debug/turndb', import.meta.url).pathname;
 if (!existsSync(CLI)) {
@@ -24,9 +25,8 @@ test('reads a store held in one file, live or sealed', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-wasm-file-'));
   const container = join(root, 'store.turndb');
   const payload = JSON.stringify([{ role: 'user', content: 'one file' }]);
-  // The portable writer produces the single file directly now; the CLI seals its snapshot —
-  // the pack's successor, same magic, same reader, finality by flag. (The pack READER survives
-  // for old artifacts; nothing produces new ones, so nothing here does either.)
+  // The portable writer produces the single file directly; the CLI seals its snapshot because
+  // WASI Preview1 cannot provide the atomic no-replace publication that seal promises.
   const store = await open(container);
   store.putBody('trace:1#input', payload, { model: 'm0' });
   store.sync();

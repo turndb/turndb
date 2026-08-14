@@ -12,16 +12,20 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CHECK = ROOT / "scripts/check-release-metadata.py"
 
 
-def copy_tracked(dest: pathlib.Path) -> None:
-    """Copy the tracked working tree, and nothing else.
+def copy_candidates(dest: pathlib.Path) -> None:
+    """Copy version-controlled candidates, including new non-ignored files, and nothing else.
 
     `cp -a` of the repository copies `target/` with it — tens of gigabytes of build output, three
     times, to check a handful of manifests. On a warm tree that is slow at best and fails on
     `ENOSPC` at worst, which reports as the control being broken rather than as the disk being
-    full. The checker only ever reads tracked files, so those are the only ones worth staging.
+    full. A change may add a versioned manifest and its controls must pass before it is staged, so
+    include untracked, non-ignored files while continuing to exclude build output.
     """
     tracked = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        [
+            "git", "-C", str(ROOT), "ls-files", "-z", "--cached", "--others",
+            "--exclude-standard",
+        ],
         check=True,
         capture_output=True,
     ).stdout.split(b"\0")
@@ -49,7 +53,7 @@ if baseline.returncode != 0:
 
 with tempfile.TemporaryDirectory() as temp:
     copy = pathlib.Path(temp) / "repo"
-    copy_tracked(copy)
+    copy_candidates(copy)
     bad = copy / ".changeset/invalid-control.md"
     bad.parent.mkdir(exist_ok=True)
     bad.write_text("---\ndefault: mjaor\n---\n\ncontrol\n")
@@ -59,7 +63,7 @@ with tempfile.TemporaryDirectory() as temp:
 
 with tempfile.TemporaryDirectory() as temp:
     copy = pathlib.Path(temp) / "repo"
-    copy_tracked(copy)
+    copy_candidates(copy)
     manifest = copy / "npm/turndb/package.json"
     # Derive the version to perturb rather than hardcoding one: a hardcoded string stops matching
     # on the first release PR that bumps it, injects no drift, and fails the control spuriously.
@@ -73,7 +77,7 @@ with tempfile.TemporaryDirectory() as temp:
 
 with tempfile.TemporaryDirectory() as temp:
     copy = pathlib.Path(temp) / "repo"
-    copy_tracked(copy)
+    copy_candidates(copy)
     workflow = copy / ".github/workflows/release-native.yml"
     workflow.write_text(workflow.read_text().replace(
         'case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*)',

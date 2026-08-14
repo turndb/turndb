@@ -12,6 +12,8 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Rust crash model | nightly deterministic simulation on Linux x86-64 | qualified durability model when the scheduled gate is green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
 | Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
+| Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux wheels for CPython 3.9–3.13 and installs each exact wheel | Linux release candidate after CI and the owner-approved PyPI workflow are green |
+| Browser viewer | `wasm32-unknown-unknown` structured reader plus local-file and HTTP-range viewer tests in stock Chromium and Firefox | qualified read-only browser artifact when both browser jobs are green |
 | Other Unix systems and architectures | code paths exist but no CI or packaged artifacts prove them | unqualified; no support claim |
 | Native Windows | the native core requires Unix positioned I/O and writer locking | unsupported |
 
@@ -34,13 +36,14 @@ work. See the [native prebuild contract](native-prebuilds.md).
 
 ## Capabilities are runtime facts
 
-`turndb::capabilities()`, the portable package's asynchronous `capabilities()`, and native Node's
-`capabilities()` describe the compiled implementation. Consumers should branch on them rather than
-the host OS or package name. In particular:
+`turndb::capabilities()` and every SDK's `capabilities()` describe the compiled implementation.
+Consumers should branch on them rather than the host OS or package name. In particular:
 
 - WASI reports embedder-enforced writer exclusion, no threads, and refold-only reclamation even on a
   Linux host;
 - native Linux reports OS-enforced writer exclusion, threads, and punch-or-refold reclamation;
+- Python reports the mechanisms in its native, actor-owned build;
+- the browser reports a read-only, single-threaded structured-query profile and no reclamation;
 - Rust features decide whether the columnar lens and SQL exist;
 - the native package refuses to load when its addon is absent and never silently falls back to the
   reduced WASM profile.
@@ -52,8 +55,8 @@ purpose of the profile.
 
 ## Package and API versions
 
-The Rust crate, portable npm package, and native Node package currently share `0.1.0`, but their
-versions describe API artifacts, not the part-format byte. Until 1.0:
+The Rust crate, portable npm package, native Node package, and Python distribution move in lockstep,
+but their versions describe API artifacts, not the part-format byte. Until 1.0:
 
 - a patch release fixes defects and may add diagnostic context, but does not intentionally remove or
   rename documented APIs, change a stable error code for the same typed condition, raise a supported

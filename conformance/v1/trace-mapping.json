@@ -1,0 +1,36 @@
+{
+  "contractVersion": 1,
+  "span": {
+    "traceId": "0123456789abcdef0123456789abcdef",
+    "spanId": "0123456789abcdef",
+    "parentSpanId": "fedcba9876543210",
+    "name": "chat gpt",
+    "kind": "CLIENT",
+    "startTimeUnixNano": "1700000000000000001",
+    "endTimeUnixNano": "1700000000000000043",
+    "status": { "code": "OK", "message": "done" },
+    "attributes": [
+      ["gen_ai.request.model", "gpt-test"],
+      ["gen_ai.usage.input_tokens", 7],
+      ["gen_ai.response.finish_reasons", ["stop", "tool_call"]],
+      ["gen_ai.input.messages", "[{\"role\":\"user\",\"content\":\"hello\"}]"]
+    ],
+    "events": [{ "name": "choice", "timeUnixNano": "1700000000000000020", "attributes": { "index": 0 } }],
+    "links": []
+  },
+  "expected": {
+    "id": "span/0123456789abcdef0123456789abcdef/01700000000000000001/0123456789abcdef",
+    "attributeNames": [
+      "otel.trace_id", "otel.span_id", "otel.parent_span_id", "otel.name", "otel.kind",
+      "otel.start_time_unix_nano", "otel.end_time_unix_nano", "otel.duration_ns",
+      "otel.status.code", "otel.status.message", "gen_ai.request.model",
+      "gen_ai.usage.input_tokens", "gen_ai.response.finish_reasons",
+      "gen_ai.response.finish_reasons"
+    ],
+    "contents": {
+      "gen_ai.input.messages": "W3sicm9sZSI6InVzZXIiLCJjb250ZW50IjoiaGVsbG8ifV0=",
+      "otel.events": "W3siYXR0cmlidXRlcyI6eyJpbmRleCI6MH0sIm5hbWUiOiJjaG9pY2UiLCJ0aW1lVW5peE5hbm8iOiIxNzAwMDAwMDAwMDAwMDAwMDIwIn1d",
+      "otel.links": "W10="
+    }
+  }
+}
