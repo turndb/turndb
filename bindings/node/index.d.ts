@@ -606,13 +606,11 @@ export declare class NativeStore {
   /**
    * Open a writer over a store held in ONE FILE, creating the file if it does not exist.
    *
-   * The engine's write path is directory-shaped, so this drives an ordinary store in a working
-   * directory beside the file and folds it back in on {@link NativeStore.close}. After a clean
-   * close the file is the only artifact; after a crash the working directory remains and the next
-   * open resumes from it, because it holds writes the file was never told about. A close with
-   * `durable: false` deliberately skips the fold.
-   *
-   * Every write method applies unchanged — it is the same engine either way.
+   * Parts and fold segments append directly to the container. While the writer is open, the only
+   * durable companion is `<path>-wal`; a durable close publishes pending writes and removes the
+   * emptied sidecar. After a crash the next open replays that sidecar. Writer exclusion is enforced
+   * by an OS lock on the container itself. A close with `durable: false` deliberately leaves the
+   * sidecar for recovery instead of settling the store.
    */
   static openFile(path: string, options?: OpenOptions): Promise<NativeStore>;
   readonly commandQueueCapacity: number;

@@ -1515,7 +1515,7 @@ test('writes a store held in one file, end to end from Node', async (t) => {
 
   // The promise of the shape: after a clean close the file is the only artifact.
   assert.equal(singleFileKind(file), 'container');
-  assert.equal(fs.existsSync(`${file}-hot`), false, 'a clean close removes the working directory');
+  assert.equal(fs.existsSync(`${file}-wal`), false, 'a clean close removes the WAL sidecar');
 
   const snapshot = await NativeSnapshot.openFile(file);
   assert.deepEqual(await snapshot.readContent('w/0001#input', 'body'), body);
@@ -1546,7 +1546,7 @@ test('a file store closed without a single write is still a store', async (t) =>
   await store.close();
 
   assert.equal(singleFileKind(file), 'container');
-  assert.equal(fs.existsSync(`${file}-hot`), false, 'a clean close removes the working directory');
+  assert.equal(fs.existsSync(`${file}-wal`), false, 'a clean close removes the WAL sidecar');
 
   const snapshot = await NativeSnapshot.openFile(file);
   assert.deepEqual((await snapshot.scan()).rows, [], 'an empty store scans to nothing');

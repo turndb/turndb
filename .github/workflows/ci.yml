@@ -298,7 +298,9 @@ jobs:
         browser: [chromium, firefox]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Cargo is pinned by rust-toolchain.toml. Install this target into that exact toolchain:
+      # installing it into moving `stable` leaves the pinned compiler without its core library.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2

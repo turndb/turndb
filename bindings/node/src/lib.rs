@@ -1484,8 +1484,7 @@ pub fn recover_manifest<'env>(
 #[napi]
 pub struct NativeStore {
     actor: Actor,
-    /// Set when this handle was opened over a single file. The actor drives an ordinary store in
-    /// the working directory beside it; this is what closing folds that work back into.
+    /// Aggregate reservation budget shared by SQL queries created from this writer.
     #[cfg(feature = "sql")]
     sql_budget: SqlBudget,
 }
@@ -1535,14 +1534,10 @@ impl NativeStore {
 
     /// Open a writer over a store held in ONE FILE, creating the file if it does not exist.
     ///
-    /// The engine's write path is directory-shaped — append semantics, fsync, and rename atomicity
-    /// are properties a directory has and a byte range inside a file does not — so this drives an
-    /// ordinary store in a working directory beside the file and folds it back in on
-    /// [`NativeStore::close`]. After a clean close the file is the only artifact; after a crash the
-    /// working directory remains and the next open resumes from it, because it holds writes the
-    /// file was never told about.
-    ///
-    /// Every write method applies unchanged: it is the same engine either way.
+    /// Parts and fold segments append directly to the container. While the writer is open, the
+    /// only durable companion is `<path>-wal`; a durable close publishes pending writes and removes
+    /// the emptied sidecar. After a crash the next open replays that sidecar. Writer exclusion is
+    /// enforced by an OS lock on the container itself.
     #[napi(factory)]
     pub async fn open_file(
         path: String,
