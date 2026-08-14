@@ -4,15 +4,22 @@ on:
   pull_request:
     types: [closed]
   # A failed candidate check must be repaired on main before it is retried: rerunning the original
-  # run executes the old workflow again. This dispatch deliberately reaches only the portable wasm
+  # run executes the old workflow again. This dispatch deliberately reaches exactly one selected
   # publication, and accepts only an existing annotated tag with an existing GitHub release. It
   # stays in this caller because registry trusted publishers authenticate release.yml's workflow_ref.
   workflow_dispatch:
     inputs:
       release_ref:
-        description: Existing annotated release tag whose portable wasm publication should retry
+        description: Existing annotated release tag whose failed publication should retry
         required: true
         type: string
+      component:
+        description: Failed publication to rebuild, install-test, and publish
+        required: true
+        type: choice
+        options:
+          - wasm
+          - python
 
 jobs:
   tag:
@@ -126,6 +133,7 @@ jobs:
 
   wasm:
     needs: tag
+    if: github.event_name == 'pull_request' || inputs.component == 'wasm'
     permissions:
       contents: read
       id-token: write
@@ -136,7 +144,7 @@ jobs:
 
   python:
     needs: tag
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.component == 'python'
     permissions:
       contents: read
       id-token: write
