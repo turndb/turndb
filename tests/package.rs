@@ -201,3 +201,48 @@ fn native_release_is_explicitly_owner_gated() {
         "platform package must publish before the root selector package"
     );
 }
+
+#[test]
+fn failed_release_retries_build_the_intended_package_through_the_trusted_caller() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let wasm_leaf =
+        fs::read_to_string(format!("{root}/.github/workflows/release-wasm.yml")).unwrap();
+    assert!(
+        wasm_leaf.contains("open(join(dir, \"smoke.turndb\"))"),
+        "the installed package smoke must open a store file, not its temporary parent directory"
+    );
+    assert!(
+        !wasm_leaf.contains("open(dir)"),
+        "the retired directory layout must not return through a release smoke"
+    );
+
+    let python_leaf =
+        fs::read_to_string(format!("{root}/.github/workflows/release-python.yml")).unwrap();
+    assert!(
+        ci_job_block(&python_leaf, "build").contains("--manifest-path bindings/python/Cargo.toml"),
+        "the release wheel must build the Python binding, not package the root CLI binary"
+    );
+
+    let caller = fs::read_to_string(format!("{root}/.github/workflows/release.yml")).unwrap();
+    assert!(caller.contains("workflow_dispatch:"));
+    assert!(caller.contains("component:"));
+    assert!(caller.contains("REQUESTED_REF: ${{ inputs.release_ref }}"));
+    assert!(caller.contains("git describe --tags --exact-match HEAD"));
+    assert!(caller.contains("git cat-file -t \"$RELEASE_REF\""));
+    assert!(caller.contains("gh release view \"$RELEASE_REF\""));
+
+    for job in ["crate", "native", "browser", "cli"] {
+        assert!(
+            ci_job_block(&caller, job).contains("if: github.event_name == 'pull_request'"),
+            "a failed-component retry must not fan out the {job} release"
+        );
+    }
+    assert!(
+        ci_job_block(&caller, "wasm").contains("inputs.component == 'wasm'"),
+        "portable wasm recovery must be selected explicitly through the trusted caller"
+    );
+    assert!(
+        ci_job_block(&caller, "python").contains("inputs.component == 'python'"),
+        "Python recovery must be selected explicitly through the trusted caller"
+    );
+}

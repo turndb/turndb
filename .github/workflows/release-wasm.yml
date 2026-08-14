@@ -107,7 +107,7 @@ jobs:
             const caps = await capabilities();
             assert.equal(caps.binding, "wasi");
             const dir = await mkdtemp(join(tmpdir(), "turndb-release-smoke-"));
-            const store = await open(dir);
+            const store = await open(join(dir, "smoke.turndb"));
             const payload = JSON.stringify([{ role: "user", content: "release smoke" }]);
             store.putBody("smoke:1#input", payload);
             store.sync();
