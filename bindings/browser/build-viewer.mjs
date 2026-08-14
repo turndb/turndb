@@ -9,10 +9,11 @@ const root = resolve(here, '../..');
 const generated = mkdtempSync(join(tmpdir(), 'turndb-viewer-'));
 try {
   execFileSync('cargo', [
-    'build', '-p', 'turndb-browser', '--target', 'wasm32-unknown-unknown', '--release',
+    'build', '-p', 'turndb-browser', '--target', 'wasm32-unknown-unknown',
+    '--profile', 'wasm-release',
   ], { cwd: root, stdio: 'inherit' });
   execFileSync('wasm-bindgen', [
-    join(root, 'target/wasm32-unknown-unknown/release/turndb_browser.wasm'),
+    join(root, 'target/wasm32-unknown-unknown/wasm-release/turndb_browser.wasm'),
     '--target', 'web', '--out-dir', generated,
   ], { cwd: root, stdio: 'inherit' });
   const glue = readFileSync(join(generated, 'turndb_browser.js'), 'utf8');

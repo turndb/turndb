@@ -31,10 +31,11 @@ function projected(expected, request) {
 
 try {
   execFileSync('cargo', [
-    'build', '-p', 'turndb-browser', '--target', 'wasm32-unknown-unknown', '--release',
+    'build', '-p', 'turndb-browser', '--target', 'wasm32-unknown-unknown',
+    '--profile', 'wasm-release',
   ], { cwd: root, stdio: 'inherit' });
   execFileSync('wasm-bindgen', [
-    join(root, 'target/wasm32-unknown-unknown/release/turndb_browser.wasm'),
+    join(root, 'target/wasm32-unknown-unknown/wasm-release/turndb_browser.wasm'),
     '--target', 'nodejs', '--out-dir', scratch,
   ], { cwd: root, stdio: 'inherit' });
   const wasm = createRequire(import.meta.url)(join(scratch, 'turndb_browser.js'));
