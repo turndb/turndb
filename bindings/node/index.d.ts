@@ -3,7 +3,8 @@
 export type Attr =
   | { name: string; kind: 'string'; stringValue: string }
   | { name: string; kind: 'int'; intValue: bigint }
-  | { name: string; kind: 'float'; floatValue: number }
+  | { name: string; kind: 'float'; floatValue: number; floatBits?: string }
+  | { name: string; kind: 'float'; floatValue?: number; floatBits: string }
   | { name: string; kind: 'bool'; boolValue: boolean }
   | { name: string; kind: 'uint'; uintValue: bigint }
   | { name: string; kind: 'binary'; binaryValue: Buffer }
@@ -70,6 +71,8 @@ export interface ScanPage {
     durationNs: bigint;
     examined: number;
     returned: number;
+    /** Resolved rows rejected from part metadata without projecting column values. */
+    predicatePrunedRows: bigint;
     duplicateAttrOccurrences: number;
     contentValuesReconstructed: number;
     reconstructedBytes: bigint;
@@ -166,6 +169,17 @@ export interface SqlBatch {
 }
 
 export interface Capabilities {
+  /** Language-neutral binding contract; independent of package and part-format versions. */
+  contractVersion: 1;
+  profile: 'native';
+  operations: Array<
+    | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
+    | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal' | 'verify'
+    | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close'
+  >;
+  partFormat: { write: number; readMax: number };
+  reclamation: 'punch_or_refold' | 'refold_only';
+  cancellation: { scan: boolean; lifecycle: boolean };
   partFormatWrite: number;
   partFormatReadMax: number;
   writerExclusion: 'os_enforced' | 'embedder_enforced';
@@ -592,13 +606,11 @@ export declare class NativeStore {
   /**
    * Open a writer over a store held in ONE FILE, creating the file if it does not exist.
    *
-   * The engine's write path is directory-shaped, so this drives an ordinary store in a working
-   * directory beside the file and folds it back in on {@link NativeStore.close}. After a clean
-   * close the file is the only artifact; after a crash the working directory remains and the next
-   * open resumes from it, because it holds writes the file was never told about. A close with
-   * `durable: false` deliberately skips the fold.
-   *
-   * Every write method applies unchanged — it is the same engine either way.
+   * Parts and fold segments append directly to the container. While the writer is open, the only
+   * durable companion is `<path>-wal`; a durable close publishes pending writes and removes the
+   * emptied sidecar. After a crash the next open replays that sidecar. Writer exclusion is enforced
+   * by an OS lock on the container itself. A close with `durable: false` deliberately leaves the
+   * sidecar for recovery instead of settling the store.
    */
   static openFile(path: string, options?: OpenOptions): Promise<NativeStore>;
   readonly commandQueueCapacity: number;
@@ -660,6 +672,11 @@ export declare class NativeStore {
   }>;
   /** Settles prior writes; cancellation never publishes the destination. */
   backup(
+    path: string,
+    options?: LifecycleOptions,
+  ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
+  /** Contract-v1 alias for publishing a verified immutable single-file snapshot. */
+  seal(
     path: string,
     options?: LifecycleOptions,
   ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;

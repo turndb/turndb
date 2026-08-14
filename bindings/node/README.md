@@ -18,6 +18,22 @@ Build and exercise the source addon from the workspace with:
 npm run test:dev --prefix bindings/node
 ```
 
+The Tier-2 OpenTelemetry exporter is an optional subpath rather than a required SDK dependency:
+
+```js
+import { TurnDbSpanExporter } from '@turndb/native/otel';
+provider.addSpanProcessor(new BatchSpanProcessor(new TurnDbSpanExporter('agent.turndb')));
+```
+
+It durably acknowledges each export by default, publishes after 512 spans or five seconds, and
+always syncs and flushes on `forceFlush()` and `shutdown()`.
+
+Provider SDKs stay optional. `traceGenAiCall(tracer, options, call)` is the thin client wrapper: it
+runs any promise-returning SDK call inside a canonical `gen_ai` CLIENT span, moves input/output
+message arrays onto the content-bearing attributes used by the exporter, and preserves the exact
+return value or exception. This keeps OpenAI-, Anthropic-, and framework-specific adapters to a
+one-call description instead of another storage mapping.
+
 Its closed Node range is `>=22 <27`; the required Linux x86-64 matrix is Node 22, 24, and 26.
 Support claims come from that tested matrix, not from N-API 6 alone; see the repository's
 [support and compatibility policy](https://github.com/turndb/turndb/blob/main/docs/support-and-compatibility.md).
@@ -72,13 +88,18 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   projected, predicate-only, and byte-reconstructed fields; effective bounds and budgets; and exact
   pre-resolution part/row/memtable scope. It does not estimate result counts or read value/content
   columns. See [structured scan explanation](https://github.com/turndb/turndb/blob/main/docs/scan-explanation.md).
+- `capabilities()` includes the language-neutral contract-v1 profile (`operations`, `partFormat`,
+  reclamation, and cancellation) alongside the detailed native build facts. Query and scalar
+  semantics are defined once in `docs/query-contract.md`; exact NaN payloads cross N-API through
+  `floatBits`, while ordinary floats retain the ergonomic `floatValue` lane.
 - Every rejection is normalized to `TurnDbError`. Its stable `code` comes from the Rust engine's
   typed cause classifier; `BUSY` and `CLOSED` are the only binding-owned states. Messages retain full
   diagnostic context but are not an API. See [error taxonomy](https://github.com/turndb/turndb/blob/main/docs/error-taxonomy.md).
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
-- `backup(path)` settles earlier actor commands, writes and fully verifies an immutable pack, and
+- `seal(path)` (also available as the maintenance-oriented `backup(path)`) settles earlier actor
+  commands, writes and fully verifies an immutable single-file snapshot, and
   atomically publishes it without replacing an existing destination. `restoreBackup(pack, dir)`
   verifies every member, extracts with bounded memory, validates the staged store, and atomically
   publishes a new writable directory without overlaying any filesystem object. Safe restore reports

@@ -540,6 +540,20 @@ pub struct Part {
     read_limits: crate::read_limits::ReadLimits,
 }
 
+fn scalar_order(left: &AttrValue, right: &AttrValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (AttrValue::Str(left), AttrValue::Str(right)) => Some(left.cmp(right)),
+        (AttrValue::Int(left), AttrValue::Int(right)) => Some(left.cmp(right)),
+        (AttrValue::Float(left), AttrValue::Float(right)) => left.partial_cmp(right),
+        (AttrValue::Bool(left), AttrValue::Bool(right)) => Some(left.cmp(right)),
+        (AttrValue::UInt(left), AttrValue::UInt(right)) => Some(left.cmp(right)),
+        (AttrValue::Bytes(left), AttrValue::Bytes(right)) => Some(left.cmp(right)),
+        (AttrValue::TimestampNs(left), AttrValue::TimestampNs(right)) => Some(left.cmp(right)),
+        (AttrValue::Null, AttrValue::Null) => Some(std::cmp::Ordering::Equal),
+        _ => None,
+    }
+}
+
 impl Drop for Part {
     /// Release this part's entries rather than leaving them to be evicted eventually. A closed part
     /// holding budget would push out entries belonging to parts that are still open.
@@ -1404,6 +1418,91 @@ impl Part {
     /// only ever costs a scan, never an answer.
     pub fn zone(&self, c: usize) -> Result<Option<(AttrValue, AttrValue)>> {
         attrs::read_zone(self, c)
+    }
+
+    /// Whether this part can possibly contain an occurrence satisfying one typed attribute
+    /// predicate. `false` is a proof from dictionary/zone metadata; every absent, legacy, NaN, or
+    /// malformed advisory fact widens to `true` so pruning can never change an answer.
+    pub fn attr_predicate_may_match(
+        &self,
+        name: &str,
+        op: crate::scan::Compare,
+        value: &AttrValue,
+    ) -> Result<bool> {
+        let wanted_tag = value.type_tag();
+        let meta = attrs::read_meta(self)?;
+        let columns: Vec<_> = meta
+            .iter()
+            .enumerate()
+            .filter(|(_, (column_name, tag, _, _))| column_name == name && *tag == wanted_tag)
+            .map(|(ordinal, _)| ordinal)
+            .collect();
+        if columns.is_empty() {
+            return Ok(false);
+        }
+        for column in columns {
+            if wanted_tag == 0 {
+                let AttrValue::Str(needle) = value else { unreachable!() };
+                let dictionary = attrs::read_dict(self, column)?;
+                let may = match op {
+                    crate::scan::Compare::Eq => dictionary.binary_search(needle).is_ok(),
+                    crate::scan::Compare::Ne => {
+                        dictionary.len() != 1 || dictionary.first() != Some(needle)
+                    }
+                    crate::scan::Compare::Lt => {
+                        dictionary.first().is_some_and(|first| first < needle)
+                    }
+                    crate::scan::Compare::LtEq => {
+                        dictionary.first().is_some_and(|first| first <= needle)
+                    }
+                    crate::scan::Compare::Gt => dictionary.last().is_some_and(|last| last > needle),
+                    crate::scan::Compare::GtEq => {
+                        dictionary.last().is_some_and(|last| last >= needle)
+                    }
+                };
+                if may {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let Some((minimum, maximum)) = self.zone(column)? else {
+                return Ok(true);
+            };
+            let may = match op {
+                crate::scan::Compare::Eq => {
+                    scalar_order(&minimum, value).is_some_and(|order| !order.is_gt())
+                        && scalar_order(&maximum, value).is_some_and(|order| !order.is_lt())
+                }
+                // A zone cannot prove `ne` for floats because ±0 have equal numeric order but
+                // distinct contract equality. Other types can prune a constant equal column.
+                crate::scan::Compare::Ne if wanted_tag == 2 => true,
+                crate::scan::Compare::Ne => minimum != *value || maximum != *value,
+                crate::scan::Compare::Lt => {
+                    scalar_order(&minimum, value).is_none_or(|order| order.is_lt())
+                }
+                crate::scan::Compare::LtEq => {
+                    scalar_order(&minimum, value).is_none_or(|order| !order.is_gt())
+                }
+                crate::scan::Compare::Gt => {
+                    scalar_order(&maximum, value).is_none_or(|order| order.is_gt())
+                }
+                crate::scan::Compare::GtEq => {
+                    scalar_order(&maximum, value).is_none_or(|order| !order.is_lt())
+                }
+            };
+            if may {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn has_attribute_name(&self, name: &str) -> Result<bool> {
+        Ok(attrs::read_meta(self)?.iter().any(|(column, _, _, _)| column == name))
+    }
+
+    pub fn has_content_name(&self, name: &str) -> Result<bool> {
+        Ok(self.content_meta()?.iter().any(|content| content.name == name))
     }
 
     /// The whole record at row `r`.

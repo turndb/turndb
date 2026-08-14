@@ -262,6 +262,71 @@ jobs:
       - name: install and exercise the same packed addon
         run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
 
+  python:
+    name: Python binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-binding
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: build and run shared conformance plus trace mapping
+        run: |
+          python -m pip install 'maturin>=1.7,<2' 'opentelemetry-sdk>=1.20,<2'
+          cargo build -p turndb-python
+          python -m unittest bindings/python/tests/test_conformance.py bindings/python/tests/test_otel.py -v
+          maturin build --manifest-path bindings/python/Cargo.toml --out dist/python
+          python -m pip install dist/python/*.whl
+          python - <<'PY'
+          from opentelemetry.sdk.trace import TracerProvider
+          import turndb
+          assert turndb.capabilities()["binding"] == "python"
+          tracer = TracerProvider().get_tracer("turndb-wheel")
+          assert turndb.trace_gen_ai_call(tracer, lambda: 7, operation_name="chat") == 7
+          PY
+
+  browser:
+    name: browser viewer (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
+    steps:
+      - uses: actions/checkout@v7
+      # Cargo is pinned by rust-toolchain.toml. Install this target into that exact toolchain:
+      # installing it into moving `stable` leaves the pinned compiler without its core library.
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: browser-wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/browser/package-lock.json
+      - name: install wasm glue and browser harness
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
+          npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/browser
+          npm exec --prefix bindings/browser -- playwright install --with-deps ${{ matrix.browser }}
+      - name: compile core, rebuild one-file viewer, and exercise it
+        env:
+          TURNDB_BROWSER: ${{ matrix.browser }}
+        run: |
+          cargo check -p turndb-browser --target wasm32-unknown-unknown
+          node bindings/browser/build-viewer.mjs
+          git diff --exit-code -- bindings/browser/turndb-viewer.html
+          npm test --prefix bindings/browser
+          npm run test:wasm --prefix bindings/browser
+          npm run test:viewer --prefix bindings/browser
+
   # One check that says what actually ran, because a reader of a check list cannot tell a job that
   # passed from a job that never executed. GitHub renders `skipped` in the same muted grey as
   # `neutral`, and a matrix job that skips is not even expanded — a scheduled run used to emit the
@@ -274,7 +339,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, python, browser]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran

@@ -271,6 +271,9 @@ pub struct ScanStats {
     pub duplicate_attr_occurrences: usize,
     pub content_values_reconstructed: usize,
     pub reconstructed_bytes: u64,
+    /// Live candidate rows rejected from advisory part metadata before any selected value column
+    /// was opened. This is exact work avoided, not an estimate.
+    pub predicate_pruned_rows: usize,
     /// A matching row was deliberately left for the next page because adding all of its selected
     /// content bytes would have crossed the request's reconstruction ceiling.
     pub reconstruction_budget_exhausted: bool,
@@ -336,6 +339,11 @@ trait Source {
     ) -> Result<Vec<Record>>;
     fn reconstruct_content(&self, candidate: &ScanCandidate, content: &Content) -> Result<Vec<u8>>;
     fn physical_scope(&self, from: Option<&str>, to: Option<&str>) -> Result<ScanPhysicalScope>;
+    fn candidate_may_match(
+        &self,
+        candidate: &ScanCandidate,
+        predicates: &[Predicate],
+    ) -> Result<bool>;
 }
 
 impl Source for Store {
@@ -375,6 +383,14 @@ impl Source for Store {
     fn physical_scope(&self, from: Option<&str>, to: Option<&str>) -> Result<ScanPhysicalScope> {
         Store::scan_physical_scope(self, from, to)
     }
+
+    fn candidate_may_match(
+        &self,
+        candidate: &ScanCandidate,
+        predicates: &[Predicate],
+    ) -> Result<bool> {
+        Store::candidate_may_match(self, candidate, predicates)
+    }
 }
 
 impl Source for ReadStore {
@@ -413,6 +429,14 @@ impl Source for ReadStore {
 
     fn physical_scope(&self, from: Option<&str>, to: Option<&str>) -> Result<ScanPhysicalScope> {
         ReadStore::scan_physical_scope(self, from, to)
+    }
+
+    fn candidate_may_match(
+        &self,
+        candidate: &ScanCandidate,
+        predicates: &[Predicate],
+    ) -> Result<bool> {
+        ReadStore::candidate_may_match(self, candidate, predicates)
     }
 }
 
@@ -588,7 +612,12 @@ fn explain_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanExpl
 }
 
 fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
-    let started = std::time::Instant::now();
+    #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+    let started = Some(std::time::Instant::now());
+    // `std::time::Instant::now()` traps on wasm32-unknown-unknown. The browser binding can time
+    // outside wasm with performance.now(); the engine returns an explicit zero rather than panic.
+    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+    let started: Option<std::time::Instant> = None;
     let prepared = prepare(request)?;
     let read_trace = crate::io_trace::ReadTraceScope::start();
     let PreparedScan {
@@ -601,10 +630,7 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
         content_needed,
     } = prepared;
     if matches!((&from, &to), (Some(a), Some(b)) if a >= b) {
-        let stats = ScanStats {
-            duration_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            ..ScanStats::default()
-        };
+        let stats = ScanStats { duration_ns: elapsed_ns(started), ..ScanStats::default() };
         return Ok(ScanPage { rows: Vec::new(), next: None, stats });
     }
     let needs_record = !attr_needed.is_empty() || !content_needed.is_empty();
@@ -683,19 +709,36 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
             let (candidate_batch, rest) = pending.split_at(chunk);
             pending = rest;
             check_interruption(request)?;
-            let projected = if needs_record {
-                Some(source.project_batch(candidate_batch, &attr_needed, &content_needed)?)
+            let may_match = candidate_batch
+                .iter()
+                .map(|candidate| source.candidate_may_match(candidate, &request.predicates))
+                .collect::<Result<Vec<_>>>()?;
+            let project_candidates = candidate_batch
+                .iter()
+                .zip(&may_match)
+                .filter(|(_, may_match)| **may_match)
+                .map(|(candidate, _)| candidate.clone())
+                .collect::<Vec<_>>();
+            let projected = if needs_record && !project_candidates.is_empty() {
+                Some(source.project_batch(&project_candidates, &attr_needed, &content_needed)?)
             } else {
                 None
             };
-            if projected.as_ref().is_some_and(|records| records.len() != candidate_batch.len()) {
+            if projected.as_ref().is_some_and(|records| records.len() != project_candidates.len()) {
                 bail!("scan source returned the wrong number of projected rows");
             }
-            for (candidate_index, candidate) in candidate_batch.iter().enumerate() {
+            let mut projected_index = 0usize;
+            for (candidate, may_match) in candidate_batch.iter().zip(may_match) {
                 check_interruption(request)?;
                 processed += 1;
                 stats.examined += 1;
-                let record = projected.as_ref().map(|records| &records[candidate_index]);
+                if !may_match {
+                    stats.predicate_pruned_rows += 1;
+                    last_consumed = Some(candidate.id().to_string());
+                    continue;
+                }
+                let record = projected.as_ref().map(|records| &records[projected_index]);
+                projected_index += usize::from(projected.is_some());
                 if !request.predicates.iter().all(|p| matches_predicate(candidate.id(), record, p))
                 {
                     last_consumed = Some(candidate.id().to_string());
@@ -804,8 +847,14 @@ fn scan_source(source: &dyn Source, request: &ScanRequest) -> Result<ScanPage> {
     } else {
         None
     };
-    stats.duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    stats.duration_ns = elapsed_ns(started);
     Ok(ScanPage { rows, next, stats })
+}
+
+fn elapsed_ns(started: Option<std::time::Instant>) -> u64 {
+    started
+        .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn check_interruption(request: &ScanRequest) -> Result<()> {
@@ -1188,6 +1237,14 @@ mod tests {
             _content: &Content,
         ) -> Result<Vec<u8>> {
             unreachable!("the interruption test projects no content")
+        }
+
+        fn candidate_may_match(
+            &self,
+            _candidate: &ScanCandidate,
+            _predicates: &[Predicate],
+        ) -> Result<bool> {
+            Ok(true)
         }
 
         fn physical_scope(

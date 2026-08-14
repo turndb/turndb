@@ -37,6 +37,32 @@ for relative in SELECTORS:
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 print(f"synced {synced} platform pins across {len(SELECTORS)} selectors to {VERSION}")
 
+# PyPI reads PEP 621 metadata rather than Cargo's package table. Knope owns the Cargo member
+# version; keep the Python distribution's independent metadata in the same lockstep release.
+pyproject_path = ROOT / "bindings/python/pyproject.toml"
+pyproject = pyproject_path.read_text()
+pyproject, replacements = re.subn(
+    r'(?ms)(\[project\].*?^version = ")[^"]+("$)',
+    rf'\g<1>{VERSION}\g<2>',
+    pyproject,
+    count=1,
+)
+if replacements != 1:
+    raise SystemExit("could not update bindings/python/pyproject.toml project.version")
+pyproject_path.write_text(pyproject)
+
+python_cargo_path = ROOT / "bindings/python/Cargo.toml"
+python_cargo = python_cargo_path.read_text()
+python_cargo, replacements = re.subn(
+    r'(turndb = \{ path = "\.\./\.\.", version = ")[^"]+("[^\n]*\})',
+    rf'\g<1>{VERSION}\g<2>',
+    python_cargo,
+    count=1,
+)
+if replacements != 1:
+    raise SystemExit("could not update the Python binding's core version requirement")
+python_cargo_path.write_text(python_cargo)
+
 # Knope updates the root Cargo.lock entry but, with explicit workspace member manifests in
 # versioned_files, leaves member entries at their old versions. Ask Cargo to update every local
 # package that still differs; deriving the names from the lock keeps a new workspace member from

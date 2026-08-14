@@ -1,7 +1,7 @@
 [workspace]
 # Bindings live in their own crates so the engine never carries an ABI. `turndb` stays a Rust library
 # with a Rust API; the WASM and N-API crates translate at their respective process boundaries.
-members = [".", "bindings/wasm", "bindings/node"]
+members = [".", "bindings/wasm", "bindings/node", "bindings/python", "bindings/browser"]
 
 [package]
 name = "turndb"

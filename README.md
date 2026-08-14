@@ -84,6 +84,19 @@ s.flush()?;                                   // one superblock flip publishes t
 s.close()?;                                   // settles the sidecar; one file remains
 ```
 
+## SDKs and browser viewer
+
+Node and Python expose the same versioned [capability contract](docs/capability-contract.md) and
+[structured query contract](docs/query-contract.md), including ordered duplicate attributes,
+bit-exact floats, byte-exact named content, sealing, and bounded maintenance. Their OpenTelemetry
+exporters and provider-independent client-call wrappers implement one
+[trace mapping and cadence policy](docs/trace-mapping.md).
+
+The checked [self-contained browser viewer](bindings/browser/turndb-viewer.html) opens a local
+`.turndb` with no network traffic or fetches one from a static host using strict HTTP Range. It is
+read-only and runs the same structured scans in wasm; the measured multi-GiB point-query fetch is
+recorded in [the browser read report](docs/browser.md).
+
 ## Storing gen_ai traces
 
 [`examples/genai_dogfood.rs`](examples/genai_dogfood.rs) is the working mapping from LLM API calls

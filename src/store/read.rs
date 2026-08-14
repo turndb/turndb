@@ -82,6 +82,28 @@ pub(crate) struct RowBatch {
     pub budget_exhausted: bool,
 }
 
+pub(crate) fn part_may_match(part: &Part, predicates: &[crate::scan::Predicate]) -> Result<bool> {
+    for predicate in predicates {
+        let possible = match predicate {
+            crate::scan::Predicate::Attr { name, op, value } => {
+                part.attr_predicate_may_match(name, *op, value)?
+            }
+            crate::scan::Predicate::AttrExists { name, present: true } => {
+                part.has_attribute_name(name)?
+            }
+            crate::scan::Predicate::ContentExists { name, present: true } => {
+                part.has_content_name(name)?
+            }
+            // Absence and id predicates cannot be disproved by part-wide field metadata.
+            _ => true,
+        };
+        if !possible {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowScan<'a> {
     pub from: Option<&'a str>,

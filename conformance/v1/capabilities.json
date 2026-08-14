@@ -1,0 +1,47 @@
+{
+  "contractVersion": 1,
+  "invariants": [
+    {
+      "name": "sql-requires-columnar-and-arrow-ipc",
+      "if": { "sql": true },
+      "then": { "columnar": true, "arrowIpc": true, "operationsInclude": ["querySql"] }
+    },
+    {
+      "name": "read-only-profiles-have-no-writer",
+      "if": { "writerExclusion": "read_only" },
+      "then": {
+        "partFormatWriteAbsent": true,
+        "operationsExclude": [
+          "openWriter",
+          "write",
+          "sync",
+          "flush",
+          "seal",
+          "compactBounded",
+          "refold",
+          "erase"
+        ]
+      }
+    },
+    {
+      "name": "browser-is-read-only-and-single-threaded",
+      "if": { "profile": "browser" },
+      "then": {
+        "writerExclusion": "read_only",
+        "positionedIo": true,
+        "threads": false,
+        "reclamation": "none"
+      }
+    },
+    {
+      "name": "wasi-exclusion-belongs-to-the-embedder",
+      "if": { "profile": "wasi" },
+      "then": { "writerExclusion": "embedder_enforced", "threads": false }
+    },
+    {
+      "name": "structured-scan-is-one-semantic-operation",
+      "if": { "operationsInclude": ["scan"] },
+      "then": { "positionedIo": true }
+    }
+  ]
+}

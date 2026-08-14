@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://turndb.dev/conformance/v1/capabilities.schema.json",
+  "title": "TurnDB capability contract v1",
+  "type": "object",
+  "required": [
+    "contractVersion",
+    "profile",
+    "operations",
+    "partFormat",
+    "writerExclusion",
+    "positionedIo",
+    "threads",
+    "columnar",
+    "sql",
+    "arrowIpc",
+    "reclamation",
+    "cancellation"
+  ],
+  "properties": {
+    "contractVersion": { "const": 1 },
+    "profile": {
+      "type": "string",
+      "enum": ["native", "wasi", "browser"]
+    },
+    "operations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "partFormat": {
+      "type": "object",
+      "required": ["readMax"],
+      "properties": {
+        "write": { "type": "integer", "minimum": 1, "maximum": 255 },
+        "readMax": { "type": "integer", "minimum": 1, "maximum": 255 }
+      },
+      "additionalProperties": false
+    },
+    "writerExclusion": {
+      "type": "string",
+      "enum": ["os_enforced", "embedder_enforced", "read_only"]
+    },
+    "positionedIo": { "type": "boolean" },
+    "threads": { "type": "boolean" },
+    "columnar": { "type": "boolean" },
+    "sql": { "type": "boolean" },
+    "arrowIpc": { "type": "boolean" },
+    "reclamation": {
+      "type": "string",
+      "enum": ["punch_or_refold", "refold_only", "none"]
+    },
+    "cancellation": {
+      "type": "object",
+      "required": ["scan", "lifecycle"],
+      "properties": {
+        "scan": { "type": "boolean" },
+        "lifecycle": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "operation": {
+      "type": "string",
+      "enum": [
+        "openWriter",
+        "openSnapshot",
+        "compiledCapabilities",
+        "write",
+        "sync",
+        "flush",
+        "scan",
+        "explainScan",
+        "schema",
+        "readContent",
+        "snapshot",
+        "querySql",
+        "seal",
+        "verify",
+        "spaceUsage",
+        "compactBounded",
+        "refold",
+        "erase",
+        "close"
+      ]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@turndb/browser-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:wasm": "node test/wasm-conformance.mjs",
+    "test:viewer": "node test/viewer.e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

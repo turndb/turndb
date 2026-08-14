@@ -20,6 +20,7 @@ bindings/node/npm/*/*.node
 bindings/node/*.tgz
 bindings/node/npm/*/*.tgz
 bindings/node/node_modules/
+bindings/browser/node_modules/
 
 # `cargo run --example readme_check` opens a store at this relative path, so it lands in the
 # repository root. A generated store is binary and content-addressed; a reviewer cannot read a diff

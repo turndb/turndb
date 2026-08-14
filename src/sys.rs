@@ -126,6 +126,22 @@ pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result
     Ok(())
 }
 
+#[cfg(not(any(unix, target_os = "wasi")))]
+pub(crate) fn read_exact_at(_f: &File, _buf: &mut [u8], _off: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this target has no filesystem positioned-read primitive; use a custom ReadAt source",
+    ))
+}
+
+#[cfg(not(any(unix, target_os = "wasi")))]
+pub(crate) fn write_all_at(_f: &File, _buf: &[u8], _off: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this target has no filesystem positioned-write primitive",
+    ))
+}
+
 // ── Whole-file advisory lock ────────────────────────────────────────────────
 
 /// Take an exclusive advisory lock on `f`, or report that another writer holds it.

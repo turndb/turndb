@@ -16,6 +16,7 @@ export type AttrValue =
   | null
   | { i: number | bigint }
   | { f: number }
+  | { fBits: string }
   | { u: number | bigint }
   | { timestampNs: number | bigint };
 
@@ -147,6 +148,8 @@ export interface ScanStats {
   durationNs: bigint;
   examined: number;
   returned: number;
+  /** Resolved rows rejected from part metadata without projecting column values. */
+  predicatePrunedRows: bigint;
   /** Repeat `(name, type)` occurrences beyond each first. Every occurrence is still returned. */
   duplicateAttrOccurrences: number;
   contentValuesReconstructed: number;
@@ -230,10 +233,29 @@ export type BindingOperation =
   | 'scanIds' | 'scan' | 'stats' | 'verify' | 'health' | 'metrics' | 'lifecycleEvents'
   | 'contentLiveness' | 'spaceUsage' | 'estimateRefoldSpace' | 'refold' | 'eraseIds' | 'close';
 
+export type ContractOperation =
+  | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
+  | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal'
+  | 'verify' | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close';
+
 /** What is actually callable through this npm/WASI binding. */
 export interface Capabilities {
+  contractVersion: 1;
+  profile: 'wasi';
   binding: 'wasi';
-  operations: BindingOperation[];
+  /** Stable Tier-1 contract operations. */
+  operations: ContractOperation[];
+  /** Package-specific convenience methods retained outside the cross-binding contract. */
+  bindingOperations: BindingOperation[];
+  partFormat: { write: number; readMax: number };
+  writerExclusion: 'embedder_enforced';
+  positionedIo: true;
+  threads: false;
+  columnar: boolean;
+  sql: false;
+  arrowIpc: false;
+  reclamation: 'refold_only';
+  cancellation: { scan: true; lifecycle: true };
   limits: { lifecycleEvents: number };
   controls: {
     /** Methods accepting cooperative `timeoutMs`; every name resolves on `Store`. */
@@ -242,7 +264,11 @@ export interface Capabilities {
       | 'contentLiveness' | 'spaceUsage' | 'estimateRefoldSpace' | 'refold' | 'eraseIds'
     >;
   };
-  unavailable: { allocatedBytes: 'absent'; cancellationToken: 'absent' };
+  unavailable: {
+    allocatedBytes: 'absent';
+    cancellationToken: 'absent';
+    atomicNoReplacePublication: 'absent';
+  };
 }
 
 /** Mechanisms and format facts compiled into the guest, independent of binding reachability. */
@@ -608,23 +634,23 @@ export declare class Store {
 }
 
 /**
- * Open (or create) a store at `dir`.
+ * Open (or create) a store at a `.turndb` file path.
  *
- * **At most one open writer per store directory across every process.** This package is always the
+ * **At most one open writer per store file across every process.** This package is always the
  * `wasm32-wasip1` build and WASI has no advisory locking, so the engine cannot enforce
  * cross-process exclusion. Measured concurrent writers both received successful durability
  * acknowledgements while one writer's entire record set was silently discarded; the surviving
  * store remained internally consistent. The embedder must enforce this precondition before it can
  * treat an acknowledgement as durable fact.
  *
- * The store directory is created if it does not exist, matching the Rust `Store::open` it wraps.
+ * The parent directory is created if it does not exist, matching the Rust `Store::open_file` it wraps.
  *
  * Within one process, sequential opens — including opens of different directories — reuse one WASI
  * instance. The directory capability is switched between handles without widening the sandbox to a
  * common ancestor. Consequently only one `Store` may be open in a process at a time; use separate
  * processes when multiple stores must be held open concurrently.
  */
-export declare function open(dir: string, opts?: OpenOptions): Promise<Store>;
+export declare function open(file: string, opts?: OpenOptions): Promise<Store>;
 
 /** Read admission for a single-file open; the write-side limits do not apply to a reader. */
 export type OpenFileOptions = Pick<

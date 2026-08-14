@@ -1,0 +1,329 @@
+{
+  "contractVersion": 1,
+  "steps": [
+    {
+      "action": "apply",
+      "name": "published-v1",
+      "puts": [
+        {
+          "id": "alpha",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "first" } },
+            { "name": "signed", "value": { "type": "i64", "decimal": "-9223372036854775808" } },
+            { "name": "float", "value": { "type": "f64", "bitsHex": "8000000000000000" } },
+            { "name": "enabled", "value": { "type": "bool", "value": true } },
+            { "name": "unsigned", "value": { "type": "u64", "decimal": "18446744073709551615" } },
+            { "name": "raw", "value": { "type": "binary", "base64": "AP8=" } },
+            { "name": "at", "value": { "type": "timestampNs", "decimal": "-1" } },
+            { "name": "nullable", "value": { "type": "null" } },
+            { "name": "tag", "value": { "type": "string", "value": "second" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "YWxwaGEgYm9keQ==", "storage": "piece" },
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "beta",
+          "attrs": [
+            { "name": "kind", "value": { "type": "string", "value": "old" } },
+            { "name": "float", "value": { "type": "f64", "bitsHex": "7ff8000000000001" } }
+          ],
+          "contents": [
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "gamma",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "gamma" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "7" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "MDEyMzQ1Njc4OQ==", "storage": "piece" }
+          ]
+        }
+      ],
+      "deletes": []
+    },
+    { "action": "sync" },
+    { "action": "flush" },
+    { "action": "captureSnapshot", "name": "snapshot-v1" },
+    {
+      "action": "apply",
+      "name": "overlay-v2",
+      "puts": [
+        {
+          "id": "alpha",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "new" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "2" } },
+            { "name": "nullable", "value": { "type": "null" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "YWxwaGEgYm9keSB2Mg==", "storage": "piece" },
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "delta",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "delta" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "3" } },
+            { "name": "enabled", "value": { "type": "bool", "value": false } },
+            { "name": "at", "value": { "type": "timestampNs", "decimal": "1" } }
+          ],
+          "contents": [
+            { "name": "aux", "base64": "c2hhcmVk", "storage": "piece" },
+            { "name": "body", "base64": "ZGVsdGEtYm9keQ==", "storage": "piece" }
+          ]
+        }
+      ],
+      "deletes": ["beta"]
+    },
+    { "action": "assertWriter", "name": "writer-overlay" },
+    { "action": "sync" },
+    { "action": "flush" },
+    { "action": "captureSnapshot", "name": "snapshot-v2" }
+  ],
+  "views": [
+    {
+      "name": "published-v1",
+      "source": "snapshot-v1",
+      "records": [
+        {
+          "id": "alpha",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "first" } },
+            { "name": "signed", "value": { "type": "i64", "decimal": "-9223372036854775808" } },
+            { "name": "float", "value": { "type": "f64", "bitsHex": "8000000000000000" } },
+            { "name": "enabled", "value": { "type": "bool", "value": true } },
+            { "name": "unsigned", "value": { "type": "u64", "decimal": "18446744073709551615" } },
+            { "name": "raw", "value": { "type": "binary", "base64": "AP8=" } },
+            { "name": "at", "value": { "type": "timestampNs", "decimal": "-1" } },
+            { "name": "nullable", "value": { "type": "null" } },
+            { "name": "tag", "value": { "type": "string", "value": "second" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "YWxwaGEgYm9keQ==", "storage": "piece" },
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "beta",
+          "attrs": [
+            { "name": "kind", "value": { "type": "string", "value": "old" } },
+            { "name": "float", "value": { "type": "f64", "bitsHex": "7ff8000000000001" } }
+          ],
+          "contents": [
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "gamma",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "gamma" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "7" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "MDEyMzQ1Njc4OQ==", "storage": "piece" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "overlay-v2",
+      "source": "writer-overlay",
+      "records": [
+        {
+          "id": "alpha",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "new" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "2" } },
+            { "name": "nullable", "value": { "type": "null" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "YWxwaGEgYm9keSB2Mg==", "storage": "piece" },
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "delta",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "delta" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "3" } },
+            { "name": "enabled", "value": { "type": "bool", "value": false } },
+            { "name": "at", "value": { "type": "timestampNs", "decimal": "1" } }
+          ],
+          "contents": [
+            { "name": "aux", "base64": "c2hhcmVk", "storage": "piece" },
+            { "name": "body", "base64": "ZGVsdGEtYm9keQ==", "storage": "piece" }
+          ]
+        },
+        {
+          "id": "gamma",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "gamma" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "7" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "MDEyMzQ1Njc4OQ==", "storage": "piece" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "published-v2",
+      "source": "snapshot-v2",
+      "records": [
+        {
+          "id": "alpha",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "new" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "2" } },
+            { "name": "nullable", "value": { "type": "null" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "YWxwaGEgYm9keSB2Mg==", "storage": "piece" },
+            { "name": "empty", "base64": "", "storage": "literal" }
+          ]
+        },
+        {
+          "id": "delta",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "delta" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "3" } },
+            { "name": "enabled", "value": { "type": "bool", "value": false } },
+            { "name": "at", "value": { "type": "timestampNs", "decimal": "1" } }
+          ],
+          "contents": [
+            { "name": "aux", "base64": "c2hhcmVk", "storage": "piece" },
+            { "name": "body", "base64": "ZGVsdGEtYm9keQ==", "storage": "piece" }
+          ]
+        },
+        {
+          "id": "gamma",
+          "attrs": [
+            { "name": "tag", "value": { "type": "string", "value": "gamma" } },
+            { "name": "count", "value": { "type": "i64", "decimal": "7" } }
+          ],
+          "contents": [
+            { "name": "body", "base64": "MDEyMzQ1Njc4OQ==", "storage": "piece" }
+          ]
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "name": "all-scalars-duplicates-and-content-shapes",
+      "source": "snapshot-v1",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "attrs": ["tag", "signed", "float", "enabled", "unsigned", "raw", "at", "nullable"],
+        "contents": [
+          { "name": "body", "mode": "bytes" },
+          { "name": "empty", "mode": "bytes" },
+          { "name": "missing", "mode": "metadata" }
+        ],
+        "predicates": [
+          { "kind": "id", "op": "eq", "value": "alpha" }
+        ]
+      },
+      "expectedIds": ["alpha"]
+    },
+    {
+      "name": "reverse-cursor-pages",
+      "source": "snapshot-v1",
+      "request": { "contractVersion": 1, "direction": "reverse", "limit": 1 },
+      "paginate": true,
+      "expectedIds": ["gamma", "beta", "alpha"],
+      "assertCursorDamageRejected": true,
+      "assertCursorMismatchRejected": true
+    },
+    {
+      "name": "typed-inequality-after-newest-wins",
+      "source": "writer-overlay",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "predicates": [
+          { "kind": "attr", "name": "count", "op": "gt", "value": { "type": "i64", "decimal": "2" } }
+        ]
+      },
+      "expectedIds": ["delta", "gamma"]
+    },
+    {
+      "name": "explicit-null-is-not-missing",
+      "source": "snapshot-v2",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "predicates": [
+          { "kind": "attr", "name": "nullable", "op": "eq", "value": { "type": "null" } }
+        ]
+      },
+      "expectedIds": ["alpha"]
+    },
+    {
+      "name": "absent-content-is-queryable",
+      "source": "snapshot-v1",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "predicates": [
+          { "kind": "contentExists", "name": "body", "present": false }
+        ]
+      },
+      "expectedIds": ["beta"]
+    },
+    {
+      "name": "nan-payload-equality-is-bit-exact",
+      "source": "snapshot-v1",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "predicates": [
+          { "kind": "attr", "name": "float", "op": "eq", "value": { "type": "f64", "bitsHex": "7ff8000000000001" } }
+        ]
+      },
+      "expectedIds": ["beta"]
+    },
+    {
+      "name": "metadata-does-not-open-fold-blocks",
+      "source": "snapshot-v2",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "contents": [{ "name": "body", "mode": "metadata" }]
+      },
+      "expectedIds": ["alpha", "delta", "gamma"],
+      "assertMetadataOnlyIo": true
+    },
+    {
+      "name": "content-budget-refuses-to-truncate",
+      "source": "snapshot-v2",
+      "request": {
+        "contractVersion": 1,
+        "limit": 10,
+        "maxReconstructedBytes": "5",
+        "contents": [{ "name": "body", "mode": "bytes" }]
+      },
+      "paginate": true,
+      "expectedIds": ["alpha", "delta", "gamma"]
+    },
+    {
+      "name": "half-open-bounds-survive-reverse-order",
+      "source": "snapshot-v2",
+      "request": {
+        "contractVersion": 1,
+        "from": "alpha",
+        "to": "gamma",
+        "direction": "reverse",
+        "limit": 10
+      },
+      "expectedIds": ["delta", "alpha"]
+    }
+  ]
+}

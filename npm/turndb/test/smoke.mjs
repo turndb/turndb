@@ -14,12 +14,20 @@ async function withStore(fn, opts) {
 
 test('capabilities describe the WASI guest rather than its host', async () => {
   const reachable = await capabilities();
+  assert.equal(reachable.contractVersion, 1);
+  assert.equal(reachable.profile, 'wasi');
+  assert.equal(reachable.writerExclusion, 'embedder_enforced');
+  assert.deepEqual(reachable.partFormat, { write: 2, readMax: 2 });
+  assert.deepEqual(reachable.cancellation, { scan: true, lifecycle: true });
+  assert.ok(reachable.operations.includes('scan'));
   assert.equal(reachable.binding, 'wasi');
   for (const operation of ['metrics', 'lifecycleEvents', 'contentLiveness', 'spaceUsage', 'eraseIds']) {
-    assert.ok(reachable.operations.includes(operation), `${operation} must be callable`);
+    assert.ok(reachable.bindingOperations.includes(operation), `${operation} must be callable`);
   }
   assert.equal(reachable.limits.lifecycleEvents, 256);
   assert.equal(reachable.unavailable.allocatedBytes, 'absent');
+  assert.equal(reachable.unavailable.atomicNoReplacePublication, 'absent');
+  assert.equal(reachable.operations.includes('seal'), false);
   const c = await compiledCapabilities();
   assert.equal(c.portable_wasm, true);
   assert.equal(c.writer_exclusion, 'embedder_enforced');
@@ -158,9 +166,18 @@ test('non-finite floats cross the JSON-only portable ABI deliberately', async ()
   await withStore((s) => {
     s.putBody('floats', 'body', [['nan', { f: NaN }], ['pos', { f: Infinity }], ['neg', { f: -Infinity }]]);
     const attrs = Object.fromEntries(s.getRecord('floats').attrs);
-    assert.equal(Number.isNaN(attrs.nan), true);
+    assert.match(attrs.nan.fBits, /^[0-9a-f]{16}$/);
+    assert.equal((BigInt(`0x${attrs.nan.fBits}`) & 0x7ff0000000000000n), 0x7ff0000000000000n);
     assert.equal(attrs.pos, Infinity);
     assert.equal(attrs.neg, -Infinity);
+  });
+});
+
+test('an explicit NaN payload survives the portable boundary bit-exactly', async () => {
+  await withStore((s) => {
+    s.putBody('nan-payload', 'body', [['nan', { fBits: '7ff8000000000001' }]]);
+    const attrs = Object.fromEntries(s.getRecord('nan-payload').attrs);
+    assert.deepEqual(attrs.nan, { fBits: '7ff8000000000001' });
   });
 });
 

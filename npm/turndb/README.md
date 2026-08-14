@@ -6,7 +6,7 @@ for the distinction between the portable WASI profile, native source qualificati
 support.
 
 A content-addressed columnar store for AI traces. Byte-exact, embedded, single-writer — a store is
-a directory you can `tar`.
+one `.turndb` file.
 
 The engine is Rust compiled to `wasm32-wasip1`. **No native addon, no prebuild matrix, no
 postinstall** — one `.wasm` runs everywhere Node does.
@@ -18,7 +18,7 @@ npm install turndb
 ```js
 import { open } from 'turndb';
 
-const store = await open('./traces');   // the directory is created if it does not exist
+const store = await open('./traces.turndb');   // its parent directory is created if needed
 
 store.putBody('alice/1700000000000/req-1#input', JSON.stringify(messages), {
   model: 'claude-opus-5',
@@ -87,7 +87,7 @@ writes.
 WASI has no advisory locking. The lock file is created and gates nothing.
 
 The host layer permits one live `Store` per process. That is not enough isolation: another process
-can still open the same directory. The obligation is therefore **at most one open writer per store
+can still open the same file. The obligation is therefore **at most one open writer per store
 directory across every process.** The guest cannot enforce or detect a violation. In four measured
 overlapping-writer runs on Node 24, both writers received successful `sync()` acknowledgements and
 one writer's complete record set was silently discarded. The surviving store was internally
@@ -201,14 +201,18 @@ Unsigned u64 and UTC nanosecond timestamps use `{ u: bigint }` and
 stores binary metadata and `null` stores explicit null; missing remains absence of the key. See
 [the version-2 scalar contract](https://github.com/turndb/turndb/blob/main/docs/field-types-v4.md).
 The JSON-only WASM boundary carries those values as decimal text internally, never through a float.
-Non-finite f64 values also use explicit text spellings rather than JSON `null`.
+Non-finite f64 values also use explicit text spellings rather than JSON `null`. Use
+`{ fBits: '7ff8000000000001' }` when an exact f64 bit pattern matters; reads return that form for
+NaNs so their payload cannot be canonicalized at the JavaScript boundary.
 
 ## Capability profile
 
-`await capabilities()` (or `store.capabilities()`) reports what is reachable through this binding:
-callable operation names, the lifecycle-journal capacity, and facts explicitly absent here. In
-particular, allocated filesystem blocks and a cancellation token are absent on WASI; neither is
-reported as zero or silently accepted.
+`await capabilities()` (or `store.capabilities()`) reports the cross-binding contract-v1 profile.
+Its `operations` are stable Tier-1 names; `bindingOperations` separately lists every callable
+package convenience. The profile also carries the lifecycle-journal capacity and facts explicitly absent here. In
+particular, allocated filesystem blocks, a cancellation token, and atomic no-replace publication
+are absent on WASI; none is reported as zero or silently accepted. Because that last primitive is
+required by `seal`, the portable profile omits `seal` instead of publishing a weaker artifact.
 
 `await compiledCapabilities()` is the separate answer to what mechanisms and format guarantees the
 guest contains. It describes the WASI guest, not the host OS: this package reports embedder-enforced
@@ -238,7 +242,7 @@ ASCII ids they agree, so this only bites once an id carries an astral character 
 wrong page boundary rather than an error. Use `prefixUpperBound` to build a range, or compare
 `Buffer.from(id, 'utf8')`.
 
-For analytics, the `turndb` CLI runs SQL against the same directory. No daemon, no second copy.
+For analytics, the `turndb` CLI runs SQL against the same file. No daemon, no second copy.
 
 ## License
 

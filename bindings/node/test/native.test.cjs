@@ -20,6 +20,16 @@ function temporaryStore(t) {
 
 test('reports the native capability profile without a portable fallback', () => {
   assert.deepEqual(capabilities(), {
+    contractVersion: 1,
+    profile: 'native',
+    operations: [
+      'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+      'explainScan', 'schema', 'readContent', 'snapshot', 'querySql', 'seal', 'verify', 'spaceUsage',
+      'compactBounded', 'refold', 'erase', 'close',
+    ],
+    partFormat: { write: 2, readMax: 2 },
+    reclamation: process.platform === 'win32' ? 'refold_only' : 'punch_or_refold',
+    cancellation: { scan: true, lifecycle: true },
     partFormatWrite: 2,
     partFormatReadMax: 2,
     writerExclusion: 'os_enforced',
@@ -1505,7 +1515,7 @@ test('writes a store held in one file, end to end from Node', async (t) => {
 
   // The promise of the shape: after a clean close the file is the only artifact.
   assert.equal(singleFileKind(file), 'container');
-  assert.equal(fs.existsSync(`${file}-hot`), false, 'a clean close removes the working directory');
+  assert.equal(fs.existsSync(`${file}-wal`), false, 'a clean close removes the WAL sidecar');
 
   const snapshot = await NativeSnapshot.openFile(file);
   assert.deepEqual(await snapshot.readContent('w/0001#input', 'body'), body);
@@ -1536,7 +1546,7 @@ test('a file store closed without a single write is still a store', async (t) =>
   await store.close();
 
   assert.equal(singleFileKind(file), 'container');
-  assert.equal(fs.existsSync(`${file}-hot`), false, 'a clean close removes the working directory');
+  assert.equal(fs.existsSync(`${file}-wal`), false, 'a clean close removes the WAL sidecar');
 
   const snapshot = await NativeSnapshot.openFile(file);
   assert.deepEqual((await snapshot.scan()).rows, [], 'an empty store scans to nothing');

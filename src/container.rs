@@ -51,6 +51,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::part::idcol::{get_varint, put_varint};
 use crate::readat::Extents;
+use crate::readat::ReadAt;
 
 /// Head of every superblock. A file that does not start with it is not a container.
 pub const MAGIC: &[u8; 8] = b"TURNCTNR";
@@ -232,6 +233,102 @@ pub struct Container {
     sealed: bool,
     /// Whether a [`MemberWrite`] handle is outstanding — it owns the tail while it lives.
     member_open: bool,
+}
+
+/// Read-only container directory over an arbitrary positioned source.
+///
+/// This is the browser/object-store door: it parses the same checksummed superblocks and member
+/// directory as [`Container`], but owns no filesystem handle and exposes no mutation.
+pub struct ContainerReader {
+    source: Arc<dyn ReadAt>,
+    label: String,
+    dir: BTreeMap<String, Member>,
+    seq: u64,
+    sealed: bool,
+}
+
+impl ContainerReader {
+    pub fn open(source: Arc<dyn ReadAt>, label: impl Into<String>) -> Result<ContainerReader> {
+        let label = label.into();
+        let len = source.len()?;
+        if len < REGION_START {
+            bail!("not a container: {label} is shorter than its superblocks");
+        }
+        let mut a = [0u8; SLOT_LEN as usize];
+        let mut b = [0u8; SLOT_LEN as usize];
+        source.read_exact_at(&mut a, 0)?;
+        source.read_exact_at(&mut b, SLOT_LEN)?;
+        let sa = Superblock::decode(&a).with_context(|| format!("container {label} slot 0"))?;
+        let sb = Superblock::decode(&b).with_context(|| format!("container {label} slot 1"))?;
+        let live = match (sa, sb) {
+            (Some(x), Some(y)) if y.seq > x.seq => y,
+            (Some(x), _) => x,
+            (None, Some(y)) => y,
+            (None, None) => bail!("not a container, or both superblocks are unreadable: {label}"),
+        };
+        if live.tail > len {
+            bail!(
+                "container {label} is truncated: committed tail {} exceeds length {len}",
+                live.tail
+            );
+        }
+        let (dir, _) = read_directory(&source, Path::new(&label), &live)?;
+        Ok(ContainerReader {
+            source,
+            label,
+            dir,
+            seq: live.seq,
+            sealed: live.flags & SB_FLAG_SEALED != 0,
+        })
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.dir.keys().map(String::as_str)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.dir.contains_key(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.dir.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dir.is_empty()
+    }
+
+    pub fn extent(&self, name: &str) -> Option<Extents<Arc<dyn ReadAt>>> {
+        let member = self.dir.get(name)?;
+        Some(Extents::new(self.source.clone(), &member.extents))
+    }
+
+    pub fn read_file_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let member = self.dir.get(name).ok_or_else(|| {
+            anyhow::anyhow!("container member not found in {}: {name}", self.label)
+        })?;
+        if member.len > max_bytes {
+            bail!(
+                "container member {name} is {} bytes, over the {max_bytes} byte ceiling",
+                member.len
+            );
+        }
+        let reader = Extents::new(self.source.clone(), &member.extents);
+        let len = usize::try_from(member.len).context("container member exceeds this platform")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len)?;
+        bytes.resize(len, 0);
+        reader.read_exact_at(&mut bytes, 0)?;
+        Ok(bytes)
+    }
 }
 
 impl Container {
@@ -1128,7 +1225,11 @@ fn encode_directory(dir: &BTreeMap<String, Member>, free: &[(u64, u64, u64)]) ->
 
 type Directory = (BTreeMap<String, Member>, Vec<(u64, u64, u64)>);
 
-fn read_directory(f: &Arc<File>, path: &Path, sb: &Superblock) -> Result<Directory> {
+fn read_directory<R: ReadAt + ?Sized>(
+    f: &Arc<R>,
+    path: &Path,
+    sb: &Superblock,
+) -> Result<Directory> {
     if sb.n_entries == 0 && sb.dir_stored == 0 {
         return Ok((BTreeMap::new(), Vec::new()));
     }
@@ -1141,7 +1242,7 @@ fn read_directory(f: &Arc<File>, path: &Path, sb: &Superblock) -> Result<Directo
     let mut stored = Vec::new();
     stored.try_reserve_exact(sb.dir_stored as usize)?;
     stored.resize(sb.dir_stored as usize, 0);
-    crate::sys::read_exact_at(f, &mut stored, sb.dir_off)?;
+    f.read_exact_at(&mut stored, sb.dir_off)?;
     if crc32fast::hash(&stored) != sb.dir_xsum {
         bail!("container {} directory fails its checksum", path.display());
     }

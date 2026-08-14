@@ -310,14 +310,7 @@ fn decode_attr_triple(item: &serde_json::Value, i: usize) -> Result<(String, Att
                 }
                 .ok_or_else(|| format!("attribute {key} is not an i64"))?,
             ),
-            "f" => AttrValue::Float(
-                match val {
-                    serde_json::Value::Number(n) => n.as_f64(),
-                    serde_json::Value::String(s) => s.parse::<f64>().ok(),
-                    _ => None,
-                }
-                .ok_or_else(|| format!("attribute {key} is not an f64"))?,
-            ),
+            "f" => AttrValue::Float(decode_float(val, key)?),
             "b" => AttrValue::Bool(
                 val.as_bool().ok_or_else(|| format!("attribute {key} is not a boolean"))?,
             ),
@@ -365,8 +358,12 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
                     // JSON numbers cross JavaScript as f64 and cannot represent every i64. Decimal
                     // text keeps the portable ABI exact; the JS wrapper returns a BigInt.
                     AttrValue::Int(i) => ("i", serde_json::Value::from(i.to_string())),
-                    // A non-finite float has no JSON spelling. Carrying it across as a string
-                    // keeps the value visible rather than silently turning it into null.
+                    // NaN payloads are part of TurnDB's bit-exact scalar semantics. A JS Number
+                    // crossing a JSON boundary can canonicalize them, so NaNs use an explicit
+                    // lowercase 64-bit lane. Infinities keep their established text spellings.
+                    AttrValue::Float(f) if f.is_nan() => {
+                        ("f", serde_json::Value::from(format!("bits:{:016x}", f.to_bits())))
+                    }
                     AttrValue::Float(f) => (
                         "f",
                         serde_json::Number::from_f64(*f)
@@ -388,6 +385,33 @@ fn encode_attrs(attrs: &[(String, AttrValue)]) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+fn decode_float(value: &serde_json::Value, key: &str) -> Result<f64, String> {
+    match value {
+        serde_json::Value::Number(number) => {
+            number.as_f64().ok_or_else(|| format!("attribute {key} is not an f64"))
+        }
+        serde_json::Value::String(text) => {
+            if let Some(bits) = text.strip_prefix("bits:") {
+                if bits.len() != 16
+                    || !bits
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(format!(
+                        "attribute {key} float bits must be exactly sixteen lowercase hexadecimal digits"
+                    ));
+                }
+                let bits = u64::from_str_radix(bits, 16)
+                    .map_err(|_| format!("attribute {key} float bits are outside the u64 range"))?;
+                Ok(f64::from_bits(bits))
+            } else {
+                text.parse::<f64>().map_err(|_| format!("attribute {key} is not an f64"))
+            }
+        }
+        _ => Err(format!("attribute {key} is not an f64")),
+    }
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -430,6 +454,7 @@ pub extern "C" fn tdb_binding_capabilities() -> i32 {
         "unavailable": {
             "allocatedBytes": "absent",
             "cancellationToken": "absent",
+            "atomicNoReplacePublication": "absent",
         },
     });
     match serde_json::to_vec(&value) {
@@ -1435,6 +1460,7 @@ fn encode_scan_page(page: &ScanPage) -> serde_json::Value {
             "durationNs": big(s.duration_ns),
             "examined": s.examined,
             "returned": s.returned,
+            "predicatePrunedRows": big(s.predicate_pruned_rows as u64),
             "duplicateAttrOccurrences": s.duplicate_attr_occurrences,
             "contentValuesReconstructed": s.content_values_reconstructed,
             "reconstructedBytes": big(s.reconstructed_bytes),
@@ -2050,6 +2076,8 @@ mod tests {
             &br#"[["k","s"]]"#[..],
             &br#"[["k","q","v"]]"#[..],
             &br#"[["k","i","not a number"]]"#[..],
+            &br#"[["k","f","bits:7FF8000000000001"]]"#[..],
+            &br#"[["k","f","bits:123"]]"#[..],
             &br#"[[1,"s","v"]]"#[..],
         ] {
             assert!(decode_attrs(bad).is_err(), "{:?} must be refused", std::str::from_utf8(bad));
@@ -2062,17 +2090,18 @@ mod tests {
         let attrs = vec![
             ("min".into(), AttrValue::Int(i64::MIN)),
             ("max".into(), AttrValue::Int(i64::MAX)),
-            ("nan".into(), AttrValue::Float(f64::NAN)),
+            ("nan".into(), AttrValue::Float(f64::from_bits(0x7ff8_0000_0000_0001))),
             ("pos".into(), AttrValue::Float(f64::INFINITY)),
             ("neg".into(), AttrValue::Float(f64::NEG_INFINITY)),
         ];
         let json = encode_attrs(&attrs);
         assert_eq!(json[0][2], i64::MIN.to_string());
         assert_eq!(json[1][2], i64::MAX.to_string());
+        assert_eq!(json[2][2], "bits:7ff8000000000001");
         let got = decode_attrs(json.to_string().as_bytes()).unwrap();
         assert!(matches!(got[0].1, AttrValue::Int(i64::MIN)));
         assert!(matches!(got[1].1, AttrValue::Int(i64::MAX)));
-        assert!(matches!(got[2].1, AttrValue::Float(v) if v.is_nan()));
+        assert!(matches!(got[2].1, AttrValue::Float(v) if v.to_bits() == 0x7ff8_0000_0000_0001));
         assert!(matches!(got[3].1, AttrValue::Float(v) if v == f64::INFINITY));
         assert!(matches!(got[4].1, AttrValue::Float(v) if v == f64::NEG_INFINITY));
     }

@@ -48,6 +48,10 @@ def check_versions() -> str:
     if not all(isinstance(item, str) for item in VERSIONED_FILES):
         fail("release detector supports only path entries in package.versioned_files")
     observed = [entry for relative in VERSIONED_FILES for entry in versions_for(relative)]
+    python_version = tomllib.loads((ROOT / "bindings/python/pyproject.toml").read_text())["project"]["version"]
+    observed.append(("bindings/python/pyproject.toml:project", python_version))
+    python_core_version = tomllib.loads((ROOT / "bindings/python/Cargo.toml").read_text())["dependencies"]["turndb"]["version"]
+    observed.append(("bindings/python/Cargo.toml:dependencies.turndb", python_core_version))
     reference = observed[0][1]
     if not isinstance(reference, str) or not SEMVER.fullmatch(reference):
         fail(f"invalid release version at {observed[0][0]}: {reference!r}")

@@ -226,9 +226,10 @@ For this pre-1.0 release line, both `patch` and `minor` advance `0.1.x`; only `m
 same next number.
 
 Pushing a change file to `main` updates the `release` PR. Merging that PR creates the single
-annotated `vX.Y.Z` tag and GitHub release, then starts the crate, native, and portable-wasm
-publication workflows; every publication job stops at the protected `npm` environment for owner
-review. The release-PR workflow needs the owner-managed `KNOPE_TOKEN` secret because GitHub does
+annotated `vX.Y.Z` tag and GitHub release, then starts the crate, native, portable-wasm, Python, and
+browser-artifact workflows. Registry publication stops at its protected `npm` or `pypi` environment
+for owner review; the browser workflow attaches the byte-rebuilt one-file viewer to the already
+approved GitHub release. The release-PR workflow needs the owner-managed `KNOPE_TOKEN` secret because GitHub does
 not trigger CI for a pull request created with the default workflow token.
 
 ### Publishing the portable npm package

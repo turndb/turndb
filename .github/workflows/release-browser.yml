@@ -1,0 +1,53 @@
+name: Release self-contained browser viewer
+
+on:
+  workflow_call:
+    inputs:
+      release_ref:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Exact annotated lockstep tag to release (vX.Y.Z)
+        required: true
+        type: string
+
+concurrency:
+  group: release-browser-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: attach viewer to GitHub release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      # Keep the release build on the repository toolchain; targets are toolchain-specific.
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: verify exact release tag
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+      - run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: rebuild and verify checked viewer
+        run: |
+          node bindings/browser/build-viewer.mjs
+          git diff --exit-code -- bindings/browser/turndb-viewer.html
+      - name: attach immutable viewer artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: gh release upload "$RELEASE_REF" bindings/browser/turndb-viewer.html#turndb-viewer.html --clobber

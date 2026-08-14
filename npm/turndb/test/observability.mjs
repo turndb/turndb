@@ -26,18 +26,19 @@ test('compiled facts and callable binding operations are separate questions', as
   assert.equal(reachable.binding, 'wasi');
   assert.deepEqual(reachable.unavailable, {
     allocatedBytes: 'absent',
+    atomicNoReplacePublication: 'absent',
     cancellationToken: 'absent',
   });
   assert.equal(reachable.limits.lifecycleEvents, 256);
   for (const operation of [
     'metrics', 'lifecycleEvents', 'contentLiveness', 'spaceUsage', 'eraseIds',
-  ]) assert.ok(reachable.operations.includes(operation), operation);
+  ]) assert.ok(reachable.bindingOperations.includes(operation), operation);
   await withStore('reachability-complete', async (store) => {
     const callable = Object.getOwnPropertyNames(Object.getPrototypeOf(store))
       .filter((name) => name !== 'constructor'
         && typeof Object.getOwnPropertyDescriptor(Object.getPrototypeOf(store), name)?.value === 'function')
       .sort();
-    assert.deepEqual([...reachable.operations].sort(), callable,
+    assert.deepEqual([...reachable.bindingOperations].sort(), callable,
       'a new public method must be added to the reachability profile');
   });
 });

@@ -10,7 +10,7 @@
  * Writing traces and reading them back by id or id-range. It deliberately exposes NO SQL: the
  * query engine would dominate the artifact, and the two things an application actually does — a
  * point lookup and a page scan — are already served by the id order. Analytics run through the
- * `turndb` CLI against the same directory, which needs no daemon and no second copy of the data.
+ * `turndb` CLI against the same file, which needs no daemon and no second copy of the data.
  *
  * ## Durability, in one sentence
  *
@@ -25,7 +25,7 @@
  * The native build's `flock` is not in play here, on any host.
  *
  * The host layer permits only one live `Store` in a process, but that is not cross-process
- * exclusion. The obligation is still the embedder's: **at most one open writer per store directory
+ * exclusion. The obligation is still the embedder's: **at most one open writer per store file
  * across every process.** What a violation does is stated once, with the measurement behind it, in
  * this package's README under "Cross-process exclusion is yours to provide" — briefly: an
  * acknowledged write can be lost silently from a store that still reads and verifies clean, so an
@@ -168,17 +168,48 @@ function readProfile(runtime, exportName) {
   return JSON.parse(json);
 }
 
+const contractOperations = Object.freeze([
+  'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+  'verify', 'spaceUsage', 'refold', 'erase', 'close',
+]);
+
+function contractProfile(runtime) {
+  const binding = readProfile(runtime, 'tdb_binding_capabilities');
+  const compiled = readProfile(runtime, 'tdb_capabilities');
+  return {
+    ...binding,
+    contractVersion: 1,
+    profile: 'wasi',
+    operations: [...contractOperations],
+    bindingOperations: binding.operations,
+    partFormat: {
+      write: compiled.part_format_write,
+      readMax: compiled.part_format_read_max,
+    },
+    writerExclusion: 'embedder_enforced',
+    positionedIo: compiled.positioned_io,
+    threads: compiled.threads,
+    columnar: compiled.columnar,
+    sql: false,
+    arrowIpc: false,
+    reclamation: 'refold_only',
+    // Relative deadlines use the same cooperative checkpoints as native cancellation. An
+    // AbortSignal is separately and truthfully absent in `unavailable` below.
+    cancellation: { scan: true, lifecycle: true },
+  };
+}
+
 /** Operations, limits, and explicit absences reachable through this npm/WASI binding. */
 export async function capabilities() {
   // An existing store already owns the one runtime. Reading the immutable binding profile does not
   // need another directory capability and must remain available while that store is open.
   if (runtimePromise != null) {
     const runtime = await runtimePromise;
-    if (runtime.active) return readProfile(runtime, 'tdb_binding_capabilities');
+    if (runtime.active) return contractProfile(runtime);
   }
   const runtime = await acquireRuntime(process.cwd());
   try {
-    return readProfile(runtime, 'tdb_binding_capabilities');
+    return contractProfile(runtime);
   } finally {
     releaseRuntime(runtime);
   }
@@ -233,7 +264,14 @@ function encodeAttrs(attrs) {
         }
         out.push([k, 'i', v.toString()]);
       } else out.push([k, 'f', encodeFloat(v)]);
-    } else if (v && typeof v === 'object' && 'f' in v) {
+    } else if (v && typeof v === 'object' && 'fBits' in v) {
+      const bits = v.fBits;
+      if (typeof bits !== 'string' || !/^[0-9a-f]{16}$/.test(bits)) {
+        throw new TypeError(`float attribute ${k} bits must be sixteen lowercase hexadecimal digits`);
+      }
+      out.push([k, 'f', `bits:${bits}`]);
+    }
+    else if (v && typeof v === 'object' && 'f' in v) {
       out.push([k, 'f', encodeFloat(Number(v.f))]);
     }
     else if (v && typeof v === 'object' && 'i' in v) {
@@ -287,6 +325,7 @@ function decodeAttrs(tagged) {
 }
 
 function decodeFloat(v) {
+  if (typeof v === 'string' && v.startsWith('bits:')) return { fBits: v.slice(5) };
   if (v === 'inf') return Infinity;
   if (v === '-inf') return -Infinity;
   return Number(v);
@@ -394,6 +433,7 @@ function decodeScanPage(v) {
       durationNs: BigInt(v.stats.durationNs),
       examined: v.stats.examined,
       returned: v.stats.returned,
+      predicatePrunedRows: BigInt(v.stats.predicatePrunedRows),
       duplicateAttrOccurrences: v.stats.duplicateAttrOccurrences,
       contentValuesReconstructed: v.stats.contentValuesReconstructed,
       reconstructedBytes: BigInt(v.stats.reconstructedBytes),
@@ -446,7 +486,7 @@ export class Store {
   /** Operations and limits reachable through this binding. */
   capabilities() {
     this.#alive();
-    return readProfile(this.#runtime, 'tdb_binding_capabilities');
+    return contractProfile(this.#runtime);
   }
 
   /** Exact frame-byte and persistent object-count admission configured for this handle. */
@@ -1139,9 +1179,9 @@ async function acquireRuntime(hostDir) {
 }
 
 /**
- * Open (or create) a store at `dir`.
+ * Open (or create) a store at `file`.
  *
- * @param {string} dir  Host directory. Created if absent.
+ * @param {string} dir  Host `.turndb` path. Its parent is created if absent.
  * @param {{blockTarget?: number, level?: number, maxRecordBytes?: number,
  *   maxBatchBytes?: number, maxBatchRecords?: number, maxIdentifierBytes?: number,
  *   maxStoredFrameBytes?: number, maxDecodedFrameBytes?: number,
