@@ -1,6 +1,6 @@
 {
   "name": "@turndb/cli-linux-x64-gnu",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "turndb command-line binary for linux-x64-gnu",
   "license": "Apache-2.0",

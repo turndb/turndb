@@ -38,6 +38,13 @@ jobs:
         run: |
           git config user.name 'turndb-release'
           git config user.email 'turndb-release@users.noreply.github.com'
+      - uses: dtolnay/rust-toolchain@1.95.0
+        if: steps.changes.outputs.present == 'true'
+        with:
+          targets: wasm32-unknown-unknown
+      - name: install pinned browser wasm glue
+        if: steps.changes.outputs.present == 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       - uses: knope-dev/action@v2.1.2
         if: steps.changes.outputs.present == 'true'
         with:
