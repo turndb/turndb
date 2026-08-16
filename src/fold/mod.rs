@@ -1467,6 +1467,8 @@ impl Fold {
         // Every block must be compressed AND written before a tail can be reported durable.
         self.write_ready(true)?;
         self.segs.sync(self.active)?;
+        let entries = self.active_block_entries();
+        self.segs.checkpoint_sidecar(self.active, self.cur_off, &entries)?;
         Ok(self.tail())
     }
 
@@ -1688,6 +1690,20 @@ impl Fold {
         }
     }
 
+    fn active_block_entries(&self) -> Vec<(u32, u32)> {
+        let mut entries: Vec<(u32, u32)> = self
+            .blockdir
+            .iter()
+            .enumerate()
+            .filter_map(|(id, entry)| match entry {
+                Some((segment, offset)) if *segment == self.active => Some((id as u32, *offset)),
+                _ => None,
+            })
+            .collect();
+        entries.sort_by_key(|&(_, offset)| offset);
+        entries
+    }
+
     /// Roll to a new segment. Every physical step happens before any logical state moves, so a failure
     /// leaves nothing changed and the caller's retry re-enters cleanly. (An earlier generation of this
     /// engine advanced the offset first; a roll-time ENOSPC then left a zero offset over the *old*
@@ -1697,20 +1713,12 @@ impl Fold {
         let flags = self.headers[self.active as usize].flags;
         self.segs.sync(self.active).context("fsync before roll")?;
         // The segment being sealed gets its directory sidecar now — the write that turns the next
-        // open's full scan of it into a 2 KB read. Best-effort, AFTER the fsync above: advisory
-        // data must never fail a roll, and a sidecar must never describe bytes less durable than
-        // itself.
-        let mut entries: Vec<(u32, u32)> = self
-            .blockdir
-            .iter()
-            .enumerate()
-            .filter_map(|(id, e)| match e {
-                Some((s, o)) if *s == self.active => Some((id as u32, *o)),
-                _ => None,
-            })
-            .collect();
-        entries.sort_by_key(|&(_, off)| off);
-        self.segs.write_sidecar(self.active, self.cur_off, &entries);
+        // open's full scan of it into a 2 KB read. AFTER the sync above, so a sidecar can never
+        // describe bytes less durable than itself. The retired directory home keeps this
+        // best-effort internally; a container propagates failure so remote-open locality is a
+        // property of every state its superblock publishes.
+        let entries = self.active_block_entries();
+        self.segs.write_sidecar(self.active, self.cur_off, &entries)?;
         let next = self
             .active
             .checked_add(1)

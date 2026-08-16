@@ -164,6 +164,28 @@ refuse, so reserving the bit now, at no format cost, is what secures that guaran
 refusal names encryption, because "this is encrypted and this build cannot read it" sends an
 operator somewhere very different from "unknown flags".
 
+### Segment directory sidecar
+
+`seg-NNNNNNNN.dir` is an advisory index for the segment of the same number. It carries the block
+ids and offsets a reader would otherwise recover by scanning every frame in the segment:
+
+```
+offset  size  field
+     0     8  MAGIC = "TURNSDIR"
+     8     4  seg          must match the segment name and header
+    12     4  tail         logical segment length this index describes
+    16     4  n_entries
+    20   n*8  block_id u32, offset u32 pairs in physical order
+20+n*8     4  crc32 over all preceding bytes
+```
+
+The retired directory writer creates a sidecar when a segment seals. A current container writer
+also stages one for the active segment whenever it commits that segment's tail; sidecar and segment
+therefore become visible in the same superblock state. This is the remote-open locality guarantee,
+not a correctness dependency: a missing sidecar, a checksum failure, a tail mismatch, impossible
+entries, or an over-budget sidecar all mean **scan the segment**, never refuse an otherwise valid
+store and never trust part of the advisory index.
+
 ---
 
 ## Parts
@@ -966,6 +988,35 @@ Per-member `xsum` follows the pack's policy: not verified on the read path — t
 carry their own integrity, and content carries BLAKE3 — but verified by a deliberate scrub, and a
 writer may not omit it. A writer extending a member extends the checksum by CRC combination; it
 never rereads what it already wrote.
+
+### Remote-open locality
+
+A **cold open** here means resolving the live container into a `ReadStore`, before a query or
+content read. Let `S` be the live fold generation's segment count, `D` its candidate dictionary
+member count, and `P` the live manifest's part count. An empty, never-flushed container performs
+two reads — the superblock slots — and stops. For a non-empty valid version-2 state published by
+the current writer, opening over an uncached positioned source performs exactly
+
+```
+4 + 2*S + D + 2*P
+```
+
+source reads: two superblock slots, the member directory, the manifest; one sidecar and one header
+per segment; each candidate dictionary once; and the footer plus TOC of each part. It reads **zero
+fold block payload bytes**. The count is independent of the store's content bytes and record count;
+parts and segments are named because those are the metadata objects that actually add open work.
+
+An HTTP block cache may coalesce several of these positioned reads into one fetched block. Its
+length-discovery probe, if it needs one, is transport work and is not included in the formula.
+Conversely, one logical metadata read spanning several cache blocks may require several HTTP
+requests. Those are properties of the cache geometry, so measured HTTP requests and core
+positioned reads are reported separately.
+
+The fallback rule above stays load-bearing. A container written before active-sidecar publication,
+a retained snapshot whose active tail no longer matches the live sidecar, or a damaged advisory
+sidecar still opens by scanning the affected segment. Such a degraded open is correct but is outside
+the locality formula; verification reports damaged sidecar/member bytes where applicable rather
+than pretending the fast path ran.
 
 ### Commit
 

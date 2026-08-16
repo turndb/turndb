@@ -317,11 +317,13 @@ pub struct FoldTail {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The directory sidecar — advisory, derived, and the answer to O(store) opens
+// The directory sidecar — advisory, derived, and the answer to O(segment) opens
 // ---------------------------------------------------------------------------------------------
 
-/// Sidecar magic. `seg-NNNNNNNN.dir` beside a SEALED segment carries what `scan_tail` would
-/// recompute: the block ids and offsets, and the scan end.
+/// Sidecar magic. `seg-NNNNNNNN.dir` beside a segment carries what `scan_tail` would recompute:
+/// the block ids and offsets, and the scan end. The retired directory writer emits one when a
+/// segment seals; the live container writer also stages one for the active segment at every
+/// commit so a ranged cold open never scans content payload.
 pub const DIR_MAGIC: &[u8; 8] = b"TURNSDIR";
 
 /// ```text
@@ -337,9 +339,9 @@ pub fn dir_path(dir: &Path, n: u32) -> PathBuf {
     dir.join(format!("seg-{n:08}.dir"))
 }
 
-/// Write the sidecar for a sealed segment. ADVISORY, so tmp + rename but no fsync anywhere: a
-/// sidecar lost to a crash costs one rescan at the next open, and a torn one fails its checksum
-/// and costs the same. Nothing durable depends on it.
+/// Write a directory-layout sidecar for a sealed segment. ADVISORY, so tmp + rename but no fsync
+/// anywhere: a sidecar lost to a crash costs one rescan at the next open, and a torn one fails its
+/// checksum and costs the same. Nothing durable depends on it.
 pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
     let b = encode_dir_sidecar(n, tail, entries);
     let tmp = dir.join(format!("seg-{n:08}.dir.tmp"));

@@ -40,12 +40,19 @@ TURNDB_NATIVE_PATH=target/release/libturndb_node.so node bindings/browser/measur
 ```
 
 It creates 56 deterministic 52 MiB one-element JSON arrays (3,053,453,312 logical content bytes),
-producing a 2,290,598,290-byte container. It opens that container through an exact in-memory
-HTTP-206 oracle and runs a metadata-only point query for its final id. The cold open plus query made
-5 range requests and fetched 246,163 bytes: 0.0107% of the 2.13 GiB file. The counter includes open,
-and is a transport measurement rather than a network-latency benchmark. The AES-CTR/base64url
-payload generator is deterministic, while the JSON-array shape exercises the structural carving
-used by large trace payloads instead of manufacturing a binary-CDC metadata worst case.
+producing a 2,290,602,394-byte container. It opens that container through an exact in-memory
+HTTP-206 oracle and runs a metadata-only point query for its final id. Cold open made 5 range
+requests and fetched 250,267 bytes: 0.0109% of the 2.13 GiB file. The point query was then answered
+entirely from those cached metadata blocks — 0 more requests and 0 more network bytes. The report
+keeps the phases separate and also records their combined total; these are transport measurements,
+not network-latency benchmarks.
+
+The core contract underneath that measurement is independent of the 64 KiB HTTP cache:
+[`FORMAT.md`](../FORMAT.md#remote-open-locality) states the exact positioned-read formula, and the
+container suite executes it over a multi-part, multi-segment store while proving that cold open
+touches no fold block payload. The AES-CTR/base64url payload generator is deterministic, while the
+JSON-array shape exercises the structural carving used by large trace payloads instead of
+manufacturing a binary-CDC metadata worst case.
 
 The self-contained artifact is [`bindings/browser/turndb-viewer.html`](../bindings/browser/turndb-viewer.html).
 CI rebuilds it byte-for-byte and opens the checked physical fixture in stock Chromium and Firefox,

@@ -1,6 +1,6 @@
 # TurnDB roadmap
 
-**Status: draft, 2026-08-12.** The previous roadmap was deleted at 0.1.0 because its six gates had
+**Status: active, 2026-08-15.** The previous roadmap was deleted at 0.1.0 because its six gates had
 been exercised and it described a sprint, not a direction. This one states the direction.
 
 ## The thesis
@@ -76,6 +76,9 @@ property. The open meta-issues get triaged once into "blocks a phase" or "closed
 
 ## Phase 1: one file is the store
 
+**Status: complete, 2026-08-15.** The maturity gate is executable across the native file lifecycle,
+crash and corruption harnesses, binding parity, and the cold-open positioned-read bound below.
+
 The container (FORMAT.md, "The container") already holds what a pack holds and grows past it under
 alternating superblocks. But the current writer treats it as a checkpoint target: `ContainerStore`
 materializes working state into a hot *directory*, runs the directory engine there, and folds the
@@ -123,7 +126,7 @@ anything is published against it.
   of renames and directory-entry durability; the in-file protocol needs its own op vocabulary —
   positional writes, fsync barriers, the slot flip — with torn-superblock writes modeled
   explicitly (a torn slot fails its checksum and the previous slot is, by alternation, never the
-  one being written). Sweeps print their coverage, as the six directory-protocol sweeps do.
+  one being written). Sweeps print their coverage, as the existing protocol sweeps do.
 - Corruption-storm coverage of superblocks, the member directory, extent map, and live-tail
   states.
 - Full operation parity on container stores across Rust, CLI, and native Node: write, sync, flush,
@@ -164,6 +167,10 @@ only store a user can create, name, ship, or restore is a `.turndb` file, and ha
 requires zero caveats about which operations work on it.
 
 ## Phase 2: publish the proof
+
+**Status: deferred until the later product phases mature.** Their storage and query changes can
+move the measured numbers; publish the reproducible tables once those systems have settled rather
+than canonizing intermediate results and re-running the proof after every phase.
 
 The dedup and collapse numbers were measured on private corpora and re-run offline against public
 datasets, but nothing published is reproducible by a stranger. Fix that, against the layout Phase 1

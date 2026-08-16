@@ -382,6 +382,22 @@ fn rust_store_replays_the_shared_query_corpus() {
     }
 
     let generated = std::fs::read(&path).unwrap();
+    if std::env::var_os("TURNDB_UPDATE_CONFORMANCE_FIXTURE").is_some() {
+        let mut encoded = String::new();
+        for line in generated.chunks(64) {
+            for byte in line {
+                use std::fmt::Write as _;
+                write!(&mut encoded, "{byte:02x}").unwrap();
+            }
+            encoded.push('\n');
+        }
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/v1/fixture.turndb.hex"),
+            encoded,
+        )
+        .unwrap();
+        return;
+    }
     assert_eq!(
         generated,
         decode_hex(CONTAINER_HEX).unwrap(),
@@ -397,7 +413,7 @@ fn checked_in_container_matches_the_published_v2_view() {
     let _remove = RemoveOnDrop(dir.clone());
     let path = dir.join("fixture.turndb");
     let bytes = decode_hex(CONTAINER_HEX).unwrap();
-    assert_eq!(bytes.len(), 37_439, "fixture completeness guard");
+    assert_eq!(bytes.len(), 45_650, "fixture completeness guard");
     std::fs::write(&path, bytes).unwrap();
     let reader = open_read_container(&path, fold_cfg()).unwrap();
     assert_source_cases("snapshot-v2", &reader, &corpus);

@@ -42,9 +42,16 @@ pub(crate) trait SegmentStore: Send + Sync {
     /// directory entries; a store whose own layer already admits member growth may accept.
     fn admit_roll(&self) -> Result<()>;
 
-    /// Best-effort advisory sidecar for a segment being sealed. Advisory data must never fail a
-    /// roll — implementations swallow their own errors.
-    fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]);
+    /// Advisory sidecar for a segment being sealed. The retired directory implementation keeps
+    /// its historical best-effort behavior. A container propagates staging failure so a current
+    /// commit never publishes a segment that ranged readers must scan merely to open.
+    fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()>;
+
+    /// Publishable open metadata for the active segment at a commit boundary. The retired
+    /// directory writer may omit it and pay a scan on reopen. A container writer must stage it in
+    /// the same commit as the segment tail: ranged readers otherwise have to fetch the active
+    /// segment's block payloads merely to open the store.
+    fn checkpoint_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()>;
 
     /// Create segment `next` — header durable before this returns, where the store has its own
     /// durability — make it the active append target, and hand back its reader.
@@ -103,8 +110,13 @@ impl SegmentStore for DirSegments {
         Ok(())
     }
 
-    fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) {
+    fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
         let _ = segment::write_dir_sidecar(&self.dir, seg, tail, entries);
+        Ok(())
+    }
+
+    fn checkpoint_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) -> Result<()> {
+        Ok(())
     }
 
     fn create_segment(
@@ -183,15 +195,18 @@ impl SegmentStore for ContainerSegments {
         Ok(())
     }
 
-    fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) {
-        // Advisory: staged like any member, published by the same commit as the blocks it
-        // describes, and never able to describe bytes less durable than itself because both
-        // ride one barrier.
+    fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
+        // Staged like any member, published by the same commit as the blocks it describes, and
+        // never able to describe bytes less durable than itself because both ride one barrier.
         let name = format!("{}/seg-{seg:08}.dir", self.prefix);
         let bytes = segment::encode_dir_sidecar(seg, tail, entries);
-        if let Ok(mut c) = self.container.lock() {
-            let _ = c.put_bytes(&name, &bytes);
-        }
+        self.container.lock().expect("container lock poisoned").put_bytes(&name, &bytes)
+    }
+
+    fn checkpoint_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
+        let name = format!("{}/seg-{seg:08}.dir", self.prefix);
+        let bytes = segment::encode_dir_sidecar(seg, tail, entries);
+        self.container.lock().expect("container lock poisoned").put_bytes(&name, &bytes)
     }
 
     fn create_segment(
@@ -229,7 +244,12 @@ impl SegmentStore for NoSegments {
     fn admit_roll(&self) -> Result<()> {
         bail!("read-only fold cannot roll")
     }
-    fn write_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) {}
+    fn write_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) -> Result<()> {
+        bail!("read-only fold cannot write a sidecar")
+    }
+    fn checkpoint_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) -> Result<()> {
+        bail!("read-only fold cannot checkpoint a sidecar")
+    }
     fn create_segment(
         &mut self,
         _next: u32,

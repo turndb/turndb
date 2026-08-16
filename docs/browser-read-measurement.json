@@ -6,14 +6,29 @@
     "logicalContentBytes": 3053453312,
     "selectedId": "trace/0055"
   },
-  "storeBytes": 2290598290,
+  "storeBytes": 2290602394,
   "blockBytes": 65536,
-  "openAndPointQuery": {
+  "coldOpen": {
     "rangeRequests": 5,
-    "networkBytes": 246163,
-    "cacheHits": 38,
-    "cacheMisses": 10,
+    "networkBytes": 250267,
+    "cacheHits": 28,
+    "cacheMisses": 9,
     "cachedBlocks": 4
   },
-  "fetchedFraction": 0.00010746668286389055
+  "pointQuery": {
+    "rangeRequests": 0,
+    "networkBytes": 0,
+    "cacheHits": 12,
+    "cacheMisses": 0,
+    "cachedBlocksBefore": 4,
+    "cachedBlocksAfter": 4
+  },
+  "openAndPointQuery": {
+    "rangeRequests": 5,
+    "networkBytes": 250267,
+    "cacheHits": 40,
+    "cacheMisses": 9,
+    "cachedBlocks": 4
+  },
+  "fetchedFraction": 0.00010925815875140485
 }
