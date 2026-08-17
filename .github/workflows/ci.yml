@@ -59,7 +59,7 @@ jobs:
       # Pinned to the toolchain the complete local matrix passes on. Whether current stable's lld
       # crash was real or another face of the free-tier resource exhaustion was never separated;
       # trial @stable here as its own change once this configuration is green.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -300,7 +300,7 @@ jobs:
       - uses: actions/checkout@v7
       # Cargo is pinned by rust-toolchain.toml. Install this target into that exact toolchain:
       # installing it into moving `stable` leaves the pinned compiler without its core library.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
