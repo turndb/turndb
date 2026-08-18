@@ -292,6 +292,7 @@ jobs:
   browser:
     name: browser viewer (${{ matrix.browser }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -311,12 +312,14 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: bindings/browser/package-lock.json
-      - name: install wasm glue and browser harness
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.126 --locked
-          npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/browser
-          npm exec --prefix bindings/browser -- playwright install --with-deps ${{ matrix.browser }}
+      - name: install wasm glue
+        timeout-minutes: 10
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: install browser harness
+        timeout-minutes: 5
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/browser
       - name: compile core, rebuild one-file viewer, and exercise it
+        timeout-minutes: 10
         env:
           TURNDB_BROWSER: ${{ matrix.browser }}
         run: |
@@ -325,7 +328,15 @@ jobs:
           git diff --exit-code -- bindings/browser/turndb-viewer.html
           npm test --prefix bindings/browser
           npm run test:wasm --prefix bindings/browser
-          npm run test:viewer --prefix bindings/browser
+          # Keep Rust on the toolchain-equipped host, but start browsers in the matching Playwright
+          # image. It already carries the browser binaries and Linux libraries, so this gate never
+          # runs apt against a transient host mirror merely to start Firefox or Chromium.
+          docker run --rm --ipc=host \
+            -e TURNDB_BROWSER \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            mcr.microsoft.com/playwright:v1.62.1-noble \
+            npm run test:viewer --prefix bindings/browser
 
   # One check that says what actually ran, because a reader of a check list cannot tell a job that
   # passed from a job that never executed. GitHub renders `skipped` in the same muted grey as
