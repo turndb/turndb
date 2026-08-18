@@ -94,8 +94,8 @@ exporters and provider-independent client-call wrappers implement one
 
 The checked [self-contained browser viewer](bindings/browser/turndb-viewer.html) opens a local
 `.turndb` with no network traffic or fetches one from a static host using strict HTTP Range. It is
-read-only and runs the same structured scans in wasm; the measured multi-GiB point-query fetch is
-recorded in [the browser read report](docs/browser.md).
+read-only and runs the same structured scans in wasm; the measured multi-GiB cold-open cost and
+subsequent point-query cost are recorded separately in [the browser read report](docs/browser.md).
 
 ## Storing gen_ai traces
 
@@ -128,9 +128,9 @@ first. The shape:
 | **Compaction** | Total merge at eight parts plus exact input-part/row/byte-bounded work units; merges provably touch zero content bytes |
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
-| **Shipping** | `pack` puts a whole store in one file that reads — and answers SQL — identically |
+| **Shipping** | `seal` publishes a verified, final single-file snapshot that every reader opens directly |
 
-The pack command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-lock)), settles a
+The seal command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-lock)), settles a
 recovered WAL, fully verifies its staged artifact,
 and refuses to replace an output path. Restore likewise verifies before extraction and atomically
 publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
@@ -261,7 +261,7 @@ worthless.
 
 ```sh
 cargo test                              # the ordinary suites
-cargo test --features dst --test dst    # every crash state of seven recorded protocols, strict POSIX
+cargo test --features dst --test dst    # every crash state of eleven recorded protocols, strict POSIX
 cargo test --test corruption            # ~48k mutants across every parser
 STORM_XOR=$RANDOM cargo test --test corruption   # fresh mutant space
 ```
@@ -269,11 +269,12 @@ STORM_XOR=$RANDOM cargo test --test corruption   # fresh mutant space
 The **deterministic simulation** harness records every write, fsync, rename, link, unlink, and
 punch, then replays every crash point under a model where file content and directory entries
 become durable independently, and asserts the recovered store equals some prefix of the
-acknowledged writes. Six sweeps cover the write path and every publication protocol — backup,
-restore, manifest recovery with rollback, hole punching, and format migration — and each sweep
-prints the exact number of crash states it checked, so the suite reports its own coverage. It has
-found real bugs, including an ACK backed by a WAL whose directory entry was not yet durable, and a
-declared hole punch whose partially landed deallocation bricked writer recovery.
+acknowledged writes. Eleven sweeps cover the mixed write path; backup, restore, recovery,
+content-hole punching, format migration, and conversion; and the single-file session, merge,
+erasure, and free-space-punch protocols. Each prints the exact number of crash states it checked,
+so the suite reports its own coverage. It has found real bugs, including an ACK backed by a WAL
+whose directory entry was not yet durable, and a declared hole punch whose partially landed
+deallocation bricked writer recovery.
 
 The **corruption storm** mutates every on-disk structure and requires errors, never panics. It
 found five parser bug classes, including bounds checks of the form `at + n > len` that *overflow

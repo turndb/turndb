@@ -15,6 +15,11 @@ patches and reviews remain textual. Runners decode whitespace-separated hex to o
 bytes, and a reader opened on those bytes produces the published-v2 goldens. Read-only/browser
 runners use this fixture without needing a writer.
 
+Regenerate the fixture after an intentional writer-layout change with
+`TURNDB_UPDATE_CONFORMANCE_FIXTURE=1 cargo test --test conformance
+rust_store_replays_the_shared_query_corpus`, review the textual diff, then rerun the command without
+the environment variable to prove that the generator and checked-in bytes agree.
+
 ## Runner protocol v1
 
 Out-of-process binding runners use newline-delimited JSON on standard input and output. Each request

@@ -1,12 +1,48 @@
 //! The container gate: a store in one MUTABLE file answers exactly as the directory did, grows
 //! without invalidating what a reader already resolved, and survives a torn commit.
 
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use turndb::container::{Container, ALIGN, CONTAINER_VERSION, MAGIC, REGION_START, SLOT_LEN};
 use turndb::fold::FoldCfg;
 use turndb::readat::ReadAt as _;
 use turndb::store::{convert_to_file, open_read_container, Span, Store};
 use turndb::AttrValue;
+
+#[derive(Clone)]
+struct CountingSource {
+    bytes: Arc<Vec<u8>>,
+    reads: Arc<Mutex<Vec<(u64, usize)>>>,
+}
+
+impl CountingSource {
+    fn new(bytes: Vec<u8>) -> CountingSource {
+        CountingSource { bytes: Arc::new(bytes), reads: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    fn reads(&self) -> Vec<(u64, usize)> {
+        self.reads.lock().unwrap().clone()
+    }
+}
+
+impl turndb::readat::ReadAt for CountingSource {
+    fn read_exact_at(&self, into: &mut [u8], offset: u64) -> io::Result<()> {
+        let at = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset too large"))?;
+        let bytes = self
+            .bytes
+            .get(at..at.saturating_add(into.len()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "past counting source"))?;
+        into.copy_from_slice(bytes);
+        self.reads.lock().unwrap().push((offset, into.len()));
+        Ok(())
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.bytes.len() as u64)
+    }
+}
 
 fn tmp(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -93,6 +129,135 @@ fn fixture_body(seed: u64, len: usize) -> Vec<u8> {
             (x >> 32) as u8
         })
         .collect()
+}
+
+fn fold_payload_ranges(container: &Container) -> Vec<std::ops::Range<u64>> {
+    let mut ranges = Vec::new();
+    for name in container.names().filter(|name| name.ends_with(".fold")) {
+        let mut header_left = turndb::fold::segment::SEG_HDR_LEN;
+        for (offset, length) in container.member_extents(name).unwrap() {
+            let header = header_left.min(length);
+            header_left -= header;
+            if length > header {
+                ranges.push(offset + header..offset + length);
+            }
+        }
+        assert_eq!(header_left, 0, "segment {name} is shorter than its header");
+    }
+    ranges
+}
+
+fn overlaps(read: &(u64, usize), range: &std::ops::Range<u64>) -> bool {
+    let read_end = read.0 + read.1 as u64;
+    read.0 < range.end && range.start < read_end
+}
+
+#[test]
+fn an_empty_cold_open_reads_only_the_superblock_slots() {
+    let root = tmp("empty-cold-open");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    Store::open_file(&path, cfg()).unwrap().close().unwrap();
+
+    let source = CountingSource::new(std::fs::read(&path).unwrap());
+    turndb::store::open_read_container_source(
+        Arc::new(source.clone()),
+        "memory://empty-cold-open",
+        cfg(),
+        turndb::read_limits::ReadLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(source.reads(), vec![(0, 4096), (4096, 4096)]);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn cold_open_reads_only_metadata_while_a_missing_sidecar_remains_advisory() {
+    let root = tmp("cold-open-reads");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = Store::open_file(&path, cfg()).unwrap();
+    for round in 0..3u64 {
+        for record in 0..4u64 {
+            store
+                .put_body(
+                    &format!("trace/{round}/{record}"),
+                    &fixture_body(round * 10 + record + 1, 6 * 1024),
+                    vec![],
+                )
+                .unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+    }
+    store.close().unwrap();
+
+    let container = Container::open(&path).unwrap();
+    let segment_names: Vec<String> =
+        container.names().filter(|name| name.ends_with(".fold")).map(String::from).collect();
+    let part_count = container.names().filter(|name| name.ends_with(".part")).count();
+    let dictionary_count = container.names().filter(|name| name.ends_with(".zd")).count();
+    assert!(segment_names.len() > 1, "fixture must exercise sealed and active segments");
+    assert!(part_count > 1, "fixture must exercise a multi-part cold open");
+    for segment in &segment_names {
+        let sidecar = segment.replace(".fold", ".dir");
+        assert!(
+            container.contains(&sidecar),
+            "every committed segment, including the active one, needs open metadata: {sidecar}"
+        );
+    }
+    let payload_ranges = fold_payload_ranges(&container);
+    drop(container);
+
+    let source = CountingSource::new(std::fs::read(&path).unwrap());
+    let reader = turndb::store::open_read_container_source(
+        Arc::new(source.clone()),
+        "memory://cold-open",
+        cfg(),
+        turndb::read_limits::ReadLimits::default(),
+    )
+    .unwrap();
+    let cold_reads = source.reads();
+    assert_eq!(
+        cold_reads.len(),
+        4 + 2 * segment_names.len() + 2 * part_count + dictionary_count,
+        "two slots, directory, manifest, one sidecar and header per segment, one whole read per dictionary, and footer plus TOC per part: {cold_reads:?}"
+    );
+    assert!(
+        cold_reads.iter().all(|read| payload_ranges.iter().all(|payload| !overlaps(read, payload))),
+        "a valid current container must not fetch fold payload merely to open: {cold_reads:?}"
+    );
+    assert_eq!(reader.reconstruct("trace/2/3").unwrap().unwrap().len(), 6 * 1024);
+
+    // Sidecars stay advisory format data. Removing the active one makes open slower, not invalid:
+    // the reader reconstructs its directory from the checksummed block frames and answers exactly.
+    let active = segment_names.last().unwrap();
+    let active_sidecar = active.replace(".fold", ".dir");
+    let mut container = Container::open(&path).unwrap();
+    assert!(container.remove(&active_sidecar).unwrap());
+    container.commit().unwrap();
+    let payload_ranges = fold_payload_ranges(&container);
+    drop(container);
+
+    let fallback = CountingSource::new(std::fs::read(&path).unwrap());
+    let reader = turndb::store::open_read_container_source(
+        Arc::new(fallback.clone()),
+        "memory://cold-open-without-advisory-sidecar",
+        cfg(),
+        turndb::read_limits::ReadLimits::default(),
+    )
+    .unwrap();
+    let fallback_reads = fallback.reads();
+    assert!(
+        fallback_reads
+            .iter()
+            .any(|read| payload_ranges.iter().any(|payload| overlaps(read, payload))),
+        "without advisory open metadata the reader must derive it from the active payload"
+    );
+    assert_eq!(reader.reconstruct("trace/2/3").unwrap().unwrap().len(), 6 * 1024);
+
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]

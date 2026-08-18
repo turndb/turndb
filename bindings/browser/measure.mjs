@@ -35,6 +35,17 @@ function payload(seed, length) {
   return Buffer.from(`["${encoded}"]`);
 }
 
+function subtractStats(after, before) {
+  return {
+    rangeRequests: after.rangeRequests - before.rangeRequests,
+    networkBytes: after.networkBytes - before.networkBytes,
+    cacheHits: after.cacheHits - before.cacheHits,
+    cacheMisses: after.cacheMisses - before.cacheMisses,
+    cachedBlocksBefore: before.cachedBlocks,
+    cachedBlocksAfter: after.cachedBlocks,
+  };
+}
+
 try {
   const records = Number(process.env.TURNDB_MEASURE_RECORDS ?? 56);
   const bytesPerRecord = Number(process.env.TURNDB_MEASURE_RECORD_BYTES ?? (52 << 20));
@@ -71,7 +82,9 @@ try {
   const wasm = createRequire(import.meta.url)(join(generated, 'turndb_browser.js'));
   const storeBytes = (await stat(storePath)).size;
   const file = await open(storePath, 'r');
-  let fetchStats;
+  let openStats;
+  let queryStats;
+  let combinedStats;
   let blockBytes;
   try {
     const fetch = async (_url, options) => {
@@ -88,6 +101,7 @@ try {
     const source = await HttpRangeReadAt.open('https://fixture.invalid/large.turndb', { fetch });
     blockBytes = source.blockSize;
     const database = await BrowserDatabase.open(wasm, source);
+    openStats = database.fetchStats();
     const selectedId = `trace/${String(records - 1).padStart(4, '0')}`;
     const page = await database.scan({
       contractVersion: 1,
@@ -99,7 +113,8 @@ try {
     if (page.rows.length !== 1 || page.rows[0].id !== selectedId) {
       throw new Error(`point query returned ${JSON.stringify(page.rows)}`);
     }
-    fetchStats = database.fetchStats();
+    combinedStats = database.fetchStats();
+    queryStats = subtractStats(combinedStats, openStats);
     database.close();
   } finally {
     await file.close();
@@ -114,8 +129,10 @@ try {
     },
     storeBytes,
     blockBytes,
-    openAndPointQuery: fetchStats,
-    fetchedFraction: fetchStats.networkBytes / storeBytes,
+    coldOpen: openStats,
+    pointQuery: queryStats,
+    openAndPointQuery: combinedStats,
+    fetchedFraction: combinedStats.networkBytes / storeBytes,
   }, null, 2)}\n`);
 } finally {
   await rm(scratch, { recursive: true, force: true });

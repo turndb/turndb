@@ -17,11 +17,12 @@
 //!   * whatever else is present is byte-exact too — a half-applied batch, a resurrected record,
 //!     or drifted content is a failure even if no ack covered it.
 //!
-//! Beyond the write path, each PUBLICATION PROTOCOL gets its own crash sweep: backup, restore,
-//! manifest recovery promotion, hole punching, format migration, container checkpointing, and the
-//! container session cycle each run once for real, and then every op prefix × durability variant
-//! is replayed against protocol-specific invariants. Container superblock alternation is also
-//! proven from each recorded trace directly — see `assert_slot_alternation`.
+//! Beyond the mixed write path, each PUBLICATION PROTOCOL gets its own crash sweep: backup,
+//! restore, manifest recovery promotion, content-hole punching, format migration, conversion, the
+//! container session cycle, merge, erasure, and free-space punching each run once for real, and
+//! then every op prefix × durability variant is replayed against protocol-specific invariants.
+//! Container superblock alternation is also proven from each recorded trace directly — see
+//! `assert_slot_alternation`.
 //!
 //! Run with: `cargo test --features dst --test dst`
 #![cfg(feature = "dst")]

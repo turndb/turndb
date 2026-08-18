@@ -31,7 +31,7 @@ for (const [name, browserType] of browsers) {
     await page.locator('#run').waitFor({ state: 'visible' });
     await assert.doesNotReject(() => page.locator('#run').click());
     await page.waitForFunction(() => document.querySelector('#metrics')?.textContent.includes('3 rows'));
-    assert.match(await page.locator('#status').textContent(), /Open: fixture\.turndb · 37439 bytes/);
+    assert.match(await page.locator('#status').textContent(), /Open: fixture\.turndb · 45650 bytes/);
     assert.match(await page.locator('#metrics').textContent(), /3 rows · examined 3/);
     assert.equal(await page.locator('#error').textContent(), '');
     assert.deepEqual(localNetwork, [], 'local-file mode must make no network requests');
@@ -73,10 +73,10 @@ for (const [name, browserType] of browsers) {
       await page.locator('#url').fill(`${origin}/fixture.turndb`);
       await page.locator('#open-url').click();
       await page.waitForFunction(() =>
-        document.querySelector('#status')?.textContent.includes('37439 bytes')
+        document.querySelector('#status')?.textContent.includes('45650 bytes')
           || document.querySelector('#error')?.textContent.length > 0);
       assert.equal(await page.locator('#error').textContent(), '');
-      assert.match(await page.locator('#status').textContent(), /37439 bytes/);
+      assert.match(await page.locator('#status').textContent(), /45650 bytes/);
       await page.locator('#run').click();
       await page.waitForFunction(() => document.querySelector('#metrics')?.textContent.includes('3 rows'));
       assert(rangeRequests > 1, 'URL mode must perform positioned range requests');
