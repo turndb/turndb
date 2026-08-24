@@ -1,6 +1,6 @@
 {
   "name": "@turndb/native",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "Native N-API embedding interface for TurnDB",
   "keywords": [
@@ -61,7 +61,7 @@
     "test:types": "tsc --project test/types/tsconfig.json"
   },
   "optionalDependencies": {
-    "@turndb/native-linux-x64-gnu": "0.1.5"
+    "@turndb/native-linux-x64-gnu": "0.1.6"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.4",
