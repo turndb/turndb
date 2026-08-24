@@ -4,7 +4,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use turndb::container::{Container, ALIGN, CONTAINER_VERSION, MAGIC, REGION_START, SLOT_LEN};
+use turndb::container::{
+    Container, ContainerReader, ALIGN, CONTAINER_VERSION, MAGIC, REGION_START, SLOT_LEN,
+};
 use turndb::fold::FoldCfg;
 use turndb::readat::ReadAt as _;
 use turndb::store::{convert_to_file, open_read_container, Span, Store};
@@ -470,6 +472,98 @@ fn a_container_refuses_what_it_must() {
     std::fs::write(&ct, &bytes).unwrap();
     let c = Container::open(&ct).unwrap();
     assert!(c.verify().is_err(), "a mutated member must fail its checksum");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A positioned source whose first answer to the length question is from before the last commit
+/// and every later answer is honest. That is exactly the view a lock-free open gets when a writer
+/// commits between the open's length query and its superblock read.
+struct StaleLenSource {
+    bytes: Arc<Vec<u8>>,
+    stale: Mutex<Option<u64>>,
+}
+
+impl turndb::readat::ReadAt for StaleLenSource {
+    fn read_exact_at(&self, into: &mut [u8], offset: u64) -> io::Result<()> {
+        let at = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset too large"))?;
+        let bytes = self
+            .bytes
+            .get(at..at.saturating_add(into.len()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "past stale source"))?;
+        into.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        match self.stale.lock().unwrap().take() {
+            Some(stale) => Ok(stale),
+            None => Ok(self.bytes.len() as u64),
+        }
+    }
+}
+
+/// A lock-free open measures the container's length and then reads the superblock slots, and a
+/// writer can commit in that gap: bytes land past the old tail, fsync, slot flip. The newest
+/// slot's tail then exceeds the stale measurement with nothing truncated, so the open must
+/// re-measure and serve the committed state in full. A length that stays short of the tail on the
+/// second answer is genuine truncation and must still refuse — both questions below, per the
+/// testing standard: the nearest valid thing is accepted whole, the invalid one still stops.
+#[test]
+fn a_commit_between_the_length_query_and_the_slot_read_is_not_truncation() {
+    let root = tmp("stalelen");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("stale.turndb");
+
+    let mut c = Container::create(&ct).unwrap();
+    c.put_bytes("early", &noise(1, 3000)).unwrap();
+    c.commit().unwrap();
+    drop(c);
+    let stale_len = std::fs::metadata(&ct).unwrap().len();
+
+    let mut c = Container::open(&ct).unwrap();
+    c.put_bytes("late", &noise(2, 5000)).unwrap();
+    c.commit().unwrap();
+    drop(c);
+    let bytes = std::fs::read(&ct).unwrap();
+
+    // The race's precondition, asserted rather than assumed: the newest committed tail lies
+    // beyond the length a reader could have measured before the second commit.
+    let live = newest_slot(&bytes);
+    let tail = u64::from_le_bytes(bytes[live + 40..live + 48].try_into().unwrap());
+    assert!(tail > stale_len, "the fixture must put the committed tail past the stale length");
+
+    // Accept the nearest valid thing, and accept it whole: every committed member, byte-exact,
+    // not merely an open that returns.
+    let racing = Arc::new(StaleLenSource {
+        bytes: Arc::new(bytes.clone()),
+        stale: Mutex::new(Some(stale_len)),
+    });
+    let r = ContainerReader::open(racing, "stale.turndb").unwrap_or_else(|e| {
+        panic!("a commit racing the length query must not read as truncation: {e}")
+    });
+    assert_eq!(r.names().collect::<Vec<_>>(), ["early", "late"]);
+    assert_eq!(r.read_file_bounded("early", 1 << 20).unwrap(), noise(1, 3000));
+    assert_eq!(r.read_file_bounded("late", 1 << 20).unwrap(), noise(2, 5000));
+
+    // Genuine truncation answers short on the second measurement too, and must still refuse —
+    // through the source reader and the file open alike, and for the stated reason rather than
+    // some downstream parse failure.
+    let cut = &bytes[..stale_len as usize];
+    let steady =
+        Arc::new(StaleLenSource { bytes: Arc::new(cut.to_vec()), stale: Mutex::new(None) });
+    let err = match ContainerReader::open(steady, "cut.turndb") {
+        Ok(_) => panic!("a source truly missing its committed tail must refuse"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("truncated"), "the refusal must name truncation, got: {err}");
+    let cut_path = root.join("cut.turndb");
+    std::fs::write(&cut_path, cut).unwrap();
+    let err = match Container::open(&cut_path) {
+        Ok(_) => panic!("a file truly missing its committed tail must refuse"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("truncated"), "the refusal must name truncation, got: {err}");
     std::fs::remove_dir_all(&root).ok();
 }
 
