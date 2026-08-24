@@ -267,10 +267,18 @@ impl ContainerReader {
             (None, None) => bail!("not a container, or both superblocks are unreadable: {label}"),
         };
         if live.tail > len {
-            bail!(
-                "container {label} is truncated: committed tail {} exceeds length {len}",
-                live.tail
-            );
+            // Same race as [`Container::open`]: over a live file a commit can land between the
+            // length query and the slot reads, and a committed tail legitimately exceeds the
+            // stale length. Containers only grow, so one fresh query decides; a tail still
+            // beyond it is genuine truncation. Static sources (object stores, browser range
+            // caches) answer the same length twice and reach the refusal unchanged.
+            let len = source.len()?;
+            if live.tail > len {
+                bail!(
+                    "container {label} is truncated: committed tail {} exceeds length {len}",
+                    live.tail
+                );
+            }
         }
         let (dir, _) = read_directory(&source, Path::new(&label), &live)?;
         Ok(ContainerReader {
@@ -422,11 +430,21 @@ impl Container {
         };
 
         if live.tail > len {
-            bail!(
-                "container {} is truncated: committed tail {} exceeds file length {len}",
-                path.display(),
-                live.tail
-            );
+            // `len` was measured before the slots were read, and a lock-free open races the
+            // writer: a commit lands its bytes past the old tail, fsyncs, then flips a slot —
+            // so a freshly committed tail can legitimately exceed a stale measurement. The
+            // file never shrinks (reclamation punches holes in place), which makes one fresh
+            // measurement decisive: any slot we managed to read was committed by then, so its
+            // tail is covered by the file's length from that moment on. A tail still beyond a
+            // re-measurement is genuine truncation, and the refusal stands.
+            let len = f.metadata()?.len();
+            if live.tail > len {
+                bail!(
+                    "container {} is truncated: committed tail {} exceeds file length {len}",
+                    path.display(),
+                    live.tail
+                );
+            }
         }
 
         let f = Arc::new(f);
