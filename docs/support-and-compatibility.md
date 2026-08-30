@@ -40,6 +40,13 @@ not touched. Every kind below is a variant of `DebrisKind`, a non-exhaustive enu
 | `PartBuilderSpool` | `<part>.s<n>.tmp` (directory layout) | the part builder mid-build | removes it | — |
 | `LegacyHotDirectory` | `<store>-hot/` | a **0.1.x** working session (CHANGELOG 0.1.0, 0.1.2) abandoned before an upgrade; it may hold acknowledged writes only that release can settle | **refuses and names it** — never removes it | refuses to create, names it — never removes it. Open the store with the release that wrote the directory (which adopts and settles it), or move the directory aside deliberately |
 
+The commonest refusal, stated plainly: a crash (or a failed first sync) while a **brand-new**
+store is being created on Windows leaves `<store>.publish-<pid>-<n>` beside a name that does not
+exist. Nothing acknowledged is in it — the store was never published — but nothing proves that
+to the engine either, so the next writer open refuses to create a store there and names the file;
+the user's action is to remove the named file (or move it aside) and open again. `turndb inspect
+<store>` lists it first.
+
 A writer open counts what it removed in `StoreMetrics.debris_removed` — the one disposition a
 returned store can truthfully report. A removal that fails is the open's error, with the path and
 the underlying cause, and nothing is counted (a failed barrier is a failure). A reader never
