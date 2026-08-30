@@ -221,20 +221,39 @@ impl Fs {
     fn apply(&mut self, op: &Op) {
         match op {
             Op::Create { path } => {
-                let i = self.new_inode(Kind::File);
-                self.volatile_ns.insert(path.clone(), i);
-                if self.windows() {
-                    self.pending.push(path.clone());
+                // `File::create` on a name that already exists truncates THAT file in place:
+                // the same inode, its name as durable as it was, only its bytes volatile until
+                // its fsync — on every platform, and on Windows without entering `pending`
+                // (vfs::create registers only a genuinely new name). A new name is a new inode,
+                // volatile until its directory's fsync (Posix) or its publish (Windows).
+                if let Some(&i) = self.volatile_ns.get(path) {
+                    let node = &mut self.inodes[i];
+                    node.volatile.clear();
+                    node.pending.push((u64::MAX, Vec::new()));
+                } else {
+                    let i = self.new_inode(Kind::File);
+                    self.volatile_ns.insert(path.clone(), i);
+                    if self.windows() {
+                        self.pending.push(path.clone());
+                    }
                 }
             }
             Op::WriteFile { path, data } => {
-                let i = self.new_inode(Kind::File);
-                self.volatile_ns.insert(path.clone(), i);
-                let node = &mut self.inodes[i];
-                node.pending.push((0, data.clone()));
-                node.volatile = data.clone();
-                if self.windows() {
-                    self.pending.push(path.clone());
+                // `std::fs::write` likewise: an existing name is rewritten in place (modelled as
+                // a rewrite to this image, like truncation); a new name is a new inode.
+                if let Some(&i) = self.volatile_ns.get(path) {
+                    let node = &mut self.inodes[i];
+                    node.volatile = data.clone();
+                    node.pending.push((u64::MAX, data.clone()));
+                } else {
+                    let i = self.new_inode(Kind::File);
+                    self.volatile_ns.insert(path.clone(), i);
+                    let node = &mut self.inodes[i];
+                    node.pending.push((0, data.clone()));
+                    node.volatile = data.clone();
+                    if self.windows() {
+                        self.pending.push(path.clone());
+                    }
                 }
             }
             Op::WriteAt { path, off, data } => {
@@ -519,6 +538,61 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
         }
     }
     wrote
+}
+
+/// The model follows the implementation's existing-name branch: creating or rewriting a name
+/// that already exists changes that inode's bytes in place — durable bytes and the durable
+/// name untouched until the file's own fsync — and, on Windows, never enters `pending`, so a
+/// crash on the directory sync has no publish-neither state for it.
+#[test]
+fn the_model_treats_create_and_write_on_an_existing_name_as_in_place_content_changes() {
+    for &model in MODELS {
+        let root = PathBuf::from("/m");
+        let name = root.join("existing");
+        let mut fs = Fs::new(model);
+        // Seed: a durable directory and a durable file with old bytes.
+        let d = fs.new_inode(Kind::Dir);
+        fs.volatile_ns.insert(root.clone(), d);
+        fs.durable_ns.insert(root.clone(), d);
+        let i = fs.new_inode(Kind::File);
+        fs.inodes[i].durable = b"old bytes".to_vec();
+        fs.inodes[i].volatile = b"old bytes".to_vec();
+        fs.volatile_ns.insert(name.clone(), i);
+        fs.durable_ns.insert(name.clone(), i);
+
+        // Create (truncate) then write: same inode, durable untouched, nothing pending.
+        fs.apply(&Op::Create { path: name.clone() });
+        fs.apply(&Op::WriteAt { path: name.clone(), off: 0, data: b"new".to_vec() });
+        assert_eq!(fs.volatile_ns[&name], i, "{model:?}: the same inode");
+        assert_eq!(fs.inodes[i].durable, b"old bytes", "{model:?}: durable bytes unchanged");
+        assert_eq!(fs.inodes[i].volatile, b"new", "{model:?}: volatile bytes truncated+written");
+        assert_eq!(fs.durable_ns.get(&name), Some(&i), "{model:?}: the name stays durable");
+        assert!(fs.pending.is_empty(), "{model:?}: an existing name never enters pending");
+        // A crash on the directory sync has no publish-neither state for it.
+        let states = fs.crash_states(Some(&Op::SyncDir { path: root.clone() }));
+        assert_eq!(
+            states.len(),
+            1,
+            "{model:?}: {:?}",
+            states.iter().map(|(_, l)| l).collect::<Vec<_>>()
+        );
+        // After the file's fsync the bytes are durable; the name never changed.
+        fs.apply(&Op::SyncFile { path: name.clone() });
+        assert_eq!(fs.inodes[i].durable, b"new", "{model:?}");
+        assert_eq!(fs.durable_ns.get(&name), Some(&i), "{model:?}");
+        // WriteFile on the existing name: also in place.
+        fs.apply(&Op::WriteFile { path: name.clone(), data: b"rewritten".to_vec() });
+        assert_eq!(fs.volatile_ns[&name], i, "{model:?}");
+        assert_eq!(fs.inodes[i].durable, b"new", "{model:?}: durable until fsync");
+        assert!(fs.pending.is_empty(), "{model:?}");
+        // A NEW name behaves as before: new inode; pending on Windows; publish-neither exists.
+        let fresh = root.join("fresh");
+        fs.apply(&Op::Create { path: fresh.clone() });
+        assert_ne!(fs.volatile_ns[&fresh], i);
+        assert_eq!(fs.durable_ns.get(&fresh), None, "{model:?}: not durable before a barrier");
+        let states = fs.crash_states(Some(&Op::SyncDir { path: root.clone() }));
+        assert_eq!(states.len(), if model == Model::Windows { 2 } else { 1 }, "{model:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
