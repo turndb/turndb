@@ -38,6 +38,7 @@ not touched. Every kind below is a variant of `DebrisKind`, a non-exhaustive enu
 | `ExcessRetainedManifest` | `MANIFEST.<commit>` older than the retention window, with a live `MANIFEST` (directory layout) | a commit's prune whose unlink a crash undid | removes it | — |
 | `SegmentSidecarStaging` | `seg-<n>.dir.tmp` in `fold/` or `fold-<generation>/` | a sidecar before its rename | removes it | — |
 | `PartBuilderSpool` | `<part>.s<n>.tmp` (directory layout) | the part builder mid-build | removes it | — |
+| `LegacyHotDirectory` | `<store>-hot/` | a **0.1.x** working session (CHANGELOG 0.1.0, 0.1.2) abandoned before an upgrade; it may hold acknowledged writes only that release can settle | **refuses and names it** — never removes it | refuses to create, names it — never removes it. Open the store with the release that wrote the directory (which adopts and settles it), or move the directory aside deliberately |
 
 A writer open counts what it removed in `StoreMetrics.debris_removed` — the one disposition a
 returned store can truthfully report. A removal that fails is the open's error, with the path and
