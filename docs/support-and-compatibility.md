@@ -9,7 +9,7 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Surface | Current evidence | Status |
 |---|---|---|
 | Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, the corruption suite and the release-profile suite all run hosted on every push and pull request (the release-profile link exceeded the private free-tier runner class while the repository was private; it has run hosted since the repository went public) | qualified development platform |
-| Rust crash model | deterministic simulation under two durability models — strict POSIX, and Windows built from documented operations only (no directory fsync; write-through renames; a crash on a rename admitting old, new, or neither; unlinks never durable) — both models run on every platform: nightly on Linux x86-64, and on every push on Windows x86-64 as a required gate. The harness also fails every attempted sync of every sweep once, under both models, and requires the operation to report the failure and the store to converge (see "Sync failures" below) | qualified durability model on both platforms when those gates are green |
+| Rust crash model | deterministic simulation under two durability models — strict POSIX, and Windows built from documented operations only (no directory fsync; write-through renames; a crash on a rename admitting old, new, or neither; unlinks never durable) — both models run on every platform: nightly on Linux x86-64, and on every push on Windows x86-64 as a required gate. The harness also fails every attempted sync of every publication sweep once, under both models, and requires the operation to report the failure and the store to converge (see "Sync failures" below) | qualified durability model on both platforms when those gates are green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
 | Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
 | Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux x86-64 wheels for CPython 3.9–3.13 and installs each exact wheel. Ships **without** the columnar/Arrow lens, SQL, and cooperative cancellation: `turndb.capabilities()` reports `columnar: false`, `arrowIpc: false`, `sql: false`, `cancellation: {scan: false, lifecycle: false}` | Linux x86-64 release candidate; a consumer that needs SQL or cancellation chooses the Rust crate or native Node |
@@ -31,9 +31,10 @@ more**, and what a failed directory sync means for each publication is:
 | close (removal of the `-wal` sidecar) | the store is complete; an empty sidecar may be back after a crash | `close` returns an error naming the directory and the log | nothing is lost; the next open settles the sidecar |
 
 A failed *file* sync has always propagated; these were the directory syncs that did not. The
-deterministic simulator proves each row: every attempted sync of every sweep fails once, the
-operation must report it, and both the real directory and every crash state of the recording
-without that barrier must converge under both durability models.
+deterministic simulator proves each row: every attempted sync of every publication sweep fails
+once (the punch sweeps are physical reclamation, not publication, and are covered by their own
+crash sweeps), the operation must report it, and both the real directory and every crash state of
+the recording without that barrier must converge under both durability models.
 
 Node ranges are deliberately closed at the next untested major: both manifests declare
 `>=22 <27`. Node 22 and 24 are maintained LTS lines and Node 26 is the Current line as of
