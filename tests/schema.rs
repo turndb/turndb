@@ -5,13 +5,18 @@ use turndb::store::{ContentSpans, Store};
 use turndb::types::AttrValue;
 
 fn temp() -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "turndb-schema-{}-{}",
+    // A per-process counter as well as the clock: Windows's clock can hand two parallel tests
+    // the same nanosecond, and two tests in one directory then race at the store's create_new.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "turndb-schema-{}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        N.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    std::fs::create_dir_all(&path).unwrap();
+    path
 }
 
 #[test]
