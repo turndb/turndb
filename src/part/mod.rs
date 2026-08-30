@@ -370,8 +370,15 @@ impl crate::vfs::ArtifactSink for FilePartSink {
     fn write_all_at(&mut self, data: &[u8], off: u64) -> std::io::Result<()> {
         crate::vfs::write_all_at(&self.f, &self.path, data, off)
     }
+    /// The part's completeness barrier: its bytes, and then its NAME. `build_full` is public
+    /// and promises a part file at `path` when it returns; on Windows a created name is durable
+    /// (and reachable by anyone else) only once its directory is synced, which publishes it, so
+    /// the sink syncs the directory itself rather than leaving the name to a later commit. On
+    /// POSIX that is one directory fsync per part, in addition to the commit's.
     fn sync(&mut self) -> std::io::Result<()> {
-        crate::vfs::sync_file(&self.f, &self.path)
+        crate::vfs::sync_file(&self.f, &self.path)?;
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        crate::vfs::sync_dir(parent)
     }
     fn describe(&self) -> String {
         format!("part {}", self.path.display())
