@@ -1025,10 +1025,15 @@ fn check_state(
                     report.entries.iter().map(|d| d.path.clone()).collect();
                 let mut wal = store_path.as_os_str().to_os_string();
                 wal.push("-wal");
-                let unreported: Vec<PathBuf> = std::fs::read_dir(stage)
-                    .unwrap()
-                    .flatten()
-                    .map(|d| d.path())
+                // Every entry is observed or the state fails: a per-entry read error is not an
+                // empty directory.
+                let entries: Vec<PathBuf> = std::fs::read_dir(stage)
+                    .and_then(|rd| rd.map(|d| d.map(|d| d.path())).collect())
+                    .unwrap_or_else(|re| {
+                        panic!("crash point {k} {variant:?}: reading the stage directory: {re}")
+                    });
+                let unreported: Vec<PathBuf> = entries
+                    .into_iter()
                     .filter(|p| p.as_os_str() != wal.as_os_str() && !reported.contains(p))
                     .collect();
                 if !report.entries.is_empty()
