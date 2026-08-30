@@ -999,6 +999,54 @@ fn check_state(
     let store = match Store::open_file(&stage.join("s.turndb"), cfg) {
         Ok(s) => s,
         Err(e) => {
+            // One refusal converges by report (obj-mtg0jtf1-l, the verifier's shape): the store's
+            // name is absent; the debris inventory beside it is non-empty and every entry is in
+            // the creation-refusal vocabulary; the error names every reported path; and nothing
+            // was ever acknowledged (an acked record with no store would be a loss). The error
+            // text is evidence the caller was told, never the classifier.
+            let store_path = stage.join("s.turndb");
+            let text = format!("{e:#}");
+            if !store_path.exists() && floor == 0 {
+                let report = turndb::store::debris_report(&store_path).unwrap_or_else(|re| {
+                    panic!("crash point {k} {variant:?}: open refused and the debris scan failed: {re:#} (open: {text})")
+                });
+                let refusing = |kind: turndb::store::DebrisKind| {
+                    matches!(
+                        kind,
+                        turndb::store::DebrisKind::PendingPublish
+                            | turndb::store::DebrisKind::ReclaimStaging
+                            | turndb::store::DebrisKind::ReclaimCandidate
+                            | turndb::store::DebrisKind::LegacyHotDirectory
+                    )
+                };
+                // And nothing else sits in the directory: every entry beside the absent store
+                // must be one the report names — the sidecar excepted, which is recovery input.
+                let reported: std::collections::BTreeSet<PathBuf> =
+                    report.entries.iter().map(|d| d.path.clone()).collect();
+                let mut wal = store_path.as_os_str().to_os_string();
+                wal.push("-wal");
+                // Every entry is observed or the state fails: a per-entry read error is not an
+                // empty directory.
+                let entries: Vec<PathBuf> = std::fs::read_dir(stage)
+                    .and_then(|rd| rd.map(|d| d.map(|d| d.path())).collect())
+                    .unwrap_or_else(|re| {
+                        panic!("crash point {k} {variant:?}: reading the stage directory: {re}")
+                    });
+                let unreported: Vec<PathBuf> = entries
+                    .into_iter()
+                    .filter(|p| p.as_os_str() != wal.as_os_str() && !reported.contains(p))
+                    .collect();
+                if !report.entries.is_empty()
+                    && report.entries.iter().all(|d| refusing(d.kind))
+                    && report.entries.iter().all(|d| text.contains(&d.path.display().to_string()))
+                    && unreported.is_empty()
+                {
+                    return;
+                }
+                if !unreported.is_empty() {
+                    panic!("crash point {k} {variant:?}: open refused and unreported entries sit beside the absent store: {unreported:?} (open: {text})");
+                }
+            }
             panic!("crash point {k} {variant:?}: open REFUSED a reachable crash state: {e:#}")
         }
     };
