@@ -1481,3 +1481,23 @@ fn a_legacy_working_directory_is_refused_by_open_and_reclaim_and_never_removed()
     assert!(hot.join("WAL").exists(), "never removed");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Beside an ABSENT store, a 0.1.x working directory refuses creation too: nothing is created,
+/// nothing is removed, the path is named.
+#[test]
+fn a_legacy_working_directory_beside_an_absent_store_refuses_creation() {
+    let root = tmp("legacy-hot-absent");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    let hot = root.join("s.turndb-hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    std::fs::write(hot.join("WAL"), b"acked").unwrap();
+    let err = match Store::open_file(&ct, cfg()) {
+        Ok(_) => panic!("must not create a store beside a 0.1.x working directory"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:#}").contains("s.turndb-hot"), "{err:#}");
+    assert!(!ct.exists(), "nothing created");
+    assert!(hot.join("WAL").exists(), "nothing removed");
+    std::fs::remove_dir_all(&root).ok();
+}

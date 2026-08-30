@@ -58,3 +58,17 @@ fn inspect_lists_debris_in_a_directory_layout_then_refuses_the_directory() {
     assert!(d.join("MANIFEST.tmp").exists(), "inspect never removes");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn inspect_lists_a_legacy_working_directory_which_nothing_removes() {
+    let d = scratch("hot");
+    let store = d.join("s.turndb");
+    std::fs::write(&store, b"not a store yet, just bytes").unwrap();
+    std::fs::create_dir_all(d.join("s.turndb-hot")).unwrap();
+    std::fs::write(d.join("s.turndb-hot").join("WAL"), b"acked").unwrap();
+    let out = turndb().arg("inspect").arg(&store).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("s.turndb-hot") && stdout.contains("LegacyHotDirectory"), "{stdout}");
+    assert!(d.join("s.turndb-hot").join("WAL").exists(), "inspect never removes");
+    let _ = std::fs::remove_dir_all(&d);
+}
