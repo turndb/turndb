@@ -511,9 +511,10 @@ jobs:
 
   # The release-profile suite on Windows: the same invocation the Linux `rust` job runs
   # (`cargo test --release --tests`), on the same trigger (every push and pull request), with the
-  # same arming (hosted only while the repository is public — the private free-tier runner class
-  # could not link the DataFusion-static release binaries on either OS; see the `rust` job's
-  # comment). Its own job rather than a step in `windows`: the release link is the wall-time,
+  # same arming (hosted only while the repository is public). The Linux trail in the `rust` job's
+  # comment documents that private class failing the release link; on Windows that class was
+  # never attempted — the public run's measured footprint predicts memory pressure there, and
+  # the claim stops at prediction, not an observed failure. Its own job rather than a step in `windows`: the release link is the wall-time,
   # memory and disk pole, and a separate job keeps its cache, its disk and its measurement scope
   # its own. Required exactly as the Linux counterpart is: gate.needs lists it, and a skipped or
   # cancelled result fails the gate.
@@ -607,7 +608,7 @@ jobs:
       - name: release suite deferred on the private free tier
         if: ${{ github.event.repository.private }}
         run: |
-          echo "::warning title=release-profile suite not run::exceeds the private free-tier runner class; verified locally on this source per docs/support-and-compatibility.md; arms automatically when the repository is public"
+          echo "::warning title=release-profile suite not run::deferred on the private free tier — never attempted on that runner class; the public-tier run's measured footprint (docs/support-and-compatibility.md) predicts memory pressure there, and the claim stops at prediction; arms automatically when the repository is public"
 
   # detector explicitly reports false. That one exception is printed, named, and checked below.
   gate:
