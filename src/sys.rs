@@ -40,6 +40,11 @@ pub(crate) fn allocated_bytes(_metadata: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
+#[cfg(unix)]
+fn checked_filesystem_bytes<A: Into<u64>, B: Into<u64>>(blocks: A, block_size: B) -> Option<u64> {
+    blocks.into().checked_mul(block_size.into())
+}
+
 /// Bytes available to the current user on the filesystem containing `path`.
 #[cfg(unix)]
 pub(crate) fn filesystem_available_bytes(path: &Path) -> io::Result<Option<u64>> {
@@ -52,7 +57,9 @@ pub(crate) fn filesystem_available_bytes(path: &Path) -> io::Result<Option<u64>>
         return Err(io::Error::last_os_error());
     }
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail.checked_mul(stats.f_frsize))
+    // libc follows each OS's statvfs ABI: Darwin exposes f_bavail as u32 while Linux uses u64.
+    // Normalize both operands without narrowing before checking the byte-count multiplication.
+    Ok(checked_filesystem_bytes(stats.f_bavail, stats.f_frsize))
 }
 
 #[cfg(not(unix))]

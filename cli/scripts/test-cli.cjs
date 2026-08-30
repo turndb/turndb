@@ -14,8 +14,21 @@ const path = require('node:path');
 const CLI_DIR = path.resolve(__dirname, '..');
 const DIST = process.argv[2] ? path.resolve(process.argv[2]) : path.join(CLI_DIR, 'dist');
 
-const tarballs = fs.readdirSync(DIST).filter((f) => f.endsWith('.tgz'));
-assert.ok(tarballs.length >= 2, `expected a selector and a platform tarball in ${DIST}`);
+const version = JSON.parse(fs.readFileSync(path.join(CLI_DIR, 'package.json'), 'utf8')).version;
+const hostSlice = process.env.TURNDB_CLI_TEST_SLICE ?? (() => {
+  if (process.platform === 'linux' && process.arch === 'x64') return 'linux-x64-gnu';
+  if (process.platform === 'linux' && process.arch === 'arm64') return 'linux-arm64-gnu';
+  if (process.platform === 'darwin' && process.arch === 'x64') return 'darwin-x64';
+  if (process.platform === 'darwin' && process.arch === 'arm64') return 'darwin-arm64';
+  throw new Error(`no CLI test slice for ${process.platform}-${process.arch}`);
+})();
+const tarballs = [
+  `turndb-cli-${version}.tgz`,
+  `turndb-cli-${hostSlice}-${version}.tgz`,
+];
+for (const tarball of tarballs) {
+  assert.ok(fs.existsSync(path.join(DIST, tarball)), `expected ${tarball} in ${DIST}`);
+}
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-cli-test-'));
 try {

@@ -262,6 +262,97 @@ jobs:
       - name: install and exercise the same packed addon
         run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
 
+  cli-slice-changes:
+    # Keep the two macOS runners off changes that cannot affect the CLI package. This detector is
+    # itself unconditional, so gate can distinguish an intentional path skip from a lost job.
+    name: CLI slice path filter
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: paths
+        name: detect packaging input changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == workflow_dispatch || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            changed=true
+          elif git diff --quiet "$BASE_SHA" HEAD -- \
+            .github/workflows/ci.yml .github/workflows/release-cli.yml \
+            cli src Cargo.toml Cargo.lock rust-toolchain.toml \
+            LICENSE NOTICE THIRD_PARTY_LICENSES.html; then
+            changed=false
+          else
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+  cli-slices:
+    # release-cli.yml is tag/dispatch-only, so this is the PR proof. It has no npm environment,
+    # OIDC permission or publish step. Native hosts install their package; Linux arm64 cross-builds.
+    name: CLI slice (${{ matrix.slice }})
+    needs: cli-slice-changes
+    if: needs.cli-slice-changes.outputs.changed == 'true'
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slice: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            execute: '1'
+          - slice: linux-arm64-gnu
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            linker: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          - slice: darwin-x64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+            execute: '1'
+          - slice: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+            execute: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.slice }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: install the cross linker
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - name: build and pack this slice
+        env:
+          TURNDB_CLI_TARGET: ${{ matrix.target }}
+          TURNDB_CLI_SLICE: ${{ matrix.slice }}
+          TURNDB_CLI_PACK_SELECTOR: '1'
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: node cli/scripts/pack-cli.cjs
+      - name: install and drive the native package
+        if: matrix.execute == '1'
+        run: node cli/scripts/test-cli.cjs cli/dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-cli-${{ matrix.slice }}
+          path: cli/dist/
+          if-no-files-found: error
+          retention-days: 7
+
   python:
     name: Python binding
     runs-on: ubuntu-latest
@@ -345,12 +436,12 @@ jobs:
   # differently from the presence of a failing one and neither shouts.
   #
   # This job runs on every event, `needs` everything, and fails unless every dependency SUCCEEDED.
-  # `skipped` and `cancelled` are failures here on purpose: nothing in this file is conditional, so
-  # a skip means a dependency died or someone added a condition without adding it to this list.
+  # `skipped` and `cancelled` are failures here except for cli-slices when its unconditional path
+  # detector explicitly reports false. That one exception is printed, named, and checked below.
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, python, browser]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, cli-slice-changes, cli-slices, python, browser]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran
@@ -366,6 +457,10 @@ jobs:
           for name in sorted(needs):
               result = needs[name]['result']
               print('  ' + name.ljust(width) + '  ' + result)
+              if (name == 'cli-slices' and result == 'skipped'
+                      and needs['cli-slice-changes']['outputs'].get('changed') == 'false'):
+                  print('    skipped by paths filter')
+                  continue
               if result != 'success':
                   bad.append((name, result))
           if bad:
