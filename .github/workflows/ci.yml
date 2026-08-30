@@ -440,8 +440,8 @@ jobs:
   # Windows x64: the platform floor in src/sys.rs (positioned I/O, LockFileEx, sparse punch,
   # write-through renames) and every suite the Linux job runs except the release-profile one,
   # plus the crash sweeps under BOTH durability models (tests/dst.rs: strict POSIX, and Windows
-  # built from documented operations only). Not yet in gate.needs — that wiring lands with the
-  # cross-OS test.
+  # built from documented operations only). Required: gate.needs lists it, and gate fails on any
+  # result but success — a skipped Windows job is a failed gate.
   windows:
     name: windows x64
     runs-on: windows-latest
@@ -471,11 +471,47 @@ jobs:
       - name: deterministic simulation (both models)
         run: cargo test --features dst --test dst -- --nocapture
 
+      # tests/cross_os.rs: this platform's build of the reference store must be byte-identical to
+      # the Linux-made fixture and the fixture must open here (Linux → Windows). The build is
+      # emitted for the cross-os job below, which closes the other direction.
+      - name: cross-OS store (Linux → Windows) and emit this platform's build
+        env:
+          TURNDB_CROSS_OS_EMIT: ${{ runner.temp }}/windows-made.turndb
+        run: cargo test --test cross_os -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-made-store
+          path: ${{ runner.temp }}/windows-made.turndb
+          if-no-files-found: error
+          retention-days: 7
+
+  # Windows → Linux: the store the Windows job built, opened, verified and byte-compared here.
+  cross-os:
+    name: cross-OS store (Windows → Linux)
+    needs: [windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-os-v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-made-store
+          path: ${{ runner.temp }}/from-windows
+      - name: open, verify and byte-compare the Windows-made store
+        env:
+          TURNDB_CROSS_OS_STORE: ${{ runner.temp }}/from-windows/windows-made.turndb
+        run: |
+          test -s "$TURNDB_CROSS_OS_STORE"
+          cargo test --test cross_os -- --nocapture
+
   # detector explicitly reports false. That one exception is printed, named, and checked below.
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, cli-slice-changes, cli-slices, python, browser]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, cli-slice-changes, cli-slices, python, browser, windows, cross-os]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran
