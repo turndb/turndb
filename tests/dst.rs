@@ -1019,11 +1019,27 @@ fn check_state(
                             | turndb::store::DebrisKind::LegacyHotDirectory
                     )
                 };
+                // And nothing else sits in the directory: every entry beside the absent store
+                // must be one the report names — the sidecar excepted, which is recovery input.
+                let reported: std::collections::BTreeSet<PathBuf> =
+                    report.entries.iter().map(|d| d.path.clone()).collect();
+                let mut wal = store_path.as_os_str().to_os_string();
+                wal.push("-wal");
+                let unreported: Vec<PathBuf> = std::fs::read_dir(stage)
+                    .unwrap()
+                    .flatten()
+                    .map(|d| d.path())
+                    .filter(|p| p.as_os_str() != wal.as_os_str() && !reported.contains(p))
+                    .collect();
                 if !report.entries.is_empty()
                     && report.entries.iter().all(|d| refusing(d.kind))
                     && report.entries.iter().all(|d| text.contains(&d.path.display().to_string()))
+                    && unreported.is_empty()
                 {
                     return;
+                }
+                if !unreported.is_empty() {
+                    panic!("crash point {k} {variant:?}: open refused and unreported entries sit beside the absent store: {unreported:?} (open: {text})");
                 }
             }
             panic!("crash point {k} {variant:?}: open REFUSED a reachable crash state: {e:#}")
