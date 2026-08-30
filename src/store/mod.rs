@@ -1028,6 +1028,14 @@ pub fn open_read_container_with_limits(
     cfg: FoldCfg,
     read_limits: ReadLimits,
 ) -> Result<ReadStore> {
+    if !path.exists() && crate::container::reclaim_names(path).anchor.exists() {
+        bail!(
+            "{} is absent but its reclaim anchor {} exists: a reclaim's replace was interrupted; \
+             a writer open recovers the store from the anchor (readers never mutate)",
+            path.display(),
+            crate::container::reclaim_names(path).anchor.display()
+        );
+    }
     let read_limits = read_limits.validate()?;
     let container = crate::container::Container::open(path)?;
     // Absent means a store nothing has flushed yet — the directory reader's rule, with the same
@@ -2142,6 +2150,66 @@ fn hash_file_with_control(
     Ok(hasher.finalize())
 }
 
+/// `<store>` is absent and `<store>.reclaimed` — a reclaim's anchor — is present: promote the
+/// anchor to the store's name, or refuse. One contender at a time: the anchor's own writer lock
+/// is the exclusion, so a second recoverer sees `WriterLocked`. The anchor is validated whole
+/// (fold at its tail scrubbed, every part by digest and sections, every record reconstructed —
+/// the same bar as manifest recovery) BEFORE anything is created; a corrupt or incomplete anchor
+/// refuses and leaves everything as found. Promotion is a copy to a fresh candidate, fsynced,
+/// writer-locked, and published at `<store>` by a write-through no-replace rename — a name taken
+/// meanwhile refuses with the anchor intact — after which the anchor is unlinked (laggable). A
+/// crash at any point re-enters here on the next writer open and converges.
+fn recover_store_from_reclaim_anchor(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+) -> Result<()> {
+    let names = crate::container::reclaim_names(path);
+    let anchor = crate::container::Container::open(&names.anchor)
+        .with_context(|| format!("open reclaim anchor {}", names.anchor.display()))?;
+    anchor.lock_writer().with_context(|| "another recovery of this store is in progress")?;
+    if anchor.sealed() {
+        bail!("reclaim anchor {} is sealed; not a reclaim's output", names.anchor.display());
+    }
+    let manifest = Manifest::parse(&anchor.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+    let control = crate::control::OperationControl::default();
+    validate_recovery_candidate_container(
+        &anchor,
+        &names.anchor,
+        cfg,
+        manifest,
+        read_limits,
+        &control,
+    )
+    .with_context(|| {
+        format!(
+            "reclaim anchor {} does not validate whole; the store is not recreated from it",
+            names.anchor.display()
+        )
+    })?;
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let _ = crate::vfs::unlink(&names.candidate_tmp);
+    let _ = crate::vfs::unlink(&names.candidate);
+    crate::container::copy_container_bytes_pub(&names.anchor, &names.candidate_tmp)?;
+    crate::vfs::sync_dir(&parent)?;
+    crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
+    crate::vfs::sync_dir(&parent)?;
+    let new_store = crate::vfs::open_rw(&names.candidate)?;
+    if !crate::sys::lock_exclusive(&new_store)? {
+        return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
+    }
+    crate::container::Container::open(&names.candidate)?.verify()?;
+    crate::vfs::rename_noreplace(&names.candidate, path).with_context(|| {
+        format!("{} was taken while the reclaim anchor was being promoted", path.display())
+    })?;
+    crate::vfs::sync_dir(&parent)?;
+    drop(anchor);
+    let _ = crate::vfs::unlink(&names.anchor);
+    let _ = crate::vfs::sync_dir(&parent);
+    drop(new_store);
+    Ok(())
+}
+
 /// Promote retained `commit` to the live `MANIFEST` of a directory-layout store, but only after
 /// validating the candidate whole — the same bar as [`recover_manifest_file`]'s candidates, on
 /// files instead of container members. Used by open when the live manifest is absent beside a
@@ -2835,6 +2903,26 @@ impl Store {
                 path.display()
             );
         }
+        let reclaim = crate::container::reclaim_names(path);
+        if !path.exists()
+            && !reclaim.anchor.exists()
+            && (reclaim.candidate.exists()
+                || reclaim.candidate_tmp.exists()
+                || reclaim.staging.exists())
+        {
+            // Reclaim material without its anchor and without a store is a shape the protocol
+            // cannot leave; creating a fresh store over it would bury whatever it is.
+            bail!(
+                "{} is absent but reclaim material sits beside it without an anchor; not creating \
+                 a new store over it — inspect and remove the `.reclaim*` files first",
+                path.display()
+            );
+        }
+        if !path.exists() && reclaim.anchor.exists() {
+            // A reclaim's replace crashed in the state its protocol admits — the store's name
+            // gone, the anchor intact. Recover from the anchor, or refuse; never create.
+            recover_store_from_reclaim_anchor(path, cfg, read_limits)?;
+        }
         let container = if !path.exists() {
             // The parent directories are created exactly as the directory store's open always
             // created its own — the friendliness embedders relied on, kept.
@@ -2863,6 +2951,14 @@ impl Store {
             bail!("{} is sealed; sealed is final — a writer cannot open it", path.display());
         }
         container.lock_writer()?;
+        // The store is present, so it is authority: reclaim material beside it is debris from a
+        // crash after the replace (a laggable unlink) and is removed, never consulted.
+        for stale in [&reclaim.staging, &reclaim.anchor, &reclaim.candidate_tmp, &reclaim.candidate]
+        {
+            if stale.exists() {
+                let _ = crate::vfs::unlink(stale);
+            }
+        }
 
         // The manifest is a member. Missing means a new store — UNLESS retained commits exist,
         // which is the same tripwire the directory store fires: this store has committed before

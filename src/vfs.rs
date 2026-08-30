@@ -145,6 +145,15 @@ pub mod record {
             from: PathBuf,
             to: PathBuf,
         },
+        /// A replace-rename whose destination is OPEN by this process (reclaim's final step).
+        /// On Windows that takes the POSIX-semantics route, which has no write-through form,
+        /// and no documented barrier ever promotes it: the simulator's Windows model carries
+        /// old / new / neither for it through every later crash point, not only the one on the
+        /// call. On POSIX it is an ordinary rename.
+        RenameLagged {
+            from: PathBuf,
+            to: PathBuf,
+        },
         /// `hard_link`: atomically publish another name for an already durable file. Unlike
         /// rename, this refuses when `to` exists, which is the pack writer's no-overwrite gate.
         Link {
@@ -424,6 +433,20 @@ pub(crate) fn rename(from: &Path, to: &Path) -> Result<()> {
     publish::forget(from);
     #[cfg(feature = "dst")]
     push(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+    Ok(())
+}
+
+/// Replace `to` with `from` while `to` is held OPEN by this process — reclaim's final step. On
+/// Windows `MoveFileExW` refuses an open destination and `sys::rename` takes the documented
+/// POSIX-semantics route, which is not write-through; recorded as its own operation so the crash
+/// model carries that uncertainty for as long as it really lasts (see `Op::RenameLagged`).
+#[inline]
+pub(crate) fn rename_replace_open(from: &Path, to: &Path) -> Result<()> {
+    crate::sys::rename(from, to)?;
+    #[cfg(windows)]
+    publish::forget(from);
+    #[cfg(feature = "dst")]
+    push(Op::RenameLagged { from: from.to_path_buf(), to: to.to_path_buf() });
     Ok(())
 }
 

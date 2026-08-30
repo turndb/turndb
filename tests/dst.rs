@@ -101,6 +101,21 @@ struct Fs {
     durable_ns: BTreeMap<PathBuf, usize>,
     /// Windows only: names created (file, dir, link) and not yet published, in creation order.
     pending: Vec<PathBuf>,
+    /// Windows only: replace-renames over an open destination (`Op::RenameLagged`) whose
+    /// durability no documented barrier has settled. Each carries old / new / neither through
+    /// every later crash point until a write-through operation on one of its names resolves it.
+    lagged: Vec<Lagged>,
+}
+
+/// One unsettled `RenameLagged`: what `to` and `from` durably name is unknown.
+#[derive(Clone)]
+struct Lagged {
+    from: PathBuf,
+    to: PathBuf,
+    /// The inode that was moved.
+    moved: usize,
+    /// What `to` durably named before the rename, if anything.
+    replaced: Option<usize>,
 }
 
 impl Fs {
@@ -112,6 +127,7 @@ impl Fs {
             volatile_ns: BTreeMap::new(),
             durable_ns: BTreeMap::new(),
             pending: Vec::new(),
+            lagged: Vec::new(),
         }
     }
 
@@ -130,6 +146,40 @@ impl Fs {
             self.durable_ns.insert(path.to_path_buf(), i);
         }
         self.pending.retain(|p| p != path);
+        self.settle(path);
+    }
+
+    /// A write-through operation on `name` settles any lagged rename that involves it.
+    fn settle(&mut self, name: &Path) {
+        self.lagged.retain(|l| l.from != name && l.to != name);
+    }
+
+    /// Apply one alternative of an unsettled lagged rename to the durable namespace.
+    fn apply_lagged(&mut self, l: &Lagged, which: u8) {
+        match which {
+            0 => {
+                // old: nothing moved on disk
+                self.durable_ns.insert(l.from.clone(), l.moved);
+                match l.replaced {
+                    Some(i) => {
+                        self.durable_ns.insert(l.to.clone(), i);
+                    }
+                    None => {
+                        self.durable_ns.remove(&l.to);
+                    }
+                }
+            }
+            1 => {
+                // new: the move landed
+                self.durable_ns.remove(&l.from);
+                self.durable_ns.insert(l.to.clone(), l.moved);
+            }
+            _ => {
+                // neither
+                self.durable_ns.remove(&l.from);
+                self.durable_ns.remove(&l.to);
+            }
+        }
     }
 
     /// Erase every trace of `path` (and, for a directory, everything under it) from both
@@ -149,6 +199,29 @@ impl Fs {
     /// rename, the state where neither name exists; for a publish (`SyncDir`), one state per
     /// pending file where the files before it were published and that one is gone.
     fn crash_states(&self, next: Option<&Op>) -> Vec<(Fs, String)> {
+        let mut out = self.boundary_states(next);
+        if !self.windows() {
+            return out;
+        }
+        // Every unsettled lagged rename multiplies every state by its three alternatives, at
+        // this crash point and every later one, until something write-through settles it.
+        for k in 0..self.lagged.len() {
+            let mut expanded = Vec::with_capacity(out.len() * 3);
+            for (fs, label) in out {
+                for (which, word) in [(0u8, "old"), (1, "new"), (2, "neither")] {
+                    let mut alt = fs.clone();
+                    let l = alt.lagged[k].clone();
+                    alt.apply_lagged(&l, which);
+                    expanded.push((alt, format!("{label} lagged-{word} {}", short_name(&l.to))));
+                }
+            }
+            out = expanded;
+        }
+        out
+    }
+
+    /// The states reachable when the crash lands ON `next` (before lagged expansion).
+    fn boundary_states(&self, next: Option<&Op>) -> Vec<(Fs, String)> {
         let mut out = vec![(self.clone(), String::new())];
         if !self.windows() {
             return out;
@@ -170,6 +243,13 @@ impl Fs {
                     fs.vanish(victim);
                     out.push((fs, format!("publish-neither {}", short_name(victim))));
                 }
+            }
+            Some(Op::RenameLagged { from, to }) => {
+                // A crash on the call itself: the three alternatives, before the op is applied.
+                let mut fs = self.clone();
+                fs.vanish(from);
+                fs.vanish(to);
+                out.push((fs, format!("rename-neither {}", short_name(to))));
             }
             _ => {}
         }
@@ -353,6 +433,26 @@ impl Fs {
                         self.durable_ns.remove(from);
                         self.durable_ns.insert(to.clone(), i);
                         self.pending.retain(|p| p != from);
+                        self.settle(from);
+                        self.settle(to);
+                    }
+                }
+            }
+            Op::RenameLagged { from, to } => {
+                // Posix: an ordinary rename (durable at the directory's fsync). Windows: the
+                // POSIX-semantics replace of an open destination — volatile view updated, the
+                // durable view UNKNOWN until settled, carried by `crash_states`.
+                if let Some(i) = self.volatile_ns.remove(from) {
+                    let replaced = self.durable_ns.get(to).copied();
+                    self.volatile_ns.insert(to.clone(), i);
+                    if self.windows() {
+                        self.pending.retain(|p| p != from);
+                        self.lagged.push(Lagged {
+                            from: from.clone(),
+                            to: to.clone(),
+                            moved: i,
+                            replaced,
+                        });
                     }
                 }
             }
@@ -855,6 +955,13 @@ fn op_summary(op: &Op) -> String {
         Op::SyncFile { path } => format!("SyncFile    {}", short(path)),
         Op::SyncDir { path } => format!("SyncDir     {}", short(path)),
         Op::Rename { from, to } => format!("Rename      {} -> {}", short(from), short(to)),
+        Op::RenameLagged { from, to } => {
+            format!(
+                "RenameLagged {} -> {} (open destination; not write-through on Windows)",
+                short(from),
+                short(to)
+            )
+        }
         Op::Link { from, to } => format!("Link        {} -> {}", short(from), short(to)),
         Op::Unlink { path } => format!("Unlink      {}", short(path)),
         Op::Mkdir { path } => format!("Mkdir       {}", short(path)),
@@ -1943,6 +2050,77 @@ fn every_single_file_erase_crash_answers_honestly() {
             }
         });
     println!("dst single-file erase: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// Reclaim's publication protocol — anchor, candidate, uncertain replace, laggable cleanup —
+/// at every crash point, under both models. The claim: whenever `<store>` exists it is whole and
+/// serves every record; whenever it does not, a writer open recovers it from the anchor and
+/// then serves every record; opening never refuses; and a second open converges on the same
+/// store. Debris (`.reclaim*`) may remain; it never changes which store wins.
+#[test]
+fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
+    let root = tmp("reclaim");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // Sessions leave superseded extents; enough of them that reclaim has real work.
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for round in 0..6usize {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let id = format!("w:{round}");
+        let body = body_for(600 + round);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert(id, body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    assert!(turndb::container::Container::open(&file).unwrap().free_bytes() > 0);
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    record::arm();
+    let stats = turndb::container::reclaim(&file).unwrap();
+    let ops = record::disarm();
+    assert!(stats.reclaimed > 0);
+    assert!(ops.len() > 12, "reclaim must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("reclaim", &ops);
+
+    let stage = tmp("reclaim-stage");
+    let check = |what: &str, k: usize, variant: Variant, store: &Path| {
+        let rs = turndb::store::open_read_container(store, cfg).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?} {what}: store refuses a reader: {e:#}")
+        });
+        for (id, body) in &want {
+            assert_eq!(
+                rs.reconstruct(id).unwrap().as_deref(),
+                Some(body.as_slice()),
+                "crash point {k} {variant:?} {what}: record {id}"
+            );
+        }
+        assert_eq!(rs.ids().unwrap().len(), want.len(), "crash point {k} {variant:?} {what}: ids");
+        turndb::container::Container::open(store)
+            .unwrap()
+            .verify()
+            .unwrap_or_else(|e| panic!("crash point {k} {variant:?} {what}: verify: {e:#}"));
+    };
+    let checked = replay_recorded("reclaim", &base, &root, &ops, &stage, |stage, k, variant| {
+        let store = stage.join("s.turndb");
+        if store.exists() {
+            check("present", k, variant, &store);
+        }
+        // A writer open: recovers from the anchor when the name is gone, opens otherwise, and
+        // never refuses. Then the store must be whole, and a second open must converge.
+        for pass in ["first writer open", "second writer open"] {
+            let s = Store::open_file(&store, cfg)
+                .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}"));
+            s.close().unwrap();
+            check(pass, k, variant, &store);
+        }
+    });
+    println!("dst reclaim: {checked} crash states checked across {} ops", ops.len());
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&stage).ok();
 }

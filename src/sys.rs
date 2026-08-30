@@ -869,6 +869,37 @@ mod windows_tests {
         let _ = std::fs::remove_file(&b);
     }
 
+    /// After the POSIX-semantics replace, the lock taken on the SOURCE handle must still gate the
+    /// name — asserted, not inferred from handle identity.
+    #[test]
+    fn the_candidate_lock_survives_the_replace_fallback_and_gates_the_new_name() {
+        let cand = scratch("handoff-cand");
+        let store = scratch("handoff-store");
+        std::fs::write(&cand, b"new").unwrap();
+        std::fs::write(&store, b"old").unwrap();
+        let old = open_rw(&store);
+        assert!(lock_exclusive(&old).unwrap(), "old store locked, as reclaim holds it");
+        let new = open_rw(&cand);
+        assert!(lock_exclusive(&new).unwrap(), "candidate locked before publication");
+        rename(&cand, &store).expect("replace over the open, locked destination (fallback)");
+        let third = open_rw(&store);
+        assert!(
+            !lock_exclusive(&third).unwrap(),
+            "a writer at the name meets the candidate's lock"
+        );
+        drop(old);
+        let fourth = open_rw(&store);
+        assert!(
+            !lock_exclusive(&fourth).unwrap(),
+            "the old handle's lock was never what gated the new name"
+        );
+        drop(new);
+        assert!(lock_exclusive(&fourth).unwrap(), "released with the candidate handle");
+        drop(third);
+        drop(fourth);
+        let _ = std::fs::remove_file(&store);
+    }
+
     #[test]
     fn free_space_is_measured_for_a_directory_and_for_a_file_path() {
         let p = scratch("space");
