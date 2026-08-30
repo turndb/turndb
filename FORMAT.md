@@ -89,6 +89,14 @@ releases when the descriptor closes — including on a crash. That is what makes
 rather than a convention: a stale lock cannot outlive its owner, so there is never a lock nobody can
 distinguish from a live one.
 
+**On Windows this is `LockFileEx`**, which the operating system releases when the handle closes or
+the process terminates — the same property. One difference is load-bearing: a Windows byte-range
+lock is *mandatory*, and an exclusive lock denies other handles both reads and writes of the range
+it covers, while ordinary readers of a live store never take the lock and must keep reading. The
+lock therefore covers exactly one byte at offset 2^64 − 2 — past any offset a file can hold, and so
+never inside a read (locking beyond end-of-file is permitted). Mapped views ignore byte-range locks
+altogether; both reader paths are exercised against the locked byte in `src/sys.rs`'s tests.
+
 **On `wasm32-wasip1` there is no advisory locking.** WASI provides no equivalent, so the lock call
 succeeds unconditionally and the file is created but gates nothing. On that build the single-writer
 invariant is **the embedder's to keep**, and the
@@ -685,7 +693,14 @@ than from the snapshot's own.
 Committed, in a single-file store, as a restaged `MANIFEST` member published by the container's
 superblock flip — one atomic state carrying the manifest, its retained copy, and everything the
 commit stages. The retired directory layout committed with tmp + fsync + rename + fsync-dir, so a
-crash sees either the old manifest or the new one. **An unreadable manifest is an error, not an
+crash sees either the old manifest or the new one — or, on Windows, *neither*: a replace-rename there
+is not documented to exclude a crash state with the old name removed and the new one not yet
+landed, so that layout's commit publishes `MANIFEST.<commit>` before it touches the live name, and
+an open that finds the live `MANIFEST` absent beside a commit log promotes the newest retained copy
+only after validating it whole — the manifest, its fold at the candidate's tail, every part it
+names by digest and section checksums, and every record it serves. A copy that is merely present,
+or merely newest, is not promoted; a damaged newest copy is a refusal, never a rollback to an older
+one. **An unreadable manifest is an error, not an
 empty store** — conflating those with a sweep that unlinks unnamed files turns one bad byte into
 an empty store.
 
@@ -1063,13 +1078,42 @@ anything a reader could still hold.
 A container consequently only grows, and every flush restages `MANIFEST` whether or not anything
 else changed — so dead space accumulates with sessions, not with writes. **Reclaim** is the
 operation that returns it whole: every live member copied to a fresh container as one aligned
-extent, committed, verified, and published over the original with an atomic rename. It is a copy
-and a rename rather than an edit, so the container being read is never half-rewritten and a crash
-leaves the original untouched; a reader holding the old file keeps reading it, because the inode
-outlives the name. Reclaim takes the writer `flock` for the whole rewrite — a live writer would
-keep committing to the renamed-away inode — and is refused while an unsettled `-wal` sidecar
-sits beside the file (acknowledged records only their writer can settle) or for a sealed
-container, whose bytes are final.
+extent, committed, verified, and published at the store's name. It is a copy and a rename rather
+than an edit, so the container being read is never half-rewritten; a reader holding the old file
+keeps reading it, because the inode outlives the name. Reclaim takes the writer lock for the whole
+rewrite — a live writer would keep committing to the renamed-away inode — and is refused while an
+unsettled `-wal` sidecar sits beside the file (acknowledged records only their writer can settle)
+or for a sealed container, whose bytes are final.
+
+The publication is the crash-safety argument, and it is the same on every platform so the
+deterministic simulator proves it under both durability models it knows. A name is "published
+durably" below by the platform's no-replace rename plus its namespace barrier: on POSIX an ordinary
+no-replace rename followed by the directory's fsync; on Windows a rename with `MOVEFILE_WRITE_THROUGH`,
+which is the barrier. The sequence, exactly as the code performs it:
+
+1. the fresh container is written at `<store>.reclaiming`, committed and verified;
+2. it is published durably as the **anchor**, `<store>.reclaimed` — a durable name for verified
+   bytes that nothing afterwards touches;
+3. a byte copy of the anchor is fsynced and published durably as the **candidate**,
+   `<store>.reclaim-candidate`; the candidate is then opened and the writer lock is taken on that
+   handle — before it is published at the store's name, the name a second writer would open — and
+   the handle is held until reclaim returns, so no second writer can enter between the replace and
+   the return;
+4. the candidate is renamed over `<store>` — `rename(2)` on POSIX; on Windows the documented route
+   that replaces an open file (`FileRenameInfoEx` with POSIX semantics), which has no write-through
+   form and which no later documented operation promotes. The simulator carries old / new / neither
+   for this step through every later crash point, including after the cleanup below and after the
+   return;
+5. the store at its name is reopened and verified, and the anchor is unlinked.
+
+In every one of those states the anchor is intact: a writer open that finds the store's name absent
+beside its anchor validates the anchor whole (the manifest-recovery bar), copies it, locks and
+verifies the copy, publishes it durably at the store's name, and only then unlinks the anchor; one
+recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor is refused and
+nothing is created. A store that is present is always the authority — reclaim material beside it is
+removed, never consulted. The anchor's unlink and the candidate's are laggable on Windows, so
+`.reclaim*` debris may follow a crash; it never changes which store wins. Cost: one extra copy of the
+compacted container per reclaim on every platform, and on Windows two write-through renames more.
 
 ---
 
