@@ -83,12 +83,6 @@ const SB_LEN: usize = 56;
 /// actually returnable in place.
 pub const ALIGN: u64 = 4096;
 
-/// Suffix of the working directory the RETIRED checkpoint bridge kept beside a container. No
-/// writer creates one any more; it is named so `reclaim` can refuse a container that still has
-/// an abandoned 0.1.x session beside it, instead of rewriting under unfolded acknowledged writes
-/// only that release can settle.
-pub const HOT_SUFFIX: &str = "-hot";
-
 /// Refuse a directory that claims more than this compressed, before allocating for it.
 const MAX_DIR_STORED: u32 = 64 << 20;
 /// Refuse a directory that claims more than this decompressed.
@@ -1227,14 +1221,6 @@ pub(crate) fn reclaim_with_hook(
     path: &Path,
     mut after_replace: impl FnMut(&Path),
 ) -> Result<ReclaimStats> {
-    let mut hot = path.as_os_str().to_os_string();
-    hot.push(HOT_SUFFIX);
-    if Path::new(&hot).exists() {
-        bail!(
-            "{} has a writer's working directory beside it; settle or close that writer first",
-            path.display()
-        );
-    }
     let source = Container::open(path)?;
     if source.sealed() {
         bail!("container {} is sealed; sealed is final", path.display());
