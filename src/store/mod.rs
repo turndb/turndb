@@ -31,9 +31,12 @@
 //! Anything the fold wrote past that tail is discarded and regenerated, so there is no window in
 //! which a part could reference content that never landed.
 
+pub mod debris;
 pub mod read;
 pub mod refold;
 pub mod wal;
+
+pub use debris::{debris_report, DebrisEntry, DebrisKind, DebrisReport};
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
@@ -2915,19 +2918,19 @@ impl Store {
             );
         }
         let reclaim = crate::container::reclaim_names(path);
-        if !path.exists()
-            && !reclaim.anchor.exists()
-            && (reclaim.candidate.exists()
-                || reclaim.candidate_tmp.exists()
-                || reclaim.staging.exists())
-        {
-            // Reclaim material without its anchor and without a store is a shape the protocol
-            // cannot leave; creating a fresh store over it would bury whatever it is.
-            bail!(
-                "{} is absent but reclaim material sits beside it without an anchor; not creating \
-                 a new store over it — inspect and remove the `.reclaim*` files first",
-                path.display()
-            );
+        if !path.exists() && !reclaim.anchor.exists() {
+            // Transient names beside an ABSENT store — a pending publish that never landed,
+            // reclaim material without its anchor — are not proven dead, so nothing is removed;
+            // the ones that mean "a store was being published here" refuse creation.
+            let refusing = debris::names_refusing_creation(path)?;
+            if !refusing.is_empty() {
+                bail!(
+                    "{} is absent but transient files sit beside it ({}); not creating a new \
+                     store over them — inspect and remove them first",
+                    path.display(),
+                    refusing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                );
+            }
         }
         if !path.exists() && reclaim.anchor.exists() {
             // A reclaim's replace crashed in the state its protocol admits — the store's name
@@ -2962,14 +2965,10 @@ impl Store {
             bail!("{} is sealed; sealed is final — a writer cannot open it", path.display());
         }
         container.lock_writer()?;
-        // The store is present, so it is authority: reclaim material beside it is debris from a
-        // crash after the replace (a laggable unlink) and is removed, never consulted.
-        for stale in [&reclaim.staging, &reclaim.anchor, &reclaim.candidate_tmp, &reclaim.candidate]
-        {
-            if stale.exists() {
-                let _ = crate::vfs::unlink(stale);
-            }
-        }
+        // The store is present, so it is authority: every transient name beside it — reclaim
+        // material, a Windows pending publish, a merge's scratch — is dead by the protocol and
+        // removed here; a removal that fails is carried in the report and the counters.
+        let debris_removed = debris::remove_beside_present_store(path)?;
 
         // The manifest is a member. Missing means a new store — UNLESS retained commits exist,
         // which is the same tripwire the directory store fires: this store has committed before
@@ -3077,6 +3076,7 @@ impl Store {
 
         let mut metrics = crate::observability::StoreMetrics {
             recovered_wal_frames,
+            debris_removed,
             ..crate::observability::StoreMetrics::default()
         };
         let recovery_duration = recovery_started.elapsed();
@@ -3264,17 +3264,10 @@ impl Store {
         // Crash litter: builder spools and staging files are all *.tmp, and every one of them is
         // pre-commit garbage. Swept ONLY at writer open, not at flush — an external packer's
         // staging file must not race a live writer's flush.
-        let rd = std::fs::read_dir(dir)
-            .with_context(|| format!("read store directory {} for temp cleanup", dir.display()))?;
-        let mut visited = 0u64;
-        for e in rd {
-            visited = visited.saturating_add(1);
-            read_limits.admit_directory_entries("store directory", visited)?;
-            let e = e?;
-            if e.file_name().to_string_lossy().ends_with(".tmp") && e.path().is_file() {
-                let _ = crate::vfs::unlink(&e.path());
-            }
-        }
+        // Transient names in the directory: staging files by exact grammar, pending publishes
+        // anchored to a valid final name, retained copies past the window — removed, and a
+        // removal that fails is this open's error with the path and the cause.
+        let debris_removed = debris::remove_in_dir_layout(dir)?;
 
         let wal_path = dir.join("WAL");
         let retained_commit_count = list_retained_with_limits(dir, read_limits)?.len();
@@ -3303,6 +3296,7 @@ impl Store {
 
         let mut metrics = crate::observability::StoreMetrics {
             recovered_wal_frames,
+            debris_removed,
             ..crate::observability::StoreMetrics::default()
         };
         let recovery_duration = recovery_started.elapsed();

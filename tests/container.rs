@@ -1420,7 +1420,7 @@ fn reclaim_material_without_an_anchor_and_without_a_store_is_never_built_over() 
         Ok(_) => panic!("must not create a store over unexplained reclaim material"),
         Err(e) => e,
     };
-    assert!(format!("{err:#}").contains("without an anchor"), "{err:#}");
+    assert!(format!("{err:#}").contains("not creating a new store over"), "{err:#}");
     assert!(!ct.exists());
     std::fs::remove_dir_all(&root).ok();
 }

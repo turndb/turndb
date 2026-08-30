@@ -199,6 +199,11 @@ pub struct StoreMetrics {
     pub erase: OperationMetrics,
     pub format_migration: OperationMetrics,
     pub folded_content: FoldedContentMetrics,
+    /// Transient names (`store::DebrisKind`) a successful writer open removed because the
+    /// protocol proved them dead — the one disposition a returned `Store` can truthfully report:
+    /// a removal that fails is the open's error, and nothing is counted. Set at open, not
+    /// persisted.
+    pub debris_removed: u64,
 }
 
 /// Successful content-piece work observed at the content-addressed write boundary.
