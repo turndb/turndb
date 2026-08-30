@@ -47,3 +47,27 @@ jobs:
       # the absence of is the defect this file exists to remove.
       - name: dst harness
         run: cargo test --features dst --test dst -- --nocapture
+
+  # The lockfiles against the registry as it is TONIGHT. `scripts/sync-release-version.py` writes a
+  # version-less stub for each @turndb platform package at release prep, because that version is
+  # not on the registry yet; npm tolerates the stub only until it is. Publication therefore makes
+  # the lock invalid while main keeps displaying its pre-publication green, and the first PR after
+  # a release fails `npm ci` in `native prebuild` for a reason nobody changed (#118, #94 before it).
+  # This job runs the same `npm ci` every night so the transition is seen within a day of the
+  # publish, on main, rather than by whoever opens the next PR.
+  lockfiles:
+    name: lockfiles resolve against the registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      # The only lockfile that carries a platform-package pin. `cli/` and `npm/turndb` have no
+      # lockfile; the CLI selector's pins are checked against the in-repo slice manifests by
+      # `cli/scripts/pack-cli.cjs` instead.
+      - name: bindings/node
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
