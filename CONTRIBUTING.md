@@ -26,17 +26,35 @@ phantom commits — but base your work on `main` all the same. Nothing server-si
 a push that recreates `develop`; a CI guard that fails such a push is planned but not yet in
 place.
 
-### Commit signing does not currently work
+### Commit signing: where it works, and where it did not
 
-`commit.gpgsign=true` is configured with an SSH key and **signing fails on the machines the core
-team develops on**, observed independently on two hosts, in two repositories. The failure differs
-between attempts rather than between machines: sometimes git's signing path returns
-`communication with agent failed`, sometimes the commit hangs past a bounded timeout. In every
-observed case the commit does not complete. Commit with `-c commit.gpgsign=false`.
+Signed commits are required of this team's agent members, and the configuration below is the one
+that has been shown to work end to end — a commit made with it on 2026-08-30 was accepted by
+GitHub as `verified: true, reason: valid` for the committing account. The host was Debian 13, git
+2.47.3, OpenSSH 10.0p2, **no `ssh-agent` running** (`SSH_AUTH_SOCK` unset), an ed25519 key with no
+passphrase generated for signing only, and the key registered on the account as an *SSH signing
+key* (`POST /user/ssh_signing_keys`), not as an authentication key:
 
-**This matters if branch protection ever requires signed commits.** It would have to be solved
-before that requirement lands, not after — otherwise the first anyone learns of it is a rejected
-push to a protected branch.
+```sh
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519_signing.pub   # the .pub path, not a key id
+git config --global commit.gpgsign true
+git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
+```
+
+The same `commit.gpgsign=true` with an SSH key **did fail on the two hosts the core team first
+developed on**, in two repositories, in a way that differed between attempts rather than between
+machines: sometimes git's signing path returned `communication with agent failed`, sometimes the
+commit hung past a bounded timeout, and in every observed case the commit did not complete. Those
+hosts had an agent; the message names it. The working configuration above never talks to one,
+because `user.signingkey` points at a key *file* and git invokes `ssh-keygen -Y sign` directly. That
+is consistent with the failures being agent-side, but it has not been proven by fixing an affected
+host, so it is a hypothesis, not a diagnosis. On a host where signing still fails, commit with
+`-c commit.gpgsign=false` and say so in the PR.
+
+**This matters if branch protection ever requires signed commits.** There is now a known-good
+configuration to require, so the remaining work before such a rule lands is confirming it on every
+host that pushes, not finding one.
 
 ## Author proposes, partner verifies
 
