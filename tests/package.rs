@@ -127,7 +127,10 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         );
     }
 
-    let ci = fs::read_to_string(format!("{root}/.github/workflows/ci.yml")).unwrap();
+    // Normalised: a checkout that converted the file to CRLF must not fail the exact-line search.
+    let ci = fs::read_to_string(format!("{root}/.github/workflows/ci.yml"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let portable_job = ci_job_block(&ci, "npm");
     let native_job = ci_job_block(&ci, "native-node");
     for (name, job) in [("portable", portable_job), ("native", native_job)] {

@@ -703,7 +703,8 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
     assert!(estimate.estimated_stage_bytes > estimate.input_raw_section_bytes);
     assert!(!estimate.estimate_is_hard_bound);
     assert_eq!(estimate.retained_input_bytes_after_commit, plan.input_bytes);
-    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+    // Measured on Unix (statvfs) and Windows (GetDiskFreeSpaceExW); an explicit None elsewhere.
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(any(unix, windows)));
 
     let result = s.compact_bounded(budget).unwrap().unwrap();
     assert_eq!(result.plan, plan, "execution must honor the observed plan exactly");
@@ -1651,7 +1652,8 @@ fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
     assert!(estimate.source_part_raw_section_bytes > 0);
     assert!(estimate.estimated_stage_bytes > estimate.source_fold_logical_bytes);
     assert!(!estimate.estimate_is_hard_bound);
-    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+    // Measured on Unix (statvfs) and Windows (GetDiskFreeSpaceExW); an explicit None elsewhere.
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(any(unix, windows)));
 
     let st = s.refold().unwrap();
     assert_eq!(st.tombstones_dropped, 10);
@@ -2064,7 +2066,15 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
 
     // bytes actually left the disk, and the file LENGTHS did not change (offsets are stable)
     let after = allocated_bytes(&dir);
-    assert!(after < before, "punching must deallocate: {before} -> {after}");
+    // Linux `fallocate(PUNCH_HOLE)` returns the blocks; the assertion is the proof there. On
+    // Windows the punch is `FSCTL_SET_ZERO_DATA` on a sparse file, where the bytes are
+    // guaranteed zero but the space return is best-effort at NTFS's 64 KiB granularity — so the
+    // measurement is REPORTED for CI's log and not asserted, until evidence earns more.
+    if cfg!(target_os = "linux") {
+        assert!(after < before, "punching must deallocate: {before} -> {after}");
+    } else {
+        println!("allocated bytes before punch {before}, after {after} (measured, not asserted)");
+    }
 
     // everything still live reads byte-exact, through the same unmoved offsets
     for (id, body) in &keep {
@@ -2083,14 +2093,13 @@ fn punching_reclaims_erased_bytes_in_place_without_moving_anything() {
 /// Allocated (not logical) bytes under a path — what `du` counts. Punching keeps lengths and
 /// offsets stable, so allocation is the only honest measure of bytes leaving the disk.
 fn allocated_bytes(d: &std::path::Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
     let mut total = 0;
     for entry in std::fs::read_dir(d).unwrap().flatten() {
         let meta = entry.metadata().unwrap();
         if meta.is_dir() {
             total += allocated_bytes(&entry.path());
         } else {
-            total += meta.blocks() * 512;
+            total += file_allocated_bytes(&entry.path(), &meta);
         }
     }
     total
@@ -3085,4 +3094,27 @@ fn wal_of(dir: &Path) -> PathBuf {
     let mut p = store_file(dir).into_os_string();
     p.push("-wal");
     PathBuf::from(p)
+}
+
+#[cfg(unix)]
+fn file_allocated_bytes(_path: &std::path::Path, meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks() * 512
+}
+
+/// `GetCompressedFileSizeW`: the bytes a sparse or compressed file actually occupies.
+#[cfg(windows)]
+fn file_allocated_bytes(path: &std::path::Path, _meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut high: u32 = 0;
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    assert!(
+        low != INVALID_FILE_SIZE || std::io::Error::last_os_error().raw_os_error() == Some(0),
+        "GetCompressedFileSizeW({}) failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    ((high as u64) << 32) | low as u64
 }

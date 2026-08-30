@@ -55,7 +55,7 @@ pub const fn capabilities() -> Capabilities {
     Capabilities {
         part_format_write: crate::part::PART_VERSION,
         part_format_read_max: crate::part::PART_VERSION,
-        writer_exclusion: if cfg!(unix) {
+        writer_exclusion: if cfg!(any(unix, windows)) {
             WriterExclusion::OsEnforced
         } else {
             WriterExclusion::EmbedderEnforced
@@ -69,7 +69,7 @@ pub const fn capabilities() -> Capabilities {
         read_admission_limits: true,
         object_count_admission: true,
         store_space_usage: true,
-        allocated_space_usage: cfg!(unix),
+        allocated_space_usage: cfg!(any(unix, windows)),
         format_migration: true,
         operation_metrics: true,
         part_distribution: true,
@@ -110,7 +110,7 @@ mod tests {
             c.max_decoded_frame_bytes_default,
             crate::read_limits::DEFAULT_MAX_DECODED_FRAME_BYTES
         );
-        assert_eq!(c.allocated_space_usage, cfg!(unix));
+        assert_eq!(c.allocated_space_usage, cfg!(any(unix, windows)));
         assert!(c.format_migration);
         assert!(c.operation_metrics);
         assert!(c.part_distribution);

@@ -1,0 +1,4 @@
+# Checkouts keep LF everywhere: tests read workflow and fixture files as text and search
+# them for exact lines, and a Windows checkout that converted them to CRLF fails those tests
+# for a reason unrelated to what they assert.
+* text=auto eol=lf

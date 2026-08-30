@@ -5,10 +5,15 @@ use turndb::store::{ContentSpans, Span, Store};
 use turndb::types::ContentHash;
 
 fn temp() -> PathBuf {
+    // A per-process counter as well as the clock: Windows's clock can hand two parallel tests
+    // the same nanosecond, and two tests in one directory then race at the store's create_new.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "turndb-content-identity-{}-{}",
+        "turndb-content-identity-{}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        N.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&path).unwrap();
     path
