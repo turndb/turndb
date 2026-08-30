@@ -2225,7 +2225,14 @@ fn converges(
     ops: &[Op],
     mut check: impl FnMut(&Path, &str),
 ) {
-    check(real, &format!("{label}: real directory after the failed sync"));
+    // The real directory, restart-shaped: its on-disk bytes — debris included — copied into a
+    // directory no process state knows. In this process the Windows pending-publication registry
+    // still remembers a name whose sync failed; a restarted process would not, and a writer open
+    // must be checked as that process would run it.
+    let restarted = tmp(&format!("{stage_tag}-syncfail-restart"));
+    copy_tree(real, &restarted);
+    check(&restarted, &format!("{label}: real directory after the failed sync (restart-shaped)"));
+    std::fs::remove_dir_all(&restarted).ok();
     // The stage directory's name must be a valid file name on every platform: no ':' or '('.
     let stage = tmp(&format!("{stage_tag}-syncfail-stage"));
     for &model in MODELS {
@@ -2242,6 +2249,19 @@ fn converges(
         }
     }
     std::fs::remove_dir_all(&stage).ok();
+}
+
+/// Copy a directory tree's files byte for byte — what a restart sees, nothing more.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let dst = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dst);
+        } else {
+            std::fs::copy(e.path(), dst).unwrap();
+        }
+    }
 }
 
 fn serves_all(store: &Path, want: &BTreeMap<String, Vec<u8>>, cfg: FoldCfg, what: &str) {
@@ -3088,11 +3108,14 @@ fn every_workload_sync_failure_is_reported_and_recovers_to_an_acked_consistent_s
                 }
             }
         }
-        // And the real directory as the failed run left it.
+        // And the real directory as the failed run left it — restart-shaped: copied into a
+        // directory no process state (the Windows pending-publication registry) knows.
+        let restarted = root.join("restarted");
+        copy_tree(&work, &restarted);
         let r = catch_unwind(AssertUnwindSafe(|| {
-            check_state(&work, &issued, &boundaries, floor, ops.len(), Variant::AllLanded)
+            check_state(&restarted, &issued, &boundaries, floor, ops.len(), Variant::AllLanded)
         }));
-        assert!(r.is_ok(), "{label}: the real directory after the failed sync");
+        assert!(r.is_ok(), "{label}: the real directory after the failed sync (restart-shaped)");
         std::fs::remove_dir_all(&root).ok();
     }
     println!(
