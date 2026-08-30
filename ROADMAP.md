@@ -318,12 +318,13 @@ Two halves, and the phase is done when both are:
    enough — writes and reads through the Node package with no reach into engine internals. A Python
    agent traces itself into a local file with two lines. Both speak the same query contract the
    browser and server will. The Python package states its capability difference from Node (no
-   columnar/SQL lens, no cancellation) where a consumer chooses a binding, or closes it. Native
-   slices for Linux arm64, macOS x64 and macOS arm64 exist across the native Node package, the
-   Python wheels and the CLI, built and install-tested in CI on the toolchain that targets each;
-   Windows x64 native follows once `src/sys.rs` carries a Windows floor; the portable package
-   serves everywhere else, never as a silent fallback. No consumer on any of the five OS slices
-   named above installs TurnDB and inherits a restriction TurnDB did not state up front.
+   columnar/SQL lens, no cancellation) where a consumer chooses a binding, or closes it. The
+   deliverable is native slices for Linux arm64, macOS x64 and macOS arm64 across the native Node
+   package, the Python wheels and the CLI, built and install-tested in CI on the toolchain that
+   targets each; Windows x64 native follows once `src/sys.rs` carries a Windows floor; the portable
+   package serves everywhere else, never as a silent fallback. The gate: no consumer on any of the
+   five OS slices named above installs TurnDB and inherits a restriction TurnDB did not state up
+   front.
 2. **Theirs to state.** CommandSuite adopts the Node package for traces. What that requires of TurnDB
    — the agent-activity record family, retention semantics, a runner-side durable spool, anything
    else — is unknown until CommandSuite states its need, and this roadmap does not guess. The seam
