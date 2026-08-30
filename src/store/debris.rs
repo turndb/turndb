@@ -392,12 +392,20 @@ pub(crate) fn refusal_beside(store: &Path, read_limits: ReadLimits) -> Result<Ve
         .collect())
 }
 
+/// Remove every found name, or refuse: a never-removed class met here is an error naming it —
+/// the removal scan is its own refusal, so nothing that appeared between an earlier check and
+/// this one can be skipped past.
 fn remove_all(found: Vec<Found>) -> Result<u64> {
+    if let Some(f) = found.iter().find(|f| never_removed(f.kind)) {
+        anyhow::bail!(
+            "{} is beside the store and is never removed ({:?}): open the store with the release \
+             that wrote it, or move it aside deliberately",
+            f.path.display(),
+            f.kind
+        );
+    }
     let mut removed = 0u64;
     for f in found {
-        if never_removed(f.kind) {
-            continue;
-        }
         let r =
             if f.is_dir { crate::vfs::remove_tree(&f.path) } else { crate::vfs::unlink(&f.path) };
         r.with_context(|| format!("remove transient {:?} {}", f.kind, f.path.display()))?;
@@ -668,12 +676,11 @@ mod tests {
         std::fs::write(d.join("s.turndb.reclaiming"), b"x").unwrap();
         let r = debris_report(&store).unwrap();
         assert!(r.entries.iter().any(|e| e.kind == DebrisKind::LegacyHotDirectory), "{r:?}");
-        assert_eq!(
-            remove_beside_present_store(&store, ReadLimits::default()).unwrap(),
-            1,
-            "only the reclaim staging"
-        );
+        // The removal path itself refuses: nothing is removed, the working directory is named.
+        let err = remove_beside_present_store(&store, ReadLimits::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("s.turndb-hot"), "{err:#}");
         assert!(d.join("s.turndb-hot").join("WAL").exists(), "never removed");
+        assert!(d.join("s.turndb.reclaiming").exists(), "nothing else touched either");
         assert_eq!(
             refusal_beside(&store, ReadLimits::default()).unwrap(),
             vec![d.join("s.turndb-hot")]
