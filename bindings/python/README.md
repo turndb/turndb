@@ -4,6 +4,12 @@ The Python SDK is a thin PyO3 shell over TurnDB's single-file engine. It uses th
 and structured-query contract as Rust and Node. One dedicated Rust actor owns each writer, so
 Python threads never concurrently enter mutable engine state.
 
+What this package does **not** carry, so you choose it knowing: the columnar/Arrow lens and SQL
+(`columnar: false`, `arrowIpc: false`, `sql: false`) and cooperative cancellation of scans and
+lifecycle operations (`cancellation: {scan: false, lifecycle: false}`). `turndb.capabilities()`
+reports exactly these; a consumer that needs SQL or cancellation uses the Rust crate or the native
+Node package. Wheels are Linux x86-64 (manylinux); other platforms build from the sdist.
+
 ```python
 from turndb import Store
 

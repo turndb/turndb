@@ -68,7 +68,9 @@ head -4000 traces.jsonl | ./target/release/turndb import mystore.turndb -
 ./target/release/turndb query   mystore.turndb "SELECT model, count(*) FROM t GROUP BY model"
 ./target/release/turndb seal    mystore.turndb snap.turndb   # the committed snapshot, sealed
 ./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"
-# If the manifest member is damaged: validates the newest retained commit, no rollback by default
+# Only if the manifest member is damaged: validates the newest retained commit, no rollback by
+# default. On a healthy store it refuses and exits 1 — "refusing recovery of a healthy store" —
+# which is the point: recovery is never an accidental rollback.
 ./target/release/turndb recover mystore.turndb
 ```
 
@@ -86,6 +88,9 @@ s.close()?;                                   // settles the sidecar; one file r
 
 ## SDKs and browser viewer
 
+The consumer's design surface — what an embedder can rely on and what is still a gap — is the
+[embedding contract](docs/embedding-contract.md); every document under `docs/` is listed in
+[docs/README.md](docs/README.md).
 Node and Python expose the same versioned [capability contract](docs/capability-contract.md) and
 [structured query contract](docs/query-contract.md), including ordered duplicate attributes,
 bit-exact floats, byte-exact named content, sealing, and bounded maintenance. Their OpenTelemetry
@@ -105,9 +110,14 @@ to turndb records, with the reasoning behind each choice in its doc comment;
 page, a `responseId` lookup, aggregates — against the result, and checks byte-exact reconstruction
 first. The shape:
 
-* **Three records per API call** — `#system` / `#input` / `#output` — because a record has one
-  body by design. Each body is the message array verbatim, which is what lets the structural carve
-  above resolve re-sent turns to the same pieces.
+* **One record per API call, three named contents** — `gen_ai.system_instructions`,
+  `gen_ai.input.messages`, `gen_ai.output.messages` — the shape the
+  [trace mapping](docs/trace-mapping.md) and both OpenTelemetry exporters write. Format version 2
+  gave a record any number of independently named content values
+  ([record model v2](docs/record-model-v2.md)); the example predates that and still stores three
+  records (`#system` / `#input` / `#output`) with one `body` each, which the same engine reads. Either
+  way each content is the message array verbatim, which is what lets the structural carve above
+  resolve re-sent turns to the same pieces.
 * **Ids are `member/ts/responseId#kind`** with the timestamp zero-padded, so ids sort
   lexicographically into member-then-time order — the access pattern a trace UI actually has — and
   the front-coded id column stays both compressible and range-scannable.
