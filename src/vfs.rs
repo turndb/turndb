@@ -16,6 +16,75 @@ use std::fs::File;
 use std::io::Result;
 use std::path::Path;
 
+#[cfg(windows)]
+mod publish {
+    //! Windows has no directory fsync, so "create a file, then fsync its directory" cannot make a
+    //! new name durable there. What Windows documents instead is `MoveFileExW` with
+    //! `MOVEFILE_WRITE_THROUGH`: the call does not return until the move is on disk. So on this
+    //! platform a new file is created under a temporary name and `sync_dir(dir)` — the same call
+    //! the protocols already make at exactly the point the name must be durable — publishes every
+    //! pending file in `dir` with a write-through rename. Call sites do not change; the crash
+    //! model does: `SyncDir` on Windows means "publish", and a crash inside it is modelled per
+    //! file as published / not yet / neither (tests/dst.rs).
+    //!
+    //! A pending file is addressed by its FINAL name everywhere above this module; the map here
+    //! resolves that name to the temporary one for the few operations that reach the file by
+    //! path before it is published (rename, unlink, reopen, existence).
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static PENDING: Mutex<BTreeMap<PathBuf, PathBuf>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn temp_name_for(path: &Path) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".publish-{}-{n}", std::process::id()));
+        PathBuf::from(name)
+    }
+
+    /// Register `path` as created-but-unpublished at `temp`.
+    pub(super) fn register(path: &Path, temp: PathBuf) {
+        PENDING.lock().unwrap().insert(path.to_path_buf(), temp);
+    }
+
+    /// Where `path` physically is right now: its temporary name while pending, itself otherwise.
+    pub(super) fn resolve(path: &Path) -> PathBuf {
+        PENDING.lock().unwrap().get(path).cloned().unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Forget a pending entry because the final name was consumed by a rename or unlink of the
+    /// pending file itself.
+    pub(super) fn forget(path: &Path) -> Option<PathBuf> {
+        PENDING.lock().unwrap().remove(path)
+    }
+
+    /// Publish every pending file directly inside `dir`, in registration order. Each publish is a
+    /// write-through, no-replace rename; the entry is removed only once its rename returned.
+    pub(super) fn publish_dir(dir: &Path) -> std::io::Result<()> {
+        let due: Vec<(PathBuf, PathBuf)> = PENDING
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.parent().map(|d| same_dir(d, dir)).unwrap_or(false))
+            .map(|(p, t)| (p.clone(), t.clone()))
+            .collect();
+        for (path, temp) in due {
+            crate::sys::rename_noreplace(&temp, &path)?;
+            PENDING.lock().unwrap().remove(&path);
+        }
+        Ok(())
+    }
+
+    fn same_dir(a: &Path, b: &Path) -> bool {
+        let norm =
+            |p: &Path| if p.as_os_str().is_empty() { PathBuf::from(".") } else { p.to_path_buf() };
+        norm(a) == norm(b)
+    }
+}
+
 #[cfg(feature = "dst")]
 pub mod record {
     //! The recorder: armed per thread by the DST harness, ignored otherwise.
@@ -132,12 +201,31 @@ pub(crate) trait ArtifactSink {
 /// needs. Records nothing: opening mutates no state the crash model tracks.
 #[inline]
 pub(crate) fn open_rw(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    let path = &publish::resolve(path);
     std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(path)
+}
+
+/// Does `path` exist as far as this writer is concerned — including a file it created and has
+/// not yet published (Windows)?
+#[inline]
+pub(crate) fn exists(path: &Path) -> bool {
+    #[cfg(windows)]
+    let path = &publish::resolve(path);
+    path.exists()
 }
 
 #[inline]
 pub(crate) fn create(path: &Path) -> Result<File> {
+    #[cfg(not(windows))]
     let f = File::create(path)?;
+    #[cfg(windows)]
+    let f = {
+        let temp = publish::temp_name_for(path);
+        let f = File::create(&temp)?;
+        publish::register(path, temp);
+        f
+    };
     #[cfg(feature = "dst")]
     push(Op::Create { path: path.to_path_buf() });
     Ok(f)
@@ -148,15 +236,23 @@ pub(crate) fn create(path: &Path) -> Result<File> {
 /// file existing.
 #[inline]
 pub(crate) fn open_or_create(path: &Path) -> Result<(File, bool)> {
-    let existed = path.exists();
+    let existed = exists(path);
     // `truncate(false)` stated explicitly: this opens an EXISTING file to keep working on it, and
     // silently truncating one here would discard a durable WAL or segment.
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let open = |p: &Path| {
+        std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(p)
+    };
+    #[cfg(not(windows))]
+    let f = open(path)?;
+    #[cfg(windows)]
+    let f = if existed {
+        open(&publish::resolve(path))?
+    } else {
+        let temp = publish::temp_name_for(path);
+        let f = open(&temp)?;
+        publish::register(path, temp);
+        f
+    };
     #[cfg(feature = "dst")]
     if !existed {
         push(Op::Create { path: path.to_path_buf() });
@@ -167,7 +263,21 @@ pub(crate) fn open_or_create(path: &Path) -> Result<(File, bool)> {
 /// `create_new` — exclusive creation, refusing a leftover file. Same recording as [`create`].
 #[inline]
 pub(crate) fn create_new(path: &Path) -> Result<File> {
-    let f = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(path)?;
+    let open =
+        |p: &Path| std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(p);
+    #[cfg(not(windows))]
+    let f = open(path)?;
+    #[cfg(windows)]
+    let f = {
+        // Exclusive against the FINAL name: a leftover there is what `create_new` refuses.
+        if exists(path) {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        }
+        let temp = publish::temp_name_for(path);
+        let f = open(&temp)?;
+        publish::register(path, temp);
+        f
+    };
     #[cfg(feature = "dst")]
     push(Op::Create { path: path.to_path_buf() });
     Ok(f)
@@ -195,7 +305,14 @@ pub(crate) fn set_len(f: &File, path: &Path, len: u64) -> Result<()> {
 
 #[inline]
 pub(crate) fn write_file(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(not(windows))]
     std::fs::write(path, data)?;
+    #[cfg(windows)]
+    {
+        let temp = publish::temp_name_for(path);
+        std::fs::write(&temp, data)?;
+        publish::register(path, temp);
+    }
     #[cfg(feature = "dst")]
     push(Op::WriteFile { path: path.to_path_buf(), data: data.to_vec() });
     Ok(())
@@ -218,26 +335,45 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     // it. Opening `""` is ENOENT, so the first quickstart command failed (#121). The empty path
     // means the current directory, so sync the current directory.
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    // Windows: publish every file created in `dir` and not yet named, each by a write-through
+    // rename — the documented barrier this platform has in place of a directory fsync. The
+    // recorded `SyncDir` then means exactly that, and the simulator's Windows model reads it so.
+    #[cfg(windows)]
+    publish::publish_dir(dir)?;
     crate::sys::sync_dir(dir)?;
-    // On Windows there is no directory fsync and `sys::sync_dir` did nothing, so nothing is
-    // recorded: the simulator's log must hold only operations that happened.
-    #[cfg(all(feature = "dst", not(windows)))]
+    #[cfg(feature = "dst")]
     push(Op::SyncDir { path: dir.to_path_buf() });
     Ok(())
 }
 
 #[inline]
 pub(crate) fn rename(from: &Path, to: &Path) -> Result<()> {
-    crate::sys::rename(from, to)?;
+    #[cfg(windows)]
+    let physical = publish::resolve(from);
+    #[cfg(windows)]
+    let from_physical: &Path = &physical;
+    #[cfg(not(windows))]
+    let from_physical: &Path = from;
+    crate::sys::rename(from_physical, to)?;
+    #[cfg(windows)]
+    publish::forget(from);
     #[cfg(feature = "dst")]
     push(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
     Ok(())
 }
 
-/// Atomic rename that refuses to replace `to`.
+/// Rename that refuses to replace `to` (atomic on Linux and macOS; see `sys::rename_noreplace`).
 #[inline]
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
-    crate::sys::rename_noreplace(from, to)?;
+    #[cfg(windows)]
+    let physical = publish::resolve(from);
+    #[cfg(windows)]
+    let from_physical: &Path = &physical;
+    #[cfg(not(windows))]
+    let from_physical: &Path = from;
+    crate::sys::rename_noreplace(from_physical, to)?;
+    #[cfg(windows)]
+    publish::forget(from);
     #[cfg(feature = "dst")]
     push(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
     Ok(())
@@ -245,7 +381,15 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
 
 #[inline]
 pub(crate) fn unlink(path: &Path) -> Result<()> {
-    std::fs::remove_file(path)?;
+    #[cfg(windows)]
+    let physical = publish::resolve(path);
+    #[cfg(windows)]
+    let path_physical: &Path = &physical;
+    #[cfg(not(windows))]
+    let path_physical: &Path = path;
+    std::fs::remove_file(path_physical)?;
+    #[cfg(windows)]
+    publish::forget(path);
     #[cfg(feature = "dst")]
     push(Op::Unlink { path: path.to_path_buf() });
     Ok(())
