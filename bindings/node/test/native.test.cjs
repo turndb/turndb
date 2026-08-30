@@ -352,17 +352,28 @@ test('bounds aggregate SQL reservations across a store and its snapshots', async
   );
 });
 
-test('refuses a missing native artifact instead of silently loading WASM', () => {
+test('refuses a missing native artifact instead of silently loading WASM', (t) => {
+  // The condition under test is "no artifact resolvable". Establish it rather than inherit it:
+  // the loader is copied alone into a directory outside this tree, so neither a `.node` beside it
+  // nor `node_modules/@turndb/native-linux-x64-gnu` above it can exist. Running `require('.')`
+  // from the package directory asserted only that nobody had installed the optional dependency,
+  // which stopped being true the day 0.1.2 was published (#102).
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-no-artifact-'));
+  t.after(() => fs.rmSync(isolated, { recursive: true, force: true }));
+  fs.copyFileSync(path.resolve(__dirname, '..', 'index.cjs'), path.join(isolated, 'index.cjs'));
   const env = { ...process.env };
   delete env.TURNDB_NATIVE_PATH;
+  delete env.NODE_PATH;
   assert.throws(
-    () => child.execFileSync(process.execPath, ['-e', 'require(".")'], {
-      cwd: path.resolve(__dirname, '..'),
+    () => child.execFileSync(process.execPath, ['-e', 'require("./index.cjs")'], {
+      cwd: isolated,
       env,
       stdio: 'pipe',
     }),
     (error) => {
-      assert.match(error.stderr.toString(), /does not silently fall back/);
+      const stderr = error.stderr.toString();
+      assert.match(stderr, /does not silently fall back/);
+      assert.match(stderr, /Optional package: @turndb\/native-linux-x64-gnu/);
       return true;
     }
   );
