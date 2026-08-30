@@ -57,7 +57,7 @@ impl Spool {
     ) -> Result<Vec<u8>> {
         read_limits.admit_decoded(format!("new part section {section:?}"), self.len)?;
         self.w.flush()?;
-        let b = std::fs::read(&self.path)?;
+        let b = crate::vfs::read_file(&self.path)?;
         let _ = crate::vfs::unlink(&self.path);
         Ok(b)
     }

@@ -60,18 +60,122 @@ enum Kind {
     Dir,
 }
 
+/// Which platform's DOCUMENTED durability rules the crash states are derived under. Both models
+/// run on every platform: a recorded op log is the same shape everywhere (Windows records
+/// `SyncDir` where it publishes pending names), so the Windows proof is deterministic on Linux
+/// and the POSIX proof runs on Windows.
+///
+/// **Posix** — strict: a write is volatile until its file's fsync; a created, renamed or unlinked
+/// NAME is volatile until its parent directory's fsync.
+///
+/// **Windows** — built from documented operations only, nothing inferred (obj-mtfoklqo-c ruling):
+///   * there is no directory fsync; `SyncDir` is the point where the engine publishes every file
+///     it created in that directory with `MoveFileExW(MOVEFILE_WRITE_THROUGH)` (src/vfs.rs), and
+///     the model treats it as exactly those renames — a create is otherwise never durable;
+///   * a rename is durable when the call returns (write-through), and a crash *during* it admits
+///     old, new, or NEITHER, because Microsoft documents what a successful call did and nothing
+///     about the crash state — `crash_states` below adds the neither state at every rename and
+///     at every publish;
+///   * an unlink has no write-through form and is never durable in the model: a deleted name may
+///     be back after a crash, and stays back until a later rename or publish takes the name;
+///   * a directory or a hard link is created at its name and never published — the engine
+///     publishes files only — so in the model neither is ever durable (a laggable name);
+///   * `SyncFile` on a file makes that file's own bytes and length durable and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Model {
+    Posix,
+    Windows,
+}
+
+const MODELS: &[Model] = &[Model::Posix, Model::Windows];
+
 /// The whole tree: an inode table plus TWO namespaces. `volatile` is what a process sees;
-/// `durable` is what survives a strict-POSIX power loss — names only move between them at their
-/// parent directory's fsync.
-#[derive(Clone, Default)]
+/// `durable` is what survives a power loss under the model — names move between them at the
+/// parent directory's fsync (Posix) or at write-through renames and publishes (Windows).
+#[derive(Clone)]
 struct Fs {
+    model: Model,
     inodes: Vec<Inode>,
     kinds: Vec<Kind>,
     volatile_ns: BTreeMap<PathBuf, usize>,
     durable_ns: BTreeMap<PathBuf, usize>,
+    /// Windows only: names created (file, dir, link) and not yet published, in creation order.
+    pending: Vec<PathBuf>,
 }
 
 impl Fs {
+    fn new(model: Model) -> Fs {
+        Fs {
+            model,
+            inodes: Vec::new(),
+            kinds: Vec::new(),
+            volatile_ns: BTreeMap::new(),
+            durable_ns: BTreeMap::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn windows(&self) -> bool {
+        self.model == Model::Windows
+    }
+
+    /// Names directly inside `dir` awaiting publication, in creation order (Windows).
+    fn pending_in(&self, dir: &Path) -> Vec<PathBuf> {
+        self.pending.iter().filter(|p| p.parent() == Some(dir)).cloned().collect()
+    }
+
+    /// Publish one pending name: its dirent is now on disk (write-through rename returned).
+    fn publish(&mut self, path: &Path) {
+        if let Some(&i) = self.volatile_ns.get(path) {
+            self.durable_ns.insert(path.to_path_buf(), i);
+        }
+        self.pending.retain(|p| p != path);
+    }
+
+    /// Erase every trace of `path` (and, for a directory, everything under it) from both
+    /// namespaces: the "neither" state of a rename or publish that was in flight.
+    fn vanish(&mut self, path: &Path) {
+        for ns in [&mut self.volatile_ns, &mut self.durable_ns] {
+            let doomed: Vec<PathBuf> = ns.keys().filter(|p| p.starts_with(path)).cloned().collect();
+            for p in doomed {
+                ns.remove(&p);
+            }
+        }
+        self.pending.retain(|p| !p.starts_with(path));
+    }
+
+    /// The crash states reachable when the crash lands ON `next` rather than before it. Every
+    /// model has the "before" state (the prefix already applied). The Windows model adds, for a
+    /// rename, the state where neither name exists; for a publish (`SyncDir`), one state per
+    /// pending file where the files before it were published and that one is gone.
+    fn crash_states(&self, next: Option<&Op>) -> Vec<(Fs, String)> {
+        let mut out = vec![(self.clone(), String::new())];
+        if !self.windows() {
+            return out;
+        }
+        match next {
+            Some(Op::Rename { from, to }) => {
+                let mut fs = self.clone();
+                fs.vanish(from);
+                fs.vanish(to);
+                out.push((fs, format!("rename-neither {}", short_name(to))));
+            }
+            Some(Op::SyncDir { path }) => {
+                let due = self.pending_in(path);
+                for (j, victim) in due.iter().enumerate() {
+                    let mut fs = self.clone();
+                    for p in &due[..j] {
+                        fs.publish(p);
+                    }
+                    fs.vanish(victim);
+                    out.push((fs, format!("publish-neither {}", short_name(victim))));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
     fn new_inode(&mut self, kind: Kind) -> usize {
         self.inodes.push(Inode::default());
         self.kinds.push(kind);
@@ -117,15 +221,40 @@ impl Fs {
     fn apply(&mut self, op: &Op) {
         match op {
             Op::Create { path } => {
-                let i = self.new_inode(Kind::File);
-                self.volatile_ns.insert(path.clone(), i);
+                // `File::create` on a name that already exists truncates THAT file in place:
+                // the same inode, its name as durable as it was, only its bytes volatile until
+                // its fsync — on every platform, and on Windows without entering `pending`
+                // (vfs::create registers only a genuinely new name). A new name is a new inode,
+                // volatile until its directory's fsync (Posix) or its publish (Windows).
+                if let Some(&i) = self.volatile_ns.get(path) {
+                    let node = &mut self.inodes[i];
+                    node.volatile.clear();
+                    node.pending.push((u64::MAX, Vec::new()));
+                } else {
+                    let i = self.new_inode(Kind::File);
+                    self.volatile_ns.insert(path.clone(), i);
+                    if self.windows() {
+                        self.pending.push(path.clone());
+                    }
+                }
             }
             Op::WriteFile { path, data } => {
-                let i = self.new_inode(Kind::File);
-                self.volatile_ns.insert(path.clone(), i);
-                let node = &mut self.inodes[i];
-                node.pending.push((0, data.clone()));
-                node.volatile = data.clone();
+                // `std::fs::write` likewise: an existing name is rewritten in place (modelled as
+                // a rewrite to this image, like truncation); a new name is a new inode.
+                if let Some(&i) = self.volatile_ns.get(path) {
+                    let node = &mut self.inodes[i];
+                    node.volatile = data.clone();
+                    node.pending.push((u64::MAX, data.clone()));
+                } else {
+                    let i = self.new_inode(Kind::File);
+                    self.volatile_ns.insert(path.clone(), i);
+                    let node = &mut self.inodes[i];
+                    node.pending.push((0, data.clone()));
+                    node.volatile = data.clone();
+                    if self.windows() {
+                        self.pending.push(path.clone());
+                    }
+                }
             }
             Op::WriteAt { path, off, data } => {
                 let i = self.touch(path);
@@ -162,6 +291,14 @@ impl Fs {
                     let node = &mut self.inodes[i];
                     node.durable = node.volatile.clone();
                     node.pending.clear();
+                }
+            }
+            Op::SyncDir { path } if self.windows() => {
+                // Windows: no directory fsync exists; this is the engine publishing each pending
+                // name in `path` with a write-through rename. Only those names become durable —
+                // not unlinks, and not anything else in the directory.
+                for p in self.pending_in(path) {
+                    self.publish(&p);
                 }
             }
             Op::SyncDir { path } => {
@@ -209,15 +346,29 @@ impl Fs {
                         rebase(&mut self.durable_ns);
                     }
                     self.volatile_ns.insert(to.clone(), i);
+                    if self.windows() {
+                        // Write-through: the new name is on disk when the call returns, and the
+                        // old one is gone from disk with it. A pending source is published by
+                        // being renamed.
+                        self.durable_ns.remove(from);
+                        self.durable_ns.insert(to.clone(), i);
+                        self.pending.retain(|p| p != from);
+                    }
                 }
             }
             Op::Link { from, to } => {
+                // Windows: never published by the engine, so never durable in the model.
                 if let Some(&i) = self.volatile_ns.get(from) {
                     self.volatile_ns.insert(to.clone(), i);
                 }
             }
             Op::Unlink { path } => {
                 self.volatile_ns.remove(path);
+                // Windows: DeleteFile has no write-through form, so the durable name stays until
+                // something else takes it. An unpublished temp that is deleted simply never was.
+                if self.windows() {
+                    self.pending.retain(|p| p != path);
+                }
             }
             Op::Mkdir { path } => {
                 // create_dir_all: every missing ancestor
@@ -228,6 +379,8 @@ impl Fs {
                     }
                     stack.push(p);
                 }
+                // Windows: a directory is created at its name and never published (the engine
+                // publishes files only), so its name is never durable in the model.
                 for p in stack.into_iter().rev() {
                     if !self.volatile_ns.contains_key(&p) {
                         let i = self.new_inode(Kind::Dir);
@@ -385,6 +538,61 @@ fn materialize(fs: &Fs, variant: Variant, root: &Path, out: &Path) -> bool {
         }
     }
     wrote
+}
+
+/// The model follows the implementation's existing-name branch: creating or rewriting a name
+/// that already exists changes that inode's bytes in place — durable bytes and the durable
+/// name untouched until the file's own fsync — and, on Windows, never enters `pending`, so a
+/// crash on the directory sync has no publish-neither state for it.
+#[test]
+fn the_model_treats_create_and_write_on_an_existing_name_as_in_place_content_changes() {
+    for &model in MODELS {
+        let root = PathBuf::from("/m");
+        let name = root.join("existing");
+        let mut fs = Fs::new(model);
+        // Seed: a durable directory and a durable file with old bytes.
+        let d = fs.new_inode(Kind::Dir);
+        fs.volatile_ns.insert(root.clone(), d);
+        fs.durable_ns.insert(root.clone(), d);
+        let i = fs.new_inode(Kind::File);
+        fs.inodes[i].durable = b"old bytes".to_vec();
+        fs.inodes[i].volatile = b"old bytes".to_vec();
+        fs.volatile_ns.insert(name.clone(), i);
+        fs.durable_ns.insert(name.clone(), i);
+
+        // Create (truncate) then write: same inode, durable untouched, nothing pending.
+        fs.apply(&Op::Create { path: name.clone() });
+        fs.apply(&Op::WriteAt { path: name.clone(), off: 0, data: b"new".to_vec() });
+        assert_eq!(fs.volatile_ns[&name], i, "{model:?}: the same inode");
+        assert_eq!(fs.inodes[i].durable, b"old bytes", "{model:?}: durable bytes unchanged");
+        assert_eq!(fs.inodes[i].volatile, b"new", "{model:?}: volatile bytes truncated+written");
+        assert_eq!(fs.durable_ns.get(&name), Some(&i), "{model:?}: the name stays durable");
+        assert!(fs.pending.is_empty(), "{model:?}: an existing name never enters pending");
+        // A crash on the directory sync has no publish-neither state for it.
+        let states = fs.crash_states(Some(&Op::SyncDir { path: root.clone() }));
+        assert_eq!(
+            states.len(),
+            1,
+            "{model:?}: {:?}",
+            states.iter().map(|(_, l)| l).collect::<Vec<_>>()
+        );
+        // After the file's fsync the bytes are durable; the name never changed.
+        fs.apply(&Op::SyncFile { path: name.clone() });
+        assert_eq!(fs.inodes[i].durable, b"new", "{model:?}");
+        assert_eq!(fs.durable_ns.get(&name), Some(&i), "{model:?}");
+        // WriteFile on the existing name: also in place.
+        fs.apply(&Op::WriteFile { path: name.clone(), data: b"rewritten".to_vec() });
+        assert_eq!(fs.volatile_ns[&name], i, "{model:?}");
+        assert_eq!(fs.inodes[i].durable, b"new", "{model:?}: durable until fsync");
+        assert!(fs.pending.is_empty(), "{model:?}");
+        // A NEW name behaves as before: new inode; pending on Windows; publish-neither exists.
+        let fresh = root.join("fresh");
+        fs.apply(&Op::Create { path: fresh.clone() });
+        assert_ne!(fs.volatile_ns[&fresh], i);
+        assert_eq!(fs.durable_ns.get(&fresh), None, "{model:?}: not durable before a barrier");
+        let states = fs.crash_states(Some(&Op::SyncDir { path: root.clone() }));
+        assert_eq!(states.len(), if model == Model::Windows { 2 } else { 1 }, "{model:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -586,37 +794,49 @@ fn every_crash_state_recovers_to_an_acked_consistent_store() {
 
     let stage = root.join("stage");
     let mut checked = 0usize;
-    for k in 0..=ops.len() {
-        // The ack floor: the largest issued prefix whose sync completed within the op prefix.
-        // Recovery may sit ANYWHERE at or beyond it (later writes were issued, just not acked),
-        // but always at a group boundary and always exactly a prefix — no holes, no reordering.
-        let floor: usize = acks.iter().rev().find(|(n, _)| *n <= k).map(|(_, p)| *p).unwrap_or(0);
+    for &model in MODELS {
+        for k in 0..=ops.len() {
+            // The ack floor: the largest issued prefix whose sync completed within the op
+            // prefix. Recovery may sit ANYWHERE at or beyond it (later writes were issued, just
+            // not acked), but always at a group boundary and always exactly a prefix — no holes,
+            // no reordering.
+            let floor: usize =
+                acks.iter().rev().find(|(n, _)| *n <= k).map(|(_, p)| *p).unwrap_or(0);
 
-        let mut fs = Fs::default();
-        for op in &ops[..k] {
-            fs.apply(op);
-        }
-
-        for &variant in VARIANTS {
-            if !materialize(&fs, variant, &work, &stage) {
-                continue; // nothing durable yet — an empty directory is a new store, not a crash
+            let mut fs = Fs::new(model);
+            for op in &ops[..k] {
+                fs.apply(op);
             }
-            let r = catch_unwind(AssertUnwindSafe(|| {
-                check_state(&stage, &issued, &boundaries, floor, k, variant)
-            }));
-            if r.is_err() {
-                eprintln!("--- op trace up to crash point {k} ---");
-                for (i, op) in ops[..k].iter().enumerate() {
-                    eprintln!("{i:4}: {}", op_summary(op));
+
+            for (fs, label) in fs.crash_states(ops.get(k)) {
+                for &variant in VARIANTS {
+                    if !materialize(&fs, variant, &work, &stage) {
+                        continue; // nothing durable yet — an empty directory is a new store
+                    }
+                    let r = catch_unwind(AssertUnwindSafe(|| {
+                        check_state(&stage, &issued, &boundaries, floor, k, variant)
+                    }));
+                    if r.is_err() {
+                        eprintln!("--- {model:?} {label}: op trace up to crash point {k} ---");
+                        for (i, op) in ops[..k].iter().enumerate() {
+                            eprintln!("{i:4}: {}", op_summary(op));
+                        }
+                        panic!(
+                            "FAILED under {model:?} {label} at crash point {k} variant {variant:?}"
+                        );
+                    }
+                    checked += 1;
                 }
-                panic!("FAILED at crash point {k} variant {variant:?}");
             }
-            checked += 1;
         }
     }
     assert!(checked > 0);
-    println!("dst: {} crash states checked across {} ops", checked, ops.len());
+    println!("dst: {} crash states checked across {} ops, both models", checked, ops.len());
     std::fs::remove_dir_all(&root).ok();
+}
+
+fn short_name(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
 }
 
 fn op_summary(op: &Op) -> String {
@@ -744,22 +964,32 @@ fn replay_recorded(
     mut check: impl FnMut(&Path, usize, Variant),
 ) -> usize {
     let mut checked = 0usize;
-    for k in 0..=ops.len() {
-        let mut fs = base.clone();
-        for op in &ops[..k] {
-            fs.apply(op);
-        }
-        for &variant in VARIANTS {
-            materialize(&fs, variant, root, stage);
-            let r = catch_unwind(AssertUnwindSafe(|| check(stage, k, variant)));
-            if r.is_err() {
-                eprintln!("--- {tag}: op trace up to crash point {k} ---");
-                for (i, op) in ops[..k].iter().enumerate() {
-                    eprintln!("{i:4}: {}", op_summary(op));
-                }
-                panic!("{tag}: FAILED at crash point {k} variant {variant:?}");
+    for &model in MODELS {
+        for k in 0..=ops.len() {
+            let mut fs = base.clone();
+            fs.model = model;
+            for op in &ops[..k] {
+                fs.apply(op);
             }
-            checked += 1;
+            for (fs, label) in fs.crash_states(ops.get(k)) {
+                for &variant in VARIANTS {
+                    materialize(&fs, variant, root, stage);
+                    let r = catch_unwind(AssertUnwindSafe(|| check(stage, k, variant)));
+                    if r.is_err() {
+                        eprintln!(
+                            "--- {tag} {model:?} {label}: op trace up to crash point {k} ---"
+                        );
+                        for (i, op) in ops[..k].iter().enumerate() {
+                            eprintln!("{i:4}: {}", op_summary(op));
+                        }
+                        panic!(
+                            "{tag}: FAILED under {model:?} {label} at crash point {k} \
+                             variant {variant:?}"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
         }
     }
     checked
@@ -913,7 +1143,7 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
     let want = build_settled_file_store(&file, cfg, 200);
 
     let out = root.join("backup.turndb");
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     {
@@ -998,7 +1228,7 @@ fn every_restore_crash_leaves_the_destination_all_or_nothing() {
     std::fs::remove_dir_all(&srcroot).ok();
 
     let dest = root.join("restored.turndb");
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     turndb::store::restore_file(&origin, &dest).unwrap();
@@ -1090,7 +1320,7 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
     };
     let want = per_commit[1].clone(); // the state commit 2 acknowledged
 
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     let report = turndb::store::recover_manifest_file(
@@ -1212,7 +1442,7 @@ fn every_punch_crash_leaves_declared_blocks_retryable() {
         s.flush().unwrap();
         s.close().unwrap();
     }
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     let stats = {
@@ -1294,7 +1524,7 @@ fn every_format_migration_crash_preserves_contents_and_resumes() {
     let want: [(&str, &[u8]); 2] =
         [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
 
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     {
@@ -1391,7 +1621,7 @@ fn every_conversion_crash_is_recovered_by_rerunning_the_conversion() {
     let cfg = FoldCfg::default();
     let container = root.join("state.turndb");
 
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     turndb::store::convert_to_file(&work, &container).unwrap();
@@ -1481,7 +1711,7 @@ fn every_single_file_session_crash_keeps_every_acknowledged_write() {
     assert!(!wal_of(&file).exists(), "a clean close leaves only the file");
 
     let mut acked = before.clone();
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     {
@@ -1596,7 +1826,7 @@ fn every_single_file_merge_crash_answers_identically() {
             .collect()
     };
 
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     {
@@ -1669,7 +1899,7 @@ fn every_single_file_erase_crash_answers_honestly() {
         s.close().unwrap();
     }
 
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     {
@@ -1765,7 +1995,7 @@ fn every_single_file_punch_crash_disturbs_nothing() {
         s.close().unwrap();
     }
 
-    let mut base = Fs::default();
+    let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
     {

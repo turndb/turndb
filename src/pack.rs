@@ -136,7 +136,8 @@ impl Pack {
     ) -> Result<Pack> {
         let limits = limits.validate()?;
         control.check("backup validation")?;
-        let f = File::open(path).with_context(|| format!("open pack {}", path.display()))?;
+        let f =
+            crate::vfs::open_read(path).with_context(|| format!("open pack {}", path.display()))?;
         let len = f.metadata()?.len();
         if len < FOOTER_LEN {
             bail!("pack of {len} bytes is too short to hold a footer");

@@ -44,7 +44,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -641,7 +640,7 @@ fn valid_blake3_hex(value: &str) -> bool {
 /// Read the one small authoritative file through a hard allocation boundary. Metadata is checked
 /// first for the common/sparse-file case and `take(max + 1)` closes a concurrent-growth race.
 pub(crate) fn read_manifest_file(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path)?;
+    let file = crate::vfs::open_read(path)?;
     let announced = file.metadata()?.len();
     if announced > MAX_MANIFEST_BYTES {
         bail!(
@@ -828,6 +827,12 @@ impl Manifest {
             crate::vfs::write_all_at(&f, &p, &bytes, 0)?;
             crate::vfs::sync_file(&f, &p)?;
         }
+        // The retained copy's NAME is made durable before the live name is touched. On Windows
+        // the replace-rename below can leave neither the old nor the new `MANIFEST` after a crash
+        // (tests/dst.rs, `rename-neither`), and the copy published here is then the manifest a
+        // recovery promotes. One directory fsync per commit on POSIX, in a layout that is
+        // convert-only.
+        crate::vfs::sync_dir(dir)?;
         let tmp = dir.join("MANIFEST.tmp");
         let f = crate::vfs::create(&tmp)?;
         crate::vfs::write_all_at(&f, &tmp, &bytes, 0)?;
@@ -1307,7 +1312,7 @@ pub fn single_file_kind(path: &Path) -> Option<SingleFileKind> {
     if !path.is_file() {
         return None;
     }
-    let f = std::fs::File::open(path).ok()?;
+    let f = crate::vfs::open_read(path).ok()?;
     let len = f.metadata().ok()?.len();
 
     let mut magic = [0u8; 8];
@@ -2123,7 +2128,7 @@ fn hash_file_with_control(
 ) -> Result<blake3::Hash> {
     use std::io::Read;
 
-    let mut file = File::open(path)?;
+    let mut file = crate::vfs::open_read(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -2135,6 +2140,153 @@ fn hash_file_with_control(
         hasher.update(&buf[..read]);
     }
     Ok(hasher.finalize())
+}
+
+/// Promote retained `commit` to the live `MANIFEST` of a directory-layout store, but only after
+/// validating the candidate whole — the same bar as [`recover_manifest_file`]'s candidates, on
+/// files instead of container members. Used by open when the live manifest is absent beside a
+/// commit log; the caller has already established that shape.
+fn promote_newest_retained_if_whole(
+    dir: &Path,
+    cfg: FoldCfg,
+    commit: u64,
+    read_limits: ReadLimits,
+) -> Result<()> {
+    let bytes = read_manifest_file(&retained_path(dir, commit))?;
+    let manifest = Manifest::parse(&bytes)?;
+    if manifest.commit != commit {
+        bail!(
+            "retained copy {} carries commit {}, not the commit its name claims",
+            retained_path(dir, commit).display(),
+            manifest.commit
+        );
+    }
+    let control = crate::control::OperationControl::default();
+    validate_recovery_candidate_dir(dir, cfg, manifest, read_limits, &control)?;
+    promote_manifest_with_limits(dir, commit, &bytes, read_limits)
+}
+
+/// [`validate_recovery_candidate_container`] for the directory layout: the candidate's fold,
+/// bounded at its tail and scrubbed; every part it names, by digest where recorded and by
+/// section checksums always; then every record it serves, reconstructed byte for byte.
+fn validate_recovery_candidate_dir(
+    dir: &Path,
+    cfg: FoldCfg,
+    manifest: Manifest,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<RecoveryReport> {
+    control.check("manifest recovery validation")?;
+    let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
+    let tail = manifest.fold_tail();
+    let mut segs = Vec::new();
+    let mut dict_files = Vec::new();
+    let mut entries = 0u64;
+    for entry in std::fs::read_dir(&fold_dir).with_context(|| {
+        format!("candidate commit {} names fold {}", manifest.commit, fold_dir.display())
+    })? {
+        control.check("manifest recovery validation")?;
+        entries = entries.saturating_add(1);
+        read_limits.admit_directory_entries("candidate fold directory", entries)?;
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(n) = crate::fold::segment::parse_seg_name(&name) {
+            let file = crate::vfs::open_read(&entry.path())?;
+            let full_len = crate::readat::ReadAt::len(&file)?;
+            let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
+                Some(t) if n > t.seg => continue,
+                Some(t) if n == t.seg => (
+                    Arc::new(crate::readat::Slice::new(file, 0, u64::from(t.off))),
+                    u64::from(t.off),
+                    u64::from(t.off) == full_len,
+                ),
+                _ => (Arc::new(file), full_len, true),
+            };
+            segs.push(crate::fold::SegmentInput {
+                seg: n,
+                reader,
+                sidecar: if whole {
+                    read_bounded(
+                        &fold_dir.join(format!("seg-{n:08}.dir")),
+                        crate::fold::segment::max_dir_sidecar_bytes(len)
+                            .min(read_limits.max_stored_frame_bytes),
+                    )
+                    .ok()
+                } else {
+                    None
+                },
+            });
+        } else if name.starts_with("zdict-") && name.ends_with(".zd") {
+            dict_files.push(read_bounded(&entry.path(), crate::fold::MAX_DICTIONARY_BYTES)?);
+        }
+    }
+    let fold = Fold::open_read_from_with_limits(
+        segs,
+        dict_files,
+        cfg,
+        &fold_dir,
+        &manifest.punched,
+        read_limits,
+    )?;
+    let scrub = fold.scrub_with_control(control)?;
+    let pcache = SectionCache::shared();
+    let mut parts = Vec::with_capacity(manifest.parts.len());
+    let mut part_sections = 0usize;
+    for part_ref in &manifest.parts {
+        control.check("manifest recovery validation")?;
+        let path = dir.join(&part_ref.file);
+        if !path.is_file() {
+            bail!(
+                "candidate commit {} names part {} but the directory does not hold it",
+                manifest.commit,
+                part_ref.file
+            );
+        }
+        if let Some(want) = &part_ref.b3 {
+            let got = hash_file_with_control(&path, control, "manifest recovery validation")?
+                .to_hex()
+                .to_string();
+            if &got != want {
+                bail!(
+                    "candidate commit {} names part {} with the wrong digest",
+                    manifest.commit,
+                    part_ref.file
+                );
+            }
+        }
+        let part = Arc::new(Part::open_in_with_limits(&path, pcache.clone(), read_limits)?);
+        part_sections += part.verify_sections_with_control(control)?;
+        parts.push(part);
+    }
+    let reader = ReadStore { fold: Arc::new(fold), parts, manifest, read_limits };
+    let (records, content_values) = validate_candidate_records(&reader, control)?;
+    Ok(RecoveryReport {
+        records,
+        content_values,
+        parts: reader.parts.len(),
+        part_sections,
+        fold_segments: scrub.segments,
+        fold_blocks: scrub.blocks,
+        fold_bytes: scrub.bytes,
+        ..RecoveryReport::default()
+    })
+}
+
+/// Read a whole small file, refusing one larger than `max` rather than allocating for it.
+fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = crate::vfs::open_read(path)?;
+    let announced = file.metadata()?.len();
+    if announced > max {
+        bail!("{} is {announced} bytes, over the {max}-byte limit", path.display());
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(announced as usize).context("reserve read buffer")?;
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        bail!("{} grew past the {max}-byte limit while reading", path.display());
+    }
+    Ok(bytes)
 }
 
 fn promote_manifest_with_limits(
@@ -2230,7 +2382,7 @@ pub fn restore_file_with_control(
     {
         use std::io::Read;
         let mut from =
-            std::fs::File::open(src).with_context(|| format!("open backup {}", src.display()))?;
+            crate::vfs::open_read(src).with_context(|| format!("open backup {}", src.display()))?;
         let to = crate::vfs::create(&staging)
             .with_context(|| format!("stage restore at {}", staging.display()))?;
         let mut buf = vec![0u8; 1 << 20];
@@ -2888,7 +3040,8 @@ impl Store {
                 // missing-manifest shape means a manifest that once existed is gone, and stays a
                 // refusal. Found by the DST harness at the first flush's commit window.
                 let retained = list_retained_with_limits(dir, read_limits)?;
-                if !dir.join("MANIFEST").exists() && retained == [1] {
+                let live_absent = !crate::vfs::exists(&dir.join("MANIFEST"));
+                if live_absent && retained == [1] {
                     if load_retained(dir, 1).is_ok() {
                         complete_first_commit_with_limits(dir, read_limits)?;
                     } else {
@@ -2899,6 +3052,34 @@ impl Store {
                         "open committed manifest",
                         Manifest::load_with_limits(dir, read_limits),
                     )?
+                } else if live_absent && !retained.is_empty() {
+                    // The one other legitimate shape: a crash INSIDE the manifest publish on a
+                    // platform whose replace-rename can leave neither the old name nor the new
+                    // (Windows; tests/dst.rs `rename-neither`). The commit protocol publishes
+                    // `MANIFEST.<commit>` before it touches the live name, so the newest retained
+                    // copy IS the manifest that was being published — but only if it validates
+                    // whole: the manifest, its fold at the candidate's tail, every part it names
+                    // by digest and section, and every record it serves. Anything less stays the
+                    // refusal below; an absent live manifest beside a damaged newest copy is a
+                    // damaged store, and rolling back to an older copy is an operator's decision
+                    // (`recover`), never an open's.
+                    let newest = *retained.last().expect("non-empty");
+                    match promote_newest_retained_if_whole(dir, cfg, newest, read_limits) {
+                        Ok(()) => verification_integrity(
+                            "open committed manifest",
+                            Manifest::load_with_limits(dir, read_limits),
+                        )?,
+                        Err(why) => {
+                            return verification_integrity(
+                                "open committed manifest",
+                                Err(e.context(format!(
+                                    "MANIFEST is absent and the newest retained copy \
+                                     (commit {newest}) does not validate whole, so it was not \
+                                     promoted: {why:#}"
+                                ))),
+                            );
+                        }
+                    }
                 } else {
                     return verification_integrity("open committed manifest", Err(e));
                 }
@@ -3080,7 +3261,7 @@ impl Store {
     /// member's logical length in a single-file one.
     fn part_file_bytes(&self, file: &str) -> Result<u64> {
         match &self.home {
-            Home::Dir(dir) => Ok(std::fs::metadata(dir.join(file))
+            Home::Dir(dir) => Ok(crate::vfs::metadata(&dir.join(file))
                 .with_context(|| format!("measure live part {file}"))?
                 .len()),
             Home::File { container, .. } => container
@@ -6298,6 +6479,84 @@ pub fn looks_like_store(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Build a directory-layout store with two commits and close it: `MANIFEST`,
+    /// `MANIFEST.00000001`, `MANIFEST.00000002`, one part per commit.
+    fn two_commit_dir_store(tag: &str) -> (std::path::PathBuf, crate::fold::FoldCfg) {
+        let d = std::env::temp_dir().join(format!(
+            "turndb-promote-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let cfg = crate::fold::FoldCfg::default();
+        let mut store = super::Store::open(&d, cfg).unwrap();
+        store.put("one", &[crate::store::Span::Piece(b"first commit")], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.put("two", &[crate::store::Span::Piece(b"second commit")], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+        assert!(d.join("MANIFEST").is_file());
+        assert!(super::retained_path(&d, 1).is_file() && super::retained_path(&d, 2).is_file());
+        (d, cfg)
+    }
+
+    /// The crash state a Windows replace-rename can leave: no live `MANIFEST`, a published
+    /// newest retained copy. Open promotes it and serves both commits.
+    #[test]
+    fn an_absent_manifest_beside_a_whole_newest_retained_copy_is_promoted_at_open() {
+        let (d, cfg) = two_commit_dir_store("whole");
+        std::fs::remove_file(d.join("MANIFEST")).unwrap();
+        let store = super::Store::open(&d, cfg).expect("open promotes the whole newest copy");
+        assert_eq!(store.manifest().commit, 2);
+        assert_eq!(store.reconstruct("one").unwrap().as_deref(), Some(&b"first commit"[..]));
+        assert_eq!(store.reconstruct("two").unwrap().as_deref(), Some(&b"second commit"[..]));
+        drop(store);
+        assert!(d.join("MANIFEST").is_file(), "promotion published the live name");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Absent live manifest, damaged newest retained copy: refuse. The older copy is intact,
+    /// and it must NOT be promoted — that is a rollback, an operator's decision, not an open's.
+    #[test]
+    fn an_absent_manifest_beside_a_damaged_newest_retained_copy_is_refused_not_rolled_back() {
+        let (d, cfg) = two_commit_dir_store("damaged");
+        std::fs::remove_file(d.join("MANIFEST")).unwrap();
+        let p = super::retained_path(&d, 2);
+        let mut bytes = std::fs::read(&p).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        std::fs::write(&p, &bytes).unwrap();
+        let err = match super::Store::open(&d, cfg) {
+            Ok(_) => panic!("a damaged newest copy must not be promoted"),
+            Err(e) => e,
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("does not validate whole"), "{text}");
+        assert!(!d.join("MANIFEST").exists(), "nothing was published: {text}");
+        assert!(super::retained_path(&d, 1).is_file(), "the older copy is untouched");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Absent live manifest, newest retained copy intact but a part it names is gone: refuse.
+    /// A manifest checksum alone is not validation.
+    #[test]
+    fn an_absent_manifest_whose_newest_retained_copy_names_a_missing_part_is_refused() {
+        let (d, cfg) = two_commit_dir_store("missing-part");
+        std::fs::remove_file(d.join("MANIFEST")).unwrap();
+        let newest = super::load_retained(&d, 2).unwrap();
+        let part = newest.parts.last().expect("commit 2 wrote a part").file.clone();
+        std::fs::remove_file(d.join(&part)).unwrap();
+        let err = match super::Store::open(&d, cfg) {
+            Ok(_) => panic!("a candidate missing a part must not be promoted"),
+            Err(e) => e,
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("does not validate whole"), "{text}");
+        assert!(!d.join("MANIFEST").exists(), "nothing was published: {text}");
+        std::fs::remove_dir_all(&d).ok();
+    }
     fn manifest_bytes_with_part(file: &str) -> Vec<u8> {
         serde_json::to_vec(&super::Manifest {
             parts: vec![super::PartRef {

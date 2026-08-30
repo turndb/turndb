@@ -438,11 +438,10 @@ jobs:
   # This job runs on every event, `needs` everything, and fails unless every dependency SUCCEEDED.
   # `skipped` and `cancelled` are failures here except for cli-slices when its unconditional path
   # Windows x64: the platform floor in src/sys.rs (positioned I/O, LockFileEx, sparse punch,
-  # write-through renames) and every suite the Linux job runs except the release-profile one.
-  # The crash sweeps join this job with the Windows durability model (there is no directory
-  # fsync on this platform, so the strict-POSIX model would call every created name volatile);
-  # until then the job says so below rather than running the wrong proof. Not yet in
-  # gate.needs — that wiring lands with the cross-OS test.
+  # write-through renames) and every suite the Linux job runs except the release-profile one,
+  # plus the crash sweeps under BOTH durability models (tests/dst.rs: strict POSIX, and Windows
+  # built from documented operations only). Not yet in gate.needs — that wiring lands with the
+  # cross-OS test.
   windows:
     name: windows x64
     runs-on: windows-latest
@@ -467,8 +466,10 @@ jobs:
       - name: corruption
         run: cargo test --test corruption
 
-      - name: crash sweeps wait for the Windows durability model
-        run: echo "::notice title=DST not run on Windows yet::the strict-POSIX model has no meaning without directory fsync; the Windows model lands with the next PR and this step becomes the sweep"
+      # The crash sweeps. Here rather than nightly on purpose: on this platform the sweep is the
+      # proof, and a proof that runs once a night is not a gate.
+      - name: deterministic simulation (both models)
+        run: cargo test --features dst --test dst -- --nocapture
 
   # detector explicitly reports false. That one exception is printed, named, and checked below.
   gate:
