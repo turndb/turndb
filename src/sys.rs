@@ -47,7 +47,7 @@ pub(crate) fn allocated_bytes(_path: &Path, metadata: &std::fs::Metadata) -> Opt
 #[cfg(windows)]
 pub(crate) fn allocated_bytes(path: &Path, _metadata: &std::fs::Metadata) -> Option<u64> {
     use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
-    let wide = wide_path(path);
+    let wide = wide_path(path).ok()?;
     let mut high: u32 = 0;
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
     if low == INVALID_FILE_SIZE && io::Error::last_os_error().raw_os_error() != Some(0) {
@@ -61,13 +61,56 @@ pub(crate) fn allocated_bytes(_path: &Path, _metadata: &std::fs::Metadata) -> Op
     None
 }
 
-/// A NUL-terminated UTF-16 path for the wide Win32 entry points. Passed as given: no `\\?\`
-/// prefix is added, so these calls share the classic `MAX_PATH` limit unless the process opted
-/// out of it — the same limit `std` applies to the paths it hands these functions' callers.
+/// A NUL-terminated UTF-16 path for the wide Win32 entry points, with the long-path handling
+/// `std` applies to its own calls: a path that would exceed the classic `MAX_PATH` limit is
+/// made absolute and given the `\\?\` verbatim prefix (`\\?\UNC\` for a network path), which
+/// lifts the limit to 32,767 characters. Shorter paths are passed as given, exactly as `std`
+/// passes them.
 #[cfg(windows)]
-fn wide_path(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+
+    const MAX_PATH: usize = 260;
+    let plain: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // Room for the terminating NUL, as the Win32 limit counts it.
+    if plain.len() < MAX_PATH || plain.contains(&0) {
+        return Ok(plain.into_iter().chain(std::iter::once(0)).collect());
+    }
+    let already_verbatim = matches!(
+        path.components().next(),
+        Some(Component::Prefix(p)) if p.kind().is_verbatim()
+    );
+    if already_verbatim {
+        return Ok(plain.into_iter().chain(std::iter::once(0)).collect());
+    }
+    // Absolute and normalized (`GetFullPathNameW` underneath), because a verbatim path is taken
+    // literally: no `.`/`..` resolution and no `/` separators once the prefix is on.
+    let absolute = std::path::absolute(path)?;
+    let mut out: Vec<u16> = Vec::with_capacity(absolute.as_os_str().len() + 8);
+    let unc = matches!(
+        absolute.components().next(),
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..))
+    );
+    if unc {
+        // `\\server\share\...` becomes `\\?\UNC\server\share\...`.
+        out.extend("\\\\?\\UNC".encode_utf16());
+        let rest: Vec<u16> = absolute.as_os_str().encode_wide().skip(1).collect();
+        out.extend(rest);
+    } else {
+        out.extend("\\\\?\\".encode_utf16());
+        out.extend(absolute.as_os_str().encode_wide());
+    }
+    for c in &mut out {
+        if *c == b'/' as u16 {
+            *c = b'\\' as u16;
+        }
+    }
+    // Sanity: the result must still round-trip as an OsString; a malformed conversion is a bug
+    // here, never something to hand the OS.
+    debug_assert!(!std::ffi::OsString::from_wide(&out).is_empty());
+    out.push(0);
+    Ok(out)
 }
 
 #[cfg(unix)]
@@ -99,7 +142,7 @@ pub(crate) fn filesystem_available_bytes(path: &Path) -> io::Result<Option<u64>>
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let dir = if path.is_file() { path.parent().unwrap_or_else(|| Path::new(".")) } else { path };
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-    let wide = wide_path(dir);
+    let wide = wide_path(dir)?;
     let mut available: u64 = 0;
     let rc = unsafe {
         GetDiskFreeSpaceExW(
@@ -443,7 +486,9 @@ pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
 
 // ── Exclusive rename ──────────────────────────────────────────────────────
 
-/// Atomically rename `from` to `to` while refusing to replace any existing filesystem object.
+/// Rename `from` to `to` while refusing to replace any existing filesystem object — on Linux
+/// (`renameat2(RENAME_NOREPLACE)`) and macOS (`renamex_np(RENAME_EXCL)`) as one atomic step; the
+/// Windows form below makes no atomicity claim.
 ///
 /// This is stronger than `exists()` followed by `std::fs::rename`: ordinary POSIX rename may
 /// replace an empty directory created between those calls. Backup restoration uses this as its
@@ -495,11 +540,12 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` refuses an existing destination
 /// (`ERROR_ALREADY_EXISTS`), and `MOVEFILE_WRITE_THROUGH` makes the function "not return until
 /// the file is actually moved on the disk" — the durability a directory fsync provides on Unix
-/// and Windows has no other way to ask for.
+/// and Windows has no other way to ask for. No crash-atomicity is claimed: the proof admits
+/// source-only, destination-only, and neither.
 #[cfg(windows)]
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-    let (from, to) = (wide_path(from), wide_path(to));
+    let (from, to) = (wide_path(from)?, wide_path(to)?);
     let rc = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
     if rc == 0 {
         return Err(io::Error::last_os_error());
@@ -517,29 +563,36 @@ pub(crate) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
 
 // ── Replace rename and directory sync ─────────────────────────────────────
 //
-// On Unix these are `std::fs::rename` and an fsync of the directory: the rename is atomic, and
-// the directory fsync is what makes the new name durable. Windows has no directory fsync. What it
-// has instead is `MOVEFILE_WRITE_THROUGH`, so the rename itself is the durability barrier, and the
-// directory sync becomes a no-op. FORMAT.md, "Durability on Windows", states the model the
+// On Unix these are `std::fs::rename` — POSIX `rename(2)`, which replaces the destination as one
+// atomic step — and an fsync of the directory, which is what makes the new name durable. Windows
+// has no directory fsync. What it has instead is `MOVEFILE_WRITE_THROUGH`, so the rename itself
+// is the durability barrier on return, and the directory sync becomes a no-op. Microsoft's
+// contract for `MoveFileExW` says what a *successful* call has done and nothing about the state a
+// crash during the call can leave; the crash-safety proof therefore admits a state in which the
+// old destination is gone and the source has not landed (`RenameNeither` in tests/dst.rs), and
+// no comment in this crate calls a Windows rename atomic. FORMAT.md, "Durability on Windows", states the model the
 // crash-safety proof runs under on this platform, built from documented operations only: a name
 // is durable when the operation that produced it was write-through, and laggable otherwise.
 
-/// Atomically replace `to` with `from`, durably where the platform needs asking.
+/// Replace `to` with `from`: POSIX `rename(2)`, atomic with respect to every observer; durable
+/// once the caller syncs the directory.
 #[cfg(not(windows))]
 #[inline]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Replace `to` with `from`. On success the destination has been replaced and, because
 /// `std::fs::rename` on Windows is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` with no write-through
-/// flag (library/std/src/sys/fs/windows.rs, Rust 1.95), so the rename could be reordered behind a
-/// power loss. Add the flag: the function returns only once the move is on disk.
+/// flag (library/std/src/sys/fs/windows.rs, Rust 1.95), this adds `MOVEFILE_WRITE_THROUGH` so the
+/// function returns only once the move is on disk. That is the whole claim: what a crash during
+/// the call leaves behind is not documented, and the proof models it as old, new, or neither.
 #[cfg(windows)]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    let (from, to) = (wide_path(from), wide_path(to));
+    let (from, to) = (wide_path(from)?, wide_path(to)?);
     let rc = unsafe {
         MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
     };
@@ -582,7 +635,13 @@ mod windows_tests {
     }
 
     fn open_rw(p: &Path) -> File {
-        std::fs::OpenOptions::new().read(true).write(true).create(true).open(p).unwrap()
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(p)
+            .unwrap()
     }
 
     #[test]
@@ -691,6 +750,49 @@ mod windows_tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"a");
         assert!(!a.exists());
         let _ = std::fs::remove_file(&b);
+    }
+
+    /// Every raw call here goes through `wide_path`, so the one thing that could silently regress
+    /// against `std` is the classic 260-character limit. Build a path well past it and drive
+    /// rename, no-replace rename, free space and allocation through it.
+    #[test]
+    fn paths_past_max_path_work_for_rename_and_the_space_measurements() {
+        let mut dir = std::env::temp_dir().join(format!("turndb-long-{}", std::process::id()));
+        while dir.as_os_str().len() < 300 {
+            dir.push("a-deliberately-long-directory-component-0123456789");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.as_os_str().len() > 260);
+        let a = dir.join("a.turndb");
+        let b = dir.join("b.turndb");
+        let c = dir.join("c.turndb");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        rename_noreplace(&a, &c).expect("no-replace rename past MAX_PATH");
+        assert!(c.exists() && !a.exists());
+        rename_noreplace(&c, &b).expect_err("destination exists");
+        rename(&c, &b).expect("replace rename past MAX_PATH");
+        assert_eq!(std::fs::read(&b).unwrap(), b"a");
+        assert!(filesystem_available_bytes(&dir).unwrap().is_some());
+        assert!(filesystem_available_bytes(&b).unwrap().is_some());
+        assert_eq!(
+            allocated_bytes(&b, &std::fs::metadata(&b).unwrap()).map(|n| n >= 1),
+            Some(true)
+        );
+        // and a relative form of the same, which the verbatim conversion must absolutize
+        let cwd = std::env::current_dir().unwrap();
+        let rel = pathdiff_relative(&cwd, &b);
+        if let Some(rel) = rel {
+            assert!(filesystem_available_bytes(&rel).unwrap().is_some());
+        }
+        drop(std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("turndb-long-{}", std::process::id())),
+        ));
+    }
+
+    /// `b` relative to `base`, when `b` is under it; `None` otherwise (different drive, etc.).
+    fn pathdiff_relative(base: &Path, b: &Path) -> Option<std::path::PathBuf> {
+        b.strip_prefix(base).ok().map(Path::to_path_buf)
     }
 
     #[test]
