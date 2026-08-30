@@ -1188,20 +1188,45 @@ fn assert_directory_settled(dir: &Path, what: &str) {
         wal.push("-wal");
         known.insert(PathBuf::from(wal));
     }
-    // An artifact operation's staging file beside an ABSENT artifact (a crashed backup, restore
-    // or conversion that never published) is reported by `debris_report(<artifact>)`: the
-    // artifact's name is the staging name without its suffix.
+    // A transient beside an ABSENT store or artifact — an operation's staging file, or a Windows
+    // pending temp of any of the store's names — is reported by `debris_report(<store>)`, whose
+    // finals include the staging and reclaim names. Derive the store's name from the entry:
+    // strip a pending-publish suffix, then any staging, reclaim or sidecar suffix.
     for p in &entries {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        for suffix in [".sealing", ".restoring", ".converting"] {
-            if let Some(artifact) = name.strip_suffix(suffix) {
-                let artifact = dir.join(artifact);
-                let report = turndb::store::debris_report(&artifact).unwrap_or_else(|e| {
-                    panic!("{what}: debris_report {}: {e:#}", artifact.display())
-                });
-                for e in &report.entries {
-                    known.insert(e.path.clone());
+        let mut base = name.clone();
+        if let Some(at) = base.rfind(".publish-") {
+            let tail = &base[at + ".publish-".len()..];
+            let mut parts = tail.split('-');
+            if let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) {
+                if pid.parse::<u32>().is_ok() && n.parse::<u64>().is_ok() {
+                    base.truncate(at);
                 }
+            }
+        }
+        for suffix in [
+            ".sealing",
+            ".restoring",
+            ".converting",
+            ".reclaiming",
+            ".reclaimed",
+            ".reclaim-candidate.tmp",
+            ".reclaim-candidate",
+            "-wal",
+            "-tmp",
+            "-hot",
+        ] {
+            if let Some(b) = base.strip_suffix(suffix) {
+                base = b.to_string();
+                break;
+            }
+        }
+        if base != name && !base.is_empty() {
+            let store = dir.join(&base);
+            let report = turndb::store::debris_report(&store)
+                .unwrap_or_else(|e| panic!("{what}: debris_report {}: {e:#}", store.display()));
+            for e in &report.entries {
+                known.insert(e.path.clone());
             }
         }
     }
