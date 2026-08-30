@@ -174,13 +174,16 @@ fn run(args: &[String]) -> Result<()> {
                         "merged {} parts, {} records in, {} out ({} superseded, {} tombstones dropped)",
                         st.inputs, st.records_in, st.records_out, st.superseded, st.tombstones_dropped
                     );
-                    Ok(())
                 }
                 None => {
                     println!("nothing to merge ({n} part{})", if n == 1 { "" } else { "s" });
-                    Ok(())
                 }
             }
+            // Every writer verb closes the store it opened: close is what settles and removes the
+            // WAL sidecar, and "a cleanly closed store is exactly one file" is the README's promise
+            // (#122). Only `import` did this before.
+            s.close()?;
+            Ok(())
         }
         "punch" => {
             let mut s = open_writer(&arg(0, "STORE")?)?;
@@ -197,6 +200,7 @@ fn run(args: &[String]) -> Result<()> {
                  window, {} edge bytes await a reclaim)",
                 fp.punched_bytes, fp.punched_extents, fp.deferred_extents, fp.edge_bytes
             );
+            s.close()?;
             Ok(())
         }
         "refold" => {
@@ -211,6 +215,7 @@ fn run(args: &[String]) -> Result<()> {
                 st.bytes_reclaimed(),
                 if st.stale_generation_left { " (stale generation still on disk)" } else { "" }
             );
+            s.close()?;
             Ok(())
         }
         "recover" => {
@@ -278,6 +283,7 @@ fn run(args: &[String]) -> Result<()> {
                 st.files,
                 st.bytes
             );
+            s.close()?;
             Ok(())
         }
         "convert" => {
@@ -490,7 +496,9 @@ fn erase(store: &Path, args: &[&str]) -> Result<()> {
     let resolved_digest = h.finalize().to_hex().to_string();
 
     let stats = s.erase_ids(&ids)?;
-    drop(s);
+    // Close, not drop: close settles and removes the WAL sidecar (#122). The manifest digest below
+    // is read after the store is fully released either way.
+    s.close()?;
     let post_manifest = manifest_hex(store)?;
 
     println!(
