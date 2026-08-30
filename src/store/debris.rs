@@ -66,18 +66,26 @@ pub struct DebrisReport {
 
 // ── Grammar ────────────────────────────────────────────────────────────────
 
-/// A non-empty decimal — what `{:08}`/`{:04}` produce (minimum width) and the engine's own
-/// parsers accept.
-fn decimal(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+/// A decimal that parses as the width its producer wrote — `{:08}`/`{:04}` are MINIMUM widths,
+/// so the length is free, but the value must fit the type the engine parses it back into.
+fn decimal_u64(s: &str) -> Option<u64> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse::<u64>().ok())
+        .flatten()
 }
 
-/// `part-<seq>` or a merged `part-<lo>-<hi>`, without the `.part` suffix.
+fn decimal_u32(s: &str) -> Option<u32> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse::<u32>().ok())
+        .flatten()
+}
+
+/// `part-<seq>` or a merged `part-<lo>-<hi>` (u64 sequences), without the `.part` suffix.
 fn is_part_stem(stem: &str) -> bool {
     let Some(rest) = stem.strip_prefix("part-") else { return false };
     match rest.split_once('-') {
-        None => decimal(rest),
-        Some((lo, hi)) => decimal(lo) && decimal(hi),
+        None => decimal_u64(rest).is_some(),
+        Some((lo, hi)) => decimal_u64(lo).is_some() && decimal_u64(hi).is_some(),
     }
 }
 
@@ -86,7 +94,7 @@ pub(crate) fn is_pending_publish_of(final_name: &str, candidate: &str) -> bool {
     let Some(rest) = candidate.strip_prefix(final_name) else { return false };
     let Some(rest) = rest.strip_prefix(".publish-") else { return false };
     let mut parts = rest.split('-');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(pid), Some(n), None) if decimal(pid) && decimal(n))
+    matches!((parts.next(), parts.next(), parts.next()), (Some(pid), Some(n), None) if decimal_u64(pid).is_some() && decimal_u64(n).is_some())
 }
 
 /// The pending-publish suffix split off a candidate: `Some(final)` if `candidate` is
@@ -104,7 +112,7 @@ fn is_dir_layout_root_final(name: &str) -> bool {
         return true;
     }
     if let Some(c) = name.strip_prefix("MANIFEST.") {
-        return decimal(c);
+        return decimal_u64(c).is_some();
     }
     if let Some(stem) = name.strip_suffix(".part") {
         return is_part_stem(stem);
@@ -112,7 +120,7 @@ fn is_dir_layout_root_final(name: &str) -> bool {
     // `<part>.s<n>.tmp`
     if let Some(mid) = name.strip_suffix(".tmp") {
         if let Some((stem, s)) = mid.rsplit_once(".part.s") {
-            return is_part_stem(stem) && decimal(s);
+            return is_part_stem(stem) && decimal_u64(s).is_some();
         }
     }
     false
@@ -123,13 +131,15 @@ fn is_fold_dir_final(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("seg-") {
         for suffix in [".fold", ".dir", ".dir.tmp"] {
             if let Some(n) = rest.strip_suffix(suffix) {
-                return decimal(n);
+                return decimal_u32(n).is_some();
             }
         }
     }
+    // `zdict-<64 lowercase hex>.zd`: `PieceHash::to_hex` writes lowercase, and nothing else.
     if let Some(rest) = name.strip_prefix("zdict-") {
         if let Some(h) = rest.strip_suffix(".zd") {
-            return h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+            return h.len() == 64
+                && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         }
     }
     false
@@ -149,9 +159,15 @@ pub(crate) struct Found {
     pub is_dir: bool,
 }
 
+/// The entries of `dir`, sorted. An absent directory is an empty scan; any other read error is
+/// the scan's error — a directory that cannot be listed is not a clean one.
 fn entries_in(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return Ok(out) };
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+    };
     for e in rd {
         out.push(e.with_context(|| format!("read {}", dir.display()))?);
     }
@@ -161,7 +177,18 @@ fn entries_in(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
 
 // ── Single-file layout ─────────────────────────────────────────────────────
 
-/// The final names a single-file store's protocols publish beside `<store>`.
+/// `<final>.publish-<pid>-<n>` on OS strings: the final name's bytes exactly, then the ASCII
+/// suffix — so a store whose name is not UTF-8 is matched as faithfully as any other.
+fn is_pending_publish_of_os(final_name: &std::ffi::OsStr, candidate: &std::ffi::OsStr) -> bool {
+    let f = final_name.as_encoded_bytes();
+    let c = candidate.as_encoded_bytes();
+    let Some(rest) = c.strip_prefix(f) else { return false };
+    let Ok(rest) = std::str::from_utf8(rest) else { return false };
+    is_pending_publish_of("", rest)
+}
+
+/// The final names a single-file store's protocols publish beside `<store>`, including the
+/// artifact staging names an operation may leave with `<store>` as its destination.
 fn single_file_finals(store: &Path) -> Vec<PathBuf> {
     let names = crate::container::reclaim_names(store);
     vec![
@@ -171,6 +198,9 @@ fn single_file_finals(store: &Path) -> Vec<PathBuf> {
         names.anchor,
         names.candidate_tmp,
         names.candidate,
+        with_suffix(store, ".sealing"),
+        with_suffix(store, ".restoring"),
+        with_suffix(store, ".converting"),
     ]
 }
 
@@ -197,14 +227,18 @@ pub(crate) fn scan_single_file(store: &Path) -> Result<Vec<Found>> {
     consider(names.candidate_tmp.clone(), DebrisKind::ReclaimCandidate, false);
     consider(names.candidate.clone(), DebrisKind::ReclaimCandidate, false);
     consider(with_suffix(store, "-tmp"), DebrisKind::MergeScratch, true);
-    let finals: Vec<String> = single_file_finals(store)
+    // The store's own artifact staging: an operation whose destination was `<store>` and died
+    // before publishing. Beside a present store it is dead; beside an absent one, reported.
+    for suffix in [".sealing", ".restoring", ".converting"] {
+        consider(with_suffix(store, suffix), DebrisKind::ArtifactStaging, false);
+    }
+    let finals: Vec<std::ffi::OsString> = single_file_finals(store)
         .iter()
-        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
         .collect();
     for e in entries_in(&dir)? {
         let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if finals.iter().any(|f| is_pending_publish_of(f, name)) && e.path().is_file() {
+        if finals.iter().any(|f| is_pending_publish_of_os(f, &name)) && e.path().is_file() {
             found.push(Found { path: e.path(), kind: DebrisKind::PendingPublish, is_dir: false });
         }
     }
@@ -236,7 +270,7 @@ pub(crate) fn scan_dir_layout(dir: &Path) -> Result<Vec<Found>> {
                         continue;
                     }
                     if let Some(rest) = fname.strip_prefix("seg-") {
-                        if rest.strip_suffix(".dir.tmp").is_some_and(decimal) {
+                        if rest.strip_suffix(".dir.tmp").is_some_and(|n| decimal_u32(n).is_some()) {
                             found.push(Found {
                                 path: fe.path(),
                                 kind: DebrisKind::SegmentSidecarStaging,
@@ -261,9 +295,12 @@ pub(crate) fn scan_dir_layout(dir: &Path) -> Result<Vec<Found>> {
         }
         if name == "MANIFEST.tmp" {
             found.push(Found { path, kind: DebrisKind::ManifestStaging, is_dir: false });
-        } else if let Some(c) = name.strip_prefix("MANIFEST.").filter(|c| decimal(c)) {
-            if let (Some(live), Ok(commit)) = (live_commit, c.parse::<u64>()) {
-                if commit + (super::MANIFEST_RETAIN as u64) <= live {
+        } else if let Some(commit) = name.strip_prefix("MANIFEST.").and_then(decimal_u64) {
+            if let Some(live) = live_commit {
+                if commit
+                    .checked_add(super::MANIFEST_RETAIN as u64)
+                    .is_some_and(|edge| edge <= live)
+                {
                     found.push(Found {
                         path,
                         kind: DebrisKind::ExcessRetainedManifest,
@@ -285,31 +322,13 @@ pub(crate) fn scan_dir_layout(dir: &Path) -> Result<Vec<Found>> {
 
 // ── Artifacts ──────────────────────────────────────────────────────────────
 
-/// The pure scan beside an artifact: its operation's staging file, if a crash left one.
-pub(crate) fn scan_artifact(artifact: &Path) -> Vec<Found> {
-    let mut found = Vec::new();
-    for suffix in [".sealing", ".restoring", ".converting"] {
-        let p = with_suffix(artifact, suffix);
-        if p.is_file() {
-            found.push(Found { path: p, kind: DebrisKind::ArtifactStaging, is_dir: false });
-        }
-    }
-    found
-}
-
 // ── The public inventory and the writer's decisions ────────────────────────
 
 /// Read-only: every transient name beside `path` — a single-file store's, a directory-layout
 /// store's (when `path` is a directory), an artifact's staging file — nothing touched. What
 /// `turndb inspect` prints.
 pub fn debris_report(path: &Path) -> Result<DebrisReport> {
-    let found = if path.is_dir() {
-        scan_dir_layout(path)?
-    } else {
-        let mut f = scan_single_file(path)?;
-        f.extend(scan_artifact(path));
-        f
-    };
+    let found = if path.is_dir() { scan_dir_layout(path)? } else { scan_single_file(path)? };
     Ok(DebrisReport {
         entries: found.into_iter().map(|f| DebrisEntry { path: f.path, kind: f.kind }).collect(),
     })
@@ -441,6 +460,17 @@ mod tests {
         assert!(!is_fold_dir_final("seg-.fold"));
         assert!(!is_fold_dir_final("seg-x.fold"));
         assert!(!is_fold_dir_final("zdict-xyz.zd"));
+        // Widths: what the engine parses back, no wider.
+        assert!(!is_fold_dir_final("seg-4294967296.fold"), "u32 overflow is not a segment");
+        assert!(is_fold_dir_final("seg-4294967295.fold"));
+        assert!(!is_dir_layout_root_final("MANIFEST.18446744073709551616"), "u64 overflow");
+        assert!(is_dir_layout_root_final("MANIFEST.18446744073709551615"));
+        assert!(!is_dir_layout_root_final("part-18446744073709551616.part"));
+        assert!(
+            !is_fold_dir_final(&format!("zdict-{}.zd", "AB".repeat(32))),
+            "uppercase is not what to_hex writes"
+        );
+        assert!(!is_pending_publish_of("s", "s.publish-18446744073709551616-1"));
     }
 
     #[test]
@@ -455,9 +485,10 @@ mod tests {
         std::fs::write(d.join("s.turndb-wal.publish-4-3"), b"x").unwrap();
         std::fs::create_dir_all(d.join("s.turndb-tmp")).unwrap();
         std::fs::write(d.join("s.turndb-tmp").join("spool"), b"x").unwrap();
+        std::fs::write(d.join("s.turndb.restoring"), b"x").unwrap();
         std::fs::write(d.join("my.publish-1-1.notes"), b"mine").unwrap();
-        assert_eq!(debris_report(&store).unwrap().entries.len(), 6);
-        assert_eq!(remove_beside_present_store(&store).unwrap(), 6);
+        assert_eq!(debris_report(&store).unwrap().entries.len(), 7);
+        assert_eq!(remove_beside_present_store(&store).unwrap(), 7);
         assert_eq!(names_in(&d), vec!["my.publish-1-1.notes", "s.turndb"]);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -522,6 +553,24 @@ mod tests {
             p.set_readonly(false);
             std::fs::set_permissions(&restore, p).unwrap();
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_whose_name_is_not_utf8_has_its_pending_publish_recognised() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = scratch("nonutf8");
+        let name = std::ffi::OsStr::from_bytes(b"st\xffore.turndb");
+        let store = d.join(name);
+        std::fs::write(&store, b"store").unwrap();
+        let mut temp = store.as_os_str().to_os_string();
+        temp.push(".publish-3-1");
+        std::fs::write(&temp, b"x").unwrap();
+        let r = debris_report(&store).unwrap();
+        assert_eq!(r.entries.len(), 1, "{r:?}");
+        assert_eq!(r.entries[0].path, PathBuf::from(&temp));
+        assert_eq!(remove_beside_present_store(&store).unwrap(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -2966,8 +2966,9 @@ impl Store {
         }
         container.lock_writer()?;
         // The store is present, so it is authority: every transient name beside it — reclaim
-        // material, a Windows pending publish, a merge's scratch — is dead by the protocol and
-        // removed here; a removal that fails is carried in the report and the counters.
+        // material, a Windows pending publish, a merge's scratch, an artifact staging — is dead by
+        // the protocol and removed here, counted on success; a removal that fails is this open's
+        // error with the path and the cause (#126), and nothing is counted.
         let debris_removed = debris::remove_beside_present_store(path)?;
 
         // The manifest is a member. Missing means a new store — UNLESS retained commits exist,

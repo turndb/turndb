@@ -318,6 +318,28 @@ fn run(args: &[String]) -> Result<()> {
 }
 
 fn inspect(path: &Path) -> Result<()> {
+    // Transient names first, and without opening anything: the same recognizer a writer open
+    // runs, read-only — so debris beside an ABSENT store, or beside a directory-layout store,
+    // is still listed.
+    let debris = turndb::store::debris_report(path)?;
+    if !debris.entries.is_empty() {
+        println!(
+            "debris: {} transient file(s) beside {}; a writer open removes them when the store \
+             is present, and refuses to create a store over a pending publish or reclaim \
+             material when it is absent",
+            debris.entries.len(),
+            path.display()
+        );
+        for e in &debris.entries {
+            println!("  {}  {:?}", e.path.display(), e.kind);
+        }
+    }
+    if path.is_dir() {
+        bail!(
+            "{} is a directory: the directory layout is retired, and `convert` is its one door",
+            path.display()
+        );
+    }
     let rs = open_read(path)?;
     let m = rs.manifest();
     let c = turndb::container::Container::open(path)?;
@@ -345,19 +367,6 @@ fn inspect(path: &Path) -> Result<()> {
             "snapshots: {}",
             snaps.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
         );
-    }
-    // Transient names beside the store: the same recognizer a writer open runs, read-only here.
-    let debris = turndb::store::debris_report(path)?;
-    if !debris.entries.is_empty() {
-        println!(
-            "debris: {} transient file(s) beside the store; a writer open removes them when the \
-             store is present, and refuses to create a store over a pending publish or reclaim \
-             material when it is absent",
-            debris.entries.len()
-        );
-        for e in &debris.entries {
-            println!("  {}  {:?}", e.path.display(), e.kind);
-        }
     }
     Ok(())
 }
