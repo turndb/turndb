@@ -1124,12 +1124,26 @@ fn check_state(
 /// unexplained leave-behind, and fails.
 fn assert_directory_settled(dir: &Path, what: &str) {
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // Every entry is observed, or the state fails: a per-entry read error is not a clean
+    // directory.
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{what}: read {}: {e}", dir.display()))
-        .flatten()
-        .map(|e| e.path())
-        .collect();
+        .and_then(|rd| rd.map(|e| e.map(|e| e.path())).collect())
+        .unwrap_or_else(|e| panic!("{what}: read {}: {e}", dir.display()));
     entries.sort();
+    let refusal_kind = |kind: turndb::store::DebrisKind| {
+        matches!(
+            kind,
+            turndb::store::DebrisKind::PendingPublish
+                | turndb::store::DebrisKind::ReclaimStaging
+                | turndb::store::DebrisKind::ReclaimCandidate
+                | turndb::store::DebrisKind::LegacyHotDirectory
+        )
+    };
+    let wal_of = |base: &Path| {
+        let mut w = base.as_os_str().to_os_string();
+        w.push("-wal");
+        PathBuf::from(w)
+    };
     // Stores and artifacts: `<name>.turndb` files, and directory-layout stores.
     let mut stores: Vec<PathBuf> = Vec::new();
     let mut known: BTreeSet<PathBuf> = BTreeSet::new();
@@ -1144,32 +1158,28 @@ fn assert_directory_settled(dir: &Path, what: &str) {
     }
     for store in &stores {
         known.insert(store.clone());
+        known.insert(wal_of(store)); // a present store's sidecar: recovery input, settled by open
         let sealed = store.is_file()
             && turndb::container::Container::open(store).map(|c| c.sealed()).unwrap_or(false);
         // A directory-layout store has no public writer open (its one door is `convert`), so
-        // it gets the report-only check below; a single-file store is opened as a writer, which
-        // settles the WAL and removes dead transients — a refusal (an absent store beside a
-        // pending publish, say) is a report in its own right.
-        if !sealed && store.is_file() {
+        // it gets the report-only check below; a single-file store is opened as a writer.
+        let refused: Option<String> = if !sealed && store.is_file() {
             match Store::open_file(store, cfg) {
                 Ok(s) => {
-                    s.close().unwrap_or_else(|e| panic!("{what}: close {}: {e:#}", store.display()))
+                    s.close()
+                        .unwrap_or_else(|e| panic!("{what}: close {}: {e:#}", store.display()));
+                    None
                 }
-                Err(e) => {
-                    let text = format!("{e:#}");
-                    assert!(
-                        text.contains("not creating a new store over") || text.contains("reclaim anchor"),
-                        "{what}: writer open of {} refused for a reason that is not a debris report: {text}",
-                        store.display()
-                    );
-                }
+                Err(e) => Some(format!("{e:#}")),
             }
-        }
+        } else {
+            None
+        };
         let report = turndb::store::debris_report(store)
             .unwrap_or_else(|e| panic!("{what}: debris_report {}: {e:#}", store.display()));
-        let present = store.is_file() || store.is_dir();
-        if present && !sealed && store.is_file() {
-            assert!(
+        match (&refused, sealed || !store.is_file()) {
+            // A successful writer open removed everything the protocol proves dead.
+            (None, false) => assert!(
                 report.entries.is_empty(),
                 "{what}: transient names survived a writer open beside present {}: {:?}",
                 store.display(),
@@ -1178,20 +1188,32 @@ fn assert_directory_settled(dir: &Path, what: &str) {
                     .iter()
                     .map(|e| (e.path.display().to_string(), e.kind))
                     .collect::<Vec<_>>()
-            );
+            ),
+            // A writer refusal is a report in its own right — proven structurally: the report is
+            // non-empty, every kind is in the never-removed / refusal vocabulary, and the error
+            // names every reported path. The string alone classifies nothing.
+            (Some(text), _) => {
+                assert!(
+                    !report.entries.is_empty()
+                        && report.entries.iter().all(|e| refusal_kind(e.kind))
+                        && report.entries.iter().all(|e| text.contains(&e.path.display().to_string())),
+                    "{what}: writer open of {} refused for a reason that is not a structural debris report: {text}; report {:?}",
+                    store.display(),
+                    report.entries.iter().map(|e| (e.path.display().to_string(), e.kind)).collect::<Vec<_>>()
+                );
+            }
+            // Sealed artifacts and directory-layout stores: readers only; the report is allowed.
+            (None, true) => {}
         }
         for e in &report.entries {
-            known.insert(e.path.clone()); // reported: allowed to remain, by name
+            known.insert(e.path.clone());
         }
-        // The sidecar of a closed store is gone; of an absent store it is recovery input.
-        let mut wal = store.as_os_str().to_os_string();
-        wal.push("-wal");
-        known.insert(PathBuf::from(wal));
     }
     // A transient beside an ABSENT store or artifact — an operation's staging file, or a Windows
     // pending temp of any of the store's names — is reported by `debris_report(<store>)`, whose
     // finals include the staging and reclaim names. Derive the store's name from the entry:
-    // strip a pending-publish suffix, then any staging, reclaim or sidecar suffix.
+    // strip a pending-publish suffix, then any staging, reclaim or sidecar suffix. An absent
+    // base's exact `-wal` is recovery input and allowed, nothing suffix-wide.
     for p in &entries {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let mut base = name.clone();
@@ -1228,6 +1250,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
             for e in &report.entries {
                 known.insert(e.path.clone());
             }
+            known.insert(wal_of(&store));
         }
     }
     // Everything else in the directory must be a store's own name or reported debris.
@@ -1237,9 +1260,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
             continue;
         }
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        // Directory-layout internals live inside their store directory, which is `known`.
-        // A conversion's source directory is a store directory (opened above). Fixture inputs
-        // the sweeps place beside stores are named here explicitly.
+        // Fixture inputs the sweeps place beside stores are named here explicitly.
         let is_input = name == "pack.bin" || name.ends_with(".jsonl");
         if !is_input {
             unexplained.push(name);
