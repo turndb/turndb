@@ -81,13 +81,6 @@ mod publish {
         Some(pending.remove(at).1)
     }
 
-    /// Drop every pending entry: what a process death does. Tests use it to stand in a fresh
-    /// process and observe that unpublished temps are garbage, not recovery material.
-    #[cfg(test)]
-    pub(super) fn forget_all_for_tests() {
-        PENDING.lock().unwrap().clear();
-    }
-
     /// Publish every pending file directly inside `dir`, in registration order. Each publish is a
     /// write-through, no-replace rename; the entry is removed only once its rename returned.
     pub(super) fn publish_dir(dir: &Path) -> std::io::Result<()> {
@@ -536,8 +529,9 @@ mod windows_publish_tests {
         assert!(exists(&name));
         assert_eq!(std::io::Read::bytes(open_read(&name).unwrap()).count(), 7);
         assert_eq!(temps_beside(&name).len(), 1, "the bytes live under one temp name");
-        // A crash before sync_dir: the process is gone, the registry with it.
-        publish::forget_all_for_tests();
+        // A crash before sync_dir: the process is gone, and with it this name's registration.
+        // (Per name, not the whole registry: other tests in this process are publishing too.)
+        publish::forget(&name);
         assert!(!name.exists(), "the final name was never published");
         assert!(!exists(&name), "and nothing resolves to the temp any more");
         assert!(open_read(&name).is_err(), "a fresh process cannot read it by name");
@@ -567,7 +561,7 @@ mod windows_publish_tests {
         // Reads by name never see a temp, stale or not.
         assert_eq!(std::io::Read::bytes(open_read(&name).unwrap()).count(), 14);
         // And once published, this process's own temp is gone: only the final name is ours.
-        publish::forget_all_for_tests();
+        assert!(publish::forget(&name).is_none(), "nothing pending after a publish");
         assert!(name.exists());
         drop(f);
         let _ = std::fs::remove_dir_all(&d);
@@ -592,7 +586,7 @@ mod windows_publish_tests {
         assert_eq!(temps_beside(&b).len(), 0);
         assert_eq!(temps_beside(&a).len(), 1, "a is still pending");
         drop((fa, fb));
-        publish::forget_all_for_tests();
+        publish::forget(&a);
         let _ = std::fs::remove_dir_all(&d);
     }
 

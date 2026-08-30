@@ -1738,7 +1738,7 @@ mod compatibility_tests {
         let retain = std::collections::HashMap::new();
 
         let meta_file = build_full(&path, &records, &[], 1, 1, 3, |_| None, &retain).unwrap();
-        let file_bytes = std::fs::read(&path).unwrap();
+        let file_bytes = crate::vfs::read_file(&path).unwrap();
 
         let ct = dir.join("sink.turndb");
         let mut c = crate::container::Container::create(&ct).unwrap();

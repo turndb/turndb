@@ -408,8 +408,8 @@ mod tests {
         merge(&p1, &[a.clone(), b.clone()], 3).unwrap();
         merge(&p2, &[b, a], 3).unwrap();
         assert_eq!(
-            std::fs::read(&p1).unwrap(),
-            std::fs::read(&p2).unwrap(),
+            crate::vfs::read_file(&p1).unwrap(),
+            crate::vfs::read_file(&p2).unwrap(),
             "a merge must be a pure function of its input SET, not of argument order"
         );
         std::fs::remove_dir_all(&d).ok();
@@ -463,8 +463,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            std::fs::read(&streamed).unwrap(),
-            std::fs::read(&oracle).unwrap(),
+            crate::vfs::read_file(&streamed).unwrap(),
+            crate::vfs::read_file(&oracle).unwrap(),
             "the streaming merge must be byte-identical to the materialized algorithm"
         );
         std::fs::remove_dir_all(&d).ok();
