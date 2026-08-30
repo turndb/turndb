@@ -2198,7 +2198,13 @@ fn run_with_failed_sync<T>(
         Some(target),
         "the fault must fire at the intended attempted sync"
     );
-    assert!(guard.attempts() > target, "attempt evidence: {} attempted", guard.attempts());
+    // The failed sync is absent from the recording and every other attempted sync is present:
+    // an operation may go on syncing after the failure (a close, say), and those are real.
+    assert_eq!(
+        sync_ops(&ops),
+        guard.attempts() - 1,
+        "recorded syncs must be every attempted sync except the failed one"
+    );
     assert_eq!(
         injected_cause(&err),
         Some(target),
@@ -2269,7 +2275,6 @@ fn a_failed_directory_sync_after_container_create_is_reported_and_leaves_no_stor
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || turndb::container::Container::create(&path));
     assert!(format!("{err:#}").contains("after creating"), "{err:#}");
-    assert_eq!(sync_ops(&ops), target, "the failed sync was not recorded");
     converges("create", &base, &root, &root, &ops, |dir, what| {
         let p = dir.join("new.turndb");
         if p.exists() {
@@ -2569,7 +2574,6 @@ fn sync_failure_variant<W>(
         let mut base = Fs::new(Model::Posix);
         base.seed_durable(&root);
         let (err, ops) = run_with_failed_sync(j, || op(&root, &w));
-        assert_eq!(sync_ops(&ops), j, "{tag}: sync {j} failed, so exactly {j} syncs were recorded");
         let label = format!("{tag}: sync {j} of {syncs} failed ({})", short_err(&err));
         converges(&label, &base, &root, &root, &ops, |dir, what| check(dir, &w, what));
         std::fs::remove_dir_all(&root).ok();
@@ -3040,7 +3044,7 @@ fn run_workload_fallible(
 fn every_workload_sync_failure_is_reported_and_recovers_to_an_acked_consistent_store() {
     // Count the syncs of a clean run.
     let root = tmp("workload-syncvar-count");
-    std::fs::create_dir_all(&root.join("store")).unwrap();
+    std::fs::create_dir_all(root.join("store")).unwrap();
     let (mut issued, mut acks) = (Vec::new(), Vec::new());
     record::arm();
     run_workload_fallible(&root.join("store"), &mut issued, &mut acks).unwrap();
@@ -3057,7 +3061,6 @@ fn every_workload_sync_failure_is_reported_and_recovers_to_an_acked_consistent_s
         let base = Fs::new(Model::Posix);
         let (err, ops) =
             run_with_failed_sync(j, || run_workload_fallible(&work, &mut issued, &mut acks));
-        assert_eq!(sync_ops(&ops), j);
         let floor = acks.last().map(|(_, p)| *p).unwrap_or(0);
         let boundaries = group_boundaries(&issued);
         let label = format!("workload: sync {j} of {syncs} failed ({})", short_err(&err));
