@@ -102,9 +102,8 @@ work before it is packaging work; no dates are implied by this table.
 
 ## Phase 0: the front door tells the truth
 
-**Status: closed 2026-08-30** (obj-mtfi3akf-5; verified by a byte-for-byte run of the README quickstart
-on a clean checkout of main). Inserted ahead of every other phase because it is what a stranger meets
-first: the survey found the README's first store command failing on its bare path, `inspect` and
+**Status: closed 2026-08-30** (obj-mtfi3akf-5). Inserted ahead of every other phase because it is what
+a stranger meets first: the survey found the README's first store command failing on its bare path, `inspect` and
 `verify` then passing misleadingly on the empty store it left, the remaining four commands failing,
 and the `seal` step leaving debris beside the store. Every item below landed as its own reviewed PR:
 #128 (#121), #127 (#122), #133 (#120), #129 (#97), #131 (#102), #130 (the four document corrections),
