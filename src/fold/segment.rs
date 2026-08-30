@@ -3,7 +3,7 @@
 use super::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
 use crate::readat::ReadAt;
 use anyhow::{bail, Context, Result};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -132,16 +132,13 @@ pub fn create_flagged(dir: &Path, n: u32, dict_id: [u8; 32], flags: u32) -> Resu
 /// Read-only handle — never opens for write, so a reader cannot damage a store it does not own.
 pub fn open_read(dir: &Path, n: u32) -> Result<File> {
     let path = dir.join(seg_name(n));
-    File::open(&path).with_context(|| format!("open segment {} read-only", path.display()))
+    crate::vfs::open_read(&path)
+        .with_context(|| format!("open segment {} read-only", path.display()))
 }
 
 pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
     let path = dir.join(seg_name(n));
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open segment {}", path.display()))
+    crate::vfs::open_rw(&path).with_context(|| format!("open segment {}", path.display()))
 }
 
 /// Deallocate `len` bytes at `off` — the extents are freed and read back as zeros, and the file's
@@ -415,7 +412,7 @@ pub fn read_dir_sidecar_bytes_with_limits(
     file_len: u64,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<Option<Vec<u8>>> {
-    let file = match File::open(dir_path(dir, n)) {
+    let file = match crate::vfs::open_read(&dir_path(dir, n)) {
         Ok(file) => file,
         Err(_) => return Ok(None),
     };

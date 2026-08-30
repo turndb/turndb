@@ -28,8 +28,16 @@ mod publish {
     //! file as published / not yet / neither (tests/dst.rs).
     //!
     //! A pending file is addressed by its FINAL name everywhere above this module; the map here
-    //! resolves that name to the temporary one for the few operations that reach the file by
-    //! path before it is published (rename, unlink, reopen, existence).
+    //! resolves that name to the temporary one for every operation that reaches the file by path
+    //! before it is published — reopen for reading (`open_read`) or writing, existence, metadata,
+    //! rename, unlink.
+    //!
+    //! Crash states, exactly as the simulator models them: before the publish, the final name
+    //! does not exist and the bytes sit under a temporary name nobody will ever consult — the
+    //! same outcome an unsynced dirent has on POSIX, with the debris visible; during the publish,
+    //! old (unpublished) / new (published) / neither; after, published. A temporary name is never
+    //! promoted, never read, and never overrides a final name: it is garbage from the moment the
+    //! process that created it is gone, and a stale one beside a valid final is exactly that.
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -53,6 +61,13 @@ mod publish {
     /// Where `path` physically is right now: its temporary name while pending, itself otherwise.
     pub(super) fn resolve(path: &Path) -> PathBuf {
         PENDING.lock().unwrap().get(path).cloned().unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Drop every pending entry: what a process death does. Tests use it to stand in a fresh
+    /// process and observe that unpublished temps are garbage, not recovery material.
+    #[cfg(test)]
+    pub(super) fn forget_all_for_tests() {
+        PENDING.lock().unwrap().clear();
     }
 
     /// Forget a pending entry because the final name was consumed by a rename or unlink of the
@@ -204,6 +219,17 @@ pub(crate) fn open_rw(path: &Path) -> Result<File> {
     #[cfg(windows)]
     let path = &publish::resolve(path);
     std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(path)
+}
+
+/// Open for reading, by name — resolving a name this process created and has not yet published
+/// (Windows) to where its bytes are. Reads record nothing: a read cannot change what a crash
+/// preserves. Every read of a store file by path goes through here, not `File::open`, for
+/// exactly that reason.
+#[inline]
+pub(crate) fn open_read(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    let path = &publish::resolve(path);
+    File::open(path)
 }
 
 /// Does `path` exist as far as this writer is concerned — including a file it created and has
@@ -422,6 +448,101 @@ pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     #[cfg(feature = "dst")]
     push(Op::RemoveTree { path: path.to_path_buf() });
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_publish_tests {
+    //! The crash states of a pending publish, on the real filesystem: before the publish the
+    //! final name does not exist and the temp is garbage to any other process; a stale temp
+    //! beside a valid final is never consulted; after the publish only the final name remains.
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("turndb-publish-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn temps_beside(final_name: &Path) -> Vec<std::path::PathBuf> {
+        let stem = final_name.file_name().unwrap().to_string_lossy().to_string();
+        let mut v: Vec<_> = std::fs::read_dir(final_name.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy();
+                n.starts_with(&format!("{stem}.publish-"))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn an_unpublished_name_is_invisible_to_a_fresh_process_and_its_temp_is_garbage() {
+        let d = scratch("unpublished");
+        let name = d.join("part-00000001.part");
+        let f = create(&name).unwrap();
+        write_all_at(&f, &name, b"payload", 0).unwrap();
+        sync_file(&f, &name).unwrap();
+        // Within this process the name resolves: reads by name see the bytes.
+        assert!(exists(&name));
+        assert_eq!(std::io::Read::bytes(open_read(&name).unwrap()).count(), 7);
+        assert_eq!(temps_beside(&name).len(), 1, "the bytes live under one temp name");
+        // A crash before sync_dir: the process is gone, the registry with it.
+        publish::forget_all_for_tests();
+        assert!(!name.exists(), "the final name was never published");
+        assert!(!exists(&name), "and nothing resolves to the temp any more");
+        assert!(open_read(&name).is_err(), "a fresh process cannot read it by name");
+        assert_eq!(temps_beside(&name).len(), 1, "the temp is debris, still there, never promoted");
+        drop(f);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stale_temp_beside_a_valid_final_is_never_consulted_and_a_publish_removes_nothing_else() {
+        let d = scratch("stale");
+        let name = d.join("part-00000001.part");
+        // Debris from an earlier life: two stale temps, one of them torn.
+        std::fs::write(d.join("part-00000001.part.publish-1-0"), b"stale one").unwrap();
+        std::fs::write(d.join("part-00000001.part.publish-1-1"), b"st").unwrap();
+        // A fresh create + publish of the same final name.
+        let f = create(&name).unwrap();
+        write_all_at(&f, &name, b"the real bytes", 0).unwrap();
+        sync_file(&f, &name).unwrap();
+        sync_dir(&d).unwrap();
+        assert_eq!(std::fs::read(&name).unwrap(), b"the real bytes");
+        assert_eq!(
+            temps_beside(&name).len(),
+            2,
+            "stale temps are untouched by an unrelated publish"
+        );
+        // Reads by name never see a temp, stale or not.
+        assert_eq!(std::io::Read::bytes(open_read(&name).unwrap()).count(), 14);
+        // And once published, this process's own temp is gone: only the final name is ours.
+        publish::forget_all_for_tests();
+        assert!(name.exists());
+        drop(f);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn publishing_two_names_in_one_directory_publishes_in_creation_order() {
+        let d = scratch("order");
+        let a = d.join("a.part");
+        let b = d.join("b.part");
+        let fa = create(&a).unwrap();
+        let fb = create(&b).unwrap();
+        sync_file(&fa, &a).unwrap();
+        sync_file(&fb, &b).unwrap();
+        assert!(!a.exists() && !b.exists());
+        sync_dir(&d).unwrap();
+        assert!(a.exists() && b.exists());
+        assert!(temps_beside(&a).is_empty() && temps_beside(&b).is_empty());
+        drop((fa, fb));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

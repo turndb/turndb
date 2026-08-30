@@ -494,7 +494,7 @@ impl Wal {
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<ReplayState> {
         let read_limits = read_limits.validate()?;
-        let f = match File::open(path) {
+        let f = match crate::vfs::open_read(path) {
             Ok(f) => f,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ReplayState { frames: Vec::new(), physical_frames: 0, valid_bytes: 0 });

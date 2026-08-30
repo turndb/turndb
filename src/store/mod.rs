@@ -44,7 +44,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -641,7 +640,7 @@ fn valid_blake3_hex(value: &str) -> bool {
 /// Read the one small authoritative file through a hard allocation boundary. Metadata is checked
 /// first for the common/sparse-file case and `take(max + 1)` closes a concurrent-growth race.
 pub(crate) fn read_manifest_file(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path)?;
+    let file = crate::vfs::open_read(path)?;
     let announced = file.metadata()?.len();
     if announced > MAX_MANIFEST_BYTES {
         bail!(
@@ -1313,7 +1312,7 @@ pub fn single_file_kind(path: &Path) -> Option<SingleFileKind> {
     if !path.is_file() {
         return None;
     }
-    let f = std::fs::File::open(path).ok()?;
+    let f = crate::vfs::open_read(path).ok()?;
     let len = f.metadata().ok()?.len();
 
     let mut magic = [0u8; 8];
@@ -2129,7 +2128,7 @@ fn hash_file_with_control(
 ) -> Result<blake3::Hash> {
     use std::io::Read;
 
-    let mut file = File::open(path)?;
+    let mut file = crate::vfs::open_read(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -2192,7 +2191,7 @@ fn validate_recovery_candidate_dir(
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(n) = crate::fold::segment::parse_seg_name(&name) {
-            let file = File::open(entry.path())?;
+            let file = crate::vfs::open_read(&entry.path())?;
             let full_len = crate::readat::ReadAt::len(&file)?;
             let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
                 Some(t) if n > t.seg => continue,
@@ -2276,7 +2275,7 @@ fn validate_recovery_candidate_dir(
 /// Read a whole small file, refusing one larger than `max` rather than allocating for it.
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
     use std::io::Read;
-    let file = File::open(path)?;
+    let file = crate::vfs::open_read(path)?;
     let announced = file.metadata()?.len();
     if announced > max {
         bail!("{} is {announced} bytes, over the {max}-byte limit", path.display());
@@ -2383,7 +2382,7 @@ pub fn restore_file_with_control(
     {
         use std::io::Read;
         let mut from =
-            std::fs::File::open(src).with_context(|| format!("open backup {}", src.display()))?;
+            crate::vfs::open_read(src).with_context(|| format!("open backup {}", src.display()))?;
         let to = crate::vfs::create(&staging)
             .with_context(|| format!("stage restore at {}", staging.display()))?;
         let mut buf = vec![0u8; 1 << 20];

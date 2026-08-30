@@ -591,7 +591,8 @@ impl Part {
         cache: Arc<SectionCache>,
         read_limits: crate::read_limits::ReadLimits,
     ) -> Result<Part> {
-        let f = File::open(path).with_context(|| format!("open part {}", path.display()))?;
+        let f =
+            crate::vfs::open_read(path).with_context(|| format!("open part {}", path.display()))?;
         Part::open_reader_with_limits(Box::new(f), cache, read_limits)
     }
 

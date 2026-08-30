@@ -726,8 +726,8 @@ impl Container {
     pub fn ingest(&mut self, name: &str, from: &Path) -> Result<u64> {
         self.ensure_writable()?;
         validate_name(name)?;
-        let mut src =
-            File::open(from).with_context(|| format!("ingest source {}", from.display()))?;
+        let mut src = crate::vfs::open_read(from)
+            .with_context(|| format!("ingest source {}", from.display()))?;
         let off = self.aligned_start();
         let mut hasher = crc32fast::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];

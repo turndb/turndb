@@ -54,7 +54,7 @@ pub const BLOCK_TARGET_MAX: u64 = (u32::MAX as u64) / 2;
 pub const MAX_DICTIONARY_BYTES: u64 = 64 << 20;
 
 fn read_bounded_candidate(path: &Path, max: u64) -> Result<Vec<u8>> {
-    let file = File::open(path)?;
+    let file = crate::vfs::open_read(path)?;
     let len = file.metadata()?.len();
     if len > max {
         bail!("candidate file {} is {len} bytes, exceeding the {max}-byte limit", path.display());
@@ -437,7 +437,8 @@ impl Fold {
             let mut retry = false;
             for &n in &nums {
                 let path = segment::seg_path(dir, n);
-                let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+                let f = crate::vfs::open_read(&path)
+                    .with_context(|| format!("open {}", path.display()))?;
                 let len = f.metadata()?.len();
                 let mut hb = [0u8; SEG_HDR_LEN as usize];
                 let ok = len >= SEG_HDR_LEN && f.read_exact_at(&mut hb, 0).is_ok();
