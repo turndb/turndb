@@ -2217,25 +2217,27 @@ fn run_with_failed_sync<T>(
 /// Convergence under both models for a log that lacks a barrier: every crash state at the end
 /// of `ops` must pass `check`, and so must the real directory as it stands.
 fn converges(
-    tag: &str,
+    stage_tag: &str,
+    label: &str,
     base: &Fs,
     root: &Path,
     real: &Path,
     ops: &[Op],
     mut check: impl FnMut(&Path, &str),
 ) {
-    check(real, &format!("{tag}: real directory after the failed sync"));
-    let stage = tmp(&format!("{tag}-syncfail-stage"));
+    check(real, &format!("{label}: real directory after the failed sync"));
+    // The stage directory's name must be a valid file name on every platform: no ':' or '('.
+    let stage = tmp(&format!("{stage_tag}-syncfail-stage"));
     for &model in MODELS {
         let mut fs = base.clone();
         fs.model = model;
         for op in ops {
             fs.apply(op);
         }
-        for (fs, label) in fs.crash_states(None) {
+        for (fs, sublabel) in fs.crash_states(None) {
             for &variant in VARIANTS {
                 materialize(&fs, variant, root, &stage);
-                check(&stage, &format!("{tag}: {model:?} {label} {variant:?}"));
+                check(&stage, &format!("{label}: {model:?} {sublabel} {variant:?}"));
             }
         }
     }
@@ -2275,7 +2277,7 @@ fn a_failed_directory_sync_after_container_create_is_reported_and_leaves_no_stor
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || turndb::container::Container::create(&path));
     assert!(format!("{err:#}").contains("after creating"), "{err:#}");
-    converges("create", &base, &root, &root, &ops, |dir, what| {
+    converges("create", "create", &base, &root, &root, &ops, |dir, what| {
         let p = dir.join("new.turndb");
         if p.exists() {
             turndb::container::Container::open(&p)
@@ -2308,7 +2310,7 @@ fn a_failed_directory_sync_after_recreating_an_interrupted_container_is_reported
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || Store::open_file(&path, cfg).map(|_| ()));
     assert!(format!("{err:#}").contains("after creating"), "{err:#}");
-    converges("recreate", &base, &root, &root, &ops, |dir, what| {
+    converges("recreate", "recreate", &base, &root, &root, &ops, |dir, what| {
         let p = dir.join("s.turndb");
         if p.exists() && std::fs::metadata(&p).unwrap().len() > turndb::container::REGION_START {
             turndb::container::Container::open(&p)
@@ -2351,7 +2353,7 @@ fn a_failed_directory_sync_after_backup_publication_is_reported_and_the_artifact
         r.map(|_| ())
     });
     assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("backup", &base, &root, &root, &ops, |dir, what| {
+    converges("backup", "backup", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
         let b = dir.join("backup.turndb");
         if b.exists() {
@@ -2390,7 +2392,7 @@ fn a_failed_directory_sync_after_restore_publication_is_reported_and_the_destina
     let (err, ops) =
         run_with_failed_sync(target, || turndb::store::restore_file(&origin, &dest).map(|_| ()));
     assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("restore", &base, &root, &root, &ops, |dir, what| {
+    converges("restore", "restore", &base, &root, &root, &ops, |dir, what| {
         let d = dir.join("restored.turndb");
         if d.exists() {
             serves_all(&d, &want, cfg, what);
@@ -2422,7 +2424,7 @@ fn a_failed_directory_sync_after_conversion_publication_is_reported_and_rerunnin
         turndb::store::convert_to_file(&work, &container).map(|_| ())
     });
     assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("convert", &base, &root, &root, &ops, |dir, what| {
+    converges("convert", "convert", &base, &root, &root, &ops, |dir, what| {
         let file = dir.join("state.turndb");
         if !file.exists() {
             turndb::store::convert_to_file(&dir.join("store"), &file)
@@ -2472,7 +2474,7 @@ fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_wh
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || turndb::container::reclaim(&file).map(|_| ()));
     assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
-    converges("reclaim", &base, &root, &root, &ops, |dir, what| {
+    converges("reclaim", "reclaim", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
@@ -2502,7 +2504,7 @@ fn a_failed_directory_sync_after_anchor_recovery_cleanup_is_reported_and_the_sto
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || Store::open_file(&file, cfg).map(|_| ()));
     assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
-    converges("recover", &base, &root, &root, &ops, |dir, what| {
+    converges("recover", "recover", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
@@ -2534,7 +2536,7 @@ fn a_failed_directory_sync_after_close_removes_the_wal_is_reported_and_the_store
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || session(&mut want).close());
     assert!(format!("{err:#}").contains("after removing the write-ahead log"), "{err:#}");
-    converges("close", &base, &root, &root, &ops, |dir, what| {
+    converges("close", "close", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
@@ -2575,7 +2577,9 @@ fn sync_failure_variant<W>(
         base.seed_durable(&root);
         let (err, ops) = run_with_failed_sync(j, || op(&root, &w));
         let label = format!("{tag}: sync {j} of {syncs} failed ({})", short_err(&err));
-        converges(&label, &base, &root, &root, &ops, |dir, what| check(dir, &w, what));
+        converges(&format!("{tag}-syncvar-{j}"), &label, &base, &root, &root, &ops, |dir, what| {
+            check(dir, &w, what)
+        });
         std::fs::remove_dir_all(&root).ok();
     }
     syncs
