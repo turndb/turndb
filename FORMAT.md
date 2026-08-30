@@ -1086,23 +1086,34 @@ unsettled `-wal` sidecar sits beside the file (acknowledged records only their w
 or for a sealed container, whose bytes are final.
 
 The publication is the crash-safety argument, and it is the same on every platform so the
-deterministic simulator proves it under both durability models it knows. The fresh container is
-published first as the **anchor**, `<store>.reclaimed`, by a write-through no-replace rename — a
-durable name for verified bytes that nothing afterwards touches. A byte copy of the anchor is
-fsynced and published the same way as the **candidate**, `<store>.reclaim-candidate`; the writer
-lock is taken on the candidate's handle before it is published anywhere, and that handle is held
-until reclaim returns, so no second writer can enter between the replace and the return. Only the
-candidate is then renamed over the store — `rename(2)` on Unix, and on Windows the documented route
-that replaces an open file (`FileRenameInfoEx` with POSIX semantics, which has no write-through
-form), so a crash inside that step may leave the old store, the new one, or neither. In every case
-the anchor is intact: a writer open that finds the store's name absent beside its anchor validates
-the anchor whole (the manifest-recovery bar), copies it, locks and verifies the copy, publishes it
-write-through at the store's name, and only then unlinks the anchor; one recoverer at a time, under
-the anchor's own lock; a corrupt or incomplete anchor is refused and nothing is created. A store
-that is present is always the authority — reclaim material beside it is removed, never consulted.
-The anchor's unlink and the candidate's are laggable on Windows, so `.reclaim*` debris may follow a
-crash; it never changes which store wins. Cost: one extra copy of the compacted container per
-reclaim on every platform, and on Windows two write-through renames more.
+deterministic simulator proves it under both durability models it knows. A name is "published
+durably" below by the platform's no-replace rename plus its namespace barrier: on POSIX an ordinary
+no-replace rename followed by the directory's fsync; on Windows a rename with `MOVEFILE_WRITE_THROUGH`,
+which is the barrier. The sequence, exactly as the code performs it:
+
+1. the fresh container is written at `<store>.reclaiming`, committed and verified;
+2. it is published durably as the **anchor**, `<store>.reclaimed` — a durable name for verified
+   bytes that nothing afterwards touches;
+3. a byte copy of the anchor is fsynced and published durably as the **candidate**,
+   `<store>.reclaim-candidate`; the candidate is then opened and the writer lock is taken on that
+   handle — before it is published at the store's name, the name a second writer would open — and
+   the handle is held until reclaim returns, so no second writer can enter between the replace and
+   the return;
+4. the candidate is renamed over `<store>` — `rename(2)` on POSIX; on Windows the documented route
+   that replaces an open file (`FileRenameInfoEx` with POSIX semantics), which has no write-through
+   form and which no later documented operation promotes. The simulator carries old / new / neither
+   for this step through every later crash point, including after the cleanup below and after the
+   return;
+5. the store at its name is reopened and verified, and the anchor is unlinked.
+
+In every one of those states the anchor is intact: a writer open that finds the store's name absent
+beside its anchor validates the anchor whole (the manifest-recovery bar), copies it, locks and
+verifies the copy, publishes it durably at the store's name, and only then unlinks the anchor; one
+recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor is refused and
+nothing is created. A store that is present is always the authority — reclaim material beside it is
+removed, never consulted. The anchor's unlink and the candidate's are laggable on Windows, so
+`.reclaim*` debris may follow a crash; it never changes which store wins. Cost: one extra copy of the
+compacted container per reclaim on every platform, and on Windows two write-through renames more.
 
 ---
 
