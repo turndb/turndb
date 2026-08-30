@@ -1,7 +1,9 @@
 # TurnDB roadmap
 
-**Status: active, 2026-08-15.** The previous roadmap was deleted at 0.1.0 because its six gates had
-been exercised and it described a sprint, not a direction. This one states the direction.
+**Status: active, 2026-08-15; realigned 2026-08-30 against the surveyed state of `50832b9`** (obj-mtfdibju-2).
+The previous roadmap was deleted at 0.1.0 because its six gates had been exercised and it described a
+sprint, not a direction. This one states the direction. Each phase now carries a status line that says
+what has shipped and what its gate still lacks, so the document claims exactly what is true.
 
 ## The thesis
 
@@ -72,12 +74,84 @@ server and an account; this is two lines and a local file with the collapse rati
 
 Release machinery changes only when a phase demands it — new artifacts, new SDK packaging, a
 renamed surface — never as its own workstream. The full freeze is a 1.0 property, not a today
-property. The open meta-issues get triaged once into "blocks a phase" or "closed, revisit at 1.0".
+property. The open meta-issues were triaged once, on 2026-08-30, in the survey report under
+obj-mtfdibju-2 (§4); the dispositions there are the ones this roadmap assumes.
+
+## Every OS a consumer runs on
+
+**Requirement, 2026-08-30 (Andrew):** TurnDB supports every operating system a consumer runs on —
+Linux x64 and arm64, macOS x64 and arm64, Windows x64 — with native packages where they are built
+and the portable package everywhere else, its capability difference stated where the consumer
+chooses. A consumer embedding TurnDB must never inherit an OS restriction from it: CommandSuite's
+adoption cannot cost CommandSuite a platform.
+
+What exists today, by registry, so this claims exactly what is true:
+
+| slice | `@turndb/native` | `@turndb/cli` | Python wheels | portable `turndb` (wasm) |
+|---|---|---|---|---|
+| Linux x64 glibc | 0.1.6 | 0.1.6 | 0.1.6 (cp39–cp313, manylinux_2_17) | yes |
+| Linux arm64 | open | open (#89, in progress) | open | yes |
+| macOS x64 | open | open (#89, in progress) | open | yes |
+| macOS arm64 | open | open (#89, in progress) | open | yes |
+| Windows x64 | open — needs a Windows platform floor in `src/sys.rs` (positioned I/O, writer lock), not only a build | open, same | open, same | yes |
+
+The portable package runs on every host Node 22–26 does, and gives up exactly three things —
+advisory locking, in-place punch, threads — which the capability contract reports and the front
+door must state. Native slices are Phase 3a-i work ("ours to meet"); the Windows row is engine
+work before it is packaging work; no dates are implied by this table.
+
+## Phase 0: the front door tells the truth
+
+**Status: open, 2026-08-30.** Inserted ahead of every other phase because it is what a stranger meets
+first, and the survey found the README's first store command failing on its bare path, `inspect` and
+`verify` then passing misleadingly on the empty store it left, the remaining four commands failing,
+and the `seal` step leaving debris beside the store.
+
+This phase is finite and boring on purpose. It is not a quality sweep; it is the list of places where
+what we ship and what we say diverge, closed one by one:
+
+- `turndb import mystore.turndb -` — the README's first command — fails on a bare relative path and
+  leaves an empty store and a WAL (#121).
+- `seal`, `compact`, `refold`, `punch`, `erase` leave a `<store>-wal` beside a cleanly operated store,
+  against FORMAT.md's own promise (#122).
+- The published `@turndb/cli` README documents a verb and a store shape the binary refuses (#120);
+  the CLI cannot report its version (#97).
+- The native Node suite fails on a developer's box after the documented `npm ci` and passes in CI only
+  because that job never installs the optional platform package (#102); the test establishes its own
+  no-artifact condition.
+- The README's record model ("three records per call because a record has one body") predates
+  format version 2's named content, which the trace mapping already uses; one mapping, stated once.
+- `docs/support-and-compatibility.md` says the release-profile suite is verified only locally; CI has
+  run it hosted and green since the repository went public, and the private-tier skip is dead code.
+- The Python package ships without the columnar/SQL lens and without cancellation, and the portable
+  package without advisory locking, punch, or threads, and no document says either in the words a
+  consumer choosing a package would read; the support policy and each package README state the
+  capability difference explicitly.
+- `docs/embedding-contract.md` — the consumer's design surface — is linked from no current document;
+  its sole inbound reference is the 0.1.0 CHANGELOG entry.
+- A publication makes `bindings/node/package-lock.json` invalid against the now-published platform
+  package while main keeps displaying its pre-publication green, and the next push or PR job fails —
+  because the lock stub written at release prep is restored by nobody (#118). The release workflow
+  restores it, or nightly runs the job that would catch it, or both.
+
+### Maturity gate
+
+A stranger follows the README on a clean machine and every command does what the README says and
+leaves what the README says it leaves. Every registry description and README describes the artifact
+behind it. A publication cannot leave main displaying a green it would no longer earn. Phase 2's harness
+runs against this quickstart, not a corrected one.
 
 ## Phase 1: one file is the store
 
-**Status: complete, 2026-08-15.** The maturity gate is executable across the native file lifecycle,
-crash and corruption harnesses, binding parity, and the cold-open positioned-read bound below.
+**Status: complete, 2026-08-15 — with one deliverable landed differently than described below, recorded
+2026-08-30.** The maturity gate is executable across the native file lifecycle, crash and corruption
+harnesses, binding parity, and the cold-open positioned-read bound below. The commit authority did not
+become "superblock states plus a commit journal": the manifest is restaged as JSON members
+(`MANIFEST`, `MANIFEST.<commit>`) on every flush and published by the superblock flip — a port of the
+manifest-file design into the container, not the redesign the deliverable text asks for. It is correct,
+crash-proven by the DST container sweeps, and it is what FORMAT.md now specifies. Whether the redesign
+is still wanted is an open decision; it is not a completed one, and this paragraph exists so nobody
+reads the deliverable below as done in the form it states.
 
 The container (FORMAT.md, "The container") already holds what a pack holds and grows past it under
 alternating superblocks. But the current writer treats it as a checkpoint target: `ContainerStore`
@@ -170,7 +244,9 @@ requires zero caveats about which operations work on it.
 
 **Status: deferred until the later product phases mature.** Their storage and query changes can
 move the measured numbers; publish the reproducible tables once those systems have settled rather
-than canonizing intermediate results and re-running the proof after every phase.
+than canonizing intermediate results and re-running the proof after every phase. When it runs, it
+runs against the README quickstart Phase 0 fixed, on a clean machine, with no step a stranger would
+not type.
 
 The dedup and collapse numbers were measured on private corpora and re-run offline against public
 datasets, but nothing published is reproducible by a stranger. Fix that, against the layout Phase 1
@@ -210,6 +286,14 @@ without asking us anything. The README carries no number the harness cannot rege
 
 ## Phase 3a: the SDK baseline
 
+**Status: shipped 2026-08-14 (0.1.4, #107); gate unmet as of 2026-08-30.** The three contracts exist
+with conformance vectors, the Node native and portable packages, the Python package and both Tier-2
+exporters are published at 0.1.6 and install from the registries. What the gate asked for has not
+happened: no demonstrated external or production consumer writes and reads through the Node package,
+and the one named below has no dependency on TurnDB at all — its traces live in SQLite with its own
+content-addressed blob store. The gate is therefore restated in two halves below so it can be met by
+something this repository controls, and the CommandSuite half is stated as the dependency it is.
+
 The contracts above, written down and enforced, then the bindings rebased onto them.
 
 ### Deliverables
@@ -227,11 +311,33 @@ The contracts above, written down and enforced, then the bindings rebased onto t
 
 ### Maturity gate
 
-CommandSuite writes and reads production traffic through the Node package with no reach into
-engine internals. A Python agent traces itself into a local file with two lines. Both speak the
-same query contract the browser and server will.
+Two halves, and the phase is done when both are:
+
+1. **Ours to meet.** A consumer that is not this repository's own test suite — the reference
+   consumer harness under `bindings/node/qualification/` is the current stand-in, and it is not
+   enough — writes and reads through the Node package with no reach into engine internals. A Python
+   agent traces itself into a local file with two lines. Both speak the same query contract the
+   browser and server will. The Python package states its capability difference from Node (no
+   columnar/SQL lens, no cancellation) where a consumer chooses a binding, or closes it. Native
+   slices for Linux arm64, macOS x64 and macOS arm64 exist across the native Node package, the
+   Python wheels and the CLI, built and install-tested in CI on the toolchain that targets each;
+   Windows x64 native follows once `src/sys.rs` carries a Windows floor; the portable package
+   serves everywhere else, never as a silent fallback. No consumer on any of the five OS slices
+   named above installs TurnDB and inherits a restriction TurnDB did not state up front.
+2. **Theirs to state.** CommandSuite adopts the Node package for traces. What that requires of TurnDB
+   — the agent-activity record family, retention semantics, a runner-side durable spool, anything
+   else — is unknown until CommandSuite states its need, and this roadmap does not guess. The seam
+   rule applies to every item that arrives: it goes into TurnDB only if a second trace consumer
+   would want it; CommandSuite-only needs are built on top.
 
 ## Phase 3b: the browser — query a `.turndb` anywhere
+
+**Status: shipped 2026-08-14 (#107); gate measured on one shape, 2026-08-30.** The one-file viewer is
+attached to every GitHub release since v0.1.4 (v0.1.1 and v0.1.3 carry none). `docs/browser.md` records a 2.13 GiB container opening in 5 range
+requests (250,267 bytes, 0.0109 % of the file) and answering a metadata point query with no further
+bytes — on a store of 56 parts each holding one 52 MiB element. A many-part, many-segment store pays
+`4 + 2S + D + 2P` reads by FORMAT.md's own formula and has not been measured over HTTP; that
+measurement is what remains of this gate.
 
 The dream, stated plainly: a precompiled HTML page, served from any static host or CDN, that opens a
 `.turndb` file — dragged in, picked from disk, or fetched by URL with range requests — and lets the
@@ -272,6 +378,14 @@ local file with no network at all.
 
 ## Phase 4: the trace vocabulary — one-stop shop
 
+**Status: not started, 2026-08-30.** One family exists (the gen_ai exchange, through the Tier-2
+exporters and `docs/trace-mapping.md`), and five trace-UI queries exist hard-coded in
+`examples/genai_query.rs`; the agent-activity family, every *trace-format or provider* importer (the
+generic JSONL `turndb import` exists), every *supported and documented* query recipe and every viewer
+rendering below are unwritten. The activity family's shape waits on a consumer
+stating what it records (Phase 3a, half 2); the engine already carries everything the shape will
+need (named content, ordered typed attributes, prefix-ordered ids).
+
 `examples/genai_dogfood.rs` is the working mapping and stays the reference for *why*; this phase
 makes the mapping a supported surface rather than an example. The live motion — tracers and
 exporters — landed with Phase 3a on the shared mapping spec; this phase completes the vocabulary
@@ -301,6 +415,8 @@ container and a shareable viewer link without writing mapping code. The private 
 one public dataset both pass through the importers byte-exact.
 
 ## Phase 5: the center — serve stores
+
+**Status: not started.**
 
 Some deployments want ingestion and querying behind one endpoint. The engine does not grow a
 network; a separate binary embeds it. "No daemon, no network" remains true of the core and FORMAT.md
