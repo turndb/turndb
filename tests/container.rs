@@ -1278,37 +1278,21 @@ fn is_writer_locked(e: &anyhow::Error) -> bool {
 }
 
 #[test]
-fn reclaim_leaves_exactly_one_file_and_a_competing_writer_in_the_handoff_window_is_refused() {
-    use turndb::container::reclaim_with_hook;
-    let root = tmp("reclaim-handoff");
+fn reclaim_leaves_exactly_one_file_and_the_store_serves_everything() {
+    use turndb::container::reclaim;
+    let root = tmp("reclaim-clean");
     std::fs::create_dir_all(&root).unwrap();
     let ct = root.join("grows.turndb");
     let want = wasteful_store(&ct);
-    let mut competitor_saw = None;
-    let stats = reclaim_with_hook(&ct, |p| {
-        // The name has been replaced; the new store's handle holds the writer lock. A writer
-        // opening the name now must receive the TYPED refusal, not a store.
-        match Store::open_file(p, cfg()) {
-            Ok(_) => competitor_saw = Some("a store".to_string()),
-            Err(e) => {
-                competitor_saw = Some(if is_writer_locked(&e) {
-                    "WriterLocked".into()
-                } else {
-                    format!("other: {e:#}")
-                })
-            }
-        }
-    })
-    .unwrap();
+    let stats = reclaim(&ct).unwrap();
     assert!(stats.reclaimed > 0);
-    assert_eq!(competitor_saw.as_deref(), Some("WriterLocked"));
     assert_eq!(
         names(&ct),
         vec!["grows.turndb".to_string()],
         "no anchor, candidate or staging left"
     );
     assert_serves(&ct, &want, "after reclaim");
-    // ... and the writer lock was released at return: a writer opens now.
+    // The writer lock was released at return: a writer opens now.
     Store::open_file(&ct, cfg()).expect("writer opens after reclaim returned").close().unwrap();
     std::fs::remove_dir_all(&root).ok();
 }

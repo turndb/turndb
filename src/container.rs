@@ -1190,13 +1190,17 @@ fn copy_container_bytes(from: &Path, to: &Path) -> Result<u64> {
 /// 2. it is published as the **anchor**, `<store>.reclaimed`, by a write-through no-replace
 ///    rename — a durable name for verified bytes that nothing below touches;
 /// 3. a byte copy of the anchor is fsynced and published as the **candidate**,
-///    `<store>.reclaim-candidate`, the same way; the candidate is opened and the writer lock is
-///    taken on that handle *before* it is published anywhere;
-/// 4. the candidate is renamed over `<store>` — `rename(2)` on Unix; on Windows the write-through
-///    `MoveFileExW`, which refuses because this function holds the original open and locked, then
-///    `std`'s POSIX-semantics fallback, which is **not** write-through (`sys::rename`). A crash here
-///    may leave the old store, the new one, or neither; in every case the anchor is intact, and an
-///    absent `<store>` beside a whole anchor is what a writer open recovers (`Store::open_file`);
+///    `<store>.reclaim-candidate`, the same way; the candidate is then opened and the writer lock
+///    is taken on that handle *before* it is published at the store's name — the name a second
+///    writer would open;
+/// 4. the candidate is renamed over `<store>` (`vfs::rename_replace_open`) — `rename(2)` on Unix;
+///    on Windows the write-through `MoveFileExW`, which refuses because this function holds the
+///    original open and locked, then `std`'s POSIX-semantics fallback, which is **not**
+///    write-through (`sys::rename`) and which no later documented barrier promotes. The crash
+///    model therefore carries old / new / neither for this step through every later crash point,
+///    including after the cleanup below and after this function returns. In every one of those
+///    states the anchor is intact, and an absent `<store>` beside a whole anchor is what a writer
+///    open recovers (`Store::open_file`);
 /// 5. the new store at its name is reopened and verified, the locked candidate handle — now the
 ///    handle of `<store>` itself — is held until this function returns so no second writer can
 ///    enter between the replace and the return, and the anchor is unlinked (laggable: a stale
@@ -1208,9 +1212,10 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     reclaim_with_hook(path, |_| {})
 }
 
-/// [`reclaim`] with a test hook called between the replace and the return, while the new store's
-/// writer lock is held: the window a competing writer must be refused in.
-pub fn reclaim_with_hook(
+/// [`reclaim`] with a hook called between the replace and the return, while the new store's
+/// writer lock is held: the window a competing writer must be refused in. Crate-private — a test
+/// seam, not API.
+pub(crate) fn reclaim_with_hook(
     path: &Path,
     mut after_replace: impl FnMut(&Path),
 ) -> Result<ReclaimStats> {
@@ -1271,7 +1276,8 @@ pub fn reclaim_with_hook(
     crate::vfs::rename_noreplace(&names.staging, &names.anchor)?;
     crate::vfs::sync_dir(&parent)?;
 
-    // 3. The candidate: a copy, fsynced, published, and writer-locked before it goes anywhere.
+    // 3. The candidate: a copy, fsynced, published under its own name, then opened and
+    //    writer-locked before it is published at the store's name.
     let bytes_after = copy_container_bytes(&names.anchor, &names.candidate_tmp)?;
     crate::vfs::sync_dir(&parent)?;
     crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
@@ -1284,8 +1290,9 @@ pub fn reclaim_with_hook(
     }
     Container::open(&names.candidate)?.verify()?;
 
-    // 4. The uncertain replace. The anchor is not involved.
-    crate::vfs::rename(&names.candidate, path)?;
+    // 4. The uncertain replace — recorded as its own operation for the crash model. The anchor
+    //    is not involved.
+    crate::vfs::rename_replace_open(&names.candidate, path)?;
     crate::vfs::sync_dir(&parent)?;
 
     // 5. Reopen at the name, hand off, clean up.
@@ -1490,4 +1497,59 @@ fn read_xsum(payload: &[u8], at: &mut usize) -> Result<u32> {
     let xsum = u32::from_le_bytes(bytes.try_into()?);
     *at += 4;
     Ok(xsum)
+}
+
+#[cfg(test)]
+mod reclaim_handoff_tests {
+    //! The handoff window: after the candidate has replaced `<store>` and before `reclaim`
+    //! returns, the new store's handle holds the writer lock, so a writer opening the name must
+    //! receive the typed refusal — not a store.
+    use super::*;
+    use crate::fold::FoldCfg;
+    use crate::store::{Span, Store};
+
+    fn tmp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "turndb-handoff-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn is_writer_locked(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.downcast_ref::<crate::fold::WriterLocked>().is_some())
+    }
+
+    #[test]
+    fn a_competing_writer_in_the_handoff_window_is_refused_with_the_typed_error() {
+        let root = tmp("window");
+        let ct = root.join("s.turndb");
+        let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+        for round in 0..6u8 {
+            let mut s = Store::open_file(&ct, cfg).unwrap();
+            s.put(&format!("r:{round}"), &[Span::Piece(&[round; 1200])], vec![]).unwrap();
+            s.sync().unwrap();
+            s.flush().unwrap();
+            s.close().unwrap();
+        }
+        let mut saw: Option<String> = None;
+        let stats = reclaim_with_hook(&ct, |p| {
+            saw = Some(match Store::open_file(p, cfg) {
+                Ok(_) => "a store".to_string(),
+                Err(e) if is_writer_locked(&e) => "WriterLocked".to_string(),
+                Err(e) => format!("other: {e:#}"),
+            });
+        })
+        .unwrap();
+        assert!(stats.reclaimed > 0);
+        assert_eq!(saw.as_deref(), Some("WriterLocked"));
+        // Released at return: a writer opens now.
+        Store::open_file(&ct, cfg).expect("writer opens after reclaim returned").close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

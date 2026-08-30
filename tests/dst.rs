@@ -101,6 +101,21 @@ struct Fs {
     durable_ns: BTreeMap<PathBuf, usize>,
     /// Windows only: names created (file, dir, link) and not yet published, in creation order.
     pending: Vec<PathBuf>,
+    /// Windows only: replace-renames over an open destination (`Op::RenameLagged`) whose
+    /// durability no documented barrier has settled. Each carries old / new / neither through
+    /// every later crash point until a write-through operation on one of its names resolves it.
+    lagged: Vec<Lagged>,
+}
+
+/// One unsettled `RenameLagged`: what `to` and `from` durably name is unknown.
+#[derive(Clone)]
+struct Lagged {
+    from: PathBuf,
+    to: PathBuf,
+    /// The inode that was moved.
+    moved: usize,
+    /// What `to` durably named before the rename, if anything.
+    replaced: Option<usize>,
 }
 
 impl Fs {
@@ -112,6 +127,7 @@ impl Fs {
             volatile_ns: BTreeMap::new(),
             durable_ns: BTreeMap::new(),
             pending: Vec::new(),
+            lagged: Vec::new(),
         }
     }
 
@@ -130,6 +146,40 @@ impl Fs {
             self.durable_ns.insert(path.to_path_buf(), i);
         }
         self.pending.retain(|p| p != path);
+        self.settle(path);
+    }
+
+    /// A write-through operation on `name` settles any lagged rename that involves it.
+    fn settle(&mut self, name: &Path) {
+        self.lagged.retain(|l| l.from != name && l.to != name);
+    }
+
+    /// Apply one alternative of an unsettled lagged rename to the durable namespace.
+    fn apply_lagged(&mut self, l: &Lagged, which: u8) {
+        match which {
+            0 => {
+                // old: nothing moved on disk
+                self.durable_ns.insert(l.from.clone(), l.moved);
+                match l.replaced {
+                    Some(i) => {
+                        self.durable_ns.insert(l.to.clone(), i);
+                    }
+                    None => {
+                        self.durable_ns.remove(&l.to);
+                    }
+                }
+            }
+            1 => {
+                // new: the move landed
+                self.durable_ns.remove(&l.from);
+                self.durable_ns.insert(l.to.clone(), l.moved);
+            }
+            _ => {
+                // neither
+                self.durable_ns.remove(&l.from);
+                self.durable_ns.remove(&l.to);
+            }
+        }
     }
 
     /// Erase every trace of `path` (and, for a directory, everything under it) from both
@@ -149,6 +199,29 @@ impl Fs {
     /// rename, the state where neither name exists; for a publish (`SyncDir`), one state per
     /// pending file where the files before it were published and that one is gone.
     fn crash_states(&self, next: Option<&Op>) -> Vec<(Fs, String)> {
+        let mut out = self.boundary_states(next);
+        if !self.windows() {
+            return out;
+        }
+        // Every unsettled lagged rename multiplies every state by its three alternatives, at
+        // this crash point and every later one, until something write-through settles it.
+        for k in 0..self.lagged.len() {
+            let mut expanded = Vec::with_capacity(out.len() * 3);
+            for (fs, label) in out {
+                for (which, word) in [(0u8, "old"), (1, "new"), (2, "neither")] {
+                    let mut alt = fs.clone();
+                    let l = alt.lagged[k].clone();
+                    alt.apply_lagged(&l, which);
+                    expanded.push((alt, format!("{label} lagged-{word} {}", short_name(&l.to))));
+                }
+            }
+            out = expanded;
+        }
+        out
+    }
+
+    /// The states reachable when the crash lands ON `next` (before lagged expansion).
+    fn boundary_states(&self, next: Option<&Op>) -> Vec<(Fs, String)> {
         let mut out = vec![(self.clone(), String::new())];
         if !self.windows() {
             return out;
@@ -170,6 +243,13 @@ impl Fs {
                     fs.vanish(victim);
                     out.push((fs, format!("publish-neither {}", short_name(victim))));
                 }
+            }
+            Some(Op::RenameLagged { from, to }) => {
+                // A crash on the call itself: the three alternatives, before the op is applied.
+                let mut fs = self.clone();
+                fs.vanish(from);
+                fs.vanish(to);
+                out.push((fs, format!("rename-neither {}", short_name(to))));
             }
             _ => {}
         }
@@ -353,6 +433,26 @@ impl Fs {
                         self.durable_ns.remove(from);
                         self.durable_ns.insert(to.clone(), i);
                         self.pending.retain(|p| p != from);
+                        self.settle(from);
+                        self.settle(to);
+                    }
+                }
+            }
+            Op::RenameLagged { from, to } => {
+                // Posix: an ordinary rename (durable at the directory's fsync). Windows: the
+                // POSIX-semantics replace of an open destination — volatile view updated, the
+                // durable view UNKNOWN until settled, carried by `crash_states`.
+                if let Some(i) = self.volatile_ns.remove(from) {
+                    let replaced = self.durable_ns.get(to).copied();
+                    self.volatile_ns.insert(to.clone(), i);
+                    if self.windows() {
+                        self.pending.retain(|p| p != from);
+                        self.lagged.push(Lagged {
+                            from: from.clone(),
+                            to: to.clone(),
+                            moved: i,
+                            replaced,
+                        });
                     }
                 }
             }
@@ -855,6 +955,13 @@ fn op_summary(op: &Op) -> String {
         Op::SyncFile { path } => format!("SyncFile    {}", short(path)),
         Op::SyncDir { path } => format!("SyncDir     {}", short(path)),
         Op::Rename { from, to } => format!("Rename      {} -> {}", short(from), short(to)),
+        Op::RenameLagged { from, to } => {
+            format!(
+                "RenameLagged {} -> {} (open destination; not write-through on Windows)",
+                short(from),
+                short(to)
+            )
+        }
         Op::Link { from, to } => format!("Link        {} -> {}", short(from), short(to)),
         Op::Unlink { path } => format!("Unlink      {}", short(path)),
         Op::Mkdir { path } => format!("Mkdir       {}", short(path)),
