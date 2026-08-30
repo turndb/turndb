@@ -78,6 +78,8 @@ enum Kind {
 ///     at every publish;
 ///   * an unlink has no write-through form and is never durable in the model: a deleted name may
 ///     be back after a crash, and stays back until a later rename or publish takes the name;
+///   * a directory or a hard link is created at its name and never published — the engine
+///     publishes files only — so in the model neither is ever durable (a laggable name);
 ///   * `SyncFile` on a file makes that file's own bytes and length durable and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Model {
@@ -336,11 +338,9 @@ impl Fs {
                 }
             }
             Op::Link { from, to } => {
+                // Windows: never published by the engine, so never durable in the model.
                 if let Some(&i) = self.volatile_ns.get(from) {
                     self.volatile_ns.insert(to.clone(), i);
-                    if self.windows() {
-                        self.pending.push(to.clone());
-                    }
                 }
             }
             Op::Unlink { path } => {
@@ -360,13 +360,12 @@ impl Fs {
                     }
                     stack.push(p);
                 }
+                // Windows: a directory is created at its name and never published (the engine
+                // publishes files only), so its name is never durable in the model.
                 for p in stack.into_iter().rev() {
                     if !self.volatile_ns.contains_key(&p) {
                         let i = self.new_inode(Kind::Dir);
-                        self.volatile_ns.insert(p.clone(), i);
-                        if self.windows() {
-                            self.pending.push(p);
-                        }
+                        self.volatile_ns.insert(p, i);
                     }
                 }
             }

@@ -38,11 +38,12 @@ mod publish {
     //! old (unpublished) / new (published) / neither; after, published. A temporary name is never
     //! promoted, never read, and never overrides a final name: it is garbage from the moment the
     //! process that created it is gone, and a stale one beside a valid final is exactly that.
-    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static PENDING: Mutex<BTreeMap<PathBuf, PathBuf>> = Mutex::new(BTreeMap::new());
+    /// `(final name, temporary name)` in REGISTRATION order — the order `publish_dir` renames
+    /// in, and the order the simulator enumerates partial-publish crash states in.
+    static PENDING: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
     pub(super) fn temp_name_for(path: &Path) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,14 +54,31 @@ mod publish {
         PathBuf::from(name)
     }
 
-    /// Register `path` as created-but-unpublished at `temp`.
+    /// Register `path` as created-but-unpublished at `temp`. A name already pending keeps its
+    /// original temp and position: the caller truncated that same file.
     pub(super) fn register(path: &Path, temp: PathBuf) {
-        PENDING.lock().unwrap().insert(path.to_path_buf(), temp);
+        let mut pending = PENDING.lock().unwrap();
+        if !pending.iter().any(|(p, _)| p == path) {
+            pending.push((path.to_path_buf(), temp));
+        }
+    }
+
+    /// The temporary name of a pending final name, if it is pending.
+    pub(super) fn pending_temp(path: &Path) -> Option<PathBuf> {
+        PENDING.lock().unwrap().iter().find(|(p, _)| p == path).map(|(_, t)| t.clone())
     }
 
     /// Where `path` physically is right now: its temporary name while pending, itself otherwise.
     pub(super) fn resolve(path: &Path) -> PathBuf {
-        PENDING.lock().unwrap().get(path).cloned().unwrap_or_else(|| path.to_path_buf())
+        pending_temp(path).unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// Forget a pending entry because the final name was consumed by a rename or unlink of the
+    /// pending file itself.
+    pub(super) fn forget(path: &Path) -> Option<PathBuf> {
+        let mut pending = PENDING.lock().unwrap();
+        let at = pending.iter().position(|(p, _)| p == path)?;
+        Some(pending.remove(at).1)
     }
 
     /// Drop every pending entry: what a process death does. Tests use it to stand in a fresh
@@ -68,12 +86,6 @@ mod publish {
     #[cfg(test)]
     pub(super) fn forget_all_for_tests() {
         PENDING.lock().unwrap().clear();
-    }
-
-    /// Forget a pending entry because the final name was consumed by a rename or unlink of the
-    /// pending file itself.
-    pub(super) fn forget(path: &Path) -> Option<PathBuf> {
-        PENDING.lock().unwrap().remove(path)
     }
 
     /// Publish every pending file directly inside `dir`, in registration order. Each publish is a
@@ -84,11 +96,11 @@ mod publish {
             .unwrap()
             .iter()
             .filter(|(p, _)| p.parent().map(|d| same_dir(d, dir)).unwrap_or(false))
-            .map(|(p, t)| (p.clone(), t.clone()))
+            .cloned()
             .collect();
         for (path, temp) in due {
             crate::sys::rename_noreplace(&temp, &path)?;
-            PENDING.lock().unwrap().remove(&path);
+            forget(&path);
         }
         Ok(())
     }
@@ -241,12 +253,21 @@ pub(crate) fn exists(path: &Path) -> bool {
     path.exists()
 }
 
+/// `File::create`: truncate-or-create at `path`. On Windows a name that already exists is
+/// truncated in place — its name is already durable, and only its bytes change, which the
+/// file's own fsync covers; a name still pending is truncated at its temporary location; only a
+/// genuinely new name gets a temporary file and a registration. `std::fs::File::create`'s
+/// semantics for callers, on every platform.
 #[inline]
 pub(crate) fn create(path: &Path) -> Result<File> {
     #[cfg(not(windows))]
     let f = File::create(path)?;
     #[cfg(windows)]
-    let f = {
+    let f = if let Some(temp) = publish::pending_temp(path) {
+        File::create(&temp)?
+    } else if path.exists() {
+        File::create(path)?
+    } else {
         let temp = publish::temp_name_for(path);
         let f = File::create(&temp)?;
         publish::register(path, temp);
@@ -255,6 +276,22 @@ pub(crate) fn create(path: &Path) -> Result<File> {
     #[cfg(feature = "dst")]
     push(Op::Create { path: path.to_path_buf() });
     Ok(f)
+}
+
+/// Read a whole file by name, resolving a pending name (Windows). Records nothing.
+#[inline]
+pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>> {
+    #[cfg(windows)]
+    let path = &publish::resolve(path);
+    std::fs::read(path)
+}
+
+/// `std::fs::metadata` by name, resolving a pending name (Windows). Records nothing.
+#[inline]
+pub(crate) fn metadata(path: &Path) -> Result<std::fs::Metadata> {
+    #[cfg(windows)]
+    let path = &publish::resolve(path);
+    std::fs::metadata(path)
 }
 
 /// Open read-write, creating if absent — and say whether this call CREATED it, because a caller
@@ -295,7 +332,8 @@ pub(crate) fn create_new(path: &Path) -> Result<File> {
     let f = open(path)?;
     #[cfg(windows)]
     let f = {
-        // Exclusive against the FINAL name: a leftover there is what `create_new` refuses.
+        // Exclusive against the FINAL name, pending or published: a leftover there is what
+        // `create_new` refuses.
         if exists(path) {
             return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
         }
@@ -335,9 +373,17 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> Result<()> {
     std::fs::write(path, data)?;
     #[cfg(windows)]
     {
-        let temp = publish::temp_name_for(path);
-        std::fs::write(&temp, data)?;
-        publish::register(path, temp);
+        // Same semantics as `create`: an existing name is rewritten in place, a pending one at
+        // its temp, a new one gets a temp and a registration.
+        if let Some(temp) = publish::pending_temp(path) {
+            std::fs::write(&temp, data)?;
+        } else if path.exists() {
+            std::fs::write(path, data)?;
+        } else {
+            let temp = publish::temp_name_for(path);
+            std::fs::write(&temp, data)?;
+            publish::register(path, temp);
+        }
     }
     #[cfg(feature = "dst")]
     push(Op::WriteFile { path: path.to_path_buf(), data: data.to_vec() });
@@ -527,20 +573,61 @@ mod windows_publish_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Registration order, not lexical order — observed, not assumed: `b` is created before `a`,
+    /// and `a`'s final name is blocked by a directory, so the publish fails at `a`. If the order
+    /// were lexical, `a` would fail first and `b` would still be pending.
     #[test]
-    fn publishing_two_names_in_one_directory_publishes_in_creation_order() {
+    fn publishing_follows_registration_order_not_lexical_order() {
         let d = scratch("order");
-        let a = d.join("a.part");
         let b = d.join("b.part");
-        let fa = create(&a).unwrap();
+        let a = d.join("a.part");
         let fb = create(&b).unwrap();
-        sync_file(&fa, &a).unwrap();
+        let fa = create(&a).unwrap();
         sync_file(&fb, &b).unwrap();
-        assert!(!a.exists() && !b.exists());
-        sync_dir(&d).unwrap();
-        assert!(a.exists() && b.exists());
-        assert!(temps_beside(&a).is_empty() && temps_beside(&b).is_empty());
+        sync_file(&fa, &a).unwrap();
+        std::fs::create_dir(&a).unwrap(); // blocks a's publish
+        let err = sync_dir(&d).expect_err("a's publish is blocked");
+        assert!(err.raw_os_error().is_some(), "{err}");
+        assert!(b.is_file(), "b, registered first, was published before a failed");
+        assert_eq!(temps_beside(&b).len(), 0);
+        assert_eq!(temps_beside(&a).len(), 1, "a is still pending");
         drop((fa, fb));
+        publish::forget_all_for_tests();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `create` keeps `File::create`'s semantics: an existing final is truncated in place (no
+    /// temp — its name is already durable), a pending name is truncated at its one temp, and
+    /// `create_new` refuses both.
+    #[test]
+    fn create_truncates_an_existing_final_in_place_and_a_pending_name_at_its_one_temp() {
+        let d = scratch("semantics");
+        let existing = d.join("existing.part");
+        std::fs::write(&existing, b"old bytes here").unwrap();
+        let f = create(&existing).unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"", "truncated in place");
+        assert!(temps_beside(&existing).is_empty(), "no temp for a name that already exists");
+        assert!(create_new(&existing).is_err());
+
+        let fresh = d.join("fresh.part");
+        let f1 = create(&fresh).unwrap();
+        write_all_at(&f1, &fresh, b"first", 0).unwrap();
+        drop(f1);
+        let f2 = create(&fresh).unwrap();
+        drop(f2);
+        assert_eq!(temps_beside(&fresh).len(), 1, "a repeated create truncates the same temp");
+        assert_eq!(read_file(&fresh).unwrap(), b"", "and it is truncated");
+        assert!(create_new(&fresh).is_err(), "pending counts as existing for create_new");
+        write_file(&fresh, b"via write_file").unwrap();
+        assert_eq!(read_file(&fresh).unwrap(), b"via write_file");
+        assert_eq!(temps_beside(&fresh).len(), 1);
+        write_file(&existing, b"rewritten").unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"rewritten");
+        assert!(temps_beside(&existing).is_empty());
+        sync_dir(&d).unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"via write_file");
+        assert!(temps_beside(&fresh).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

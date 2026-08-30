@@ -1187,7 +1187,7 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     fresh.verify()?;
     drop(fresh);
 
-    let bytes_after = std::fs::metadata(&staging)?.len();
+    let bytes_after = crate::vfs::metadata(&staging)?.len();
     crate::vfs::rename(&staging, path)?;
     if let Some(parent) = path.parent() {
         let _ = crate::vfs::sync_dir(parent);

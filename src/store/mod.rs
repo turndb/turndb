@@ -3261,7 +3261,7 @@ impl Store {
     /// member's logical length in a single-file one.
     fn part_file_bytes(&self, file: &str) -> Result<u64> {
         match &self.home {
-            Home::Dir(dir) => Ok(std::fs::metadata(dir.join(file))
+            Home::Dir(dir) => Ok(crate::vfs::metadata(&dir.join(file))
                 .with_context(|| format!("measure live part {file}"))?
                 .len()),
             Home::File { container, .. } => container
