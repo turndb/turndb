@@ -286,13 +286,20 @@ fn compiled_core_satisfies_capability_contract_invariants() {
         "profile": "native",
         "operations": operations,
         "partFormat": { "write": core.part_format_write, "readMax": core.part_format_read_max },
-        "writerExclusion": if cfg!(unix) { "os_enforced" } else { "embedder_enforced" },
+        "writerExclusion": match turndb::capabilities::capabilities().writer_exclusion {
+            turndb::capabilities::WriterExclusion::OsEnforced => "os_enforced",
+            turndb::capabilities::WriterExclusion::EmbedderEnforced => "embedder_enforced",
+        },
         "positionedIo": core.positioned_io,
         "threads": core.threads,
         "columnar": core.columnar,
         "sql": core.sql,
         "arrowIpc": core.columnar,
-        "reclamation": if cfg!(unix) { "punch_or_refold" } else { "refold_only" },
+        "reclamation": if turndb::capabilities::capabilities().allocated_space_usage {
+            "punch_or_refold"
+        } else {
+            "refold_only"
+        },
         "cancellation": { "scan": true, "lifecycle": true }
     });
     validate_profile_shape(&native, &schema);

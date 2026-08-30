@@ -703,7 +703,8 @@ fn bounded_compaction_plans_exact_physical_work_and_preserves_every_record() {
     assert!(estimate.estimated_stage_bytes > estimate.input_raw_section_bytes);
     assert!(!estimate.estimate_is_hard_bound);
     assert_eq!(estimate.retained_input_bytes_after_commit, plan.input_bytes);
-    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+    // Measured on Unix (statvfs) and Windows (GetDiskFreeSpaceExW); an explicit None elsewhere.
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(any(unix, windows)));
 
     let result = s.compact_bounded(budget).unwrap().unwrap();
     assert_eq!(result.plan, plan, "execution must honor the observed plan exactly");
@@ -1651,7 +1652,8 @@ fn refold_reclaims_deleted_content_and_keeps_the_rest_byte_exact() {
     assert!(estimate.source_part_raw_section_bytes > 0);
     assert!(estimate.estimated_stage_bytes > estimate.source_fold_logical_bytes);
     assert!(!estimate.estimate_is_hard_bound);
-    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(unix));
+    // Measured on Unix (statvfs) and Windows (GetDiskFreeSpaceExW); an explicit None elsewhere.
+    assert_eq!(estimate.filesystem_available_bytes.is_some(), cfg!(any(unix, windows)));
 
     let st = s.refold().unwrap();
     assert_eq!(st.tombstones_dropped, 10);
