@@ -82,6 +82,12 @@ returns `{ applied, durable: true }`; a thrown error is never an acknowledgement
 traffic, flushing every record gave 15×; every 50 gave 171×; every 512 gave 292×. Batch your
 writes.
 
+**What this package gives up, stated once.** Against the native builds it lacks exactly three
+things — advisory locking (below), in-place `punch` (`refold` reclaims the same space by
+rewriting), and threads (compression runs inline) — and `capabilities()` reports each as a fact
+about this build, not the host. Choose it for portability; choose `@turndb/native` where those
+three matter.
+
 **Cross-process exclusion is yours to provide.** The native engine takes an advisory `flock`, but
 **this package is always the `wasm32-wasip1` build**, on every host including Linux and macOS, and
 WASI has no advisory locking. The lock file is created and gates nothing.

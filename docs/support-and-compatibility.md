@@ -8,11 +8,11 @@ line. Publication of a crate or package remains a separate owner-approved action
 
 | Surface | Current evidence | Status |
 |---|---|---|
-| Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, and the corruption suite run hosted. The release-profile suite is verified on the local qualified platform; its hosted job runs on the larger public-repository runner class (the private free-tier runner could not link it — SIGBUS/disk, documented in the CI workflow) | qualified development platform; release-profile evidence is local until the hosted job reports green |
+| Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, the corruption suite and the release-profile suite all run hosted on every push and pull request (the release-profile link exceeded the private free-tier runner class while the repository was private; it has run hosted since the repository went public) | qualified development platform |
 | Rust crash model | nightly deterministic simulation on Linux x86-64 | qualified durability model when the scheduled gate is green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
 | Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
-| Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux wheels for CPython 3.9–3.13 and installs each exact wheel | Linux release candidate after CI and the owner-approved PyPI workflow are green |
+| Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux x86-64 wheels for CPython 3.9–3.13 and installs each exact wheel. Ships **without** the columnar/Arrow lens, SQL, and cooperative cancellation: `turndb.capabilities()` reports `columnar: false`, `arrowIpc: false`, `sql: false`, `cancellation: {scan: false, lifecycle: false}` | Linux x86-64 release candidate; a consumer that needs SQL or cancellation chooses the Rust crate or native Node |
 | Browser viewer | `wasm32-unknown-unknown` structured reader plus local-file and HTTP-range viewer tests in stock Chromium and Firefox | qualified read-only browser artifact when both browser jobs are green |
 | Other Unix systems and architectures | code paths exist but no CI or packaged artifacts prove them | unqualified; no support claim |
 | Native Windows | the native core requires Unix positioned I/O and writer locking | unsupported |
@@ -40,7 +40,8 @@ work. See the [native prebuild contract](native-prebuilds.md).
 Consumers should branch on them rather than the host OS or package name. In particular:
 
 - WASI reports embedder-enforced writer exclusion, no threads, and refold-only reclamation even on a
-  Linux host;
+  Linux host — the portable `turndb` npm package gives up exactly three things a consumer choosing
+  it must know: advisory locking, in-place punch, and threads;
 - native Linux reports OS-enforced writer exclusion, threads, and punch-or-refold reclamation;
 - Python reports the mechanisms in its native, actor-owned build;
 - the browser reports a read-only, single-threaded structured-query profile and no reclamation;
