@@ -1052,6 +1052,9 @@ One commit legitimately skips steps 1–3: sealing with nothing staged. The comm
 already durable and the new superblock re-points at it, adding only the flag — so the flip and its
 barrier are the entire commit.
 
+A barrier that reports failure is a failure: no publication path reports success after a failed
+sync, and the simulator fails every barrier once to hold it to that.
+
 Skipping step 3 is the failure this ordering exists for. Without an intervening fsync the order
 dirty pages reach the platter is unspecified, so the superblock can survive while the members it
 names do not — a published pointer to bytes that never landed. The

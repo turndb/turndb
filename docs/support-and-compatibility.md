@@ -9,13 +9,31 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Surface | Current evidence | Status |
 |---|---|---|
 | Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, the corruption suite and the release-profile suite all run hosted on every push and pull request (the release-profile link exceeded the private free-tier runner class while the repository was private; it has run hosted since the repository went public) | qualified development platform |
-| Rust crash model | deterministic simulation under two durability models — strict POSIX, and Windows built from documented operations only (no directory fsync; write-through renames; a crash on a rename admitting old, new, or neither; unlinks never durable) — both models run on every platform: nightly on Linux x86-64, and on every push on Windows x86-64 as a required gate | qualified durability model on both platforms when those gates are green |
+| Rust crash model | deterministic simulation under two durability models — strict POSIX, and Windows built from documented operations only (no directory fsync; write-through renames; a crash on a rename admitting old, new, or neither; unlinks never durable) — both models run on every platform: nightly on Linux x86-64, and on every push on Windows x86-64 as a required gate. The harness also fails every attempted sync of every sweep once, under both models, and requires the operation to report the failure and the store to converge (see "Sync failures" below) | qualified durability model on both platforms when those gates are green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
 | Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
 | Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux x86-64 wheels for CPython 3.9–3.13 and installs each exact wheel. Ships **without** the columnar/Arrow lens, SQL, and cooperative cancellation: `turndb.capabilities()` reports `columnar: false`, `arrowIpc: false`, `sql: false`, `cancellation: {scan: false, lifecycle: false}` | Linux x86-64 release candidate; a consumer that needs SQL or cancellation chooses the Rust crate or native Node |
 | Browser viewer | `wasm32-unknown-unknown` structured reader plus local-file and HTTP-range viewer tests in stock Chromium and Firefox | qualified read-only browser artifact when both browser jobs are green |
 | Other Unix systems and architectures | code paths exist but no CI or packaged artifacts prove them | unqualified; no support claim |
 | Native Windows x86-64 | the platform floor in `src/sys.rs` (positioned I/O through `seek_read`/`seek_write`; the writer lock through `LockFileEx` on one byte past any read; durable flush through `FlushFileBuffers`; renames through `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`); a required `windows-latest` job runs clippy, the debug suites, the corruption suite, the crash sweeps under both models, and a cross-OS test that byte-compares a store built on Windows with one built on Linux in both directions. Capability differences, stated: **punch** is `FSCTL_SET_ZERO_DATA` on a sparse file — the range is guaranteed to read as zeros with offsets unmoved (the erasure contract), while the space return is best-effort at NTFS's 64 KiB sparse granularity and is *measured* (`allocated_space_usage`), never promised; the in-place reclaim measurement is asserted on Linux only. **Replacing an open file** (reclaim's final step) takes the POSIX-semantics route, which is not write-through; reclaim's anchor protocol (FORMAT.md, "Free space") is what makes that step crash-safe, at the cost of one extra copy of the compacted container. A process killed between creating a file and publishing its name may leave `<name>.publish-<pid>-<n>` beside the store, and a crash during reclaim may leave `.reclaim*` files; neither is ever consulted over a present store. Not on Windows in this tier: the release-profile suite; packaged native, CLI and Python artifacts (a follow-on) | supported: engine and crash model qualified on `windows-latest` x86-64 when its required gate is green; packaging pending |
+
+## Sync failures
+
+A barrier that reports failure is a failure: no publication path reports success after a failed
+file or directory sync. The rule is that **an operation reports what it made durable, nothing
+more**, and what a failed directory sync means for each publication is:
+
+| Publication | If its directory sync fails | What the caller sees | What to do |
+|---|---|---|---|
+| store creation, and the rebirth of an interrupted creation | the store's name may not survive a crash | the call returns an error naming the directory and the store | run it again; a writer open creates or finishes the store |
+| backup / seal, restore, conversion | the artifact's name may not survive a crash; the artifact is whole or absent at its final name, never torn | the call returns an error naming the directory and the artifact | run it again; the source is untouched |
+| reclaim's and anchor recovery's cleanup | the store at its name is complete and authoritative; the anchor may be back after a crash | the call returns an error naming the directory and the anchor | nothing is lost; the next writer open removes the stale anchor |
+| close (removal of the `-wal` sidecar) | the store is complete; an empty sidecar may be back after a crash | `close` returns an error naming the directory and the log | nothing is lost; the next open settles the sidecar |
+
+A failed *file* sync has always propagated; these were the directory syncs that did not. The
+deterministic simulator proves each row: every attempted sync of every sweep fails once, the
+operation must report it, and both the real directory and every crash state of the recording
+without that barrier must converge under both durability models.
 
 Node ranges are deliberately closed at the next untested major: both manifests declare
 `>=22 <27`. Node 22 and 24 are maintained LTS lines and Node 26 is the Current line as of
