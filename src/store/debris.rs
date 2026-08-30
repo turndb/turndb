@@ -46,6 +46,10 @@ pub enum DebrisKind {
     PartBuilderSpool,
     /// `<artifact>.sealing`, `.restoring`, `.converting`: an artifact operation's staging file.
     ArtifactStaging,
+    /// `<store>-hot/`: a 0.1.x working session (CHANGELOG.md, 0.1.0 and 0.1.2) that may hold
+    /// acknowledged, unfolded writes only that release can settle. Reported, never removed: a
+    /// writer open and `reclaim` refuse and name it; open it with the release that wrote it.
+    LegacyHotDirectory,
 }
 
 /// One transient name, as found. `path` is exact and never lossy: only the ASCII suffix or the
@@ -241,6 +245,7 @@ pub(crate) fn scan_single_file(store: &Path, read_limits: ReadLimits) -> Result<
     consider(names.candidate_tmp.clone(), DebrisKind::ReclaimCandidate, false);
     consider(names.candidate.clone(), DebrisKind::ReclaimCandidate, false);
     consider(with_suffix(store, "-tmp"), DebrisKind::MergeScratch, true);
+    consider(with_suffix(store, "-hot"), DebrisKind::LegacyHotDirectory, true);
     // The store's own artifact staging: an operation whose destination was `<store>` and died
     // before publishing. Beside a present store it is dead; beside an absent one, reported.
     for suffix in [".sealing", ".restoring", ".converting"] {
@@ -372,9 +377,27 @@ pub(crate) fn remove_in_dir_layout(dir: &Path, read_limits: ReadLimits) -> Resul
     remove_all(scan_dir_layout(dir, read_limits)?)
 }
 
+/// The classes a writer open never removes: it refuses instead (see `refusal_beside`).
+fn never_removed(kind: DebrisKind) -> bool {
+    matches!(kind, DebrisKind::LegacyHotDirectory)
+}
+
+/// Beside a present or an absent store: the transient names a writer open must refuse on,
+/// naming them, rather than remove or ignore — today the 0.1.x working directory.
+pub(crate) fn refusal_beside(store: &Path, read_limits: ReadLimits) -> Result<Vec<PathBuf>> {
+    Ok(scan_single_file(store, read_limits)?
+        .into_iter()
+        .filter(|f| never_removed(f.kind))
+        .map(|f| f.path)
+        .collect())
+}
+
 fn remove_all(found: Vec<Found>) -> Result<u64> {
     let mut removed = 0u64;
     for f in found {
+        if never_removed(f.kind) {
+            continue;
+        }
         let r =
             if f.is_dir { crate::vfs::remove_tree(&f.path) } else { crate::vfs::unlink(&f.path) };
         r.with_context(|| format!("remove transient {:?} {}", f.kind, f.path.display()))?;
@@ -631,6 +654,36 @@ mod tests {
         let err = debris_report_with_limits(&store, tight).unwrap_err();
         assert!(format!("{err:#}").contains("scanning"), "{err:#}");
         assert_eq!(debris_report(&store).unwrap().entries.len(), 8);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The 0.1.x working directory is reported and never removed; a writer open refuses on it.
+    #[test]
+    fn a_legacy_working_directory_is_reported_refused_and_never_removed() {
+        let d = scratch("hot");
+        let store = d.join("s.turndb");
+        std::fs::write(&store, b"store").unwrap();
+        std::fs::create_dir_all(d.join("s.turndb-hot")).unwrap();
+        std::fs::write(d.join("s.turndb-hot").join("WAL"), b"acked").unwrap();
+        std::fs::write(d.join("s.turndb.reclaiming"), b"x").unwrap();
+        let r = debris_report(&store).unwrap();
+        assert!(r.entries.iter().any(|e| e.kind == DebrisKind::LegacyHotDirectory), "{r:?}");
+        assert_eq!(
+            remove_beside_present_store(&store, ReadLimits::default()).unwrap(),
+            1,
+            "only the reclaim staging"
+        );
+        assert!(d.join("s.turndb-hot").join("WAL").exists(), "never removed");
+        assert_eq!(
+            refusal_beside(&store, ReadLimits::default()).unwrap(),
+            vec![d.join("s.turndb-hot")]
+        );
+        std::fs::remove_file(&store).unwrap();
+        assert_eq!(
+            refusal_beside(&store, ReadLimits::default()).unwrap(),
+            vec![d.join("s.turndb-hot")],
+            "beside an absent store too"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

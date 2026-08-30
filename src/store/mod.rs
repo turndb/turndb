@@ -2917,6 +2917,18 @@ impl Store {
                 path.display()
             );
         }
+        // A 0.1.x working session beside the store (CHANGELOG, 0.1.0/0.1.2) may hold acknowledged
+        // writes only that release can settle: refuse, name it, never remove it.
+        let legacy = debris::refusal_beside(path, read_limits)?;
+        if !legacy.is_empty() {
+            bail!(
+                "{} has a 0.1.x working directory beside it ({}), which may hold acknowledged \
+                 writes only that release can settle; open it with the release that wrote it, or \
+                 move it aside deliberately — this release never removes it",
+                path.display(),
+                legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
         let reclaim = crate::container::reclaim_names(path);
         if !path.exists() && !reclaim.anchor.exists() {
             // Transient names beside an ABSENT store — a pending publish that never landed,

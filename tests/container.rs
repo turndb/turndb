@@ -1459,3 +1459,25 @@ fn two_recovery_contenders_converge_on_one_store() {
     assert_eq!(names(&ct), vec!["s.turndb".to_string()]);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A 0.1.x working session beside a store is refused by name by a writer open and by reclaim,
+/// and never removed — it may hold acknowledged writes only that release can settle.
+#[test]
+fn a_legacy_working_directory_is_refused_by_open_and_reclaim_and_never_removed() {
+    let root = tmp("legacy-hot");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    let _ = wasteful_store(&ct);
+    let hot = root.join("s.turndb-hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    std::fs::write(hot.join("WAL"), b"acked").unwrap();
+    let err = match Store::open_file(&ct, cfg()) {
+        Ok(_) => panic!("a writer open must refuse"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:#}").contains("s.turndb-hot"), "{err:#}");
+    let err = turndb::container::reclaim(&ct).unwrap_err();
+    assert!(format!("{err:#}").contains("working directory"), "{err:#}");
+    assert!(hot.join("WAL").exists(), "never removed");
+    std::fs::remove_dir_all(&root).ok();
+}
