@@ -1115,7 +1115,8 @@ verifies the copy, publishes it durably at the store's name, and only then unlin
 recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor is refused and
 nothing is created. A store that is present is always the authority — reclaim material beside it is
 removed, never consulted. The anchor's unlink and the candidate's are laggable on Windows, so
-`.reclaim*` debris may follow a crash; it never changes which store wins. Cost: one extra copy of the
+`.reclaim*` debris may follow a crash; it never changes which store wins, and a writer open beside
+the present store removes it (docs/support-and-compatibility.md, "Transient names"). Cost: one extra copy of the
 compacted container per reclaim on every platform, and on Windows two write-through renames more.
 
 ---

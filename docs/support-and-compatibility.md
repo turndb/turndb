@@ -15,7 +15,66 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux x86-64 wheels for CPython 3.9–3.13 and installs each exact wheel. Ships **without** the columnar/Arrow lens, SQL, and cooperative cancellation: `turndb.capabilities()` reports `columnar: false`, `arrowIpc: false`, `sql: false`, `cancellation: {scan: false, lifecycle: false}` | Linux x86-64 release candidate; a consumer that needs SQL or cancellation chooses the Rust crate or native Node |
 | Browser viewer | `wasm32-unknown-unknown` structured reader plus local-file and HTTP-range viewer tests in stock Chromium and Firefox | qualified read-only browser artifact when both browser jobs are green |
 | Other Unix systems and architectures | code paths exist but no CI or packaged artifacts prove them | unqualified; no support claim |
-| Native Windows x86-64 | the platform floor in `src/sys.rs` (positioned I/O through `seek_read`/`seek_write`; the writer lock through `LockFileEx` on one byte past any read; durable flush through `FlushFileBuffers`; renames through `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`); a required `windows-latest` job runs clippy, the debug suites, the corruption suite, the crash sweeps under both models, and a cross-OS test that byte-compares a store built on Windows with one built on Linux in both directions. Capability differences, stated: **punch** is `FSCTL_SET_ZERO_DATA` on a sparse file — the range is guaranteed to read as zeros with offsets unmoved (the erasure contract), while the space return is best-effort at NTFS's 64 KiB sparse granularity and is *measured* (`allocated_space_usage`), never promised; the in-place reclaim measurement is asserted on Linux only. **Replacing an open file** (reclaim's final step) takes the POSIX-semantics route, which is not write-through; reclaim's anchor protocol (FORMAT.md, "Free space") is what makes that step crash-safe, at the cost of one extra copy of the compacted container. A process killed between creating a file and publishing its name may leave `<name>.publish-<pid>-<n>` beside the store, and a crash during reclaim may leave `.reclaim*` files; neither is ever consulted over a present store. Not on Windows in this tier: the release-profile suite; packaged native, CLI and Python artifacts (a follow-on) | supported: engine and crash model qualified on `windows-latest` x86-64 when its required gate is green; packaging pending |
+| Native Windows x86-64 | the platform floor in `src/sys.rs` (positioned I/O through `seek_read`/`seek_write`; the writer lock through `LockFileEx` on one byte past any read; durable flush through `FlushFileBuffers`; renames through `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`); a required `windows-latest` job runs clippy, the debug suites, the corruption suite, the crash sweeps under both models, and a cross-OS test that byte-compares a store built on Windows with one built on Linux in both directions. Capability differences, stated: **punch** is `FSCTL_SET_ZERO_DATA` on a sparse file — the range is guaranteed to read as zeros with offsets unmoved (the erasure contract), while the space return is best-effort at NTFS's 64 KiB sparse granularity and is *measured* (`allocated_space_usage`), never promised; the in-place reclaim measurement is asserted on Linux only. **Replacing an open file** (reclaim's final step) takes the POSIX-semantics route, which is not write-through; reclaim's anchor protocol (FORMAT.md, "Free space") is what makes that step crash-safe, at the cost of one extra copy of the compacted container. Transient names a crash can leave beside a store — a pending publish, reclaim material, a staging file — are listed exactly in "Transient names" below: a writer open removes them beside a present store and counts them, refuses to create a store over them beside an absent one, and `turndb inspect` lists them; none is ever consulted over a present store. Not on Windows in this tier: the release-profile suite; packaged native, CLI and Python artifacts (a follow-on) | supported: engine and crash model qualified on `windows-latest` x86-64 when its required gate is green; packaging pending |
+
+## Transient names
+
+Every name the publication and reclaim protocols can leave beside a store after a crash, the
+window that leaves it, and what happens to it. One recognizer produces this inventory
+(`turndb::store::debris_report`, read-only; `debris_report_with_limits` honours directory-entry
+admission), and the same recognizer decides for a writer open. Names are matched exactly, or by
+the layout's own grammar — never by substring: a user's file that merely contains `.publish-` is
+not touched. Every kind below is a variant of `DebrisKind`, a non-exhaustive enum.
+
+| Kind | Exact name | Left by | Beside a **present** store, a writer open… | Beside an **absent** store, a writer open… |
+|---|---|---|---|---|
+| `PendingPublish` | `<final>.publish-<pid>-<n>` after a valid final name of the layout | a Windows process that died before the directory sync that publishes a new name | removes it — it was never durable, never recovery material | refuses to create a fresh store over it, naming it |
+| `ReclaimStaging` | `<store>.reclaiming` | reclaim, before the anchor was published | removes it | refuses to create over it |
+| `ReclaimAnchor` | `<store>.reclaimed` | reclaim, from the anchor's publish until its cleanup landed | removes it (the store is authority) | **recovers the store from it** — not debris until a store exists again |
+| `ReclaimCandidate` | `<store>.reclaim-candidate`, `<store>.reclaim-candidate.tmp` | reclaim or anchor recovery, between the copy and the replace | removes them | refuses to create over them (recovery rebuilds them from the anchor) |
+| `MergeScratch` | `<store>-tmp/` | a crashed streaming merge | removes it | reports it |
+| `ArtifactStaging` | `<artifact>.sealing`, `<artifact>.restoring`, `<artifact>.converting` | a backup / seal, restore or conversion whose destination was `<artifact>`, before it published | removes it | reports it; the operation's retry removes its own stage |
+| `ManifestStaging` | `MANIFEST.tmp` (directory layout) | a commit before its rename | removes it | — |
+| `ExcessRetainedManifest` | `MANIFEST.<commit>` older than the retention window, with a live `MANIFEST` (directory layout) | a commit's prune whose unlink a crash undid | removes it | — |
+| `SegmentSidecarStaging` | `seg-<n>.dir.tmp` in `fold/` or `fold-<generation>/` | a sidecar before its rename | removes it | — |
+| `PartBuilderSpool` | `<part>.s<n>.tmp` (directory layout) | the part builder mid-build | removes it | — |
+| `LegacyHotDirectory` | `<store>-hot/` | a **0.1.x** working session (CHANGELOG 0.1.0, 0.1.2) abandoned before an upgrade; it may hold acknowledged writes only that release can settle | **refuses and names it** — never removes it | refuses to create, names it — never removes it. Open the store with the release that wrote the directory (which adopts and settles it), or move the directory aside deliberately |
+
+`<final>` in the `PendingPublish` row is not free-form: it must be a syntactically valid final
+name of the layout, matched by the layout's own grammar, and a name whose `<final>` is anything
+else is not `PendingPublish` and is never touched. The full list:
+
+- **Single-file layout**, beside `<store>`: `<store>` itself, `<store>-wal`, and
+  `<store>.reclaiming`, `<store>.reclaimed`, `<store>.reclaim-candidate`,
+  `<store>.reclaim-candidate.tmp`, `<store>.sealing`, `<store>.restoring`, `<store>.converting`.
+- **Directory layout, root**: `MANIFEST`, `MANIFEST.tmp`, `MANIFEST.<commit>` (`<commit>` a
+  decimal `u64`), `WAL`, `WRITER.lock`, `part-<seq>.part` and a merged `part-<lo>-<hi>.part`
+  (`u64` sequence numbers), and the builder spool `<part stem>.part.s<n>.tmp` (`<n>` a decimal
+  `u64`).
+- **Fold directories** (`fold/` and every `fold-<generation>/`): `seg-<n>.fold`, `seg-<n>.dir`,
+  `seg-<n>.dir.tmp` (`<n>` a decimal `u32`), and `zdict-<h>.zd` (`<h>` exactly 64 lowercase hex
+  digits — the engine writes lowercase, and nothing else matches).
+
+In `.publish-<pid>-<n>` itself, `<pid>` is a decimal `u32` (the producing `std::process::id()`)
+and `<n>` a decimal `u64` (that process's per-process counter): digits only, and each must parse
+as its type.
+
+The commonest refusal, stated plainly: a crash (or a failed first sync) while a **brand-new**
+store is being created on Windows leaves `<store>.publish-<pid>-<n>` beside a name that does not
+exist. Nothing acknowledged is in it — the store was never published — but nothing proves that
+to the engine either, so the next writer open refuses to create a store there and names the file;
+the user's action is to remove the named file (or move it aside) and open again. `turndb inspect
+<store>` lists it first.
+
+A writer open counts what it removed in `StoreMetrics.debris_removed` — the one disposition a
+returned store can truthfully report. A removal that fails is the open's error, with the path and
+the underlying cause, and nothing is counted (a failed barrier is a failure). A reader never
+mutates; `turndb inspect` prints this inventory before it opens anything, so debris beside an
+absent store, or beside a directory-layout store, is still listed. Not debris, and excluded from
+the inventory: `<store>-wal` and the directory layout's `WAL` (recovery input, replayed and
+settled) and `WRITER.lock`. The deterministic simulator asserts, for every crash state of every
+sweep under both durability models, that after open-and-recover a directory holds only live
+names plus names this inventory reports.
 
 ## Sync failures
 
