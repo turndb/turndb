@@ -36,7 +36,7 @@ pub mod read;
 pub mod refold;
 pub mod wal;
 
-pub use debris::{debris_report, DebrisEntry, DebrisKind, DebrisReport};
+pub use debris::{debris_report, debris_report_with_limits, DebrisEntry, DebrisKind, DebrisReport};
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
@@ -2922,7 +2922,7 @@ impl Store {
             // Transient names beside an ABSENT store — a pending publish that never landed,
             // reclaim material without its anchor — are not proven dead, so nothing is removed;
             // the ones that mean "a store was being published here" refuse creation.
-            let refusing = debris::names_refusing_creation(path)?;
+            let refusing = debris::names_refusing_creation(path, read_limits)?;
             if !refusing.is_empty() {
                 bail!(
                     "{} is absent but transient files sit beside it ({}); not creating a new \
@@ -2969,7 +2969,7 @@ impl Store {
         // material, a Windows pending publish, a merge's scratch, an artifact staging — is dead by
         // the protocol and removed here, counted on success; a removal that fails is this open's
         // error with the path and the cause (#126), and nothing is counted.
-        let debris_removed = debris::remove_beside_present_store(path)?;
+        let debris_removed = debris::remove_beside_present_store(path, read_limits)?;
 
         // The manifest is a member. Missing means a new store — UNLESS retained commits exist,
         // which is the same tripwire the directory store fires: this store has committed before
@@ -3268,7 +3268,7 @@ impl Store {
         // Transient names in the directory: staging files by exact grammar, pending publishes
         // anchored to a valid final name, retained copies past the window — removed, and a
         // removal that fails is this open's error with the path and the cause.
-        let debris_removed = debris::remove_in_dir_layout(dir)?;
+        let debris_removed = debris::remove_in_dir_layout(dir, read_limits)?;
 
         let wal_path = dir.join("WAL");
         let retained_commit_count = list_retained_with_limits(dir, read_limits)?.len();

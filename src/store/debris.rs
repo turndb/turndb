@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::read_limits::ReadLimits;
+
 /// What a transient name is. Each variant is one exact shape; the doc comment is the grammar.
 /// Non-exhaustive: a future protocol may add a class, and a consumer must match with a wildcard.
 ///
@@ -94,7 +96,8 @@ pub(crate) fn is_pending_publish_of(final_name: &str, candidate: &str) -> bool {
     let Some(rest) = candidate.strip_prefix(final_name) else { return false };
     let Some(rest) = rest.strip_prefix(".publish-") else { return false };
     let mut parts = rest.split('-');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(pid), Some(n), None) if decimal_u64(pid).is_some() && decimal_u64(n).is_some())
+    // The producer is `std::process::id()` (u32) and a per-process u64 counter.
+    matches!((parts.next(), parts.next(), parts.next()), (Some(pid), Some(n), None) if decimal_u32(pid).is_some() && decimal_u64(n).is_some())
 }
 
 /// The pending-publish suffix split off a candidate: `Some(final)` if `candidate` is
@@ -159,16 +162,27 @@ pub(crate) struct Found {
     pub is_dir: bool,
 }
 
-/// The entries of `dir`, sorted. An absent directory is an empty scan; any other read error is
-/// the scan's error — a directory that cannot be listed is not a clean one.
-fn entries_in(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
+/// The entries of `dir`, sorted, each counted against the caller's directory-entry admission
+/// under `what` — one budget per directory traversed, as `count_directory_entries` counts. An
+/// absent directory is an empty scan; any other read error is the scan's error — a directory
+/// that cannot be listed is not a clean one.
+fn entries_in(
+    dir: &Path,
+    read_limits: ReadLimits,
+    what: &'static str,
+) -> Result<Vec<std::fs::DirEntry>> {
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
     };
+    let mut visited = 0u64;
     for e in rd {
+        visited = visited.saturating_add(1);
+        read_limits
+            .admit_directory_entries(what, visited)
+            .with_context(|| format!("scanning {}", dir.display()))?;
         out.push(e.with_context(|| format!("read {}", dir.display()))?);
     }
     out.sort_by_key(|e| e.file_name());
@@ -205,7 +219,7 @@ fn single_file_finals(store: &Path) -> Vec<PathBuf> {
 }
 
 /// The pure scan beside a single-file store: every transient name present, nothing decided.
-pub(crate) fn scan_single_file(store: &Path) -> Result<Vec<Found>> {
+pub(crate) fn scan_single_file(store: &Path, read_limits: ReadLimits) -> Result<Vec<Found>> {
     let store_present = store.is_file();
     let names = crate::container::reclaim_names(store);
     let dir = store.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
@@ -236,7 +250,7 @@ pub(crate) fn scan_single_file(store: &Path) -> Result<Vec<Found>> {
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
         .collect();
-    for e in entries_in(&dir)? {
+    for e in entries_in(&dir, read_limits, "store directory during debris scan")? {
         let name = e.file_name();
         if finals.iter().any(|f| is_pending_publish_of_os(f, &name)) && e.path().is_file() {
             found.push(Found { path: e.path(), kind: DebrisKind::PendingPublish, is_dir: false });
@@ -251,19 +265,19 @@ pub(crate) fn scan_single_file(store: &Path) -> Result<Vec<Found>> {
 /// anchored to a valid final name of the root or of a fold directory — every `fold/` and
 /// `fold-<generation>/` directory in the root is entered — and, when the live manifest is
 /// readable, retained copies older than the retention window.
-pub(crate) fn scan_dir_layout(dir: &Path) -> Result<Vec<Found>> {
+pub(crate) fn scan_dir_layout(dir: &Path, read_limits: ReadLimits) -> Result<Vec<Found>> {
     let mut found = Vec::new();
     let live_commit: Option<u64> = super::read_manifest_file(&dir.join("MANIFEST"))
         .ok()
         .and_then(|b| super::Manifest::parse(&b).ok())
         .map(|m| m.commit);
-    for e in entries_in(dir)? {
+    for e in entries_in(dir, read_limits, "store directory during debris scan")? {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         let path = e.path();
         if path.is_dir() {
             if super::refold::parse_fold_gen(name).is_some() || name == "fold" {
-                for fe in entries_in(&path)? {
+                for fe in entries_in(&path, read_limits, "fold directory during debris scan")? {
                     let fname = fe.file_name();
                     let Some(fname) = fname.to_str() else { continue };
                     if !fe.path().is_file() {
@@ -328,7 +342,18 @@ pub(crate) fn scan_dir_layout(dir: &Path) -> Result<Vec<Found>> {
 /// store's (when `path` is a directory), an artifact's staging file — nothing touched. What
 /// `turndb inspect` prints.
 pub fn debris_report(path: &Path) -> Result<DebrisReport> {
-    let found = if path.is_dir() { scan_dir_layout(path)? } else { scan_single_file(path)? };
+    debris_report_with_limits(path, ReadLimits::default())
+}
+
+/// [`debris_report`] with explicit directory-entry admission: every directory the scan reads
+/// is counted against `read_limits` and refused past the bound, as every other read is.
+pub fn debris_report_with_limits(path: &Path, read_limits: ReadLimits) -> Result<DebrisReport> {
+    let read_limits = read_limits.validate()?;
+    let found = if path.is_dir() {
+        scan_dir_layout(path, read_limits)?
+    } else {
+        scan_single_file(path, read_limits)?
+    };
     Ok(DebrisReport {
         entries: found.into_iter().map(|f| DebrisEntry { path: f.path, kind: f.kind }).collect(),
     })
@@ -337,14 +362,14 @@ pub fn debris_report(path: &Path) -> Result<DebrisReport> {
 /// Writer open beside a PRESENT single-file store: everything the scan found is dead by the
 /// protocol and is removed. Returns how many; a removal that fails is the open's error, with the
 /// path and the underlying cause (#126: nothing is counted on failure).
-pub(crate) fn remove_beside_present_store(store: &Path) -> Result<u64> {
+pub(crate) fn remove_beside_present_store(store: &Path, read_limits: ReadLimits) -> Result<u64> {
     debug_assert!(store.is_file());
-    remove_all(scan_single_file(store)?)
+    remove_all(scan_single_file(store, read_limits)?)
 }
 
 /// Writer open of a directory-layout store with a readable live manifest: same rule.
-pub(crate) fn remove_in_dir_layout(dir: &Path) -> Result<u64> {
-    remove_all(scan_dir_layout(dir)?)
+pub(crate) fn remove_in_dir_layout(dir: &Path, read_limits: ReadLimits) -> Result<u64> {
+    remove_all(scan_dir_layout(dir, read_limits)?)
 }
 
 fn remove_all(found: Vec<Found>) -> Result<u64> {
@@ -360,8 +385,11 @@ fn remove_all(found: Vec<Found>) -> Result<u64> {
 
 /// Writer open beside an ABSENT single-file store with no anchor: the names that mean "a store
 /// was being published here". Nothing is removed; a fresh store is not created over them.
-pub(crate) fn names_refusing_creation(store: &Path) -> Result<Vec<PathBuf>> {
-    Ok(scan_single_file(store)?
+pub(crate) fn names_refusing_creation(
+    store: &Path,
+    read_limits: ReadLimits,
+) -> Result<Vec<PathBuf>> {
+    Ok(scan_single_file(store, read_limits)?
         .into_iter()
         .filter(|f| {
             matches!(
@@ -471,6 +499,8 @@ mod tests {
             "uppercase is not what to_hex writes"
         );
         assert!(!is_pending_publish_of("s", "s.publish-18446744073709551616-1"));
+        assert!(!is_pending_publish_of("s", "s.publish-4294967296-1"), "pid is a u32");
+        assert!(is_pending_publish_of("s", "s.publish-4294967295-18446744073709551615"));
     }
 
     #[test]
@@ -488,7 +518,7 @@ mod tests {
         std::fs::write(d.join("s.turndb.restoring"), b"x").unwrap();
         std::fs::write(d.join("my.publish-1-1.notes"), b"mine").unwrap();
         assert_eq!(debris_report(&store).unwrap().entries.len(), 7);
-        assert_eq!(remove_beside_present_store(&store).unwrap(), 7);
+        assert_eq!(remove_beside_present_store(&store, ReadLimits::default()).unwrap(), 7);
         assert_eq!(names_in(&d), vec!["my.publish-1-1.notes", "s.turndb"]);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -500,7 +530,7 @@ mod tests {
         std::fs::write(d.join("s.turndb.publish-4-2"), b"x").unwrap();
         std::fs::write(d.join("s.turndb.reclaim-candidate"), b"x").unwrap();
         std::fs::create_dir_all(d.join("s.turndb-tmp")).unwrap();
-        let refusing = names_refusing_creation(&store).unwrap();
+        let refusing = names_refusing_creation(&store, ReadLimits::default()).unwrap();
         assert_eq!(refusing.len(), 2, "{refusing:?} — the scratch dir reports but does not refuse");
         assert_eq!(names_in(&d).len(), 3, "nothing removed");
         // The anchor beside an absent store is recovery's, not debris.
@@ -514,8 +544,6 @@ mod tests {
     }
 
     #[test]
-    // The Windows branch restores its own scratch file's read-only bit to remove it.
-    #[allow(clippy::permissions_set_readonly_false)]
     fn a_removal_that_fails_is_the_open_error_with_path_and_cause() {
         let d = scratch("fail");
         let store = d.join("s.turndb");
@@ -530,14 +558,14 @@ mod tests {
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
             d.clone()
         };
+        // Windows: Rust >= 1.87 deletes read-only files, so hold the file open with no delete
+        // sharing instead — DeleteFile then fails with a sharing violation.
         #[cfg(windows)]
         let restore = {
-            let mut p = std::fs::metadata(&stale).unwrap().permissions();
-            p.set_readonly(true);
-            std::fs::set_permissions(&stale, p).unwrap();
-            stale.clone()
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(&stale).unwrap()
         };
-        let err = remove_beside_present_store(&store).unwrap_err();
+        let err = remove_beside_present_store(&store, ReadLimits::default()).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("s.turndb.reclaiming"), "{text}");
         assert!(err.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some()), "{text}");
@@ -548,11 +576,7 @@ mod tests {
             std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         #[cfg(windows)]
-        {
-            let mut p = std::fs::metadata(&restore).unwrap().permissions();
-            p.set_readonly(false);
-            std::fs::set_permissions(&restore, p).unwrap();
-        }
+        drop(restore);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -570,7 +594,43 @@ mod tests {
         let r = debris_report(&store).unwrap();
         assert_eq!(r.entries.len(), 1, "{r:?}");
         assert_eq!(r.entries[0].path, PathBuf::from(&temp));
-        assert_eq!(remove_beside_present_store(&store).unwrap(), 1);
+        assert_eq!(remove_beside_present_store(&store, ReadLimits::default()).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory that cannot be listed is not a clean scan: the error is returned, never an
+    /// empty inventory.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_scan_directory_is_an_error_not_a_clean_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads anything; the permission trick cannot fail
+        }
+        let d = scratch("unreadable");
+        let store = d.join("s.turndb");
+        std::fs::write(&store, b"store").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = debris_report(&store);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = r.expect_err("an unreadable directory is an error");
+        assert!(format!("{err:#}").contains("read "), "{err:#}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The scan counts entries against the caller's directory-entry admission.
+    #[test]
+    fn the_scan_refuses_past_the_directory_entry_limit() {
+        let d = scratch("limit");
+        let store = d.join("s.turndb");
+        std::fs::write(&store, b"store").unwrap();
+        for i in 0..8 {
+            std::fs::write(d.join(format!("s.turndb.publish-1-{i}")), b"x").unwrap();
+        }
+        let tight = ReadLimits { max_directory_entries: 4, ..ReadLimits::default() };
+        let err = debris_report_with_limits(&store, tight).unwrap_err();
+        assert!(format!("{err:#}").contains("scanning"), "{err:#}");
+        assert_eq!(debris_report(&store).unwrap().entries.len(), 8);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -616,7 +676,7 @@ mod tests {
                 ("seg-00000002.fold.publish-9-3".to_string(), DebrisKind::PendingPublish),
             ]
         );
-        assert_eq!(remove_in_dir_layout(&d).unwrap(), 5);
+        assert_eq!(remove_in_dir_layout(&d, ReadLimits::default()).unwrap(), 5);
         assert!(d.join("notes.publish-9-1").exists() && d.join("part-00000005.part").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
