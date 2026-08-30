@@ -228,9 +228,18 @@ pub mod record {
     impl std::error::Error for InjectedSyncFailure {}
 
     /// An armed sync fault on the current thread. Dropping it — including during a panic's
-    /// unwinding — disarms the thread, so no later test on this thread inherits it.
+    /// unwinding — disarms the thread, so no later test on this thread inherits it. The state
+    /// is thread-local, so the guard is `!Send` and `!Sync`: it can only be dropped on the
+    /// thread it armed, which is the whole guarantee.
+    ///
+    /// ```compile_fail
+    /// # #[cfg(feature = "dst")] {
+    /// let guard = turndb::vfs::record::fail_sync_after(0);
+    /// std::thread::spawn(move || drop(guard)); // error: `SyncFault` cannot be sent between threads
+    /// # }
+    /// ```
     pub struct SyncFault {
-        _private: (),
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
     }
 
     impl SyncFault {
@@ -259,7 +268,7 @@ pub mod record {
         SYNC_FAULT.with(|f| f.set(Some(n)));
         SYNC_FIRED.with(|f| f.set(None));
         SYNC_ATTEMPTS.with(|a| a.set(0));
-        SyncFault { _private: () }
+        SyncFault { _not_send: std::marker::PhantomData }
     }
 
     /// Consulted by every sync: counts the attempt, and fails exactly once when armed and due.
