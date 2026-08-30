@@ -438,7 +438,8 @@ jobs:
   # This job runs on every event, `needs` everything, and fails unless every dependency SUCCEEDED.
   # `skipped` and `cancelled` are failures here except for cli-slices when its unconditional path
   # Windows x64: the platform floor in src/sys.rs (positioned I/O, LockFileEx, sparse punch,
-  # write-through renames) and every suite the Linux job runs except the release-profile one,
+  # write-through renames) and every suite the Linux job runs except the release-profile one
+  # (which runs in its own required job, "windows x64 release", below),
   # plus the crash sweeps under BOTH durability models (tests/dst.rs: strict POSIX, and Windows
   # built from documented operations only). Required: gate.needs lists it, and gate fails on any
   # result but success — a skipped Windows job is a failed gate.
@@ -507,11 +508,90 @@ jobs:
           test -s "$TURNDB_CROSS_OS_STORE"
           cargo test --test cross_os -- --nocapture
 
+
+  # The release-profile suite on Windows: the same invocation the Linux `rust` job runs
+  # (`cargo test --release --tests`), on the same trigger (every push and pull request), with the
+  # same arming (hosted only while the repository is public — the private free-tier runner class
+  # could not link the DataFusion-static release binaries on either OS; see the `rust` job's
+  # comment). Its own job rather than a step in `windows`: the release link is the wall-time,
+  # memory and disk pole, and a separate job keeps its cache, its disk and its measurement scope
+  # its own. Required exactly as the Linux counterpart is: gate.needs lists it, and a skipped or
+  # cancelled result fails the gate.
+  windows-release:
+    name: windows x64 release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release-v1
+      - name: test (release), measured
+        if: ${{ !github.event.repository.private }}
+        shell: pwsh
+        run: |
+          # Wall time: one stopwatch around the whole invocation. Peak memory: every 2 seconds
+          # the working sets (Win32_Process.WorkingSetSize) of cargo.exe and every live
+          # descendant are summed, and the peak is the largest sample — a floor, not a ceiling:
+          # sampling can miss an instant between samples, and a working set is resident bytes,
+          # not commit charge. Both land in the job summary so drift is visible from the runs
+          # list without opening a log.
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $proc = Start-Process -FilePath 'cargo' -ArgumentList 'test','--release','--tests' -NoNewWindow -PassThru
+          [long]$peak = 0
+          while (-not $proc.HasExited) {
+            Start-Sleep -Seconds 2
+            try {
+              $procs = Get-CimInstance Win32_Process -ErrorAction Stop |
+                Select-Object ProcessId, ParentProcessId, WorkingSetSize
+              $byId = @{}
+              $byParent = @{}
+              foreach ($p in $procs) {
+                $byId[[string]$p.ProcessId] = $p
+                $key = [string]$p.ParentProcessId
+                if (-not $byParent.ContainsKey($key)) { $byParent[$key] = @() }
+                $byParent[$key] += ,$p
+              }
+              [long]$sum = 0
+              $seen = @{}
+              $queue = [System.Collections.Generic.Queue[string]]::new()
+              $queue.Enqueue([string]$proc.Id)
+              while ($queue.Count -gt 0) {
+                $id = $queue.Dequeue()
+                if ($seen.ContainsKey($id)) { continue }
+                $seen[$id] = $true
+                if ($byId.ContainsKey($id)) { $sum += [long]$byId[$id].WorkingSetSize }
+                if ($byParent.ContainsKey($id)) {
+                  foreach ($c in $byParent[$id]) { $queue.Enqueue([string]$c.ProcessId) }
+                }
+              }
+              if ($sum -gt $peak) { $peak = $sum }
+            } catch {
+              # One failed sample is a hole in the floor, not a failed suite.
+            }
+          }
+          $proc.WaitForExit()
+          $sw.Stop()
+          $gib = [math]::Round($peak / 1GB, 2)
+          $wall = $sw.Elapsed.ToString('hh\:mm\:ss')
+          $freeGib = [math]::Round((Get-PSDrive -Name C).Free / 1GB, 1)
+          @(
+            '### windows x64 release'
+            "- wall time: $wall"
+            "- peak memory: $gib GiB (largest 2-second sample of the summed working sets of ``cargo.exe`` and every live descendant; a floor — see the step for scope)"
+            "- disk free after, C: drive: $freeGib GiB"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit $proc.ExitCode
+      - name: release suite deferred on the private free tier
+        if: ${{ github.event.repository.private }}
+        run: |
+          echo "::warning title=release-profile suite not run::exceeds the private free-tier runner class; verified locally on this source per docs/support-and-compatibility.md; arms automatically when the repository is public"
+
   # detector explicitly reports false. That one exception is printed, named, and checked below.
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, cli-slice-changes, cli-slices, python, browser, windows, cross-os]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran
