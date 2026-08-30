@@ -33,12 +33,31 @@ not touched. Every kind below is a variant of `DebrisKind`, a non-exhaustive enu
 | `ReclaimAnchor` | `<store>.reclaimed` | reclaim, from the anchor's publish until its cleanup landed | removes it (the store is authority) | **recovers the store from it** — not debris until a store exists again |
 | `ReclaimCandidate` | `<store>.reclaim-candidate`, `<store>.reclaim-candidate.tmp` | reclaim or anchor recovery, between the copy and the replace | removes them | refuses to create over them (recovery rebuilds them from the anchor) |
 | `MergeScratch` | `<store>-tmp/` | a crashed streaming merge | removes it | reports it |
-| `ArtifactStaging` | `<store>.sealing`, `.restoring`, `.converting` | a backup / seal, restore or conversion whose destination was `<store>`, before it published | removes it | reports it; the operation's retry removes its own stage |
+| `ArtifactStaging` | `<artifact>.sealing`, `<artifact>.restoring`, `<artifact>.converting` | a backup / seal, restore or conversion whose destination was `<artifact>`, before it published | removes it | reports it; the operation's retry removes its own stage |
 | `ManifestStaging` | `MANIFEST.tmp` (directory layout) | a commit before its rename | removes it | — |
 | `ExcessRetainedManifest` | `MANIFEST.<commit>` older than the retention window, with a live `MANIFEST` (directory layout) | a commit's prune whose unlink a crash undid | removes it | — |
 | `SegmentSidecarStaging` | `seg-<n>.dir.tmp` in `fold/` or `fold-<generation>/` | a sidecar before its rename | removes it | — |
 | `PartBuilderSpool` | `<part>.s<n>.tmp` (directory layout) | the part builder mid-build | removes it | — |
 | `LegacyHotDirectory` | `<store>-hot/` | a **0.1.x** working session (CHANGELOG 0.1.0, 0.1.2) abandoned before an upgrade; it may hold acknowledged writes only that release can settle | **refuses and names it** — never removes it | refuses to create, names it — never removes it. Open the store with the release that wrote the directory (which adopts and settles it), or move the directory aside deliberately |
+
+`<final>` in the `PendingPublish` row is not free-form: it must be a syntactically valid final
+name of the layout, matched by the layout's own grammar, and a name whose `<final>` is anything
+else is not `PendingPublish` and is never touched. The full list:
+
+- **Single-file layout**, beside `<store>`: `<store>` itself, `<store>-wal`, and
+  `<store>.reclaiming`, `<store>.reclaimed`, `<store>.reclaim-candidate`,
+  `<store>.reclaim-candidate.tmp`, `<store>.sealing`, `<store>.restoring`, `<store>.converting`.
+- **Directory layout, root**: `MANIFEST`, `MANIFEST.tmp`, `MANIFEST.<commit>` (`<commit>` a
+  decimal `u64`), `WAL`, `WRITER.lock`, `part-<seq>.part` and a merged `part-<lo>-<hi>.part`
+  (`u64` sequence numbers), and the builder spool `<part stem>.part.s<n>.tmp` (`<n>` a decimal
+  `u64`).
+- **Fold directories** (`fold/` and every `fold-<generation>/`): `seg-<n>.fold`, `seg-<n>.dir`,
+  `seg-<n>.dir.tmp` (`<n>` a decimal `u32`), and `zdict-<h>.zd` (`<h>` exactly 64 lowercase hex
+  digits — the engine writes lowercase, and nothing else matches).
+
+In `.publish-<pid>-<n>` itself, `<pid>` is a decimal `u32` (the producing `std::process::id()`)
+and `<n>` a decimal `u64` (that process's per-process counter): digits only, and each must parse
+as its type.
 
 The commonest refusal, stated plainly: a crash (or a failed first sync) while a **brand-new**
 store is being created on Windows leaves `<store>.publish-<pid>-<n>` beside a name that does not
