@@ -53,6 +53,9 @@ usage: turndb <verb> [args]
 
   converting (the one door retired layouts keep):
     convert   <SRC> <OUT>        store directory or pack -> single-file store, verified whole
+
+  about this binary:
+    version                      the crate version compiled in (also --version, -V)
 ";
 
 fn main() {
@@ -296,6 +299,12 @@ fn run(args: &[String]) -> Result<()> {
         }
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
+            Ok(())
+        }
+        // The crate version compiled in, not a string that could drift from it (#97). A bug report
+        // that says "turndb 0.1.6" is worth more than "whatever npm gave me".
+        "version" | "--version" | "-V" => {
+            println!("turndb {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         other => bail!("unknown verb {other:?}\n\n{USAGE}"),
