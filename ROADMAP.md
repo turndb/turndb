@@ -93,7 +93,7 @@ What exists today, by registry, so this claims exactly what is true:
 | Linux arm64 | open | open (#89, in progress) | open | yes |
 | macOS x64 | open | open (#89, in progress) | open | yes |
 | macOS arm64 | open | open (#89, in progress) | open | yes |
-| Windows x64 | open — needs a Windows platform floor in `src/sys.rs` (positioned I/O, writer lock), not only a build | open, same | open, same | yes |
+| Windows x64 | open — the engine floor and crash proof landed 2026-08-30 (obj-mtfoklqo-c: `src/sys.rs` Windows arms, the DST under a documented-operations Windows model, a required `windows-latest` gate, a cross-OS byte-compare); packaging is the follow-on | open, same | open, same | yes |
 
 The portable package runs on every host Node 22–26 does, and gives up exactly three things —
 advisory locking, in-place punch, threads — which the capability contract reports and the front
@@ -324,7 +324,7 @@ Two halves, and the phase is done when both are:
    columnar/SQL lens, no cancellation) where a consumer chooses a binding, or closes it. The
    deliverable is native slices for Linux arm64, macOS x64 and macOS arm64 across the native Node
    package, the Python wheels and the CLI, built and install-tested in CI on the toolchain that
-   targets each; Windows x64 native follows once `src/sys.rs` carries a Windows floor; the portable
+   targets each; Windows x64 native follows now that `src/sys.rs` carries a Windows floor; the portable
    package serves everywhere else, never as a silent fallback. The gate: no consumer on any of the
    five OS slices named above installs TurnDB and inherits a restriction TurnDB did not state up
    front.
