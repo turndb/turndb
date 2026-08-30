@@ -1,7 +1,8 @@
 # Documentation index
 
-Every file under `docs/` other than this index, by its own title. `FORMAT.md` (normative on-disk format), `ROADMAP.md`,
-`CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md` and `SUPPORT.md` live at the repository root.
+Every file under `docs/` other than this index, by its own title. `FORMAT.md` (normative on-disk
+format), `ROADMAP.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md` and `SUPPORT.md` live at the
+repository root.
 
 Start with the [embedding contract](embedding-contract.md) if you are integrating TurnDB, the
 [support and compatibility policy](support-and-compatibility.md) if you are choosing a package, and the
