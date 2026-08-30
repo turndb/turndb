@@ -5,11 +5,17 @@
 //! and each is isolated here rather than cfg-gated at its call sites, so "what does turndb need from
 //! an operating system" has one answer you can read in one place.
 //!
-//! | facility | Unix | WASI | why it is needed |
-//! |---|---|---|---|
-//! | positioned read/write | `std::os::unix::fs::FileExt` | `std::os::wasi::fs::FileExt` | every read is `n` bytes at offset `o`; seek-then-read is not thread-safe |
-//! | advisory whole-file lock | `flock` | **absent** — see [`lock_exclusive`] | the single-writer invariant, enforced by the OS rather than by convention |
-//! | hole punching | `fallocate(PUNCH_HOLE)`, Linux | **absent** | erase content in place without moving a single offset |
+//! | facility | Unix | Windows | WASI | why it is needed |
+//! |---|---|---|---|---|
+//! | positioned read/write | `std::os::unix::fs::FileExt` | `std::os::windows::fs::FileExt` (`seek_read`/`seek_write`, offset per call) | `std::os::wasi::fs::FileExt` | every read is `n` bytes at offset `o`; seek-then-read is not thread-safe |
+//! | advisory whole-file lock | `flock` | `LockFileEx` on one byte past any real offset — see [`lock_exclusive`] | **absent** — see [`lock_exclusive`] | the single-writer invariant, enforced by the OS rather than by convention |
+//! | hole punching | `fallocate(PUNCH_HOLE)`, Linux | `FSCTL_SET_ZERO_DATA` on a sparse file — see [`punch_hole`] | **absent** | erase content in place without moving a single offset |
+//!
+//! Two more are not in that table because Unix gets them from `std` for free and Windows does
+//! not: a **durable rename** ([`rename`], [`rename_noreplace`] — `MoveFileExW` with
+//! `MOVEFILE_WRITE_THROUGH`, because `std::fs::rename` on Windows passes no write-through flag)
+//! and a **directory sync** ([`sync_dir`] — a no-op on Windows, which has no directory fsync;
+//! FORMAT.md states the durability model that replaces it).
 //!
 //! # The honest position on WASI
 //!
@@ -30,14 +36,38 @@ use std::path::Path;
 /// Logical length is not a substitute: punched fold blocks remain inside the file's length while
 /// consuming no blocks. `None` is an explicit capability absence rather than a fabricated value.
 #[cfg(unix)]
-pub(crate) fn allocated_bytes(metadata: &std::fs::Metadata) -> Option<u64> {
+pub(crate) fn allocated_bytes(_path: &Path, metadata: &std::fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks().checked_mul(512)
 }
 
-#[cfg(not(unix))]
-pub(crate) fn allocated_bytes(_metadata: &std::fs::Metadata) -> Option<u64> {
+/// Windows has no allocation count on a metadata record; `GetCompressedFileSizeW` answers by name
+/// and, for a sparse or compressed file, reports the bytes actually allocated — which is what a
+/// punched range gives back. A failure is an explicit `None`, never a logical length in disguise.
+#[cfg(windows)]
+pub(crate) fn allocated_bytes(path: &Path, _metadata: &std::fs::Metadata) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+    let wide = wide_path(path);
+    let mut high: u32 = 0;
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == INVALID_FILE_SIZE && io::Error::last_os_error().raw_os_error() != Some(0) {
+        return None;
+    }
+    Some(((high as u64) << 32) | low as u64)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn allocated_bytes(_path: &Path, _metadata: &std::fs::Metadata) -> Option<u64> {
     None
+}
+
+/// A NUL-terminated UTF-16 path for the wide Win32 entry points. Passed as given: no `\\?\`
+/// prefix is added, so these calls share the classic `MAX_PATH` limit unless the process opted
+/// out of it — the same limit `std` applies to the paths it hands these functions' callers.
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(unix)]
@@ -62,7 +92,30 @@ pub(crate) fn filesystem_available_bytes(path: &Path) -> io::Result<Option<u64>>
     Ok(checked_filesystem_bytes(stats.f_bavail, stats.f_frsize))
 }
 
-#[cfg(not(unix))]
+/// `GetDiskFreeSpaceExW` wants a directory; callers pass one, but a file path is mapped to its
+/// parent rather than failing, so the probe never depends on which the caller happened to hold.
+#[cfg(windows)]
+pub(crate) fn filesystem_available_bytes(path: &Path) -> io::Result<Option<u64>> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let dir = if path.is_file() { path.parent().unwrap_or_else(|| Path::new(".")) } else { path };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let wide = wide_path(dir);
+    let mut available: u64 = 0;
+    let rc = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(available))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn filesystem_available_bytes(_path: &Path) -> io::Result<Option<u64>> {
     Ok(None)
 }
@@ -133,7 +186,55 @@ pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result
     Ok(())
 }
 
-#[cfg(not(any(unix, target_os = "wasi")))]
+// Windows: `seek_read`/`seek_write` hand the offset to `ReadFile`/`WriteFile` through an
+// OVERLAPPED per call, so two threads reading the same `File` at different offsets each get the
+// bytes they asked for — the cursor they also happen to move is never consulted. Both loop, as
+// on Unix: a short transfer means "call again".
+#[cfg(windows)]
+pub(crate) fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_read(buf, off) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "positioned read hit end of file before filling the buffer",
+                ))
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                off += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_write(buf, off) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "positioned write made no progress",
+                ))
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 pub(crate) fn read_exact_at(_f: &File, _buf: &mut [u8], _off: u64) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -141,7 +242,7 @@ pub(crate) fn read_exact_at(_f: &File, _buf: &mut [u8], _off: u64) -> io::Result
     ))
 }
 
-#[cfg(not(any(unix, target_os = "wasi")))]
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 pub(crate) fn write_all_at(_f: &File, _buf: &[u8], _off: u64) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -174,6 +275,15 @@ pub(crate) fn write_all_at(_f: &File, _buf: &[u8], _off: u64) -> io::Result<()> 
 ///
 /// This is a documented reduction in a guarantee the format states, not an oversight; FORMAT.md
 /// says so too.
+///
+/// **On Windows this is `LockFileEx`**, which the OS releases when the handle closes or the
+/// process terminates — the same property that makes `flock` safe. One difference matters:
+/// a Windows byte-range lock is *mandatory*, not advisory — an exclusive lock denies other
+/// handles both reads and writes of the locked range. Readers of a live store never take the
+/// lock and must keep reading, so the lock covers exactly one byte at offset 2^64 − 2, past any
+/// offset a file can hold and past anything a reader ever asks for (locking beyond end-of-file
+/// is explicitly permitted). Contention is `ERROR_LOCK_VIOLATION`; anything else is a real
+/// failure.
 #[inline]
 pub(crate) fn lock_exclusive(f: &File) -> io::Result<bool> {
     #[cfg(unix)]
@@ -191,19 +301,65 @@ pub(crate) fn lock_exclusive(f: &File) -> io::Result<bool> {
             _ => Err(e),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.Offset = LOCK_BYTE_OFFSET as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (LOCK_BYTE_OFFSET >> 32) as u32;
+        let rc = unsafe {
+            LockFileEx(
+                f.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if rc != 0 {
+            return Ok(true);
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(c) if c == ERROR_LOCK_VIOLATION as i32 || c == ERROR_IO_PENDING as i32 => {
+                Ok(false)
+            }
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = f;
         Ok(true)
     }
 }
 
+/// The one byte the Windows writer lock covers: past every offset a file can have, so the
+/// mandatory lock never intersects a read.
+#[cfg(windows)]
+const LOCK_BYTE_OFFSET: u64 = u64::MAX - 1;
+
 // ── Hole punching ───────────────────────────────────────────────────────────
 
 /// Deallocate `len` bytes at `off`, leaving the file's length untouched.
 ///
-/// Linux only. Everywhere else this returns [`io::ErrorKind::Unsupported`], which callers already
-/// treat as "re-fold instead" — reclaiming the same space by rewriting rather than in place.
+/// Linux: `fallocate(PUNCH_HOLE | KEEP_SIZE)`. Windows: the file is marked sparse once
+/// (`FSCTL_SET_SPARSE`, idempotent) and the range zeroed with `FSCTL_SET_ZERO_DATA`. Microsoft's
+/// contract for that call is exact on the bytes and best-effort on the space: the range reads
+/// back as zeros without the length changing, and "if the file is sparse or compressed, the NTFS
+/// file system *may* deallocate disk space" — in practice at NTFS's 64 KiB sparse granularity,
+/// so a hole smaller than that is zeroed but not returned. The erasure contract (bytes gone,
+/// offsets unmoved) therefore holds exactly on Windows; how much space comes back is what
+/// `allocated_bytes` measures rather than something this function promises. Everywhere else
+/// this returns [`io::ErrorKind::Unsupported`], which callers already treat as "re-fold
+/// instead" — reclaiming the same space by rewriting rather than in place.
 #[inline]
 pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
     #[cfg(target_os = "linux")]
@@ -222,7 +378,60 @@ pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Ioctl::{
+            FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        let end = off.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "punch range overflows u64")
+        })?;
+        if end > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "punch range exceeds the Windows file offset space",
+            ));
+        }
+        let h = f.as_raw_handle() as _;
+        let mut returned: u32 = 0;
+        let rc = unsafe {
+            DeviceIoControl(
+                h,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let info =
+            FILE_ZERO_DATA_INFORMATION { FileOffset: off as i64, BeyondFinalZero: end as i64 };
+        let rc = unsafe {
+            DeviceIoControl(
+                h,
+                FSCTL_SET_ZERO_DATA,
+                (&info as *const FILE_ZERO_DATA_INFORMATION).cast(),
+                std::mem::size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (f, off, len);
         Err(io::Error::new(
@@ -283,10 +492,214 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` refuses an existing destination
+/// (`ERROR_ALREADY_EXISTS`), and `MOVEFILE_WRITE_THROUGH` makes the function "not return until
+/// the file is actually moved on the disk" — the durability a directory fsync provides on Unix
+/// and Windows has no other way to ask for.
+#[cfg(windows)]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let (from, to) = (wide_path(from), wide_path(to));
+    let rc = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if rc == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 pub(crate) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is unavailable on this platform",
     ))
+}
+
+// ── Replace rename and directory sync ─────────────────────────────────────
+//
+// On Unix these are `std::fs::rename` and an fsync of the directory: the rename is atomic, and
+// the directory fsync is what makes the new name durable. Windows has no directory fsync. What it
+// has instead is `MOVEFILE_WRITE_THROUGH`, so the rename itself is the durability barrier, and the
+// directory sync becomes a no-op. FORMAT.md, "Durability on Windows", states the model the
+// crash-safety proof runs under on this platform, built from documented operations only: a name
+// is durable when the operation that produced it was write-through, and laggable otherwise.
+
+/// Atomically replace `to` with `from`, durably where the platform needs asking.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// `std::fs::rename` on Windows is `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` with no write-through
+/// flag (library/std/src/sys/fs/windows.rs, Rust 1.95), so the rename could be reordered behind a
+/// power loss. Add the flag: the function returns only once the move is on disk.
+#[cfg(windows)]
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let (from, to) = (wide_path(from), wide_path(to));
+    let rc = unsafe {
+        MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+    };
+    if rc == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Make the names inside `dir` durable: an fsync of the directory itself.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// Windows has no directory fsync, and opening a directory as a file is refused. A name is made
+/// durable only by a write-through rename ([`rename`], [`rename_noreplace`]); `FlushFileBuffers`
+/// covers a file's own bytes and nothing in the namespace. This is a no-op by design, and the DST
+/// harness's Windows model gives `SyncDir` no meaning.
+#[cfg(windows)]
+#[inline]
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    //! The writer lock on Windows is a *mandatory* byte-range lock, so the proof that it gates
+    //! writers without touching readers has to exercise both reader paths Microsoft documents:
+    //! ordinary reads, which fail when they overlap a locked range, and mapped views, which ignore
+    //! byte-range locks entirely. The far-offset byte must be invisible to both.
+    use super::*;
+    use std::io::Write;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("turndb-sys-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn open_rw(p: &Path) -> File {
+        std::fs::OpenOptions::new().read(true).write(true).create(true).open(p).unwrap()
+    }
+
+    #[test]
+    fn second_writer_is_refused_and_the_lock_dies_with_its_handle() {
+        let p = scratch("lock");
+        let a = open_rw(&p);
+        assert!(lock_exclusive(&a).unwrap(), "first writer takes the lock");
+        let b = open_rw(&p);
+        assert!(!lock_exclusive(&b).unwrap(), "second handle sees contention, not an error");
+        drop(a);
+        assert!(lock_exclusive(&b).unwrap(), "closing the holder's handle releases the lock");
+        drop(b);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_ordinary_reader_reads_the_whole_file_under_a_writer_lock() {
+        let p = scratch("lock-read");
+        let mut w = open_rw(&p);
+        w.write_all(&[7u8; 100_000]).unwrap();
+        assert!(lock_exclusive(&w).unwrap());
+        let r = File::open(&p).unwrap();
+        let mut buf = vec![0u8; 100_000];
+        read_exact_at(&r, &mut buf, 0).expect("a lock-free reader must not be denied");
+        assert!(buf.iter().all(|&b| b == 7));
+        // ... and the same through the plain sequential path a CLI tool would take.
+        let all = std::fs::read(&p).unwrap();
+        assert_eq!(all.len(), 100_000);
+        drop(r);
+        drop(w);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_mapped_view_reads_the_whole_file_under_a_writer_lock() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+        };
+
+        let p = scratch("lock-map");
+        let mut w = open_rw(&p);
+        w.write_all(&[9u8; 65_536]).unwrap();
+        w.sync_all().unwrap();
+        assert!(lock_exclusive(&w).unwrap());
+        let r = File::open(&p).unwrap();
+        unsafe {
+            let mapping = CreateFileMappingW(
+                r.as_raw_handle() as _,
+                std::ptr::null(),
+                PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            );
+            assert!(!mapping.is_null(), "CreateFileMappingW: {}", io::Error::last_os_error());
+            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+            assert!(!view.Value.is_null(), "MapViewOfFile: {}", io::Error::last_os_error());
+            let bytes = std::slice::from_raw_parts(view.Value as *const u8, 65_536);
+            assert!(bytes.iter().all(|&b| b == 9), "mapped view must read every byte");
+            assert_ne!(UnmapViewOfFile(view), 0);
+            assert_ne!(CloseHandle(mapping), 0);
+        }
+        drop(r);
+        drop(w);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn punch_zeroes_the_range_and_keeps_the_length() {
+        let p = scratch("punch");
+        let mut f = open_rw(&p);
+        let body: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8 + 1).collect();
+        f.write_all(&body).unwrap();
+        f.sync_all().unwrap();
+        // 64 KiB at a 64 KiB boundary: the one shape NTFS documents as deallocatable; the bytes
+        // are the contract, the space is a measurement.
+        punch_hole(&f, 65_536, 65_536).expect("FSCTL_SET_ZERO_DATA on a sparse file");
+        f.sync_all().unwrap();
+        assert_eq!(f.metadata().unwrap().len(), body.len() as u64, "length unchanged");
+        let mut back = vec![0u8; body.len()];
+        read_exact_at(&f, &mut back, 0).unwrap();
+        assert_eq!(&back[..65_536], &body[..65_536]);
+        assert!(back[65_536..131_072].iter().all(|&b| b == 0), "punched range reads as zeros");
+        assert_eq!(&back[131_072..], &body[131_072..]);
+        let allocated = allocated_bytes(&p, &f.metadata().unwrap());
+        println!(
+            "allocated after punch: {allocated:?} of {} logical (measured, not asserted)",
+            body.len()
+        );
+        drop(f);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rename_noreplace_refuses_an_existing_destination_and_replace_rename_does_not() {
+        let a = scratch("ren-a");
+        let b = scratch("ren-b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let err = rename_noreplace(&a, &b).expect_err("destination exists");
+        assert!(err.raw_os_error().is_some());
+        assert_eq!(std::fs::read(&b).unwrap(), b"b", "destination untouched");
+        rename(&a, &b).expect("replace rename");
+        assert_eq!(std::fs::read(&b).unwrap(), b"a");
+        assert!(!a.exists());
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn free_space_is_measured_for_a_directory_and_for_a_file_path() {
+        let p = scratch("space");
+        std::fs::write(&p, b"x").unwrap();
+        let by_dir = filesystem_available_bytes(&std::env::temp_dir()).unwrap();
+        let by_file = filesystem_available_bytes(&p).unwrap();
+        assert!(by_dir.is_some() && by_file.is_some());
+        let _ = std::fs::remove_file(&p);
+    }
 }

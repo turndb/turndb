@@ -186,16 +186,15 @@ fn corrupted_frame_is_refused_not_served() {
     };
     // flip a byte inside the payload
     {
-        use std::os::unix::fs::FileExt;
         let seg =
             OpenOptions::new().read(true).write(true).open(dir.join("seg-00000000.fold")).unwrap();
         // first block: segment header (48) + block header (16), then into the payload
         let _ = loc;
         let at = 48u64 + 16 + 4;
         let mut b = [0u8; 1];
-        seg.read_exact_at(&mut b, at).unwrap();
+        read_at(&seg, &mut b, at).unwrap();
         b[0] ^= 0xFF;
-        seg.write_all_at(&b, at).unwrap();
+        write_at(&seg, &b, at).unwrap();
         seg.sync_all().unwrap();
     }
     let f = Fold::open(&dir, FoldCfg::default()).unwrap();
@@ -321,13 +320,12 @@ fn read_only_committed_prefix_ignores_damaged_later_bytes() {
     // Damage only the suffix beyond the retained manifest's authority. Recovery of that older
     // candidate must neither trust nor reject bytes the candidate does not name.
     {
-        use std::os::unix::fs::FileExt;
         let path = dir.join(format!("seg-{:08}.fold", committed.seg));
         let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
         let mut byte = [0u8; 1];
-        file.read_exact_at(&mut byte, committed.off as u64 + 20).unwrap();
+        read_at(&file, &mut byte, committed.off as u64 + 20).unwrap();
         byte[0] ^= 0xff;
-        file.write_all_at(&byte, committed.off as u64 + 20).unwrap();
+        write_at(&file, &byte, committed.off as u64 + 20).unwrap();
         file.sync_all().unwrap();
     }
 
@@ -748,4 +746,31 @@ fn a_fold_lives_inside_a_container_and_recovers_by_reading() {
         .unwrap_err();
     assert!(err.to_string().contains("disagree"), "got: {err:#}");
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// Positioned read/write for the byte flips below, on every OS the suite runs on.
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(f, buf, off)
+    }
+    #[cfg(windows)]
+    {
+        let n = std::os::windows::fs::FileExt::seek_read(f, buf, off)?;
+        assert_eq!(n, buf.len(), "short positioned read");
+        Ok(())
+    }
+}
+
+fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+    }
+    #[cfg(windows)]
+    {
+        let n = std::os::windows::fs::FileExt::seek_write(f, buf, off)?;
+        assert_eq!(n, buf.len(), "short positioned write");
+        Ok(())
+    }
 }

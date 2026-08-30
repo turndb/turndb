@@ -2668,6 +2668,7 @@ dependencies = [
  "structured-zstd",
  "tokio",
  "wasi",
+ "windows-sys",
  "zstd",
 ]
 

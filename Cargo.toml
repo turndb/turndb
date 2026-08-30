@@ -84,6 +84,17 @@ zstd = "0.13"
 # flock: the single-writer invariant, enforced by the OS rather than by convention.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# The Windows platform floor: LockFileEx (writer exclusion), MoveFileExW with write-through
+# (durable rename), FSCTL_SET_ZERO_DATA on a sparse file (punch), GetDiskFreeSpaceExW and
+# GetCompressedFileSizeW (space accounting). Raw bindings only; no runtime, no allocation.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl",
+    # Win32_System_Memory + Win32_Security: the lock test's mapped-view reader only
+    # (CreateFileMappingW is gated on the SECURITY_ATTRIBUTES type).
+    "Win32_System_Memory", "Win32_Security",
+] }
+
 [target.'cfg(target_os = "wasi")'.dependencies]
 # Positioned reads via the preview1 syscalls. `std::os::wasi::fs::FileExt` would do the same thing
 # but is still unstable (`wasi_ext`), and an engine that builds only on nightly is not shippable.

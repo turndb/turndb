@@ -218,15 +218,17 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     // it. Opening `""` is ENOENT, so the first quickstart command failed (#121). The empty path
     // means the current directory, so sync the current directory.
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-    File::open(dir)?.sync_all()?;
-    #[cfg(feature = "dst")]
+    crate::sys::sync_dir(dir)?;
+    // On Windows there is no directory fsync and `sys::sync_dir` did nothing, so nothing is
+    // recorded: the simulator's log must hold only operations that happened.
+    #[cfg(all(feature = "dst", not(windows)))]
     push(Op::SyncDir { path: dir.to_path_buf() });
     Ok(())
 }
 
 #[inline]
 pub(crate) fn rename(from: &Path, to: &Path) -> Result<()> {
-    std::fs::rename(from, to)?;
+    crate::sys::rename(from, to)?;
     #[cfg(feature = "dst")]
     push(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
     Ok(())

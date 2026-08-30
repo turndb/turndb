@@ -2542,7 +2542,7 @@ impl Default for SpaceAmount {
         SpaceAmount {
             files: 0,
             logical_bytes: 0,
-            allocated_bytes: if cfg!(unix) { Some(0) } else { None },
+            allocated_bytes: if cfg!(any(unix, windows)) { Some(0) } else { None },
         }
     }
 }
@@ -5877,19 +5877,20 @@ fn account_store_files(
             if file_type.is_dir() {
                 directories.push(entry.path());
             } else if file_type.is_file() {
-                let relative = relative_store_path(root, &entry.path())?;
+                let path = entry.path();
+                let relative = relative_store_path(root, &path)?;
                 let metadata = entry.metadata()?;
-                add_space(&mut usage.total, &metadata)?;
+                add_space(&mut usage.total, &path, &metadata)?;
                 let live = reachability.live_files.contains(&relative)
                     || relative.starts_with(reachability.live_fold);
                 let retained = reachability.retained_files.contains(&relative)
                     || reachability.retained_folds.iter().any(|fold| relative.starts_with(fold));
                 if live {
-                    add_space(&mut usage.live, &metadata)?;
+                    add_space(&mut usage.live, &path, &metadata)?;
                 } else if retained {
-                    add_space(&mut usage.retained_only, &metadata)?;
+                    add_space(&mut usage.retained_only, &path, &metadata)?;
                 } else {
-                    add_space(&mut usage.unclassified, &metadata)?;
+                    add_space(&mut usage.unclassified, &path, &metadata)?;
                 }
             }
         }
@@ -5897,21 +5898,22 @@ fn account_store_files(
     Ok(())
 }
 
-fn add_space(amount: &mut SpaceAmount, metadata: &std::fs::Metadata) -> Result<()> {
+fn add_space(amount: &mut SpaceAmount, path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     amount.files =
         amount.files.checked_add(1).ok_or_else(|| anyhow::anyhow!("store file count overflow"))?;
     amount.logical_bytes = amount
         .logical_bytes
         .checked_add(metadata.len())
         .ok_or_else(|| anyhow::anyhow!("store logical byte count overflow"))?;
-    amount.allocated_bytes = match (amount.allocated_bytes, crate::sys::allocated_bytes(metadata)) {
-        (Some(total), Some(bytes)) => Some(
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| anyhow::anyhow!("store allocated byte count overflow"))?,
-        ),
-        _ => None,
-    };
+    amount.allocated_bytes =
+        match (amount.allocated_bytes, crate::sys::allocated_bytes(path, metadata)) {
+            (Some(total), Some(bytes)) => Some(
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| anyhow::anyhow!("store allocated byte count overflow"))?,
+            ),
+            _ => None,
+        };
     Ok(())
 }
 

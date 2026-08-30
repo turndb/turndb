@@ -437,6 +437,39 @@ jobs:
   #
   # This job runs on every event, `needs` everything, and fails unless every dependency SUCCEEDED.
   # `skipped` and `cancelled` are failures here except for cli-slices when its unconditional path
+  # Windows x64: the platform floor in src/sys.rs (positioned I/O, LockFileEx, sparse punch,
+  # write-through renames) and every suite the Linux job runs except the release-profile one.
+  # The crash sweeps join this job with the Windows durability model (there is no directory
+  # fsync on this platform, so the strict-POSIX model would call every created name volatile);
+  # until then the job says so below rather than running the wrong proof. Not yet in
+  # gate.needs — that wiring lands with the cross-OS test.
+  windows:
+    name: windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-v1
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test (default)
+        run: cargo test
+
+      - name: test (no default features)
+        run: cargo test --no-default-features
+
+      - name: corruption
+        run: cargo test --test corruption
+
+      - name: crash sweeps wait for the Windows durability model
+        run: echo "::notice title=DST not run on Windows yet::the strict-POSIX model has no meaning without directory fsync; the Windows model lands with the next PR and this step becomes the sweep"
+
   # detector explicitly reports false. That one exception is printed, named, and checked below.
   gate:
     name: gate
