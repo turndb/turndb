@@ -108,7 +108,7 @@ mod publish {
 #[cfg(feature = "dst")]
 pub mod record {
     //! The recorder: armed per thread by the DST harness, ignored otherwise.
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
 
     /// One mutating operation, bytes included. `SyncFile`/`SyncDir` are the durability barriers
@@ -200,6 +200,96 @@ pub mod record {
                 v.push(op);
             }
         });
+    }
+
+    thread_local! {
+        // Syncs left before the next one fails, when armed; whether the armed fault fired; and
+        // how many syncs were attempted since the last arming — the evidence that the intended
+        // site was hit. All per thread: the parallel test runner never shares them.
+        static SYNC_FAULT: Cell<Option<usize>> = const { Cell::new(None) };
+        static SYNC_FIRED: Cell<Option<usize>> = const { Cell::new(None) };
+        static SYNC_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The distinctive cause of an injected sync failure, findable by `downcast_ref` through
+    /// the `io::Error` (`get_ref`) inside a caller's `anyhow` chain — never matched by prose.
+    #[derive(Debug)]
+    pub struct InjectedSyncFailure {
+        /// Which attempted sync (0-based, counted from the arming) failed.
+        pub attempt: usize,
+    }
+
+    impl std::fmt::Display for InjectedSyncFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "injected sync failure at attempted sync {}", self.attempt)
+        }
+    }
+
+    impl std::error::Error for InjectedSyncFailure {}
+
+    /// An armed sync fault on the current thread. Dropping it — including during a panic's
+    /// unwinding — disarms the thread, so no later test on this thread inherits it. The state
+    /// is thread-local, so the guard is `!Send` and `!Sync`: it can only be dropped on the
+    /// thread it armed, which is the whole guarantee.
+    ///
+    /// ```compile_fail
+    /// # #[cfg(feature = "dst")] {
+    /// let guard = turndb::vfs::record::fail_sync_after(0);
+    /// std::thread::spawn(move || drop(guard)); // error: `SyncFault` cannot be sent between threads
+    /// # }
+    /// ```
+    pub struct SyncFault {
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl SyncFault {
+        /// The attempted-sync index at which the armed fault fired, if it has — the evidence
+        /// that the intended sync was the one that failed, whatever syncs followed it.
+        pub fn fired_at(&self) -> Option<usize> {
+            SYNC_FIRED.with(|f| f.get())
+        }
+        /// Syncs attempted on this thread since arming, the failed one included.
+        pub fn attempts(&self) -> usize {
+            SYNC_ATTEMPTS.with(|a| a.get())
+        }
+    }
+
+    impl Drop for SyncFault {
+        fn drop(&mut self) {
+            SYNC_FAULT.with(|f| f.set(None));
+        }
+    }
+
+    /// Arm this thread so that the sync after the next `n` syncs (`sync_file` or `sync_dir`)
+    /// returns an I/O error carrying [`InjectedSyncFailure`] instead of syncing, and records
+    /// nothing — a sync that failed did not happen, and the crash model's "no sync" states
+    /// already cover the result. One-shot; the returned guard disarms on drop.
+    pub fn fail_sync_after(n: usize) -> SyncFault {
+        SYNC_FAULT.with(|f| f.set(Some(n)));
+        SYNC_FIRED.with(|f| f.set(None));
+        SYNC_ATTEMPTS.with(|a| a.set(0));
+        SyncFault { _not_send: std::marker::PhantomData }
+    }
+
+    /// Consulted by every sync: counts the attempt, and fails exactly once when armed and due.
+    pub(super) fn sync_fault() -> std::io::Result<()> {
+        let attempt = SYNC_ATTEMPTS.with(|a| {
+            let n = a.get();
+            a.set(n + 1);
+            n
+        });
+        SYNC_FAULT.with(|f| match f.get() {
+            None => Ok(()),
+            Some(0) => {
+                f.set(None);
+                SYNC_FIRED.with(|x| x.set(Some(attempt)));
+                Err(std::io::Error::other(InjectedSyncFailure { attempt }))
+            }
+            Some(left) => {
+                f.set(Some(left - 1));
+                Ok(())
+            }
+        })
     }
 
     /// The number of ops recorded so far — a crash-point cursor for the harness.
@@ -394,6 +484,8 @@ pub(crate) fn write_file(path: &Path, data: &[u8]) -> Result<()> {
 
 #[inline]
 pub(crate) fn sync_file(f: &File, path: &Path) -> Result<()> {
+    #[cfg(feature = "dst")]
+    record::sync_fault()?;
     f.sync_all()?;
     #[cfg(feature = "dst")]
     push(Op::SyncFile { path: path.to_path_buf() });
@@ -409,6 +501,8 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     // it. Opening `""` is ENOENT, so the first quickstart command failed (#121). The empty path
     // means the current directory, so sync the current directory.
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    #[cfg(feature = "dst")]
+    record::sync_fault()?;
     // Windows: publish every file created in `dir` and not yet named, each by a write-through
     // rename — the documented barrier this platform has in place of a directory fsync. The
     // recorded `SyncDir` then means exactly that, and the simulator's Windows model reads it so.

@@ -2125,6 +2125,416 @@ fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Sync failures: a barrier that returns an error, not a crash
+// ---------------------------------------------------------------------------------------------
+//
+// #126: publication paths must never report success after a failed directory sync. Each test
+// records an operation once to locate the target sync by its position in the protocol, runs it
+// again with that sync armed to fail, and asserts: the operation returns an error whose chain
+// carries the injected cause; the guard fired at the intended attempt; the failed sync was not
+// recorded; the real directory converges on a writer open; and the log that now lacks that
+// barrier converges under every crash state of both models — the "sync did not happen" states.
+
+/// `<store>.reclaimed`: reclaim's anchor name, a fixed convention of the protocol.
+fn anchor_of(store: &Path) -> PathBuf {
+    let mut p = store.as_os_str().to_os_string();
+    p.push(".reclaimed");
+    PathBuf::from(p)
+}
+
+fn sync_ops(ops: &[Op]) -> usize {
+    ops.iter().filter(|o| matches!(o, Op::SyncFile { .. } | Op::SyncDir { .. })).count()
+}
+
+/// The attempted-sync index (0-based) of the op at position `at` in `ops`.
+fn sync_index_of(ops: &[Op], at: usize) -> usize {
+    sync_ops(&ops[..at])
+}
+
+/// Position of the last sync op in `ops`.
+fn last_sync_pos(ops: &[Op]) -> usize {
+    ops.iter().rposition(|o| matches!(o, Op::SyncFile { .. } | Op::SyncDir { .. })).expect("a sync")
+}
+
+/// Position of the `SyncDir` immediately following the `Unlink` of `name`.
+fn sync_after_unlink_pos(ops: &[Op], name: &Path) -> usize {
+    let u = ops
+        .iter()
+        .position(|o| matches!(o, Op::Unlink { path } if path == name))
+        .unwrap_or_else(|| panic!("an Unlink of {}", name.display()));
+    ops[u..]
+        .iter()
+        .position(|o| matches!(o, Op::SyncDir { .. }))
+        .map(|k| u + k)
+        .expect("a SyncDir after the unlink")
+}
+
+fn injected_cause(e: &anyhow::Error) -> Option<usize> {
+    e.chain().find_map(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<record::InjectedSyncFailure>())
+            .map(|f| f.attempt)
+    })
+}
+
+/// Run `op` with the sync at attempted index `target` failing. Returns the error and the ops
+/// recorded up to the failure (the failed sync is absent by construction).
+fn run_with_failed_sync<T>(
+    target: usize,
+    op: impl FnOnce() -> Result<T, anyhow::Error>,
+) -> (anyhow::Error, Vec<Op>) {
+    let guard = record::fail_sync_after(target);
+    record::arm();
+    let outcome = op();
+    let ops = record::disarm();
+    let err = match outcome {
+        Ok(_) => panic!("the operation must report the failed sync, but returned success"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        guard.fired_at(),
+        Some(target),
+        "the fault must fire at the intended attempted sync"
+    );
+    assert!(guard.attempts() > target, "attempt evidence: {} attempted", guard.attempts());
+    assert_eq!(
+        injected_cause(&err),
+        Some(target),
+        "the injected cause must be in the error chain: {err:#}"
+    );
+    drop(guard);
+    (err, ops)
+}
+
+/// Convergence under both models for a log that lacks a barrier: every crash state at the end
+/// of `ops` must pass `check`, and so must the real directory as it stands.
+fn converges(
+    tag: &str,
+    base: &Fs,
+    root: &Path,
+    real: &Path,
+    ops: &[Op],
+    mut check: impl FnMut(&Path, &str),
+) {
+    check(real, &format!("{tag}: real directory after the failed sync"));
+    let stage = tmp(&format!("{tag}-syncfail-stage"));
+    for &model in MODELS {
+        let mut fs = base.clone();
+        fs.model = model;
+        for op in ops {
+            fs.apply(op);
+        }
+        for (fs, label) in fs.crash_states(None) {
+            for &variant in VARIANTS {
+                materialize(&fs, variant, root, &stage);
+                check(&stage, &format!("{tag}: {model:?} {label} {variant:?}"));
+            }
+        }
+    }
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+fn serves_all(store: &Path, want: &BTreeMap<String, Vec<u8>>, cfg: FoldCfg, what: &str) {
+    let s = Store::open_file(store, cfg)
+        .unwrap_or_else(|e| panic!("{what}: writer open refused: {e:#}"));
+    for (id, body) in want {
+        assert_eq!(s.reconstruct(id).unwrap().as_deref(), Some(body.as_slice()), "{what}: {id}");
+    }
+    assert_eq!(s.ids().unwrap().len(), want.len(), "{what}: ids");
+    s.close().unwrap_or_else(|e| panic!("{what}: close: {e:#}"));
+}
+
+fn settled_store(root: &Path, tag: usize) -> (PathBuf, FoldCfg, BTreeMap<String, Vec<u8>>) {
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let want = build_settled_file_store(&file, cfg, tag);
+    (file, cfg, want)
+}
+
+#[test]
+fn a_failed_directory_sync_after_container_create_is_reported_and_leaves_no_store_or_a_whole_one() {
+    let root = tmp("syncfail-create");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("new.turndb");
+    // Locate: the create's own directory sync is its last sync.
+    record::arm();
+    turndb::container::Container::create(&path).unwrap();
+    let ops = record::disarm();
+    let target = sync_index_of(&ops, last_sync_pos(&ops));
+    std::fs::remove_file(&path).unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || turndb::container::Container::create(&path));
+    assert!(format!("{err:#}").contains("after creating"), "{err:#}");
+    assert_eq!(sync_ops(&ops), target, "the failed sync was not recorded");
+    converges("create", &base, &root, &root, &ops, |dir, what| {
+        let p = dir.join("new.turndb");
+        if p.exists() {
+            turndb::container::Container::open(&p)
+                .unwrap_or_else(|e| panic!("{what}: a present container must open: {e:#}"));
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_recreating_an_interrupted_container_is_reported() {
+    let root = tmp("syncfail-recreate");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("s.turndb");
+    let cfg = FoldCfg::default();
+    let short = || std::fs::write(&path, vec![0u8; 100]).unwrap(); // shorter than the slots
+    short();
+    record::arm();
+    Store::open_file(&path, cfg).unwrap().close().unwrap();
+    let ops = record::disarm();
+    // Locate: the first SyncDir after the first SyncFile of the store file — the rebirth's.
+    let sf = ops.iter().position(|o| matches!(o, Op::SyncFile { path: p } if *p == path)).unwrap();
+    let sd = sf + ops[sf..].iter().position(|o| matches!(o, Op::SyncDir { .. })).unwrap();
+    let target = sync_index_of(&ops, sd);
+    std::fs::remove_file(&path).unwrap();
+    let _ = std::fs::remove_file(root.join("s.turndb-wal"));
+    short();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || Store::open_file(&path, cfg).map(|_| ()));
+    assert!(format!("{err:#}").contains("after creating"), "{err:#}");
+    converges("recreate", &base, &root, &root, &ops, |dir, what| {
+        let p = dir.join("s.turndb");
+        if p.exists() && std::fs::metadata(&p).unwrap().len() > turndb::container::REGION_START {
+            turndb::container::Container::open(&p)
+                .unwrap_or_else(|e| panic!("{what}: a reborn container must open: {e:#}"));
+        }
+        // An interrupted or absent file is exactly what a writer open finishes.
+        Store::open_file(&p, cfg)
+            .unwrap_or_else(|e| panic!("{what}: writer open: {e:#}"))
+            .close()
+            .unwrap();
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_backup_publication_is_reported_and_the_artifact_is_all_or_nothing()
+{
+    let root = tmp("syncfail-backup");
+    std::fs::create_dir_all(&root).unwrap();
+    let (file, cfg, want) = settled_store(&root, 300);
+    let out = root.join("backup.turndb");
+    record::arm();
+    {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        s.backup(&out).unwrap();
+        s.close().unwrap();
+    }
+    let ops = record::disarm();
+    let pos = ops.iter().rposition(|o| matches!(o, Op::Rename { to, .. } if *to == out)).unwrap();
+    let sd = pos + ops[pos..].iter().position(|o| matches!(o, Op::SyncDir { .. })).unwrap();
+    let target = sync_index_of(&ops, sd);
+    std::fs::remove_file(&out).unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let r = s.backup(&out);
+        let _ = s.close();
+        r.map(|_| ())
+    });
+    assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
+    converges("backup", &base, &root, &root, &ops, |dir, what| {
+        serves_all(&dir.join("s.turndb"), &want, cfg, what);
+        let b = dir.join("backup.turndb");
+        if b.exists() {
+            let c = turndb::container::Container::open(&b)
+                .unwrap_or_else(|e| panic!("{what}: a published backup must open: {e:#}"));
+            c.verify().unwrap_or_else(|e| panic!("{what}: published backup verify: {e:#}"));
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_restore_publication_is_reported_and_the_destination_is_all_or_nothing(
+) {
+    let root = tmp("syncfail-restore");
+    std::fs::create_dir_all(&root).unwrap();
+    let srcroot = tmp("syncfail-restore-src");
+    std::fs::create_dir_all(&srcroot).unwrap();
+    let (srcfile, cfg, want) = settled_store(&srcroot, 400);
+    let origin = root.join("origin.turndb");
+    {
+        let mut s = Store::open_file(&srcfile, cfg).unwrap();
+        s.backup(&origin).unwrap();
+        s.close().unwrap();
+    }
+    std::fs::remove_dir_all(&srcroot).ok();
+    let dest = root.join("restored.turndb");
+    record::arm();
+    turndb::store::restore_file(&origin, &dest).unwrap();
+    let ops = record::disarm();
+    let target = sync_index_of(&ops, last_sync_pos(&ops));
+    std::fs::remove_file(&dest).unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) =
+        run_with_failed_sync(target, || turndb::store::restore_file(&origin, &dest).map(|_| ()));
+    assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
+    converges("restore", &base, &root, &root, &ops, |dir, what| {
+        let d = dir.join("restored.turndb");
+        if d.exists() {
+            serves_all(&d, &want, cfg, what);
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_conversion_publication_is_reported_and_rerunning_converges() {
+    let root = tmp("syncfail-convert");
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.join("store");
+    unpack_dir_fixture(&work);
+    let want = fixture_expectations();
+    let cfg = FoldCfg::default();
+    let container = root.join("state.turndb");
+    record::arm();
+    turndb::store::convert_to_file(&work, &container).unwrap();
+    let ops = record::disarm();
+    let target = sync_index_of(&ops, last_sync_pos(&ops));
+    std::fs::remove_file(&container).unwrap();
+    std::fs::remove_dir_all(&work).unwrap();
+    unpack_dir_fixture(&work);
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || {
+        turndb::store::convert_to_file(&work, &container).map(|_| ())
+    });
+    assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
+    converges("convert", &base, &root, &root, &ops, |dir, what| {
+        let file = dir.join("state.turndb");
+        if !file.exists() {
+            turndb::store::convert_to_file(&dir.join("store"), &file)
+                .unwrap_or_else(|e| panic!("{what}: conversion cannot be re-run: {e:#}"));
+        }
+        let rs = turndb::store::open_read_container(&file, cfg)
+            .unwrap_or_else(|e| panic!("{what}: converted store refuses a reader: {e:#}"));
+        for (id, body) in &want {
+            assert_eq!(
+                rs.reconstruct(id).unwrap().as_deref(),
+                Some(body.as_slice()),
+                "{what}: {id}"
+            );
+        }
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_whole() {
+    let root = tmp("syncfail-reclaim");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for round in 0..6usize {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let id = format!("w:{round}");
+        let body = body_for(800 + round);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert(id, body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let snapshot = tmp("syncfail-reclaim-snap");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::copy(&file, snapshot.join("s.turndb")).unwrap();
+    record::arm();
+    turndb::container::reclaim(&file).unwrap();
+    let ops = record::disarm();
+    let anchor = anchor_of(&file);
+    let target = sync_index_of(&ops, sync_after_unlink_pos(&ops, &anchor));
+    std::fs::copy(snapshot.join("s.turndb"), &file).unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || turndb::container::reclaim(&file).map(|_| ()));
+    assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
+    converges("reclaim", &base, &root, &root, &ops, |dir, what| {
+        serves_all(&dir.join("s.turndb"), &want, cfg, what);
+    });
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&snapshot).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_anchor_recovery_cleanup_is_reported_and_the_store_is_whole() {
+    let root = tmp("syncfail-recover");
+    std::fs::create_dir_all(&root).unwrap();
+    let (file, cfg, want) = settled_store(&root, 500);
+    let anchor = anchor_of(&file);
+    std::fs::rename(&file, &anchor).unwrap();
+    let snapshot = tmp("syncfail-recover-snap");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::copy(&anchor, snapshot.join("anchor")).unwrap();
+    record::arm();
+    Store::open_file(&file, cfg).unwrap().close().unwrap();
+    let ops = record::disarm();
+    let target = sync_index_of(&ops, sync_after_unlink_pos(&ops, &anchor));
+    for e in std::fs::read_dir(&root).unwrap().flatten() {
+        std::fs::remove_file(e.path()).unwrap();
+    }
+    std::fs::copy(snapshot.join("anchor"), &anchor).unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || Store::open_file(&file, cfg).map(|_| ()));
+    assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
+    converges("recover", &base, &root, &root, &ops, |dir, what| {
+        serves_all(&dir.join("s.turndb"), &want, cfg, what);
+    });
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&snapshot).ok();
+}
+
+#[test]
+fn a_failed_directory_sync_after_close_removes_the_wal_is_reported_and_the_store_serves_everything()
+{
+    let root = tmp("syncfail-close");
+    std::fs::create_dir_all(&root).unwrap();
+    let (file, cfg, mut want) = settled_store(&root, 600);
+    let wal = root.join("s.turndb-wal");
+    let session = |want: &mut BTreeMap<String, Vec<u8>>| {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let body = body_for(999);
+        s.put("late", &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert("late".into(), body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s
+    };
+    record::arm();
+    session(&mut want).close().unwrap();
+    let ops = record::disarm();
+    let target = sync_index_of(&ops, sync_after_unlink_pos(&ops, &wal));
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || session(&mut want).close());
+    assert!(format!("{err:#}").contains("after removing the write-ahead log"), "{err:#}");
+    converges("close", &base, &root, &root, &ops, |dir, what| {
+        serves_all(&dir.join("s.turndb"), &want, cfg, what);
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The free-space punch is physical-only — no commit, no declaration, nothing referenced — so
 /// its whole crash contract is: at every crash state, every record answers exactly as before,
 /// and reopening never refuses. A punch that could disturb an answer would mean the free list

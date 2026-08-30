@@ -1645,7 +1645,11 @@ fn seal_container_copy(
     drop(fresh);
     crate::vfs::rename_noreplace(&staging, out)?;
     if let Some(parent) = out.parent() {
-        let _ = crate::vfs::sync_dir(parent);
+        // The published name is the result; a failed directory sync means it may not survive a
+        // crash, and the operation reports that rather than success.
+        crate::vfs::sync_dir(parent).with_context(|| {
+            format!("sync {} after publishing {}", parent.display(), out.display())
+        })?;
     }
     Ok(crate::pack::BackupStats { files: names.len(), bytes, commit: manifest.commit })
 }
@@ -2205,7 +2209,8 @@ fn recover_store_from_reclaim_anchor(
     crate::vfs::sync_dir(&parent)?;
     drop(anchor);
     let _ = crate::vfs::unlink(&names.anchor);
-    let _ = crate::vfs::sync_dir(&parent);
+    crate::vfs::sync_dir(&parent)
+        .with_context(|| format!("sync {} after removing the reclaim anchor", parent.display()))?;
     drop(new_store);
     Ok(())
 }
@@ -2478,7 +2483,9 @@ pub fn restore_file_with_control(
     }
     crate::vfs::rename_noreplace(&staging, dst)?;
     if let Some(parent) = dst.parent() {
-        let _ = crate::vfs::sync_dir(parent);
+        crate::vfs::sync_dir(parent).with_context(|| {
+            format!("sync {} after publishing {}", parent.display(), dst.display())
+        })?;
     }
     // Member bytes, not file length: the same accounting the backup reported, so a consumer can
     // compare the two stats and see the identity they describe.
@@ -2576,7 +2583,11 @@ pub fn convert_to_file(src: &Path, out: &Path) -> Result<ConvertStats> {
     };
     crate::vfs::rename_noreplace(&staging, out)?;
     if let Some(parent) = out.parent() {
-        let _ = crate::vfs::sync_dir(parent);
+        // The published name is the result; a failed directory sync means it may not survive a
+        // crash, and the operation reports that rather than success.
+        crate::vfs::sync_dir(parent).with_context(|| {
+            format!("sync {} after publishing {}", parent.display(), out.display())
+        })?;
     }
     Ok(stats)
 }
@@ -3108,7 +3119,10 @@ impl Store {
                 let wal_path = file_wal_path(path);
                 let _ = crate::vfs::unlink(&wal_path);
                 if let Some(parent) = wal_path.parent() {
-                    let _ = crate::vfs::sync_dir(parent);
+                    // "Exactly one file" is close's promise; it is not durable if this fails.
+                    crate::vfs::sync_dir(parent).with_context(|| {
+                        format!("sync {} after removing the write-ahead log", parent.display())
+                    })?;
                 }
             }
         }
