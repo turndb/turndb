@@ -27,7 +27,7 @@
 //! Run with: `cargo test --features dst --test dst`
 #![cfg(feature = "dst")]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
@@ -914,7 +914,11 @@ fn every_crash_state_recovers_to_an_acked_consistent_store() {
                         continue; // nothing durable yet — an empty directory is a new store
                     }
                     let r = catch_unwind(AssertUnwindSafe(|| {
-                        check_state(&stage, &issued, &boundaries, floor, k, variant)
+                        check_state(&stage, &issued, &boundaries, floor, k, variant);
+                        assert_directory_settled(
+                            &stage,
+                            &format!("workload crash point {k} {model:?} {label} {variant:?}"),
+                        );
                     }));
                     if r.is_err() {
                         eprintln!("--- {model:?} {label}: op trace up to crash point {k} ---");
@@ -1110,6 +1114,215 @@ fn check_state(
 /// Replay every op prefix × variant of one recorded protocol run on top of a durable baseline,
 /// materializing each crash state under `stage` and handing it to `check`. Returns the number of
 /// states checked. Every prefix and every variant is checked — nothing is subsampled.
+/// After open-and-recover, a directory holds only live names plus reported debris — never a
+/// silently accumulated transient (obj-mtg0jtf1-l, outcome c). Every `*.turndb` file and every
+/// directory-layout store in `dir` is opened as a writer (sealed artifacts are readers only)
+/// and closed; then `debris_report` beside a PRESENT store must be empty — the open removed
+/// what the protocol proves dead — and beside an absent store every remaining transient is
+/// one the report names, which is the definition of "reported". Anything the report does not
+/// recognise and that is not a store, an artifact, or a directory layout's own file is an
+/// unexplained leave-behind, and fails.
+fn assert_directory_settled(dir: &Path, what: &str) {
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // Every entry is observed, or the state fails: a per-entry read error is not a clean
+    // directory.
+    let list = |label: &str| -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .and_then(|rd| rd.map(|e| e.map(|e| e.path())).collect())
+            .unwrap_or_else(|e| panic!("{what}: read {} {label}: {e}", dir.display()));
+        entries.sort();
+        entries
+    };
+    let entries = list("before the settling opens");
+    let refusal_kind = |kind: turndb::store::DebrisKind| {
+        matches!(
+            kind,
+            turndb::store::DebrisKind::PendingPublish
+                | turndb::store::DebrisKind::ReclaimStaging
+                | turndb::store::DebrisKind::ReclaimCandidate
+                | turndb::store::DebrisKind::LegacyHotDirectory
+        )
+    };
+    let wal_of = |base: &Path| {
+        let mut w = base.as_os_str().to_os_string();
+        w.push("-wal");
+        PathBuf::from(w)
+    };
+    let report_of = |store: &Path| {
+        turndb::store::debris_report(store)
+            .unwrap_or_else(|e| panic!("{what}: debris_report {}: {e:#}", store.display()))
+    };
+    let describe = |report: &turndb::store::DebrisReport| {
+        report.entries.iter().map(|e| (e.path.display().to_string(), e.kind)).collect::<Vec<_>>()
+    };
+    // Stores and artifacts: `<name>.turndb` files, and directory-layout stores.
+    let mut stores: Vec<PathBuf> = Vec::new();
+    let mut known: BTreeSet<PathBuf> = BTreeSet::new();
+    for p in &entries {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        let is_file_store = p.is_file() && name.ends_with(".turndb");
+        let is_dir_store = p.is_dir()
+            && (p.join("MANIFEST").exists() || p.join("fold").exists() || p.join("WAL").exists());
+        if is_file_store || is_dir_store {
+            stores.push(p.clone());
+        }
+    }
+    for store in &stores {
+        known.insert(store.clone());
+        known.insert(wal_of(store)); // a present store's sidecar: recovery input, settled by open
+        let sealed = store.is_file()
+            && turndb::container::Container::open(store).map(|c| c.sealed()).unwrap_or(false);
+        // The report BEFORE this assertion's own writer open: whatever that open removes must
+        // have been reported here, or it vanished unreported.
+        let before = report_of(store);
+        for e in &before.entries {
+            known.insert(e.path.clone());
+        }
+        // A directory-layout store has no public writer open (its one door is `convert`), so
+        // it gets the report-only check below; a single-file store is opened as a writer.
+        let opened: Option<Result<u64, String>> = if !sealed && store.is_file() {
+            Some(match Store::open_file(store, cfg) {
+                Ok(s) => {
+                    let removed = s.metrics().debris_removed;
+                    s.close()
+                        .unwrap_or_else(|e| panic!("{what}: close {}: {e:#}", store.display()));
+                    Ok(removed)
+                }
+                Err(e) => Err(format!("{e:#}")),
+            })
+        } else {
+            None
+        };
+        let report = report_of(store);
+        match opened {
+            // A successful writer open removed everything the protocol proves dead — and
+            // counted exactly what the report before it named.
+            Some(Ok(removed)) => {
+                assert!(
+                    report.entries.is_empty(),
+                    "{what}: transient names survived a writer open beside present {}: {:?}",
+                    store.display(),
+                    describe(&report)
+                );
+                assert_eq!(
+                    removed,
+                    before.entries.len() as u64,
+                    "{what}: writer open of {} counted {removed} removed; the report before it named {:?}",
+                    store.display(),
+                    describe(&before)
+                );
+            }
+            // A writer refusal is a report in its own right — proven structurally: the report is
+            // non-empty, every kind is in the never-removed / refusal vocabulary, and the error
+            // names every reported path. The string alone classifies nothing.
+            Some(Err(text)) => {
+                assert!(
+                    !report.entries.is_empty()
+                        && report.entries.iter().all(|e| refusal_kind(e.kind))
+                        && report.entries.iter().all(|e| text.contains(&e.path.display().to_string())),
+                    "{what}: writer open of {} refused for a reason that is not a structural debris report: {text}; report {:?}",
+                    store.display(),
+                    describe(&report)
+                );
+            }
+            // Sealed artifacts and directory-layout stores: readers only; the report is allowed.
+            None => {}
+        }
+        for e in &report.entries {
+            known.insert(e.path.clone());
+        }
+    }
+    // A transient beside an ABSENT store or artifact — an operation's staging file, or a Windows
+    // pending temp of any of the store's names — is reported by `debris_report(<store>)`, whose
+    // finals include the staging and reclaim names. Derive the store's name from the entry:
+    // strip a pending-publish suffix, then any staging, reclaim or sidecar suffix. An absent
+    // base's exact `-wal` is recovery input and allowed, nothing suffix-wide.
+    for p in &entries {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        let mut base = name.clone();
+        if let Some(at) = base.rfind(".publish-") {
+            let tail = &base[at + ".publish-".len()..];
+            let mut parts = tail.split('-');
+            if let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) {
+                if pid.parse::<u32>().is_ok() && n.parse::<u64>().is_ok() {
+                    base.truncate(at);
+                }
+            }
+        }
+        for suffix in [
+            ".sealing",
+            ".restoring",
+            ".converting",
+            ".reclaiming",
+            ".reclaimed",
+            ".reclaim-candidate.tmp",
+            ".reclaim-candidate",
+            "-wal",
+            "-tmp",
+            "-hot",
+        ] {
+            if let Some(b) = base.strip_suffix(suffix) {
+                base = b.to_string();
+                break;
+            }
+        }
+        if base != name && !base.is_empty() {
+            let store = dir.join(&base);
+            for e in &report_of(&store).entries {
+                known.insert(e.path.clone());
+            }
+            known.insert(wal_of(&store));
+        }
+    }
+    // Nothing may vanish unreported: an entry the settling opens removed must be a live name
+    // the protocol consumes or debris a report named before the open.
+    let after = list("after the settling opens");
+    let present: BTreeSet<&PathBuf> = after.iter().collect();
+    let vanished: Vec<String> = entries
+        .iter()
+        .filter(|p| !present.contains(p) && !known.contains(*p))
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        vanished.is_empty(),
+        "{what}: entries removed by open without a report naming them: {vanished:?}"
+    );
+    // Everything still in the directory must be a store's own name or reported debris.
+    let mut unexplained: Vec<String> = Vec::new();
+    for p in &after {
+        if known.contains(p) {
+            continue;
+        }
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        // Fixture inputs the sweeps place beside stores are named here explicitly.
+        let is_input = name == "pack.bin" || name.ends_with(".jsonl");
+        if !is_input {
+            unexplained.push(name);
+        }
+    }
+    assert!(
+        unexplained.is_empty(),
+        "{what}: unexplained files after open-and-recover: {unexplained:?}"
+    );
+}
+
+/// Windows leaves the pending temp of a conversion's staging name beside the converted store when
+/// the sync that would have published it failed; the re-run unlinks the staging name, not its
+/// temp, and the next writer open removes it. The assertion attributes that removal to the report
+/// taken before its own open — the shape the `windows x64` run of #147 hit.
+#[test]
+fn settled_assertion_accounts_for_what_its_own_writer_open_removes() {
+    let root = tmp("settled-own-open");
+    unpack_dir_fixture(&root.join("store"));
+    let file = root.join("state.turndb");
+    turndb::store::convert_to_file(&root.join("store"), &file).unwrap();
+    let stray = root.join("state.turndb.converting.publish-3580-8116");
+    std::fs::write(&stray, b"partial").unwrap();
+    assert_directory_settled(&root, "own-open");
+    assert!(!stray.exists(), "the writer open removes the pending temp of the staging name");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 fn replay_recorded(
     tag: &str,
     base: &Fs,
@@ -1129,7 +1342,13 @@ fn replay_recorded(
             for (fs, label) in fs.crash_states(ops.get(k)) {
                 for &variant in VARIANTS {
                     materialize(&fs, variant, root, stage);
-                    let r = catch_unwind(AssertUnwindSafe(|| check(stage, k, variant)));
+                    let r = catch_unwind(AssertUnwindSafe(|| {
+                        check(stage, k, variant);
+                        assert_directory_settled(
+                            stage,
+                            &format!("{tag} crash point {k} {model:?} {label} {variant:?}"),
+                        );
+                    }));
                     if r.is_err() {
                         eprintln!(
                             "--- {tag} {model:?} {label}: op trace up to crash point {k} ---"
@@ -2280,6 +2499,7 @@ fn converges(
     let restarted = tmp(&format!("{stage_tag}-syncfail-restart"));
     copy_tree(real, &restarted);
     check(&restarted, &format!("{label}: real directory after the failed sync (restart-shaped)"));
+    assert_directory_settled(&restarted, &format!("{label}: real directory (restart-shaped)"));
     std::fs::remove_dir_all(&restarted).ok();
     // The stage directory's name must be a valid file name on every platform: no ':' or '('.
     let stage = tmp(&format!("{stage_tag}-syncfail-stage"));
@@ -2293,6 +2513,10 @@ fn converges(
             for &variant in VARIANTS {
                 materialize(&fs, variant, root, &stage);
                 check(&stage, &format!("{label}: {model:?} {sublabel} {variant:?}"));
+                assert_directory_settled(
+                    &stage,
+                    &format!("{label}: {model:?} {sublabel} {variant:?}"),
+                );
             }
         }
     }
