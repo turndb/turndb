@@ -73,8 +73,13 @@ fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
 
     const MAX_PATH: usize = 260;
     let plain: Vec<u16> = path.as_os_str().encode_wide().collect();
-    // Room for the terminating NUL, as the Win32 limit counts it.
-    if plain.len() < MAX_PATH || plain.contains(&0) {
+    // An interior NUL would silently truncate the name at the Win32 boundary; `std` refuses it
+    // with `InvalidInput`, and so does this.
+    if plain.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"));
+    }
+    // The Win32 limit counts the terminating NUL.
+    if plain.len() < MAX_PATH {
         return Ok(plain.into_iter().chain(std::iter::once(0)).collect());
     }
     let already_verbatim = matches!(
@@ -752,17 +757,58 @@ mod windows_tests {
         let _ = std::fs::remove_file(&b);
     }
 
+    /// A path with an interior NUL is refused the way `std` refuses it, never truncated at the
+    /// Win32 boundary into a different name.
+    #[test]
+    fn a_path_with_an_interior_nul_is_invalid_input_not_a_truncated_name() {
+        use std::os::windows::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_wide(&[b'a' as u16, 0, b'b' as u16]);
+        let bad = Path::new(&bad);
+        let err = wide_path(bad).expect_err("interior NUL");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(rename(bad, bad).expect_err("rename").kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            rename_noreplace(bad, bad).expect_err("rename_noreplace").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            filesystem_available_bytes(bad).expect_err("free space").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let meta = std::fs::metadata(std::env::temp_dir()).unwrap();
+        assert_eq!(allocated_bytes(bad, &meta), None);
+    }
+
     /// Every raw call here goes through `wide_path`, so the one thing that could silently regress
-    /// against `std` is the classic 260-character limit. Build a path well past it and drive
-    /// rename, no-replace rename, free space and allocation through it.
+    /// against `std` is the classic 260-character limit. Build a path well past it — under the
+    /// current directory, so the RELATIVE form is exercised deterministically rather than only
+    /// when the temp directory happens to sit under cwd — and drive rename, no-replace rename,
+    /// free space and allocation through both forms.
     #[test]
     fn paths_past_max_path_work_for_rename_and_the_space_measurements() {
-        let mut dir = std::env::temp_dir().join(format!("turndb-long-{}", std::process::id()));
-        while dir.as_os_str().len() < 300 {
-            dir.push("a-deliberately-long-directory-component-0123456789");
+        let base = Path::new("target").join(format!("turndb-long-{}", std::process::id()));
+        let mut rel = base.clone();
+        while rel.as_os_str().len() < 300 {
+            rel.push("a-deliberately-long-directory-component-0123456789");
         }
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(dir.as_os_str().len() > 260);
+        // Relative and past the limit on its own: `std::fs` handles it, so every raw call must.
+        std::fs::create_dir_all(&rel).unwrap();
+        assert!(rel.is_relative() && rel.as_os_str().len() > 260);
+        {
+            let a = rel.join("rel-a.turndb");
+            let b = rel.join("rel-b.turndb");
+            std::fs::write(&a, b"a").unwrap();
+            rename_noreplace(&a, &b).expect("relative no-replace rename past MAX_PATH");
+            std::fs::write(&a, b"a2").unwrap();
+            rename(&a, &b).expect("relative replace rename past MAX_PATH");
+            assert_eq!(std::fs::read(&b).unwrap(), b"a2");
+            assert!(filesystem_available_bytes(&rel).unwrap().is_some());
+            assert!(filesystem_available_bytes(&b).unwrap().is_some());
+            assert!(allocated_bytes(&b, &std::fs::metadata(&b).unwrap()).is_some());
+        }
+        // The absolute form of the same directory.
+        let dir = std::path::absolute(&rel).unwrap();
+        assert!(dir.is_absolute() && dir.as_os_str().len() > 260);
         let a = dir.join("a.turndb");
         let b = dir.join("b.turndb");
         let c = dir.join("c.turndb");
@@ -779,20 +825,7 @@ mod windows_tests {
             allocated_bytes(&b, &std::fs::metadata(&b).unwrap()).map(|n| n >= 1),
             Some(true)
         );
-        // and a relative form of the same, which the verbatim conversion must absolutize
-        let cwd = std::env::current_dir().unwrap();
-        let rel = pathdiff_relative(&cwd, &b);
-        if let Some(rel) = rel {
-            assert!(filesystem_available_bytes(&rel).unwrap().is_some());
-        }
-        drop(std::fs::remove_dir_all(
-            std::env::temp_dir().join(format!("turndb-long-{}", std::process::id())),
-        ));
-    }
-
-    /// `b` relative to `base`, when `b` is under it; `None` otherwise (different drive, etc.).
-    fn pathdiff_relative(base: &Path, b: &Path) -> Option<std::path::PathBuf> {
-        b.strip_prefix(base).ok().map(Path::to_path_buf)
+        drop(std::fs::remove_dir_all(&base));
     }
 
     #[test]
