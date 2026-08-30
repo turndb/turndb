@@ -2198,7 +2198,13 @@ fn run_with_failed_sync<T>(
         Some(target),
         "the fault must fire at the intended attempted sync"
     );
-    assert!(guard.attempts() > target, "attempt evidence: {} attempted", guard.attempts());
+    // The failed sync is absent from the recording and every other attempted sync is present:
+    // an operation may go on syncing after the failure (a close, say), and those are real.
+    assert_eq!(
+        sync_ops(&ops),
+        guard.attempts() - 1,
+        "recorded syncs must be every attempted sync except the failed one"
+    );
     assert_eq!(
         injected_cause(&err),
         Some(target),
@@ -2211,29 +2217,51 @@ fn run_with_failed_sync<T>(
 /// Convergence under both models for a log that lacks a barrier: every crash state at the end
 /// of `ops` must pass `check`, and so must the real directory as it stands.
 fn converges(
-    tag: &str,
+    stage_tag: &str,
+    label: &str,
     base: &Fs,
     root: &Path,
     real: &Path,
     ops: &[Op],
     mut check: impl FnMut(&Path, &str),
 ) {
-    check(real, &format!("{tag}: real directory after the failed sync"));
-    let stage = tmp(&format!("{tag}-syncfail-stage"));
+    // The real directory, restart-shaped: its on-disk bytes — debris included — copied into a
+    // directory no process state knows. In this process the Windows pending-publication registry
+    // still remembers a name whose sync failed; a restarted process would not, and a writer open
+    // must be checked as that process would run it.
+    let restarted = tmp(&format!("{stage_tag}-syncfail-restart"));
+    copy_tree(real, &restarted);
+    check(&restarted, &format!("{label}: real directory after the failed sync (restart-shaped)"));
+    std::fs::remove_dir_all(&restarted).ok();
+    // The stage directory's name must be a valid file name on every platform: no ':' or '('.
+    let stage = tmp(&format!("{stage_tag}-syncfail-stage"));
     for &model in MODELS {
         let mut fs = base.clone();
         fs.model = model;
         for op in ops {
             fs.apply(op);
         }
-        for (fs, label) in fs.crash_states(None) {
+        for (fs, sublabel) in fs.crash_states(None) {
             for &variant in VARIANTS {
                 materialize(&fs, variant, root, &stage);
-                check(&stage, &format!("{tag}: {model:?} {label} {variant:?}"));
+                check(&stage, &format!("{label}: {model:?} {sublabel} {variant:?}"));
             }
         }
     }
     std::fs::remove_dir_all(&stage).ok();
+}
+
+/// Copy a directory tree's files byte for byte — what a restart sees, nothing more.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let dst = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dst);
+        } else {
+            std::fs::copy(e.path(), dst).unwrap();
+        }
+    }
 }
 
 fn serves_all(store: &Path, want: &BTreeMap<String, Vec<u8>>, cfg: FoldCfg, what: &str) {
@@ -2269,8 +2297,7 @@ fn a_failed_directory_sync_after_container_create_is_reported_and_leaves_no_stor
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || turndb::container::Container::create(&path));
     assert!(format!("{err:#}").contains("after creating"), "{err:#}");
-    assert_eq!(sync_ops(&ops), target, "the failed sync was not recorded");
-    converges("create", &base, &root, &root, &ops, |dir, what| {
+    converges("create", "create", &base, &root, &root, &ops, |dir, what| {
         let p = dir.join("new.turndb");
         if p.exists() {
             turndb::container::Container::open(&p)
@@ -2303,7 +2330,7 @@ fn a_failed_directory_sync_after_recreating_an_interrupted_container_is_reported
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || Store::open_file(&path, cfg).map(|_| ()));
     assert!(format!("{err:#}").contains("after creating"), "{err:#}");
-    converges("recreate", &base, &root, &root, &ops, |dir, what| {
+    converges("recreate", "recreate", &base, &root, &root, &ops, |dir, what| {
         let p = dir.join("s.turndb");
         if p.exists() && std::fs::metadata(&p).unwrap().len() > turndb::container::REGION_START {
             turndb::container::Container::open(&p)
@@ -2346,7 +2373,7 @@ fn a_failed_directory_sync_after_backup_publication_is_reported_and_the_artifact
         r.map(|_| ())
     });
     assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("backup", &base, &root, &root, &ops, |dir, what| {
+    converges("backup", "backup", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
         let b = dir.join("backup.turndb");
         if b.exists() {
@@ -2385,7 +2412,7 @@ fn a_failed_directory_sync_after_restore_publication_is_reported_and_the_destina
     let (err, ops) =
         run_with_failed_sync(target, || turndb::store::restore_file(&origin, &dest).map(|_| ()));
     assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("restore", &base, &root, &root, &ops, |dir, what| {
+    converges("restore", "restore", &base, &root, &root, &ops, |dir, what| {
         let d = dir.join("restored.turndb");
         if d.exists() {
             serves_all(&d, &want, cfg, what);
@@ -2417,7 +2444,7 @@ fn a_failed_directory_sync_after_conversion_publication_is_reported_and_rerunnin
         turndb::store::convert_to_file(&work, &container).map(|_| ())
     });
     assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("convert", &base, &root, &root, &ops, |dir, what| {
+    converges("convert", "convert", &base, &root, &root, &ops, |dir, what| {
         let file = dir.join("state.turndb");
         if !file.exists() {
             turndb::store::convert_to_file(&dir.join("store"), &file)
@@ -2467,7 +2494,7 @@ fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_wh
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || turndb::container::reclaim(&file).map(|_| ()));
     assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
-    converges("reclaim", &base, &root, &root, &ops, |dir, what| {
+    converges("reclaim", "reclaim", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
@@ -2497,7 +2524,7 @@ fn a_failed_directory_sync_after_anchor_recovery_cleanup_is_reported_and_the_sto
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || Store::open_file(&file, cfg).map(|_| ()));
     assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
-    converges("recover", &base, &root, &root, &ops, |dir, what| {
+    converges("recover", "recover", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
@@ -2529,10 +2556,571 @@ fn a_failed_directory_sync_after_close_removes_the_wal_is_reported_and_the_store
     base.seed_durable(&root);
     let (err, ops) = run_with_failed_sync(target, || session(&mut want).close());
     assert!(format!("{err:#}").contains("after removing the write-ahead log"), "{err:#}");
-    converges("close", &base, &root, &root, &ops, |dir, what| {
+    converges("close", "close", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The sync-failure variant: every sweep, every attempted sync, failing once
+// ---------------------------------------------------------------------------------------------
+//
+// For each sweep's operation: record it once to count its syncs, then run it S more times, the
+// j-th attempted sync failing on the j-th run. Every run must report the failure with the
+// injected cause in its chain, the failed sync must be absent from the recording, and both the
+// real directory and every crash state of the barrier-less recording under both models must pass
+// the sweep's own convergence check. The punch sweeps are not publication paths (a punch that did
+// not sync is a punch that may not have happened, already covered by the crash sweeps) and are
+// not in this set.
+
+fn sync_failure_variant<W>(
+    tag: &str,
+    prepare: impl Fn(&Path) -> W,
+    op: impl Fn(&Path, &W) -> Result<(), anyhow::Error>,
+    check: impl Fn(&Path, &W, &str),
+) -> usize {
+    let root = tmp(&format!("{tag}-syncvar-count"));
+    std::fs::create_dir_all(&root).unwrap();
+    let w = prepare(&root);
+    record::arm();
+    op(&root, &w).unwrap_or_else(|e| panic!("{tag}: the unarmed operation must succeed: {e:#}"));
+    let syncs = sync_ops(&record::disarm());
+    std::fs::remove_dir_all(&root).ok();
+    assert!(syncs > 0, "{tag}: the operation must sync at least once");
+
+    for j in 0..syncs {
+        let root = tmp(&format!("{tag}-syncvar-{j}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let w = prepare(&root);
+        let mut base = Fs::new(Model::Posix);
+        base.seed_durable(&root);
+        let (err, ops) = run_with_failed_sync(j, || op(&root, &w));
+        let label = format!("{tag}: sync {j} of {syncs} failed ({})", short_err(&err));
+        converges(&format!("{tag}-syncvar-{j}"), &label, &base, &root, &root, &ops, |dir, what| {
+            check(dir, &w, what)
+        });
+        std::fs::remove_dir_all(&root).ok();
+    }
+    syncs
+}
+
+fn short_err(e: &anyhow::Error) -> String {
+    let s = e.to_string();
+    if s.len() > 80 {
+        format!("{}…", &s[..80])
+    } else {
+        s
+    }
+}
+
+fn cfg4k() -> FoldCfg {
+    FoldCfg { block_target: 4 * 1024, ..Default::default() }
+}
+
+#[test]
+fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
+    let cfg = cfg4k();
+    let n = sync_failure_variant(
+        "backup",
+        |root| build_settled_file_store(&root.join("store.turndb"), cfg, 200),
+        |root, _| {
+            let mut s = Store::open_file(&root.join("store.turndb"), cfg)?;
+            let r = s.backup(&root.join("backup.turndb")).map(|_| ());
+            let c = s.close();
+            r.and(c)
+        },
+        |dir, want, what| {
+            serves_all(&dir.join("store.turndb"), want, cfg, what);
+            let b = dir.join("backup.turndb");
+            if b.exists() {
+                let c = turndb::container::Container::open(&b)
+                    .unwrap_or_else(|e| panic!("{what}: a torn artifact at the FINAL name: {e:#}"));
+                assert!(c.sealed(), "{what}: a published backup must be sealed");
+                c.verify().unwrap_or_else(|e| panic!("{what}: backup verify: {e:#}"));
+                let rs = turndb::store::open_read_container(&b, cfg).unwrap();
+                for (id, body) in want {
+                    assert_eq!(
+                        rs.reconstruct(id).unwrap().as_deref(),
+                        Some(body.as_slice()),
+                        "{what}: {id}"
+                    );
+                }
+            }
+        },
+    );
+    println!("dst sync-failure backup: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_restore_sync_failure_is_reported_and_the_destination_is_all_or_nothing() {
+    let cfg = cfg4k();
+    let n = sync_failure_variant(
+        "restore",
+        |root| {
+            let srcroot = root.join("src");
+            std::fs::create_dir_all(&srcroot).unwrap();
+            let want = build_settled_file_store(&srcroot.join("src.turndb"), cfg, 400);
+            let mut s = Store::open_file(&srcroot.join("src.turndb"), cfg).unwrap();
+            s.backup(&root.join("origin.turndb")).unwrap();
+            s.close().unwrap();
+            std::fs::remove_dir_all(&srcroot).unwrap();
+            want
+        },
+        |root, _| {
+            turndb::store::restore_file(&root.join("origin.turndb"), &root.join("restored.turndb"))
+                .map(|_| ())
+        },
+        |dir, want, what| {
+            let d = dir.join("restored.turndb");
+            if d.exists() {
+                serves_all(&d, want, cfg, what);
+            }
+        },
+    );
+    println!("dst sync-failure restore: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_conversion_sync_failure_is_reported_and_rerunning_converges() {
+    let cfg = FoldCfg::default();
+    let n = sync_failure_variant(
+        "conversion",
+        |root| {
+            unpack_dir_fixture(&root.join("store"));
+            fixture_expectations()
+        },
+        |root, _| {
+            turndb::store::convert_to_file(&root.join("store"), &root.join("state.turndb"))
+                .map(|_| ())
+        },
+        |dir, want, what| {
+            let file = dir.join("state.turndb");
+            if !file.exists() {
+                turndb::store::convert_to_file(&dir.join("store"), &file)
+                    .unwrap_or_else(|e| panic!("{what}: conversion cannot be re-run: {e:#}"));
+            }
+            let rs = turndb::store::open_read_container(&file, cfg)
+                .unwrap_or_else(|e| panic!("{what}: converted store refuses a reader: {e:#}"));
+            for (id, body) in want {
+                assert_eq!(
+                    rs.reconstruct(id).unwrap().as_deref(),
+                    Some(body.as_slice()),
+                    "{what}: {id}"
+                );
+            }
+        },
+    );
+    println!("dst sync-failure conversion: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_reclaim_sync_failure_is_reported_and_the_store_is_whole() {
+    let cfg = cfg4k();
+    let n = sync_failure_variant(
+        "reclaim",
+        |root| {
+            let file = root.join("s.turndb");
+            let mut want = BTreeMap::new();
+            for round in 0..6usize {
+                let mut s = Store::open_file(&file, cfg).unwrap();
+                let id = format!("w:{round}");
+                let body = body_for(600 + round);
+                s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                want.insert(id, body);
+                s.sync().unwrap();
+                s.flush().unwrap();
+                s.close().unwrap();
+            }
+            want
+        },
+        |root, _| turndb::container::reclaim(&root.join("s.turndb")).map(|_| ()),
+        |dir, want, what| serves_all(&dir.join("s.turndb"), want, cfg, what),
+    );
+    println!("dst sync-failure reclaim: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_session_sync_failure_is_reported_and_acknowledged_writes_survive() {
+    let cfg = cfg4k();
+    // `before` is committed before the session; `expected` maps every id the session may ack
+    // to its bytes — a partial session leaves any prefix of them, each exact if present.
+    let n = sync_failure_variant(
+        "session",
+        |root| {
+            let file = root.join("live.turndb");
+            let mut before = BTreeMap::new();
+            let mut s = Store::open_file(&file, cfg).unwrap();
+            for i in 0..5usize {
+                let id = format!("before:{i}");
+                let body = body_for(700 + i);
+                s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                before.insert(id, body);
+            }
+            s.sync().unwrap();
+            s.flush().unwrap();
+            s.close().unwrap();
+            let mut expected = before.clone();
+            for i in 0..3usize {
+                expected.insert(format!("acked:a{i}"), body_for(800 + i));
+                expected.insert(format!("acked:b{i}"), body_for(900 + i));
+            }
+            (before, expected)
+        },
+        |root, _| {
+            let mut s = Store::open_file(&root.join("live.turndb"), cfg)?;
+            for i in 0..3usize {
+                s.put(&format!("acked:a{i}"), &[Span::Piece(&body_for(800 + i))], vec![])?;
+            }
+            s.sync()?;
+            s.flush()?;
+            for i in 0..3usize {
+                s.put(&format!("acked:b{i}"), &[Span::Piece(&body_for(900 + i))], vec![])?;
+            }
+            s.sync()?;
+            s.close()
+        },
+        |dir, (before, expected), what| {
+            let file = dir.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s = Store::open_file(&file, cfg)
+                .unwrap_or_else(|e| panic!("{what}: reopen refused: {e:#}"));
+            for (id, body) in expected {
+                match s.reconstruct(id).unwrap() {
+                    Some(got) => assert_eq!(got, *body, "{what}: {id} came back but drifted"),
+                    None => assert!(
+                        !before.contains_key(id),
+                        "{what}: {id} predates the session and vanished"
+                    ),
+                }
+            }
+            s.close().unwrap();
+        },
+    );
+    println!("dst sync-failure session: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_merge_sync_failure_is_reported_and_answers_identically() {
+    let cfg = cfg4k();
+    let n = sync_failure_variant(
+        "merge",
+        |root| {
+            let file = root.join("live.turndb");
+            let mut s = Store::open_file(&file, cfg).unwrap();
+            for round in 0..3usize {
+                for i in 0..6usize {
+                    let id = format!("m:{:02}", (round * 3 + i) % 9);
+                    s.put(&id, &[Span::Piece(&body_for(round * 50 + i))], vec![]).unwrap();
+                }
+                s.sync().unwrap();
+                s.flush().unwrap();
+            }
+            s.delete("m:02").unwrap();
+            s.sync().unwrap();
+            s.flush().unwrap();
+            s.close().unwrap();
+            let s = Store::open_file(&file, cfg).unwrap();
+            let oracle: BTreeMap<String, Option<Vec<u8>>> = (0..9usize)
+                .map(|i| {
+                    let id = format!("m:{i:02}");
+                    let v = s.reconstruct(&id).unwrap();
+                    (id, v)
+                })
+                .collect();
+            s.close().unwrap();
+            oracle
+        },
+        |root, _| {
+            let mut s = Store::open_file(&root.join("live.turndb"), cfg)?;
+            s.merge_range(0, 4)?.ok_or_else(|| anyhow::anyhow!("four parts merge"))?;
+            s.close()
+        },
+        |dir, oracle, what| {
+            let file = dir.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s =
+                Store::open_file(&file, cfg).unwrap_or_else(|e| panic!("{what}: refuses: {e:#}"));
+            for (id, want) in oracle {
+                assert_eq!(
+                    &s.reconstruct(id).unwrap(),
+                    want,
+                    "{what}: {id} must answer identically"
+                );
+            }
+            s.close().unwrap();
+        },
+    );
+    println!("dst sync-failure merge: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_erase_sync_failure_is_reported_and_answers_honestly() {
+    let cfg = cfg4k();
+    let n = sync_failure_variant(
+        "erase",
+        |root| {
+            let file = root.join("live.turndb");
+            let mut bodies = BTreeMap::new();
+            let mut s = Store::open_file(&file, cfg).unwrap();
+            for i in 0..6usize {
+                let id = format!("e:{i}");
+                let body = body_for(i);
+                s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                bodies.insert(id, body);
+            }
+            s.sync().unwrap();
+            s.flush().unwrap();
+            s.close().unwrap();
+            bodies
+        },
+        |root, _| {
+            let mut s = Store::open_file(&root.join("live.turndb"), cfg)?;
+            s.erase_ids(&["e:2".to_string()])?;
+            s.close()
+        },
+        |dir, bodies, what| {
+            let file = dir.join("live.turndb");
+            if !file.exists() {
+                return;
+            }
+            let s =
+                Store::open_file(&file, cfg).unwrap_or_else(|e| panic!("{what}: refuses: {e:#}"));
+            for (id, body) in bodies {
+                let got = s.reconstruct(id).unwrap();
+                if id == "e:2" {
+                    if let Some(got) = got {
+                        assert_eq!(got, *body, "{what}: the erased id drifted");
+                    }
+                } else {
+                    assert_eq!(
+                        got.as_ref(),
+                        Some(body),
+                        "{what}: survivor {id} must answer exactly"
+                    );
+                }
+            }
+            s.close().unwrap();
+        },
+    );
+    println!("dst sync-failure erase: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_recovery_sync_failure_is_reported_and_converges_on_the_promoted_timeline() {
+    let cfg = cfg4k();
+    let n = sync_failure_variant(
+        "recovery",
+        |root| {
+            let file = root.join("s.turndb");
+            let mut per_commit: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
+            let mut s = Store::open_file(&file, cfg).unwrap();
+            let mut now = BTreeMap::new();
+            for c in 1usize..=4 {
+                for i in 0..3usize {
+                    let id = format!("c{c}:{i}");
+                    let body = body_for(300 + c * 10 + i);
+                    s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                    now.insert(id, body);
+                }
+                s.sync().unwrap();
+                s.flush().unwrap();
+                per_commit.push(now.clone());
+            }
+            s.close().unwrap();
+            for name in ["MANIFEST", "MANIFEST.00000004", "MANIFEST.00000003"] {
+                flip_member_byte(&file, name, 0.5);
+            }
+            per_commit[1].clone()
+        },
+        |root, _| {
+            turndb::store::recover_manifest_file(
+                &root.join("s.turndb"),
+                cfg,
+                RecoveryOptions { max_rollback_commits: 2 },
+            )
+            .map(|r| assert_eq!(r.commit, 2))
+        },
+        |dir, want, what| {
+            let f = dir.join("s.turndb");
+            let store = match Store::open_file(&f, cfg) {
+                Ok(s) => s,
+                Err(_) => {
+                    let r = turndb::store::recover_manifest_file(
+                        &f,
+                        cfg,
+                        RecoveryOptions { max_rollback_commits: 2 },
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: recovery cannot resume: {e:#}"));
+                    assert_eq!(r.commit, 2, "{what}: re-run recovery promoted a different commit");
+                    Store::open_file(&f, cfg)
+                        .unwrap_or_else(|e| panic!("{what}: open after recovery: {e:#}"))
+                }
+            };
+            assert_eq!(store.manifest().commit, 2, "{what}");
+            store.close().unwrap();
+            let rs = turndb::store::open_read_container(&f, cfg).unwrap();
+            assert_eq!(rs.ids().unwrap(), want.keys().cloned().collect::<Vec<_>>(), "{what}: ids");
+            for (id, body) in want {
+                assert_eq!(
+                    rs.reconstruct(id).unwrap().as_deref(),
+                    Some(body.as_slice()),
+                    "{what}: {id}"
+                );
+            }
+        },
+    );
+    println!("dst sync-failure recovery: {n} syncs, each failed once, both models");
+}
+
+#[test]
+fn every_migration_sync_failure_is_reported_and_resumes() {
+    let cfg = FoldCfg::default();
+    let want: [(&str, &[u8]); 2] =
+        [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
+    let n = sync_failure_variant(
+        "migration",
+        |root| {
+            let pack = root.join("pack.bin");
+            std::fs::write(&pack, revision_one_pack_bytes()).unwrap();
+            turndb::store::convert_to_file(&pack, &root.join("legacy.turndb")).unwrap();
+            std::fs::remove_file(&pack).unwrap();
+        },
+        |root, _| {
+            let mut s = Store::open_file(&root.join("legacy.turndb"), cfg)?;
+            while s.migrate_format_step()?.is_some() {}
+            Ok(())
+        },
+        |dir, _, what| {
+            let mut s = Store::open_file(&dir.join("legacy.turndb"), cfg)
+                .unwrap_or_else(|e| panic!("{what}: open refused mid-migration: {e:#}"));
+            let mut steps = 0usize;
+            while s
+                .migrate_format_step()
+                .unwrap_or_else(|e| panic!("{what}: cannot resume: {e:#}"))
+                .is_some()
+            {
+                steps += 1;
+                assert!(steps <= 2, "{what}: more steps than legacy parts");
+            }
+            let status = s.format_migration_status().unwrap();
+            assert_eq!((status.legacy_parts, status.current_parts), (0, 2), "{what}: incomplete");
+            for (id, bytes) in &want {
+                assert_eq!(
+                    s.reconstruct_content(id, BODY_CONTENT).unwrap().as_deref(),
+                    Some(*bytes),
+                    "{what}: {id}"
+                );
+            }
+        },
+    );
+    println!("dst sync-failure migration: {n} syncs, each failed once, both models");
+}
+
+/// The main workload, fallible: the same writes as `run_workload`, returning at the first error
+/// with what was issued and acknowledged up to it, so the check can hold the acked floor.
+fn run_workload_fallible(
+    dir: &Path,
+    issued: &mut Vec<Issued>,
+    acks: &mut Vec<Ack>,
+) -> Result<(), anyhow::Error> {
+    let cfg = cfg4k();
+    let mut group = 0usize;
+    let mut s = Store::open_file(&dir.join("s.turndb"), cfg)?;
+    for round in 0..3usize {
+        for i in 0..6usize {
+            let id = format!("r{round}:{i}");
+            let body = body_for(round * 10 + i);
+            s.put(&id, &[Span::Lit(b"["), Span::Piece(&body), Span::Lit(b"]")], vec![])?;
+            let mut want = b"[".to_vec();
+            want.extend_from_slice(&body);
+            want.extend_from_slice(b"]");
+            group += 1;
+            issued.push((group, id, Some(Expect::body(want))));
+        }
+        if round == 1 {
+            s.delete("r0:0")?;
+            group += 1;
+            issued.push((group, "r0:0".into(), None));
+        }
+        s.sync()?;
+        acks.push((record::len(), issued.len()));
+        s.flush()?;
+    }
+    s.merge_range(0, 2)?;
+    s.close()?;
+    let mut s = Store::open_file(&dir.join("s.turndb"), cfg)?;
+    s.delete("r2:5")?;
+    group += 1;
+    issued.push((group, "r2:5".into(), None));
+    s.sync()?;
+    acks.push((record::len(), issued.len()));
+    s.flush()?;
+    s.close()?;
+    Ok(())
+}
+
+#[test]
+fn every_workload_sync_failure_is_reported_and_recovers_to_an_acked_consistent_store() {
+    // Count the syncs of a clean run.
+    let root = tmp("workload-syncvar-count");
+    std::fs::create_dir_all(root.join("store")).unwrap();
+    let (mut issued, mut acks) = (Vec::new(), Vec::new());
+    record::arm();
+    run_workload_fallible(&root.join("store"), &mut issued, &mut acks).unwrap();
+    let syncs = sync_ops(&record::disarm());
+    std::fs::remove_dir_all(&root).ok();
+    assert!(syncs > 5);
+
+    let mut checked = 0usize;
+    for j in 0..syncs {
+        let root = tmp(&format!("workload-syncvar-{j}"));
+        let work = root.join("store");
+        std::fs::create_dir_all(&work).unwrap();
+        let (mut issued, mut acks) = (Vec::new(), Vec::new());
+        let base = Fs::new(Model::Posix);
+        let (err, ops) =
+            run_with_failed_sync(j, || run_workload_fallible(&work, &mut issued, &mut acks));
+        let floor = acks.last().map(|(_, p)| *p).unwrap_or(0);
+        let boundaries = group_boundaries(&issued);
+        let label = format!("workload: sync {j} of {syncs} failed ({})", short_err(&err));
+        let stage = root.join("stage");
+        for &model in MODELS {
+            let mut fs = base.clone();
+            fs.model = model;
+            for op in &ops {
+                fs.apply(op);
+            }
+            for (fs, sub) in fs.crash_states(None) {
+                for &variant in VARIANTS {
+                    if !materialize(&fs, variant, &work, &stage) {
+                        continue;
+                    }
+                    let r = catch_unwind(AssertUnwindSafe(|| {
+                        check_state(&stage, &issued, &boundaries, floor, ops.len(), variant)
+                    }));
+                    assert!(r.is_ok(), "{label}: {model:?} {sub} {variant:?} FAILED");
+                    checked += 1;
+                }
+            }
+        }
+        // And the real directory as the failed run left it — restart-shaped: copied into a
+        // directory no process state (the Windows pending-publication registry) knows.
+        let restarted = root.join("restarted");
+        copy_tree(&work, &restarted);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            check_state(&restarted, &issued, &boundaries, floor, ops.len(), Variant::AllLanded)
+        }));
+        assert!(r.is_ok(), "{label}: the real directory after the failed sync (restart-shaped)");
+        std::fs::remove_dir_all(&root).ok();
+    }
+    println!(
+        "dst sync-failure workload: {syncs} syncs each failed once; {checked} states, both models"
+    );
 }
 
 /// The free-space punch is physical-only — no commit, no declaration, nothing referenced — so
