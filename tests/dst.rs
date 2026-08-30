@@ -1947,6 +1947,77 @@ fn every_single_file_erase_crash_answers_honestly() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
+/// Reclaim's publication protocol — anchor, candidate, uncertain replace, laggable cleanup —
+/// at every crash point, under both models. The claim: whenever `<store>` exists it is whole and
+/// serves every record; whenever it does not, a writer open recovers it from the anchor and
+/// then serves every record; opening never refuses; and a second open converges on the same
+/// store. Debris (`.reclaim*`) may remain; it never changes which store wins.
+#[test]
+fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
+    let root = tmp("reclaim");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    // Sessions leave superseded extents; enough of them that reclaim has real work.
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for round in 0..6usize {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let id = format!("w:{round}");
+        let body = body_for(600 + round);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert(id, body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    assert!(turndb::container::Container::open(&file).unwrap().free_bytes() > 0);
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    record::arm();
+    let stats = turndb::container::reclaim(&file).unwrap();
+    let ops = record::disarm();
+    assert!(stats.reclaimed > 0);
+    assert!(ops.len() > 12, "reclaim must exercise a real op stream, got {}", ops.len());
+    assert_slot_alternation("reclaim", &ops);
+
+    let stage = tmp("reclaim-stage");
+    let check = |what: &str, k: usize, variant: Variant, store: &Path| {
+        let rs = turndb::store::open_read_container(store, cfg).unwrap_or_else(|e| {
+            panic!("crash point {k} {variant:?} {what}: store refuses a reader: {e:#}")
+        });
+        for (id, body) in &want {
+            assert_eq!(
+                rs.reconstruct(id).unwrap().as_deref(),
+                Some(body.as_slice()),
+                "crash point {k} {variant:?} {what}: record {id}"
+            );
+        }
+        assert_eq!(rs.ids().unwrap().len(), want.len(), "crash point {k} {variant:?} {what}: ids");
+        turndb::container::Container::open(store)
+            .unwrap()
+            .verify()
+            .unwrap_or_else(|e| panic!("crash point {k} {variant:?} {what}: verify: {e:#}"));
+    };
+    let checked = replay_recorded("reclaim", &base, &root, &ops, &stage, |stage, k, variant| {
+        let store = stage.join("s.turndb");
+        if store.exists() {
+            check("present", k, variant, &store);
+        }
+        // A writer open: recovers from the anchor when the name is gone, opens otherwise, and
+        // never refuses. Then the store must be whole, and a second open must converge.
+        for pass in ["first writer open", "second writer open"] {
+            let s = Store::open_file(&store, cfg)
+                .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}"));
+            s.close().unwrap();
+            check(pass, k, variant, &store);
+        }
+    });
+    println!("dst reclaim: {checked} crash states checked across {} ops", ops.len());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
 /// The free-space punch is physical-only — no commit, no declaration, nothing referenced — so
 /// its whole crash contract is: at every crash state, every record answers exactly as before,
 /// and reopening never refuses. A punch that could disturb an answer would mean the free list

@@ -1231,3 +1231,247 @@ fn a_directory_that_lies_about_layout_is_refused_at_open() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── reclaim's publication protocol: anchor, candidate, locked handoff, recovery ──────────────
+
+/// Ten sessions of waste, closed cleanly: the input every reclaim test below starts from.
+fn wasteful_store(ct: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut want = Vec::new();
+    for round in 0..10 {
+        let mut s = Store::open_file(ct, cfg()).unwrap();
+        let id = format!("r:{round:02}");
+        let body = noise(round, 1200);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.push((id, body));
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    want
+}
+
+fn assert_serves(ct: &std::path::Path, want: &[(String, Vec<u8>)], what: &str) {
+    Container::open(ct)
+        .unwrap_or_else(|e| panic!("{what}: open: {e:#}"))
+        .verify()
+        .unwrap_or_else(|e| panic!("{what}: verify: {e:#}"));
+    let rs = turndb::store::open_read_container(ct, cfg())
+        .unwrap_or_else(|e| panic!("{what}: read: {e:#}"));
+    for (id, body) in want {
+        assert_eq!(rs.reconstruct(id).unwrap().as_deref(), Some(body.as_slice()), "{what}: {id}");
+    }
+    assert_eq!(rs.ids().unwrap().len(), want.len(), "{what}: record count");
+}
+
+fn names(ct: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(ct.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+fn is_writer_locked(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<turndb::fold::WriterLocked>().is_some())
+}
+
+#[test]
+fn reclaim_leaves_exactly_one_file_and_a_competing_writer_in_the_handoff_window_is_refused() {
+    use turndb::container::reclaim_with_hook;
+    let root = tmp("reclaim-handoff");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("grows.turndb");
+    let want = wasteful_store(&ct);
+    let mut competitor_saw = None;
+    let stats = reclaim_with_hook(&ct, |p| {
+        // The name has been replaced; the new store's handle holds the writer lock. A writer
+        // opening the name now must receive the TYPED refusal, not a store.
+        match Store::open_file(p, cfg()) {
+            Ok(_) => competitor_saw = Some("a store".to_string()),
+            Err(e) => {
+                competitor_saw = Some(if is_writer_locked(&e) {
+                    "WriterLocked".into()
+                } else {
+                    format!("other: {e:#}")
+                })
+            }
+        }
+    })
+    .unwrap();
+    assert!(stats.reclaimed > 0);
+    assert_eq!(competitor_saw.as_deref(), Some("WriterLocked"));
+    assert_eq!(
+        names(&ct),
+        vec!["grows.turndb".to_string()],
+        "no anchor, candidate or staging left"
+    );
+    assert_serves(&ct, &want, "after reclaim");
+    // ... and the writer lock was released at return: a writer opens now.
+    Store::open_file(&ct, cfg()).expect("writer opens after reclaim returned").close().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn an_absent_store_beside_a_whole_anchor_is_recovered_by_a_writer_open_and_refused_by_a_reader() {
+    let root = tmp("reclaim-anchor");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    let want = wasteful_store(&ct);
+    // Manufacture the crash state the protocol admits: the anchor published, the name gone.
+    let anchor = root.join("s.turndb.reclaimed");
+    std::fs::rename(&ct, &anchor).unwrap();
+    let err = turndb::store::open_read_container(&ct, cfg()).err().expect("a reader refuses");
+    assert!(format!("{err:#}").contains("reclaim anchor"), "{err:#}");
+    assert!(!ct.exists(), "a reader created nothing");
+    let s = Store::open_file(&ct, cfg()).expect("a writer open recovers from the anchor");
+    s.close().unwrap();
+    assert_serves(&ct, &want, "recovered store");
+    assert_eq!(
+        names(&ct),
+        vec!["s.turndb".to_string()],
+        "anchor and candidate gone after recovery"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_corrupt_or_incomplete_anchor_is_refused_and_nothing_is_created() {
+    for (tag, damage) in [("corrupt", 0u8), ("truncated", 1u8)] {
+        let root = tmp(&format!("reclaim-anchor-{tag}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let ct = root.join("s.turndb");
+        let _ = wasteful_store(&ct);
+        let anchor = root.join("s.turndb.reclaimed");
+        std::fs::rename(&ct, &anchor).unwrap();
+        let bytes = std::fs::read(&anchor).unwrap();
+        let before = bytes.clone();
+        if damage == 0 {
+            // Inside a LIVE member: a flip in superseded space would validate legitimately.
+            let (off, len) = {
+                let c = Container::open(&anchor).unwrap();
+                let part = c.names().find(|n| n.starts_with("part-")).unwrap().to_string();
+                c.member_extents(&part).unwrap()[0]
+            };
+            let mut b = bytes;
+            let at = (off + len / 2) as usize;
+            b[at] ^= 0xff;
+            std::fs::write(&anchor, &b).unwrap();
+        } else {
+            std::fs::write(&anchor, &bytes[..bytes.len() - 700]).unwrap();
+        }
+        let err = match Store::open_file(&ct, cfg()) {
+            Ok(_) => panic!("{tag}: a damaged anchor must not be promoted"),
+            Err(e) => e,
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("does not validate whole") || text.contains("anchor"),
+            "{tag}: {text}"
+        );
+        assert!(!ct.exists(), "{tag}: no store was created: {text}");
+        assert!(
+            !root.join("s.turndb.reclaim-candidate").exists(),
+            "{tag}: no candidate was published"
+        );
+        let after = std::fs::read(&anchor).unwrap();
+        assert!(after.len() <= before.len(), "{tag}: the anchor was left as found");
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[test]
+fn a_stale_anchor_beside_a_present_store_never_overrides_it_and_is_removed() {
+    let root = tmp("reclaim-stale");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    let want = wasteful_store(&ct);
+    // A stale anchor with DIFFERENT content: one more session's worth, never published.
+    let other = root.join("other.turndb");
+    let mut want_other = wasteful_store(&other);
+    want_other.push(("extra".into(), b"never the store's".to_vec()));
+    {
+        let mut s = Store::open_file(&other, cfg()).unwrap();
+        s.put("extra", &[Span::Piece(b"never the store's")], vec![]).unwrap();
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    std::fs::rename(&other, root.join("s.turndb.reclaimed")).unwrap();
+    std::fs::write(root.join("s.turndb.reclaim-candidate"), b"debris").unwrap();
+    let s = Store::open_file(&ct, cfg()).expect("the present store is authority");
+    assert!(s.reconstruct("extra").unwrap().is_none(), "the anchor's content never entered");
+    s.close().unwrap();
+    assert_serves(&ct, &want, "store after stale anchor");
+    assert_eq!(names(&ct), vec!["s.turndb".to_string()], "stale reclaim material removed");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn an_absent_store_with_a_broken_candidate_beside_a_whole_anchor_recovers_from_the_anchor() {
+    let root = tmp("reclaim-bad-candidate");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    let want = wasteful_store(&ct);
+    std::fs::rename(&ct, root.join("s.turndb.reclaimed")).unwrap();
+    std::fs::write(root.join("s.turndb.reclaim-candidate"), b"torn").unwrap();
+    std::fs::write(root.join("s.turndb.reclaim-candidate.tmp"), b"torn too").unwrap();
+    Store::open_file(&ct, cfg())
+        .expect("recovery rebuilds the candidate from the anchor")
+        .close()
+        .unwrap();
+    assert_serves(&ct, &want, "recovered past a broken candidate");
+    assert_eq!(names(&ct), vec!["s.turndb".to_string()]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn reclaim_material_without_an_anchor_and_without_a_store_is_never_built_over() {
+    let root = tmp("reclaim-orphan");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    std::fs::write(root.join("s.turndb.reclaim-candidate"), b"something").unwrap();
+    let err = match Store::open_file(&ct, cfg()) {
+        Ok(_) => panic!("must not create a store over unexplained reclaim material"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:#}").contains("without an anchor"), "{err:#}");
+    assert!(!ct.exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn two_recovery_contenders_converge_on_one_store() {
+    let root = tmp("reclaim-contend");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("s.turndb");
+    let want = wasteful_store(&ct);
+    std::fs::rename(&ct, root.join("s.turndb.reclaimed")).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let ct = ct.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                match Store::open_file(&ct, cfg()) {
+                    Ok(s) => {
+                        s.close().unwrap();
+                        Ok(())
+                    }
+                    Err(e) => Err(is_writer_locked(&e)),
+                }
+            })
+        })
+        .collect();
+    let outcomes: Vec<Result<(), bool>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(outcomes.iter().any(|o| o.is_ok()), "one contender recovers: {outcomes:?}");
+    assert!(
+        outcomes.iter().all(|o| matches!(o, Ok(()) | Err(true))),
+        "any loser sees WriterLocked: {outcomes:?}"
+    );
+    assert_serves(&ct, &want, "after contention");
+    assert_eq!(names(&ct), vec!["s.turndb".to_string()]);
+    std::fs::remove_dir_all(&root).ok();
+}

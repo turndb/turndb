@@ -1130,7 +1130,90 @@ pub struct ReclaimStats {
 /// state the container has not been told about and rewriting would publish a version of the
 /// container that is about to be superseded by a checkpoint of writes it never saw. Refused for a
 /// sealed container, whose bytes are final — copy it instead.
+/// The names reclaim uses beside `<store>`. Each is a full path built from the store's own, so
+/// a store's recovery material is always found next to it and never mistaken for another's.
+pub(crate) fn reclaim_names(path: &Path) -> ReclaimNames {
+    let with = |suffix: &str| {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    ReclaimNames {
+        staging: with(".reclaiming"),
+        anchor: with(".reclaimed"),
+        candidate_tmp: with(".reclaim-candidate.tmp"),
+        candidate: with(".reclaim-candidate"),
+    }
+}
+
+pub(crate) struct ReclaimNames {
+    /// The fresh container while it is being written: unpublished, no crash meaning.
+    pub staging: PathBuf,
+    /// The ANCHOR: the fresh, verified container under a write-through-published name. Never the
+    /// source of the uncertain replace, so no crash state consumes it. Recovery starts here.
+    pub anchor: PathBuf,
+    /// A byte copy of the anchor while it is being written.
+    pub candidate_tmp: PathBuf,
+    /// The CANDIDATE: the copy under a write-through-published name, writer-locked, and then
+    /// replaced over `<store>`. A crash during that replace may lose it; the anchor remains.
+    pub candidate: PathBuf,
+}
+
+/// Copy `from` to `to` through the vfs seam (so the crash model sees every byte), fsynced.
+pub(crate) fn copy_container_bytes_pub(from: &Path, to: &Path) -> Result<u64> {
+    copy_container_bytes(from, to)
+}
+
+fn copy_container_bytes(from: &Path, to: &Path) -> Result<u64> {
+    let src = File::open(from).with_context(|| format!("open {}", from.display()))?;
+    let len = src.metadata()?.len();
+    let _ = crate::vfs::unlink(to);
+    let dst = crate::vfs::create_new(to).with_context(|| format!("create {}", to.display()))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    while at < len {
+        let take = buf.len().min((len - at) as usize);
+        crate::sys::read_exact_at(&src, &mut buf[..take], at)?;
+        crate::vfs::write_all_at(&dst, to, &buf[..take], at)?;
+        at += take as u64;
+    }
+    crate::vfs::sync_file(&dst, to)?;
+    Ok(len)
+}
+
+/// Rewrite a live container as one aligned extent per member and put the result at its name.
+///
+/// The publication protocol is the crash-safety argument, and it is the same on every platform
+/// so the deterministic simulator proves it under both durability models:
+///
+/// 1. the fresh container is written at `<store>.reclaiming`, committed and verified;
+/// 2. it is published as the **anchor**, `<store>.reclaimed`, by a write-through no-replace
+///    rename — a durable name for verified bytes that nothing below touches;
+/// 3. a byte copy of the anchor is fsynced and published as the **candidate**,
+///    `<store>.reclaim-candidate`, the same way; the candidate is opened and the writer lock is
+///    taken on that handle *before* it is published anywhere;
+/// 4. the candidate is renamed over `<store>` — `rename(2)` on Unix; on Windows the write-through
+///    `MoveFileExW`, which refuses because this function holds the original open and locked, then
+///    `std`'s POSIX-semantics fallback, which is **not** write-through (`sys::rename`). A crash here
+///    may leave the old store, the new one, or neither; in every case the anchor is intact, and an
+///    absent `<store>` beside a whole anchor is what a writer open recovers (`Store::open_file`);
+/// 5. the new store at its name is reopened and verified, the locked candidate handle — now the
+///    handle of `<store>` itself — is held until this function returns so no second writer can
+///    enter between the replace and the return, and the anchor is unlinked (laggable: a stale
+///    anchor beside a present store is removed by the next writer open, never promoted).
+///
+/// Cost: one extra copy of the fresh, compacted container on every platform, and on Windows two
+/// write-through renames more than before. No format bytes change.
 pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
+    reclaim_with_hook(path, |_| {})
+}
+
+/// [`reclaim`] with a test hook called between the replace and the return, while the new store's
+/// writer lock is held: the window a competing writer must be refused in.
+pub fn reclaim_with_hook(
+    path: &Path,
+    mut after_replace: impl FnMut(&Path),
+) -> Result<ReclaimStats> {
     let mut hot = path.as_os_str().to_os_string();
     hot.push(HOT_SUFFIX);
     if Path::new(&hot).exists() {
@@ -1139,16 +1222,10 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
             path.display()
         );
     }
-
     let source = Container::open(path)?;
     if source.sealed() {
         bail!("container {} is sealed; sealed is final", path.display());
     }
-    // The rewrite publishes by renaming over the live name. A writer holding the file would keep
-    // committing to the OLD inode — acknowledged writes vanishing behind a rename — so the flock
-    // is taken for the whole rewrite, and contention refuses typed, exactly as a second writer's
-    // open does. An unsettled WAL sidecar is the same hazard one step earlier: acknowledged
-    // records the container has not been told about yet, which only their writer can settle.
     source.lock_writer()?;
     let mut wal = path.as_os_str().to_os_string();
     wal.push("-wal");
@@ -1167,17 +1244,20 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
             reclaimed: 0,
         });
     }
+    let names = reclaim_names(path);
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    // Debris from an earlier crash: the store is present, so it is authority and these are not.
+    for stale in [&names.staging, &names.anchor, &names.candidate_tmp, &names.candidate] {
+        let _ = crate::vfs::unlink(stale);
+    }
 
-    let staging = path.with_extension("reclaiming");
-    let _ = crate::vfs::unlink(&staging);
-    let mut fresh = Container::create(&staging)?;
+    // 1. The fresh container.
+    let mut fresh = Container::create(&names.staging)?;
     for name in source.names().map(String::from).collect::<Vec<_>>() {
         let extent = source
             .extent(&name)
             .ok_or_else(|| anyhow::anyhow!("container lost member {name} mid-reclaim"))?;
         let len = crate::readat::ReadAt::len(&extent)?;
-        // Streamed: a part is the largest thing a store holds, and a reclaim that has to hold one
-        // in memory would fail on exactly the containers most worth reclaiming.
         fresh.put_stream(&name, len, |at, into| {
             crate::readat::ReadAt::read_exact_at(&extent, into, at)
         })?;
@@ -1187,11 +1267,34 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     fresh.verify()?;
     drop(fresh);
 
-    let bytes_after = crate::vfs::metadata(&staging)?.len();
-    crate::vfs::rename(&staging, path)?;
-    if let Some(parent) = path.parent() {
-        let _ = crate::vfs::sync_dir(parent);
+    // 2. The anchor: a durable name for verified bytes.
+    crate::vfs::rename_noreplace(&names.staging, &names.anchor)?;
+    crate::vfs::sync_dir(&parent)?;
+
+    // 3. The candidate: a copy, fsynced, published, and writer-locked before it goes anywhere.
+    let bytes_after = copy_container_bytes(&names.anchor, &names.candidate_tmp)?;
+    crate::vfs::sync_dir(&parent)?;
+    crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
+    crate::vfs::sync_dir(&parent)?;
+    let new_store = crate::vfs::open_rw(&names.candidate)?;
+    if !crate::sys::lock_exclusive(&new_store)
+        .with_context(|| format!("locking {}", names.candidate.display()))?
+    {
+        return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
     }
+    Container::open(&names.candidate)?.verify()?;
+
+    // 4. The uncertain replace. The anchor is not involved.
+    crate::vfs::rename(&names.candidate, path)?;
+    crate::vfs::sync_dir(&parent)?;
+
+    // 5. Reopen at the name, hand off, clean up.
+    Container::open(path)?.verify()?;
+    after_replace(path);
+    drop(source);
+    let _ = crate::vfs::unlink(&names.anchor);
+    let _ = crate::vfs::sync_dir(&parent);
+    drop(new_store);
     Ok(ReclaimStats {
         members,
         bytes_before,
