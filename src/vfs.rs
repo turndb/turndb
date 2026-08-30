@@ -213,6 +213,11 @@ pub(crate) fn sync_file(f: &File, path: &Path) -> Result<()> {
 
 #[inline]
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    // `Path::new("mystore.turndb").parent()` is `Some("")`, and every caller reaches here with
+    // exactly that when a store is named by a bare relative path — which is how README.md names
+    // it. Opening `""` is ENOENT, so the first quickstart command failed (#121). The empty path
+    // means the current directory, so sync the current directory.
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
     File::open(dir)?.sync_all()?;
     #[cfg(feature = "dst")]
     push(Op::SyncDir { path: dir.to_path_buf() });
@@ -271,4 +276,17 @@ pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     #[cfg(feature = "dst")]
     push(Op::RemoveTree { path: path.to_path_buf() });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syncing_the_empty_parent_of_a_bare_name_syncs_the_current_directory() {
+        // The parent of a bare file name, as `Path::parent` reports it.
+        let parent = Path::new("mystore.turndb").parent().unwrap();
+        assert!(parent.as_os_str().is_empty());
+        sync_dir(parent).expect("an empty parent is the current directory, not ENOENT");
+    }
 }
