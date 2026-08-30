@@ -352,7 +352,11 @@ impl Container {
         crate::vfs::write_all_at(&f, path, &[0u8; SLOT_LEN as usize], SLOT_LEN)?;
         crate::vfs::sync_file(&f, path)?;
         if let Some(parent) = path.parent() {
-            let _ = crate::vfs::sync_dir(parent);
+            // The container's NAME is what this makes durable; a failed directory sync means the
+            // store may not exist after a crash, and creation must say so rather than succeed.
+            crate::vfs::sync_dir(parent).with_context(|| {
+                format!("sync {} after creating {}", parent.display(), path.display())
+            })?;
         }
         Ok(Container {
             f: Arc::new(f),
@@ -381,7 +385,11 @@ impl Container {
         crate::vfs::write_all_at(&f, path, &[0u8; SLOT_LEN as usize], SLOT_LEN)?;
         crate::vfs::sync_file(&f, path)?;
         if let Some(parent) = path.parent() {
-            let _ = crate::vfs::sync_dir(parent);
+            // The container's NAME is what this makes durable; a failed directory sync means the
+            // store may not exist after a crash, and creation must say so rather than succeed.
+            crate::vfs::sync_dir(parent).with_context(|| {
+                format!("sync {} after creating {}", parent.display(), path.display())
+            })?;
         }
         Ok(Container {
             f: Arc::new(f),
@@ -1299,8 +1307,11 @@ pub(crate) fn reclaim_with_hook(
     Container::open(path)?.verify()?;
     after_replace(path);
     drop(source);
+    // Cleanup, and still reported: the store is complete either way, but "the anchor is gone" is
+    // this operation's result, and it is not durable if the directory sync failed.
     let _ = crate::vfs::unlink(&names.anchor);
-    let _ = crate::vfs::sync_dir(&parent);
+    crate::vfs::sync_dir(&parent)
+        .with_context(|| format!("sync {} after removing the reclaim anchor", parent.display()))?;
     drop(new_store);
     Ok(ReclaimStats {
         members,
