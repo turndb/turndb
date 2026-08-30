@@ -580,13 +580,17 @@ jobs:
           $gib = [math]::Round($peak / 1GB, 2)
           $wall = $sw.Elapsed.ToString('hh\:mm\:ss')
           $freeGib = [math]::Round((Get-PSDrive -Name C).Free / 1GB, 1)
-          @(
+          $report = @(
             '### windows x64 release'
             "- wall time: $wall"
             "- peak memory: $gib GiB (largest of $okSamples 2-second samples of the summed working sets of ``cargo.exe`` and every live descendant; a floor — see the step for scope)"
             "- memory samples: $okSamples succeeded, $badSamples failed"
             "- disk free after, C: drive: $freeGib GiB"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          )
+          # Both surfaces on purpose: the summary is where drift is visible from the runs list,
+          # the raw log is what a verifier reads and the only one an API can reach.
+          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $report | Write-Host
           if ($badSamples -gt 0) {
             Write-Host "::warning title=memory sampler::$badSamples of $($okSamples + $badSamples) samples failed"
           }
