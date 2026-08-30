@@ -1,0 +1,30 @@
+{
+  "name": "@turndb/cli-linux-arm64-gnu",
+  "version": "0.1.6",
+  "private": true,
+  "description": "turndb command-line binary for linux-arm64-gnu",
+  "license": "Apache-2.0",
+  "files": [
+    "turndb",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.html"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/turndb/turndb.git",
+    "directory": "cli"
+  }
+}

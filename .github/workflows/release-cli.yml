@@ -31,15 +31,42 @@ concurrency:
 
 jobs:
   build:
-    name: build release candidate
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    name: build ${{ matrix.slice }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      # No fail-fast: a slice that cannot build is worth seeing on its own rather than as a
+      # casualty of whichever sibling failed first.
+      fail-fast: false
+      matrix:
+        include:
+          # The reference slice, and the only one that also packs the selector and runs the
+          # licence check — both are platform-independent and doing them four times is waste.
+          - slice: linux-x64-gnu
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            selector: '1'
+          - slice: linux-arm64-gnu
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            linker: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          # GitHub's explicit Intel and arm64 labels keep the architecture stable as
+          # macos-latest moves. Each builds natively on the toolchain that targets it.
+          - slice: darwin-x64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - slice: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -54,15 +81,27 @@ jobs:
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
         run: test "v$(node -p "require('./cli/package.json').version")" = "$RELEASE_REF"
+      - name: install the cross linker
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
       - name: install pinned license-report generator
+        if: matrix.selector == '1'
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
       - name: verify third-party licenses
+        if: matrix.selector == '1'
         run: bash scripts/check-third-party-licenses.sh
-      - name: build the binary and pack both tarballs
+      - name: build the binary and pack this slice
+        env:
+          TURNDB_CLI_TARGET: ${{ matrix.target }}
+          TURNDB_CLI_SLICE: ${{ matrix.slice }}
+          TURNDB_CLI_PACK_SELECTOR: ${{ matrix.selector }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: node cli/scripts/pack-cli.cjs --release
+      # One artifact per slice, merged by the jobs downstream: matrix jobs writing one artifact
+      # name race each other for it.
       - uses: actions/upload-artifact@v7
         with:
-          name: turndb-cli-${{ inputs.release_ref }}
+          name: turndb-cli-${{ inputs.release_ref }}-${{ matrix.slice }}
           path: cli/dist/
           if-no-files-found: error
           retention-days: 7
@@ -85,7 +124,8 @@ jobs:
           node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v4
         with:
-          name: turndb-cli-${{ inputs.release_ref }}
+          pattern: turndb-cli-${{ inputs.release_ref }}-*
+          merge-multiple: true
           path: cli/dist/
       # Drives node_modules/.bin/turndb, not the built binary: the launcher resolving its platform
       # package is the part most likely to be wrong, and only an install exercises it.
@@ -109,13 +149,25 @@ jobs:
         run: npm install --global npm@11.5.1
       - uses: actions/download-artifact@v4
         with:
-          name: turndb-cli-${{ inputs.release_ref }}
+          pattern: turndb-cli-${{ inputs.release_ref }}-*
+          merge-multiple: true
           path: dist/
       # The platform package first: a selector whose optional dependency does not yet exist would
       # install a launcher that cannot resolve its binary, and npm reports a missing OPTIONAL
       # dependency as success rather than as a failed install.
-      - name: publish platform package, then selector
+      # Every platform package first, the selector last. A selector whose optional dependencies do
+      # not yet exist installs a launcher that cannot resolve its binary — and npm calls a missing
+      # OPTIONAL dependency a successful install, so that failure arrives as silence.
+      - name: publish platform packages, then selector
         run: |
           set -euo pipefail
-          npm publish ./dist/turndb-cli-linux-x64-gnu-*.tgz --access public --provenance
-          npm publish ./dist/turndb-cli-0*.tgz --access public --provenance
+          # The tag carries a leading v and the tarball name does not.
+          version="${RELEASE_REF#v}"
+          for slice in linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64; do
+            tarball="./dist/turndb-cli-${slice}-${version}.tgz"
+            test -f "$tarball" || { echo "missing platform tarball for $slice" >&2; exit 1; }
+            npm publish "$tarball" --access public --provenance
+          done
+          npm publish "./dist/turndb-cli-${version}.tgz" --access public --provenance
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}

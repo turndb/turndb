@@ -11,6 +11,9 @@ versioned_files = [
   "npm/turndb/package.json",
   "cli/package.json",
   "cli/npm/linux-x64-gnu/package.json",
+  "cli/npm/linux-arm64-gnu/package.json",
+  "cli/npm/darwin-x64/package.json",
+  "cli/npm/darwin-arm64/package.json",
 ]
 changelog = "CHANGELOG.md"
 
