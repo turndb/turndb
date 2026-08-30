@@ -539,6 +539,8 @@ jobs:
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
           $proc = Start-Process -FilePath 'cargo' -ArgumentList 'test','--release','--tests' -NoNewWindow -PassThru
           [long]$peak = 0
+          [long]$okSamples = 0
+          [long]$badSamples = 0
           while (-not $proc.HasExited) {
             Start-Sleep -Seconds 2
             try {
@@ -566,8 +568,11 @@ jobs:
                 }
               }
               if ($sum -gt $peak) { $peak = $sum }
+              $okSamples += 1
             } catch {
-              # One failed sample is a hole in the floor, not a failed suite.
+              # One failed sample is a hole in the floor — counted and warned below, never
+              # silently swallowed: a measurement made of holes fails this job.
+              $badSamples += 1
             }
           }
           $proc.WaitForExit()
@@ -578,10 +583,23 @@ jobs:
           @(
             '### windows x64 release'
             "- wall time: $wall"
-            "- peak memory: $gib GiB (largest 2-second sample of the summed working sets of ``cargo.exe`` and every live descendant; a floor — see the step for scope)"
+            "- peak memory: $gib GiB (largest of $okSamples 2-second samples of the summed working sets of ``cargo.exe`` and every live descendant; a floor — see the step for scope)"
+            "- memory samples: $okSamples succeeded, $badSamples failed"
             "- disk free after, C: drive: $freeGib GiB"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          exit $proc.ExitCode
+          if ($badSamples -gt 0) {
+            Write-Host "::warning title=memory sampler::$badSamples of $($okSamples + $badSamples) samples failed"
+          }
+          # The suite's own result first: a failing suite reports cargo's exit code, measured or
+          # not. Then the measurement must have existed: a run with no successful sample (or a
+          # zero peak) fails as measurement unavailable rather than passing with a hole where
+          # outcome evidence belongs.
+          if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
+          if ($okSamples -lt 1 -or $peak -le 0) {
+            Write-Host "::error title=measurement unavailable::0 usable memory samples ($badSamples failed); the suite passed but the job cannot report its peak"
+            exit 1
+          }
+          exit 0
       - name: release suite deferred on the private free tier
         if: ${{ github.event.repository.private }}
         run: |
