@@ -592,19 +592,40 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// flag (library/std/src/sys/fs/windows.rs, Rust 1.95), this adds `MOVEFILE_WRITE_THROUGH` so the
 /// function returns only once the move is on disk. That is the whole claim: what a crash during
 /// the call leaves behind is not documented, and the proof models it as old, new, or neither.
+///
+/// **When the destination is open** — a reader, or `reclaim` itself, which holds the writer lock
+/// on the container it is replacing (FORMAT.md, "Free space") — `MoveFileExW` refuses with
+/// `ERROR_ACCESS_DENIED`; Windows will not replace a file with open handles by that route. The
+/// documented route that will is `FileRenameInfoEx` with `FILE_RENAME_FLAG_REPLACE_IF_EXISTS |
+/// FILE_RENAME_FLAG_POSIX_SEMANTICS` (the target must have been opened with
+/// `FILE_SHARE_DELETE`, which `std` always does), and that is exactly `std::fs::rename`'s own
+/// fallback on the same error, so it is used here rather than re-implemented. It has no
+/// write-through flag: on that path the rename is **not** durable on return, and the caller's
+/// crash story must say so — `reclaim`'s does, in the support doc, until its Windows protocol
+/// gives the fresh container a write-through name of its own.
 #[cfg(windows)]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    let (from, to) = (wide_path(from)?, wide_path(to)?);
+    let (wfrom, wto) = (wide_path(from)?, wide_path(to)?);
     let rc = unsafe {
-        MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+        MoveFileExW(
+            wfrom.as_ptr(),
+            wto.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     };
-    if rc == 0 {
-        return Err(io::Error::last_os_error());
+    if rc != 0 {
+        return Ok(());
     }
-    Ok(())
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        // The destination is open: take std's POSIX-semantics route. Not write-through.
+        return std::fs::rename(from, to);
+    }
+    Err(e)
 }
 
 /// Make the names inside `dir` durable: an fsync of the directory itself.
@@ -826,6 +847,26 @@ mod windows_tests {
             Some(true)
         );
         drop(std::fs::remove_dir_all(&base));
+    }
+
+    /// `reclaim` replaces a container it holds open and locked. `MoveFileExW` refuses that;
+    /// the POSIX-semantics fallback does not, and the old handle keeps reading the old bytes.
+    #[test]
+    fn replace_rename_over_an_open_locked_destination_succeeds_and_the_old_handle_survives() {
+        let a = scratch("open-a");
+        let b = scratch("open-b");
+        std::fs::write(&a, b"fresh").unwrap();
+        let mut old = open_rw(&b);
+        old.write_all(b"old").unwrap();
+        old.sync_all().unwrap();
+        assert!(lock_exclusive(&old).unwrap());
+        rename(&a, &b).expect("replace over an open, locked destination");
+        assert_eq!(std::fs::read(&b).unwrap(), b"fresh", "the name now serves the fresh bytes");
+        let mut back = [0u8; 3];
+        read_exact_at(&old, &mut back, 0).unwrap();
+        assert_eq!(&back, b"old", "the old handle still reads the old file");
+        drop(old);
+        let _ = std::fs::remove_file(&b);
     }
 
     #[test]
