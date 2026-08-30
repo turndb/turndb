@@ -102,10 +102,13 @@ work before it is packaging work; no dates are implied by this table.
 
 ## Phase 0: the front door tells the truth
 
-**Status: open, 2026-08-30.** Inserted ahead of every other phase because it is what a stranger meets
-first, and the survey found the README's first store command failing on its bare path, `inspect` and
+**Status: closed 2026-08-30** (obj-mtfi3akf-5). Inserted ahead of every other phase because it is what
+a stranger meets first: the survey found the README's first store command failing on its bare path, `inspect` and
 `verify` then passing misleadingly on the empty store it left, the remaining four commands failing,
-and the `seal` step leaving debris beside the store.
+and the `seal` step leaving debris beside the store. Every item below landed as its own reviewed PR:
+#128 (#121), #127 (#122), #133 (#120), #129 (#97), #131 (#102), #130 (the four document corrections),
+#132 (#118's nightly catch — the publish-time restore remains #118's open tracker, a release-gate
+decision).
 
 This phase is finite and boring on purpose. It is not a quality sweep; it is the list of places where
 what we ship and what we say diverge, closed one by one:
