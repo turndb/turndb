@@ -176,16 +176,12 @@ async function main() {
   const beforeSpace = await store.spaceUsage();
   const punched = await store.punch();
   const afterSpace = await store.spaceUsage();
-  assert.equal(
-    typeof beforeSpace.total.allocatedBytes,
-    'bigint',
-    'allocatedSpaceUsage=true requires a pre-punch allocation measurement',
-  );
-  assert.equal(
-    typeof afterSpace.total.allocatedBytes,
-    'bigint',
-    'allocatedSpaceUsage=true requires a post-punch allocation measurement',
-  );
+  // #153: single-file accounting cannot attribute physical file blocks to its logical member
+  // buckets and currently carries a structural Some(0). Name that as unavailable rather than
+  // presenting the constant as a measurement; the build-level capability also covers directory
+  // stores and the Windows punch primitive, so it cannot express this per-layout distinction.
+  assert.equal(beforeSpace.total.allocatedBytes, 0n);
+  assert.equal(afterSpace.total.allocatedBytes, 0n);
   const after = fs.readFileSync(punchStore);
   assert(punched.blocksPunched > 0n, 'installed Windows addon must exercise zero-data punch');
   assert(
@@ -257,10 +253,14 @@ async function main() {
       longestZeroRunBytes: zeroRunBytes,
       fileBytesBefore: before.length,
       fileBytesAfter: after.length,
+    },
+    singleFileAllocation: {
+      availability: 'unavailable',
+      issue: 'https://github.com/turndb/turndb/issues/153',
       logicalBefore: beforeSpace.total.logicalBytes.toString(),
       logicalAfter: afterSpace.total.logicalBytes.toString(),
-      allocatedBefore: beforeSpace.total.allocatedBytes.toString(),
-      allocatedAfter: afterSpace.total.allocatedBytes.toString(),
+      rawStructuralValueBefore: beforeSpace.total.allocatedBytes.toString(),
+      rawStructuralValueAfter: afterSpace.total.allocatedBytes.toString(),
     },
     erasureRefold: {
       tombstoned: erased.tombstoned.toString(),
