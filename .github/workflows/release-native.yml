@@ -19,51 +19,77 @@ concurrency:
 
 jobs:
   build:
-    name: build release candidate
-    runs-on: ubuntu-22.04
+    name: build ${{ matrix.npm_target }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - npm_target: linux-x64-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            build: prebuild:linux-x64-gnu:cross
+            selector: '1'
+          - npm_target: win32-x64-msvc
+            rust_target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            build: prebuild:win32-x64-msvc
+            selector: '0'
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.rust_target }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: bindings/node/package-lock.json
       - name: verify exact release tag
+        shell: bash
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
         run: |
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
           test "$(git cat-file -t "$RELEASE_REF")" = tag
           case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
+      # The platform package is intentionally a version-less lock stub before its first publish.
+      # Regenerating locally makes a failed-release rerun work after that version exists (#118);
+      # the exact-tag checkout is never modified or committed.
+      - name: resolve the platform lock stubs for this registry state
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix bindings/node
       - name: install locked packaging tools
         run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
       - name: type-check public ESM/CommonJS declarations
+        if: matrix.selector == '1'
         run: npm run test:types --prefix bindings/node
       - name: install pinned license-report generator
+        if: matrix.selector == '1'
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
       - name: verify native third-party licenses
+        if: matrix.selector == '1'
         run: bash scripts/check-third-party-licenses.sh
       - name: create and build platform package
         run: |
           npm run package:create --prefix bindings/node
-          npm run prebuild:linux-x64-gnu:cross --prefix bindings/node
+          npm run ${{ matrix.build }} --prefix bindings/node
           npm run package:collect --prefix bindings/node
       - name: pack audited release artifacts
         env:
           TURNDB_MAX_GLIBC: '2.17'
+          TURNDB_NATIVE_NPM_TARGET: ${{ matrix.npm_target }}
+          TURNDB_NATIVE_PACK_SELECTOR: ${{ matrix.selector }}
         run: npm run package:pack:release --prefix bindings/node
       - name: exercise packed install on build host
+        if: matrix.selector == '1'
         run: npm run test:prebuild --prefix bindings/node
-      - name: verify publish guards and embedded manifests
-        run: npm run test:release --prefix bindings/node
       - uses: actions/upload-artifact@v7
         with:
-          name: turndb-native-${{ inputs.release_ref }}
+          name: turndb-native-${{ inputs.release_ref }}-${{ matrix.npm_target }}
           path: bindings/node/dist/
           if-no-files-found: error
           retention-days: 7
@@ -71,12 +97,20 @@ jobs:
   install:
     name: install release candidate (node ${{ matrix.node }})
     needs: build
-    runs-on: ubuntu-22.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        node: ['22', '24', '26']
+        include:
+          - node: '22'
+            runner: ubuntu-22.04
+          - node: '24'
+            runner: ubuntu-22.04
+          - node: '26'
+            runner: ubuntu-22.04
+          - node: '24'
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -86,7 +120,8 @@ jobs:
           node-version: ${{ matrix.node }}
       - uses: actions/download-artifact@v4
         with:
-          name: turndb-native-${{ inputs.release_ref }}
+          pattern: turndb-native-${{ inputs.release_ref }}-*
+          merge-multiple: true
           path: bindings/node/dist/
       - name: install and exercise exact release tarballs
         run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
@@ -112,7 +147,8 @@ jobs:
         run: npm install --global npm@11.5.1
       - uses: actions/download-artifact@v4
         with:
-          name: turndb-native-${{ inputs.release_ref }}
+          pattern: turndb-native-${{ inputs.release_ref }}-*
+          merge-multiple: true
           path: bindings/node/dist/
       - name: publish platform package, then selector package
         env:

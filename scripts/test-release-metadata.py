@@ -88,4 +88,17 @@ with tempfile.TemporaryDirectory() as temp:
     if result.returncode == 0 or "obsolete release tag namespace" not in result.stderr:
         raise SystemExit(f"tag-namespace control did not discriminate:\n{result.stdout}{result.stderr}")
 
-print("release metadata controls: baseline passes; unknown bump, version drift, and old tag namespace are refused")
+with tempfile.TemporaryDirectory() as temp:
+    copy = pathlib.Path(temp) / "repo"
+    copy_candidates(copy)
+    publisher = copy / "bindings/node/scripts/publish-prebuild.cjs"
+    publisher.write_text(publisher.read_text().replace(
+        "const expectedTag = `v${version}`;",
+        "const expectedTag = 'v0.0.0';",
+        1,
+    ))
+    result = run(copy)
+    if result.returncode == 0 or "does not derive the lockstep tag" not in result.stderr:
+        raise SystemExit(f"manifest-tag control did not discriminate:\n{result.stdout}{result.stderr}")
+
+print("release metadata controls: baseline passes; unknown bump, version drift, old tag namespace, and manifest-independent tag are refused")
