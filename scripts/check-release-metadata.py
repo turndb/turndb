@@ -154,7 +154,7 @@ def check_tag_contract() -> None:
     shell_pattern = 'case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*)'
     if shell_pattern not in crate or shell_pattern not in native:
         fail("both release workflows must accept only the lockstep vX.Y.Z namespace")
-    if "const expectedTag = `v${manifest.version}`;" not in publisher:
+    if "const expectedTag = `v${version}`;" not in publisher:
         fail("native publisher does not derive the lockstep tag from its manifest")
     for command in (
         'test "$(git describe --tags --exact-match HEAD)" = "vX.Y.Z"',
