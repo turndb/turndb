@@ -57,11 +57,10 @@ jobs:
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
           test "$(git cat-file -t "$RELEASE_REF")" = tag
           case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
-      # The platform package is intentionally a version-less lock stub before its first publish.
-      # Regenerating locally makes a failed-release rerun work after that version exists (#118);
-      # the exact-tag checkout is never modified or committed.
-      - name: resolve the platform lock stubs for this registry state
-        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix bindings/node
+      # The platform packages are intentionally version-less optional lock stubs before their
+      # first publish. Keep those committed stubs: `npm ci` accepts them and still refuses any
+      # unexpected dependency-tree change. Regenerating against a registry where this release
+      # does not exist deletes the stubs and makes the following clean install circular (#118).
       - name: install locked packaging tools
         run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
       - name: type-check public ESM/CommonJS declarations
