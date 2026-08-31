@@ -117,18 +117,61 @@ async function main() {
   await store.close();
   assert(fs.statSync(deepStore).isFile());
 
+  // Erasure has its own proof: removing the only logical record refolds the sealed pieces out of
+  // the store. This is deliberately separate from punch, whose workload must retain unreachable
+  // bytes rather than rewriting them away.
+  const eraseStore = path.join(evidence, 'erase-refold.turndb');
+  store = await native.NativeStore.openFile(eraseStore, { blockTargetBytes: 64n << 10n, segmentMaxBytes: 1n << 20n });
+  for (let i = 0; i < 8; i += 1) {
+    await store.write([{
+      kind: 'put', id: 'erase-me',
+      contents: [{ name: 'body', bytes: crypto.randomBytes(192 * 1024) }],
+    }]);
+    await store.flush();
+  }
+  const erased = await store.erase(['erase-me']);
+  assert.equal(erased.tombstoned, 1n);
+  assert.equal(erased.absent, 0n);
+  assert(erased.refold, 'installed erasure must report the refold that removes content');
+  assert(erased.refold.piecesDropped > 0n, 'erasure refold must drop sealed pieces');
+  assert(
+    erased.refold.foldBytesAfter < erased.refold.foldBytesBefore,
+    'erasure refold must reduce the fold that held the erased content',
+  );
+  assert.equal(await store.readContent('erase-me', 'body'), null);
+  await store.close();
+
   // Exercise Windows zero-data punch through the installed addon. Allocation is evidence, not an
   // assertion: NTFS is allowed to retain physical clusters below its sparse granularity.
   const punchStore = path.join(evidence, 'punch.turndb');
   store = await native.NativeStore.openFile(punchStore, { blockTargetBytes: 1n, segmentMaxBytes: 1n << 20n });
-  let liveBytes;
-  for (let round = 0; round < 8; round += 1) {
-    liveBytes = crypto.randomBytes(192 * 1024);
-    await store.write([{
-      kind: 'put', id: 'replace-me', contents: [{ name: 'body', bytes: liveBytes }],
-    }]);
-    await store.flush();
+  const first = [{
+    kind: 'put', id: 'replace-me',
+    contents: [{ name: 'body', bytes: crypto.randomBytes(64 * 1024) }],
+  }];
+  for (let i = 0; i < 8; i += 1) {
+    first.push({
+      kind: 'put', id: `first-${i}`,
+      contents: [{ name: 'body', bytes: crypto.randomBytes(64 * 1024) }],
+    });
   }
+  await store.write(first);
+  await store.flush();
+
+  // Match the engine's erasure proof: supersede (do not erase/refold) and add enough unrelated
+  // live content to seal the old version outside the active segment, which is never punched.
+  const liveBytes = crypto.randomBytes(1024);
+  const second = [{
+    kind: 'put', id: 'replace-me', contents: [{ name: 'body', bytes: liveBytes }],
+  }];
+  for (let i = 0; i < 24; i += 1) {
+    second.push({
+      kind: 'put', id: `second-${i}`,
+      contents: [{ name: 'body', bytes: crypto.randomBytes(64 * 1024) }],
+    });
+  }
+  await store.write(second);
+  await store.flush();
   const before = fs.readFileSync(punchStore);
   const beforeSpace = await store.spaceUsage();
   const punched = await store.punch();
@@ -148,6 +191,16 @@ async function main() {
     await store.readContent('replace-me', 'body'), liveBytes,
     'punch must preserve the current version byte-exactly',
   );
+  await store.close();
+
+  // Exercise the installed CLI's container-reclaim entrance over the same Windows file. The
+  // engine's qualified crash proof covers the anchor protocol; this proves the shipped CLI reaches
+  // that exact path and leaves a valid store behind.
+  const reclaimed = run(cli, ['reclaim', punchStore]);
+  assert.match(reclaimed, /reclaimed [1-9][0-9]* bytes/);
+  assert.match(run(cli, ['verify', punchStore, '--deep']), /ok/i);
+  store = await native.NativeStore.openFile(punchStore);
+  assert.deepEqual(await store.readContent('replace-me', 'body'), liveBytes);
   await store.close();
 
   const importFile = path.join(evidence, 'reference.jsonl');
@@ -179,6 +232,14 @@ async function main() {
       allocatedBefore: beforeSpace.allocatedBytes?.toString(),
       allocatedAfter: afterSpace.allocatedBytes?.toString(),
     },
+    erasureRefold: {
+      tombstoned: erased.tombstoned.toString(),
+      absent: erased.absent.toString(),
+      piecesDropped: erased.refold.piecesDropped.toString(),
+      foldBytesBefore: erased.refold.foldBytesBefore.toString(),
+      foldBytesAfter: erased.refold.foldBytesAfter.toString(),
+    },
+    reclaim: reclaimed.trim(),
     files: Object.fromEntries([fixture, windowsStore, importFile].map((file) => [path.basename(file), sha256(file)])),
   }, (_, value) => typeof value === 'bigint' ? value.toString() : value, 2)}\n`);
   console.log(`installed Windows artifacts exercised at ${installed.Version}; evidence: ${evidence}`);
