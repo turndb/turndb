@@ -22,6 +22,7 @@ const SLICE = process.env.TURNDB_CLI_SLICE ?? 'linux-x64-gnu';
 const DIST = path.join(CLI_DIR, 'dist');
 const SELECTOR_ONLY = process.argv.includes('--selector-only');
 const PACK_SELECTOR = SELECTOR_ONLY || process.env.TURNDB_CLI_PACK_SELECTOR !== '0';
+const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 function run(cmd, args, opts = {}) {
   execFileSync(cmd, args, { stdio: 'inherit', ...opts });
@@ -71,12 +72,12 @@ try {
     }
   }
   if (!SELECTOR_ONLY) {
-    run('npm', ['pack', platformDir, '--pack-destination', DIST]);
+    run(NPM, ['pack', platformDir, '--pack-destination', DIST]);
   }
   // The selector is packed once, by whichever invocation is told to; a matrix job packing it
   // would race its siblings for the same filename.
   if (PACK_SELECTOR) {
-    run('npm', ['pack', CLI_DIR, '--pack-destination', DIST]);
+    run(NPM, ['pack', CLI_DIR, '--pack-destination', DIST]);
   }
 } finally {
   manifests.forEach((file, i) => fs.writeFileSync(file, originals[i]));

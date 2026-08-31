@@ -54,6 +54,7 @@ for (const entry of manifest.tarballs) {
 }
 
 const rootFilename = `turndb-native-${manifest.version}.tgz`;
+const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const targetFilename = `turndb-native-${hostTarget}-${manifest.version}.tgz`;
 const rootTarball = manifest.tarballs.find((entry) => entry.file === rootFilename);
 const targetTarball = manifest.tarballs.find(
@@ -70,7 +71,7 @@ try {
     JSON.stringify({ name: 'turndb-prebuild-smoke', version: '0.0.0', private: true }),
   );
   child.execFileSync(
-    'npm',
+    npmCommand,
     [
       'install', '--ignore-scripts', '--offline', '--no-audit', '--no-fund',
       path.join(dist, targetTarball.file),

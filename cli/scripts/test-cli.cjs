@@ -13,6 +13,7 @@ const path = require('node:path');
 
 const CLI_DIR = path.resolve(__dirname, '..');
 const DIST = process.argv[2] ? path.resolve(process.argv[2]) : path.join(CLI_DIR, 'dist');
+const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 const version = JSON.parse(fs.readFileSync(path.join(CLI_DIR, 'package.json'), 'utf8')).version;
 const hostSlice = process.env.TURNDB_CLI_TEST_SLICE ?? (() => {
@@ -33,14 +34,16 @@ for (const tarball of tarballs) {
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-cli-test-'));
 try {
-  execFileSync('npm', ['init', '-y'], { cwd: work, stdio: 'ignore' });
+  execFileSync(NPM, ['init', '-y'], { cwd: work, stdio: 'ignore' });
   execFileSync(
-    'npm',
+    NPM,
     ['install', '--no-audit', '--no-fund', ...tarballs.map((f) => path.join(DIST, f))],
     { cwd: work, stdio: 'inherit' },
   );
 
-  const turndb = path.join(work, 'node_modules', '.bin', 'turndb');
+  const turndb = path.join(
+    work, 'node_modules', '.bin', process.platform === 'win32' ? 'turndb.cmd' : 'turndb',
+  );
   assert.ok(fs.existsSync(turndb), 'the selector must install a turndb bin');
 
   const cli = (args, opts = {}) => spawnSync(turndb, args, { encoding: 'utf8', cwd: work, ...opts });
