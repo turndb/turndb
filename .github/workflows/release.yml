@@ -197,3 +197,90 @@ jobs:
     with:
       release_ref: ${{ needs.tag.outputs.release_ref }}
     secrets: inherit
+
+  # The expected skip set is coupled to workflow_dispatch.inputs.component above: change them
+  # together. A component retry is green only when the requested jobs succeeded, every skip was
+  # caused by that selection, and the public release is complete. Registry reads can lag writes,
+  # so retry the observation; unknown state never becomes success merely because a job was skipped.
+  complete:
+    name: verify the public release is complete
+    needs: [tag, crate, native, wasm, python_publish, browser, cli]
+    if: always() && !cancelled() && needs.tag.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.tag.outputs.release_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: verify every registry component and release asset exists
+        env:
+          COMPONENT: ${{ inputs.component }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ needs.tag.outputs.release_ref }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            expected='{"tag":"success","crate":"success","native":"success","wasm":"success","python_publish":"success","browser":"success","cli":"success"}'
+          elif [ "$COMPONENT" = python ]; then
+            expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"success","browser":"skipped","cli":"skipped"}'
+          elif [ "$COMPONENT" = wasm ]; then
+            expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"success","python_publish":"skipped","browser":"skipped","cli":"skipped"}'
+          else
+            echo "no complete-graph contract for event=$EVENT_NAME component=$COMPONENT" >&2
+            exit 1
+          fi
+          actual="$(jq -c 'with_entries(.value = .value.result)' <<<"$RESULTS")"
+          if [ "$(jq -S . <<<"$actual")" != "$(jq -S . <<<"$expected")" ]; then
+            echo "release job results do not match the requested component" >&2
+            echo "expected: $expected" >&2
+            echo "actual:   $actual" >&2
+            exit 1
+          fi
+          version="${RELEASE_REF#v}"
+          mapfile -t npm_packages < <(node <<'NODE'
+          const fs = require('node:fs');
+          const manifests = ['npm/turndb/package.json', 'bindings/node/package.json', 'cli/package.json'];
+          const names = new Set();
+          for (const path of manifests) {
+            const pkg = JSON.parse(fs.readFileSync(path));
+            names.add(pkg.name);
+            for (const name of Object.keys(pkg.optionalDependencies || {})) names.add(name);
+          }
+          process.stdout.write([...names].sort().join('\n') + '\n');
+          NODE
+          )
+          test "${#npm_packages[@]}" -gt 3
+          for attempt in $(seq 1 18); do
+            missing=()
+            for package in "${npm_packages[@]}"; do
+              # npm view reads the packument, which lagged exact-version documents by up to fifteen
+              # minutes during the bootstrap. Observe the immutable version endpoint directly.
+              # This proves registry existence, not packument propagation or npm installability.
+              encoded="$(node -p 'encodeURIComponent(process.argv[1])' "$package")"
+              curl --fail --silent --show-error \
+                "https://registry.npmjs.org/$encoded/$version" >/dev/null \
+                || missing+=("npm:$package@$version")
+            done
+            curl --fail --silent --show-error "https://crates.io/api/v1/crates/turndb/$version" \
+              | jq -e --arg version "$version" '.version.num == $version' >/dev/null \
+              || missing+=("crates.io:turndb@$version")
+            curl --fail --silent --show-error "https://pypi.org/pypi/turndb/$version/json" >/dev/null \
+              || missing+=("PyPI:turndb@$version")
+            gh release view "$RELEASE_REF" --json assets \
+              --jq '.assets[].name' | grep -Fx 'turndb-viewer.html' >/dev/null \
+              || missing+=("GitHub:$RELEASE_REF/turndb-viewer.html")
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "release complete: $RELEASE_REF is present on npm, crates.io, PyPI, and GitHub"
+              exit 0
+            fi
+            echo "observation $attempt/18 incomplete: ${missing[*]}"
+            [ "$attempt" -eq 18 ] || sleep 10
+          done
+          echo "release incomplete after registry propagation window: ${missing[*]}" >&2
+          exit 1

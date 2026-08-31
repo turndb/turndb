@@ -190,6 +190,26 @@ def check_release_workflow_runtime_contract() -> None:
     if "npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node" not in native:
         fail("native release lost the locked dependency-tree refusal")
 
+    release = (ROOT / ".github/workflows/release.yml").read_text()
+    complete = re.search(r"(?ms)^  complete:\n(?P<body>.*?)(?=^  [a-z_]+:\n|\Z)", release)
+    if complete is None:
+        fail("top-level release lost its public completeness verdict")
+    complete_body = complete.group("body")
+    for required in (
+        "needs: [tag, crate, native, wasm, python_publish, browser, cli]",
+        "if: always() && !cancelled() && needs.tag.result == 'success'",
+        "RESULTS: ${{ toJSON(needs) }}",
+        'expected=\'{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"success","browser":"skipped","cli":"skipped"}\'',
+        'expected=\'{"tag":"success","crate":"skipped","native":"skipped","wasm":"success","python_publish":"skipped","browser":"skipped","cli":"skipped"}\'',
+        "with_entries(.value = .value.result)",
+        'https://registry.npmjs.org/$encoded/$version',
+        'https://crates.io/api/v1/crates/turndb/$version',
+        'https://pypi.org/pypi/turndb/$version/json',
+        "grep -Fx 'turndb-viewer.html'",
+    ):
+        if required not in complete_body:
+            fail(f"top-level release completeness verdict lost: {required}")
+
 
 if __name__ == "__main__":
     check_versions()
