@@ -303,9 +303,10 @@ submission does not retract an ordered snapshot sync/flush that the actor may al
 
 Binding-owned failure classes, typed DataFusion failures, scan/SQL-pull interruption, writer
 contention, backup/restore, and manifest recovery have stable machine-readable codes, and the
-Linux x86-64 glibc loader/package path and same-artifact Node-major matrix are implemented and
-published as `@turndb/native` 0.1.0. **Current gaps:** other platforms remain unqualified, and the
-aggregate execution budget is not a total-process RSS limit.
+Linux x86-64 glibc and Windows x86-64 MSVC loader/package paths and same-artifact Node-major matrix
+are implemented; the Linux package is published as `@turndb/native` 0.1.0 and Windows publication is
+owner-gated. **Current gaps:** other native platforms remain unqualified, and the aggregate execution
+budget is not a total-process RSS limit.
 
 The package-level `TurnDbError` uses the same generic typed-cause classifier exposed to Rust
 embedders. It gives stable codes to boundary/scan/cursor validation, bounded-queue overload, closed

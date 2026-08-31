@@ -243,13 +243,14 @@ The exact tested targets, Node majors, capability rules, semantic-version policy
 prototype/publication status are defined in the
 [support and compatibility policy](docs/support-and-compatibility.md).
 
-The crate's **native** build is Unix only — it needs positioned reads, `flock`, and (for `punch`)
-Linux hole punching.
+The crate's **native** build is qualified on Linux and Windows x86-64. The capability profile names
+the platform locking and reclamation mechanisms instead of assuming they are identical.
 
 `bindings/node` is the native server-side release candidate. Its `napi-rs` addon gives each open
 writer a dedicated Rust actor and bounded queue, exposes Promise-based batch/durability/scan/content
 operations with `Buffer` and exact `bigint`, and refuses to fall back to WASM when a native artifact
-is unavailable. The first prebuilt slice is Linux x86-64 glibc across Node 22, 24, and 26; its
+is unavailable. Prebuilt slices cover Linux x86-64 glibc and Windows x86-64 MSVC across Node 22, 24,
+and 26; their
 package manifests carry npm's `"private": true`, which makes `npm publish` refuse outright, so
 publication can only happen through the staged release path. The
 [native prebuild contract](docs/native-prebuilds.md) states the exact artifact, install, provenance,

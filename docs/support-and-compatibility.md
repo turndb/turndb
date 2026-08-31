@@ -11,11 +11,24 @@ line. Publication of a crate or package remains a separate owner-approved action
 | Rust core, default and SQL-off | pinned stable Rust on GitHub's Linux x86-64 runner; debug tests, clippy, rustdoc, the corruption suite and the release-profile suite all run hosted on every push and pull request (the release-profile link exceeded the private free-tier runner class while the repository was private; it has run hosted since the repository went public) | qualified development platform |
 | Rust crash model | deterministic simulation under two durability models — strict POSIX, and Windows built from documented operations only (no directory fsync; write-through renames; a crash on a rename admitting old, new, or neither; unlinks never durable) — both models run on every platform: nightly on Linux x86-64, and on every push on Windows x86-64 as a required gate. The harness also fails every attempted sync of every publication sweep once, under both models, and requires the operation to report the failure and the store to converge (see "Sync failures" below) | qualified durability model on both platforms when those gates are green |
 | Portable npm/WASI | `wasm32-wasip1` rebuilt from source; required CI matrix is Node 22, 24, and 26 | support candidate once the complete matrix is green and the package is published |
-| Native Node | source-built addon plus one cross-built Linux x86-64 glibc candidate installed from the same tarballs on Node 22, 24, and 26 | release candidate after both matrices are green; tracked manifests remain private and registry status is owner-approved |
+| Native Node | source-built addon plus Linux x86-64 glibc and Windows x86-64 MSVC candidates installed from the same tarballs on Node 22, 24, and 26 | release candidate after the matrices are green; tracked manifests remain private and registry status is owner-approved |
 | Python SDK | PyO3 actor binding built and conformance-tested on CPython 3.12/Linux; release workflow builds manylinux x86-64 wheels for CPython 3.9–3.13 and installs each exact wheel. Ships **without** the columnar/Arrow lens, SQL, and cooperative cancellation: `turndb.capabilities()` reports `columnar: false`, `arrowIpc: false`, `sql: false`, `cancellation: {scan: false, lifecycle: false}` | Linux x86-64 release candidate; a consumer that needs SQL or cancellation chooses the Rust crate or native Node |
 | Browser viewer | `wasm32-unknown-unknown` structured reader plus local-file and HTTP-range viewer tests in stock Chromium and Firefox | qualified read-only browser artifact when both browser jobs are green |
 | Other Unix systems and architectures | code paths exist but no CI or packaged artifacts prove them | unqualified; no support claim |
-| Native Windows x86-64 | the platform floor in `src/sys.rs` (positioned I/O through `seek_read`/`seek_write`; the writer lock through `LockFileEx` on one byte past any read; durable flush through `FlushFileBuffers`; renames through `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`); a required `windows-latest` job runs clippy, the debug suites, the corruption suite, the crash sweeps under both models, and a cross-OS test that byte-compares a store built on Windows with one built on Linux in both directions. Capability differences, stated: **punch** is `FSCTL_SET_ZERO_DATA` on a sparse file — the range is guaranteed to read as zeros with offsets unmoved (the erasure contract), while the space return is best-effort at NTFS's 64 KiB sparse granularity and is *measured* (`allocated_space_usage`), never promised; the in-place reclaim measurement is asserted on Linux only. **Replacing an open file** (reclaim's final step) takes the POSIX-semantics route, which is not write-through; reclaim's anchor protocol (FORMAT.md, "Free space") is what makes that step crash-safe, at the cost of one extra copy of the compacted container. Transient names a crash can leave beside a store — a pending publish, reclaim material, a staging file — are listed exactly in "Transient names" below: a writer open removes them beside a present store and counts them, refuses to create a store over them beside an absent one, and `turndb inspect` lists them; none is ever consulted over a present store. The release-profile suite (`cargo test --release --tests`, the identical invocation the Linux gate runs) runs hosted in its own required job, `windows x64 release`, on every push and pull request; its wall time and peak memory are recorded in the job summary so drift is visible. Not on Windows in this tier: packaged native, CLI and Python artifacts (a follow-on) | supported: engine and crash model qualified on `windows-latest` x86-64 when its required gate is green; packaging pending |
+| Native Windows x86-64 | the platform floor in `src/sys.rs` (positioned I/O through `seek_read`/`seek_write`; the writer lock through `LockFileEx` on one byte past any read; durable flush through `FlushFileBuffers`; renames through `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`); required jobs run clippy, debug and release suites, corruption and crash sweeps, and byte-identical cross-OS opening in both directions. **Punch** is `FSCTL_SET_ZERO_DATA` on a sparse file: the range is guaranteed to read as zeros with offsets unmoved. Physical space return remains best-effort at NTFS's 64 KiB sparse granularity. It is reported, not promised; the in-place reclaim measurement is asserted on Linux only. **Single-file allocation accounting is unavailable on every platform**: `space_usage` currently reports a structural zero rather than an allocation measurement ([#153](https://github.com/turndb/turndb/issues/153)); directory stores use the platform allocation query. **Replacing an open file** takes the POSIX-semantics route, not write-through; reclaim's anchor protocol (FORMAT.md, "Free space") makes that step crash-safe. Transient names are governed by the exact inventory below: a writer open removes them beside a present store and counts them, refuses and names them beside an absent store, and `turndb inspect` lists them; none is consulted over a present store. Published-shaped native Node, CLI, and CPython 3.9–3.13 artifacts are built, digest-verified, installed from closed local registries, and exercised on `windows-latest`; registry publication remains an owner-approved release action. | supported and qualified on `windows-latest` x86-64 when the required jobs are green; Windows package publication is prepared for the next owner-approved release |
+
+## Installed Windows entrances
+
+The same installed-artifact run proves each row below; it does not infer parity between entrances.
+
+| Entrance | Installed surface exercised on Windows x86-64 | Deliberately not claimed through that entrance |
+|---|---|---|
+| `@turndb/native` | native open/write/read, query, erase-by-refold, punch zeroing, `spaceUsage`, capability report, and opening the Linux fixture | CLI-only transient inventory and container `reclaim` command |
+| `@turndb/cli` | `import`, `inspect`, `verify --deep`, transient-name listing/refusal, `reclaim`, and a store opened byte-exact on Linux | programmatic addon methods |
+| Python `turndb` | exact wheels install and perform write/scan/close on CPython 3.9–3.13; the full installed capability and cross-OS contract runs on 3.12 | CLI `inspect`/`reclaim` and the Node addon's direct `punch()` operation |
+
+All three Windows binaries import `VCRUNTIME140.dll` and therefore require the Microsoft Visual C++
+x64 Redistributable. See the [install guide](install.md) for commands and the qualification bounds.
 
 ## Transient names
 
@@ -108,9 +121,9 @@ declared major passes.
 
 N-API 6 decouples the addon from a particular V8 ABI. It does not prove OS/architecture prebuild
 availability or runtime correctness on every later Node release. Only the matrix above is evidence.
-The first package target is exactly Linux x86-64 glibc 2.17 or newer. macOS, musl, other
-architectures, and other native Unix systems remain unqualified even if a source build happens to
-work. See the [native prebuild contract](native-prebuilds.md).
+Qualified package targets are Linux x86-64 glibc 2.17 or newer and Windows x86-64 MSVC. macOS,
+musl, other architectures, and other native Unix systems remain unqualified even if a source build
+happens to work. See the [native prebuild contract](native-prebuilds.md).
 
 ## Capabilities are runtime facts
 
@@ -122,7 +135,8 @@ Consumers should branch on them rather than the host OS or package name. In part
   it must know: advisory locking, in-place punch, and threads;
 - native Linux reports OS-enforced writer exclusion, threads, and punch-or-refold reclamation;
 - native Windows reports OS-enforced writer exclusion, threads, and punch-or-refold reclamation,
-  where "punch" guarantees zeroed bytes and measures — does not promise — the space returned;
+  where "punch" guarantees zeroed bytes. Allocation accounting is reported for directory stores;
+  single-file stores currently expose a structural zero, not a measurement, on every platform;
 - Python reports the mechanisms in its native, actor-owned build;
 - the browser reports a read-only, single-threaded structured-query profile and no reclamation;
 - Rust features decide whether the columnar lens and SQL exist;
