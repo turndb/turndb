@@ -361,6 +361,17 @@ test('refuses a missing native artifact instead of silently loading WASM', (t) =
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-no-artifact-'));
   t.after(() => fs.rmSync(isolated, { recursive: true, force: true }));
   fs.copyFileSync(path.resolve(__dirname, '..', 'index.cjs'), path.join(isolated, 'index.cjs'));
+  // The selector now also carries a Windows optional package. Its presence in the tree on Linux
+  // must not perturb target selection or make a reduced implementation reachable.
+  const windowsPackage = path.join(
+    isolated, 'node_modules', '@turndb', 'native-win32-x64-msvc',
+  );
+  fs.mkdirSync(windowsPackage, { recursive: true });
+  fs.writeFileSync(
+    path.join(windowsPackage, 'package.json'),
+    JSON.stringify({ name: '@turndb/native-win32-x64-msvc', main: 'turndb.node' }),
+  );
+  fs.writeFileSync(path.join(windowsPackage, 'turndb.node'), 'not a native addon');
   const env = { ...process.env };
   delete env.TURNDB_NATIVE_PATH;
   delete env.NODE_PATH;

@@ -16,12 +16,21 @@ const explicit = process.env.TURNDB_NATIVE_PATH;
 const libc = process.platform === 'linux'
   ? (process.report?.getReport?.().header?.glibcVersionRuntime ? 'gnu' : 'musl')
   : null;
-const target = process.platform === 'linux' && process.arch === 'x64' && libc === 'gnu'
-  ? {
+const target = (() => {
+  if (process.platform === 'linux' && process.arch === 'x64' && libc === 'gnu') {
+    return {
       suffix: 'linux-x64-gnu',
       package: '@turndb/native-linux-x64-gnu',
-    }
-  : null;
+    };
+  }
+  if (process.platform === 'win32' && process.arch === 'x64') {
+    return {
+      suffix: 'win32-x64-msvc',
+      package: '@turndb/native-win32-x64-msvc',
+    };
+  }
+  return null;
+})();
 const candidates = explicit
   ? [path.resolve(explicit)]
   : [

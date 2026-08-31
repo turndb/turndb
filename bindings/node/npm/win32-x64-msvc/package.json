@@ -1,18 +1,25 @@
 {
-  "name": "@turndb/native-linux-x64-gnu",
+  "name": "@turndb/native-win32-x64-msvc",
   "version": "0.1.6",
   "private": true,
   "cpu": [
     "x64"
   ],
-  "main": "turndb.linux-x64-gnu.node",
+  "main": "turndb.win32-x64-msvc.node",
   "files": [
-    "turndb.linux-x64-gnu.node",
+    "turndb.win32-x64-msvc.node",
     "LICENSE",
     "NOTICE",
     "THIRD_PARTY_LICENSES.html"
   ],
   "description": "Native N-API embedding interface for TurnDB",
+  "keywords": [
+    "database",
+    "content-addressed",
+    "columnar",
+    "tracing",
+    "napi"
+  ],
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22 <27"
@@ -23,9 +30,6 @@
     "directory": "bindings/node"
   },
   "os": [
-    "linux"
-  ],
-  "libc": [
-    "glibc"
+    "win32"
   ]
 }

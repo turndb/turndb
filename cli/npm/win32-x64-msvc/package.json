@@ -1,0 +1,27 @@
+{
+  "name": "@turndb/cli-win32-x64-msvc",
+  "version": "0.1.6",
+  "private": true,
+  "description": "turndb command-line binary for win32-x64-msvc",
+  "license": "Apache-2.0",
+  "files": [
+    "turndb.exe",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.html"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/turndb/turndb.git",
+    "directory": "cli"
+  }
+}

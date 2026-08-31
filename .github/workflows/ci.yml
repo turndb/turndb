@@ -262,6 +262,210 @@ jobs:
       - name: install and exercise the same packed addon
         run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
 
+  windows-native-package:
+    # Published-shaped staging, but no production credential or environment exists in this job.
+    # A mistaken registry target therefore fails authentication rather than publishing externally.
+    name: Windows native package
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-native-package
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: install locked packaging tools
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
+      - name: create and build the Windows platform package
+        run: |
+          npm run package:create --prefix bindings/node
+          npm run prebuild:win32-x64-msvc --prefix bindings/node
+          npm run package:collect --prefix bindings/node
+      - name: pack published-shaped selector and Windows slice
+        env:
+          TURNDB_NATIVE_NPM_TARGET: win32-x64-msvc
+          TURNDB_NATIVE_PACK_SELECTOR: '1'
+        run: npm run package:pack:release --prefix bindings/node
+      - name: install and exercise the exact packed addon
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-windows-native-package
+          path: bindings/node/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-cli-package:
+    name: Windows CLI package
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-cli-package
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: build published-shaped selector and Windows slice
+        env:
+          TURNDB_CLI_TARGET: x86_64-pc-windows-msvc
+          TURNDB_CLI_SLICE: win32-x64-msvc
+          TURNDB_CLI_PACK_SELECTOR: '1'
+        run: node cli/scripts/pack-cli.cjs --release
+      - name: install and drive the exact packed CLI
+        run: node cli/scripts/test-cli.cjs cli/dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-windows-cli-package
+          path: cli/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-python-wheel:
+    # Keep all five interpreters distinct and visible. The first exact-set run caught packaging
+    # code importing `tomllib` on 3.9/3.10 (stdlib only from 3.11); one convenient interpreter, or
+    # a matrix that silently resolved every leg to it, would have shipped that incompatibility.
+    name: Windows Python wheel (${{ matrix.python }})
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-python-${{ matrix.python }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: state the interpreter actually selected
+        shell: pwsh
+        run: |
+          python -c "import hashlib, pathlib, platform, sys, sysconfig; p=pathlib.Path(sys.executable); print('requested=${{ matrix.python }} actual=' + platform.python_version() + ' executable=' + str(p) + ' sha256=' + hashlib.sha256(p.read_bytes()).hexdigest() + ' ext_suffix=' + str(sysconfig.get_config_var('EXT_SUFFIX')))"
+          python -c "import platform, sys; assert platform.python_version().startswith('${{ matrix.python }}.'), (platform.python_version(), sys.executable)"
+      - name: install the pinned wheel builder
+        run: python -m pip install 'maturin>=1.7,<2'
+      - name: build this interpreter's published-shaped wheel
+        run: >-
+          maturin build --manifest-path bindings/python/Cargo.toml
+          --release --out dist/python --interpreter python
+      - name: write the build-to-install digest manifest
+        shell: pwsh
+        run: |
+          $version = python -c 'import pathlib,re; v=re.findall(r"(?m)^version = \"([^\"]+)\"$", pathlib.Path("bindings/python/pyproject.toml").read_text()); assert len(v)==1,v; print(v[0])'
+          $wheels = @(Get-ChildItem dist/python -Filter '*.whl')
+          if ($wheels.Count -ne 1) { throw "expected one wheel, got $($wheels.Count)" }
+          $wheel = $wheels[0]
+          python scripts/release-artifacts.py create --component "python-cp${{ matrix.python }}" `
+            --version $version --output "dist/python/python-manifest-${{ matrix.python }}.json" `
+            $wheel.FullName
+      - name: install and run from a closed loopback index
+        shell: pwsh
+        run: |
+          $version = python -c 'import pathlib,re; v=re.findall(r"(?m)^version = \"([^\"]+)\"$", pathlib.Path("bindings/python/pyproject.toml").read_text()); assert len(v)==1,v; print(v[0])'
+          $wheels = @(Get-ChildItem dist/python -Filter '*.whl')
+          if ($wheels.Count -ne 1) { throw "expected one wheel, got $($wheels.Count)" }
+          $wheel = $wheels[0]
+          scripts/test-wheel-local-index.ps1 -Wheel $wheel.FullName -Version $version `
+            -WorkDirectory "$env:RUNNER_TEMP/wheel-${{ matrix.python }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-windows-python-${{ matrix.python }}
+          path: dist/python/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-package-install:
+    name: Windows published-shaped install
+    needs: [windows-native-package, windows-cli-package, windows-python-wheel]
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: install pinned offline registry
+        run: npm install --global verdaccio@6.10.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: turndb-windows-*
+          merge-multiple: true
+          path: dist/windows/
+      - name: install the exact bytes from closed local registry and index
+        shell: pwsh
+        run: >-
+          scripts/install-windows-artifacts.ps1
+          -ArtifactDirectory dist/windows
+          -WorkDirectory "$env:RUNNER_TEMP/published-install"
+      - name: exercise installed capability and cross-OS contract
+        run: >-
+          node scripts/test-installed-windows.cjs
+          "$env:RUNNER_TEMP/published-install/installed.json"
+          tests/fixtures/cross-os-reference.turndb.hex
+          "$env:RUNNER_TEMP/published-install/evidence"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-windows-installed-evidence
+          path: ${{ runner.temp }}/published-install/evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-package-cross-os:
+    # The installed Windows CLI writes this store. A separate Linux job downloads those exact
+    # bytes and opens them, completing the opposite direction from the Windows job opening the
+    # checked-in Linux fixture.
+    name: Windows package cross-OS open
+    needs: windows-package-install
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-package-cross-os
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-windows-installed-evidence
+          path: dist/windows-evidence/
+      - name: open and verify the installed Windows CLI's store on Linux
+        run: |
+          cargo run --release --bin turndb -- verify dist/windows-evidence/windows-cli.turndb --deep
+          cargo run --release --bin turndb -- inspect dist/windows-evidence/windows-cli.turndb
+
   cli-slice-changes:
     # Keep the two macOS runners off changes that cannot affect the CLI package. This detector is
     # itself unconditional, so gate can distinguish an intentional path skip from a lost job.
@@ -614,7 +818,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran
