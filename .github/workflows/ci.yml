@@ -375,7 +375,7 @@ jobs:
       - name: write the build-to-install digest manifest
         shell: pwsh
         run: |
-          $version = python -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml','rb'))['project']['version'])"
+          $version = python -c "import pathlib,re; print(re.search(r'(?m)^version = \"([^\"]+)\"$', pathlib.Path('bindings/python/pyproject.toml').read_text()).group(1))"
           $wheels = @(Get-ChildItem dist/python -Filter '*.whl')
           if ($wheels.Count -ne 1) { throw "expected one wheel, got $($wheels.Count)" }
           $wheel = $wheels[0]
@@ -385,7 +385,7 @@ jobs:
       - name: install and run from a closed loopback index
         shell: pwsh
         run: |
-          $version = python -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml','rb'))['project']['version'])"
+          $version = python -c "import pathlib,re; print(re.search(r'(?m)^version = \"([^\"]+)\"$', pathlib.Path('bindings/python/pyproject.toml').read_text()).group(1))"
           $wheels = @(Get-ChildItem dist/python -Filter '*.whl')
           if ($wheels.Count -ne 1) { throw "expected one wheel, got $($wheels.Count)" }
           $wheel = $wheels[0]
