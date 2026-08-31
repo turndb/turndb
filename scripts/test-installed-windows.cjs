@@ -120,20 +120,22 @@ async function main() {
   // Exercise Windows zero-data punch through the installed addon. Allocation is evidence, not an
   // assertion: NTFS is allowed to retain physical clusters below its sparse granularity.
   const punchStore = path.join(evidence, 'punch.turndb');
-  store = await native.NativeStore.openFile(punchStore, { blockTargetBytes: 65536n, segmentMaxBytes: 1n << 20n });
+  store = await native.NativeStore.openFile(punchStore, { blockTargetBytes: 1n, segmentMaxBytes: 1n << 20n });
+  let liveBytes;
   for (let round = 0; round < 8; round += 1) {
-    const bytes = crypto.randomBytes(192 * 1024);
-    await store.write([{ kind: 'put', id: 'replace-me', contents: [{ name: 'body', bytes }] }]);
+    liveBytes = crypto.randomBytes(192 * 1024);
+    await store.write([{
+      kind: 'put', id: 'replace-me', contents: [{ name: 'body', bytes: liveBytes }],
+    }]);
     await store.flush();
   }
-  await store.erase(['replace-me']);
-  await store.flush();
   const before = fs.readFileSync(punchStore);
   const beforeSpace = await store.spaceUsage();
   const punched = await store.punch();
   const afterSpace = await store.spaceUsage();
   const after = fs.readFileSync(punchStore);
   assert(punched.blocksPunched > 0n, 'installed Windows addon must exercise zero-data punch');
+  assert.equal(after.length, before.length, 'punch must not move offsets or change file length');
   let zeroed = 0;
   for (let i = 0; i < Math.min(before.length, after.length); i += 1) {
     if (before[i] !== after[i]) {
@@ -142,6 +144,10 @@ async function main() {
     }
   }
   assert(zeroed > 0, 'punch reported blocks but no old nonzero byte became zero');
+  assert.deepEqual(
+    await store.readContent('replace-me', 'body'), liveBytes,
+    'punch must preserve the current version byte-exactly',
+  );
   await store.close();
 
   const importFile = path.join(evidence, 'reference.jsonl');
