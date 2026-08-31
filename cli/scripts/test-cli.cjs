@@ -45,16 +45,26 @@ try {
     { cwd: work, stdio: 'inherit' },
   );
 
-  const turndb = path.join(
+  const shim = path.join(
     work, 'node_modules', '.bin', process.platform === 'win32' ? 'turndb.cmd' : 'turndb',
   );
-  assert.ok(fs.existsSync(turndb), 'the selector must install a turndb bin');
+  const launcher = path.join(work, 'node_modules', '@turndb', 'cli', 'bin', 'turndb.cjs');
+  assert.ok(fs.existsSync(shim), 'the selector must install a turndb bin');
+  assert.ok(fs.existsSync(launcher), 'the selector must install its JS launcher');
 
-  const cli = (args, opts = {}) => spawnSync(turndb, args, { encoding: 'utf8', cwd: work, ...opts });
-
-  const help = cli(['help']);
-  assert.equal(help.status, 0, `help exited ${help.status}: ${help.stderr}`);
+  const detail = (result) => result.error?.stack || result.stderr || `signal ${result.signal}`;
+  // Node 24 deliberately refuses to spawn Windows .cmd files without a shell. Exercise the shim
+  // users type once with the fixed literal `help`; keep every path-bearing functional assertion
+  // below on Node's argument-array boundary by invoking the installed JS launcher directly.
+  const help = process.platform === 'win32'
+    ? spawnSync(shim, ['help'], { encoding: 'utf8', cwd: work, shell: true })
+    : spawnSync(shim, ['help'], { encoding: 'utf8', cwd: work });
+  assert.equal(help.status, 0, `help exited ${help.status}: ${detail(help)}`);
   assert.match(help.stdout, /database for AI traces, in one file/, 'help must be the real usage text');
+
+  const cli = (args, opts = {}) => spawnSync(
+    process.execPath, [launcher, ...args], { encoding: 'utf8', cwd: work, ...opts },
+  );
 
   // A real store, so the install is exercised as a store tool rather than as a binary that runs.
   const jsonl = path.join(work, 'traces.jsonl');
@@ -66,21 +76,22 @@ try {
   );
   const store = path.join(work, 'store.turndb');
   const imported = cli(['import', store, jsonl]);
-  assert.equal(imported.status, 0, `import exited ${imported.status}: ${imported.stderr}`);
+  assert.equal(imported.status, 0, `import exited ${imported.status}: ${detail(imported)}`);
 
   const ids = cli(['ids', store]);
-  assert.equal(ids.status, 0, `ids exited ${ids.status}: ${ids.stderr}`);
+  assert.equal(ids.status, 0, `ids exited ${ids.status}: ${detail(ids)}`);
   assert.equal(ids.stdout.trim().split('\n').length, 3, 'every imported record must be listed');
 
   const verified = cli(['verify', store, '--deep']);
-  assert.equal(verified.status, 0, `verify exited ${verified.status}: ${verified.stderr}`);
+  assert.equal(verified.status, 0, `verify exited ${verified.status}: ${detail(verified)}`);
   assert.match(verified.stdout, /reconstruct byte-exact/, 'deep verify must report reconstruction');
 
   // The store IS the single-file form; sealing ships its snapshot with the same binary.
   const sealedOut = path.join(work, 'snapshot.turndb');
-  assert.equal(cli(['seal', store, sealedOut]).status, 0, 'seal must succeed');
+  const sealed = cli(['seal', store, sealedOut]);
+  assert.equal(sealed.status, 0, `seal exited ${sealed.status}: ${detail(sealed)}`);
   const inspected = cli(['inspect', sealedOut]);
-  assert.equal(inspected.status, 0, `inspect exited ${inspected.status}: ${inspected.stderr}`);
+  assert.equal(inspected.status, 0, `inspect exited ${inspected.status}: ${detail(inspected)}`);
   assert.match(inspected.stdout, /\(sealed\)/, 'a sealed snapshot must be reported as one');
 
   // A refusal must be a refusal: nonzero status and a message on stderr, not a stack trace.
