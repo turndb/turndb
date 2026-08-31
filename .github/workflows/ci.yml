@@ -343,6 +343,9 @@ jobs:
           retention-days: 7
 
   windows-python-wheel:
+    # Keep all five interpreters distinct and visible. The first exact-set run caught packaging
+    # code importing `tomllib` on 3.9/3.10 (stdlib only from 3.11); one convenient interpreter, or
+    # a matrix that silently resolved every leg to it, would have shipped that incompatibility.
     name: Windows Python wheel (${{ matrix.python }})
     permissions:
       contents: read
@@ -375,7 +378,7 @@ jobs:
       - name: write the build-to-install digest manifest
         shell: pwsh
         run: |
-          $version = python -c "import pathlib,re; print(re.search(r'(?m)^version = \"([^\"]+)\"$', pathlib.Path('bindings/python/pyproject.toml').read_text()).group(1))"
+          $version = python -c "import pathlib,re; v=re.findall(r'(?m)^version = \"([^\"]+)\"$', pathlib.Path('bindings/python/pyproject.toml').read_text()); assert len(v)==1,v; print(v[0])"
           $wheels = @(Get-ChildItem dist/python -Filter '*.whl')
           if ($wheels.Count -ne 1) { throw "expected one wheel, got $($wheels.Count)" }
           $wheel = $wheels[0]
@@ -385,7 +388,7 @@ jobs:
       - name: install and run from a closed loopback index
         shell: pwsh
         run: |
-          $version = python -c "import pathlib,re; print(re.search(r'(?m)^version = \"([^\"]+)\"$', pathlib.Path('bindings/python/pyproject.toml').read_text()).group(1))"
+          $version = python -c "import pathlib,re; v=re.findall(r'(?m)^version = \"([^\"]+)\"$', pathlib.Path('bindings/python/pyproject.toml').read_text()); assert len(v)==1,v; print(v[0])"
           $wheels = @(Get-ChildItem dist/python -Filter '*.whl')
           if ($wheels.Count -ne 1) { throw "expected one wheel, got $($wheels.Count)" }
           $wheel = $wheels[0]
