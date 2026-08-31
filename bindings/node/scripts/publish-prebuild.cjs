@@ -140,6 +140,16 @@ if (!checkOnly) {
     if (exists.status === 0) {
       throw new Error(`refusing release rerun before publication: ${packageName}@${version} exists`);
     }
+    const outputs = [exists.stdout, exists.stderr].filter((output) => output?.trim());
+    const definitelyAbsent = outputs.some((output) => {
+      try { return JSON.parse(output).error?.code === 'E404'; } catch { return false; }
+    });
+    if (!definitelyAbsent) {
+      throw new Error(
+        `refusing publication: registry did not prove ${packageName}@${version} absent: `
+          + (outputs.join('\n') || exists.error?.message || `npm exited ${exists.status}`),
+      );
+    }
   }
 }
 

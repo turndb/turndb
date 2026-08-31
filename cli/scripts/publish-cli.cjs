@@ -107,9 +107,21 @@ if (!checkOnly) {
     throw new Error(`CLI release requires exact annotated tag ${releaseRef}`);
   }
   for (const packageName of [...Object.keys(selector.optionalDependencies), selector.name]) {
-    const exists = child.spawnSync('npm', ['view', `${packageName}@${version}`, 'version', '--json']);
+    const exists = child.spawnSync(
+      'npm', ['view', `${packageName}@${version}`, 'version', '--json'], { encoding: 'utf8' },
+    );
     if (exists.status === 0) {
       throw new Error(`refusing release rerun before publication: ${packageName}@${version} exists`);
+    }
+    const outputs = [exists.stdout, exists.stderr].filter((output) => output?.trim());
+    const definitelyAbsent = outputs.some((output) => {
+      try { return JSON.parse(output).error?.code === 'E404'; } catch { return false; }
+    });
+    if (!definitelyAbsent) {
+      throw new Error(
+        `refusing publication: registry did not prove ${packageName}@${version} absent: `
+          + (outputs.join('\n') || exists.error?.message || `npm exited ${exists.status}`),
+      );
     }
   }
 }

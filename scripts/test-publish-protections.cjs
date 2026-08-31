@@ -102,7 +102,12 @@ fi
   fs.writeFileSync(path.join(bin, 'npm'), `#!/bin/sh
 echo "$*" >> "$TURNDB_TEST_CALLS"
 if [ "$1" = --version ]; then echo 11.5.1; exit 0; fi
-if [ "$1" = view ]; then [ "$TURNDB_TEST_EXISTS" = 1 ] && echo ${version} && exit 0; exit 1; fi
+if [ "$1" = view ]; then
+  [ "$TURNDB_TEST_EXISTS" = 1 ] && echo ${version} && exit 0
+  [ "$TURNDB_TEST_INCONCLUSIVE" = 1 ] && echo 'registry unavailable' >&2 && exit 1
+  echo '{"error":{"code":"E404"}}' >&2
+  exit 1
+fi
 if [ "$1" = publish ]; then exit 0; fi
 exit 2
 `);
@@ -159,6 +164,7 @@ try {
 
     for (const mode of [
       { TURNDB_TEST_EXISTS: '1' },
+      { TURNDB_TEST_INCONCLUSIVE: '1' },
       { TURNDB_TEST_LIGHTWEIGHT: '1' },
       { TURNDB_TEST_UNTAGGED: '1' },
     ]) {
@@ -167,7 +173,7 @@ try {
       assert.equal(refusal.calls.filter((call) => call.startsWith('publish ')).length, 0);
     }
   }
-  console.log('publish protections: complete set publishes platform-first; missing, rerun, lightweight and untagged refuse before publish');
+  console.log('publish protections: complete set publishes platform-first; missing, rerun, inconclusive registry, lightweight and untagged refuse before publish');
 } finally {
   fs.rmSync(work, { recursive: true, force: true });
 }
