@@ -10,6 +10,7 @@
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { npmCommand } = require('../../scripts/npm-command.cjs');
 
 // `--release` clears `private` in the packed manifests. Without it both tarballs stay private, so
 // a stray `npm publish` refuses rather than shipping — the same posture the native prebuild takes.
@@ -22,7 +23,6 @@ const SLICE = process.env.TURNDB_CLI_SLICE ?? 'linux-x64-gnu';
 const DIST = path.join(CLI_DIR, 'dist');
 const SELECTOR_ONLY = process.argv.includes('--selector-only');
 const PACK_SELECTOR = SELECTOR_ONLY || process.env.TURNDB_CLI_PACK_SELECTOR !== '0';
-const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 function run(cmd, args, opts = {}) {
   execFileSync(cmd, args, { stdio: 'inherit', ...opts });
@@ -72,12 +72,14 @@ try {
     }
   }
   if (!SELECTOR_ONLY) {
-    run(NPM, ['pack', platformDir, '--pack-destination', DIST]);
+    const npm = npmCommand(['pack', platformDir, '--pack-destination', DIST]);
+    run(npm.file, npm.args);
   }
   // The selector is packed once, by whichever invocation is told to; a matrix job packing it
   // would race its siblings for the same filename.
   if (PACK_SELECTOR) {
-    run(NPM, ['pack', CLI_DIR, '--pack-destination', DIST]);
+    const npm = npmCommand(['pack', CLI_DIR, '--pack-destination', DIST]);
+    run(npm.file, npm.args);
   }
 } finally {
   manifests.forEach((file, i) => fs.writeFileSync(file, originals[i]));

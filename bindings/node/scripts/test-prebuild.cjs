@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { npmCommand } = require('../../../scripts/npm-command.cjs');
 
 const root = path.resolve(__dirname, '..');
 const dist = path.resolve(process.argv[2] || path.join(root, 'dist'));
@@ -54,7 +55,6 @@ for (const entry of manifest.tarballs) {
 }
 
 const rootFilename = `turndb-native-${manifest.version}.tgz`;
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const targetFilename = `turndb-native-${hostTarget}-${manifest.version}.tgz`;
 const rootTarball = manifest.tarballs.find((entry) => entry.file === rootFilename);
 const targetTarball = manifest.tarballs.find(
@@ -70,13 +70,14 @@ try {
     path.join(consumer, 'package.json'),
     JSON.stringify({ name: 'turndb-prebuild-smoke', version: '0.0.0', private: true }),
   );
-  child.execFileSync(
-    npmCommand,
-    [
+  const npm = npmCommand([
       'install', '--ignore-scripts', '--offline', '--no-audit', '--no-fund',
       path.join(dist, targetTarball.file),
       path.join(dist, rootTarball.file),
-    ],
+  ]);
+  child.execFileSync(
+    npm.file,
+    npm.args,
     {
       cwd: consumer,
       env: { ...process.env, npm_config_cache: path.join(consumer, '.npm-cache') },

@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { npmCommand } = require('../../../scripts/npm-command.cjs');
 
 const cliArguments = new Set(process.argv.slice(2));
 for (const argument of cliArguments) {
@@ -21,7 +22,6 @@ const targets = {
 };
 const target = targets[npmTarget];
 if (!target) throw new Error(`unsupported native npm target: ${npmTarget}`);
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 const targetDir = path.join(root, 'npm', npmTarget);
 const artifactName = `turndb.${npmTarget}.node`;
@@ -62,9 +62,12 @@ function stagePackage(sourceDir, destination, files) {
 }
 
 function pack(packageDir) {
-  const result = child.spawnSync(
-    npmCommand,
+  const npm = npmCommand(
     ['pack', '--ignore-scripts', '--json', '--pack-destination', dist, '.'],
+  );
+  const result = child.spawnSync(
+    npm.file,
+    npm.args,
     {
       // Packing an external directory argument goes through npm's package-spec resolver. Run in
       // the isolated staging directory so optional platform dependencies remain metadata, not

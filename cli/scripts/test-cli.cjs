@@ -10,10 +10,10 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { npmCommand } = require('../../scripts/npm-command.cjs');
 
 const CLI_DIR = path.resolve(__dirname, '..');
 const DIST = process.argv[2] ? path.resolve(process.argv[2]) : path.join(CLI_DIR, 'dist');
-const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 const version = JSON.parse(fs.readFileSync(path.join(CLI_DIR, 'package.json'), 'utf8')).version;
 const hostSlice = process.env.TURNDB_CLI_TEST_SLICE ?? (() => {
@@ -34,10 +34,14 @@ for (const tarball of tarballs) {
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-cli-test-'));
 try {
-  execFileSync(NPM, ['init', '-y'], { cwd: work, stdio: 'ignore' });
+  let npm = npmCommand(['init', '-y']);
+  execFileSync(npm.file, npm.args, { cwd: work, stdio: 'ignore' });
+  npm = npmCommand([
+    'install', '--no-audit', '--no-fund', ...tarballs.map((f) => path.join(DIST, f)),
+  ]);
   execFileSync(
-    NPM,
-    ['install', '--no-audit', '--no-fund', ...tarballs.map((f) => path.join(DIST, f))],
+    npm.file,
+    npm.args,
     { cwd: work, stdio: 'inherit' },
   );
 
