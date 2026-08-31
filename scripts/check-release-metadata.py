@@ -164,8 +164,36 @@ def check_tag_contract() -> None:
             fail(f"portable publish procedure lost tag check: {command}")
 
 
+def check_release_workflow_runtime_contract() -> None:
+    """Keep tag-only workflows aligned with the shells and toolchain they actually execute."""
+    cli = (ROOT / ".github/workflows/release-cli.yml").read_text()
+    python = (ROOT / ".github/workflows/release-python.yml").read_text()
+    native = (ROOT / ".github/workflows/release-native.yml").read_text()
+
+    cli_version_check = """      - name: verify lockstep package version matches the tag
+        shell: bash
+"""
+    if cli_version_check not in cli:
+        fail("CLI release version check must select Bash explicitly on Windows")
+    if "dtolnay/rust-toolchain@1.95.0\n        with:\n          targets: ${{ matrix.target }}" not in cli:
+        fail("CLI release targets must be installed for the pinned 1.95.0 build toolchain")
+
+    if 're.findall(r"(?m)^version = \\\\"([^\\\\"]+)\\\\"$"' in python:
+        fail("Windows wheel release still contains the double-escaped version extractor")
+    if "mapfile -t versions < <(sed -n" not in python:
+        fail("Windows wheel release lost its single-value package-version check")
+    if "dtolnay/rust-toolchain@stable" in python:
+        fail("Python release jobs must use the repository's pinned 1.95.0 toolchain")
+
+    if "npm install --package-lock-only" in native:
+        fail("native release must not delete unpublished optional lock stubs before npm ci")
+    if "npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node" not in native:
+        fail("native release lost the locked dependency-tree refusal")
+
+
 if __name__ == "__main__":
     check_versions()
     check_changesets()
     check_tag_contract()
+    check_release_workflow_runtime_contract()
     print("changesets: all configured packages and bump types are valid")

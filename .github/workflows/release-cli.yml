@@ -71,7 +71,9 @@ jobs:
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      # Match rust-toolchain.toml: installing a target on `stable` does not install it for the
+      # pinned toolchain that Cargo actually selects from the tagged checkout.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-node@v4
@@ -86,11 +88,13 @@ jobs:
           test "$(git cat-file -t "$RELEASE_REF")" = tag
           case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 1 ;; esac
       - name: verify lockstep package version matches the tag
+        shell: bash
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
         run: test "v$(node -p "require('./cli/package.json').version")" = "$RELEASE_REF"
       - name: install the cross linker
         if: matrix.apt != ''
+        shell: bash
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
       - name: install pinned license-report generator
         if: matrix.selector == '1'

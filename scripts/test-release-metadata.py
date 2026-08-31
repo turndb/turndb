@@ -101,4 +101,52 @@ with tempfile.TemporaryDirectory() as temp:
     if result.returncode == 0 or "does not derive the lockstep tag" not in result.stderr:
         raise SystemExit(f"manifest-tag control did not discriminate:\n{result.stdout}{result.stderr}")
 
-print("release metadata controls: baseline passes; unknown bump, version drift, old tag namespace, and manifest-independent tag are refused")
+workflow_controls = [
+    (
+        ".github/workflows/release-cli.yml",
+        "        shell: bash\n        env:\n          RELEASE_REF: ${{ inputs.release_ref }}\n        run: test",
+        "        env:\n          RELEASE_REF: ${{ inputs.release_ref }}\n        run: test",
+        "must select Bash explicitly",
+        "Windows-shell",
+    ),
+    (
+        ".github/workflows/release-cli.yml",
+        "dtolnay/rust-toolchain@1.95.0\n        with:\n          targets: ${{ matrix.target }}",
+        "dtolnay/rust-toolchain@stable\n        with:\n          targets: ${{ matrix.target }}",
+        "pinned 1.95.0 build toolchain",
+        "cross-target toolchain",
+    ),
+    (
+        ".github/workflows/release-python.yml",
+        "mapfile -t versions < <(sed -n",
+        "mapfile -t package_versions < <(sed -n",
+        "single-value package-version check",
+        "Windows version extraction",
+    ),
+    (
+        ".github/workflows/release-native.yml",
+        "      - name: install locked packaging tools\n",
+        "      - run: npm install --package-lock-only --prefix bindings/node\n"
+        "      - name: install locked packaging tools\n",
+        "must not delete unpublished optional lock stubs",
+        "native lock regeneration",
+    ),
+]
+
+for relative, old, new, expected, label in workflow_controls:
+    with tempfile.TemporaryDirectory() as temp:
+        copy = pathlib.Path(temp) / "repo"
+        copy_candidates(copy)
+        workflow = copy / relative
+        text = workflow.read_text()
+        if old not in text:
+            raise SystemExit(f"{label} control could not find the construct it is meant to perturb")
+        workflow.write_text(text.replace(old, new, 1))
+        result = run(copy)
+        if result.returncode == 0 or expected not in result.stderr:
+            raise SystemExit(f"{label} control did not discriminate:\n{result.stdout}{result.stderr}")
+
+print(
+    "release metadata controls: baseline passes; metadata drift and all four tag-only workflow "
+    "defect classes are refused"
+)
