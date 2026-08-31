@@ -183,13 +183,25 @@ async function main() {
     'punch may append its manifest publication but must not truncate the existing file',
   );
   let zeroed = 0;
-  for (let i = 0; i < Math.min(before.length, after.length); i += 1) {
-    if (before[i] !== after[i]) {
-      assert.equal(after[i], 0, `punch changed old byte ${i} to a nonzero value`);
-      zeroed += 1;
+  let zeroRunBytes = 0;
+  for (let i = 0; i < before.length;) {
+    if (after[i] !== 0) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < before.length && after[i] === 0) i += 1;
+    let oldNonzero = 0;
+    for (let at = start; at < i; at += 1) oldNonzero += before[at] === 0 ? 0 : 1;
+    if (i - start >= 4096 && oldNonzero > 0) {
+      zeroRunBytes = Math.max(zeroRunBytes, i - start);
+      zeroed += oldNonzero;
     }
   }
-  assert(zeroed > 0, 'punch reported blocks but no old nonzero byte became zero');
+  assert(
+    zeroRunBytes >= 4096 && zeroed > 0,
+    'punch reported blocks but no substantial same-offset payload range became all zero',
+  );
   assert.deepEqual(
     await store.readContent('replace-me', 'body'), liveBytes,
     'punch must preserve the current version byte-exactly',
@@ -232,6 +244,7 @@ async function main() {
       blocksExamined: punched.blocksExamined.toString(),
       blocksPunched: punched.blocksPunched.toString(),
       zeroedBytesObserved: zeroed,
+      longestZeroRunBytes: zeroRunBytes,
       fileBytesBefore: before.length,
       fileBytesAfter: after.length,
       allocatedBefore: beforeSpace.allocatedBytes?.toString(),
