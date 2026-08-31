@@ -176,6 +176,16 @@ async function main() {
   const beforeSpace = await store.spaceUsage();
   const punched = await store.punch();
   const afterSpace = await store.spaceUsage();
+  assert.equal(
+    typeof beforeSpace.total.allocatedBytes,
+    'bigint',
+    'allocatedSpaceUsage=true requires a pre-punch allocation measurement',
+  );
+  assert.equal(
+    typeof afterSpace.total.allocatedBytes,
+    'bigint',
+    'allocatedSpaceUsage=true requires a post-punch allocation measurement',
+  );
   const after = fs.readFileSync(punchStore);
   assert(punched.blocksPunched > 0n, 'installed Windows addon must exercise zero-data punch');
   assert(
@@ -247,8 +257,10 @@ async function main() {
       longestZeroRunBytes: zeroRunBytes,
       fileBytesBefore: before.length,
       fileBytesAfter: after.length,
-      allocatedBefore: beforeSpace.allocatedBytes?.toString(),
-      allocatedAfter: afterSpace.allocatedBytes?.toString(),
+      logicalBefore: beforeSpace.total.logicalBytes.toString(),
+      logicalAfter: afterSpace.total.logicalBytes.toString(),
+      allocatedBefore: beforeSpace.total.allocatedBytes.toString(),
+      allocatedAfter: afterSpace.total.allocatedBytes.toString(),
     },
     erasureRefold: {
       tombstoned: erased.tombstoned.toString(),
