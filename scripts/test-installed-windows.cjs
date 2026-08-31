@@ -10,7 +10,8 @@ const { createRequire } = require('node:module');
 function run(file, args, options = {}) {
   const result = child.spawnSync(file, args, { encoding: 'utf8', ...options });
   if (result.status !== 0) {
-    throw new Error(`${file} ${args.join(' ')} failed (${result.status})\n${result.stdout}\n${result.stderr}`);
+    const detail = result.error?.stack || `${result.stdout || ''}\n${result.stderr || ''}`;
+    throw new Error(`${file} ${args.join(' ')} failed (${result.status})\n${detail}`);
   }
   return `${result.stdout}${result.stderr}`;
 }
@@ -33,11 +34,20 @@ async function main() {
 
   const consumerRequire = createRequire(path.join(installed.NodeConsumer, 'package.json'));
   const native = consumerRequire('@turndb/native');
-  const nativeMeta = consumerRequire('@turndb/native/package.json');
-  const nativeSliceMeta = consumerRequire('@turndb/native-win32-x64-msvc/package.json');
-  const cliMeta = consumerRequire('@turndb/cli/package.json');
-  const cliSliceMeta = consumerRequire('@turndb/cli-win32-x64-msvc/package.json');
-  const cli = path.join(path.dirname(consumerRequire.resolve('@turndb/cli-win32-x64-msvc/package.json')), 'turndb.exe');
+  // Package metadata is evidence about the installed tree, not a public module subpath. Read it
+  // from that tree so selectors keep their deliberate exports boundary (`./package.json` is not
+  // part of @turndb/native's API) instead of widening the artifact solely for this harness.
+  const packageRoot = (name) => path.join(
+    installed.NodeConsumer, 'node_modules', ...name.split('/'),
+  );
+  const packageMeta = (name) => JSON.parse(
+    fs.readFileSync(path.join(packageRoot(name), 'package.json'), 'utf8'),
+  );
+  const nativeMeta = packageMeta('@turndb/native');
+  const nativeSliceMeta = packageMeta('@turndb/native-win32-x64-msvc');
+  const cliMeta = packageMeta('@turndb/cli');
+  const cliSliceMeta = packageMeta('@turndb/cli-win32-x64-msvc');
+  const cli = path.join(packageRoot('@turndb/cli-win32-x64-msvc'), 'turndb.exe');
   const versions = new Set([nativeMeta.version, nativeSliceMeta.version, cliMeta.version, cliSliceMeta.version]);
   assert.deepEqual([...versions], [installed.Version]);
   assert.equal(run(cli, ['--version']).trim(), `turndb ${installed.Version}`);
