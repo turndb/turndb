@@ -178,7 +178,10 @@ async function main() {
   const afterSpace = await store.spaceUsage();
   const after = fs.readFileSync(punchStore);
   assert(punched.blocksPunched > 0n, 'installed Windows addon must exercise zero-data punch');
-  assert.equal(after.length, before.length, 'punch must not move offsets or change file length');
+  assert(
+    after.length >= before.length,
+    'punch may append its manifest publication but must not truncate the existing file',
+  );
   let zeroed = 0;
   for (let i = 0; i < Math.min(before.length, after.length); i += 1) {
     if (before[i] !== after[i]) {
@@ -229,6 +232,8 @@ async function main() {
       blocksExamined: punched.blocksExamined.toString(),
       blocksPunched: punched.blocksPunched.toString(),
       zeroedBytesObserved: zeroed,
+      fileBytesBefore: before.length,
+      fileBytesAfter: after.length,
       allocatedBefore: beforeSpace.allocatedBytes?.toString(),
       allocatedAfter: afterSpace.allocatedBytes?.toString(),
     },
