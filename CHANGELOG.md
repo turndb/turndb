@@ -118,15 +118,7 @@ remain valid, and directory stores continue to use the platform allocation query
 MSVC binaries. `turndb --version`, `turndb version`, and `turndb -V` report the crate version compiled
 into the selected platform binary.
 
-### Fixes
-
-#### CLI writer verbs close sessions cleanly
-
-Writer verbs now close the store they open before returning. A successful `compact`, `refold`,
-`punch`, `erase`, or `seal` therefore removes its empty WAL sidecar and leaves the documented
-single-file store shape instead of a stray zero-byte `<store>-wal`.
-
-#### Crash leftovers and failed durability barriers are reported
+#### Crash-leftover inventory is public
 
 Writer open now recognises every transient name the publication and reclaim protocols can leave
 after a crash. Beside a present store it removes safe-to-discard leftovers and reports the count in
@@ -141,12 +133,24 @@ exhaustive struct literal must add `debris_removed`; callers that obtain metrics
 read their fields are unaffected. This source-compatibility break ships in 0.1.7 without a breaking
 version signal; compatibility hardening is deferred to a future breaking release.
 
+### Fixes
+
+#### CLI writer verbs close sessions cleanly
+
+Writer verbs now close the store they open before returning. A successful `compact`, `refold`,
+`punch`, `erase`, or `seal` therefore removes its empty WAL sidecar and leaves the documented
+single-file store shape instead of a stray zero-byte `<store>-wal`.
+
+#### Crash leftovers are inspected with remediation
+
 `turndb inspect` scans that inventory before opening the target, so it can report leftovers beside
 an absent store and gives a conversion hint for a retired directory store. The support and format
 documents list every recognised name, when it can appear, and the corresponding recovery action.
 For a refused pending-publication file beside an absent store, inspect it and remove or move aside
 the named file before retrying. For `<store>-hot`, use the 0.1.x release that wrote it to settle its
 acknowledged writes, or move the directory aside deliberately; a current writer will not delete it.
+
+#### Failed durability barriers are reported
 
 Every publication path also propagates a failed file or directory sync. Operations that previously
 could report success after the durability barrier failed now return an error describing the name
