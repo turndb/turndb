@@ -93,7 +93,7 @@ First release, so everything is new.
 [0.1.0]: https://github.com/turndb/turndb/releases/tag/v0.1.0
 ## 0.1.7 (2026-08-31)
 
-### Fixes
+### Added
 
 #### Windows x64 packages install the qualified binaries
 
@@ -112,11 +112,15 @@ structural zero for allocated bytes for that store shape, not a measurement. Log
 remain valid, and directory stores continue to use the platform allocation query (tracked in
 [#153](https://github.com/turndb/turndb/issues/153)).
 
-#### The packaged CLI covers five targets and closes writer sessions cleanly
+#### The packaged CLI covers five targets and reports its version
 
 `@turndb/cli` now packages Linux x86-64 and arm64 GNU, macOS x86-64 and arm64, and Windows x86-64
 MSVC binaries. `turndb --version`, `turndb version`, and `turndb -V` report the crate version compiled
 into the selected platform binary.
+
+### Fixes
+
+#### CLI writer verbs close sessions cleanly
 
 Writer verbs now close the store they open before returning. A successful `compact`, `refold`,
 `punch`, `erase`, or `seal` therefore removes its empty WAL sidecar and leaves the documented
