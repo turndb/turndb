@@ -37,23 +37,37 @@ const packWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-pack-
 
 function stagePackage(sourceDir, destination, files) {
   fs.mkdirSync(destination, { recursive: true });
-  for (const file of files) fs.copyFileSync(path.join(sourceDir, file), path.join(destination, file));
+  for (const file of files) {
+    fs.copyFileSync(path.join(sourceDir, file), path.join(destination, file));
+  }
   for (const file of ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.html']) {
     fs.copyFileSync(path.join(workspace, file), path.join(destination, file));
   }
+  // napi-rs owns the generated platform metadata and may rewrite its `files` list. Make the legal
+  // payload an invariant of the actual staging directory instead of relying on generated metadata
+  // retaining local additions.
   const packagePath = path.join(destination, 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
-  packageJson.files = [...new Set([
-    ...(packageJson.files || []), 'LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.html',
-  ])];
+  packageJson.files = [
+    ...new Set([
+      ...(packageJson.files || []),
+      'LICENSE',
+      'NOTICE',
+      'THIRD_PARTY_LICENSES.html',
+    ]),
+  ];
   packageJson.private = !release;
   fs.writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
 }
 
 function pack(packageDir) {
   const result = child.spawnSync(
-    'npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', dist, '.'],
+    'npm',
+    ['pack', '--ignore-scripts', '--json', '--pack-destination', dist, '.'],
     {
+      // Packing an external directory argument goes through npm's package-spec resolver. Run in
+      // the isolated staging directory so optional platform dependencies remain metadata, not
+      // registry lookups, and the report describes only the bytes we staged.
       cwd: packageDir,
       encoding: 'utf8',
       env: { ...process.env, npm_config_cache: npmCache },
@@ -61,7 +75,12 @@ function pack(packageDir) {
     },
   );
   if (result.error || result.status !== 0) {
-    throw new Error(`npm pack failed for ${packageDir} (${result.status}): ${result.stderr || result.error}`);
+    throw new Error(
+      `npm pack failed for ${packageDir} (${result.status}): ${result.stderr || result.error}`,
+    );
+  }
+  if (!result.stdout.trim()) {
+    throw new Error(`npm pack returned no report for ${packageDir}: ${result.stderr}`);
   }
   const reports = JSON.parse(result.stdout);
   if (!Array.isArray(reports) || reports.length !== 1) {
@@ -144,7 +163,9 @@ if (target.glibc) {
     .map((match) => match[1])
     .sort(compareVersions)
     .at(-1);
-  if (!glibcRequired) throw new Error(`${artifactName} exposes no readable GLIBC requirement`);
+  if (!glibcRequired) {
+    throw new Error(`${artifactName} exposes no readable GLIBC symbol-version requirement`);
+  }
   const allowedGlibc = process.env.TURNDB_MAX_GLIBC;
   if (allowedGlibc && compareVersions(glibcRequired, allowedGlibc) > 0) {
     throw new Error(

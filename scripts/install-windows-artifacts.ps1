@@ -11,12 +11,27 @@ $work = (Resolve-Path $WorkDirectory).Path
 # resolves to ::1 first; mixing the two spellings can make a healthy registry look unavailable.
 $registry = 'http://127.0.0.1:4873'
 
-foreach ($manifest in Get-ChildItem $artifacts -Filter '*manifest*.json') {
+$expectedManifestNames = @(
+    'prebuild-manifest-win32-x64-msvc.json',
+    'cli-manifest-win32-x64-msvc.json',
+    'python-manifest-3.9.json',
+    'python-manifest-3.10.json',
+    'python-manifest-3.11.json',
+    'python-manifest-3.12.json',
+    'python-manifest-3.13.json'
+)
+$manifests = @(Get-ChildItem $artifacts -Filter '*manifest*.json' | Sort-Object Name)
+$actualManifestNames = @($manifests | ForEach-Object { $_.Name })
+if (Compare-Object $expectedManifestNames $actualManifestNames) {
+    throw "artifact manifest set differs: expected $($expectedManifestNames -join ', '); " +
+        "got $($actualManifestNames -join ', ')"
+}
+foreach ($manifest in $manifests) {
     python scripts/release-artifacts.py verify `
         --manifest $manifest.FullName --directory $artifacts
     if ($LASTEXITCODE -ne 0) { throw "digest verification failed: $($manifest.Name)" }
 }
-$versions = @(Get-ChildItem $artifacts -Filter '*manifest*.json' |
+$versions = @($manifests |
     ForEach-Object { (Get-Content -Raw $_.FullName | ConvertFrom-Json).version } |
     Sort-Object -Unique)
 if ($versions.Count -ne 1) { throw "artifact versions disagree: $($versions -join ', ')" }
