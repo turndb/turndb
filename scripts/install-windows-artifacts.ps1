@@ -42,6 +42,10 @@ New-Item -ItemType Directory -Force -Path $verdaccioRoot | Out-Null
 $config = Join-Path $verdaccioRoot 'config.yml'
 @"
 storage: ./storage
+# Verdaccio defaults to 10 MB, below both Windows slices (28–29 MB). npm already serves the
+# comparable 76.8 MB unpacked @turndb/cli-linux-x64-gnu package; this raises only the closed test
+# double's request ceiling so it does not manufacture a product-size failure.
+max_body_size: 200mb
 auth:
   htpasswd:
     file: ./htpasswd
