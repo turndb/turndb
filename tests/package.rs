@@ -165,6 +165,93 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
     assert!(prebuild_install_job.contains("scripts/test-prebuild.cjs"));
 }
 
+fn guarded_python_publish_job(workflow: &str) -> Result<&str, String> {
+    let key = "  python_publish:\n";
+    if workflow.matches(key).count() != 1 {
+        return Err("release.yml must contain exactly one python_publish job".into());
+    }
+    let start = workflow.find(key).unwrap() + key.len();
+    let rest = &workflow[start..];
+    let end = rest
+        .lines()
+        .scan(0usize, |offset, line| {
+            let here = *offset;
+            *offset += line.len() + 1;
+            Some((here, line))
+        })
+        .find_map(|(offset, line)| {
+            (line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':'))
+                .then_some(offset)
+        })
+        .unwrap_or(rest.len());
+    let job = &rest[..end];
+    if job.matches("uses: actions/download-artifact@").count() != 1 {
+        return Err("python_publish must have exactly one artifact download".into());
+    }
+    if !job.contains("pattern: turndb-python-*-${{ needs.tag.outputs.release_ref }}")
+        || !job.contains("path: dist")
+    {
+        return Err(
+            "python_publish must download only the release-python artifact family to dist".into()
+        );
+    }
+    if job.matches("uses: pypa/gh-action-pypi-publish@").count() != 1
+        || !job.contains("packages-dir: dist/")
+    {
+        return Err("python_publish must publish only the downloaded dist directory".into());
+    }
+    if job.matches("      - uses:").count() != 2 {
+        return Err("python_publish may contain only download and publish actions".into());
+    }
+    for forbidden in [
+        "actions/checkout@",
+        "actions/setup-python@",
+        "dtolnay/rust-toolchain@",
+        " run:",
+        "maturin",
+        "cargo ",
+        "pip ",
+        "curl ",
+    ] {
+        if job.contains(forbidden) {
+            return Err(format!("python_publish contains byte-producing step {forbidden:?}"));
+        }
+    }
+    Ok(job)
+}
+
+#[test]
+fn pypi_publish_cannot_bypass_the_install_verified_artifact_handoff() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow = fs::read_to_string(format!("{root}/.github/workflows/release.yml")).unwrap();
+    guarded_python_publish_job(&workflow).unwrap();
+
+    // Prove the guard can reject the bypass it claims to detect. A matcher that has never rejected
+    // anything can pass forever after the job it watches is renamed or its shape changes.
+    let rebuild_shaped = r#"  python_publish:
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: turndb-python-*-${{ needs.tag.outputs.release_ref }}
+          path: dist
+      - uses: actions/checkout@v7
+      - run: maturin build --out dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+  next_job:
+    steps: []
+"#;
+    assert!(
+        guarded_python_publish_job(rebuild_shaped).is_err(),
+        "the frozen-caller guard accepted a checkout-and-rebuild bypass"
+    );
+    assert!(
+        guarded_python_publish_job("  renamed_python_publish:\n    steps: []\n").is_err(),
+        "the frozen-caller guard accepted an absent/renamed job"
+    );
+}
+
 /// A single job's block from a workflow file, bounded by the next top-level job key.
 ///
 /// This used to bound each job by whichever job was written after it — `npm` ended where
@@ -197,12 +284,19 @@ fn native_release_is_explicitly_owner_gated() {
         fs::read_to_string(format!("{root}/.github/workflows/release-native.yml")).unwrap();
     assert!(workflow.contains("workflow_dispatch:"));
     assert!(workflow.contains("release_ref:"));
-    assert!(workflow.contains("node: ['22', '24', '26']"));
+    for node in ["node: '22'", "node: '24'", "node: '26'"] {
+        assert!(workflow.contains(node), "native release lost install coverage for {node}");
+    }
+    assert!(workflow.contains("runner: windows-latest"));
     assert!(workflow.contains("needs: [build, install]"));
     assert!(workflow.contains("environment: npm"));
     assert!(workflow.contains("id-token: write"));
     assert!(workflow.contains("package:pack:release"));
     assert!(workflow.contains("scripts/publish-prebuild.cjs"));
+    assert!(workflow.contains("on:\n  workflow_call:"));
+    assert!(workflow.contains("  workflow_dispatch:"));
+    assert!(!workflow.contains("  push:"));
+    assert!(!workflow.contains("  pull_request:"));
 
     let publisher =
         fs::read_to_string(format!("{root}/bindings/node/scripts/publish-prebuild.cjs")).unwrap();
@@ -217,9 +311,29 @@ fn native_release_is_explicitly_owner_gated() {
         assert!(publisher.contains(guard), "native publisher lost guard {guard}");
     }
     assert!(
-        publisher.contains("for (const tarball of [targetTarball, rootTarball])"),
-        "platform package must publish before the root selector package"
+        publisher.contains("for (const tarball of [...platformTarballs, selectorTarball])"),
+        "every platform package must publish before the root selector package"
     );
+}
+
+#[test]
+fn cli_release_is_explicitly_owner_gated() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow = fs::read_to_string(format!("{root}/.github/workflows/release-cli.yml")).unwrap();
+    assert!(workflow.contains("on:\n  workflow_call:"));
+    assert!(workflow.contains("  workflow_dispatch:"));
+    assert!(!workflow.contains("  push:"));
+    assert!(!workflow.contains("  pull_request:"));
+    assert!(workflow.contains("environment: npm"));
+    assert!(workflow.contains("    permissions:\n      contents: read\n      id-token: write"));
+    assert!(workflow.contains("scripts/publish-cli.cjs"));
+
+    let publisher = fs::read_to_string(format!("{root}/cli/scripts/publish-cli.cjs")).unwrap();
+    for guard in
+        ["GITHUB_ACTIONS", "TURNDB_RELEASE_APPROVED", "--exact-match", "cat-file", "--provenance"]
+    {
+        assert!(publisher.contains(guard), "CLI publisher lost guard {guard}");
+    }
 }
 
 #[test]

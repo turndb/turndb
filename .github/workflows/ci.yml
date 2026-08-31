@@ -185,6 +185,12 @@ jobs:
       - name: build and test native addon
         run: npm run test:dev --prefix bindings/node
 
+      # Run once on every PR. This uses closed fake registries and must observe each refusal
+      # before any publish call; it is the executable proof behind the release-workflow guards.
+      - name: prove release publication refusals
+        if: matrix.node == '24'
+        run: node scripts/test-publish-protections.cjs
+
   native-prebuild:
     # Build one Node-API artifact, package it as the declared optional platform dependency, and
     # exercise a clean tarball install. `--use-napi-cross` pins the GNU symbol floor; package:pack

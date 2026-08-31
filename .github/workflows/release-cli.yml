@@ -62,6 +62,10 @@ jobs:
             target: aarch64-apple-darwin
             runner: macos-15
             selector: '0'
+          - slice: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            selector: '0'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,6 +78,7 @@ jobs:
         with:
           node-version: '24'
       - name: verify exact release tag
+        shell: bash
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
         run: |
@@ -112,12 +117,20 @@ jobs:
   install:
     name: install release candidate (node ${{ matrix.node }})
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        node: ['22', '24', '26']
+        include:
+          - node: '22'
+            runner: ubuntu-22.04
+          - node: '24'
+            runner: ubuntu-22.04
+          - node: '26'
+            runner: ubuntu-22.04
+          - node: '24'
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -145,6 +158,10 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -155,22 +172,11 @@ jobs:
           pattern: turndb-cli-${{ inputs.release_ref }}-*
           merge-multiple: true
           path: dist/
-      # The platform package first: a selector whose optional dependency does not yet exist would
-      # install a launcher that cannot resolve its binary, and npm reports a missing OPTIONAL
-      # dependency as success rather than as a failed install.
-      # Every platform package first, the selector last. A selector whose optional dependencies do
-      # not yet exist installs a launcher that cannot resolve its binary — and npm calls a missing
-      # OPTIONAL dependency a successful install, so that failure arrives as silence.
+      # Every required tarball and digest is checked before the first registry write. Every
+      # platform publishes before the selector; a missing OPTIONAL dependency otherwise looks like
+      # a successful npm install while leaving the launcher unable to resolve its binary.
       - name: publish platform packages, then selector
-        run: |
-          set -euo pipefail
-          # The tag carries a leading v and the tarball name does not.
-          version="${RELEASE_REF#v}"
-          for slice in linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64; do
-            tarball="./dist/turndb-cli-${slice}-${version}.tgz"
-            test -f "$tarball" || { echo "missing platform tarball for $slice" >&2; exit 1; }
-            npm publish "$tarball" --access public --provenance
-          done
-          npm publish "./dist/turndb-cli-${version}.tgz" --access public --provenance
+        run: node cli/scripts/publish-cli.cjs dist
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
+          TURNDB_RELEASE_APPROVED: 'true'
