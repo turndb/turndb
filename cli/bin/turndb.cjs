@@ -4,10 +4,9 @@
 // Launcher for the turndb binary, which ships in a per-platform package that npm installs as an
 // optional dependency and skips everywhere it does not apply.
 //
-// The binary is native and Unix-only by design — it needs positioned reads, flock, and (for
-// `punch`) Linux hole punching — so there is deliberately no WASM fallback here. A platform this
-// package has no build for must say so plainly rather than silently degrade into a different
-// engine with different guarantees.
+// The binary is native by design, with no WASM fallback. A platform this package has no build for
+// must say so plainly rather than silently degrade into a different engine with different
+// guarantees.
 
 const { spawnSync } = require('node:child_process');
 
@@ -25,6 +24,7 @@ function platformPackage() {
     if (arch === 'x64') return '@turndb/cli-darwin-x64';
     if (arch === 'arm64') return '@turndb/cli-darwin-arm64';
   }
+  if (platform === 'win32' && arch === 'x64') return '@turndb/cli-win32-x64-msvc';
   return null;
 }
 
@@ -43,13 +43,12 @@ function resolveBinary() {
   const pkg = platformPackage();
   if (pkg === null) {
     throw new Error(
-      `turndb has no CLI build for ${process.platform}-${process.arch}. The binary is Unix-only `
-        + 'by design (positioned reads, flock, hole punching); on Windows use WSL, or build from '
-        + 'source with `cargo install turndb`.',
+      `turndb has no CLI build for ${process.platform}-${process.arch}. `
+        + 'Install a published native slice, or build from source with `cargo install turndb`.',
     );
   }
   try {
-    return require.resolve(`${pkg}/turndb`);
+    return require.resolve(`${pkg}/${process.platform === 'win32' ? 'turndb.exe' : 'turndb'}`);
   } catch (cause) {
     const error = new Error(
       `turndb's platform package ${pkg} is not installed. npm skips optional dependencies on `

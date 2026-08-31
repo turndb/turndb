@@ -39,20 +39,21 @@ if (!fs.existsSync(platformDir)) {
 run('cargo', ['build', '--profile', 'native-release', '--target', TARGET, '--bin', 'turndb'], {
   cwd: ROOT,
 });
-const built = path.join(ROOT, 'target', TARGET, 'native-release', 'turndb');
+const executable = TARGET.includes('windows') ? 'turndb.exe' : 'turndb';
+const built = path.join(ROOT, 'target', TARGET, 'native-release', executable);
 if (!fs.existsSync(built)) throw new Error(`cargo did not produce ${built}`);
 
 // The binary is the package's whole payload; copying it in rather than symlinking keeps `npm pack`
 // from following a link out of the package and shipping nothing.
-fs.copyFileSync(built, path.join(platformDir, 'turndb'));
-fs.chmodSync(path.join(platformDir, 'turndb'), 0o755);
+fs.copyFileSync(built, path.join(platformDir, executable));
+if (process.platform !== 'win32') fs.chmodSync(path.join(platformDir, executable), 0o755);
 for (const file of ['LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.html']) {
   fs.copyFileSync(path.join(ROOT, file), path.join(platformDir, file));
   fs.copyFileSync(path.join(ROOT, file), path.join(CLI_DIR, file));
 }
 fs.copyFileSync(path.join(CLI_DIR, 'README.md'), path.join(platformDir, 'README.md'));
 
-const size = fs.statSync(path.join(platformDir, 'turndb')).size;
+const size = fs.statSync(path.join(platformDir, executable)).size;
 console.log(`${SLICE}: turndb binary ${size} bytes`);
 
 fs.mkdirSync(DIST, { recursive: true });
@@ -103,4 +104,20 @@ for (const [name, pinned] of Object.entries(selector.optionalDependencies ?? {})
 if (selector.optionalDependencies?.[platform.name] === undefined) {
   throw new Error(`the selector does not pin ${platform.name}, so this slice is unreachable`);
 }
+const artifactFiles = [
+  path.join(DIST, `turndb-cli-${SLICE}-${platform.version}.tgz`),
+  ...(PACK_SELECTOR ? [path.join(DIST, `turndb-cli-${selector.version}.tgz`)] : []),
+];
+run(
+  process.platform === 'win32' ? 'python' : 'python3',
+  [
+    path.join(ROOT, 'scripts', 'release-artifacts.py'),
+    'create',
+    '--component', `cli-${SLICE}`,
+    '--version', selector.version,
+    '--output', path.join(DIST, `cli-manifest-${SLICE}.json`),
+    ...artifactFiles,
+  ],
+  { cwd: ROOT },
+);
 console.log(`packed ${fs.readdirSync(DIST).sort().join(', ')}`);

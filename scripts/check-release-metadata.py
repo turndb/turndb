@@ -81,18 +81,28 @@ def check_versions() -> str:
 
     selector = json.loads((ROOT / "bindings/node/package.json").read_text())
     selector_lock = json.loads((ROOT / "bindings/node/package-lock.json").read_text())
-    platform = json.loads(
-        (ROOT / "bindings/node/npm/linux-x64-gnu/package.json").read_text()
-    )
-    pin = selector.get("optionalDependencies", {}).get(platform.get("name"))
-    if pin != reference:
-        fail(f"selector pin {pin!r} does not equal platform version {reference!r}")
+    platforms = [
+        json.loads(path.read_text())
+        for path in sorted((ROOT / "bindings/node/npm").glob("*/package.json"))
+    ]
+    for platform in platforms:
+        pin = selector.get("optionalDependencies", {}).get(platform.get("name"))
+        if pin != reference or platform.get("version") != reference:
+            fail(
+                f"selector pin {pin!r} / platform version {platform.get('version')!r} "
+                f"for {platform.get('name')} do not equal {reference!r}"
+            )
     lock_versions = [selector_lock.get("version"), selector_lock.get("packages", {}).get("", {}).get("version")]
     if lock_versions != [reference, reference]:
         fail(f"selector lock versions {lock_versions!r} do not equal {reference!r}")
-    lock_pin = selector_lock.get("packages", {}).get("", {}).get("optionalDependencies", {}).get(platform.get("name"))
-    if lock_pin != reference:
-        fail(f"selector lock pin {lock_pin!r} does not equal platform version {reference!r}")
+    lock_pins = selector_lock.get("packages", {}).get("", {}).get("optionalDependencies", {})
+    for platform in platforms:
+        lock_pin = lock_pins.get(platform.get("name"))
+        if lock_pin != reference:
+            fail(
+                f"selector lock pin {lock_pin!r} for {platform.get('name')} "
+                f"does not equal platform version {reference!r}"
+            )
     print(f"release metadata: {len(VERSIONED_FILES)} versioned_files, version {reference}, pin aligned")
     return reference
 

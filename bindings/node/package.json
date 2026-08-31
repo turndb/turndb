@@ -52,6 +52,7 @@
     "test:dev": "node scripts/test-dev.cjs",
     "prebuild:linux-x64-gnu": "napi build --platform --profile native-release --target x86_64-unknown-linux-gnu --no-js --output-dir artifacts",
     "prebuild:linux-x64-gnu:cross": "napi build --platform --profile native-release --target x86_64-unknown-linux-gnu --use-napi-cross --no-js --output-dir artifacts",
+    "prebuild:win32-x64-msvc": "napi build --platform --profile native-release --target x86_64-pc-windows-msvc --no-js --output-dir artifacts",
     "package:create": "napi create-npm-dirs --npm-dir npm",
     "package:collect": "napi artifacts --output-dir artifacts --npm-dir npm",
     "package:pack": "node scripts/pack-prebuild.cjs",
@@ -61,7 +62,8 @@
     "test:types": "tsc --project test/types/tsconfig.json"
   },
   "optionalDependencies": {
-    "@turndb/native-linux-x64-gnu": "0.1.6"
+    "@turndb/native-linux-x64-gnu": "0.1.6",
+    "@turndb/native-win32-x64-msvc": "0.1.6"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.4",
@@ -71,7 +73,8 @@
   "napi": {
     "binaryName": "turndb",
     "targets": [
-      "x86_64-unknown-linux-gnu"
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
     ]
   }
 }

@@ -85,7 +85,7 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
     assert_eq!(native["napi"]["binaryName"], "turndb");
     assert_eq!(
         native["napi"]["targets"],
-        serde_json::json!(["x86_64-unknown-linux-gnu"]),
+        serde_json::json!(["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]),
         "every configured target needs its own build, package, and runtime evidence"
     );
     // The selector must request exactly the platform package this tree builds, so derive the
@@ -98,6 +98,10 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         "the selector's optionalDependencies pin must name its own version; a stale pin selects \
          a platform package that was never published at that version"
     );
+    assert_eq!(
+        native["optionalDependencies"]["@turndb/native-win32-x64-msvc"], native["version"],
+        "the Windows selector pin must move in lockstep"
+    );
     assert_eq!(native["exports"]["."]["types"], "./index.d.ts");
     assert_eq!(native["exports"]["."]["import"], "./index.mjs");
     assert_eq!(native["exports"]["."]["require"], "./index.cjs");
@@ -107,6 +111,19 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
             "native root package must declare {legal} in its payload"
         );
     }
+
+    let windows: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(format!("{root}/bindings/node/npm/win32-x64-msvc/package.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(windows["name"], "@turndb/native-win32-x64-msvc");
+    assert_eq!(windows["version"], native["version"]);
+    assert_eq!(windows["private"], true);
+    assert_eq!(windows["main"], "turndb.win32-x64-msvc.node");
+    assert_eq!(windows["os"], serde_json::json!(["win32"]));
+    assert_eq!(windows["cpu"], serde_json::json!(["x64"]));
+    assert!(windows.get("libc").is_none(), "Windows package has no libc selector");
 
     let linux: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(format!("{root}/bindings/node/npm/linux-x64-gnu/package.json"))

@@ -8,22 +8,24 @@ const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
 const dist = path.resolve(process.argv[2] || path.join(root, 'dist'));
-const manifestPath = path.join(dist, 'prebuild-manifest.json');
+const hostTarget = (() => {
+  if (process.platform === 'linux' && process.arch === 'x64') return 'linux-x64-gnu';
+  if (process.platform === 'win32' && process.arch === 'x64') return 'win32-x64-msvc';
+  throw new Error(`no native prebuild test target for ${process.platform}-${process.arch}`);
+})();
+const manifestPath = path.join(dist, `prebuild-manifest-${hostTarget}.json`);
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
 if (
-  manifest.schema !== 1 ||
+  manifest.schema !== 2 ||
   manifest.nodeApi !== 6 ||
-  manifest.npmTarget !== 'linux-x64-gnu' ||
+  manifest.npmTarget !== hostTarget ||
   typeof manifest.publishable !== 'boolean'
 ) {
   throw new Error(`unsupported or inconsistent prebuild manifest at ${manifestPath}`);
 }
-if (process.platform !== 'linux' || process.arch !== 'x64') {
-  throw new Error(`linux-x64-gnu prebuild test cannot run on ${process.platform}-${process.arch}`);
-}
 const glibcRuntime = process.report?.getReport?.().header?.glibcVersionRuntime;
-if (!glibcRuntime) {
+if (hostTarget === 'linux-x64-gnu' && !glibcRuntime) {
   throw new Error('linux-x64-gnu prebuild test requires a glibc runtime');
 }
 
@@ -36,7 +38,7 @@ function compareVersions(left, right) {
   }
   return 0;
 }
-if (compareVersions(glibcRuntime, manifest.glibcRequired) < 0) {
+if (hostTarget === 'linux-x64-gnu' && compareVersions(glibcRuntime, manifest.glibcRequired) < 0) {
   throw new Error(
     `prebuild requires glibc ${manifest.glibcRequired}, runtime provides only ${glibcRuntime}`,
   );
@@ -52,13 +54,13 @@ for (const entry of manifest.tarballs) {
 }
 
 const rootFilename = `turndb-native-${manifest.version}.tgz`;
-const targetFilename = `turndb-native-linux-x64-gnu-${manifest.version}.tgz`;
+const targetFilename = `turndb-native-${hostTarget}-${manifest.version}.tgz`;
 const rootTarball = manifest.tarballs.find((entry) => entry.file === rootFilename);
 const targetTarball = manifest.tarballs.find(
   (entry) => entry.file === targetFilename,
 );
 if (!rootTarball || !targetTarball) {
-  throw new Error('prebuild manifest does not contain both root and linux-x64-gnu packages');
+  throw new Error(`prebuild manifest does not contain both root and ${hostTarget} packages`);
 }
 
 const consumer = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-install-'));
@@ -85,7 +87,7 @@ try {
     const assert = require('node:assert/strict');
     const path = require('node:path');
     const addon = require('@turndb/native');
-    assert.match(require.resolve('@turndb/native-linux-x64-gnu'), /\.node$/);
+    assert.match(require.resolve('@turndb/native-${hostTarget}'), /\.node$/);
     assert.equal(addon.capabilities().napiVersion, 6);
     (async () => {
       const directory = path.join(process.cwd(), 'store');
@@ -173,5 +175,6 @@ try {
 
 console.log(
     `installed and exercised ${manifest.package}@${manifest.version} on ` +
-    `Node ${process.versions.node} (${process.platform}-${process.arch}-gnu, glibc ${glibcRuntime})`,
+    `Node ${process.versions.node} (${hostTarget}` +
+    `${glibcRuntime ? `, glibc ${glibcRuntime}` : ''})`,
 );

@@ -20,6 +20,7 @@ const hostSlice = process.env.TURNDB_CLI_TEST_SLICE ?? (() => {
   if (process.platform === 'linux' && process.arch === 'arm64') return 'linux-arm64-gnu';
   if (process.platform === 'darwin' && process.arch === 'x64') return 'darwin-x64';
   if (process.platform === 'darwin' && process.arch === 'arm64') return 'darwin-arm64';
+  if (process.platform === 'win32' && process.arch === 'x64') return 'win32-x64-msvc';
   throw new Error(`no CLI test slice for ${process.platform}-${process.arch}`);
 })();
 const tarballs = [

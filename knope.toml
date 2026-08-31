@@ -8,12 +8,14 @@ versioned_files = [
   "bindings/browser/Cargo.toml",
   "bindings/node/package.json",
   "bindings/node/npm/linux-x64-gnu/package.json",
+  "bindings/node/npm/win32-x64-msvc/package.json",
   "npm/turndb/package.json",
   "cli/package.json",
   "cli/npm/linux-x64-gnu/package.json",
   "cli/npm/linux-arm64-gnu/package.json",
   "cli/npm/darwin-x64/package.json",
   "cli/npm/darwin-arm64/package.json",
+  "cli/npm/win32-x64-msvc/package.json",
 ]
 changelog = "CHANGELOG.md"
 
