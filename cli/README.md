@@ -26,8 +26,8 @@ dependency and skips everywhere it does not apply. There is deliberately **no WA
 binary needs positioned reads, `flock`, and — for `punch` — Linux hole punching, so a platform
 without a build says so rather than silently running a different engine with different guarantees.
 
-Published slices: `linux-x64-gnu`, `linux-arm64-gnu`, `darwin-x64`, `darwin-arm64`. On anything
-else, including Windows, use WSL or build from source with `cargo install turndb`.
+Published slices: `linux-x64-gnu`, `linux-arm64-gnu`, `darwin-x64`, `darwin-arm64`, and
+`win32-x64-msvc`. Other targets must build from source with `cargo install turndb`.
 
 ## Reading a store the library wrote
 

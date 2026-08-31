@@ -5,6 +5,7 @@ format), `ROADMAP.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md` and `SUP
 repository root.
 
 Start with the [embedding contract](embedding-contract.md) if you are integrating TurnDB, the
+[install guide](install.md) if you want a packaged entrance, the
 [support and compatibility policy](support-and-compatibility.md) if you are choosing a package, and the
 [capability contract](capability-contract.md) if you are reading what a binding reports.
 
@@ -24,6 +25,7 @@ Start with the [embedding contract](embedding-contract.md) if you are integratin
 | [`field-types-v4.md`](field-types-v4.md) | General scalar field types: part of format version 2 |
 | [`format-migration.md`](format-migration.md) | Resumable format migration |
 | [`grouped-column-gather.md`](grouped-column-gather.md) | Grouped column gather |
+| [`install.md`](install.md) | Install TurnDB |
 | [`lifecycle-control.md`](lifecycle-control.md) | Lifecycle cancellation and deadlines |
 | [`lifecycle-events.md`](lifecycle-events.md) | Bounded lifecycle event journal |
 | [`maintenance-space.md`](maintenance-space.md) | Maintenance space accounting and preflight |

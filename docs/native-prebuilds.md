@@ -1,10 +1,11 @@
 # Native Node prebuild and release contract
 
-TurnDB's first native distribution target is deliberately narrow and complete:
+TurnDB's native distribution targets are deliberately narrow and complete:
 
 | package target | Rust target | runtime | Node range | evidence required |
 |---|---|---|---|---|
 | `linux-x64-gnu` | `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.17 or newer | `>=22 <27` | one audited addon installed and exercised on Node 22, 24, and 26 |
+| `win32-x64-msvc` | `x86_64-pc-windows-msvc` | Windows x86-64 with the Visual C++ v14 x64 runtime | `>=22 <27` | one audited addon installed and exercised on Node 22, 24, and 26; full installed-artifact contract on Node 22 |
 
 No other native OS, architecture, or libc is implied. Unsupported hosts receive a load error naming
 their platform, architecture, libc, searched files, and optional package. TurnDB never turns a failed
@@ -22,9 +23,9 @@ The distribution follows the standard `napi-rs` optional-package model:
 ```text
 @turndb/native                         platform-neutral JavaScript + TypeScript declarations
         |
-        +-- optional dependency --> @turndb/native-linux-x64-gnu
+        +-- optional dependency --> @turndb/native-<platform slice>
                                         |
-                                        +-- turndb.linux-x64-gnu.node
+                                        +-- one platform-named `.node` addon
 ```
 
 The root package is small and contains no native bytes. npm selects the platform package through its
@@ -32,7 +33,7 @@ The root package is small and contains no native bytes. npm selects the platform
 
 1. `TURNDB_NATIVE_PATH`, an explicit development override;
 2. the standard local target filename, then legacy local development filenames;
-3. `@turndb/native-linux-x64-gnu` on Linux x64 glibc.
+3. the exact optional platform package on qualified Linux or Windows x86-64.
 
 Only an exact missing optional package is converted to TurnDB's diagnostic load error. A present
 package whose addon fails to load is rethrown unchanged so ABI, shared-library, corruption, and

@@ -5,8 +5,8 @@ compatibility rather than one V8 or Node release. Each `NativeStore` owns a dedi
 a bounded command queue; filesystem, compression, scan, and sync work do not run on the JavaScript
 event loop.
 
-Version 0.1.0 is published on npm. Its first prebuilt distribution target is Linux x86-64 glibc,
-installed and exercised on Node 22, 24, and 26. On a supported host, install it with:
+Version 0.1.0 is published on npm. Prebuilt distribution targets are Linux x86-64 glibc and Windows
+x86-64 MSVC, installed and exercised on Node 22, 24, and 26. On a supported host, install it with:
 
 ```sh
 npm install @turndb/native
