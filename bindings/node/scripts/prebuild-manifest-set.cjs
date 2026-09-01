@@ -41,4 +41,13 @@ function readPrebuildManifestSet(dist) {
   return { manifests, entries };
 }
 
-module.exports = { readPrebuildManifestSet };
+function selectInstallTarballs(entries, hostTarget, version) {
+  const rootTarball = entries.get(`turndb-native-${version}.tgz`);
+  const targetTarball = entries.get(`turndb-native-${hostTarget}-${version}.tgz`);
+  if (!rootTarball || !targetTarball) {
+    throw new Error(`prebuild manifest does not contain both root and ${hostTarget} packages`);
+  }
+  return { rootTarball, targetTarball };
+}
+
+module.exports = { readPrebuildManifestSet, selectInstallTarballs };

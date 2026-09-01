@@ -6,7 +6,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { npmCommand } = require('../../../scripts/npm-command.cjs');
-const { readPrebuildManifestSet } = require('./prebuild-manifest-set.cjs');
+const {
+  readPrebuildManifestSet,
+  selectInstallTarballs,
+} = require('./prebuild-manifest-set.cjs');
 
 const root = path.resolve(__dirname, '..');
 const dist = path.resolve(process.argv[2] || path.join(root, 'dist'));
@@ -57,13 +60,9 @@ for (const entry of entries.values()) {
   }
 }
 
-const rootFilename = `turndb-native-${manifest.version}.tgz`;
-const targetFilename = `turndb-native-${hostTarget}-${manifest.version}.tgz`;
-const rootTarball = entries.get(rootFilename);
-const targetTarball = entries.get(targetFilename);
-if (!rootTarball || !targetTarball) {
-  throw new Error(`prebuild manifest does not contain both root and ${hostTarget} packages`);
-}
+const { rootTarball, targetTarball } = selectInstallTarballs(
+  entries, hostTarget, manifest.version,
+);
 
 const consumer = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-install-'));
 try {

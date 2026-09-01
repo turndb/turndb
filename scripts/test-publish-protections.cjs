@@ -6,7 +6,10 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { readPrebuildManifestSet } = require('../bindings/node/scripts/prebuild-manifest-set.cjs');
+const {
+  readPrebuildManifestSet,
+  selectInstallTarballs,
+} = require('../bindings/node/scripts/prebuild-manifest-set.cjs');
 
 const root = path.resolve(__dirname, '..');
 const version = JSON.parse(fs.readFileSync(path.join(root, 'bindings/node/package.json'))).version;
@@ -151,15 +154,13 @@ try {
   const windowsOnlyEntries = new Map(
     splitSet.manifests.get('win32-x64-msvc').tarballs.map((entry) => [entry.file, entry]),
   );
-  assert.throws(() => {
-    const selector = windowsOnlyEntries.get(`turndb-native-${version}.tgz`);
-    const target = windowsOnlyEntries.get(`turndb-native-win32-x64-msvc-${version}.tgz`);
-    if (!selector || !target) {
-      throw new Error('prebuild manifest does not contain both root and win32-x64-msvc packages');
-    }
-  }, /prebuild manifest does not contain both root and win32-x64-msvc packages/);
-  assert(splitSet.entries.get(`turndb-native-${version}.tgz`));
-  assert(splitSet.entries.get(`turndb-native-win32-x64-msvc-${version}.tgz`));
+  assert.throws(
+    () => selectInstallTarballs(windowsOnlyEntries, 'win32-x64-msvc', version),
+    /prebuild manifest does not contain both root and win32-x64-msvc packages/,
+  );
+  const selected = selectInstallTarballs(splitSet.entries, 'win32-x64-msvc', version);
+  assert.equal(selected.rootTarball.file, `turndb-native-${version}.tgz`);
+  assert.equal(selected.targetTarball.file, `turndb-native-win32-x64-msvc-${version}.tgz`);
 
   const conflictingNative = copyDirectory(splitNative, 'native-conflicting-manifest');
   const windowsManifestPath = path.join(
