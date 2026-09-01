@@ -6,6 +6,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { npmCommand } = require('../../../scripts/npm-command.cjs');
+const {
+  readPrebuildManifestSet,
+  selectInstallTarballs,
+} = require('./prebuild-manifest-set.cjs');
 
 const root = path.resolve(__dirname, '..');
 const dist = path.resolve(process.argv[2] || path.join(root, 'dist'));
@@ -15,9 +19,11 @@ const hostTarget = (() => {
   throw new Error(`no native prebuild test target for ${process.platform}-${process.arch}`);
 })();
 const manifestPath = path.join(dist, `prebuild-manifest-${hostTarget}.json`);
-const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+const { manifests, entries } = readPrebuildManifestSet(dist);
+const manifest = manifests.get(hostTarget);
 
 if (
+  !manifest ||
   manifest.schema !== 2 ||
   manifest.nodeApi !== 6 ||
   manifest.npmTarget !== hostTarget ||
@@ -45,7 +51,7 @@ if (hostTarget === 'linux-x64-gnu' && compareVersions(glibcRuntime, manifest.gli
   );
 }
 
-for (const entry of manifest.tarballs) {
+for (const entry of entries.values()) {
   const file = path.join(dist, entry.file);
   const bytes = fs.readFileSync(file);
   const actual = crypto.createHash('sha256').update(bytes).digest('hex');
@@ -54,15 +60,9 @@ for (const entry of manifest.tarballs) {
   }
 }
 
-const rootFilename = `turndb-native-${manifest.version}.tgz`;
-const targetFilename = `turndb-native-${hostTarget}-${manifest.version}.tgz`;
-const rootTarball = manifest.tarballs.find((entry) => entry.file === rootFilename);
-const targetTarball = manifest.tarballs.find(
-  (entry) => entry.file === targetFilename,
+const { rootTarball, targetTarball } = selectInstallTarballs(
+  entries, hostTarget, manifest.version,
 );
-if (!rootTarball || !targetTarball) {
-  throw new Error(`prebuild manifest does not contain both root and ${hostTarget} packages`);
-}
 
 const consumer = fs.mkdtempSync(path.join(os.tmpdir(), 'turndb-native-install-'));
 try {
