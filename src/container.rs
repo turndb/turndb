@@ -1157,13 +1157,20 @@ pub(crate) fn reclaim_names(path: &Path) -> ReclaimNames {
 pub(crate) struct ReclaimNames {
     /// The fresh container while it is being written: unpublished, no crash meaning.
     pub staging: PathBuf,
-    /// The ANCHOR: the fresh, verified container under a write-through-published name. Never the
-    /// source of the uncertain replace, so no crash state consumes it. Recovery starts here.
+    /// The ANCHOR: a durable name for the fresh, verified container. Under
+    /// [`AnchorConstruction::Copy`] it is that container published by a durable rename, and the
+    /// candidate below is what the uncertain replace consumes. Under
+    /// [`AnchorConstruction::Link`] it is a second directory entry for the staging file's inode,
+    /// and the staging name is what the replace consumes. Either way it is never the source of
+    /// that replace, so no crash state consumes it. Recovery starts here.
     pub anchor: PathBuf,
-    /// A byte copy of the anchor while it is being written.
+    /// A byte copy of the anchor while it is being written. `Copy` only — a `Link` reclaim never
+    /// creates it, though a store crashed under `Copy` (on Windows, or on a filesystem without
+    /// hard links) can still be found beside one, including by a build that does not produce it.
     pub candidate_tmp: PathBuf,
-    /// The CANDIDATE: the copy under a write-through-published name, writer-locked, and then
-    /// replaced over `<store>`. A crash during that replace may lose it; the anchor remains.
+    /// The CANDIDATE: the copy under a durably published name, writer-locked, and then replaced
+    /// over `<store>`. A crash during that replace may lose it; the anchor remains. `Copy` only,
+    /// with the same cross-platform caveat as `candidate_tmp`.
     pub candidate: PathBuf,
 }
 
@@ -1191,31 +1198,39 @@ fn copy_container_bytes(from: &Path, to: &Path) -> Result<u64> {
 
 /// Rewrite a live container as one aligned extent per member and put the result at its name.
 ///
-/// The publication protocol is the crash-safety argument, and it is the same on every platform
-/// so the deterministic simulator proves it under both durability models:
+/// The publication protocol is the crash-safety argument. Its shape is the same everywhere — a
+/// durable **anchor** naming verified bytes exists before the store's name is replaced, and
+/// survives every state the replace can leave — and the deterministic simulator proves it under
+/// both durability models. Only the anchor's construction differs; see [`AnchorConstruction`].
 ///
 /// 1. the fresh container is written at `<store>.reclaiming`, committed and verified;
-/// 2. it is published as the **anchor**, `<store>.reclaimed`, by a write-through no-replace
-///    rename — a durable name for verified bytes that nothing below touches;
-/// 3. a byte copy of the anchor is fsynced and published as the **candidate**,
-///    `<store>.reclaim-candidate`, the same way; the candidate is then opened and the writer lock
-///    is taken on that handle *before* it is published at the store's name — the name a second
-///    writer would open;
-/// 4. the candidate is renamed over `<store>` (`vfs::rename_replace_open`) — `rename(2)` on Unix;
-///    on Windows the write-through `MoveFileExW`, which refuses because this function holds the
-///    original open and locked, then `std`'s POSIX-semantics fallback, which is **not**
+/// 2. **the anchor is obtained.** With [`AnchorConstruction::Link`] — what a POSIX build asks for
+///    — it is a second directory entry for that same inode (`vfs::link`) made durable by the
+///    directory's fsync, and the staging file itself is what step 4 replaces over the store. With
+///    [`AnchorConstruction::Copy`] — what Windows asks for, since a linked name is not durable
+///    where the namespace publishes only through write-through renames, and what a POSIX build
+///    falls back to when `link` refuses — the staging file is renamed to `<store>.reclaimed` and
+///    a byte copy of it is published as `<store>.reclaim-candidate`, which is what step 4
+///    replaces;
+/// 3. that name — the staging file or the candidate — is opened and the writer lock is taken on
+///    that handle *before* it is published at the store's name, the name a second writer would
+///    open;
+/// 4. it is renamed over `<store>` (`vfs::rename_replace_open`) — `rename(2)` on Unix; on Windows
+///    the write-through `MoveFileExW`, which refuses because the destination is open (any reader
+///    of a live store holds it), then `std`'s POSIX-semantics fallback, which is **not**
 ///    write-through (`sys::rename`) and which no later documented barrier promotes. The crash
 ///    model therefore carries old / new / neither for this step through every later crash point,
 ///    including after the cleanup below and after this function returns. In every one of those
 ///    states the anchor is intact, and an absent `<store>` beside a whole anchor is what a writer
 ///    open recovers (`Store::open_file`);
-/// 5. the new store at its name is reopened and verified, the locked candidate handle — now the
-///    handle of `<store>` itself — is held until this function returns so no second writer can
-///    enter between the replace and the return, and the anchor is unlinked (laggable: a stale
-///    anchor beside a present store is removed by the next writer open, never promoted).
+/// 5. the new store at its name is reopened and verified, the locked handle — now the handle of
+///    `<store>` itself — is held until this function returns so no second writer can enter
+///    between the replace and the return, and the anchor is unlinked (laggable: a stale anchor
+///    beside a present store is removed by the next writer open, never promoted).
 ///
-/// Cost: one extra copy of the fresh, compacted container on every platform, and on Windows two
-/// write-through renames more than before. No format bytes change.
+/// Cost: the compacted container is written **once** under `Link` and **twice** under `Copy`,
+/// and on Windows there are two write-through renames more. No format bytes change: a store
+/// reclaimed either way is byte-identical.
 pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
     reclaim_with_hook(path, AnchorConstruction::for_host(), |_| {})
 }
@@ -1259,10 +1274,7 @@ impl AnchorConstruction {
 /// Windows model is what proves the platform split is necessary rather than merely tidy. Not API:
 /// production calls [`reclaim`], which selects by capability and falls back by probe.
 #[cfg(feature = "dst")]
-pub fn reclaim_with_construction(
-    path: &Path,
-    anchor: AnchorConstruction,
-) -> Result<ReclaimStats> {
+pub fn reclaim_with_construction(path: &Path, anchor: AnchorConstruction) -> Result<ReclaimStats> {
     reclaim_with_hook(path, anchor, |_| {})
 }
 

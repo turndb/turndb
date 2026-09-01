@@ -1114,17 +1114,22 @@ it:
    below and after the return;
 5. the store at its name is reopened and verified, and the anchor is unlinked.
 
-**Which anchor a reclaim uses is not decided by the platform's name.** It attempts the link and
-uses the copy if the attempt fails, so a filesystem without hard links — FAT and exFAT, some
-network and FUSE mounts — is served by the route that never needed them. The capability is probed
-by using it: `link(2)` refuses, before anything has been published, and that refusal is the whole
-of the check. Nothing infers from the platform a build was compiled for that a filesystem supports
-links, and this choice rests on no assumption that goes unenforced.
+**Two things choose the anchor, and only the first is the platform.** A build asks for the link
+anchor only where a linked name can be made durable at all — so a Windows build asks for the copy
+and never attempts a link. **Everywhere else the platform's answer is not the last word**: the
+build attempts `link(2)` and uses the copy when the attempt fails, so a filesystem without hard
+links — FAT and exFAT, some network and FUSE mounts — is served by the route that never needed
+them. The capability is probed by using it: the call refuses, before anything has been published,
+and that refusal is the whole of the check. **Nothing infers from the platform a build was
+compiled for that a filesystem supports links**, and this choice rests on no assumption that goes
+unenforced.
 
 In every one of those states the anchor is intact: a writer open that finds the store's name absent
-beside its anchor validates the anchor whole (the manifest-recovery bar), copies it, locks and
-verifies the copy, publishes it durably at the store's name, and only then unlinks the anchor; one
-recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor is refused and
+beside its anchor validates the anchor whole (the manifest-recovery bar) and then publishes it at
+the store's name — by linking the anchor's inode there where a link is durable, in which case the
+writer lock already held on the anchor **is** the lock on the store, one file with two names; and
+otherwise by copying it, locking and verifying the copy, and publishing that. The anchor is
+unlinked only afterwards; one recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor is refused and
 nothing is created. A store that is present is always the authority — reclaim material beside it is
 removed, never consulted. The anchor's unlink and the candidate's are laggable on Windows, so
 `.reclaim*` debris may follow a crash; it never changes which store wins, and a writer open beside

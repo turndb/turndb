@@ -2450,8 +2450,9 @@ fn reclaim_sweep(tag: &str, anchor: AnchorConstruction, models: &[Model]) -> usi
             // A writer open: recovers from the anchor when the name is gone, opens otherwise, and
             // never refuses. Then the store must be whole, and a second open must converge.
             for pass in ["first writer open", "second writer open"] {
-                let s = Store::open_file(&store, cfg)
-                    .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}"));
+                let s = Store::open_file(&store, cfg).unwrap_or_else(|e| {
+                    panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}")
+                });
                 s.close().unwrap();
                 check(pass, k, variant, &store);
             }
@@ -3168,9 +3169,16 @@ fn sync_failure_variant_under<W>(
         base.seed_durable(&root);
         let (err, ops) = run_with_failed_sync(j, || op(&root, &w));
         let label = format!("{tag}: sync {j} of {syncs} failed ({})", short_err(&err));
-        converges_under(&format!("{tag}-syncvar-{j}"), &label, &base, &root, &root, &ops, models, |dir, what| {
-            check(dir, &w, what)
-        });
+        converges_under(
+            &format!("{tag}-syncvar-{j}"),
+            &label,
+            &base,
+            &root,
+            &root,
+            &ops,
+            models,
+            |dir, what| check(dir, &w, what),
+        );
         std::fs::remove_dir_all(&root).ok();
     }
     syncs
