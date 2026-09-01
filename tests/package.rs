@@ -389,3 +389,61 @@ fn failed_release_retries_build_the_intended_package_through_the_trusted_caller(
         "PyPI attestations cannot be issued from a reusable workflow until PyPI supports its split OIDC identities"
     );
 }
+
+/// `reclaim` is an explicit administrative operation, and the docs say so.
+///
+/// The support doc tells a reader that reclaim's cost — one or two writes of the compacted
+/// container — is paid only when they run the command, and that nothing pays it on a write, a
+/// checkpoint or a close. That is true today because the engine has exactly one caller: the CLI
+/// verb. It would stop being true the day someone wires automatic reclamation into a commit path,
+/// and nothing else in the tree would notice.
+///
+/// So this notices. It is a claim about the shape of the code rather than about its behaviour,
+/// which is why it is a source check and not a unit test: the property is "nobody calls this",
+/// and there is no run in which that can be observed.
+#[test]
+fn reclaim_has_one_caller() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    files.sort();
+
+    let mut callers: Vec<String> = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            // The definitions themselves, and the sibling helpers, are not calls.
+            if code.contains("fn reclaim") || code.contains("reclaim_names(") {
+                continue;
+            }
+            if code.contains("reclaim(") || code.contains("reclaim_with_construction(") {
+                callers.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(root).unwrap().display(),
+                    n + 1,
+                    code.trim()
+                ));
+            }
+        }
+    }
+    assert_eq!(
+        callers,
+        vec![format!(
+            "src/bin/turndb.rs:251: let stats = turndb::container::reclaim(&file)?;"
+        )],
+        "reclaim gained or lost a caller. If an engine path now runs it, the support doc's \
+         \"no write, checkpoint or close runs reclaim\" is false and must change with it:\n  {}",
+        callers.join("\n  ")
+    );
+}

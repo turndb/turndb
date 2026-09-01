@@ -1118,8 +1118,8 @@ it:
 uses the copy if the attempt fails, so a filesystem without hard links — FAT and exFAT, some
 network and FUSE mounts — is served by the route that never needed them. The capability is probed
 by using it: `link(2)` refuses, before anything has been published, and that refusal is the whole
-of the check. Nothing infers from `cfg(unix)` that a filesystem supports links, and no store
-depends on an assumption that goes unenforced.
+of the check. Nothing infers from the platform a build was compiled for that a filesystem supports
+links, and this choice rests on no assumption that goes unenforced.
 
 In every one of those states the anchor is intact: a writer open that finds the store's name absent
 beside its anchor validates the anchor whole (the manifest-recovery bar), copies it, locks and
