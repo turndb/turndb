@@ -53,7 +53,7 @@ dst = []
 [dependencies]
 # The storage-native query lens. Kept at DataFusion 54's exact Arrow line so enabling SQL unifies one
 # Arrow graph rather than compiling two incompatible ABIs.
-arrow = { version = "58.4.0", default-features = false, optional = true }
+arrow = { version = "59.2.0", default-features = false, optional = true }
 # Optional SQL planner/executor over the lens. The embedded context registers only TurnDB's table
 # and rejects DDL, so Parquet plus external compression readers are unreachable bulk. Keep the
 # ordinary expression families and recursive parser protection, but do not ship file-format stacks
