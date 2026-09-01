@@ -103,6 +103,17 @@ def check_versions() -> str:
                 f"selector lock pin {lock_pin!r} for {platform.get('name')} "
                 f"does not equal platform version {reference!r}"
             )
+        lock_entry = selector_lock.get("packages", {}).get(f"node_modules/{platform.get('name')}")
+        expected_entry = {
+            "version": reference,
+            "optional": True,
+            **{key: platform[key] for key in ("cpu", "os", "libc") if key in platform},
+        }
+        if lock_entry != expected_entry:
+            fail(
+                f"selector lock entry for {platform.get('name')} is {lock_entry!r}; "
+                f"expected unresolved versioned optional stub {expected_entry!r}"
+            )
     print(f"release metadata: {len(VERSIONED_FILES)} versioned_files, version {reference}, pin aligned")
     return reference
 
@@ -186,7 +197,7 @@ def check_release_workflow_runtime_contract() -> None:
         fail("Python release jobs must use the repository's pinned 1.95.0 toolchain")
 
     if "npm install --package-lock-only" in native:
-        fail("native release must not delete unpublished optional lock stubs before npm ci")
+        fail("native release must consume the committed versioned optional lock stubs")
     if "npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node" not in native:
         fail("native release lost the locked dependency-tree refusal")
 

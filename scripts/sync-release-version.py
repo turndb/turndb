@@ -80,23 +80,28 @@ for package_name_in_lock in stale_local_packages:
         check=True,
     )
 
-# The lock file is edited directly rather than through `npm install --package-lock-only`: npm
-# regenerates the lock by resolving against the registry, and the platform package's new version
-# is unpublished at prepare time — this release is what publishes it — so npm silently drops the
-# unresolvable optional dependency's entry and `npm ci` then refuses the lock as out of sync.
-#
-# The platform package's entry is CONVERTED to the version-less `{"optional": true}` stub rather
-# than preserved: npm accepts the stub exactly while the pinned version is absent from the
-# registry — which is the release branch's whole lifetime — and refuses it afterwards. The
-# matching post-publication step (see the release PR body) restores the resolved entry on `main`
-# with `npm install --package-lock-only` once the version exists.
+# Edit the lock directly rather than resolving it against the registry. Each optional platform
+# entry records the exact requested version but deliberately has no resolved URL or integrity:
+# npm accepts that shape whether the version is unpublished (the release PR) or published (main
+# after the release), and an unavailable optional package remains optional. One representation is
+# therefore valid on both sides of first publication; there is no post-publication repair step.
 lock_path = ROOT / "bindings/node/package-lock.json"
 npm_lock = json.loads(lock_path.read_text())
 npm_lock["version"] = VERSION
 npm_lock["packages"][""]["version"] = VERSION
+platform_manifests = {
+    manifest["name"]: manifest
+    for path in sorted((ROOT / "bindings/node/npm").glob("*/package.json"))
+    for manifest in [json.loads(path.read_text())]
+}
 for name in [n for n in npm_lock["packages"][""].get("optionalDependencies", {}) if n.startswith("@turndb/")]:
     npm_lock["packages"][""]["optionalDependencies"][name] = VERSION
-    npm_lock["packages"][f"node_modules/{name}"] = {"optional": True}
+    platform_manifest = platform_manifests[name]
+    npm_lock["packages"][f"node_modules/{name}"] = {
+        "version": VERSION,
+        "optional": True,
+        **{key: platform_manifest[key] for key in ("cpu", "os", "libc") if key in platform_manifest},
+    }
 lock_path.write_text(json.dumps(npm_lock, indent=2) + "\n")
 
 # THIRD_PARTY_LICENSES.html lists the workspace's own crates with their versions, so a version

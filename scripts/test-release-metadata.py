@@ -78,6 +78,18 @@ with tempfile.TemporaryDirectory() as temp:
 with tempfile.TemporaryDirectory() as temp:
     copy = pathlib.Path(temp) / "repo"
     copy_candidates(copy)
+    lock_path = copy / "bindings/node/package-lock.json"
+    lock = json.loads(lock_path.read_text())
+    entry = lock["packages"]["node_modules/@turndb/native-linux-x64-gnu"]
+    entry.pop("version")
+    lock_path.write_text(json.dumps(lock, indent=2) + "\n")
+    result = run(copy)
+    if result.returncode == 0 or "expected unresolved versioned optional stub" not in result.stderr:
+        raise SystemExit(f"versionless-lock-stub control did not discriminate:\n{result.stdout}{result.stderr}")
+
+with tempfile.TemporaryDirectory() as temp:
+    copy = pathlib.Path(temp) / "repo"
+    copy_candidates(copy)
     workflow = copy / ".github/workflows/release-native.yml"
     workflow.write_text(workflow.read_text().replace(
         'case "$RELEASE_REF" in v[0-9]*.[0-9]*.[0-9]*)',
@@ -128,7 +140,7 @@ workflow_controls = [
         "      - name: install locked packaging tools\n",
         "      - run: npm install --package-lock-only --prefix bindings/node\n"
         "      - name: install locked packaging tools\n",
-        "must not delete unpublished optional lock stubs",
+        "must consume the committed versioned optional lock stubs",
         "native lock regeneration",
     ),
     (

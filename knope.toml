@@ -76,7 +76,7 @@ base = "main"
 template = "chore: prepare release $version"
 
 [workflows.steps.body]
-template = "This PR was created by Knope. Review the generated CHANGELOG.md entry and all lockstep version changes. Merging it creates the v$version release after the protected publication jobs are approved.\n\nAfter the native publication succeeds, restore the platform package's resolved lock entry on main: `npm install --package-lock-only --ignore-scripts` in `bindings/node`, committed via PR. The release branch intentionally carries a version-less stub for it, which npm accepts only while the pinned version is unpublished."
+template = "This PR was created by Knope. Review the generated CHANGELOG.md entry and all lockstep version changes. Merging it creates the v$version release after the protected publication jobs are approved.\n\nThe native platform packages remain versioned unresolved optional entries in `bindings/node/package-lock.json`. That committed shape is valid before and after first publication; there is no post-publication lock repair."
 
 # There is deliberately no `release` workflow here. Knope's Release step treats an existing tag at
 # the prepared version as evidence the release is already done, and this repository creates the
