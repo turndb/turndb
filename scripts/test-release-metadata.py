@@ -145,6 +145,20 @@ workflow_controls = [
         "top-level release completeness verdict lost",
         "component-aware skip set",
     ),
+    (
+        ".github/workflows/release.yml",
+        '          elif [ "$COMPONENT" = all ]; then\n            expected=\'{"tag":"success","crate":"success","native":"success","wasm":"success","python_publish":"success","browser":"success","cli":"success"}\'',
+        '          elif [ "$COMPONENT" = all ]; then\n            expected=\'{"tag":"success","crate":"success","native":"success","wasm":"success","python_publish":"success","browser":"success","cli":"skipped"}\'',
+        "must be stated separately",
+        "all-with-skipped-leg",
+    ),
+    (
+        ".github/workflows/release.yml",
+        "    if: github.event_name == 'pull_request' || inputs.component == 'cli' || inputs.component == 'all'\n",
+        "    if: github.event_name == 'pull_request' || inputs.component == 'cli'\n",
+        "component dispatch cannot reach the cli job",
+        "all dispatch coverage",
+    ),
 ]
 
 for relative, old, new, expected, label in workflow_controls:
