@@ -17,12 +17,17 @@ on:
         required: true
         type: string
       component:
-        description: Failed publication to rebuild, install-test, and publish
+        description: Retry component (python = wheels + PyPI) or all; published registry versions are refused
         required: true
         type: choice
         options:
+          - crate
+          - native
           - wasm
           - python
+          - browser
+          - cli
+          - all
 
 jobs:
   tag:
@@ -114,7 +119,7 @@ jobs:
   # the whole workflow fails validation at startup, before any job's `if` is evaluated.
   crate:
     needs: tag
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.component == 'crate' || inputs.component == 'all'
     permissions:
       contents: read
       id-token: write
@@ -125,7 +130,7 @@ jobs:
 
   native:
     needs: tag
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.component == 'native' || inputs.component == 'all'
     permissions:
       contents: read
       id-token: write
@@ -136,7 +141,7 @@ jobs:
 
   wasm:
     needs: tag
-    if: github.event_name == 'pull_request' || inputs.component == 'wasm'
+    if: github.event_name == 'pull_request' || inputs.component == 'wasm' || inputs.component == 'all'
     permissions:
       contents: read
       id-token: write
@@ -147,7 +152,7 @@ jobs:
 
   python:
     needs: tag
-    if: github.event_name == 'pull_request' || inputs.component == 'python'
+    if: github.event_name == 'pull_request' || inputs.component == 'python' || inputs.component == 'all'
     permissions:
       contents: read
     uses: ./.github/workflows/release-python.yml
@@ -162,7 +167,7 @@ jobs:
   python_publish:
     name: Python / publish to PyPI
     needs: [tag, python]
-    if: github.event_name == 'pull_request' || inputs.component == 'python'
+    if: github.event_name == 'pull_request' || inputs.component == 'python' || inputs.component == 'all'
     runs-on: ubuntu-22.04
     environment: pypi
     permissions:
@@ -179,7 +184,7 @@ jobs:
 
   browser:
     needs: tag
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.component == 'browser' || inputs.component == 'all'
     permissions:
       contents: write
     uses: ./.github/workflows/release-browser.yml
@@ -189,7 +194,7 @@ jobs:
 
   cli:
     needs: tag
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || inputs.component == 'cli' || inputs.component == 'all'
     permissions:
       contents: read
       id-token: write
@@ -227,13 +232,21 @@ jobs:
         run: |
           if [ "$EVENT_NAME" = pull_request ]; then
             expected='{"tag":"success","crate":"success","native":"success","wasm":"success","python_publish":"success","browser":"success","cli":"success"}'
-          elif [ "$COMPONENT" = python ]; then
-            expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"success","browser":"skipped","cli":"skipped"}'
-          elif [ "$COMPONENT" = wasm ]; then
-            expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"success","python_publish":"skipped","browser":"skipped","cli":"skipped"}'
+          elif [ "$COMPONENT" = all ]; then
+            expected='{"tag":"success","crate":"success","native":"success","wasm":"success","python_publish":"success","browser":"success","cli":"success"}'
           else
-            echo "no complete-graph contract for event=$EVENT_NAME component=$COMPONENT" >&2
-            exit 1
+            case "$COMPONENT" in
+              crate)   expected='{"tag":"success","crate":"success","native":"skipped","wasm":"skipped","python_publish":"skipped","browser":"skipped","cli":"skipped"}' ;;
+              native)  expected='{"tag":"success","crate":"skipped","native":"success","wasm":"skipped","python_publish":"skipped","browser":"skipped","cli":"skipped"}' ;;
+              wasm)    expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"success","python_publish":"skipped","browser":"skipped","cli":"skipped"}' ;;
+              python)  expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"success","browser":"skipped","cli":"skipped"}' ;;
+              browser) expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"skipped","browser":"success","cli":"skipped"}' ;;
+              cli)     expected='{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"skipped","browser":"skipped","cli":"success"}' ;;
+              *)
+                echo "no complete-graph contract for event=$EVENT_NAME component=$COMPONENT" >&2
+                exit 1
+                ;;
+            esac
           fi
           actual="$(jq -c 'with_entries(.value = .value.result)' <<<"$RESULTS")"
           if [ "$(jq -S . <<<"$actual")" != "$(jq -S . <<<"$expected")" ]; then

@@ -191,16 +191,55 @@ def check_release_workflow_runtime_contract() -> None:
         fail("native release lost the locked dependency-tree refusal")
 
     release = (ROOT / ".github/workflows/release.yml").read_text()
+    component = re.search(
+        r"(?ms)^      component:\n(?P<body>.*?)(?=^      [a-z_]+:\n|^jobs:\n)", release
+    )
+    if component is None:
+        fail("top-level release lost its component dispatch contract")
+    options = re.findall(r"^          - (\S+)$", component.group("body"), re.MULTILINE)
+    expected_options = ["crate", "native", "wasm", "python", "browser", "cli", "all"]
+    if options != expected_options:
+        fail(f"top-level release component choices {options!r} do not equal {expected_options!r}")
+    if "python = wheels + PyPI" not in component.group("body") or "published registry versions are refused" not in component.group("body"):
+        fail("component input must name Python's scope and the rerun refusal")
+
+    dispatch_conditions = {
+        "crate": "github.event_name == 'pull_request' || inputs.component == 'crate' || inputs.component == 'all'",
+        "native": "github.event_name == 'pull_request' || inputs.component == 'native' || inputs.component == 'all'",
+        "wasm": "github.event_name == 'pull_request' || inputs.component == 'wasm' || inputs.component == 'all'",
+        "python": "github.event_name == 'pull_request' || inputs.component == 'python' || inputs.component == 'all'",
+        "python_publish": "github.event_name == 'pull_request' || inputs.component == 'python' || inputs.component == 'all'",
+        "browser": "github.event_name == 'pull_request' || inputs.component == 'browser' || inputs.component == 'all'",
+        "cli": "github.event_name == 'pull_request' || inputs.component == 'cli' || inputs.component == 'all'",
+    }
+    for job, condition in dispatch_conditions.items():
+        block = re.search(rf"(?ms)^  {job}:\n(?P<body>.*?)(?=^  [a-z_]+:\n|\Z)", release)
+        if block is None or f"    if: {condition}" not in block.group("body"):
+            fail(f"component dispatch cannot reach the {job} job under its complete contract")
+
     complete = re.search(r"(?ms)^  complete:\n(?P<body>.*?)(?=^  [a-z_]+:\n|\Z)", release)
     if complete is None:
         fail("top-level release lost its public completeness verdict")
     complete_body = complete.group("body")
+    success = '{"tag":"success","crate":"success","native":"success","wasm":"success","python_publish":"success","browser":"success","cli":"success"}'
+    maps = {
+        "crate": '{"tag":"success","crate":"success","native":"skipped","wasm":"skipped","python_publish":"skipped","browser":"skipped","cli":"skipped"}',
+        "native": '{"tag":"success","crate":"skipped","native":"success","wasm":"skipped","python_publish":"skipped","browser":"skipped","cli":"skipped"}',
+        "wasm": '{"tag":"success","crate":"skipped","native":"skipped","wasm":"success","python_publish":"skipped","browser":"skipped","cli":"skipped"}',
+        "python": '{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"success","browser":"skipped","cli":"skipped"}',
+        "browser": '{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"skipped","browser":"success","cli":"skipped"}',
+        "cli": '{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"skipped","browser":"skipped","cli":"success"}',
+    }
+    for label, marker in (("pull_request", success), ("all", success), *maps.items()):
+        if f"expected='{marker}'" not in complete_body:
+            fail(f"top-level release completeness verdict lost its {label} expected map")
+    if complete_body.count(f"expected='{success}'") != 2:
+        fail("pull-request and all recovery expected maps must be stated separately")
+
     for required in (
         "needs: [tag, crate, native, wasm, python_publish, browser, cli]",
         "if: always() && !cancelled() && needs.tag.result == 'success'",
         "RESULTS: ${{ toJSON(needs) }}",
-        'expected=\'{"tag":"success","crate":"skipped","native":"skipped","wasm":"skipped","python_publish":"success","browser":"skipped","cli":"skipped"}\'',
-        'expected=\'{"tag":"success","crate":"skipped","native":"skipped","wasm":"success","python_publish":"skipped","browser":"skipped","cli":"skipped"}\'',
         "with_entries(.value = .value.result)",
         'https://registry.npmjs.org/$encoded/$version',
         'https://crates.io/api/v1/crates/turndb/$version',
