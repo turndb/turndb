@@ -1114,13 +1114,14 @@ it:
    below and after the return;
 5. the store at its name is reopened and verified, and the anchor is unlinked.
 
-**Two things choose the anchor, and only the first is the platform.** A build asks for the link
-anchor only where a linked name can be made durable at all — so a Windows build asks for the copy
-and never attempts a link. **Everywhere else the platform's answer is not the last word**: the
-build attempts `link(2)` and uses the copy when the attempt fails, so a filesystem without hard
-links — FAT and exFAT, some network and FUSE mounts — is served by the route that never needed
-them. The capability is probed by using it: the call refuses, before anything has been published,
-and that refusal is the whole of the check. **Nothing infers from the platform a build was
+**The anchor is chosen by two gates in sequence. The platform decides whether a linked name could
+ever be durable; where it could, the filesystem decides whether it is. Windows never asks** — a
+linked name is not durable where the namespace publishes only through write-through renames, so a
+Windows build takes the copy and does not attempt a link. Elsewhere the build attempts `link(2)`
+and takes the copy when the call refuses, so a filesystem without hard links — FAT and exFAT, some
+network and FUSE mounts — is served by the route that never needed them. The capability is probed
+by using it: the call refuses, before anything has been published, and that refusal is the whole
+of the check. **Nothing infers from the platform a build was
 compiled for that a filesystem supports links**, and this choice rests on no assumption that goes
 unenforced.
 
