@@ -280,7 +280,11 @@ jobs:
                 "https://registry.npmjs.org/$encoded/$version" >/dev/null \
                 || missing+=("npm:$package@$version")
             done
-            curl --fail --silent --show-error "https://crates.io/api/v1/crates/turndb/$version" \
+            # crates.io refuses curl's default User-Agent with 403, so a published crate reads as
+            # absent. Measured against 0.1.6, which is present: no -A gives 403, -A gives 200.
+            curl --fail --silent --show-error \
+              --user-agent 'turndb-release-verify (github.com/turndb/turndb)' \
+              "https://crates.io/api/v1/crates/turndb/$version" \
               | jq -e --arg version "$version" '.version.num == $version' >/dev/null \
               || missing+=("crates.io:turndb@$version")
             curl --fail --silent --show-error "https://pypi.org/pypi/turndb/$version/json" >/dev/null \
