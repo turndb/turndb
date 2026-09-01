@@ -2,7 +2,7 @@
 default: patch
 ---
 
-# 0.1.8 completes the 0.1.7 release on npm
+# Ships the npm packages absent from 0.1.7
 
 TurnDB 0.1.7 was published to crates.io and PyPI, but no TurnDB npm package was published at
 0.1.7. The npm publication could not complete from that tag because the release path executes its
