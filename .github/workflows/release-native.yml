@@ -94,7 +94,7 @@ jobs:
           retention-days: 7
 
   install:
-    name: install release candidate (node ${{ matrix.node }})
+    name: install release candidate (${{ matrix.runner }}, node ${{ matrix.node }})
     needs: build
     timeout-minutes: 15
     strategy:

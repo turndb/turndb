@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { readPrebuildManifestSet } = require('../bindings/node/scripts/prebuild-manifest-set.cjs');
 
 const root = path.resolve(__dirname, '..');
 const version = JSON.parse(fs.readFileSync(path.join(root, 'bindings/node/package.json'))).version;
@@ -143,9 +144,41 @@ function copyDirectory(source, tag) {
 
 const tools = fakeTools();
 try {
+  const splitNative = nativeFixture();
+  const splitSet = readPrebuildManifestSet(splitNative);
+  assert(splitSet.entries.has(`turndb-native-${version}.tgz`));
+  assert(splitSet.entries.has(`turndb-native-win32-x64-msvc-${version}.tgz`));
+  assert.equal(splitSet.manifests.get('win32-x64-msvc').tarballs.length, 1,
+    'fixture must keep the selector in the other slice manifest');
+
+  const conflictingNative = copyDirectory(splitNative, 'native-conflicting-manifest');
+  const windowsManifestPath = path.join(
+    conflictingNative, 'prebuild-manifest-win32-x64-msvc.json');
+  const windowsManifest = JSON.parse(fs.readFileSync(windowsManifestPath));
+  windowsManifest.tarballs.push({
+    ...splitSet.entries.get(`turndb-native-${version}.tgz`),
+    sha256: '0'.repeat(64),
+  });
+  writeJson(windowsManifestPath, windowsManifest);
+  assert.throws(
+    () => readPrebuildManifestSet(conflictingNative),
+    /disagree on duplicate tarball/,
+  );
+
+  const mismatchedNative = copyDirectory(splitNative, 'native-mismatched-manifest');
+  const mismatchedManifestPath = path.join(
+    mismatchedNative, 'prebuild-manifest-win32-x64-msvc.json');
+  const mismatchedManifest = JSON.parse(fs.readFileSync(mismatchedManifestPath));
+  mismatchedManifest.sourceCommit = 'different-build';
+  writeJson(mismatchedManifestPath, mismatchedManifest);
+  assert.throws(
+    () => readPrebuildManifestSet(mismatchedNative),
+    /disagree on version\/source commit/,
+  );
+
   for (const [name, script, fixture, selectorPrefix] of [
     ['native', path.join(root, 'bindings/node/scripts/publish-prebuild.cjs'),
-      nativeFixture(), 'turndb-native-'],
+      splitNative, 'turndb-native-'],
     ['cli', path.join(root, 'cli/scripts/publish-cli.cjs'), cliFixture(), 'turndb-cli-'],
   ]) {
     const valid = invoke(script, fixture);
