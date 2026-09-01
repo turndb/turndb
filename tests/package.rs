@@ -428,12 +428,17 @@ fn reclaim_has_one_caller() {
                 continue;
             }
             if code.contains("reclaim(") || code.contains("reclaim_with_construction(") {
-                callers.push(format!(
-                    "{}:{}: {}",
-                    file.strip_prefix(root).unwrap().display(),
-                    n + 1,
-                    code.trim()
-                ));
+                // `/` regardless of host: this compares against a literal, and a Windows
+                // `Path::display` renders `src\\bin\\turndb.rs`. The property is about the
+                // repository's shape, not about the separator the runner happens to use.
+                let rel = file
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                callers.push(format!("{rel}:{}: {}", n + 1, code.trim()));
             }
         }
     }
