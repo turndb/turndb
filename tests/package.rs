@@ -389,3 +389,70 @@ fn failed_release_retries_build_the_intended_package_through_the_trusted_caller(
         "PyPI attestations cannot be issued from a reusable workflow until PyPI supports its split OIDC identities"
     );
 }
+
+/// A tripwire for "no engine path runs `reclaim`" — and it is a lint, not a gate.
+///
+/// The support doc tells a reader that reclaim's cost is paid only when they run the command.
+/// That is true today because the engine has one caller: the CLI verb. It would stop being true
+/// the day someone wires automatic reclamation into a commit path, and nothing else in the tree
+/// would notice.
+///
+/// **What this catches:** a direct call, and an import that renames the function. **What it does
+/// not catch:** a re-export, a function pointer, a macro, or any other indirection — this scans
+/// source text, and source text is a spelling rather than a population. Seamus defeated the first
+/// version of this check with `use crate::container::reclaim as compact_store;` in under a
+/// minute, which is the correct verdict on how much it is worth: enough to catch the accident,
+/// not enough for the prose to lean on. The doc sentence says so rather than claiming a gate.
+#[test]
+fn reclaim_has_one_caller() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    files.sort();
+
+    // The one place allowed to call it. No line number: a call moving down the file is not a
+    // finding, and a check that cries about it teaches people to ignore it.
+    const CALLER: &str = "src/bin/turndb.rs";
+    let mut offenders: Vec<String> = Vec::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(root)
+            .unwrap()
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let text = std::fs::read_to_string(file).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            // Renaming the function is how the first version of this check was defeated, so the
+            // rename is itself the thing to notice — wherever it appears.
+            let aliased = code.contains("use ")
+                && code.contains("reclaim")
+                && code.contains(" as ")
+                && !code.contains("reclaim_names");
+            let called = (code.contains("reclaim(") || code.contains("reclaim_with_construction("))
+                && !code.contains("fn reclaim")
+                && !code.contains("reclaim_names(");
+            if (aliased || called) && rel != CALLER {
+                offenders.push(format!("{rel}:{}: {}", n + 1, code.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "reclaim gained a caller outside {CALLER}. If an engine path now runs it, the support \
+         doc's \"no engine path runs reclaim\" is false and must change with it:\n  {}",
+        offenders.join("\n  ")
+    );
+}

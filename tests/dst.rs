@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use turndb::container::AnchorConstruction;
 use turndb::fold::FoldCfg;
 use turndb::store::{Batch, ContentSpans, RecoveryOptions, Span, Store};
 use turndb::vfs::record::{self, Op};
@@ -1329,10 +1330,27 @@ fn replay_recorded(
     root: &Path,
     ops: &[Op],
     stage: &Path,
+    check: impl FnMut(&Path, usize, Variant),
+) -> usize {
+    replay_recorded_under(tag, base, root, ops, stage, MODELS, check)
+}
+
+/// [`replay_recorded`] against a chosen set of durability models.
+///
+/// Every protocol here is claimed under both models and swept under both. Reclaim's anchor is the
+/// one exception: its cheap construction is claimed only where a linked name can be made durable,
+/// so the models it is swept under are part of the claim rather than a constant.
+fn replay_recorded_under(
+    tag: &str,
+    base: &Fs,
+    root: &Path,
+    ops: &[Op],
+    stage: &Path,
+    models: &[Model],
     mut check: impl FnMut(&Path, usize, Variant),
 ) -> usize {
     let mut checked = 0usize;
-    for &model in MODELS {
+    for &model in models {
         for k in 0..=ops.len() {
             let mut fs = base.clone();
             fs.model = model;
@@ -2321,14 +2339,38 @@ fn every_single_file_erase_crash_answers_honestly() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
-/// Reclaim's publication protocol — anchor, candidate, uncertain replace, laggable cleanup —
-/// at every crash point, under both models. The claim: whenever `<store>` exists it is whole and
-/// serves every record; whenever it does not, a writer open recovers it from the anchor and
-/// then serves every record; opening never refuses; and a second open converges on the same
-/// store. Debris (`.reclaim*`) may remain; it never changes which store wins.
-#[test]
-fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
-    let root = tmp("reclaim");
+/// Reclaim's publication protocol — anchor, uncertain replace, laggable cleanup — at every crash
+/// point. The claim: whenever `<store>` exists it is whole and serves every record; whenever it
+/// does not, a writer open recovers it from the anchor and then serves every record; opening never
+/// refuses; and a second open converges on the same store. Debris (`.reclaim*`) may remain; it
+/// never changes which store wins.
+///
+/// Returns the number of crash states checked, so a caller can report per-cell counts rather than
+/// assert that a sweep merely happened.
+/// Bytes of compacted container written per destination during a reclaim, from the recorded
+/// stream. Barriers and bytes are different populations: a sync count cannot show that the second
+/// full write stopped happening, and this is the one the cost claim is made about.
+fn reclaim_payload_streams(ops: &[Op]) -> (BTreeMap<String, u64>, u64) {
+    let mut per: BTreeMap<String, u64> = BTreeMap::new();
+    for op in ops {
+        let (path, n) = match op {
+            Op::WriteAt { path, data, .. } => (path, data.len() as u64),
+            Op::WriteFile { path, data } => (path, data.len() as u64),
+            _ => continue,
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if name.contains(".reclaim") {
+            *per.entry(name).or_default() += n;
+        }
+    }
+    // A destination that saw only a superblock rewrite is not a stream of the container.
+    per.retain(|_, bytes| *bytes > 8192);
+    let total = per.values().sum();
+    (per, total)
+}
+
+fn reclaim_sweep(tag: &str, anchor: AnchorConstruction, models: &[Model]) -> usize {
+    let root = tmp(tag);
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("s.turndb");
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
@@ -2349,13 +2391,39 @@ fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
     let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
-    let stats = turndb::container::reclaim(&file).unwrap();
+    let stats = turndb::container::reclaim_with_construction(&file, anchor).unwrap();
     let ops = record::disarm();
     assert!(stats.reclaimed > 0);
     assert!(ops.len() > 12, "reclaim must exercise a real op stream, got {}", ops.len());
     assert_slot_alternation("reclaim", &ops);
 
-    let stage = tmp("reclaim-stage");
+    // The construction is not inferred from the platform: it is read off the recorded stream, so
+    // a cell that silently took the other route cannot be reported as this one.
+    let linked = ops.iter().any(|op| matches!(op, Op::Link { .. }));
+    assert_eq!(
+        linked,
+        anchor == AnchorConstruction::Link,
+        "{tag}: requested {anchor:?} but the recorded op stream {} a Link",
+        if linked { "contains" } else { "does not contain" }
+    );
+    // The cost claim is about BYTES, not barriers: one stream of compacted payload under Link,
+    // two under Copy. Counted per destination from the recorded writes, which is the population
+    // the outcome sentence is about.
+    let (streams, total) = reclaim_payload_streams(&ops);
+    println!(
+        "dst reclaim [{tag}]: anchor={anchor:?} ops={} link={linked} \
+         payload-streams={} bytes={total} {streams:?}",
+        ops.len(),
+        streams.len()
+    );
+    assert_eq!(
+        streams.len(),
+        if anchor == AnchorConstruction::Link { 1 } else { 2 },
+        "{tag}: {anchor:?} must write the compacted container {} time(s); wrote to {streams:?}",
+        if anchor == AnchorConstruction::Link { 1 } else { 2 }
+    );
+
+    let stage = tmp(&format!("{tag}-stage"));
     let check = |what: &str, k: usize, variant: Variant, store: &Path| {
         let rs = turndb::store::open_read_container(store, cfg).unwrap_or_else(|e| {
             panic!("crash point {k} {variant:?} {what}: store refuses a reader: {e:#}")
@@ -2373,23 +2441,232 @@ fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
             .verify()
             .unwrap_or_else(|e| panic!("crash point {k} {variant:?} {what}: verify: {e:#}"));
     };
-    let checked = replay_recorded("reclaim", &base, &root, &ops, &stage, |stage, k, variant| {
-        let store = stage.join("s.turndb");
-        if store.exists() {
-            check("present", k, variant, &store);
-        }
-        // A writer open: recovers from the anchor when the name is gone, opens otherwise, and
-        // never refuses. Then the store must be whole, and a second open must converge.
-        for pass in ["first writer open", "second writer open"] {
-            let s = Store::open_file(&store, cfg)
-                .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}"));
-            s.close().unwrap();
-            check(pass, k, variant, &store);
-        }
-    });
-    println!("dst reclaim: {checked} crash states checked across {} ops", ops.len());
+    let checked =
+        replay_recorded_under(tag, &base, &root, &ops, &stage, models, |stage, k, variant| {
+            let store = stage.join("s.turndb");
+            if store.exists() {
+                check("present", k, variant, &store);
+            }
+            // A writer open: recovers from the anchor when the name is gone, opens otherwise, and
+            // never refuses. Then the store must be whole, and a second open must converge.
+            for pass in ["first writer open", "second writer open"] {
+                let s = Store::open_file(&store, cfg).unwrap_or_else(|e| {
+                    panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}")
+                });
+                s.close().unwrap();
+                check(pass, k, variant, &store);
+            }
+        });
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&stage).ok();
+    checked
+}
+
+/// The two configurations reclaim ships, each under the models it is claimed under.
+///
+/// `Copy` is correct under both durability models and is what every platform used before, and what
+/// any filesystem without hard links still uses. `Link` is claimed only where a linked name can be
+/// made durable, which is the POSIX model; its failure under the Windows model is asserted
+/// separately below, because a split justified only by each side passing its own test proves each
+/// side works, not that the split is needed.
+#[test]
+fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
+    // One cell per (construction, model). An aggregate can hide a model contributing zero, which
+    // is the vacuity this matrix exists to exclude.
+    // The Copy cells run everywhere: that construction is claimed under both models on any host.
+    let copy_posix = reclaim_sweep("reclaim-copy-posix", AnchorConstruction::Copy, &[Model::Posix]);
+    let copy_windows =
+        reclaim_sweep("reclaim-copy-windows", AnchorConstruction::Copy, &[Model::Windows]);
+    let link_posix = reclaim_sweep("reclaim-link-posix", AnchorConstruction::Link, &[Model::Posix]);
+    println!(
+        "dst reclaim matrix: copy/Posix={copy_posix} copy/Windows={copy_windows} \
+         link/Posix={link_posix} crash states (link/Windows asserted to FAIL separately)"
+    );
+    for (cell, n) in
+        [("copy/Posix", copy_posix), ("copy/Windows", copy_windows), ("link/Posix", link_posix)]
+    {
+        assert!(n > 0, "{cell} explored no crash states");
+    }
+}
+
+/// The capability probe and the wiring behind it — not the destination, which selecting the copy
+/// construction by name already covers.
+///
+/// Production on POSIX asks for the cheap anchor. On a filesystem without hard links the `link`
+/// refuses, and the protocol must fall back to the byte copy **before anything is published**.
+/// That path is unreachable on a Linux host unless the call is made to refuse, so it is, and the
+/// recorded stream is then required to show every step of the fallback rather than its outcome:
+/// the link was attempted, it refused, no link anchor exists, the copy anchor was built, and the
+/// resulting protocol survives both models.
+#[test]
+fn a_refused_link_falls_back_to_the_copy_anchor_before_publishing_anything() {
+    let root = tmp("reclaim-link-refused");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for round in 0..6usize {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let id = format!("w:{round}");
+        let body = body_for(600 + round);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert(id, body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+
+    // Production entry point, not the construction seam: this is the host's own choice of anchor,
+    // meeting a filesystem that refuses it.
+    let refusal = record::refuse_links();
+    record::arm();
+    let stats = turndb::container::reclaim(&file).unwrap();
+    let ops = record::disarm();
+    let refused = refusal.refused();
+    drop(refusal);
+
+    // What the host asks for is part of what this test establishes, not an assumption it makes.
+    // A build that asks for the link must be seen to attempt it and to fall back; a build that
+    // does not ask — Windows, where a linked name cannot be durable — must be seen NOT to attempt
+    // it, which is the production platform selection and is otherwise only assertable from the
+    // platform the suite happens to be running on.
+    match AnchorConstruction::for_host() {
+        AnchorConstruction::Link => assert!(
+            refused >= 1,
+            "this host asks for the link anchor, so the probe must have been attempted"
+        ),
+        AnchorConstruction::Copy => assert_eq!(
+            refused, 0,
+            "this host cannot make a linked name durable and must not attempt a link"
+        ),
+    }
+    assert!(
+        !ops.iter().any(|op| matches!(op, Op::Link { .. })),
+        "no Link may reach the stream: refused where attempted, never attempted otherwise"
+    );
+    assert!(
+        !anchor_of(&file).exists() || file.exists(),
+        "nothing may be published under the anchor's name by a refused link"
+    );
+    let (streams, total) = reclaim_payload_streams(&ops);
+    assert_eq!(
+        streams.len(),
+        2,
+        "the copy anchor writes the compacted container twice, whether reached by refusal or by \
+         the host asking for it; wrote to {streams:?}"
+    );
+    assert!(stats.reclaimed > 0);
+    println!(
+        "dst reclaim [link-refused]: link attempts refused={refused} payload-streams=2 \
+         bytes={total} {streams:?}"
+    );
+
+    // And the protocol the fallback produced is the conservative one, so it is swept under both.
+    let stage = tmp("reclaim-link-refused-stage");
+    let checked = replay_recorded_under(
+        "reclaim-link-refused",
+        &base,
+        &root,
+        &ops,
+        &stage,
+        MODELS,
+        |stage, k, variant| {
+            let store = stage.join("s.turndb");
+            for pass in ["first writer open", "second writer open"] {
+                let s = Store::open_file(&store, cfg).unwrap_or_else(|e| {
+                    panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}")
+                });
+                s.close().unwrap();
+            }
+            let rs = turndb::store::open_read_container(&store, cfg).unwrap();
+            for (id, body) in &want {
+                assert_eq!(rs.reconstruct(id).unwrap().as_deref(), Some(body.as_slice()));
+            }
+        },
+    );
+    println!("dst reclaim [link-refused]: {checked} crash states, both models");
+    assert!(checked > 0);
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+/// POSIX must still recover from names it no longer produces.
+///
+/// A store crashed mid-reclaim on Windows leaves a COPY-constructed anchor — a separate inode —
+/// and possibly a candidate beside it. Moving that directory to Linux and opening it is a
+/// supported thing to do (cross-OS opening is a capability we assert), and the POSIX build now
+/// takes the link route, which never creates those names. **The recovery path for them is
+/// therefore code POSIX exercises only for stores it did not produce**, which is exactly the kind
+/// of branch that rots unnoticed.
+///
+/// Written to FAIL if `recover_store_from_reclaim_anchor` stops being reached: the store's name is
+/// absent, so nothing but that path can serve these records.
+#[test]
+fn posix_recovers_a_store_left_by_the_windows_anchor_protocol() {
+    let root = tmp("windows-shaped-anchor");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for round in 0..4usize {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let id = format!("w:{round}");
+        let body = body_for(600 + round);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert(id, body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    // Exactly the shape the Windows protocol leaves when the uncertain replace lost both names:
+    // a whole, verified anchor as its OWN inode, a half-written candidate beside it, no store.
+    let anchor = anchor_of(&file);
+    std::fs::copy(&file, &anchor).unwrap();
+    let candidate = PathBuf::from(format!("{}.reclaim-candidate", file.display()));
+    std::fs::write(&candidate, b"truncated candidate from the crash").unwrap();
+    std::fs::remove_file(&file).unwrap();
+    assert!(!file.exists(), "the store's name must be absent for this to prove anything");
+
+    let inode_before = anchor.metadata().unwrap().len();
+    let s = Store::open_file(&file, cfg)
+        .unwrap_or_else(|e| panic!("a writer open must recover from the anchor: {e:#}"));
+    s.close().unwrap();
+
+    assert!(file.exists(), "recovery must publish the store at its own name");
+    let rs = turndb::store::open_read_container(&file, cfg).unwrap();
+    for (id, body) in &want {
+        assert_eq!(
+            rs.reconstruct(id).unwrap().as_deref(),
+            Some(body.as_slice()),
+            "record {id} after recovering a Windows-shaped anchor"
+        );
+    }
+    assert_eq!(rs.ids().unwrap().len(), want.len());
+    turndb::container::Container::open(&file).unwrap().verify().unwrap();
+    assert_eq!(file.metadata().unwrap().len(), inode_before, "the anchor's bytes, whole");
+    assert!(!anchor.exists(), "the anchor is unlinked once the store exists at its name");
+    assert!(!candidate.exists(), "the crash's candidate is debris and is removed");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The negative cell: the cheap anchor MUST NOT survive the Windows model.
+///
+/// A hard link is not a durable name on a platform whose namespace publishes only through
+/// write-through renames — the model says so in its `Op::Link` arm — so a crash that leaves
+/// neither the old store nor the new one has nothing to recover from. If this ever passes, either
+/// the model arm is wrong or Windows could use the cheap construction too; in both cases the split
+/// this test defends is not justified and the failure to investigate is here, not in the protocol.
+#[test]
+fn the_link_anchor_does_not_survive_the_windows_model() {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        reclaim_sweep("reclaim-link-windows", AnchorConstruction::Link, &[Model::Windows])
+    }));
+    assert!(
+        outcome.is_err(),
+        "the link anchor passed the Windows model: the platform split is unjustified as written"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2490,6 +2767,22 @@ fn converges(
     root: &Path,
     real: &Path,
     ops: &[Op],
+    check: impl FnMut(&Path, &str),
+) {
+    converges_under(stage_tag, label, base, root, real, ops, MODELS, check)
+}
+
+/// [`converges`] against a chosen set of durability models — see [`replay_recorded_under`] for why
+/// reclaim's cheap anchor is swept under fewer than all of them.
+#[allow(clippy::too_many_arguments)]
+fn converges_under(
+    stage_tag: &str,
+    label: &str,
+    base: &Fs,
+    root: &Path,
+    real: &Path,
+    ops: &[Op],
+    models: &[Model],
     mut check: impl FnMut(&Path, &str),
 ) {
     // The real directory, restart-shaped: its on-disk bytes — debris included — copied into a
@@ -2503,7 +2796,7 @@ fn converges(
     std::fs::remove_dir_all(&restarted).ok();
     // The stage directory's name must be a valid file name on every platform: no ':' or '('.
     let stage = tmp(&format!("{stage_tag}-syncfail-stage"));
-    for &model in MODELS {
+    for &model in models {
         let mut fs = base.clone();
         fs.model = model;
         for op in ops {
@@ -2737,6 +3030,16 @@ fn a_failed_directory_sync_after_conversion_publication_is_reported_and_rerunnin
 
 #[test]
 fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_whole() {
+    // Both anchor constructions clean up an anchor, and each is swept under the models it is
+    // claimed under. The cheap one is not a subset of the other: it has one barrier fewer.
+    for (construction, models) in
+        [(AnchorConstruction::Copy, MODELS), (AnchorConstruction::Link, &[Model::Posix][..])]
+    {
+        failed_sync_after_reclaim_cleanup(construction, models);
+    }
+}
+
+fn failed_sync_after_reclaim_cleanup(construction: AnchorConstruction, models: &[Model]) {
     let root = tmp("syncfail-reclaim");
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("s.turndb");
@@ -2756,7 +3059,7 @@ fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_wh
     std::fs::create_dir_all(&snapshot).unwrap();
     std::fs::copy(&file, snapshot.join("s.turndb")).unwrap();
     record::arm();
-    turndb::container::reclaim(&file).unwrap();
+    turndb::container::reclaim_with_construction(&file, construction).unwrap();
     let ops = record::disarm();
     let anchor = anchor_of(&file);
     let target = sync_index_of(&ops, sync_after_unlink_pos(&ops, &anchor));
@@ -2764,9 +3067,11 @@ fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_wh
 
     let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
-    let (err, ops) = run_with_failed_sync(target, || turndb::container::reclaim(&file).map(|_| ()));
+    let (err, ops) = run_with_failed_sync(target, || {
+        turndb::container::reclaim_with_construction(&file, construction).map(|_| ())
+    });
     assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
-    converges("reclaim", "reclaim", &base, &root, &root, &ops, |dir, what| {
+    converges_under("reclaim", "reclaim", &base, &root, &root, &ops, models, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
     std::fs::remove_dir_all(&root).ok();
@@ -2852,6 +3157,17 @@ fn sync_failure_variant<W>(
     op: impl Fn(&Path, &W) -> Result<(), anyhow::Error>,
     check: impl Fn(&Path, &W, &str),
 ) -> usize {
+    sync_failure_variant_under(tag, MODELS, prepare, op, check)
+}
+
+/// [`sync_failure_variant`] against a chosen set of durability models.
+fn sync_failure_variant_under<W>(
+    tag: &str,
+    models: &[Model],
+    prepare: impl Fn(&Path) -> W,
+    op: impl Fn(&Path, &W) -> Result<(), anyhow::Error>,
+    check: impl Fn(&Path, &W, &str),
+) -> usize {
     let root = tmp(&format!("{tag}-syncvar-count"));
     std::fs::create_dir_all(&root).unwrap();
     let w = prepare(&root);
@@ -2869,9 +3185,16 @@ fn sync_failure_variant<W>(
         base.seed_durable(&root);
         let (err, ops) = run_with_failed_sync(j, || op(&root, &w));
         let label = format!("{tag}: sync {j} of {syncs} failed ({})", short_err(&err));
-        converges(&format!("{tag}-syncvar-{j}"), &label, &base, &root, &root, &ops, |dir, what| {
-            check(dir, &w, what)
-        });
+        converges_under(
+            &format!("{tag}-syncvar-{j}"),
+            &label,
+            &base,
+            &root,
+            &root,
+            &ops,
+            models,
+            |dir, what| check(dir, &w, what),
+        );
         std::fs::remove_dir_all(&root).ok();
     }
     syncs
@@ -3006,10 +3329,48 @@ fn every_reclaim_sync_failure_is_reported_and_the_store_is_whole() {
             }
             want
         },
-        |root, _| turndb::container::reclaim(&root.join("s.turndb")).map(|_| ()),
+        |root, _| {
+            turndb::container::reclaim_with_construction(
+                &root.join("s.turndb"),
+                AnchorConstruction::Copy,
+            )
+            .map(|_| ())
+        },
         |dir, want, what| serves_all(&dir.join("s.turndb"), want, cfg, what),
     );
-    println!("dst sync-failure reclaim: {n} syncs, each failed once, both models");
+    println!("dst sync-failure reclaim [copy]: {n} syncs, each failed once, both models");
+
+    // The cheap construction has its own sync sequence — one fewer barrier and a Link where the
+    // copy had a rename — so its sync failures are a different set, not a subset. Swept under the
+    // model it is claimed under.
+    let n_link = sync_failure_variant_under(
+        "reclaim-link",
+        &[Model::Posix],
+        |root| {
+            let file = root.join("s.turndb");
+            let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            for round in 0..4usize {
+                let mut s = Store::open_file(&file, cfg).unwrap();
+                let id = format!("w:{round}");
+                let body = body_for(600 + round);
+                s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                want.insert(id, body);
+                s.sync().unwrap();
+                s.flush().unwrap();
+                s.close().unwrap();
+            }
+            want
+        },
+        |root, _| {
+            turndb::container::reclaim_with_construction(
+                &root.join("s.turndb"),
+                AnchorConstruction::Link,
+            )
+            .map(|_| ())
+        },
+        |dir, want, what| serves_all(&dir.join("s.turndb"), want, cfg, what),
+    );
+    println!("dst sync-failure reclaim [link]: {n_link} syncs, each failed once, POSIX model");
 }
 
 #[test]

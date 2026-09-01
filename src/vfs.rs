@@ -271,6 +271,55 @@ pub mod record {
         SyncFault { _not_send: std::marker::PhantomData }
     }
 
+    thread_local! {
+        /// Armed by [`refuse_links`]: make every `link` refuse, as a filesystem without hard
+        /// links does.
+        static LINKS_REFUSED: Cell<bool> = const { Cell::new(false) };
+        static LINKS_REFUSED_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A filesystem that does not support hard links, for the duration of the guard.
+    ///
+    /// The reclaim protocol treats a refused `link` as "this filesystem cannot give me a durable
+    /// second name cheaply" and takes the byte-copy route. That fallback is reachable on a Linux
+    /// host only by making the call refuse, so this exists to exercise the WIRING — the probe and
+    /// the path it selects — rather than the destination, which selecting the copy construction
+    /// by name already covers.
+    pub fn refuse_links() -> LinkRefusal {
+        LINKS_REFUSED.with(|f| f.set(true));
+        LINKS_REFUSED_COUNT.with(|c| c.set(0));
+        LinkRefusal { _not_send: std::marker::PhantomData }
+    }
+
+    /// Guard returned by [`refuse_links`]; restores links on drop.
+    pub struct LinkRefusal {
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl LinkRefusal {
+        /// How many `link` calls were refused while armed — evidence the probe was attempted at
+        /// all, rather than skipped by a branch that never asked.
+        pub fn refused(&self) -> usize {
+            LINKS_REFUSED_COUNT.with(|c| c.get())
+        }
+    }
+
+    impl Drop for LinkRefusal {
+        fn drop(&mut self) {
+            LINKS_REFUSED.with(|f| f.set(false));
+        }
+    }
+
+    /// Consulted by every `link`: refuses exactly as a filesystem without hard-link support does.
+    pub(super) fn link_refused() -> bool {
+        if LINKS_REFUSED.with(|f| f.get()) {
+            LINKS_REFUSED_COUNT.with(|c| c.set(c.get() + 1));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Consulted by every sync: counts the attempt, and fails exactly once when armed and due.
     pub(super) fn sync_fault() -> std::io::Result<()> {
         let attempt = SYNC_ATTEMPTS.with(|a| {
@@ -558,6 +607,34 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
     publish::forget(from);
     #[cfg(feature = "dst")]
     push(Op::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+    Ok(())
+}
+
+/// Publish a second name for an already-durable file: `link(2)`. Refuses when `to` exists.
+///
+/// The name is durable once the directory syncs, on the platforms where that is true —
+/// `sys::LINK_GIVES_A_DURABLE_NAME` says which, and the caller is expected to have consulted it.
+/// The error is returned rather than swallowed: a filesystem without hard links (FAT, some
+/// network and FUSE mounts) fails here, before anything has been published, and the caller falls
+/// back to a route that does not need them. **A capability probed by using it, not declared.**
+#[inline]
+pub(crate) fn link(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(windows)]
+    let physical = publish::resolve(from);
+    #[cfg(windows)]
+    let from_physical: &Path = &physical;
+    #[cfg(not(windows))]
+    let from_physical: &Path = from;
+    #[cfg(feature = "dst")]
+    if record::link_refused() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "injected: this filesystem does not support hard links",
+        ));
+    }
+    std::fs::hard_link(from_physical, to)?;
+    #[cfg(feature = "dst")]
+    push(Op::Link { from: from.to_path_buf(), to: to.to_path_buf() });
     Ok(())
 }
 

@@ -579,6 +579,33 @@ pub(crate) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
 // crash-safety proof runs under on this platform, built from documented operations only: a name
 // is durable when the operation that produced it was write-through, and laggable otherwise.
 
+/// Can a hard link give this platform a **durable second name** for bytes that are already
+/// durable, using the namespace barrier the protocols already take?
+///
+/// Reclaim needs a second name for its verified output before it performs a replace that may not
+/// survive a crash — an anchor to recover from. A second *name* is what the protocol requires; a
+/// second *copy of the bytes* is only how it has been obtained so far. Where this is true, the
+/// anchor costs one directory entry instead of a full rewrite of the container.
+///
+/// **POSIX — true.** `link(2)` publishes another name for the same inode, and the directory's
+/// fsync — which the protocol already performs at exactly that point — makes it durable. This is
+/// a statement about the namespace, not about crash-atomicity of anything: after the link is
+/// durable, the bytes are reachable by two names, and no later step can leave zero.
+///
+/// **Windows — false.** A name created by the engine is durable only once a write-through rename
+/// has published it (see [`rename`] below and `vfs::publish`), and a hard link is not published
+/// that way. The simulator says the same thing in the `Op::Link` arm: *"Windows: never published
+/// by the engine, so never durable in the model."* So on this platform the anchor must still be
+/// obtained by copying the bytes and publishing that copy through a write-through rename.
+///
+/// **This constant is a default, not a guarantee.** Hard links are absent on FAT/exFAT and on
+/// some network and FUSE filesystems, and no `cfg` can know that. The protocol therefore *probes
+/// by doing*: it attempts the link and falls back to the byte copy when the attempt fails. A
+/// filesystem without links pays what every platform pays today; nothing silently loses an
+/// anchor, because a missing capability surfaces as a failed call before anything is published,
+/// not as a crash state months later.
+pub(crate) const LINK_GIVES_A_DURABLE_NAME: bool = !cfg!(windows);
+
 /// Replace `to` with `from`: POSIX `rename(2)`, atomic with respect to every observer; durable
 /// once the caller syncs the directory.
 #[cfg(not(windows))]

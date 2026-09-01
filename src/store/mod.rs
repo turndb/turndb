@@ -2197,19 +2197,54 @@ fn recover_store_from_reclaim_anchor(
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let _ = crate::vfs::unlink(&names.candidate_tmp);
     let _ = crate::vfs::unlink(&names.candidate);
-    crate::container::copy_container_bytes_pub(&names.anchor, &names.candidate_tmp)?;
-    crate::vfs::sync_dir(&parent)?;
-    crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
-    crate::vfs::sync_dir(&parent)?;
-    let new_store = crate::vfs::open_rw(&names.candidate)?;
-    if !crate::sys::lock_exclusive(&new_store)? {
-        return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
+
+    // Promotion needs the anchor's validated bytes to appear at the store's name without the
+    // anchor ceasing to be a recovery name until they have. Where a hard link gives a durable
+    // name, that is one directory entry: `link` publishes `<store>` for the SAME inode, refusing
+    // if the name was taken meanwhile — the check the rename below performs — and the writer lock
+    // this function already holds on the anchor is, from that moment, the lock on `<store>`
+    // itself, because it is one file with two names. No copy, and no second lock to order.
+    //
+    // A missing capability surfaces here, before anything is published, and takes the copy route
+    // unchanged. `AlreadyExists` is not a missing capability: it means the store's name was taken
+    // while the anchor was being promoted, which is this function's documented refusal.
+    let mut promoted_by_link = false;
+    if crate::sys::LINK_GIVES_A_DURABLE_NAME {
+        match crate::vfs::link(&names.anchor, path) {
+            Ok(()) => {
+                crate::vfs::sync_dir(&parent)?;
+                promoted_by_link = true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "{} was taken while the reclaim anchor was being promoted",
+                        path.display()
+                    )
+                });
+            }
+            Err(_) => {}
+        }
     }
-    crate::container::Container::open(&names.candidate)?.verify()?;
-    crate::vfs::rename_noreplace(&names.candidate, path).with_context(|| {
-        format!("{} was taken while the reclaim anchor was being promoted", path.display())
-    })?;
-    crate::vfs::sync_dir(&parent)?;
+    let new_store = if promoted_by_link {
+        None
+    } else {
+        crate::container::copy_container_bytes_pub(&names.anchor, &names.candidate_tmp)?;
+        crate::vfs::sync_dir(&parent)?;
+        crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
+        crate::vfs::sync_dir(&parent)?;
+        let new_store = crate::vfs::open_rw(&names.candidate)?;
+        if !crate::sys::lock_exclusive(&new_store)? {
+            return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
+        }
+        crate::container::Container::open(&names.candidate)?.verify()?;
+        crate::vfs::rename_noreplace(&names.candidate, path).with_context(|| {
+            format!("{} was taken while the reclaim anchor was being promoted", path.display())
+        })?;
+        crate::vfs::sync_dir(&parent)?;
+        Some(new_store)
+    };
+    crate::container::Container::open(path)?.verify()?;
     drop(anchor);
     let _ = crate::vfs::unlink(&names.anchor);
     crate::vfs::sync_dir(&parent)
