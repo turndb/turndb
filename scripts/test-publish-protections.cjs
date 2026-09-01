@@ -146,10 +146,20 @@ const tools = fakeTools();
 try {
   const splitNative = nativeFixture();
   const splitSet = readPrebuildManifestSet(splitNative);
-  assert(splitSet.entries.has(`turndb-native-${version}.tgz`));
-  assert(splitSet.entries.has(`turndb-native-win32-x64-msvc-${version}.tgz`));
   assert.equal(splitSet.manifests.get('win32-x64-msvc').tarballs.length, 1,
     'fixture must keep the selector in the other slice manifest');
+  const windowsOnlyEntries = new Map(
+    splitSet.manifests.get('win32-x64-msvc').tarballs.map((entry) => [entry.file, entry]),
+  );
+  assert.throws(() => {
+    const selector = windowsOnlyEntries.get(`turndb-native-${version}.tgz`);
+    const target = windowsOnlyEntries.get(`turndb-native-win32-x64-msvc-${version}.tgz`);
+    if (!selector || !target) {
+      throw new Error('prebuild manifest does not contain both root and win32-x64-msvc packages');
+    }
+  }, /prebuild manifest does not contain both root and win32-x64-msvc packages/);
+  assert(splitSet.entries.get(`turndb-native-${version}.tgz`));
+  assert(splitSet.entries.get(`turndb-native-win32-x64-msvc-${version}.tgz`));
 
   const conflictingNative = copyDirectory(splitNative, 'native-conflicting-manifest');
   const windowsManifestPath = path.join(
