@@ -2473,6 +2473,7 @@ fn reclaim_sweep(tag: &str, anchor: AnchorConstruction, models: &[Model]) -> usi
 fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
     // One cell per (construction, model). An aggregate can hide a model contributing zero, which
     // is the vacuity this matrix exists to exclude.
+    // The Copy cells run everywhere: that construction is claimed under both models on any host.
     let copy_posix = reclaim_sweep("reclaim-copy-posix", AnchorConstruction::Copy, &[Model::Posix]);
     let copy_windows =
         reclaim_sweep("reclaim-copy-windows", AnchorConstruction::Copy, &[Model::Windows]);
@@ -2526,10 +2527,24 @@ fn a_refused_link_falls_back_to_the_copy_anchor_before_publishing_anything() {
     let refused = refusal.refused();
     drop(refusal);
 
-    assert!(refused >= 1, "the link was never attempted: the probe did not run");
+    // What the host asks for is part of what this test establishes, not an assumption it makes.
+    // A build that asks for the link must be seen to attempt it and to fall back; a build that
+    // does not ask — Windows, where a linked name cannot be durable — must be seen NOT to attempt
+    // it, which is the production platform selection and is otherwise only assertable from the
+    // platform the suite happens to be running on.
+    match AnchorConstruction::for_host() {
+        AnchorConstruction::Link => assert!(
+            refused >= 1,
+            "this host asks for the link anchor, so the probe must have been attempted"
+        ),
+        AnchorConstruction::Copy => assert_eq!(
+            refused, 0,
+            "this host cannot make a linked name durable and must not attempt a link"
+        ),
+    }
     assert!(
         !ops.iter().any(|op| matches!(op, Op::Link { .. })),
-        "a refused link must leave no Link in the stream"
+        "no Link may reach the stream: refused where attempted, never attempted otherwise"
     );
     assert!(
         !anchor_of(&file).exists() || file.exists(),
@@ -2539,7 +2554,8 @@ fn a_refused_link_falls_back_to_the_copy_anchor_before_publishing_anything() {
     assert_eq!(
         streams.len(),
         2,
-        "the fallback writes the compacted container twice; wrote to {streams:?}"
+        "the copy anchor writes the compacted container twice, whether reached by refusal or by \
+         the host asking for it; wrote to {streams:?}"
     );
     assert!(stats.reclaimed > 0);
     println!(
