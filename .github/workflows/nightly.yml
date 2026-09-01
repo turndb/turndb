@@ -48,13 +48,9 @@ jobs:
       - name: dst harness
         run: cargo test --features dst --test dst -- --nocapture
 
-  # The lockfiles against the registry as it is TONIGHT. `scripts/sync-release-version.py` writes a
-  # version-less stub for each @turndb platform package at release prep, because that version is
-  # not on the registry yet; npm tolerates the stub only until it is. Publication therefore makes
-  # the lock invalid while main keeps displaying its pre-publication green, and the first PR after
-  # a release fails `npm ci` in `native prebuild` for a reason nobody changed (#118, #94 before it).
-  # This job runs the same `npm ci` every night so the transition is seen within a day of the
-  # publish, on main, rather than by whoever opens the next PR.
+  # Exercise the committed lock against the registry as it exists tonight. Platform packages use
+  # versioned unresolved optional entries so the lock has one valid shape before and after first
+  # publication; this repeats CI's exact clean install on main to catch registry-dependent drift.
   lockfiles:
     name: lockfiles resolve against the registry
     runs-on: ubuntu-latest

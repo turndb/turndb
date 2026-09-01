@@ -132,10 +132,9 @@ what we ship and what we say diverge, closed one by one:
   capability difference explicitly.
 - `docs/embedding-contract.md` — the consumer's design surface — is linked from no current document;
   its sole inbound reference is the 0.1.0 CHANGELOG entry.
-- A publication makes `bindings/node/package-lock.json` invalid against the now-published platform
-  package while main keeps displaying its pre-publication green, and the next push or PR job fails —
-  because the lock stub written at release prep is restored by nobody (#118). The release workflow
-  restores it, or nightly runs the job that would catch it, or both.
+- Release preparation writes versioned unresolved optional lock entries for native platform
+  packages. The same entries remain valid before and after first publication, so publishing cannot
+  silently invalidate main's next `npm ci`; the nightly job repeats that clean install on main.
 
 ### Maturity gate
 
