@@ -131,6 +131,20 @@ workflow_controls = [
         "must not delete unpublished optional lock stubs",
         "native lock regeneration",
     ),
+    (
+        ".github/workflows/release.yml",
+        '                "https://registry.npmjs.org/$encoded/$version" >/dev/null',
+        '                "https://registry.npmjs.org/$encoded" >/dev/null',
+        "top-level release completeness verdict lost",
+        "public release completeness",
+    ),
+    (
+        ".github/workflows/release.yml",
+        '"python_publish":"success","browser":"skipped","cli":"skipped"',
+        '"python_publish":"success","browser":"success","cli":"skipped"',
+        "top-level release completeness verdict lost",
+        "component-aware skip set",
+    ),
 ]
 
 for relative, old, new, expected, label in workflow_controls:
@@ -147,6 +161,6 @@ for relative, old, new, expected, label in workflow_controls:
             raise SystemExit(f"{label} control did not discriminate:\n{result.stdout}{result.stderr}")
 
 print(
-    "release metadata controls: baseline passes; metadata drift and all four tag-only workflow "
-    "defect classes are refused"
+    "release metadata controls: baseline passes; metadata drift, all four tag-only workflow "
+    "defect classes, and incomplete release graphs are refused"
 )
