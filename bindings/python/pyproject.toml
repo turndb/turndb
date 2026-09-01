@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "turndb"
-version = "0.1.7"
+version = "0.1.8"
 description = "Embedded, byte-exact storage for AI traces"
 readme = "README.md"
 requires-python = ">=3.9"
