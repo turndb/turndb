@@ -1088,26 +1088,38 @@ rewrite — a live writer would keep committing to the renamed-away inode — an
 unsettled `-wal` sidecar sits beside the file (acknowledged records only their writer can settle)
 or for a sealed container, whose bytes are final.
 
-The publication is the crash-safety argument, and it is the same on every platform so the
-deterministic simulator proves it under both durability models it knows. A name is "published
-durably" below by the platform's no-replace rename plus its namespace barrier: on POSIX an ordinary
-no-replace rename followed by the directory's fsync; on Windows a rename with `MOVEFILE_WRITE_THROUGH`,
-which is the barrier. The sequence, exactly as the code performs it:
+The publication is the crash-safety argument. Its shape is the same everywhere — a durable
+**anchor** naming verified bytes exists before the store's name is replaced, and survives every
+state the replace can leave — and the deterministic simulator proves it under both durability
+models it knows. A name is "published durably" below by the platform's namespace barrier: on POSIX
+a rename or a link followed by the directory's fsync; on Windows a rename with
+`MOVEFILE_WRITE_THROUGH`, which is itself the barrier. The sequence, exactly as the code performs
+it:
 
 1. the fresh container is written at `<store>.reclaiming`, committed and verified;
-2. it is published durably as the **anchor**, `<store>.reclaimed` — a durable name for verified
-   bytes that nothing afterwards touches;
-3. a byte copy of the anchor is fsynced and published durably as the **candidate**,
-   `<store>.reclaim-candidate`; the candidate is then opened and the writer lock is taken on that
-   handle — before it is published at the store's name, the name a second writer would open — and
-   the handle is held until reclaim returns, so no second writer can enter between the replace and
-   the return;
-4. the candidate is renamed over `<store>` — `rename(2)` on POSIX; on Windows the documented route
-   that replaces an open file (`FileRenameInfoEx` with POSIX semantics), which has no write-through
-   form and which no later documented operation promotes. The simulator carries old / new / neither
-   for this step through every later crash point, including after the cleanup below and after the
-   return;
+2. **the anchor is obtained.** Where a hard link can be made durable, it is a second directory
+   entry for the staged inode: `link(<store>.reclaiming, <store>.reclaimed)` and the directory's
+   fsync. The two names are one file, so the anchor costs no bytes. Otherwise — Windows, whose
+   namespace publishes only through write-through renames, or any filesystem that refuses the link
+   — the staging file is renamed to `<store>.reclaimed` and a **byte copy** of it is fsynced and
+   published as `<store>.reclaim-candidate`;
+3. the name that will be replaced over the store — the staging file itself when the anchor is a
+   link, the candidate when it is a copy — is opened and the writer lock is taken on that handle,
+   before it is published at the store's name, and held until reclaim returns, so no second writer
+   can enter between the replace and the return;
+4. that name is renamed over `<store>` — `rename(2)` on POSIX; on Windows the documented route
+   that replaces an open file (`FileRenameInfoEx` with POSIX semantics), which has no
+   write-through form and which no later documented operation promotes. The simulator carries
+   old / new / neither for this step through every later crash point, including after the cleanup
+   below and after the return;
 5. the store at its name is reopened and verified, and the anchor is unlinked.
+
+**Which anchor a reclaim uses is not decided by the platform's name.** It attempts the link and
+uses the copy if the attempt fails, so a filesystem without hard links — FAT and exFAT, some
+network and FUSE mounts — is served by the route that never needed them. The capability is probed
+by using it: `link(2)` refuses, before anything has been published, and that refusal is the whole
+of the check. Nothing infers from `cfg(unix)` that a filesystem supports links, and no store
+depends on an assumption that goes unenforced.
 
 In every one of those states the anchor is intact: a writer open that finds the store's name absent
 beside its anchor validates the anchor whole (the manifest-recovery bar), copies it, locks and
@@ -1116,8 +1128,12 @@ recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor
 nothing is created. A store that is present is always the authority — reclaim material beside it is
 removed, never consulted. The anchor's unlink and the candidate's are laggable on Windows, so
 `.reclaim*` debris may follow a crash; it never changes which store wins, and a writer open beside
-the present store removes it (docs/support-and-compatibility.md, "Transient names"). Cost: one extra copy of the
-compacted container per reclaim on every platform, and on Windows two write-through renames more.
+the present store removes it (docs/support-and-compatibility.md, "Transient names"). Cost, recorded because it is a decision and not only a mechanism. A reclaim writes the compacted
+container **once** where the anchor is a link — the anchor is one directory entry — and **twice**
+where it is a copy: on Windows always, and on a filesystem whose `link(2)` refuses. Windows also
+performs two write-through renames more than POSIX. The doubling is of the compacted output rather
+than of the store, and reclaim is an explicit administrative operation: nothing runs it on a write,
+a checkpoint or a close.
 
 ---
 

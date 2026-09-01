@@ -1217,7 +1217,53 @@ fn copy_container_bytes(from: &Path, to: &Path) -> Result<u64> {
 /// Cost: one extra copy of the fresh, compacted container on every platform, and on Windows two
 /// write-through renames more than before. No format bytes change.
 pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
-    reclaim_with_hook(path, |_| {})
+    reclaim_with_hook(path, AnchorConstruction::for_host(), |_| {})
+}
+
+/// How reclaim obtains the second durable name its uncertain replace recovers from.
+///
+/// The protocol is identical either way — a durable anchor naming verified bytes exists before
+/// the replace is attempted, and survives every state the replace can leave. Only the anchor's
+/// construction differs, and with it the cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorConstruction {
+    /// A second directory entry for the staged inode (`link(2)`), made durable by the directory
+    /// sync the protocol already performs. One write of the compacted container.
+    ///
+    /// Sound only where a linked name can be made durable — see
+    /// [`sys::LINK_GIVES_A_DURABLE_NAME`](crate::sys). On a platform whose namespace publishes
+    /// only through write-through renames, a linked anchor is not durable and does not survive
+    /// the replace, which is what the simulator's Windows model says and what its sweep shows.
+    Link,
+    /// A byte copy of the staged container, published under its own name by a durable rename.
+    /// Two writes of the compacted container, and correct under every model.
+    Copy,
+}
+
+impl AnchorConstruction {
+    /// What this host will attempt. `Link` still falls back to `Copy` if the filesystem refuses
+    /// the link — the capability is probed by using it, not declared here.
+    pub fn for_host() -> Self {
+        if crate::sys::LINK_GIVES_A_DURABLE_NAME {
+            Self::Link
+        } else {
+            Self::Copy
+        }
+    }
+}
+
+/// [`reclaim`] with the anchor construction chosen by the caller.
+///
+/// A seam for the deterministic simulator, which must exercise BOTH constructions on ONE host:
+/// the cheap one is only claimed under the POSIX model, and demonstrating that it fails under the
+/// Windows model is what proves the platform split is necessary rather than merely tidy. Not API:
+/// production calls [`reclaim`], which selects by capability and falls back by probe.
+#[cfg(feature = "dst")]
+pub fn reclaim_with_construction(
+    path: &Path,
+    anchor: AnchorConstruction,
+) -> Result<ReclaimStats> {
+    reclaim_with_hook(path, anchor, |_| {})
 }
 
 /// [`reclaim`] with a hook called between the replace and the return, while the new store's
@@ -1225,6 +1271,7 @@ pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
 /// seam, not API.
 pub(crate) fn reclaim_with_hook(
     path: &Path,
+    anchor: AnchorConstruction,
     mut after_replace: impl FnMut(&Path),
 ) -> Result<ReclaimStats> {
     let mut hot = path.as_os_str().to_os_string();
@@ -1280,27 +1327,64 @@ pub(crate) fn reclaim_with_hook(
     fresh.verify()?;
     drop(fresh);
 
-    // 2. The anchor: a durable name for verified bytes.
-    crate::vfs::rename_noreplace(&names.staging, &names.anchor)?;
-    crate::vfs::sync_dir(&parent)?;
-
-    // 3. The candidate: a copy, fsynced, published under its own name, then opened and
-    //    writer-locked before it is published at the store's name.
-    let bytes_after = copy_container_bytes(&names.anchor, &names.candidate_tmp)?;
-    crate::vfs::sync_dir(&parent)?;
-    crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
-    crate::vfs::sync_dir(&parent)?;
-    let new_store = crate::vfs::open_rw(&names.candidate)?;
+    // 2-3. The anchor, and the name that is replaced over the store.
+    //
+    // What the protocol needs is a second DURABLE NAME for the verified bytes, so that the
+    // uncertain replace below always has something whole behind it. A second name is the
+    // requirement; a second copy of the bytes is one way to obtain it.
+    //
+    // Where a hard link gives a durable name (`sys::LINK_GIVES_A_DURABLE_NAME` — POSIX, and only
+    // where the filesystem actually provides links, which is why this PROBES rather than
+    // declares), the anchor is one directory entry and the staging file itself is what gets
+    // replaced over the store. One write of the compacted container.
+    //
+    // Otherwise — Windows, or a filesystem without links — the anchor is published by rename and
+    // the replaced name is a byte copy of it, exactly as before. Two writes. Nothing about the
+    // crash states differs between the two routes: in both, a durable anchor names verified bytes
+    // before the replace is attempted, and every state the replace can leave has it intact.
+    // The fallback is for a MISSING CAPABILITY, and only that. `AlreadyExists` means the anchor
+    // survived the debris sweep above, which is a protocol violation rather than a filesystem
+    // without links: it propagates instead of quietly buying the slow path and publishing beside
+    // state nobody accounted for.
+    let linked = match anchor {
+        AnchorConstruction::Copy => false,
+        AnchorConstruction::Link => match crate::vfs::link(&names.staging, &names.anchor) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "{} exists after the reclaim debris sweep removed it",
+                        names.anchor.display()
+                    )
+                });
+            }
+            Err(_) => false,
+        },
+    };
+    let replaced_name = if linked {
+        crate::vfs::sync_dir(&parent)?;
+        names.staging.clone()
+    } else {
+        crate::vfs::rename_noreplace(&names.staging, &names.anchor)?;
+        crate::vfs::sync_dir(&parent)?;
+        copy_container_bytes(&names.anchor, &names.candidate_tmp)?;
+        crate::vfs::sync_dir(&parent)?;
+        crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
+        crate::vfs::sync_dir(&parent)?;
+        names.candidate.clone()
+    };
+    let bytes_after = std::fs::metadata(&replaced_name)?.len();
+    let new_store = crate::vfs::open_rw(&replaced_name)?;
     if !crate::sys::lock_exclusive(&new_store)
-        .with_context(|| format!("locking {}", names.candidate.display()))?
+        .with_context(|| format!("locking {}", replaced_name.display()))?
     {
-        return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
+        return Err(crate::fold::WriterLocked { path: replaced_name.clone() }.into());
     }
-    Container::open(&names.candidate)?.verify()?;
+    Container::open(&replaced_name)?.verify()?;
 
     // 4. The uncertain replace — recorded as its own operation for the crash model. The anchor
     //    is not involved.
-    crate::vfs::rename_replace_open(&names.candidate, path)?;
+    crate::vfs::rename_replace_open(&replaced_name, path)?;
     crate::vfs::sync_dir(&parent)?;
 
     // 5. Reopen at the name, hand off, clean up.
@@ -1549,7 +1633,7 @@ mod reclaim_handoff_tests {
             s.close().unwrap();
         }
         let mut saw: Option<String> = None;
-        let stats = reclaim_with_hook(&ct, |p| {
+        let stats = reclaim_with_hook(&ct, AnchorConstruction::for_host(), |p| {
             saw = Some(match Store::open_file(p, cfg) {
                 Ok(_) => "a store".to_string(),
                 Err(e) if is_writer_locked(&e) => "WriterLocked".to_string(),
