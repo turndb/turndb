@@ -15,9 +15,13 @@ const root = path.resolve(__dirname, '..');
 const dist = path.resolve(process.argv[2] || path.join(root, 'dist'));
 const hostTarget = (() => {
   if (process.platform === 'linux' && process.arch === 'x64') return 'linux-x64-gnu';
+  if (process.platform === 'linux' && process.arch === 'arm64') return 'linux-arm64-gnu';
+  if (process.platform === 'darwin' && process.arch === 'x64') return 'darwin-x64';
+  if (process.platform === 'darwin' && process.arch === 'arm64') return 'darwin-arm64';
   if (process.platform === 'win32' && process.arch === 'x64') return 'win32-x64-msvc';
   throw new Error(`no native prebuild test target for ${process.platform}-${process.arch}`);
 })();
+const hostIsGlibc = hostTarget.endsWith('-gnu');
 const manifestPath = path.join(dist, `prebuild-manifest-${hostTarget}.json`);
 const { manifests, entries } = readPrebuildManifestSet(dist);
 const manifest = manifests.get(hostTarget);
@@ -32,8 +36,8 @@ if (
   throw new Error(`unsupported or inconsistent prebuild manifest at ${manifestPath}`);
 }
 const glibcRuntime = process.report?.getReport?.().header?.glibcVersionRuntime;
-if (hostTarget === 'linux-x64-gnu' && !glibcRuntime) {
-  throw new Error('linux-x64-gnu prebuild test requires a glibc runtime');
+if (hostIsGlibc && !glibcRuntime) {
+  throw new Error(`${hostTarget} prebuild test requires a glibc runtime`);
 }
 
 function compareVersions(left, right) {
@@ -45,7 +49,7 @@ function compareVersions(left, right) {
   }
   return 0;
 }
-if (hostTarget === 'linux-x64-gnu' && compareVersions(glibcRuntime, manifest.glibcRequired) < 0) {
+if (hostIsGlibc && compareVersions(glibcRuntime, manifest.glibcRequired) < 0) {
   throw new Error(
     `prebuild requires glibc ${manifest.glibcRequired}, runtime provides only ${glibcRuntime}`,
   );

@@ -91,9 +91,9 @@ this claims exactly what is true:
 | slice | `@turndb/native` | `@turndb/cli` | Python wheels | portable `turndb` (wasm) |
 |---|---|---|---|---|
 | Linux x64 glibc | 0.1.8 | 0.1.8 | 0.1.8 (cp39–cp313, manylinux_2_17) | yes |
-| Linux arm64 | open | 0.1.8 — published cross-built and never executed; since 2026-09-02 built on `ubuntu-22.04-arm`, installed and driven there, with the engine suite, the crash sweeps and the cross-architecture byte-compare as required gates | open | yes |
-| macOS x64 | open | 0.1.8 — built and driven on `macos-15-intel`, where the engine suite, the crash sweeps and the cross-OS byte-compare are required gates since 2026-09-02 | open | yes |
-| macOS arm64 | open | 0.1.8 — built and driven on `macos-15`, where the engine suite, the crash sweeps and the cross-OS byte-compare are required gates since 2026-09-02 | open | yes |
+| Linux arm64 | prepared 2026-09-02: cross-built to the GLIBC 2.17 floor, installed and exercised on `ubuntu-22.04-arm` in CI and the release path; publishes at the next owner-approved release | 0.1.8 — published cross-built and never executed; since 2026-09-02 built on `ubuntu-22.04-arm`, installed and driven there, with the engine suite, the crash sweeps and the cross-architecture byte-compare as required gates | open | yes |
+| macOS x64 | prepared 2026-09-02: built, installed and exercised on `macos-15-intel` in CI and the release path; publishes at the next owner-approved release | 0.1.8 — built and driven on `macos-15-intel`, where the engine suite, the crash sweeps and the cross-OS byte-compare are required gates since 2026-09-02 | open | yes |
+| macOS arm64 | prepared 2026-09-02: built, installed and exercised on `macos-15` in CI and the release path; publishes at the next owner-approved release | 0.1.8 — built and driven on `macos-15`, where the engine suite, the crash sweeps and the cross-OS byte-compare are required gates since 2026-09-02 | open | yes |
 | Windows x64 | 0.1.8 | 0.1.8 | 0.1.8 (cp39–cp313, win_amd64) | yes |
 
 The portable package runs on every host Node 22–26 does, and gives up exactly three things —

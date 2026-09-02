@@ -36,6 +36,23 @@ jobs:
             runner: windows-latest
             build: prebuild:win32-x64-msvc
             selector: '0'
+          # Cross-built like the x86-64 slice so both Linux addons carry the GLIBC 2.17 floor;
+          # exercised on arm64 hardware in the install matrix below.
+          - npm_target: linux-arm64-gnu
+            rust_target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            build: prebuild:linux-arm64-gnu:cross
+            selector: '0'
+          - npm_target: darwin-x64
+            rust_target: x86_64-apple-darwin
+            runner: macos-15-intel
+            build: prebuild:darwin-x64
+            selector: '0'
+          - npm_target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+            runner: macos-15
+            build: prebuild:darwin-arm64
+            selector: '0'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -106,6 +123,12 @@ jobs:
             runner: ubuntu-22.04
           - node: '26'
             runner: ubuntu-22.04
+          - node: '24'
+            runner: ubuntu-22.04-arm
+          - node: '24'
+            runner: macos-15-intel
+          - node: '24'
+            runner: macos-15
           - node: '24'
             runner: windows-latest
     runs-on: ${{ matrix.runner }}

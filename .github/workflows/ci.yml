@@ -274,6 +274,141 @@ jobs:
       - name: install and exercise the same packed addon
         run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
 
+  # The Linux arm64 addon: cross-built on x86-64 through the same napi-rs toolchain as the x86-64
+  # slice, so it carries the same GLIBC 2.17 floor — a native build on `ubuntu-22.04-arm` would
+  # link 2.34 and fail the audit — then installed and exercised on real arm64 hardware below, on
+  # every Node major the package claims. Cross-built and executed, which is what the CLI slice
+  # lacked through 0.1.8: cross-built and never executed.
+  native-prebuild-arm64:
+    name: native prebuild (linux arm64 glibc)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-prebuild-linux-arm64-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - name: install locked packaging tools
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
+      - name: create platform package
+        run: npm run package:create --prefix bindings/node
+      - name: build linux arm64 glibc prebuild
+        run: npm run prebuild:linux-arm64-gnu:cross --prefix bindings/node
+      - name: collect prebuild
+        run: npm run package:collect --prefix bindings/node
+      - name: pack and audit prebuild
+        env:
+          TURNDB_MAX_GLIBC: '2.17'
+          TURNDB_NATIVE_NPM_TARGET: linux-arm64-gnu
+        run: npm run package:pack --prefix bindings/node
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-native-linux-arm64-gnu
+          path: bindings/node/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  native-prebuild-arm64-install:
+    name: native prebuild install (linux arm64, node ${{ matrix.node }})
+    needs: native-prebuild-arm64
+    runs-on: ubuntu-22.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-native-linux-arm64-gnu
+          path: bindings/node/dist/
+      - name: install and exercise the packed addon on arm64 hardware
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
+
+  # The macOS addons, both architectures: built on the hardware they run on, exercised there on
+  # the build host's Node, and then installed from the same tarballs on the other claimed majors.
+  macos-native-package:
+    name: macOS native package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - arch: arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-prebuild-darwin-${{ matrix.arch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+      - name: install locked packaging tools
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix bindings/node
+      - name: create and build the platform package
+        run: |
+          npm run package:create --prefix bindings/node
+          npm run prebuild:darwin-${{ matrix.arch }} --prefix bindings/node
+          npm run package:collect --prefix bindings/node
+      - name: pack and audit prebuild
+        env:
+          TURNDB_NATIVE_NPM_TARGET: darwin-${{ matrix.arch }}
+        run: npm run package:pack --prefix bindings/node
+      - name: install and exercise the packed addon on this host
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-native-darwin-${{ matrix.arch }}
+          path: bindings/node/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-native-install:
+    name: macOS native install (${{ matrix.arch }}, node ${{ matrix.node }})
+    needs: macos-native-package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        node: ['22', '26']
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: turndb-native-darwin-${{ matrix.arch }}
+          path: bindings/node/dist/
+      - name: install and exercise the same packed addon
+        run: node bindings/node/scripts/test-prebuild.cjs bindings/node/dist
+
   windows-native-package:
     # Published-shaped staging, but no production credential or environment exists in this job.
     # A mistaken registry target therefore fails authentication rather than publishing externally.
@@ -1003,7 +1138,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release, linux-arm64, cross-arch, macos, cross-macos]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release, linux-arm64, cross-arch, macos, cross-macos, native-prebuild-arm64, native-prebuild-arm64-install, macos-native-package, macos-native-install]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran

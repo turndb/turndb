@@ -6,6 +6,9 @@ TurnDB's native distribution targets are deliberately narrow and complete:
 |---|---|---|---|---|
 | `linux-x64-gnu` | `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.17 or newer | `>=22 <27` | one audited addon installed and exercised on Node 22, 24, and 26 |
 | `win32-x64-msvc` | `x86_64-pc-windows-msvc` | Windows x86-64 with the Visual C++ v14 x64 runtime | `>=22 <27` | one audited addon installed and exercised on Node 22, 24, and 26; full installed-artifact contract on Node 22 |
+| `linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | Linux arm64, glibc 2.17 or newer | `>=22 <27` | one audited addon, cross-built through the same toolchain as `linux-x64-gnu`, installed and exercised on arm64 hardware (`ubuntu-22.04-arm`) on Node 22, 24, and 26 |
+| `darwin-x64` | `x86_64-apple-darwin` | macOS x86-64 | `>=22 <27` | one addon built on `macos-15-intel`, installed and exercised there on Node 22, 24, and 26 |
+| `darwin-arm64` | `aarch64-apple-darwin` | macOS Apple silicon | `>=22 <27` | one addon built on `macos-15`, installed and exercised there on Node 22, 24, and 26 |
 
 No other native OS, architecture, or libc is implied. Unsupported hosts receive a load error naming
 their platform, architecture, libc, searched files, and optional package. TurnDB never turns a failed
@@ -99,12 +102,14 @@ The `Release native Node package` workflow is manually dispatched with an exact 
 
 1. checks out and verifies that exact tag;
 2. installs the locked `napi-rs` tooling;
-3. cross-builds one glibc-2.17-compatible addon;
+3. cross-builds the two glibc-2.17-compatible Linux addons, and builds the Windows and both macOS
+   addons on the hardware they run on;
 4. creates publishable staging tarballs and audits their contents, hashes, and ELF floor;
-5. clean-installs the same artifact on Node 22, 24, and 26;
+5. clean-installs the same artifacts on Linux x86-64 (Node 22, 24, and 26), Linux arm64, macOS
+   x86-64, macOS Apple silicon and Windows (Node 24 each);
 6. pauses at the protected `npm` GitHub environment;
-7. uses npm trusted publishing/OIDC and provenance to publish the platform package, then the root
-   selector package.
+7. uses npm trusted publishing/OIDC and provenance to publish every platform package, then the
+   root selector package — refusing before the first write unless all five are present.
 
 The ordinary tracked packages and candidate tarballs cannot be published accidentally.
 The publish job installs npm 11.5.1 explicitly, and the release verifier rejects older clients.

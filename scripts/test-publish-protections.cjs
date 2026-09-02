@@ -38,32 +38,39 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+const NATIVE_SLICES = [
+  { npmTarget: 'darwin-arm64', rustTarget: 'aarch64-apple-darwin', os: 'darwin', cpu: 'arm64' },
+  { npmTarget: 'darwin-x64', rustTarget: 'x86_64-apple-darwin', os: 'darwin', cpu: 'x64' },
+  { npmTarget: 'linux-arm64-gnu', rustTarget: 'aarch64-unknown-linux-gnu', os: 'linux', cpu: 'arm64',
+    libc: 'glibc', glibcRequired: '2.17' },
+  { npmTarget: 'linux-x64-gnu', rustTarget: 'x86_64-unknown-linux-gnu', os: 'linux', cpu: 'x64',
+    libc: 'glibc', glibcRequired: '2.17' },
+  { npmTarget: 'win32-x64-msvc', rustTarget: 'x86_64-pc-windows-msvc', os: 'win32', cpu: 'x64' },
+];
+
 function nativeFixture() {
   const dist = path.join(work, 'native');
   fs.mkdirSync(dist);
-  const optionalDependencies = {
-    '@turndb/native-linux-x64-gnu': version,
-    '@turndb/native-win32-x64-msvc': version,
-  };
+  const optionalDependencies = Object.fromEntries(
+    NATIVE_SLICES.map(({ npmTarget }) => [`@turndb/native-${npmTarget}`, version]),
+  );
   const selector = pack(dist, '@turndb/native', { optionalDependencies }, 'index.cjs');
-  const linux = pack(
-    dist, '@turndb/native-linux-x64-gnu',
-    { os: ['linux'], cpu: ['x64'], libc: ['glibc'] }, 'turndb.linux-x64-gnu.node',
-  );
-  const windows = pack(
-    dist, '@turndb/native-win32-x64-msvc',
-    { os: ['win32'], cpu: ['x64'] }, 'turndb.win32-x64-msvc.node',
-  );
   const common = { schema: 2, package: '@turndb/native', version, sourceCommit: 'fixture',
     nodeApi: 6, publishable: true };
-  writeJson(path.join(dist, 'prebuild-manifest-linux-x64-gnu.json'), {
-    ...common, rustTarget: 'x86_64-unknown-linux-gnu', npmTarget: 'linux-x64-gnu',
-    glibcRequired: '2.17', tarballs: [digest(linux), digest(selector)],
-  });
-  writeJson(path.join(dist, 'prebuild-manifest-win32-x64-msvc.json'), {
-    ...common, rustTarget: 'x86_64-pc-windows-msvc', npmTarget: 'win32-x64-msvc',
-    glibcRequired: null, tarballs: [digest(windows)],
-  });
+  for (const slice of NATIVE_SLICES) {
+    const platform = pack(
+      dist, `@turndb/native-${slice.npmTarget}`,
+      { os: [slice.os], cpu: [slice.cpu], ...(slice.libc ? { libc: [slice.libc] } : {}) },
+      `turndb.${slice.npmTarget}.node`,
+    );
+    // The selector rides in exactly one slice's manifest — the reference slice's — as the release
+    // build packs it; the manifest-set reader's union is what makes every other host installable.
+    writeJson(path.join(dist, `prebuild-manifest-${slice.npmTarget}.json`), {
+      ...common, rustTarget: slice.rustTarget, npmTarget: slice.npmTarget,
+      glibcRequired: slice.glibcRequired ?? null,
+      tarballs: [digest(platform), ...(slice.npmTarget === 'linux-x64-gnu' ? [digest(selector)] : [])],
+    });
+  }
   return dist;
 }
 

@@ -16,7 +16,13 @@ const packSelector = process.env.TURNDB_NATIVE_PACK_SELECTOR !== '0';
 const root = path.resolve(__dirname, '..');
 const workspace = path.resolve(root, '..', '..');
 const npmTarget = process.env.TURNDB_NATIVE_NPM_TARGET || 'linux-x64-gnu';
+// Both Linux slices are cross-built through napi-rs's toolchain and audited to the same GLIBC
+// floor; a native build on an arm64 runner would link 2.34 and fail that audit. The macOS slices
+// are built on the hardware they run on and carry no symbol-version floor to audit.
 const targets = {
+  'darwin-arm64': { rust: 'aarch64-apple-darwin', glibc: false },
+  'darwin-x64': { rust: 'x86_64-apple-darwin', glibc: false },
+  'linux-arm64-gnu': { rust: 'aarch64-unknown-linux-gnu', glibc: true },
   'linux-x64-gnu': { rust: 'x86_64-unknown-linux-gnu', glibc: true },
   'win32-x64-msvc': { rust: 'x86_64-pc-windows-msvc', glibc: false },
 };
