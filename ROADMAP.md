@@ -85,15 +85,16 @@ and the portable package everywhere else, its capability difference stated where
 chooses. A consumer embedding TurnDB must never inherit an OS restriction from it: CommandSuite's
 adoption cannot cost CommandSuite a platform.
 
-What exists today, by registry, so this claims exactly what is true:
+What exists today, by registry — re-surveyed 2026-09-02 against npm, crates.io and PyPI at 0.1.8 — so
+this claims exactly what is true:
 
 | slice | `@turndb/native` | `@turndb/cli` | Python wheels | portable `turndb` (wasm) |
 |---|---|---|---|---|
-| Linux x64 glibc | 0.1.6 | 0.1.6 | 0.1.6 (cp39–cp313, manylinux_2_17) | yes |
-| Linux arm64 | open | open (#89, in progress) | open | yes |
-| macOS x64 | open | open (#89, in progress) | open | yes |
-| macOS arm64 | open | open (#89, in progress) | open | yes |
-| Windows x64 | open — the engine floor and crash proof landed 2026-08-30 (obj-mtfoklqo-c: `src/sys.rs` Windows arms, the DST under a documented-operations Windows model, a required `windows-latest` gate, a cross-OS byte-compare); packaging is the follow-on | open, same | open, same | yes |
+| Linux x64 glibc | 0.1.8 | 0.1.8 | 0.1.8 (cp39–cp313, manylinux_2_17) | yes |
+| Linux arm64 | open | 0.1.8 — published cross-built and never executed; since 2026-09-02 built on `ubuntu-22.04-arm`, installed and driven there, with the engine suite, the crash sweeps and the cross-architecture byte-compare as required gates | open | yes |
+| macOS x64 | open | 0.1.8 — built and driven on `macos-15-intel`; the engine suite does not run on macOS | open | yes |
+| macOS arm64 | open | 0.1.8 — built and driven on `macos-15`; the engine suite does not run on macOS | open | yes |
+| Windows x64 | 0.1.8 | 0.1.8 | 0.1.8 (cp39–cp313, win_amd64) | yes |
 
 The portable package runs on every host Node 22–26 does, and gives up exactly three things —
 advisory locking, in-place punch, threads — which the capability contract reports and the front
