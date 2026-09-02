@@ -34,7 +34,7 @@ jobs:
           fetch-depth: 0
       # Keep setup aligned with rust-toolchain.toml. These host builds need no extra target today;
       # pinning here prevents a future `targets:` addition from installing it on an unused stable.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -84,7 +84,7 @@ jobs:
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
@@ -134,7 +134,7 @@ jobs:
           fetch-depth: 0
       # This is currently a host-only source build; match the repository pin so adding a target
       # later cannot recreate the CLI cross-toolchain failure.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
