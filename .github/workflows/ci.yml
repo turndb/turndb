@@ -11,11 +11,16 @@
 #
 #   every push and PR   fmt, clippy, rustdoc, `cargo test` x3 profiles, the example classifier,
 #                       the portable npm package built from committed Rust, and the native N-API
-#                       addon across every Node major its package claims
-#   nightly + on demand the DST harness, which reconstructs crash states and is the one suite too
-#                       slow to sit in front of every push. It lives in `nightly.yml`, NOT here —
-#                       see that file for why a scheduled run must not share a workflow with a
-#                       push run.
+#                       addon across every Node major its package claims; and, on Windows x86-64
+#                       and Linux arm64 hardware, the engine suite itself — clippy, both test
+#                       configurations, the corruption suite, the crash sweeps under both
+#                       durability models, and one store byte-compared both ways against the
+#                       x86-64 Linux fixture
+#   nightly + on demand the DST harness on Linux x86-64, which reconstructs crash states and is
+#                       the one suite too slow to sit in front of every push there. It lives in
+#                       `nightly.yml`, NOT here — see that file for why a scheduled run must not
+#                       share a workflow with a push run. On Windows and arm64 the sweep is the
+#                       proof of the platform, so there it is a gate.
 #
 # Every job below runs on every push and PR. NOTHING in this file is conditional on the event, so a
 # `skipped` check here is an anomaly rather than routine, and the `gate` job at the bottom fails on
@@ -473,7 +478,7 @@ jobs:
           cargo run --release --bin turndb -- inspect dist/windows-evidence/windows-cli.turndb
 
   cli-slice-changes:
-    # Keep the two macOS runners off changes that cannot affect the CLI package. This detector is
+    # Keep the macOS and arm64 runners off changes that cannot affect the CLI package. This detector is
     # itself unconditional, so gate can distinguish an intentional path skip from a lost job.
     name: CLI slice path filter
     runs-on: ubuntu-latest
@@ -503,7 +508,9 @@ jobs:
 
   cli-slices:
     # release-cli.yml is tag/dispatch-only, so this is the PR proof. It has no npm environment,
-    # OIDC permission or publish step. Native hosts install their package; Linux arm64 cross-builds.
+    # OIDC permission or publish step. Every slice builds on its own hardware and installs and
+    # drives its package — Linux arm64 included, on GitHub's hosted `ubuntu-22.04-arm`; until it
+    # did, that slice shipped cross-built and never executed.
     name: CLI slice (${{ matrix.slice }})
     needs: cli-slice-changes
     if: needs.cli-slice-changes.outputs.changed == 'true'
@@ -521,9 +528,8 @@ jobs:
             execute: '1'
           - slice: linux-arm64-gnu
             target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            linker: aarch64-linux-gnu-gcc
-            apt: gcc-aarch64-linux-gnu
+            runner: ubuntu-22.04-arm
+            execute: '1'
           - slice: darwin-x64
             target: x86_64-apple-darwin
             runner: macos-15-intel
@@ -543,15 +549,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: install the cross linker
-        if: matrix.apt != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
       - name: build and pack this slice
         env:
           TURNDB_CLI_TARGET: ${{ matrix.target }}
           TURNDB_CLI_SLICE: ${{ matrix.slice }}
           TURNDB_CLI_PACK_SELECTOR: '1'
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: node cli/scripts/pack-cli.cjs
       - name: install and drive the native package
         if: matrix.execute == '1'
@@ -718,6 +720,83 @@ jobs:
           test -s "$TURNDB_CROSS_OS_STORE"
           cargo test --test cross_os -- --nocapture
 
+  # Linux arm64: the gate `windows` is, on the second Linux architecture a consumer runs on. The
+  # CLI slice for this architecture shipped at 0.1.8 cross-built and never executed — no job in
+  # this repository ran on arm64 hardware — and the support policy could claim nothing for it.
+  # GitHub's hosted `ubuntu-22.04-arm` is real hardware, free on a public repository, so nothing
+  # here is emulated. `src/sys.rs` has no arm64-specific arm: this proves the Unix arm on a second
+  # instruction set, and the byte-compare below proves the format does not depend on which one
+  # wrote it.
+  linux-arm64:
+    name: linux arm64
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-arm64-v1
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test (default)
+        run: cargo test
+
+      - name: test (no default features)
+        run: cargo test --no-default-features
+
+      - name: corruption
+        run: cargo test --test corruption
+
+      # The crash sweeps, a gate rather than nightly, for the reason the `windows` job gives.
+      - name: deterministic simulation (both models)
+        run: cargo test --features dst --test dst -- --nocapture
+
+      # tests/cross_os.rs: this architecture's build of the reference store must be byte-identical
+      # to the x86-64-made fixture and the fixture must open here (x86-64 → arm64). The build is
+      # emitted for the cross-arch job below, which closes the other direction.
+      - name: cross-architecture store (x86-64 → arm64) and emit this architecture's build
+        env:
+          TURNDB_CROSS_OS_EMIT: ${{ runner.temp }}/linux-arm64-made.turndb
+        run: cargo test --test cross_os -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-made-store
+          path: ${{ runner.temp }}/linux-arm64-made.turndb
+          if-no-files-found: error
+          retention-days: 7
+
+      # The release-profile suite, in this job as the Linux `rust` job runs it rather than split
+      # out as Windows's is: this runner is the same 4-vCPU/16 GB class as `ubuntu-latest`, on
+      # which that job's release link is measured to fit. Unconditional: arm64 hosted runners do
+      # not exist on the private free tier at all, so there is no private-tier variant to defer.
+      - name: test (release)
+        run: cargo test --release --tests
+
+  # arm64 → x86-64: the store the arm64 job built, opened, verified and byte-compared here.
+  cross-arch:
+    name: cross-architecture store (arm64 → x86-64)
+    needs: [linux-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-os-v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64-made-store
+          path: ${{ runner.temp }}/from-arm64
+      - name: open, verify and byte-compare the arm64-made store
+        env:
+          TURNDB_CROSS_OS_STORE: ${{ runner.temp }}/from-arm64/linux-arm64-made.turndb
+        run: |
+          test -s "$TURNDB_CROSS_OS_STORE"
+          cargo test --test cross_os -- --nocapture
 
   # The release-profile suite on Windows: the same invocation the Linux `rust` job runs
   # (`cargo test --release --tests`), on the same trigger (every push and pull request), with the
@@ -824,7 +903,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release, linux-arm64, cross-arch]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran

@@ -46,11 +46,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             selector: '1'
+          # Built on arm64 hardware, not cross-compiled: the install matrix below drives it there.
           - slice: linux-arm64-gnu
             target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            linker: aarch64-linux-gnu-gcc
-            apt: gcc-aarch64-linux-gnu
+            runner: ubuntu-22.04-arm
             selector: '0'
           # GitHub's explicit Intel and arm64 labels keep the architecture stable as
           # macos-latest moves. Each builds natively on the toolchain that targets it.
@@ -92,10 +91,6 @@ jobs:
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
         run: test "v$(node -p "require('./cli/package.json').version")" = "$RELEASE_REF"
-      - name: install the cross linker
-        if: matrix.apt != ''
-        shell: bash
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
       - name: install pinned license-report generator
         if: matrix.selector == '1'
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
@@ -107,7 +102,6 @@ jobs:
           TURNDB_CLI_TARGET: ${{ matrix.target }}
           TURNDB_CLI_SLICE: ${{ matrix.slice }}
           TURNDB_CLI_PACK_SELECTOR: ${{ matrix.selector }}
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: node cli/scripts/pack-cli.cjs --release
       # One artifact per slice, merged by the jobs downstream: matrix jobs writing one artifact
       # name race each other for it.
@@ -118,8 +112,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Every architecture that ships a binary drives it from an install before publish. Linux arm64
+  # was absent from this matrix through 0.1.8: its slice was published having never been run.
   install:
-    name: install release candidate (node ${{ matrix.node }})
+    name: install release candidate (${{ matrix.runner }}, node ${{ matrix.node }})
     needs: build
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
@@ -133,6 +129,8 @@ jobs:
             runner: ubuntu-22.04
           - node: '26'
             runner: ubuntu-22.04
+          - node: '24'
+            runner: ubuntu-22.04-arm
           - node: '24'
             runner: windows-latest
     steps:
