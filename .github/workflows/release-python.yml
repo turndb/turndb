@@ -25,8 +25,17 @@ concurrency:
 
 jobs:
   build:
-    name: manylinux wheels
-    runs-on: ubuntu-22.04
+    name: manylinux wheels (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          # Built in the manylinux2014 aarch64 container on arm64 hardware, not under emulation.
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,7 +56,7 @@ jobs:
           test "v$(python -c 'import tomllib; print(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["project"]["version"])')" = "$RELEASE_REF"
       - uses: PyO3/maturin-action@v1
         with:
-          target: x86_64
+          target: ${{ matrix.arch }}
           manylinux: auto
           args: >-
             --manifest-path bindings/python/Cargo.toml
@@ -57,19 +66,19 @@ jobs:
       - name: record exact wheel digests
         run: |
           version="${RELEASE_REF#v}"
-          python scripts/release-artifacts.py create --component python-manylinux \
-            --version "$version" --output dist/python-manifest-manylinux.json dist/*.whl
+          python scripts/release-artifacts.py create --component "python-manylinux-${{ matrix.arch }}" \
+            --version "$version" --output "dist/python-manifest-manylinux-${{ matrix.arch }}.json" dist/*.whl
         env:
           RELEASE_REF: ${{ inputs.release_ref }}
       - uses: actions/upload-artifact@v7
         with:
-          name: turndb-python-wheels-${{ inputs.release_ref }}
+          name: turndb-python-wheels-manylinux-${{ matrix.arch }}-${{ inputs.release_ref }}
           path: dist/*.whl
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
-          name: release-digests-python-manylinux-${{ inputs.release_ref }}
-          path: dist/python-manifest-manylinux.json
+          name: release-digests-python-manylinux-${{ matrix.arch }}-${{ inputs.release_ref }}
+          path: dist/python-manifest-manylinux-${{ matrix.arch }}.json
           if-no-files-found: error
 
   windows:
@@ -124,6 +133,66 @@ jobs:
           path: python-manifest-${{ matrix.python }}.json
           if-no-files-found: error
 
+  # One wheel per interpreter per architecture, exactly as Windows does it, so every interpreter
+  # stays distinct and visible. Built on the hardware it runs on: `macos-15-intel` for x86-64,
+  # `macos-15` for Apple silicon. No `mapfile` here: macOS's /bin/bash is 3.2.
+  macos:
+    name: macOS wheel (${{ matrix.arch }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: verify tag, package version and actual interpreter
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
+          test "$(git cat-file -t "$RELEASE_REF")" = tag
+          test "$(sed -n 's/^version = "\([^"]*\)"$/\1/p' bindings/python/pyproject.toml | wc -l | tr -d ' ')" = 1
+          test "v$(sed -n 's/^version = "\([^"]*\)"$/\1/p' bindings/python/pyproject.toml)" = "$RELEASE_REF"
+          python -c "import platform; assert platform.python_version().startswith('${{ matrix.python }}.')"
+          python -c "import hashlib,pathlib,platform,sys,sysconfig; p=pathlib.Path(sys.executable); print(platform.python_version(), platform.machine(), p, hashlib.sha256(p.read_bytes()).hexdigest(), sysconfig.get_config_var('EXT_SUFFIX'))"
+      - run: python -m pip install 'maturin>=1.7,<2'
+      - name: build exact macOS wheel
+        run: >-
+          maturin build --manifest-path bindings/python/Cargo.toml
+          --release --out dist --interpreter python
+      - name: record exact wheel digest
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          version="${RELEASE_REF#v}"
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python scripts/release-artifacts.py create --component "python-macos-${{ matrix.arch }}-${{ matrix.python }}" \
+            --version "$version" --output "python-manifest-macos-${{ matrix.arch }}-${{ matrix.python }}.json" "${wheels[0]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: turndb-python-macos-${{ matrix.arch }}-${{ matrix.python }}-${{ inputs.release_ref }}
+          path: dist/*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-digests-python-macos-${{ matrix.arch }}-${{ matrix.python }}-${{ inputs.release_ref }}
+          path: python-manifest-macos-${{ matrix.arch }}-${{ matrix.python }}.json
+          if-no-files-found: error
+
   sdist:
     name: source distribution
     runs-on: ubuntu-22.04
@@ -146,18 +215,25 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # Every exact wheel installed and exercised on the hardware it claims, on every interpreter.
   install:
     name: install ${{ matrix.platform }} wheel (Python ${{ matrix.python }})
-    needs: [build, windows]
+    needs: [build, macos, windows]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        platform: [manylinux, windows]
+        platform: [manylinux-x86_64, manylinux-aarch64, macos-x64, macos-arm64, windows]
         python: ['3.9', '3.10', '3.11', '3.12', '3.13']
         include:
-          - platform: manylinux
+          - platform: manylinux-x86_64
             runner: ubuntu-22.04
+          - platform: manylinux-aarch64
+            runner: ubuntu-22.04-arm
+          - platform: macos-x64
+            runner: macos-15-intel
+          - platform: macos-arm64
+            runner: macos-15
           - platform: windows
             runner: windows-latest
     steps:
@@ -168,14 +244,44 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@v4
-        if: matrix.platform == 'manylinux'
+        if: matrix.platform == 'manylinux-x86_64'
         with:
-          name: turndb-python-wheels-${{ inputs.release_ref }}
+          name: turndb-python-wheels-manylinux-x86_64-${{ inputs.release_ref }}
           path: dist
       - uses: actions/download-artifact@v4
-        if: matrix.platform == 'manylinux'
+        if: matrix.platform == 'manylinux-x86_64'
         with:
-          name: release-digests-python-manylinux-${{ inputs.release_ref }}
+          name: release-digests-python-manylinux-x86_64-${{ inputs.release_ref }}
+          path: manifests
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'manylinux-aarch64'
+        with:
+          name: turndb-python-wheels-manylinux-aarch64-${{ inputs.release_ref }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'manylinux-aarch64'
+        with:
+          name: release-digests-python-manylinux-aarch64-${{ inputs.release_ref }}
+          path: manifests
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'macos-x64'
+        with:
+          name: turndb-python-macos-x64-${{ matrix.python }}-${{ inputs.release_ref }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'macos-x64'
+        with:
+          name: release-digests-python-macos-x64-${{ matrix.python }}-${{ inputs.release_ref }}
+          path: manifests
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'macos-arm64'
+        with:
+          name: turndb-python-macos-arm64-${{ matrix.python }}-${{ inputs.release_ref }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        if: matrix.platform == 'macos-arm64'
+        with:
+          name: release-digests-python-macos-arm64-${{ matrix.python }}-${{ inputs.release_ref }}
           path: manifests
       - uses: actions/download-artifact@v4
         if: matrix.platform == 'windows'
@@ -187,14 +293,23 @@ jobs:
         with:
           name: release-digests-python-windows-${{ matrix.python }}-${{ inputs.release_ref }}
           path: manifests
+      # Bash on every Unix host: the arm64 and macOS runner images are not promised to carry pwsh.
       - name: reassert build digests before install
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          manifests=(manifests/*.json)
+          test "${#manifests[@]}" -eq 1
+          python scripts/release-artifacts.py verify --manifest "${manifests[0]}" --directory dist
+      - name: reassert build digests before install (Windows)
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $manifests = @(Get-ChildItem manifests -Filter '*.json')
           if ($manifests.Count -ne 1) { throw "expected one digest manifest, got $($manifests.Count)" }
           python scripts/release-artifacts.py verify --manifest $manifests[0].FullName --directory dist
-      - name: install and exercise exact manylinux wheel
-        if: matrix.platform == 'manylinux'
+      - name: install and exercise the exact wheel on this host
+        if: matrix.platform != 'windows'
         shell: bash
         run: |
           python -m pip install 'opentelemetry-sdk>=1.20,<2'
