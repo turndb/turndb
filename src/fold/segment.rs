@@ -144,10 +144,11 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// Deallocate `len` bytes at `off` — the extents are freed and read back as zeros, and the file's
 /// length is untouched, so every offset in it still means what it meant.
 ///
-/// This is the one operation that destroys committed fold bytes in place. It is a Linux
-/// filesystem feature (ext4, xfs, btrfs, tmpfs...); where the kernel or filesystem declines, the
-/// error surfaces and the caller falls back to a re-fold, which reclaims the same space by
-/// rewriting rather than by punching.
+/// This is the one operation that destroys committed fold bytes in place. Linux (`fallocate`),
+/// macOS (`fcntl(F_PUNCHHOLE)`) and Windows (`FSCTL_SET_ZERO_DATA`) each have it, in their own
+/// idiom, behind `sys::punch_hole`; where the kernel or filesystem declines, the error surfaces
+/// and the caller falls back to a re-fold, which reclaims the same space by rewriting rather
+/// than by punching.
 ///
 /// **Only a block's PAYLOAD is ever punched, never its header.** The frame chain is walked by
 /// reading a header and stepping over `stored` bytes, so a punched header would end the chain and

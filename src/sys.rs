@@ -9,7 +9,7 @@
 //! |---|---|---|---|---|
 //! | positioned read/write | `std::os::unix::fs::FileExt` | `std::os::windows::fs::FileExt` (`seek_read`/`seek_write`, offset per call) | `std::os::wasi::fs::FileExt` | every read is `n` bytes at offset `o`; seek-then-read is not thread-safe |
 //! | advisory whole-file lock | `flock` | `LockFileEx` on one byte past any real offset — see [`lock_exclusive`] | **absent** — see [`lock_exclusive`] | the single-writer invariant, enforced by the OS rather than by convention |
-//! | hole punching | `fallocate(PUNCH_HOLE)`, Linux | `FSCTL_SET_ZERO_DATA` on a sparse file — see [`punch_hole`] | **absent** | erase content in place without moving a single offset |
+//! | hole punching | `fallocate(PUNCH_HOLE)` on Linux; `fcntl(F_PUNCHHOLE)` on macOS, edges zeroed by write — see [`punch_hole`] | `FSCTL_SET_ZERO_DATA` on a sparse file — see [`punch_hole`] | **absent** | erase content in place without moving a single offset |
 //!
 //! Two more are not in that table because Unix gets them from `std` for free and Windows does
 //! not: a **durable rename** ([`rename`], [`rename_noreplace`] — `MoveFileExW` with
@@ -411,9 +411,19 @@ const LOCK_BYTE_OFFSET: u64 = u64::MAX - 1;
 /// file system *may* deallocate disk space" — in practice at NTFS's 64 KiB sparse granularity,
 /// so a hole smaller than that is zeroed but not returned. The erasure contract (bytes gone,
 /// offsets unmoved) therefore holds exactly on Windows; how much space comes back is what
-/// `allocated_bytes` measures rather than something this function promises. Everywhere else
-/// this returns [`io::ErrorKind::Unsupported`], which callers already treat as "re-fold
-/// instead" — reclaiming the same space by rewriting rather than in place.
+/// `allocated_bytes` measures rather than something this function promises.
+///
+/// macOS: `fcntl(F_PUNCHHOLE)`, which APFS honours only for whole filesystem blocks and refuses
+/// with `EINVAL` when the range is not block-aligned — and the range this engine punches never
+/// is, because it starts past a block's header. So the unaligned head and tail are zeroed by
+/// ordinary positioned writes, which keeps the erasure contract exact on the bytes, and the
+/// aligned interior between them is deallocated, which is where the space returns; a range
+/// shorter than one aligned block is zeroed whole and returns nothing. The block size is the
+/// file's `st_blksize` (4096 on APFS). Space return is measured by `allocated_bytes`, as on
+/// Windows, not promised here.
+///
+/// Everywhere else this returns [`io::ErrorKind::Unsupported`], which callers already treat as
+/// "re-fold instead" — reclaiming the same space by rewriting rather than in place.
 #[inline]
 pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
     #[cfg(target_os = "linux")]
@@ -485,7 +495,50 @@ pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        let end = off.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "punch range overflows u64")
+        })?;
+        if end > i64::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "punch range exceeds the off_t offset space",
+            ));
+        }
+        let block = f.metadata()?.blksize().max(4096);
+        let head_end = off.div_ceil(block) * block;
+        let tail_start = (end / block) * block;
+        let zero = |from: u64, to: u64| -> io::Result<()> {
+            if to > from {
+                write_all_at(f, &vec![0u8; (to - from) as usize], from)
+            } else {
+                Ok(())
+            }
+        };
+        if head_end >= tail_start {
+            // No whole block inside the range: the bytes go, the blocks stay.
+            return zero(off, end);
+        }
+        zero(off, head_end)?;
+        zero(tail_start, end)?;
+        let hole = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: head_end as libc::off_t,
+            fp_length: (tail_start - head_end) as libc::off_t,
+        };
+        let rc = unsafe {
+            libc::fcntl(f.as_raw_fd(), libc::F_PUNCHHOLE, &hole as *const libc::fpunchhole_t)
+        };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (f, off, len);
         Err(io::Error::new(
