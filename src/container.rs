@@ -1121,23 +1121,6 @@ pub struct ReclaimStats {
     pub reclaimed: u64,
 }
 
-/// Rewrite a container without the extents nothing names any more.
-///
-/// A container only grows. Restaging a member supersedes its predecessor rather than overwriting
-/// it, and freed extents are deliberately never reused — a reader that resolved an older
-/// superblock still holds offsets into them, so handing those bytes to a new member would be
-/// silent corruption rather than a detected fault. The cost of that guarantee is that a container
-/// checkpointed daily accumulates dead space forever, and this is the only thing that returns it
-/// whole. Every member comes out a single aligned extent.
-///
-/// The rewrite is a copy to a fresh file and an atomic rename, not an edit: at no point is the
-/// container being read half-rewritten, and a crash leaves the original untouched. A reader
-/// holding the old file keeps reading it — the inode outlives the name.
-///
-/// Refused while a writer's working directory exists beside the file, because that directory holds
-/// state the container has not been told about and rewriting would publish a version of the
-/// container that is about to be superseded by a checkpoint of writes it never saw. Refused for a
-/// sealed container, whose bytes are final — copy it instead.
 /// The names reclaim uses beside `<store>`. Each is a full path built from the store's own, so
 /// a store's recovery material is always found next to it and never mistaken for another's.
 pub(crate) fn reclaim_names(path: &Path) -> ReclaimNames {
@@ -1189,42 +1172,119 @@ fn copy_container_bytes(from: &Path, to: &Path) -> Result<u64> {
     Ok(len)
 }
 
-/// Rewrite a live container as one aligned extent per member and put the result at its name.
+/// How [`reclaim`] publishes the fresh container at the store's name. Chosen by what the platform
+/// guarantees for a replace over an open destination (`sys::replace_open_durability`), never by
+/// platform name — so a constraint one platform has is that platform's protocol, not everyone's.
 ///
-/// The publication protocol is the crash-safety argument, and it is the same on every platform
-/// so the deterministic simulator proves it under both durability models:
+/// Non-exhaustive: a platform with a third guarantee would add a third protocol.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimProtocol {
+    /// One `rename(2)` over the live name, durable at the directory's fsync. The fresh container
+    /// is opened and writer-locked under its staging name first — the lock is on the inode, so it
+    /// is the lock on `<store>` the instant the rename lands, and no second writer can enter
+    /// between the replace and the return. No copy, no anchor. Sound only where the replace is
+    /// atomic and a crash leaves old or new: `ReplaceOpenDurability::Atomic`.
+    Rename,
+    /// A durable anchor, a locked candidate copy, the uncertain replace, and recovery from the
+    /// anchor at the next writer open. One extra copy of the compacted container. Required where
+    /// the replace may leave neither name: `ReplaceOpenDurability::Lagged`. Sound under either
+    /// guarantee, and the simulator proves it under both models.
+    Anchor,
+}
+
+impl ReclaimProtocol {
+    /// The protocol this platform's guarantee selects.
+    pub const fn for_this_platform() -> Self {
+        match crate::sys::replace_open_durability() {
+            crate::sys::ReplaceOpenDurability::Atomic => ReclaimProtocol::Rename,
+            crate::sys::ReplaceOpenDurability::Lagged => ReclaimProtocol::Anchor,
+        }
+    }
+}
+
+/// Rewrite a container without the extents nothing names any more.
 ///
-/// 1. the fresh container is written at `<store>.reclaiming`, committed and verified;
-/// 2. it is published as the **anchor**, `<store>.reclaimed`, by a write-through no-replace
-///    rename — a durable name for verified bytes that nothing below touches;
-/// 3. a byte copy of the anchor is fsynced and published as the **candidate**,
+/// A container only grows. Restaging a member supersedes its predecessor rather than overwriting
+/// it, and freed extents are deliberately never reused — a reader that resolved an older
+/// superblock still holds offsets into them, so handing those bytes to a new member would be
+/// silent corruption rather than a detected fault. The cost of that guarantee is that a container
+/// checkpointed daily accumulates dead space forever, and this is the only thing that returns it
+/// whole. Every member comes out a single aligned extent.
+///
+/// Refused while a writer's working directory exists beside the file, because that directory holds
+/// state the container has not been told about and rewriting would publish a version of the
+/// container that is about to be superseded by a checkpoint of writes it never saw. Refused for a
+/// sealed container, whose bytes are final — copy it instead.
+///
+/// # Publication
+///
+/// The fresh container is written at `<store>.reclaiming`, committed and verified — the same on
+/// every platform. How it then reaches the store's name is [`ReclaimProtocol::for_this_platform`],
+/// decided by the platform's guarantee for a replace over an open destination, and the two
+/// protocols are the crash-safety argument under the two guarantees:
+///
+/// **Rename** — `ReplaceOpenDurability::Atomic`, every platform but Windows:
+///
+/// 1. the fresh container is opened under its staging name and the writer lock is taken on that
+///    handle; the lock follows the inode through the rename, so `<store>` is locked the instant
+///    it names the fresh bytes, and no second writer can enter before this function returns;
+/// 2. `rename(2)` puts the fresh container at `<store>` — one atomic step to every observer; a
+///    reader holding the old file keeps reading it, because the inode outlives the name — and the
+///    directory is synced, which is what makes the new name durable; a failed sync is this
+///    function's error, and the old container, whole, is then what a crash shows;
+/// 3. the store at its name is reopened and verified.
+///
+/// A crash anywhere leaves the old container or the new one, each whole. The staging name, if it
+/// survives, is removed by the next writer open. No copy, no anchor, no recovery step.
+///
+/// **Anchor** — `ReplaceOpenDurability::Lagged`, Windows:
+///
+/// 1. the fresh container is published as the **anchor**, `<store>.reclaimed`, by a write-through
+///    no-replace rename — a durable name for verified bytes that nothing below touches;
+/// 2. a byte copy of the anchor is fsynced and published as the **candidate**,
 ///    `<store>.reclaim-candidate`, the same way; the candidate is then opened and the writer lock
 ///    is taken on that handle *before* it is published at the store's name — the name a second
 ///    writer would open;
-/// 4. the candidate is renamed over `<store>` (`vfs::rename_replace_open`) — `rename(2)` on Unix;
-///    on Windows the write-through `MoveFileExW`, which refuses because this function holds the
-///    original open and locked, then `std`'s POSIX-semantics fallback, which is **not**
-///    write-through (`sys::rename`) and which no later documented barrier promotes. The crash
-///    model therefore carries old / new / neither for this step through every later crash point,
-///    including after the cleanup below and after this function returns. In every one of those
-///    states the anchor is intact, and an absent `<store>` beside a whole anchor is what a writer
-///    open recovers (`Store::open_file`);
-/// 5. the new store at its name is reopened and verified, the locked candidate handle — now the
+/// 3. the candidate is renamed over `<store>` (`vfs::rename_replace_open`): the write-through
+///    `MoveFileExW`, which refuses because this function holds the original open and locked, then
+///    `std`'s POSIX-semantics fallback, which is **not** write-through (`sys::rename`) and which no
+///    later documented barrier promotes. The crash model therefore carries old / new / neither for
+///    this step through every later crash point, including after the cleanup below and after this
+///    function returns. In every one of those states the anchor is intact, and an absent `<store>`
+///    beside a whole anchor is what a writer open recovers (`Store::open_file`) — on every
+///    platform, because an anchor travels with the store it belongs to;
+/// 4. the new store at its name is reopened and verified, the locked candidate handle — now the
 ///    handle of `<store>` itself — is held until this function returns so no second writer can
 ///    enter between the replace and the return, and the anchor is unlinked (laggable: a stale
 ///    anchor beside a present store is removed by the next writer open, never promoted).
 ///
-/// Cost: one extra copy of the fresh, compacted container on every platform, and on Windows two
-/// write-through renames more than before. No format bytes change.
+/// The deterministic simulator proves each protocol under the durability model it is specified
+/// for, on every host, and shows the rename protocol reaching a state with no store and no anchor
+/// under the Windows model — the reason the choice is made by guarantee (tests/dst.rs).
+///
+/// Cost: the rename protocol writes the compacted container once. The anchor protocol writes it
+/// twice and, on Windows, adds two write-through renames. No format bytes change.
 pub fn reclaim(path: &Path) -> Result<ReclaimStats> {
-    reclaim_with_hook(path, |_| {})
+    reclaim_with(path, ReclaimProtocol::for_this_platform(), |_| {})
 }
 
-/// [`reclaim`] with a hook called between the replace and the return, while the new store's
-/// writer lock is held: the window a competing writer must be refused in. Crate-private — a test
-/// seam, not API.
-pub(crate) fn reclaim_with_hook(
+/// [`reclaim`] under an explicit protocol: the crash harness's seam, so every host proves both
+/// protocols under the model each is specified for. Not for production callers — the platform
+/// chooses, and forcing the rename protocol where the guarantee is `Lagged` is exactly the loss
+/// the harness demonstrates.
+#[cfg(feature = "dst")]
+pub fn reclaim_with_protocol(path: &Path, protocol: ReclaimProtocol) -> Result<ReclaimStats> {
+    reclaim_with(path, protocol, |_| {})
+}
+
+/// [`reclaim`] under an explicit protocol, with a hook called between the replace and the
+/// return while the new store's writer lock is held — the window a competing writer must be
+/// refused in. The hook is a unit-test seam; the protocol parameter is what both public entry
+/// points narrow.
+fn reclaim_with(
     path: &Path,
+    protocol: ReclaimProtocol,
     mut after_replace: impl FnMut(&Path),
 ) -> Result<ReclaimStats> {
     let mut hot = path.as_os_str().to_os_string();
@@ -1259,12 +1319,13 @@ pub(crate) fn reclaim_with_hook(
     }
     let names = reclaim_names(path);
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    // Debris from an earlier crash: the store is present, so it is authority and these are not.
+    // Debris from an earlier crash — of either protocol, or of a store carried here from the
+    // other platform: the store is present, so it is authority and these are not.
     for stale in [&names.staging, &names.anchor, &names.candidate_tmp, &names.candidate] {
         let _ = crate::vfs::unlink(stale);
     }
 
-    // 1. The fresh container.
+    // The fresh container: the same on every platform.
     let mut fresh = Container::create(&names.staging)?;
     for name in source.names().map(String::from).collect::<Vec<_>>() {
         let extent = source
@@ -1280,39 +1341,70 @@ pub(crate) fn reclaim_with_hook(
     fresh.verify()?;
     drop(fresh);
 
-    // 2. The anchor: a durable name for verified bytes.
-    crate::vfs::rename_noreplace(&names.staging, &names.anchor)?;
-    crate::vfs::sync_dir(&parent)?;
+    let bytes_after = match protocol {
+        ReclaimProtocol::Rename => {
+            // 1. The writer lock, taken on the fresh container under its staging name. The lock
+            //    is on the inode: the rename below carries it to `<store>`.
+            let new_store = crate::vfs::open_rw(&names.staging)?;
+            if !crate::sys::lock_exclusive(&new_store)
+                .with_context(|| format!("locking {}", names.staging.display()))?
+            {
+                return Err(crate::fold::WriterLocked { path: names.staging.clone() }.into());
+            }
+            let bytes_after = std::fs::metadata(&names.staging)?.len();
+            // 2. The replace — atomic to every observer under this protocol's guarantee — and
+            //    the directory sync that makes the new name durable. A failed sync is this
+            //    operation's error: the old container is what a crash would then show, whole.
+            crate::vfs::rename_replace_open(&names.staging, path)?;
+            crate::vfs::sync_dir(&parent).with_context(|| {
+                format!("sync {} after replacing {}", parent.display(), path.display())
+            })?;
+            // 3. Reopen at the name, hand off, release.
+            Container::open(path)?.verify()?;
+            after_replace(path);
+            drop(source);
+            drop(new_store);
+            bytes_after
+        }
+        ReclaimProtocol::Anchor => {
+            // 1. The anchor: a durable name for verified bytes.
+            crate::vfs::rename_noreplace(&names.staging, &names.anchor)?;
+            crate::vfs::sync_dir(&parent)?;
 
-    // 3. The candidate: a copy, fsynced, published under its own name, then opened and
-    //    writer-locked before it is published at the store's name.
-    let bytes_after = copy_container_bytes(&names.anchor, &names.candidate_tmp)?;
-    crate::vfs::sync_dir(&parent)?;
-    crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
-    crate::vfs::sync_dir(&parent)?;
-    let new_store = crate::vfs::open_rw(&names.candidate)?;
-    if !crate::sys::lock_exclusive(&new_store)
-        .with_context(|| format!("locking {}", names.candidate.display()))?
-    {
-        return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
-    }
-    Container::open(&names.candidate)?.verify()?;
+            // 2. The candidate: a copy, fsynced, published under its own name, then opened and
+            //    writer-locked before it is published at the store's name.
+            let bytes_after = copy_container_bytes(&names.anchor, &names.candidate_tmp)?;
+            crate::vfs::sync_dir(&parent)?;
+            crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
+            crate::vfs::sync_dir(&parent)?;
+            let new_store = crate::vfs::open_rw(&names.candidate)?;
+            if !crate::sys::lock_exclusive(&new_store)
+                .with_context(|| format!("locking {}", names.candidate.display()))?
+            {
+                return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
+            }
+            Container::open(&names.candidate)?.verify()?;
 
-    // 4. The uncertain replace — recorded as its own operation for the crash model. The anchor
-    //    is not involved.
-    crate::vfs::rename_replace_open(&names.candidate, path)?;
-    crate::vfs::sync_dir(&parent)?;
+            // 3. The uncertain replace — recorded as its own operation for the crash model. The
+            //    anchor is not involved.
+            crate::vfs::rename_replace_open(&names.candidate, path)?;
+            crate::vfs::sync_dir(&parent)?;
 
-    // 5. Reopen at the name, hand off, clean up.
-    Container::open(path)?.verify()?;
-    after_replace(path);
-    drop(source);
-    // Cleanup, and still reported: the store is complete either way, but "the anchor is gone" is
-    // this operation's result, and it is not durable if the directory sync failed.
-    let _ = crate::vfs::unlink(&names.anchor);
-    crate::vfs::sync_dir(&parent)
-        .with_context(|| format!("sync {} after removing the reclaim anchor", parent.display()))?;
-    drop(new_store);
+            // 4. Reopen at the name, hand off, clean up.
+            Container::open(path)?.verify()?;
+            after_replace(path);
+            drop(source);
+            // Cleanup, and still reported: the store is complete either way, but "the anchor is
+            // gone" is this operation's result, and it is not durable if the directory sync
+            // failed.
+            let _ = crate::vfs::unlink(&names.anchor);
+            crate::vfs::sync_dir(&parent).with_context(|| {
+                format!("sync {} after removing the reclaim anchor", parent.display())
+            })?;
+            drop(new_store);
+            bytes_after
+        }
+    };
     Ok(ReclaimStats {
         members,
         bytes_before,
@@ -1536,31 +1628,55 @@ mod reclaim_handoff_tests {
         e.chain().any(|c| c.downcast_ref::<crate::fold::WriterLocked>().is_some())
     }
 
+    /// Both protocols, on this host: the rename protocol's lock rides the staging inode through
+    /// the rename; the anchor protocol's rides the candidate's. Either way the hook, called with
+    /// the fresh container at the store's name, must find it locked.
     #[test]
     fn a_competing_writer_in_the_handoff_window_is_refused_with_the_typed_error() {
-        let root = tmp("window");
-        let ct = root.join("s.turndb");
-        let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-        for round in 0..6u8 {
-            let mut s = Store::open_file(&ct, cfg).unwrap();
-            s.put(&format!("r:{round}"), &[Span::Piece(&[round; 1200])], vec![]).unwrap();
-            s.sync().unwrap();
-            s.flush().unwrap();
-            s.close().unwrap();
+        for protocol in [ReclaimProtocol::Rename, ReclaimProtocol::Anchor] {
+            let root = tmp(&format!("window-{protocol:?}"));
+            let ct = root.join("s.turndb");
+            let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+            for round in 0..6u8 {
+                let mut s = Store::open_file(&ct, cfg).unwrap();
+                s.put(&format!("r:{round}"), &[Span::Piece(&[round; 1200])], vec![]).unwrap();
+                s.sync().unwrap();
+                s.flush().unwrap();
+                s.close().unwrap();
+            }
+            let mut saw: Option<String> = None;
+            let stats = reclaim_with(&ct, protocol, |p| {
+                saw = Some(match Store::open_file(p, cfg) {
+                    Ok(_) => "a store".to_string(),
+                    Err(e) if is_writer_locked(&e) => "WriterLocked".to_string(),
+                    Err(e) => format!("other: {e:#}"),
+                });
+            })
+            .unwrap();
+            assert!(stats.reclaimed > 0, "{protocol:?}");
+            assert_eq!(saw.as_deref(), Some("WriterLocked"), "{protocol:?}");
+            assert_eq!(
+                std::fs::metadata(&ct).unwrap().len(),
+                stats.bytes_after,
+                "{protocol:?}: bytes_after is the file at the store's name"
+            );
+            // Released at return: a writer opens now.
+            Store::open_file(&ct, cfg)
+                .expect("writer opens after reclaim returned")
+                .close()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&root);
         }
-        let mut saw: Option<String> = None;
-        let stats = reclaim_with_hook(&ct, |p| {
-            saw = Some(match Store::open_file(p, cfg) {
-                Ok(_) => "a store".to_string(),
-                Err(e) if is_writer_locked(&e) => "WriterLocked".to_string(),
-                Err(e) => format!("other: {e:#}"),
-            });
-        })
-        .unwrap();
-        assert!(stats.reclaimed > 0);
-        assert_eq!(saw.as_deref(), Some("WriterLocked"));
-        // Released at return: a writer opens now.
-        Store::open_file(&ct, cfg).expect("writer opens after reclaim returned").close().unwrap();
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The platform fact, stated as the platform fact: the guarantee selects the protocol.
+    #[test]
+    fn the_platform_selects_rename_everywhere_but_windows() {
+        let expected = if cfg!(target_os = "windows") {
+            ReclaimProtocol::Anchor
+        } else {
+            ReclaimProtocol::Rename
+        };
+        assert_eq!(ReclaimProtocol::for_this_platform(), expected);
     }
 }

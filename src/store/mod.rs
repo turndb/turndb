@@ -2945,8 +2945,11 @@ impl Store {
             }
         }
         if !path.exists() && reclaim.anchor.exists() {
-            // A reclaim's replace crashed in the state its protocol admits — the store's name
-            // gone, the anchor intact. Recover from the anchor, or refuse; never create.
+            // A reclaim's replace crashed in the state the ANCHOR protocol admits — the store's
+            // name gone, the anchor intact. That protocol runs where a replace over an open
+            // destination is not durable (`sys::replace_open_durability`), but the anchor is a
+            // file beside the store and travels with it, so recovery runs on every platform.
+            // Recover from the anchor, or refuse; never create.
             recover_store_from_reclaim_anchor(path, cfg, read_limits)?;
         }
         let container = if !path.exists() {

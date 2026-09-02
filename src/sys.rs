@@ -17,6 +17,12 @@
 //! and a **directory sync** ([`sync_dir`] — a no-op on Windows, which has no directory fsync;
 //! FORMAT.md states the durability model that replaces it).
 //!
+//! Where the platforms differ in what an operation *guarantees* rather than in how it is spelled,
+//! the difference is declared here as a fact — [`replace_open_durability`] — and a protocol above
+//! this module chooses its steps by that fact, never by `cfg!(windows)`. That is the separation
+//! that keeps one platform's constraint from becoming every platform's protocol: the same
+//! discipline SQLite's pager gets from its VFS's device characteristics.
+//!
 //! # The honest position on WASI
 //!
 //! Positioned I/O is genuinely equivalent — WASI's `pread`/`pwrite` are the same primitive under a
@@ -600,9 +606,9 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// FILE_RENAME_FLAG_POSIX_SEMANTICS` (the target must have been opened with
 /// `FILE_SHARE_DELETE`, which `std` always does), and that is exactly `std::fs::rename`'s own
 /// fallback on the same error, so it is used here rather than re-implemented. It has no
-/// write-through flag: on that path the rename is **not** durable on return, and the caller's
-/// crash story must say so — `reclaim`'s does, in the support doc, until its Windows protocol
-/// gives the fresh container a write-through name of its own.
+/// write-through flag: on that path the rename is **not** durable on return. That fact is what
+/// [`replace_open_durability`] declares as `Lagged`, and `reclaim` reads it to choose the anchor
+/// protocol here rather than the one rename that suffices under `Atomic`.
 #[cfg(windows)]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
@@ -643,6 +649,57 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 #[inline]
 pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
+}
+
+// ── What the platform guarantees, stated once ─────────────────────────────
+//
+// The arms above spell each operation in its platform's idiom. What a protocol needs to know is
+// not the spelling but the guarantee — and where the guarantee differs between platforms, it is
+// declared here as a value a protocol can branch on and a test can force on any host. No protocol
+// in this crate consults `cfg!(windows)`; it consults this.
+
+/// What a replace-rename over a destination that is OPEN — by a reader, or by the very writer
+/// performing the replace — guarantees on this platform once it returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplaceOpenDurability {
+    /// `rename(2)`: one atomic step to every observer, durable once the directory is synced. A
+    /// crash leaves the old name or the new one, never neither. A protocol may replace the live
+    /// name directly and needs nothing durable across the step.
+    Atomic,
+    /// The replace lands, but the route that replaces an open destination has no write-through
+    /// form and no later documented barrier promotes it (Windows: `FileRenameInfoEx` with POSIX
+    /// semantics, the fallback [`rename`] takes on `ERROR_ACCESS_DENIED`). A crash may leave old,
+    /// new, or neither — at that crash point and every later one. A protocol must hold a durable
+    /// anchor across the step, and recover from it.
+    Lagged,
+}
+
+/// The guarantee this build's platform gives a replace over an open destination. Windows is the
+/// one platform whose documented operations do not make such a replace durable; every other
+/// target this crate builds for gets POSIX `rename(2)` semantics from `std`.
+#[inline]
+pub(crate) const fn replace_open_durability() -> ReplaceOpenDurability {
+    if cfg!(windows) {
+        ReplaceOpenDurability::Lagged
+    } else {
+        ReplaceOpenDurability::Atomic
+    }
+}
+
+#[cfg(test)]
+mod guarantee_tests {
+    use super::*;
+
+    /// The platform fact, stated as the platform fact — not derived from the function under test.
+    #[test]
+    fn the_replace_guarantee_is_lagged_on_windows_and_atomic_everywhere_else() {
+        let expected = if cfg!(target_os = "windows") {
+            ReplaceOpenDurability::Lagged
+        } else {
+            ReplaceOpenDurability::Atomic
+        };
+        assert_eq!(replace_open_durability(), expected);
+    }
 }
 
 #[cfg(all(test, windows))]

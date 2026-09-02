@@ -100,6 +100,17 @@ advisory locking, in-place punch, threads — which the capability contract repo
 door must state. Native slices are Phase 3a-i work ("ours to meet"); the Windows row is engine
 work before it is packaging work; no dates are implied by this table.
 
+**Platform rule, 2026-09-02 (Andrew):** a constraint one platform has is that platform's protocol,
+never every platform's. `src/sys.rs` declares what each platform *guarantees* — the first such fact
+is `replace_open_durability`: atomic under POSIX `rename(2)`, lagged on Windows — and a protocol
+chooses its steps by the guarantee, never by `cfg!(windows)`. The simulator proves each protocol
+under the model of the guarantee it is specified for, on every host, so a split never halves the
+proof, and it shows the cheaper protocol failing under the stricter model, so the choice is
+evidence rather than caution. First application: `reclaim` is one rename again everywhere but
+Windows; 0.1.7 had made every platform pay the anchor protocol's extra copy of the compacted
+container to keep one protocol (FORMAT.md, "Free space"). The 0.1.7 decision was not recorded
+here when it was made; this paragraph records both.
+
 ## Phase 0: the front door tells the truth
 
 **Status: closed 2026-08-30** (obj-mtfi3akf-5). Inserted ahead of every other phase because it is what

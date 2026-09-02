@@ -1088,36 +1088,58 @@ rewrite — a live writer would keep committing to the renamed-away inode — an
 unsettled `-wal` sidecar sits beside the file (acknowledged records only their writer can settle)
 or for a sealed container, whose bytes are final.
 
-The publication is the crash-safety argument, and it is the same on every platform so the
-deterministic simulator proves it under both durability models it knows. A name is "published
-durably" below by the platform's no-replace rename plus its namespace barrier: on POSIX an ordinary
-no-replace rename followed by the directory's fsync; on Windows a rename with `MOVEFILE_WRITE_THROUGH`,
-which is the barrier. The sequence, exactly as the code performs it:
+The publication is the crash-safety argument, and there are two of them, because the platforms
+differ in what a replace over an open destination *guarantees*, and a protocol is chosen by that
+guarantee — declared once, in `src/sys.rs` — never by platform name. A constraint one platform has
+is that platform's protocol, not everyone's. The fresh container is written at `<store>.reclaiming`,
+committed and verified, the same everywhere; what follows is one of the two sequences below,
+exactly as the code performs them.
 
-1. the fresh container is written at `<store>.reclaiming`, committed and verified;
-2. it is published durably as the **anchor**, `<store>.reclaimed` — a durable name for verified
-   bytes that nothing afterwards touches;
-3. a byte copy of the anchor is fsynced and published durably as the **candidate**,
+**Where the replace is atomic** — POSIX `rename(2)`: one step to every observer, durable at the
+directory's fsync, and a crash leaves the old name or the new, never neither. Every platform but
+Windows.
+
+1. the fresh container is opened under its staging name and the writer lock is taken on that
+   handle — the lock is on the inode, so it is the lock on `<store>` the instant the rename lands,
+   and no second writer can enter before reclaim returns;
+2. `rename(2)` puts it at `<store>` and the directory is synced; a failed sync is reclaim's error,
+   and the old container, whole, is then what a crash shows;
+3. the store at its name is reopened and verified.
+
+A crash anywhere leaves the old container or the new one, each whole. A surviving `.reclaiming` is
+removed by the next writer open. No copy, no anchor, no recovery step.
+
+**Where the replace is not durable** — Windows, whose documented route for replacing an open file
+(`FileRenameInfoEx` with POSIX semantics) has no write-through form, and which no later documented
+operation promotes, so a crash may leave old, new, or neither. A name is "published durably" below
+by a rename with `MOVEFILE_WRITE_THROUGH`, which is the barrier:
+
+1. the fresh container is published durably as the **anchor**, `<store>.reclaimed` — a durable name
+   for verified bytes that nothing afterwards touches;
+2. a byte copy of the anchor is fsynced and published durably as the **candidate**,
    `<store>.reclaim-candidate`; the candidate is then opened and the writer lock is taken on that
    handle — before it is published at the store's name, the name a second writer would open — and
    the handle is held until reclaim returns, so no second writer can enter between the replace and
    the return;
-4. the candidate is renamed over `<store>` — `rename(2)` on POSIX; on Windows the documented route
-   that replaces an open file (`FileRenameInfoEx` with POSIX semantics), which has no write-through
-   form and which no later documented operation promotes. The simulator carries old / new / neither
-   for this step through every later crash point, including after the cleanup below and after the
-   return;
-5. the store at its name is reopened and verified, and the anchor is unlinked.
+3. the candidate is renamed over `<store>`; the simulator carries old / new / neither for this step
+   through every later crash point, including after the cleanup below and after the return;
+4. the store at its name is reopened and verified, and the anchor is unlinked.
 
 In every one of those states the anchor is intact: a writer open that finds the store's name absent
 beside its anchor validates the anchor whole (the manifest-recovery bar), copies it, locks and
 verifies the copy, publishes it durably at the store's name, and only then unlinks the anchor; one
 recoverer at a time, under the anchor's own lock; a corrupt or incomplete anchor is refused and
-nothing is created. A store that is present is always the authority — reclaim material beside it is
-removed, never consulted. The anchor's unlink and the candidate's are laggable on Windows, so
-`.reclaim*` debris may follow a crash; it never changes which store wins, and a writer open beside
-the present store removes it (docs/support-and-compatibility.md, "Transient names"). Cost: one extra copy of the
-compacted container per reclaim on every platform, and on Windows two write-through renames more.
+nothing is created. That recovery runs on every platform, because an anchor is a file beside the
+store and travels with it. A store that is present is always the authority — reclaim material
+beside it is removed, never consulted. The anchor's unlink and the candidate's are laggable on
+Windows, so `.reclaim*` debris may follow a crash; it never changes which store wins, and a writer
+open beside the present store removes it (docs/support-and-compatibility.md, "Transient names").
+
+The deterministic simulator proves each protocol under the durability model of the guarantee it is
+specified for, on every host, and shows the rename protocol reaching a state with no store and no
+anchor under the Windows model — the loss the anchor protocol's copy exists to make unreachable, and
+the reason the choice is made by guarantee. Cost: the rename protocol writes the compacted container
+once; the anchor protocol writes it twice and adds two write-through renames.
 
 ---
 
