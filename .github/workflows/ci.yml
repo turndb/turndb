@@ -11,15 +11,16 @@
 #
 #   every push and PR   fmt, clippy, rustdoc, `cargo test` x3 profiles, the example classifier,
 #                       the portable npm package built from committed Rust, and the native N-API
-#                       addon across every Node major its package claims; and, on Windows x86-64
-#                       and Linux arm64 hardware, the engine suite itself — clippy, both test
+#                       addon across every Node major its package claims; and, on Windows x86-64,
+#                       Linux arm64, and macOS x86-64 and Apple-silicon hardware, the engine
+#                       suite itself — clippy, both test
 #                       configurations, the corruption suite, the crash sweeps under both
 #                       durability models, and one store byte-compared both ways against the
 #                       x86-64 Linux fixture
 #   nightly + on demand the DST harness on Linux x86-64, which reconstructs crash states and is
 #                       the one suite too slow to sit in front of every push there. It lives in
 #                       `nightly.yml`, NOT here — see that file for why a scheduled run must not
-#                       share a workflow with a push run. On Windows and arm64 the sweep is the
+#                       share a workflow with a push run. On every other host the sweep is the
 #                       proof of the platform, so there it is a gate.
 #
 # Every job below runs on every push and PR. NOTHING in this file is conditional on the event, so a
@@ -798,6 +799,94 @@ jobs:
           test -s "$TURNDB_CROSS_OS_STORE"
           cargo test --test cross_os -- --nocapture
 
+  # macOS, both architectures: the gate `windows` and `linux-arm64` are, on the two remaining
+  # hosts a consumer runs on. Until this existed macOS proved only its CLI slices — built and
+  # driven on these same runners — and the engine suite, the crash sweeps and the byte-compare
+  # never ran there, so the macOS arms of `src/sys.rs` (`renamex_np`, the Darwin `statvfs`
+  # widths) were exercised only through that drive. GitHub's explicit `macos-15` (Apple silicon)
+  # and `macos-15-intel` labels keep each architecture stable as `macos-latest` moves.
+  macos:
+    name: macos ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}-v1
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test (default)
+        run: cargo test
+
+      - name: test (no default features)
+        run: cargo test --no-default-features
+
+      - name: corruption
+        run: cargo test --test corruption
+
+      # The crash sweeps, a gate rather than nightly, for the reason the `windows` job gives.
+      - name: deterministic simulation (both models)
+        run: cargo test --features dst --test dst -- --nocapture
+
+      # tests/cross_os.rs: this host's build of the reference store must be byte-identical to the
+      # Linux x86-64 fixture and the fixture must open here (Linux → macOS). The build is emitted
+      # for the cross-macos job below, which closes the other direction.
+      - name: cross-OS store (Linux → macOS ${{ matrix.arch }}) and emit this host's build
+        env:
+          TURNDB_CROSS_OS_EMIT: ${{ runner.temp }}/macos-${{ matrix.arch }}-made.turndb
+        run: cargo test --test cross_os -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-made-store
+          path: ${{ runner.temp }}/macos-${{ matrix.arch }}-made.turndb
+          if-no-files-found: error
+          retention-days: 7
+
+      # The release-profile suite. `macos-15-intel` is a 4-vCPU / 14 GB class; `macos-15` is
+      # 3 vCPU / 7 GB, the smallest this link has been asked to fit in. If it does not fit, the
+      # step — not the job — is what gets narrowed, with the observed failure recorded here.
+      - name: test (release)
+        run: cargo test --release --tests
+
+  # macOS → Linux: each macOS build, opened, verified and byte-compared on Linux x86-64.
+  cross-macos:
+    name: cross-OS store (macOS ${{ matrix.arch }} → Linux)
+    needs: [macos]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-os-v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-made-store
+          path: ${{ runner.temp }}/from-macos
+      - name: open, verify and byte-compare the macOS-made store
+        env:
+          TURNDB_CROSS_OS_STORE: ${{ runner.temp }}/from-macos/macos-${{ matrix.arch }}-made.turndb
+        run: |
+          test -s "$TURNDB_CROSS_OS_STORE"
+          cargo test --test cross_os -- --nocapture
+
   # The release-profile suite on Windows: the same invocation the Linux `rust` job runs
   # (`cargo test --release --tests`), on the same trigger (every push and pull request), with the
   # same arming (hosted only while the repository is public). The Linux trail in the `rust` job's
@@ -903,7 +992,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release, linux-arm64, cross-arch]
+    needs: [rust, npm, native-node, native-prebuild, native-prebuild-install, windows-native-package, windows-cli-package, windows-python-wheel, windows-package-install, windows-package-cross-os, cli-slice-changes, cli-slices, python, browser, windows, cross-os, windows-release, linux-arm64, cross-arch, macos, cross-macos]
     runs-on: ubuntu-latest
     steps:
       - name: state what ran

@@ -112,8 +112,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Every architecture that ships a binary drives it from an install before publish. Linux arm64
-  # was absent from this matrix through 0.1.8: its slice was published having never been run.
+  # Every host that ships a binary drives it from an install before publish. Linux arm64 was
+  # absent from this matrix through 0.1.8 — its slice was published having never been run — and
+  # macOS was driven on pull requests only, never on the release path.
   install:
     name: install release candidate (${{ matrix.runner }}, node ${{ matrix.node }})
     needs: build
@@ -131,6 +132,10 @@ jobs:
             runner: ubuntu-22.04
           - node: '24'
             runner: ubuntu-22.04-arm
+          - node: '24'
+            runner: macos-15-intel
+          - node: '24'
+            runner: macos-15
           - node: '24'
             runner: windows-latest
     steps:
