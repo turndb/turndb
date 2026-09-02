@@ -1815,27 +1815,19 @@ fn cancelling_an_in_progress_refold_removes_staging_and_preserves_the_live_gener
     // A file store stages the rebuilt generation as UNCOMMITTED extents appended past the
     // committed tail — so "staging exists" is observable as the file growing.
     let len_before = std::fs::metadata(&ct).unwrap().len();
+    // Cancelled at the first checkpoint after the refold has staged past the committed tail —
+    // decided by the refold's own check, not raced from a watcher thread that can lose to the
+    // operation's last checkpoint (it did, on the macOS x86-64 release gate).
     let cancellation = turndb::control::CancellationToken::new();
-    let cancel = cancellation.clone();
     let watch = ct.clone();
-    let watcher = std::thread::spawn(move || {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::fs::metadata(&watch).map(|m| m.len()).unwrap_or(0) <= len_before {
-            assert!(
-                std::time::Instant::now() < until,
-                "refold never staged past the committed tail"
-            );
-            std::thread::yield_now();
-        }
-        cancel.cancel();
-    });
+    cancellation
+        .cancel_when(move || std::fs::metadata(&watch).map(|m| m.len()).unwrap_or(0) > len_before);
     let error = store
         .refold_with_control(&turndb::control::OperationControl {
             deadline: None,
             cancellation: Some(cancellation),
         })
         .unwrap_err();
-    watcher.join().unwrap();
     assert!(error
         .downcast_ref::<turndb::control::OperationInterrupted>()
         .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
@@ -1871,17 +1863,15 @@ fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
     }
     let commit = store.manifest().commit;
     let parts = store.part_count();
+    // Cancelled at the first checkpoint after the merged part exists in the container — the
+    // check right after the part is assembled, before anything is committed. Decided by the
+    // merge's own check: a watcher thread racing that window lost it on the macOS x86-64
+    // release gate, where the merge completed before its cancel landed.
     let cancellation = turndb::control::CancellationToken::new();
-    let cancel = cancellation.clone();
     let output_watch = store_file(&dir);
     let before_len = std::fs::metadata(&output_watch).unwrap().len();
-    let watcher = std::thread::spawn(move || {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::fs::metadata(&output_watch).map(|m| m.len()).unwrap_or(0) <= before_len {
-            assert!(std::time::Instant::now() < until, "compaction never began its output");
-            std::thread::yield_now();
-        }
-        cancel.cancel();
+    cancellation.cancel_when(move || {
+        std::fs::metadata(&output_watch).map(|m| m.len()).unwrap_or(0) > before_len
     });
     let error = store
         .merge_range_with_control(
@@ -1890,7 +1880,6 @@ fn cancelling_an_in_progress_compaction_removes_its_unpublished_part() {
             &turndb::control::OperationControl { deadline: None, cancellation: Some(cancellation) },
         )
         .unwrap_err();
-    watcher.join().unwrap();
     assert!(error
         .downcast_ref::<turndb::control::OperationInterrupted>()
         .is_some_and(|error| error.reason == turndb::control::InterruptionReason::Cancelled));
