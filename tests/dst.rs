@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use turndb::container::ReclaimProtocol;
 use turndb::fold::FoldCfg;
 use turndb::store::{Batch, ContentSpans, RecoveryOptions, Span, Store};
 use turndb::vfs::record::{self, Op};
@@ -88,6 +89,10 @@ enum Model {
 }
 
 const MODELS: &[Model] = &[Model::Posix, Model::Windows];
+/// The model a protocol specified under `ReplaceOpenDurability::Atomic` is proven under — and
+/// only that one: replayed under the Windows model it is expected to lose the store, which is
+/// the reason the platform chooses the other protocol there (see the reclaim sweeps).
+const POSIX_ONLY: &[Model] = &[Model::Posix];
 
 /// The whole tree: an inode table plus TWO namespaces. `volatile` is what a process sees;
 /// `durable` is what survives a power loss under the model — names move between them at the
@@ -1329,10 +1334,25 @@ fn replay_recorded(
     root: &Path,
     ops: &[Op],
     stage: &Path,
+    check: impl FnMut(&Path, usize, Variant),
+) -> usize {
+    replay_recorded_under(MODELS, tag, base, root, ops, stage, check)
+}
+
+/// [`replay_recorded`] under the given models only. A protocol specified under one platform
+/// guarantee is proven under the model of that guarantee; running it under the other model is
+/// not a proof of anything, and the sweep that wants that answer asks for it by name.
+fn replay_recorded_under(
+    models: &[Model],
+    tag: &str,
+    base: &Fs,
+    root: &Path,
+    ops: &[Op],
+    stage: &Path,
     mut check: impl FnMut(&Path, usize, Variant),
 ) -> usize {
     let mut checked = 0usize;
-    for &model in MODELS {
+    for &model in models {
         for k in 0..=ops.len() {
             let mut fs = base.clone();
             fs.model = model;
@@ -2321,75 +2341,208 @@ fn every_single_file_erase_crash_answers_honestly() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
-/// Reclaim's publication protocol — anchor, candidate, uncertain replace, laggable cleanup —
-/// at every crash point, under both models. The claim: whenever `<store>` exists it is whole and
-/// serves every record; whenever it does not, a writer open recovers it from the anchor and
-/// then serves every record; opening never refuses; and a second open converges on the same
-/// store. Debris (`.reclaim*`) may remain; it never changes which store wins.
+/// The op log of one reclaim, as the protocol promises it: the store's name is replaced exactly
+/// once by the open-destination replace; the rename protocol names no anchor; the anchor
+/// protocol publishes the anchor before it replaces the store. Asserted so a protocol cannot
+/// quietly become the other and still pass its sweep.
+fn assert_reclaim_log_shape(protocol: ReclaimProtocol, store: &Path, ops: &[Op]) {
+    let anchor = anchor_of(store);
+    let replace_at: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| matches!(o, Op::RenameLagged { to, .. } if to.as_path() == store))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(replace_at.len(), 1, "{protocol:?}: the store's name is replaced exactly once");
+    let anchor_at = ops
+        .iter()
+        .position(|o| matches!(o, Op::Rename { to, .. } if to.as_path() == anchor.as_path()));
+    if protocol == ReclaimProtocol::Rename {
+        assert_eq!(anchor_at, None, "the rename protocol publishes no anchor");
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, Op::Create { path } if path.as_path() == anchor.as_path())),
+            "the rename protocol creates no anchor"
+        );
+    } else {
+        let anchor_at = anchor_at.expect("the anchor protocol publishes its anchor");
+        assert!(
+            anchor_at < replace_at[0],
+            "the anchor ({anchor_at}) is published before the store is replaced ({})",
+            replace_at[0]
+        );
+    }
+}
+
+/// Reclaim's two publication protocols, each at every crash point under the durability model it
+/// is specified for — on every host, because `reclaim_with_protocol` chooses the protocol, not
+/// the OS the harness runs on. The rename protocol (`ReplaceOpenDurability::Atomic`) is proven
+/// under the POSIX model; the anchor protocol (`Lagged`) under both, being sound under either
+/// guarantee. The claim: whenever `<store>` exists it is whole and serves every record; whenever
+/// it does not, a writer open recovers it from the anchor and then serves every record; opening
+/// never refuses; and a second open converges on the same store. Debris (`.reclaim*`,
+/// `.reclaiming`) may remain; it never changes which store wins.
+///
+/// What this sweep cannot see, stated: a rename protocol that skipped its final directory sync
+/// would pass, because both of that crash's outcomes — the old container back, or the new one —
+/// are whole stores serving every record. The sync-failure variant covers that the sync is
+/// attempted and its failure reported; nothing here proves it is attempted.
+///
+/// Shown to fail: with the rename protocol's replace moved ahead of the fresh container's
+/// commit, the POSIX sweep failed at crash point 19, variant `AllLanded` — and not by refusal.
+/// `Container::create` births the staging file as an empty committed container, so the store's
+/// name held a valid, empty store: the reader opened it and served no records (`w:0` absent).
+/// The ordering guards against a lie, not a crash.
 #[test]
 fn every_reclaim_crash_leaves_a_whole_store_or_a_recoverable_anchor() {
-    let root = tmp("reclaim");
-    std::fs::create_dir_all(&root).unwrap();
-    let file = root.join("s.turndb");
-    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-    // Sessions leave superseded extents; enough of them that reclaim has real work.
-    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for round in 0..6usize {
-        let mut s = Store::open_file(&file, cfg).unwrap();
-        let id = format!("w:{round}");
-        let body = body_for(600 + round);
-        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-        want.insert(id, body);
-        s.sync().unwrap();
-        s.flush().unwrap();
-        s.close().unwrap();
-    }
-    assert!(turndb::container::Container::open(&file).unwrap().free_bytes() > 0);
-
-    let mut base = Fs::new(Model::Posix);
-    base.seed_durable(&root);
-    record::arm();
-    let stats = turndb::container::reclaim(&file).unwrap();
-    let ops = record::disarm();
-    assert!(stats.reclaimed > 0);
-    assert!(ops.len() > 12, "reclaim must exercise a real op stream, got {}", ops.len());
-    assert_slot_alternation("reclaim", &ops);
-
-    let stage = tmp("reclaim-stage");
-    let check = |what: &str, k: usize, variant: Variant, store: &Path| {
-        let rs = turndb::store::open_read_container(store, cfg).unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?} {what}: store refuses a reader: {e:#}")
-        });
-        for (id, body) in &want {
-            assert_eq!(
-                rs.reconstruct(id).unwrap().as_deref(),
-                Some(body.as_slice()),
-                "crash point {k} {variant:?} {what}: record {id}"
-            );
-        }
-        assert_eq!(rs.ids().unwrap().len(), want.len(), "crash point {k} {variant:?} {what}: ids");
-        turndb::container::Container::open(store)
-            .unwrap()
-            .verify()
-            .unwrap_or_else(|e| panic!("crash point {k} {variant:?} {what}: verify: {e:#}"));
-    };
-    let checked = replay_recorded("reclaim", &base, &root, &ops, &stage, |stage, k, variant| {
-        let store = stage.join("s.turndb");
-        if store.exists() {
-            check("present", k, variant, &store);
-        }
-        // A writer open: recovers from the anchor when the name is gone, opens otherwise, and
-        // never refuses. Then the store must be whole, and a second open must converge.
-        for pass in ["first writer open", "second writer open"] {
-            let s = Store::open_file(&store, cfg)
-                .unwrap_or_else(|e| panic!("crash point {k} {variant:?}: {pass} REFUSED: {e:#}"));
+    for (protocol, models) in
+        [(ReclaimProtocol::Rename, POSIX_ONLY), (ReclaimProtocol::Anchor, MODELS)]
+    {
+        let tag = format!("reclaim-{protocol:?}");
+        let root = tmp(&tag);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("s.turndb");
+        let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+        // Sessions leave superseded extents; enough of them that reclaim has real work.
+        let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for round in 0..6usize {
+            let mut s = Store::open_file(&file, cfg).unwrap();
+            let id = format!("w:{round}");
+            let body = body_for(600 + round);
+            s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+            want.insert(id, body);
+            s.sync().unwrap();
+            s.flush().unwrap();
             s.close().unwrap();
-            check(pass, k, variant, &store);
         }
-    });
-    println!("dst reclaim: {checked} crash states checked across {} ops", ops.len());
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&stage).ok();
+        assert!(turndb::container::Container::open(&file).unwrap().free_bytes() > 0);
+
+        let mut base = Fs::new(Model::Posix);
+        base.seed_durable(&root);
+        record::arm();
+        let stats = turndb::container::reclaim_with_protocol(&file, protocol).unwrap();
+        let ops = record::disarm();
+        assert!(stats.reclaimed > 0);
+        assert!(ops.len() > 12, "{tag}: reclaim must exercise a real op stream, got {}", ops.len());
+        assert_slot_alternation(&tag, &ops);
+        assert_reclaim_log_shape(protocol, &file, &ops);
+
+        let stage = tmp(&format!("{tag}-stage"));
+        let check = |what: &str, k: usize, variant: Variant, store: &Path| {
+            let rs = turndb::store::open_read_container(store, cfg).unwrap_or_else(|e| {
+                panic!("{tag} crash point {k} {variant:?} {what}: store refuses a reader: {e:#}")
+            });
+            for (id, body) in &want {
+                assert_eq!(
+                    rs.reconstruct(id).unwrap().as_deref(),
+                    Some(body.as_slice()),
+                    "{tag} crash point {k} {variant:?} {what}: record {id}"
+                );
+            }
+            assert_eq!(
+                rs.ids().unwrap().len(),
+                want.len(),
+                "{tag} crash point {k} {variant:?} {what}: ids"
+            );
+            turndb::container::Container::open(store).unwrap().verify().unwrap_or_else(|e| {
+                panic!("{tag} crash point {k} {variant:?} {what}: verify: {e:#}")
+            });
+        };
+        let checked =
+            replay_recorded_under(models, &tag, &base, &root, &ops, &stage, |stage, k, variant| {
+                let store = stage.join("s.turndb");
+                if store.exists() {
+                    check("present", k, variant, &store);
+                }
+                // A writer open: recovers from the anchor when the name is gone, opens
+                // otherwise, and never refuses. Then the store must be whole, and a second open
+                // must converge.
+                for pass in ["first writer open", "second writer open"] {
+                    let s = Store::open_file(&store, cfg).unwrap_or_else(|e| {
+                        panic!("{tag} crash point {k} {variant:?}: {pass} REFUSED: {e:#}")
+                    });
+                    s.close().unwrap();
+                    check(pass, k, variant, &store);
+                }
+            });
+        println!(
+            "dst reclaim ({protocol:?}, {} model(s)): {checked} crash states checked across {} ops",
+            models.len(),
+            ops.len()
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&stage).ok();
+    }
+}
+
+/// Why the protocol is chosen by the platform's guarantee — on the model alone, no directory
+/// materialized; the durable namespace is the claim. The rename protocol's op log under the
+/// Windows model reaches crash states whose durable namespace holds neither `<store>` nor its
+/// anchor: the loss the anchor protocol's extra copy exists to make unreachable. Under the POSIX
+/// model it never does, and the anchor protocol's log reaches no such state under either model.
+/// The count is printed: it is how many crash states the copy buys back on that platform.
+///
+/// This is the sweep the CONTRIBUTING rule asks for turned inside out: the defect is the wrong
+/// protocol on the wrong platform, and the harness must find it every time, or the choice is
+/// unproven.
+#[test]
+fn the_rename_protocol_loses_the_store_under_the_windows_model_and_the_anchor_protocol_never_does()
+{
+    let cfg = cfg4k();
+    let mut lost: Vec<(ReclaimProtocol, Model, usize)> = Vec::new();
+    for protocol in [ReclaimProtocol::Rename, ReclaimProtocol::Anchor] {
+        let root = tmp(&format!("reclaim-model-{protocol:?}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("s.turndb");
+        for round in 0..6usize {
+            let mut s = Store::open_file(&file, cfg).unwrap();
+            s.put(&format!("w:{round}"), &[Span::Piece(&body_for(600 + round))], vec![]).unwrap();
+            s.sync().unwrap();
+            s.flush().unwrap();
+            s.close().unwrap();
+        }
+        let mut base = Fs::new(Model::Posix);
+        base.seed_durable(&root);
+        record::arm();
+        turndb::container::reclaim_with_protocol(&file, protocol).unwrap();
+        let ops = record::disarm();
+        let anchor = anchor_of(&file);
+        for &model in MODELS {
+            let mut n = 0usize;
+            let mut states = 0usize;
+            for k in 0..=ops.len() {
+                let mut fs = base.clone();
+                fs.model = model;
+                for op in &ops[..k] {
+                    fs.apply(op);
+                }
+                for (fs, _) in fs.crash_states(ops.get(k)) {
+                    states += 1;
+                    if !fs.durable_ns.contains_key(&file) && !fs.durable_ns.contains_key(&anchor) {
+                        n += 1;
+                    }
+                }
+            }
+            assert!(states > 0);
+            lost.push((protocol, model, n));
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+    for (protocol, model, n) in &lost {
+        println!("dst reclaim model: {protocol:?} under {model:?}: {n} crash states with no store and no anchor");
+    }
+    let count = |p: ReclaimProtocol, m: Model| {
+        lost.iter().find(|(pp, mm, _)| *pp == p && *mm == m).map(|(_, _, n)| *n).unwrap()
+    };
+    assert_eq!(count(ReclaimProtocol::Rename, Model::Posix), 0, "rename under POSIX: sound");
+    assert_eq!(count(ReclaimProtocol::Anchor, Model::Posix), 0, "anchor under POSIX: sound");
+    assert_eq!(count(ReclaimProtocol::Anchor, Model::Windows), 0, "anchor under Windows: sound");
+    assert!(
+        count(ReclaimProtocol::Rename, Model::Windows) > 0,
+        "the rename protocol under the Windows model must reach a state with no store and no \
+         anchor — if it does not, the model no longer expresses the loss the anchor protocol \
+         exists for, and the platform choice is unproven"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2490,6 +2643,21 @@ fn converges(
     root: &Path,
     real: &Path,
     ops: &[Op],
+    check: impl FnMut(&Path, &str),
+) {
+    converges_under(MODELS, stage_tag, label, base, root, real, ops, check)
+}
+
+/// [`converges`] under the given models only (see [`replay_recorded_under`]).
+#[allow(clippy::too_many_arguments)]
+fn converges_under(
+    models: &[Model],
+    stage_tag: &str,
+    label: &str,
+    base: &Fs,
+    root: &Path,
+    real: &Path,
+    ops: &[Op],
     mut check: impl FnMut(&Path, &str),
 ) {
     // The real directory, restart-shaped: its on-disk bytes — debris included — copied into a
@@ -2503,7 +2671,7 @@ fn converges(
     std::fs::remove_dir_all(&restarted).ok();
     // The stage directory's name must be a valid file name on every platform: no ':' or '('.
     let stage = tmp(&format!("{stage_tag}-syncfail-stage"));
-    for &model in MODELS {
+    for &model in models {
         let mut fs = base.clone();
         fs.model = model;
         for op in ops {
@@ -2735,6 +2903,8 @@ fn a_failed_directory_sync_after_conversion_publication_is_reported_and_rerunnin
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The anchor protocol's last sync — after the anchor's unlink. Explicitly that protocol, on
+/// every host: the platform's own choice may be the rename protocol, which has no anchor.
 #[test]
 fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_whole() {
     let root = tmp("syncfail-reclaim");
@@ -2756,7 +2926,7 @@ fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_wh
     std::fs::create_dir_all(&snapshot).unwrap();
     std::fs::copy(&file, snapshot.join("s.turndb")).unwrap();
     record::arm();
-    turndb::container::reclaim(&file).unwrap();
+    turndb::container::reclaim_with_protocol(&file, ReclaimProtocol::Anchor).unwrap();
     let ops = record::disarm();
     let anchor = anchor_of(&file);
     let target = sync_index_of(&ops, sync_after_unlink_pos(&ops, &anchor));
@@ -2764,11 +2934,74 @@ fn a_failed_directory_sync_after_reclaim_cleanup_is_reported_and_the_store_is_wh
 
     let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
-    let (err, ops) = run_with_failed_sync(target, || turndb::container::reclaim(&file).map(|_| ()));
+    let (err, ops) = run_with_failed_sync(target, || {
+        turndb::container::reclaim_with_protocol(&file, ReclaimProtocol::Anchor).map(|_| ())
+    });
     assert!(format!("{err:#}").contains("after removing the reclaim anchor"), "{err:#}");
     converges("reclaim", "reclaim", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
     });
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&snapshot).ok();
+}
+
+/// The rename protocol's one directory sync after the replace. When it fails, reclaim reports it
+/// naming the store, and what a crash then shows is a whole store — the new container if the
+/// name landed, the old one if it did not — never a refusal. POSIX model: the guarantee this
+/// protocol is specified under.
+#[test]
+fn a_failed_directory_sync_after_the_rename_protocols_replace_is_reported_and_the_store_is_whole() {
+    let root = tmp("syncfail-reclaim-rename");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("s.turndb");
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for round in 0..6usize {
+        let mut s = Store::open_file(&file, cfg).unwrap();
+        let id = format!("w:{round}");
+        let body = body_for(800 + round);
+        s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+        want.insert(id, body);
+        s.sync().unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let snapshot = tmp("syncfail-reclaim-rename-snap");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::copy(&file, snapshot.join("s.turndb")).unwrap();
+    record::arm();
+    turndb::container::reclaim_with_protocol(&file, ReclaimProtocol::Rename).unwrap();
+    let ops = record::disarm();
+    // The sync right after the replace: the first directory sync following the open-destination
+    // rename to the store's name.
+    let replace_at = ops
+        .iter()
+        .position(|o| matches!(o, Op::RenameLagged { to, .. } if to.as_path() == file.as_path()))
+        .expect("the rename protocol replaces the store's name");
+    let sync_at = (replace_at..ops.len())
+        .find(|&i| matches!(ops[i], Op::SyncDir { .. }))
+        .expect("a directory sync follows the replace");
+    let target = sync_index_of(&ops, sync_at);
+    std::fs::copy(snapshot.join("s.turndb"), &file).unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || {
+        turndb::container::reclaim_with_protocol(&file, ReclaimProtocol::Rename).map(|_| ())
+    });
+    assert!(format!("{err:#}").contains("after replacing"), "{err:#}");
+    converges_under(
+        POSIX_ONLY,
+        "reclaim-rename",
+        "reclaim-rename",
+        &base,
+        &root,
+        &root,
+        &ops,
+        |dir, what| {
+            serves_all(&dir.join("s.turndb"), &want, cfg, what);
+        },
+    );
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&snapshot).ok();
 }
@@ -2852,6 +3085,17 @@ fn sync_failure_variant<W>(
     op: impl Fn(&Path, &W) -> Result<(), anyhow::Error>,
     check: impl Fn(&Path, &W, &str),
 ) -> usize {
+    sync_failure_variant_under(MODELS, tag, prepare, op, check)
+}
+
+/// [`sync_failure_variant`] under the given models only (see [`replay_recorded_under`]).
+fn sync_failure_variant_under<W>(
+    models: &[Model],
+    tag: &str,
+    prepare: impl Fn(&Path) -> W,
+    op: impl Fn(&Path, &W) -> Result<(), anyhow::Error>,
+    check: impl Fn(&Path, &W, &str),
+) -> usize {
     let root = tmp(&format!("{tag}-syncvar-count"));
     std::fs::create_dir_all(&root).unwrap();
     let w = prepare(&root);
@@ -2869,9 +3113,16 @@ fn sync_failure_variant<W>(
         base.seed_durable(&root);
         let (err, ops) = run_with_failed_sync(j, || op(&root, &w));
         let label = format!("{tag}: sync {j} of {syncs} failed ({})", short_err(&err));
-        converges(&format!("{tag}-syncvar-{j}"), &label, &base, &root, &root, &ops, |dir, what| {
-            check(dir, &w, what)
-        });
+        converges_under(
+            models,
+            &format!("{tag}-syncvar-{j}"),
+            &label,
+            &base,
+            &root,
+            &root,
+            &ops,
+            |dir, what| check(dir, &w, what),
+        );
         std::fs::remove_dir_all(&root).ok();
     }
     syncs
@@ -2986,30 +3237,43 @@ fn every_conversion_sync_failure_is_reported_and_rerunning_converges() {
     println!("dst sync-failure conversion: {n} syncs, each failed once, both models");
 }
 
+/// Every attempted sync of each reclaim protocol fails once, under the model(s) that protocol is
+/// specified for; each failure is reported and the store is whole afterwards.
 #[test]
 fn every_reclaim_sync_failure_is_reported_and_the_store_is_whole() {
     let cfg = cfg4k();
-    let n = sync_failure_variant(
-        "reclaim",
-        |root| {
-            let file = root.join("s.turndb");
-            let mut want = BTreeMap::new();
-            for round in 0..6usize {
-                let mut s = Store::open_file(&file, cfg).unwrap();
-                let id = format!("w:{round}");
-                let body = body_for(600 + round);
-                s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
-                want.insert(id, body);
-                s.sync().unwrap();
-                s.flush().unwrap();
-                s.close().unwrap();
-            }
-            want
-        },
-        |root, _| turndb::container::reclaim(&root.join("s.turndb")).map(|_| ()),
-        |dir, want, what| serves_all(&dir.join("s.turndb"), want, cfg, what),
-    );
-    println!("dst sync-failure reclaim: {n} syncs, each failed once, both models");
+    for (protocol, models) in
+        [(ReclaimProtocol::Rename, POSIX_ONLY), (ReclaimProtocol::Anchor, MODELS)]
+    {
+        let n = sync_failure_variant_under(
+            models,
+            &format!("reclaim-{protocol:?}"),
+            |root| {
+                let file = root.join("s.turndb");
+                let mut want = BTreeMap::new();
+                for round in 0..6usize {
+                    let mut s = Store::open_file(&file, cfg).unwrap();
+                    let id = format!("w:{round}");
+                    let body = body_for(600 + round);
+                    s.put(&id, &[Span::Piece(&body)], vec![]).unwrap();
+                    want.insert(id, body);
+                    s.sync().unwrap();
+                    s.flush().unwrap();
+                    s.close().unwrap();
+                }
+                want
+            },
+            |root, _| {
+                turndb::container::reclaim_with_protocol(&root.join("s.turndb"), protocol)
+                    .map(|_| ())
+            },
+            |dir, want, what| serves_all(&dir.join("s.turndb"), want, cfg, what),
+        );
+        println!(
+            "dst sync-failure reclaim ({protocol:?}): {n} syncs, each failed once, {} model(s)",
+            models.len()
+        );
+    }
 }
 
 #[test]

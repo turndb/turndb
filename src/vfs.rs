@@ -536,7 +536,13 @@ pub(crate) fn rename(from: &Path, to: &Path) -> Result<()> {
 /// model carries that uncertainty for as long as it really lasts (see `Op::RenameLagged`).
 #[inline]
 pub(crate) fn rename_replace_open(from: &Path, to: &Path) -> Result<()> {
-    crate::sys::rename(from, to)?;
+    #[cfg(windows)]
+    let physical = publish::resolve(from);
+    #[cfg(windows)]
+    let from_physical: &Path = &physical;
+    #[cfg(not(windows))]
+    let from_physical: &Path = from;
+    crate::sys::rename(from_physical, to)?;
     #[cfg(windows)]
     publish::forget(from);
     #[cfg(feature = "dst")]
