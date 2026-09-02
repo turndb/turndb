@@ -611,6 +611,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The filesystem is the fact here, not the OS family: Linux filesystems accept any name
+    /// bytes but NUL and `/`, while APFS refuses a name that is not valid UTF-8 with `EILSEQ`.
+    /// Where the name cannot exist, the debris cannot either, and the test says so instead of
+    /// pretending the scenario arose. Found by the macOS gate the first time it ran.
     #[cfg(unix)]
     #[test]
     fn a_store_whose_name_is_not_utf8_has_its_pending_publish_recognised() {
@@ -618,7 +622,15 @@ mod tests {
         let d = scratch("nonutf8");
         let name = std::ffi::OsStr::from_bytes(b"st\xffore.turndb");
         let store = d.join(name);
-        std::fs::write(&store, b"store").unwrap();
+        match std::fs::write(&store, b"store") {
+            Ok(()) => {}
+            // The known refusal on the platform known to refuse; anywhere else it falls through.
+            Err(e) if cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EILSEQ) => {
+                let _ = std::fs::remove_dir_all(&d);
+                return;
+            }
+            Err(e) => panic!("creating a store with a non-UTF-8 name: {e}"),
+        }
         let mut temp = store.as_os_str().to_os_string();
         temp.push(".publish-3-1");
         std::fs::write(&temp, b"x").unwrap();
