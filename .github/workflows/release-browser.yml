@@ -29,7 +29,7 @@ jobs:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
       # Keep the release build on the repository toolchain; targets are toolchain-specific.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v4

@@ -41,7 +41,7 @@ jobs:
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.rust_target }}
       - uses: actions/setup-node@v4
