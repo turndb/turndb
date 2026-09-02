@@ -740,6 +740,11 @@ jobs:
   python-hosts:
     name: Python binding (${{ matrix.host }})
     runs-on: ${{ matrix.runner }}
+    env:
+      # One deployment target for rustc and for the C objects `cc` compiles (zstd, blake3):
+      # without it rustc links for 10.12 while the objects were built for the SDK's 15.x, and
+      # the linker says so on every object. Ignored on Linux.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     strategy:
       fail-fast: false
       matrix:

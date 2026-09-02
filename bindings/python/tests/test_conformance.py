@@ -1,3 +1,4 @@
+import importlib.machinery
 import importlib.util
 import json
 import pathlib
@@ -7,10 +8,19 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 PYTHON = ROOT / "bindings" / "python" / "python"
-NATIVE = ROOT / "target" / "debug" / "lib_native.so"
+# Cargo names the cdylib per platform; none of these is a suffix importlib recognises as an
+# extension module, so the loader is named explicitly rather than inferred from the file name.
+CDYLIB = {"linux": "lib_native.so", "darwin": "lib_native.dylib", "win32": "_native.dll"}
+if sys.platform not in CDYLIB:
+    raise RuntimeError(f"no cdylib name known for {sys.platform}")
+NATIVE = ROOT / "target" / "debug" / CDYLIB[sys.platform]
 
 sys.path.insert(0, str(PYTHON))
-spec = importlib.util.spec_from_file_location("turndb._native", NATIVE)
+spec = importlib.util.spec_from_file_location(
+    "turndb._native",
+    NATIVE,
+    loader=importlib.machinery.ExtensionFileLoader("turndb._native", str(NATIVE)),
+)
 native = importlib.util.module_from_spec(spec)
 sys.modules["turndb._native"] = native
 spec.loader.exec_module(native)

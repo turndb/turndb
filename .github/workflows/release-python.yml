@@ -139,6 +139,10 @@ jobs:
   macos:
     name: macOS wheel (${{ matrix.arch }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.runner }}
+    env:
+      # The wheel's platform tag and the floor rustc and `cc` both build for: macOS 11, the
+      # first release with Apple silicon, for both architectures.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     strategy:
       fail-fast: false
       matrix:

@@ -9,7 +9,8 @@ What this package does **not** carry, so you choose it knowing: the columnar/Arr
 lifecycle operations (`cancellation: {scan: false, lifecycle: false}`). `turndb.capabilities()`
 reports exactly these; a consumer that needs SQL or cancellation uses the Rust crate or the native
 Node package. Wheels are built for Linux x86-64 and arm64 (manylinux2014), macOS x86-64 and Apple
-silicon, and Windows x86-64, for CPython 3.9–3.13; other platforms build from the sdist.
+silicon (macOS 11 or newer), and Windows x86-64, for CPython 3.9–3.13; other platforms build from
+the sdist.
 
 ```python
 from turndb import Store
