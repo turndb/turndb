@@ -284,7 +284,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # The pinned toolchain, because the target must be installed on the toolchain cargo
+      # actually selects: rust-toolchain.toml pins 1.95.0, and a target installed on `stable`
+      # leaves that one without `core` for aarch64 (CONTRIBUTING, "What you can run locally").
+      # The first run of this job proved it: `error[E0463]: can't find crate for core`.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
@@ -352,7 +356,9 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, for the reason native-prebuild-arm64 states: the target goes on the toolchain
+      # cargo selects.
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
