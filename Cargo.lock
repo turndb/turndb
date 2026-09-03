@@ -2703,6 +2703,7 @@ dependencies = [
  "anyhow",
  "base64",
  "pyo3",
+ "pyo3-build-config",
  "serde_json",
  "turndb",
 ]
