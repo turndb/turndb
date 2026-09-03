@@ -48,7 +48,7 @@ not touched. Every kind below is a variant of `DebrisKind`, a non-exhaustive enu
 | `ReclaimAnchor` | `<store>.reclaimed` | reclaim's anchor protocol (Windows), from the anchor's publish until its cleanup landed — or a store carried here from that platform | removes it (the store is authority) | **recovers the store from it** — not debris until a store exists again |
 | `ReclaimCandidate` | `<store>.reclaim-candidate`, `<store>.reclaim-candidate.tmp` | reclaim's anchor protocol (Windows) or anchor recovery (every platform), between the copy and the replace | removes them | refuses to create over them (recovery rebuilds them from the anchor) |
 | `MergeScratch` | `<store>-tmp/` | a crashed streaming merge | removes it | reports it |
-| `ArtifactStaging` | `<artifact>.sealing`, `<artifact>.restoring`, `<artifact>.converting` | a backup / seal, restore or conversion whose destination was `<artifact>`, before it published | removes it | reports it; the operation's retry removes its own stage |
+| `ArtifactStaging` | `<artifact>.backing-up`, legacy `<artifact>.sealing`, `<artifact>.restoring`, `<artifact>.converting` | a backup, restore or conversion whose destination was `<artifact>`, before it published | removes it | reports it; the operation's retry removes its own stage |
 | `ManifestStaging` | `MANIFEST.tmp` (directory layout) | a commit before its rename | removes it | — |
 | `ExcessRetainedManifest` | `MANIFEST.<commit>` older than the retention window, with a live `MANIFEST` (directory layout) | a commit's prune whose unlink a crash undid | removes it | — |
 | `SegmentSidecarStaging` | `seg-<n>.dir.tmp` in `fold/` or `fold-<generation>/` | a sidecar before its rename | removes it | — |
@@ -61,7 +61,8 @@ else is not `PendingPublish` and is never touched. The full list:
 
 - **Single-file layout**, beside `<store>`: `<store>` itself, `<store>-wal`, and
   `<store>.reclaiming`, `<store>.reclaimed`, `<store>.reclaim-candidate`,
-  `<store>.reclaim-candidate.tmp`, `<store>.sealing`, `<store>.restoring`, `<store>.converting`.
+  `<store>.reclaim-candidate.tmp`, `<store>.backing-up`, legacy `<store>.sealing`,
+  `<store>.restoring`, `<store>.converting`.
 - **Directory layout, root**: `MANIFEST`, `MANIFEST.tmp`, `MANIFEST.<commit>` (`<commit>` a
   decimal `u64`), `WAL`, `WRITER.lock`, `part-<seq>.part` and a merged `part-<lo>-<hi>.part`
   (`u64` sequence numbers), and the builder spool `<part stem>.part.s<n>.tmp` (`<n>` a decimal
@@ -100,7 +101,7 @@ more**, and what a failed directory sync means for each publication is:
 | Publication | If its directory sync fails | What the caller sees | What to do |
 |---|---|---|---|
 | store creation, and the rebirth of an interrupted creation | the store's name may not survive a crash | the call returns an error naming the directory and the store | run it again; a writer open creates or finishes the store |
-| backup / seal, restore, conversion | the artifact's name may not survive a crash; the artifact is whole or absent at its final name, never torn | the call returns an error naming the directory and the artifact | run it again; the source is untouched |
+| backup, restore, conversion | the artifact's name may not survive a crash; the artifact is whole or absent at its final name, never torn | the call returns an error naming the directory and the artifact | run it again; the source is untouched |
 | reclaim's replace (the rename protocol: every platform but Windows) | the fresh container is at the store's name, but that name may not survive a crash: the previous container, whole, would be back | the call returns an error naming the directory and the store | nothing is lost; run reclaim again |
 | reclaim's cleanup (the anchor protocol: Windows) and anchor recovery's cleanup (every platform) | the store at its name is complete and authoritative; the anchor may be back after a crash | the call returns an error naming the directory and the anchor | nothing is lost; the next writer open removes the stale anchor |
 | close (removal of the `-wal` sidecar) | the store is complete; an empty sidecar may be back after a crash | `close` returns an error naming the directory and the log | nothing is lost; the next open settles the sidecar |
@@ -196,16 +197,16 @@ durability, validation, erasure, or byte-exact reconstruction.
 ## On-disk versions
 
 Package semver and format versions are independent. `FORMAT.md` is normative and the current writer
-emits part version 2. The compatibility promise is operational:
+emits part version 2 inside container-plane version 3. The compatibility promise is operational:
 
 - a build reads the immediately preceding format revision and can migrate it forward;
 - newer readers refuse unknown future layouts unless an explicitly optional section can be ignored;
 - older readers may refuse a newer store; downgrade writing is not promised;
 - migration is explicit, preflighted, part-sized, restartable, and does not invent missing content
   identities;
-- format fixtures are immutable evidence. The legacy reference pack carries real version-1 bytes
-  and is migrated through the public Node API; release fixtures remain after newer fixtures
-  are added.
+- format fixtures are immutable evidence. The legacy reference pack carries real pack-version-1
+  bytes, and the preserved container fixtures carry real container-version-2 bytes; release
+  fixtures remain after newer fixtures are added.
 
 Advancing the writer format is a minor-or-major package change, never a patch. A release must add the
 new previous-version fixture before it can replace the writer default. Erasure may deliberately purge

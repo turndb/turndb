@@ -121,7 +121,9 @@ pub fn classify(error: &anyhow::Error) -> ErrorClass {
     }
     if let Some(backup) = error.chain().find_map(|cause| cause.downcast_ref::<BackupError>()) {
         return match backup {
-            BackupError::DestinationExists(_) => ErrorClass::InvalidArgument,
+            BackupError::DestinationExists(_) | BackupError::SourceStagingCollision { .. } => {
+                ErrorClass::InvalidArgument
+            }
             BackupError::InvalidBackup { .. } => ErrorClass::Corruption,
             BackupError::Unsupported(_) => ErrorClass::Unsupported,
         };

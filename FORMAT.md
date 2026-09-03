@@ -1,7 +1,7 @@
 # turndb on-disk format
 
-**Status: format version 2. Not frozen.** See [Compatibility](#compatibility) for what is
-promised and what is not.
+**Status: independently versioned planes; current part version 2, container version 3, and pack
+version 1. Not frozen.** See [Compatibility](#compatibility) for what is promised and what is not.
 
 This document deliberately restates what the code implements, so a disagreement between the two is
 detectable. It exists because a portable format has to outlive the implementation that happens to
@@ -49,7 +49,7 @@ mystore/
     WRITER.lock             the single-writer gate; empty, and never read
     seg-00000000.fold       segments, numbered densely from 0
     seg-00000001.fold
-    seg-00000000.dir        advisory sidecar beside a SEALED segment
+    seg-00000000.dir        advisory sidecar beside an immutable segment
     zdict-<hex>.zd          a trained dictionary, named by its own hash
   fold-0001/                content, generation 1 (after a re-fold)
   part-00000003.part                 written by a flush, named by its sequence
@@ -816,7 +816,7 @@ and only that.
 ## The pack
 
 A **pack** is a store in one file: the committed snapshot's files laid end to end, a table of
-contents, and a footer at EOF. It exists so a sealed store can be shipped, archived, produced in
+contents, and a footer at EOF. It exists so an immutable store can be shipped, archived, produced in
 discovery, tiered to object storage, or dropped into a browser — anywhere "a directory" is the
 wrong shape and "one file readable by ranged requests" is the right one. A pack is **immutable and
 writer-less by definition**: the writer role is what directories are for, and a pack never has one.
@@ -897,7 +897,7 @@ A **container** is a store in one file that can still grow. It holds what a pack
 committed snapshot's files under the same flat `/`-joined names — and differs in exactly one thing:
 where it says it is complete.
 
-A pack is footer-addressed, and the footer is at EOF. That is right for a sealed artifact and wrong
+A pack is footer-addressed, and the footer is at EOF. That is right for an immutable artifact and wrong
 for one that grows: appending past the footer leaves a window in which EOF is not a footer, and a
 crash there leaves a file nothing can open. A container is **superblock-addressed** instead. Two
 fixed slots at the head of the file are written **alternately**, so the slot a reader resolves is
@@ -943,21 +943,19 @@ offset  size  field
     36     4  dir_xsum     crc32 of the STORED directory payload
     40     8  tail         first byte beyond this commit's data
     48     1  dir_codec    0 stored, 1 zstd
-    49     1  version      the container plane's reject-forward lever; this revision writes 2
-    50     1  flags        bit 0 SEALED; every other bit MUST be zero and a reader must refuse
-    51     1  reserved, MUST BE ZERO — and a reader must refuse otherwise
+    49     1  version      the container plane's reject-forward lever; this revision writes 3
+    50     2  reserved, MUST BE ZERO — and a reader must refuse otherwise
     52     4  xsum         first 4 bytes of blake3 over slot[0..52]
 ```
 
 `version` is independent of the record format version: the container plane can evolve without the
 parts and fold segments inside it changing, and a version above the reader's own refuses rather
-than misparses. **Version 1** — the first published revision: one `(off, len)` pair per member, a
-free list of bare pairs, no flags — is read for exactly one purpose, opening what it already
-holds; the first commit over it publishes version 2, and nothing writes version 1 again.
-
-**A sealed container is final.** The SEALED flag refuses every further staging and commit, on this
-open and every open after it; reads are untouched. Rewriting one under another name is copying,
-which sealing cannot and does not prevent — the flag makes the *file* final, not the bytes secret.
+than misparses. **Version 1** — the first published revision: one `(off, len)` pair per member and a
+free list of bare pairs — and **version 2** — extent lists, stamped free entries, and a historical
+bit 0 in byte 50 — are read for opening what they already hold. The version-2 bit is accepted and
+ignored: every container has the same mutable lifecycle. The first commit over either old revision
+publishes version 3 with bytes 50–51 zero. Version 2's other bits and byte 51 remain unknown claims
+and refuse; nothing writes versions 1 or 2 again.
 
 **A torn slot and a slot from the future are different failures and must not be confused.** A slot
 whose checksum does not cover its bytes was never completed; it carries no claim, and the other
@@ -1009,7 +1007,7 @@ never rereads what it already wrote.
 A **cold open** here means resolving the live container into a `ReadStore`, before a query or
 content read. Let `S` be the live fold generation's segment count, `D` its candidate dictionary
 member count, and `P` the live manifest's part count. An empty, never-flushed container performs
-two reads — the superblock slots — and stops. For a non-empty valid version-2 state published by
+two reads — the superblock slots — and stops. For a non-empty valid version-3 state published by
 the current writer, opening over an uncached positioned source performs exactly
 
 ```
@@ -1048,10 +1046,6 @@ torn write in step 4 fails its checksum and loses to the other slot. Recovery is
 repair: the newest slot that passes its checksum **is** the state, and uncommitted bytes past its
 tail are ignored and later overwritten.
 
-One commit legitimately skips steps 1–3: sealing with nothing staged. The committed directory is
-already durable and the new superblock re-points at it, adding only the flag — so the flip and its
-barrier are the entire commit.
-
 A barrier that reports failure is a failure: no publication path reports success after a failed
 sync, and the simulator fails every barrier in the publication sweeps once to hold it to that.
 
@@ -1085,8 +1079,7 @@ extent, committed, verified, and published at the store's name. It is a copy and
 than an edit, so the container being read is never half-rewritten; a reader holding the old file
 keeps reading it, because the inode outlives the name. Reclaim takes the writer lock for the whole
 rewrite — a live writer would keep committing to the renamed-away inode — and is refused while an
-unsettled `-wal` sidecar sits beside the file (acknowledged records only their writer can settle)
-or for a sealed container, whose bytes are final.
+unsettled `-wal` sidecar sits beside the file (acknowledged records only their writer can settle).
 
 The publication is the crash-safety argument, and there are two of them, because the platforms
 differ in what a replace over an open destination *guarantees*, and a protocol is chosen by that
@@ -1205,10 +1198,10 @@ Things a reader might reasonably expect to find here, and the reason each is abs
 checksums, section checksums, the TOC and footer chains, per-piece BLAKE3 on every content read,
 and manifest-pinned part digests — and repairs none of it. Reed-Solomon companions would solve bit
 rot *on a single copy*, which is not the failure this system is deployed into: cold tiers live on
-object storage with its own durability, sealed packs are copied, and the honest recovery for a
+object storage with its own durability, packs and backups are copied, and the honest recovery for a
 damaged member is to restore it. Adding an erasure-coding dependency to duplicate what the storage
 layer already provides would add apparent thoroughness without adding protection. Where
-belt-and-braces is wanted, external PAR2 over a sealed pack is an operations recipe and needs
+belt-and-braces is wanted, external PAR2 over a pack or backup is an operations recipe and needs
 nothing from this format.
 
 **A second identity algorithm.** BLAKE3 identifies both individual fold pieces and complete named

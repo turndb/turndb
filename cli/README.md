@@ -13,7 +13,7 @@ turndb import  mystore.turndb traces.jsonl      # each line needs a "body"; othe
 turndb inspect mystore.turndb                   # manifest, parts, fold, members, snapshots
 turndb verify  mystore.turndb --deep            # every record, piece, frame, and pin
 turndb query   mystore.turndb "SELECT model, count(*) FROM t GROUP BY model"
-turndb seal    mystore.turndb snap.turndb       # the committed snapshot as one sealed file
+turndb backup  mystore.turndb snap.turndb       # the committed snapshot as one self-contained store
 turndb query   snap.turndb "SELECT count(*) FROM t"
 ```
 
@@ -31,14 +31,14 @@ Published slices: `linux-x64-gnu`, `linux-arm64-gnu`, `darwin-x64`, `darwin-arm6
 
 ## Reading a store the library wrote
 
-Every read verb accepts a `.turndb` store file, live or sealed, and tells the two apart by magic
-rather than by extension. A store written by the [`turndb`](https://www.npmjs.com/package/turndb)
+Every read verb accepts a `.turndb` store file. A store written by the
+[`turndb`](https://www.npmjs.com/package/turndb)
 wasm package or [`@turndb/native`](https://www.npmjs.com/package/@turndb/native) reads here
 identically — the format is one format. The two retired layouts, a store directory and the
 version-1 `pack`, are refused by every other verb and have one door: `turndb convert <src> <out>`
 produces a single-file store from either.
 
-Operating verbs (`compact`, `refold`, `punch`, `erase`, `recover`, `reclaim`, `seal`) take the writer
+Operating verbs (`compact`, `refold`, `punch`, `erase`, `recover`, `reclaim`, `backup`) take the writer
 role — `flock` on the store file — and close it when they finish, so a store they have operated on
 is exactly one file.
 

@@ -1,4 +1,4 @@
-# Capability contract v1
+# Capability contract v2
 
 Status: normative Phase 3 contract. Package semver and on-disk format versions are independent of
 this contract version.
@@ -9,8 +9,8 @@ named method in another binding. In particular, a WASI guest hosted by Linux sti
 embedder-enforced writer exclusion, no threads, and no hole punching; a browser handle is read-only.
 
 The machine-readable representation is defined by
-[`conformance/v1/capabilities.schema.json`](../conformance/v1/capabilities.schema.json). Every
-profile carries `contractVersion: 1`. An implementation may add fields without advancing the
+[`conformance/v2/capabilities.schema.json`](../conformance/v2/capabilities.schema.json). Every
+profile carries `contractVersion: 2`. An implementation may add fields without advancing the
 version. Consumers must ignore unknown fields. A change to an existing field's type or meaning, or
 removal of a required field, advances the contract version.
 
@@ -54,7 +54,7 @@ language conveniences, but those do not become Tier 1 merely by existing.
 | `readContent` | reconstruct one named content value byte-exactly |
 | `snapshot` | create an immutable handle at the writer's published cut |
 | `querySql` | stream read-only SQL results as Arrow IPC |
-| `seal` | settle and publish a final container at a new path |
+| `backup` | settle and publish a self-contained container at a new path |
 | `verify` | verify the committed integrity chain and byte-exact reconstruction |
 | `spaceUsage` | report reachability-aware storage accounting |
 | `compactBounded` | execute one exact-budget compaction unit |
@@ -69,10 +69,10 @@ embedder-enforced exclusion even on a Unix host. Browser readers report `read_on
 mutating operation, and report `reclamation: "none"`.
 
 WASI Preview1 also lacks atomic no-replace publication. The portable profile therefore reports
-`atomicNoReplacePublication: "absent"` and omits `seal`; it does not weaken seal into an unsafe
-copy. Native Node and Python expose the normative seal operation.
+`atomicNoReplacePublication: "absent"` and omits `backup`; it does not weaken backup into an unsafe
+copy. Native Node and Python expose the normative backup operation.
 
-Different profiles may truthfully expose different operation sets under contract v1. Semantic
+Different profiles may truthfully expose different operation sets under contract v2. Semantic
 drift inside an operation they both expose is not a capability difference: `scan`, for example,
 has one request, ordering, cursor, scalar, and result contract everywhere.
 
@@ -85,7 +85,7 @@ error text.
 
 ## Conformance
 
-[`conformance/v1/capabilities.json`](../conformance/v1/capabilities.json) contains the required
+[`conformance/v2/capabilities.json`](../conformance/v2/capabilities.json) contains the required
 invariants for the core profiles. The Rust gate validates the compiled core against them; each
 binding runner validates its public response and then runs only cases whose required operations are
 present. A profile cannot make a failing case disappear by omitting an operation that its package

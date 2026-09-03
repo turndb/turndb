@@ -178,7 +178,7 @@ function contractProfile(runtime) {
   const compiled = readProfile(runtime, 'tdb_capabilities');
   return {
     ...binding,
-    contractVersion: 1,
+    contractVersion: 2,
     profile: 'wasi',
     operations: [...contractOperations],
     bindingOperations: binding.operations,
@@ -1280,7 +1280,7 @@ export async function open(dir, opts = {}) {
 }
 
 /**
- * Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+ * Open a store held in ONE FILE — an immutable pack or a mutable container — READ-ONLY.
  *
  * Which form it is comes from the file's magic, not its extension, and both answer reads
  * identically. Neither has a writer role to take, so this open cannot contend with anything; the

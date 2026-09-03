@@ -15,7 +15,7 @@ from turndb import Store
 
 db = Store.open("agent.turndb")
 db.write([{"kind": "put", "id": "trace/1", "attrs": [], "contents": []}], durable=True)
-db.seal("agent-snapshot.turndb")
+db.backup("agent-snapshot.turndb")
 db.close()
 ```
 

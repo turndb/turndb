@@ -66,7 +66,7 @@ head -4000 traces.jsonl | ./target/release/turndb import mystore.turndb -
 ./target/release/turndb inspect mystore.turndb
 ./target/release/turndb verify  mystore.turndb --deep   # every record, piece, frame, and pin
 ./target/release/turndb query   mystore.turndb "SELECT model, count(*) FROM t GROUP BY model"
-./target/release/turndb seal    mystore.turndb snap.turndb   # the committed snapshot, sealed
+./target/release/turndb backup  mystore.turndb snap.turndb   # self-contained committed snapshot
 ./target/release/turndb query   snap.turndb "SELECT count(*) FROM t"
 # Only if the manifest member is damaged: validates the newest retained commit, no rollback by
 # default. On a healthy store it refuses and exits 1 — "refusing recovery of a healthy store" —
@@ -93,7 +93,7 @@ The consumer's design surface — what an embedder can rely on and what is still
 [docs/README.md](docs/README.md).
 Node and Python expose the same versioned [capability contract](docs/capability-contract.md) and
 [structured query contract](docs/query-contract.md), including ordered duplicate attributes,
-bit-exact floats, byte-exact named content, sealing, and bounded maintenance. Their OpenTelemetry
+bit-exact floats, byte-exact named content, backup, and bounded maintenance. Their OpenTelemetry
 exporters and provider-independent client-call wrappers implement one
 [trace mapping and cadence policy](docs/trace-mapping.md).
 
@@ -138,11 +138,11 @@ first. The shape:
 | **Compaction** | Total merge at eight parts plus exact input-part/row/byte-bounded work units; merges provably touch zero content bytes |
 | **Deletion** | Tombstone → settle → re-fold removes content *and* metadata; `punch` reclaims dead blocks in place without moving a single offset |
 | **Integrity** | Per-piece BLAKE3 on every read, per-section checksums, footer and TOC chains, manifest-pinned parts, and a `scrub` that walks every frame |
-| **Shipping** | `seal` publishes a verified, final single-file snapshot that every reader opens directly |
+| **Shipping** | `backup` publishes a verified, self-contained single-file snapshot that readers and writers open directly |
 
-The seal command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-lock)), settles a
+The backup command takes the writer role (see [FORMAT.md](FORMAT.md#the-writer-lock)), settles a
 recovered WAL, fully verifies its staged artifact,
-and refuses to replace an output path. Restore likewise verifies before extraction and atomically
+and refuses to replace an output path. Restore likewise verifies the staged copy and atomically
 publishes only to a destination that does not exist; see [backup and restore](docs/backup-restore.md).
 Manifest recovery likewise takes the writer role — excluding a live writer only where that role is
 enforced — and validates the complete candidate before publication; rollback past the newest

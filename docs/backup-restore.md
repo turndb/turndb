@@ -1,11 +1,10 @@
 # Backup and restore
 
-A TurnDB backup is a **sealed single-file store**: the same container format as the live
-database, holding the live `MANIFEST`, every part it names, and the live fold generation — one
-aligned extent each — with the SEALED flag set in its superblock. It does not contain the WAL
-sidecar or retained-manifest history. Sealed is final: nothing ever opens a backup for writing,
-and content addresses survive the crossing unchanged. Any TurnDB reader serves a backup directly;
-no restore step is needed just to look inside it.
+A TurnDB backup is a **self-contained single-file store**: the same mutable container format as the
+source, holding the live `MANIFEST`, every part it names, and the live fold generation — one aligned
+extent each. It does not contain the WAL sidecar or retained-manifest history. Content addresses
+survive the crossing unchanged. Any TurnDB reader serves a backup directly, and any writer can
+continue from it as an independent store; no restore step is required for either use.
 
 Version-1 **pack** files, the previous backup format, remain readable and restorable. Nothing
 produces new ones.
@@ -30,11 +29,17 @@ operation can advance the manifest *from this process*. The Node equivalent,
 `await store.backup(path)`, is serialized through the store actor, so its cut includes every
 command accepted before it and excludes commands submitted after it.
 
-The artifact is built in a sibling staging file, committed sealed, verified member by member, and
-only then renamed under the requested output name with an OS no-replace primitive; the parent
-directory is synced before success is returned. TurnDB never replaces a backup destination. A
-process or machine crash can leave staging litter, but never a partial artifact under the
-requested name.
+The artifact is built in a sibling staging file, committed, and fully verified before it is renamed
+under the requested output name with an OS no-replace primitive. Verification covers member
+checksums, manifest references and pins, part sections, fold frames, and reconstruction of every
+live named content value. The parent directory is synced before success is returned. TurnDB never
+replaces a backup destination. A process or machine crash can leave staging litter, but never a
+partial artifact under the requested name.
+
+If a source store itself occupies either the current or legacy staging name derived from the
+requested destination, backup refuses before settling the source or removing any staging path.
+Likewise, restore refuses when its source occupies the destination's derived `.restoring` name.
+These are path collisions, not debris.
 
 Cancellation has one final checkpoint immediately before publication. Before that point the
 staging file is removed best-effort and the destination remains absent. Once the artifact is
@@ -59,15 +64,13 @@ let stats = turndb::store::restore_file(
 const stats = await restoreBackup('snapshot.turndb', 'restored.turndb', { timeoutMs: 30_000 });
 ```
 
-Restore is member-verified copying, in a deliberately conservative sequence:
+Restore is staged, fully verified copying, in a deliberately conservative sequence:
 
 1. Refuse if any filesystem object already occupies the destination.
-2. Verify every member of the backup against its recorded checksums.
-3. Copy the artifact byte-for-byte to a sibling staging file.
-4. Clear the SEALED flag **on the staging copy** — finality binds the artifact: the backup stays
-   sealed forever, and the restored copy is a different file being born writable, which is the
-   point of restoring.
-5. Atomically rename it into place with an OS no-replace primitive and sync the parent directory.
+2. Copy the artifact byte-for-byte to a sibling staging file.
+3. Fully verify that exact staged store, including its manifest references, part sections, fold
+   frames, and reconstructed content identities.
+4. Atomically rename it into place with an OS no-replace primitive and sync the parent directory.
 
 `restore_file_with_control` checks interruption at entry and immediately before the publishing
 rename; a cancelled restore removes its staging and never publishes. The rename is the last
@@ -81,7 +84,7 @@ writable single-file store starting from the backup's live commit, without its o
 history.
 
 Restoring a version-1 **pack** goes through the same door everything retired walks: conversion.
-The Node `restoreBackup` dispatches on the artifact's magic — a sealed container restores by
+The Node `restoreBackup` dispatches on the artifact's magic — a container restores by
 verified copy, a pack converts into a fresh single-file store.
 
 Node reports existing destinations as `INVALID_ARGUMENT`, invalid artifacts as `CORRUPTION`,

@@ -213,12 +213,12 @@ NaNs so their payload cannot be canonicalized at the JavaScript boundary.
 
 ## Capability profile
 
-`await capabilities()` (or `store.capabilities()`) reports the cross-binding contract-v1 profile.
+`await capabilities()` (or `store.capabilities()`) reports the cross-binding contract-v2 profile.
 Its `operations` are stable Tier-1 names; `bindingOperations` separately lists every callable
 package convenience. The profile also carries the lifecycle-journal capacity and facts explicitly absent here. In
 particular, allocated filesystem blocks, a cancellation token, and atomic no-replace publication
 are absent on WASI; none is reported as zero or silently accepted. Because that last primitive is
-required by `seal`, the portable profile omits `seal` instead of publishing a weaker artifact.
+required by `backup`, the portable profile omits `backup` instead of publishing a weaker artifact.
 
 `await compiledCapabilities()` is the separate answer to what mechanisms and format guarantees the
 guest contains. It describes the WASI guest, not the host OS: this package reports embedder-enforced

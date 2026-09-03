@@ -2498,6 +2498,22 @@ fn verification_metrics_preserve_typed_cancellation_and_corruption_outcomes() {
 }
 
 #[test]
+fn a_new_empty_store_verifies_before_its_first_publication() {
+    let dir = tmp("verify-empty-store");
+    let mut store = Store::open_file(&store_file(&dir), cfg()).unwrap();
+
+    let report = store.verify().unwrap();
+    assert_eq!(report.chain.retained_manifests, 0);
+    assert_eq!(report.chain.links, 0);
+    assert_eq!(report.chain.part_digests, 0);
+    assert_eq!(report.parts, 0);
+    assert_eq!(report.records, 0);
+
+    drop(store);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn lifecycle_metrics_are_monotonic_typed_and_process_local() {
     let dir = tmp("lifecycle-metrics");
     {
@@ -2700,16 +2716,6 @@ fn a_single_file_store_lives_its_whole_life_against_one_file() {
         .collect();
     assert_eq!(names, vec!["live.turndb".to_string()], "a closed store is one file");
 
-    // Sealed is final for writers too.
-    {
-        let mut c = turndb::container::Container::open(&ct).unwrap();
-        c.commit_sealed().unwrap();
-    }
-    let err = match Store::open_file(&ct, cfg) {
-        Ok(_) => panic!("a sealed container must refuse a writer"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("sealed"), "a sealed container refuses a writer: {err}");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -2922,7 +2928,7 @@ fn a_single_file_store_returns_freed_space_in_place() {
 }
 
 /// The last three operations learn the single file: verification walks members instead of
-/// files, backup publishes a SEALED container, and recovery promotes a retained member with one
+/// files, backup publishes a self-contained container, and recovery promotes a retained member with one
 /// flip — the prune of the abandoned timeline riding the same atomic state.
 #[test]
 fn a_single_file_store_verifies_backs_up_and_recovers() {
@@ -2950,21 +2956,21 @@ fn a_single_file_store_verifies_backs_up_and_recovers() {
     assert_eq!(v.chain.part_digests, v.chain.retained_manifests * 2 - 1, "{:?}", v.chain);
     assert_eq!(v.records, 16);
 
-    // Backup: a sealed container, byte-for-byte answerable, refusing writers and replacement.
+    // Backup: a self-contained container, byte-for-byte answerable and independently writable.
     let out = root.join("backup.turndb");
     let stats = s.backup(&out).unwrap();
     assert!(stats.files > 3 && stats.bytes > 0, "{stats:?}");
-    let sealed = turndb::container::Container::open(&out).unwrap();
-    assert!(sealed.sealed(), "a backup of a single-file store is a sealed container");
-    assert!(!sealed.names().any(|n| n.starts_with("MANIFEST.")), "no retained log in a snapshot");
-    sealed.verify().unwrap();
-    drop(sealed);
+    let backup = turndb::container::Container::open(&out).unwrap();
+    assert!(!backup.names().any(|n| n.starts_with("MANIFEST.")), "no retained log in a snapshot");
+    backup.verify().unwrap();
+    drop(backup);
     let r = turndb::store::open_read_container(&out, cfg).unwrap();
     for i in 0..16u64 {
         assert_eq!(r.reconstruct(&format!("v:{i}")).unwrap().unwrap(), body(i));
     }
     drop(r);
-    assert!(Store::open_file(&out, cfg).is_err(), "sealed refuses a writer");
+    let backup_writer = Store::open_file(&out, cfg).unwrap();
+    backup_writer.close().unwrap();
     assert!(s.backup(&out).is_err(), "an existing destination is never replaced");
     s.close().unwrap();
 

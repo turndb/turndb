@@ -1,7 +1,7 @@
 //! One store, every OS: the bytes TurnDB writes do not depend on the platform that wrote them.
 //!
 //! A reference store is built here from fixed inputs and compared BYTE FOR BYTE with a checked-in
-//! copy made on Linux (`tests/fixtures/cross-os-reference.turndb.hex`). On Windows CI that is the
+//! current-writer copy made on Linux (`tests/fixtures/cross-os-reference.turndb.hex`). On Windows CI that is the
 //! Linux→Windows direction; the Windows job also emits its own build as an artifact, and a Linux
 //! job compares that back (`TURNDB_CROSS_OS_STORE`) — Windows→Linux. Each direction also opens,
 //! verifies and reads the foreign bytes, so "opens" and "identical" are both asserted, and a
@@ -13,6 +13,7 @@ use turndb::store::{ContentSpans, Span, Store};
 use turndb::AttrValue;
 
 const FIXTURE: &str = "tests/fixtures/cross-os-reference.turndb.hex";
+const PREVIOUS_FIXTURE: &str = "tests/fixtures/cross-os-reference-v2.turndb.hex";
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("turndb-cross-os-{tag}-{}", std::process::id()));
@@ -79,12 +80,15 @@ fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE)
 }
 
-fn read_fixture() -> Vec<u8> {
-    let hex = std::fs::read_to_string(fixture_path()).unwrap_or_else(|e| {
-        panic!("{FIXTURE}: {e} (generate with TURNDB_WRITE_CROSS_OS_FIXTURE=1)")
-    });
+fn read_hex_fixture(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+    let hex = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{name}: {e}"));
     let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
     (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+}
+
+fn read_fixture() -> Vec<u8> {
+    read_hex_fixture(FIXTURE)
 }
 
 fn write_fixture(bytes: &[u8]) {
@@ -190,5 +194,30 @@ fn a_store_made_on_another_platform_is_byte_identical_and_opens_here() {
     let local = d.join("foreign.turndb");
     std::fs::write(&local, &theirs).unwrap();
     open_verify_read(&local, "the foreign-made store opened here");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_previous_container_revision_remains_readable_and_upgrades_on_write() {
+    let d = tmp("previous-v2");
+    let path = d.join("previous.turndb");
+    std::fs::write(&path, read_hex_fixture(PREVIOUS_FIXTURE)).unwrap();
+    open_verify_read(&path, "the preserved revision-2 fixture");
+
+    let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+    let mut writer = Store::open_file(&path, cfg).unwrap();
+    writer.put("upgrade-proof", &[Span::Lit(b"revision three")], vec![]).unwrap();
+    writer.sync().unwrap();
+    writer.flush().unwrap();
+    writer.close().unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    let live = [0usize, 4096]
+        .into_iter()
+        .max_by_key(|offset| {
+            u64::from_le_bytes(bytes[*offset + 8..*offset + 16].try_into().unwrap())
+        })
+        .unwrap();
+    assert_eq!(bytes[live + 49], turndb::container::CONTAINER_VERSION);
     let _ = std::fs::remove_dir_all(&d);
 }

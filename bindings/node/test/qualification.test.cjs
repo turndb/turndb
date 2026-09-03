@@ -257,7 +257,7 @@ test('qualifies retention, compaction, backup, restore, and physical erasure as 
   assert.equal((await store.verify()).parts, 1n);
 
   const backup = await store.backup(artifact);
-  // Member payload bytes: the sealed file adds its superblocks, alignment, and directory.
+  // Member payload bytes: the backup file adds its superblocks, alignment, and directory.
   assert(backup.bytes > 0n && backup.bytes <= BigInt(fs.statSync(artifact).size));
   assert.equal(backup.commit, (await store.health()).commit);
   assert.deepEqual((await store.scan()).rows.map(({ id }) => id), expectedIds);

@@ -639,7 +639,7 @@ pub unsafe extern "C" fn tdb_open_v3(
     }
 }
 
-/// Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+/// Open a store held in ONE FILE — an immutable pack or a mutable container — READ-ONLY.
 ///
 /// Which form it is comes from the file's magic, not its extension. Neither has a writer role to
 /// take, so this is the one open in this binding that cannot contend with anything, and every

@@ -17,9 +17,10 @@ Controlled operations currently include:
 - In-place punching through `punch_unreferenced_with_control`.
 - Generational content rewriting through `refold_with_control`.
 - The read-only planning phase of strong record erasure through `erase_ids_with_control`.
-- Backup sealing/verification through `Store::backup_with_control`; validation of retired pack
+- Backup construction/verification through `Store::backup_with_control`; validation of retired pack
   artifacts through `Pack::open_with_control` and `Pack::verify_with_control`.
-- Member-verified restore publication through `store::restore_file_with_control`.
+- Full staged-store verification and restore publication through
+  `store::restore_file_with_control`.
 - Offline candidate validation/publication through
   `store::recover_manifest_file_with_limits_and_control`.
 - Store inventory and Node maintenance-space preflight while traversing or settling the
@@ -58,12 +59,13 @@ Each operation deliberately interprets interruption according to its publication
   atomic tombstone batch is applied, cancellation is deferred until total merge and refold complete.
   Returning `cancelled` after logical deletion but before physical removal would make a retry mistake
   those ids for previously absent records and falsely report success.
-- **Backup** seals and verifies into a private sibling file. Cancellation removes unpublished
+- **Backup** builds and fully verifies a store in a private sibling file. Cancellation removes unpublished
   staging and leaves the requested artifact absent. The no-replace publication is the final
   checkpoint; once the artifact exists, TurnDB reports the publication outcome rather than
   cancellation.
-- **Restore** verifies the backup and copies it into a private sibling file. Cancellation removes
-  staging and leaves the destination absent. The atomic no-replace rename is its final checkpoint.
+- **Restore** copies the backup into a private sibling file, then fully verifies that exact staging
+  store. Cancellation removes staging and leaves the destination absent. The atomic no-replace
+  rename is its final checkpoint.
 - **Manifest recovery** takes the writer lock — `flock` on the store file — while it discovers and
   completely validates retained candidates. **That lock excludes a live writer only on Unix**; on
   `wasm32-wasip1` it always succeeds, so recovery is not protected from a concurrent writer and the

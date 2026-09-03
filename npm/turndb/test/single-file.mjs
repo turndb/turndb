@@ -21,12 +21,12 @@ if (!existsSync(CLI)) {
   );
 }
 
-test('reads a store held in one file, live or sealed', async () => {
+test('reads a live store and its backup from one file', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-wasm-file-'));
   const container = join(root, 'store.turndb');
   const payload = JSON.stringify([{ role: 'user', content: 'one file' }]);
-  // The portable writer produces the single file directly; the CLI seals its snapshot because
-  // WASI Preview1 cannot provide the atomic no-replace publication that seal promises.
+  // The portable writer produces the single file directly; the native CLI publishes a backup
+  // because WASI Preview1 cannot provide the required atomic no-replace operation.
   const store = await open(container);
   store.putBody('trace:1#input', payload, { model: 'm0' });
   store.sync();
@@ -37,12 +37,12 @@ test('reads a store held in one file, live or sealed', async () => {
   await mkdir(plainDir, { recursive: true });
   assert.equal(await singleFileKind(plainDir), null, 'a directory carries neither magic');
 
-  const sealed = join(root, 'snapshot.turndb');
-  execFileSync(CLI, ['seal', container, sealed]);
+  const backup = join(root, 'snapshot.turndb');
+  execFileSync(CLI, ['backup', container, backup]);
   assert.equal(await singleFileKind(container), 'container');
-  assert.equal(await singleFileKind(sealed), 'container');
+  assert.equal(await singleFileKind(backup), 'container');
 
-  for (const [label, file] of [['container', container], ['sealed snapshot', sealed]]) {
+  for (const [label, file] of [['container', container], ['backup', backup]]) {
     const ro = await openFile(file);
     assert.deepEqual(ro.scanIds(), ['trace:1#input'], `${label} pages the same ids`);
     assert.equal(new TextDecoder().decode(ro.get('trace:1#input')), payload, `${label} is byte-exact`);

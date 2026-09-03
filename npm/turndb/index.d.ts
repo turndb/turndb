@@ -235,12 +235,12 @@ export type BindingOperation =
 
 export type ContractOperation =
   | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
-  | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal'
+  | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'backup'
   | 'verify' | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close';
 
 /** What is actually callable through this npm/WASI binding. */
 export interface Capabilities {
-  contractVersion: 1;
+  contractVersion: 2;
   profile: 'wasi';
   binding: 'wasi';
   /** Stable Tier-1 contract operations. */
@@ -663,7 +663,7 @@ export type OpenFileOptions = Pick<
 >;
 
 /**
- * Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+ * Open a store held in ONE FILE — an immutable pack or a mutable container — READ-ONLY.
  *
  * Which form it is comes from the file's magic, not its extension, and both answer reads
  * identically. Neither has a writer role to take, so this open cannot contend with anything and

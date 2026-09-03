@@ -1121,7 +1121,7 @@ fn check_state(
 /// states checked. Every prefix and every variant is checked — nothing is subsampled.
 /// After open-and-recover, a directory holds only live names plus reported debris — never a
 /// silently accumulated transient (obj-mtg0jtf1-l, outcome c). Every `*.turndb` file and every
-/// directory-layout store in `dir` is opened as a writer (sealed artifacts are readers only)
+/// directory-layout store in `dir` is opened as a writer
 /// and closed; then `debris_report` beside a PRESENT store must be empty — the open removed
 /// what the protocol proves dead — and beside an absent store every remaining transient is
 /// one the report names, which is the definition of "reported". Anything the report does not
@@ -1175,17 +1175,15 @@ fn assert_directory_settled(dir: &Path, what: &str) {
     for store in &stores {
         known.insert(store.clone());
         known.insert(wal_of(store)); // a present store's sidecar: recovery input, settled by open
-        let sealed = store.is_file()
-            && turndb::container::Container::open(store).map(|c| c.sealed()).unwrap_or(false);
-        // The report BEFORE this assertion's own writer open: whatever that open removes must
-        // have been reported here, or it vanished unreported.
+                                     // The report BEFORE this assertion's own writer open: whatever that open removes must
+                                     // have been reported here, or it vanished unreported.
         let before = report_of(store);
         for e in &before.entries {
             known.insert(e.path.clone());
         }
         // A directory-layout store has no public writer open (its one door is `convert`), so
         // it gets the report-only check below; a single-file store is opened as a writer.
-        let opened: Option<Result<u64, String>> = if !sealed && store.is_file() {
+        let opened: Option<Result<u64, String>> = if store.is_file() {
             Some(match Store::open_file(store, cfg) {
                 Ok(s) => {
                     let removed = s.metrics().debris_removed;
@@ -1230,7 +1228,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
                     describe(&report)
                 );
             }
-            // Sealed artifacts and directory-layout stores: readers only; the report is allowed.
+            // Directory-layout stores have no public writer; the report is allowed.
             None => {}
         }
         for e in &report.entries {
@@ -1255,6 +1253,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
             }
         }
         for suffix in [
+            ".backing-up",
             ".sealing",
             ".restoring",
             ".converting",
@@ -1525,9 +1524,9 @@ fn fixture_expectations() -> BTreeMap<String, Vec<u8>> {
     want
 }
 
-/// A backup of a single-file store is a sealed container published by a no-replace rename. The
+/// A backup of a single-file store is a container published by a no-replace rename. The
 /// sweep's claim: the SOURCE file answers identically at every crash point, and the artifact is
-/// all-or-nothing at its final name — absent, or complete, sealed, and byte-exact.
+/// all-or-nothing at its final name — absent, or complete and byte-exact.
 #[test]
 fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing() {
     let root = tmp("backup");
@@ -1569,7 +1568,7 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
             "crash point {k} {variant:?}: source store gained or lost records"
         );
         drop(src);
-        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete SEALED
+        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete
         // container that verifies and serves every record byte-exact. (Staging litter beside
         // it is allowed — it is inert bytes at a name nothing resolves.)
         let dst = stage.join("backup.turndb");
@@ -1577,7 +1576,6 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
             let c = turndb::container::Container::open(&dst).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: a torn artifact sits at the FINAL name: {e:#}")
             });
-            assert!(c.sealed(), "crash point {k} {variant:?}: a published backup must be sealed");
             c.verify().unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: published backup fails verification: {e:#}")
             });
@@ -1599,15 +1597,15 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
     std::fs::remove_dir_all(&stage).ok();
 }
 
-/// Restoring is member-verified copying of a sealed backup into a fresh writable file, staged
-/// and published by a no-replace rename. The destination is all-or-nothing at its final name,
+/// Restoring copies a backup into a fresh writable staging file, fully verifies that exact store,
+/// and publishes it by a no-replace rename. The destination is all-or-nothing at its final name,
 /// and a crash is always recoverable by simply re-running the restore.
 #[test]
 fn every_restore_crash_leaves_the_destination_all_or_nothing() {
     let root = tmp("restore");
     std::fs::create_dir_all(&root).unwrap();
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-    // The source store lives OUTSIDE the modeled root: only the sealed artifact and the restore
+    // The source store lives OUTSIDE the modeled root: only the backup artifact and the restore
     // protocol itself are under test here.
     let srcroot = tmp("restore-src");
     std::fs::create_dir_all(&srcroot).unwrap();
@@ -1634,14 +1632,10 @@ fn every_restore_crash_leaves_the_destination_all_or_nothing() {
         let dst = stage.join("restored.turndb");
         if dst.exists() {
             // Published means COMPLETE: the final name only ever appears via the no-replace
-            // rename of a fully verified, unsealed staging copy.
+            // rename of a fully verified staging copy.
             let c = turndb::container::Container::open(&dst).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: a partial file sits at the FINAL name: {e:#}")
             });
-            assert!(
-                !c.sealed(),
-                "crash point {k} {variant:?}: the restored copy must be born writable"
-            );
             c.verify().unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: restored store fails verification: {e:#}")
             });
@@ -3141,6 +3135,8 @@ fn cfg4k() -> FoldCfg {
     FoldCfg { block_target: 4 * 1024, ..Default::default() }
 }
 
+/// Red-tested by disabling `UnpublishedArtifact` cleanup: the first pre-publication sync failure
+/// left `backup.turndb.backing-up`, and this test failed at the staging-removal assertion below.
 #[test]
 fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
     let cfg = cfg4k();
@@ -3150,6 +3146,12 @@ fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
         |root, _| {
             let mut s = Store::open_file(&root.join("store.turndb"), cfg)?;
             let r = s.backup(&root.join("backup.turndb")).map(|_| ());
+            if r.is_err() {
+                assert!(
+                    !root.join("backup.turndb.backing-up").exists(),
+                    "a reported pre-publication backup failure removes its staging file"
+                );
+            }
             let c = s.close();
             r.and(c)
         },
@@ -3159,7 +3161,6 @@ fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
             if b.exists() {
                 let c = turndb::container::Container::open(&b)
                     .unwrap_or_else(|e| panic!("{what}: a torn artifact at the FINAL name: {e:#}"));
-                assert!(c.sealed(), "{what}: a published backup must be sealed");
                 c.verify().unwrap_or_else(|e| panic!("{what}: backup verify: {e:#}"));
                 let rs = turndb::store::open_read_container(&b, cfg).unwrap();
                 for (id, body) in want {

@@ -1,6 +1,6 @@
 //! Every CLI verb that takes the writer role leaves a cleanly closed store behind: exactly one
 //! file, no `<store>-wal` sidecar. README.md and FORMAT.md both promise "a cleanly closed store is
-//! exactly one file"; #122 found `seal`, `compact`, `refold`, `punch` and `erase` opening a writer
+//! exactly one file"; #122 found `backup`, `compact`, `refold`, `punch` and `erase` opening a writer
 //! and returning without closing it, so each left a 0-byte WAL beside the store.
 
 use std::fs;
@@ -80,10 +80,10 @@ fn compact_refold_punch_erase_leave_exactly_one_file() {
 }
 
 #[test]
-fn seal_leaves_the_source_as_exactly_one_file_beside_the_sealed_copy() {
-    let (dir, store) = fresh_store("seal");
+fn backup_leaves_the_source_as_exactly_one_file_beside_the_copy() {
+    let (dir, store) = fresh_store("backup");
     let out = dir.join("snap.turndb");
-    run(&dir, &["seal", store.to_str().unwrap(), out.to_str().unwrap()]);
+    run(&dir, &["backup", store.to_str().unwrap(), out.to_str().unwrap()]);
     assert_eq!(entries(&dir), vec!["s.turndb".to_string(), "snap.turndb".to_string()]);
     run(&dir, &["verify", out.to_str().unwrap(), "--deep"]);
     fs::remove_dir_all(&dir).unwrap();

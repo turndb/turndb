@@ -170,11 +170,11 @@ export interface SqlBatch {
 
 export interface Capabilities {
   /** Language-neutral binding contract; independent of package and part-format versions. */
-  contractVersion: 1;
+  contractVersion: 2;
   profile: 'native';
   operations: Array<
     | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
-    | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal' | 'verify'
+    | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'backup' | 'verify'
     | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close'
   >;
   partFormat: { write: number; readMax: number };
@@ -579,7 +579,7 @@ export declare class NativeSqlQuery {
 export declare class NativeSnapshot {
   static open(path: string, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
   /**
-   * Open a store held in ONE FILE — a sealed pack or a growable container, told apart by magic
+   * Open a store held in ONE FILE — an immutable pack or a mutable container, told apart by magic
    * rather than extension. Both answer reads identically; there is no writer role to take and no
    * WAL to replay, so this cannot contend with a writer the way a directory open can.
    */
@@ -672,11 +672,6 @@ export declare class NativeStore {
   }>;
   /** Settles prior writes; cancellation never publishes the destination. */
   backup(
-    path: string,
-    options?: LifecycleOptions,
-  ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
-  /** Contract-v1 alias for publishing a verified immutable single-file snapshot. */
-  seal(
     path: string,
     options?: LifecycleOptions,
   ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;

@@ -88,7 +88,7 @@ commands, artifact measurements, the glibc floor, and first-release gates.
   projected, predicate-only, and byte-reconstructed fields; effective bounds and budgets; and exact
   pre-resolution part/row/memtable scope. It does not estimate result counts or read value/content
   columns. See [structured scan explanation](https://github.com/turndb/turndb/blob/main/docs/scan-explanation.md).
-- `capabilities()` includes the language-neutral contract-v1 profile (`operations`, `partFormat`,
+- `capabilities()` includes the language-neutral contract-v2 profile (`operations`, `partFormat`,
   reclamation, and cancellation) alongside the detailed native build facts. Query and scalar
   semantics are defined once in `docs/query-contract.md`; exact NaN payloads cross N-API through
   `floatBits`, while ordinary floats retain the ergonomic `floatValue` lane.
@@ -98,11 +98,11 @@ commands, artifact measurements, the glibc floor, and first-release gates.
 - `snapshot()` flushes all earlier accepted writes and returns an immutable reader at that exact
   actor-serialized cut. `NativeSnapshot.open()` opens the currently published manifest without a
   writer lock; `openAt()` reopens a commit still inside the bounded retention window.
-- `seal(path)` (also available as the maintenance-oriented `backup(path)`) settles earlier actor
-  commands, writes and fully verifies an immutable single-file snapshot, and
-  atomically publishes it without replacing an existing destination. `restoreBackup(pack, dir)`
-  verifies every member, extracts with bounded memory, validates the staged store, and atomically
-  publishes a new writable directory without overlaying any filesystem object. Safe restore reports
+- `backup(path)` settles earlier actor commands, writes and fully verifies a self-contained
+  single-file snapshot, and
+  atomically publishes it without replacing an existing destination. `restoreBackup(backup, path)`
+  copies with bounded memory, fully validates the staged store, and atomically publishes a new
+  writable single-file store without overlaying any filesystem object. Safe restore reports
   `UNSUPPORTED` on a platform without an OS no-replace directory rename; the capability is exposed
   as `backupRestore`. Both accept `timeoutMs`/`AbortSignal`; cancellation before the final atomic
   link/rename removes unpublished staging and never publishes the requested destination.

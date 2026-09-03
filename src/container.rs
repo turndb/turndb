@@ -1,8 +1,8 @@
 //! A store's artifacts in one **mutable** file.
 //!
 //! The [pack](crate::pack) is a store in one file that can only be read: its footer is at EOF and
-//! is the completeness marker, which is exactly right for a sealed artifact and exactly wrong for
-//! one that grows. Appending past an EOF footer leaves a window with no footer at EOF, and a crash
+//! is the completeness marker, which is exactly right for an immutable artifact and exactly wrong
+//! for one that grows. Appending past an EOF footer leaves a window with no footer at EOF, and a crash
 //! in that window leaves a file nothing can open.
 //!
 //! A container inverts the addressing. Two fixed superblock slots live at the head of the file and
@@ -37,10 +37,6 @@
 //! range whose bytes are now something else — silent corruption rather than a detected fault. The
 //! same posture the engine takes with `refold`.
 //!
-//! **A sealed container is final.** The sealed flag in the superblock refuses every further
-//! commit; what remains is a single-file artifact that reads like any other container and can
-//! never again be a writer's target.
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -57,16 +53,18 @@ use crate::readat::ReadAt;
 pub const MAGIC: &[u8; 8] = b"TURNCTNR";
 
 /// The container plane's reject-forward lever, independent of the record format version. This
-/// revision writes 2; revision 1 — the pre-extent-list layout — is read for upgrade and never
-/// written.
-pub const CONTAINER_VERSION: u8 = 2;
+/// revision writes 3; revisions 1 and 2 are read for upgrade and never written.
+pub const CONTAINER_VERSION: u8 = 3;
 
 /// The revision the first published containers carried: single-extent members, unstamped free
 /// list, no flags. Read-only; the first commit over one publishes the current revision.
 const LEGACY_VERSION: u8 = 1;
 
-/// Superblock flags, byte 50. Every undefined bit MUST be zero and a reader must refuse otherwise.
-pub const SB_FLAG_SEALED: u8 = 1;
+/// The extent-list revision. Its byte 50 admitted a finalization bit that revision 3 retires;
+/// readers accept and ignore that one historical bit so every revision-2 container opens as an
+/// ordinary store. Unknown revision-2 bits still refuse.
+const EXTENT_LIST_VERSION: u8 = 2;
+const RETIRED_V2_FINAL_BIT: u8 = 1;
 
 /// Each superblock slot is a whole page: a slot write is one `pwrite` that cannot straddle two.
 pub const SLOT_LEN: u64 = 4096;
@@ -124,7 +122,6 @@ struct Superblock {
     tail: u64,
     dir_codec: u8,
     version: u8,
-    flags: u8,
 }
 
 impl Superblock {
@@ -139,7 +136,6 @@ impl Superblock {
             tail: REGION_START,
             dir_codec: 0,
             version: CONTAINER_VERSION,
-            flags: 0,
         }
     }
 
@@ -155,8 +151,7 @@ impl Superblock {
         slot[40..48].copy_from_slice(&self.tail.to_le_bytes());
         slot[48] = self.dir_codec;
         slot[49] = CONTAINER_VERSION;
-        slot[50] = self.flags;
-        // slot[51] reserved, already zero
+        // bytes 50..52 are reserved, already zero
         let digest = blake3::hash(&slot[0..52]);
         slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
         slot
@@ -185,19 +180,25 @@ impl Superblock {
                  {CONTAINER_VERSION}"
             );
         }
-        let flags = slot[50];
         if version == LEGACY_VERSION {
-            // The legacy revision defined no flags; a nonzero byte is a claim it could not make.
+            // Revision 1 defined no flags; a nonzero byte is a claim it could not make.
             if slot[50..52] != [0, 0] {
                 bail!("container superblock sets reserved bits that must be zero");
             }
-        } else {
-            if flags & !SB_FLAG_SEALED != 0 {
-                bail!("container superblock sets flags this build does not know: {flags:#04x}");
+        } else if version == EXTENT_LIST_VERSION {
+            // Revision 2 assigned bit 0 a finalization meaning. Revision 3 has one mutable
+            // lifecycle, so the bit is accepted only as historical input and has no effect.
+            if slot[50] & !RETIRED_V2_FINAL_BIT != 0 {
+                bail!(
+                    "container superblock sets revision-2 flags this build does not know: {:#04x}",
+                    slot[50]
+                );
             }
             if slot[51] != 0 {
                 bail!("container superblock sets reserved bits that must be zero");
             }
+        } else if slot[50..52] != [0, 0] {
+            bail!("container superblock sets reserved bits that must be zero");
         }
         Ok(Some(Superblock {
             seq: u64::from_le_bytes(slot[8..16].try_into()?),
@@ -209,7 +210,6 @@ impl Superblock {
             tail: u64::from_le_bytes(slot[40..48].try_into()?),
             dir_codec: slot[48],
             version,
-            flags,
         }))
     }
 }
@@ -230,7 +230,6 @@ pub struct Container {
     slot: u8,
     /// Staged members exist in the file but in no committed superblock until `commit`.
     staged: bool,
-    sealed: bool,
     /// Whether a [`MemberWrite`] handle is outstanding — it owns the tail while it lives.
     member_open: bool,
 }
@@ -244,7 +243,6 @@ pub struct ContainerReader {
     label: String,
     dir: BTreeMap<String, Member>,
     seq: u64,
-    sealed: bool,
 }
 
 impl ContainerReader {
@@ -281,21 +279,11 @@ impl ContainerReader {
             }
         }
         let (dir, _) = read_directory(&source, Path::new(&label), &live)?;
-        Ok(ContainerReader {
-            source,
-            label,
-            dir,
-            seq: live.seq,
-            sealed: live.flags & SB_FLAG_SEALED != 0,
-        })
+        Ok(ContainerReader { source, label, dir, seq: live.seq })
     }
 
     pub fn seq(&self) -> u64 {
         self.seq
-    }
-
-    pub fn sealed(&self) -> bool {
-        self.sealed
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -367,7 +355,6 @@ impl Container {
             tail: REGION_START,
             slot: 0,
             staged: false,
-            sealed: false,
             member_open: false,
         })
     }
@@ -400,7 +387,6 @@ impl Container {
             tail: REGION_START,
             slot: 0,
             staged: false,
-            sealed: false,
             member_open: false,
         })
     }
@@ -465,7 +451,6 @@ impl Container {
             tail: live.tail,
             slot,
             staged: false,
-            sealed: live.flags & SB_FLAG_SEALED != 0,
             member_open: false,
             sb: live,
         })
@@ -490,12 +475,6 @@ impl Container {
     /// The committed sequence this handle is reading.
     pub fn seq(&self) -> u64 {
         self.sb.seq
-    }
-
-    /// Whether the committed state carries the sealed flag. Sealed is final: every staging or
-    /// commit call on this handle refuses.
-    pub fn sealed(&self) -> bool {
-        self.sealed
     }
 
     /// Member names in sorted order.
@@ -607,9 +586,6 @@ impl Container {
     }
 
     fn ensure_writable(&self) -> Result<()> {
-        if self.sealed {
-            bail!("container {} is sealed; sealed is final", self.path.display());
-        }
         if self.member_open {
             bail!(
                 "container {} has a member write in progress; finish or abandon it first",
@@ -839,27 +815,10 @@ impl Container {
         if !self.staged {
             return Ok(self.sb.seq);
         }
-        self.commit_with_flags(0)
+        self.commit_staged()
     }
 
-    /// Publish and seal in one flip. With staged changes they are committed sealed; without any,
-    /// the new superblock re-points at the committed directory and adds only the flag. Either way
-    /// this handle — and every handle after it — refuses further writes.
-    pub fn commit_sealed(&mut self) -> Result<u64> {
-        self.ensure_writable()?;
-        let seq = if self.staged {
-            self.commit_with_flags(SB_FLAG_SEALED)?
-        } else {
-            // Nothing staged: the committed directory is already durable, so the flip needs no
-            // new directory and no ordering fsync — only the slot write and its barrier.
-            let sb = Superblock { seq: self.sb.seq + 1, flags: SB_FLAG_SEALED, ..self.sb };
-            self.flip(sb)?
-        };
-        self.sealed = true;
-        Ok(seq)
-    }
-
-    fn commit_with_flags(&mut self, flags: u8) -> Result<u64> {
+    fn commit_staged(&mut self) -> Result<u64> {
         // The committed directory is superseded by the one this commit writes; its extent joins
         // the free list so dead space from past commits stays answerable.
         if self.sb.dir_stored > 0 {
@@ -887,7 +846,6 @@ impl Container {
             tail,
             dir_codec,
             version: CONTAINER_VERSION,
-            flags,
         };
         self.flip(sb)
     }
@@ -1074,22 +1032,6 @@ impl crate::readat::ReadAt for MemberReader {
     }
 }
 
-impl Container {
-    /// Clear the sealed flag on a restore's staging copy — the one deliberate exception to
-    /// "sealed is final". Finality binds the ARTIFACT: the backup stays sealed forever, and a
-    /// verified copy being restored is a different file being born writable, which is the whole
-    /// point of restoring. Crate-private and reachable only from the restore path, so nothing
-    /// else can talk itself into unsealing in place.
-    pub(crate) fn clear_seal_for_restore(&mut self) -> Result<u64> {
-        if !self.sealed {
-            return Ok(self.sb.seq);
-        }
-        self.sealed = false;
-        let sb = Superblock { seq: self.sb.seq + 1, flags: 0, ..self.sb };
-        self.flip(sb)
-    }
-}
-
 /// What one [`Container::punch_free_extents`] returned in place, and what it left.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FreePunchStats {
@@ -1214,8 +1156,7 @@ impl ReclaimProtocol {
 ///
 /// Refused while a writer's working directory exists beside the file, because that directory holds
 /// state the container has not been told about and rewriting would publish a version of the
-/// container that is about to be superseded by a checkpoint of writes it never saw. Refused for a
-/// sealed container, whose bytes are final — copy it instead.
+/// container that is about to be superseded by a checkpoint of writes it never saw.
 ///
 /// # Publication
 ///
@@ -1296,9 +1237,6 @@ fn reclaim_with(
         );
     }
     let source = Container::open(path)?;
-    if source.sealed() {
-        bail!("container {} is sealed; sealed is final", path.display());
-    }
     source.lock_writer()?;
     let mut wal = path.as_os_str().to_os_string();
     wal.push("-wal");

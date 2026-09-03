@@ -1142,7 +1142,7 @@ impl NativeSnapshot {
         }
     }
 
-    /// Open a snapshot over a store held in ONE FILE — a sealed pack or a growable container.
+    /// Open a snapshot over a store held in ONE FILE — an immutable pack or a mutable container.
     ///
     /// Which of the two it is comes from the file's magic, not its extension, and both answer
     /// reads identically: same manifest, same parts, same fold, same SQL. There is no writer role
@@ -1327,7 +1327,7 @@ impl NativeSnapshot {
     }
 }
 
-/// Which single-file form a path holds: `"pack"` if sealed, `"container"` if it can still grow,
+/// Which single-file form a path holds: `"pack"` if immutable, `"container"` if mutable,
 /// `null` for a directory or anything carrying neither magic.
 ///
 /// Reading does not need this — [`NativeSnapshot::open_file`] dispatches on its own. It is here
@@ -1356,7 +1356,7 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
     Ok(commits.into_iter().map(BigInt::from).collect())
 }
 
-/// Validate and restore one immutable backup into a destination that must not exist.
+/// Validate and restore one backup into a destination that must not exist.
 #[napi]
 pub fn restore_backup<'env>(
     env: &'env Env,
@@ -1390,7 +1390,7 @@ pub fn restore_backup<'env>(
         napi::tokio::task::spawn_blocking(move || {
             let src = PathBuf::from(backup_path);
             let dst = PathBuf::from(destination_path);
-            // A backup is a sealed single-file store now: restoring is member-verified copying.
+            // A container backup restores by copying and fully verifying the exact staged store.
             // Packs remain restorable as the retired artifacts they are.
             match turndb::store::single_file_kind(&src) {
                 Some(turndb::store::SingleFileKind::Container) => {
@@ -1841,17 +1841,6 @@ impl NativeStore {
                 })
                 .map_err(|error| engine_failure("backup TurnDB store", error))
         })
-    }
-
-    /// Contract-v1 name for publishing an immutable single-file snapshot.
-    #[napi]
-    pub fn seal<'env>(
-        &self,
-        env: &'env Env,
-        path: String,
-        options: Option<NativeLifecycleOptions>,
-    ) -> Result<PromiseRaw<'env, NativeBackupResult>> {
-        self.backup(env, path, options)
     }
 
     /// Physically erase ids from this store, including retained history. External copies are out of scope.

@@ -102,8 +102,8 @@ impl<R: ReadAt> ReadAt for Slice<R> {
 /// with no idea the bytes are scattered — the translation lives here and nowhere else.
 ///
 /// Extents are logically dense by construction: extent *k+1* begins where *k* ends. A member
-/// staged whole has exactly one extent, and that case pays a single comparison — sealed and
-/// reclaimed containers never hold anything else.
+/// staged whole has exactly one extent, and that case pays a single comparison — fresh backups
+/// and reclaimed containers never hold anything else.
 pub struct Extents<R> {
     inner: R,
     /// `(logical_start, physical_off, len)`, logical_start strictly ascending and dense.

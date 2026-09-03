@@ -34,6 +34,7 @@ pub const ATOMIC_RESTORE: bool =
 #[derive(Debug)]
 pub enum BackupError {
     DestinationExists(PathBuf),
+    SourceStagingCollision { source: PathBuf, staging: PathBuf },
     InvalidBackup { path: PathBuf, reason: String },
     Unsupported(String),
 }
@@ -44,6 +45,12 @@ impl std::fmt::Display for BackupError {
             BackupError::DestinationExists(path) => {
                 write!(f, "destination {} already exists; refusing to replace it", path.display())
             }
+            BackupError::SourceStagingCollision { source, staging } => write!(
+                f,
+                "source {} is the operation's staging path {}; refusing to remove it",
+                source.display(),
+                staging.display()
+            ),
             BackupError::InvalidBackup { path, reason } => {
                 write!(f, "backup {} is invalid: {reason}", path.display())
             }
@@ -340,4 +347,20 @@ pub(crate) fn ensure_destination_available(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("inspect destination {}", path.display())),
     }
+}
+
+pub(crate) fn ensure_source_is_not_staging(source: &Path, staging: &Path) -> Result<()> {
+    let same_path = source == staging
+        || match (std::fs::canonicalize(source), std::fs::canonicalize(staging)) {
+            (Ok(source), Ok(staging)) => source == staging,
+            _ => false,
+        };
+    if same_path {
+        return Err(BackupError::SourceStagingCollision {
+            source: source.to_path_buf(),
+            staging: staging.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(())
 }

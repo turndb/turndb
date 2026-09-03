@@ -15,7 +15,7 @@ Start with the [embedding contract](embedding-contract.md) if you are integratin
 | [`bounded-compaction.md`](bounded-compaction.md) | Bounded incremental compaction |
 | [`browser-read-measurement.json`](browser-read-measurement.json) | data file |
 | [`browser.md`](browser.md) | Browser read path |
-| [`capability-contract.md`](capability-contract.md) | Capability contract v1 |
+| [`capability-contract.md`](capability-contract.md) | Capability contract v2 |
 | [`content-identity-v3.md`](content-identity-v3.md) | Exact named-content identity: part of format version 2 |
 | [`content-liveness.md`](content-liveness.md) | Content liveness and reclamation |
 | [`cross-runtime-compatibility.md`](cross-runtime-compatibility.md) | Cross-runtime compatibility |

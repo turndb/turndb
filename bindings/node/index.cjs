@@ -108,7 +108,7 @@ function guarded(fn, operation) {
     }
     let lifecycleOptions;
     if ([
-      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup', 'seal',
+      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup',
       'recoverManifest',
     ].includes(operation)) {
       lifecycleOptions = args[1];
@@ -143,7 +143,7 @@ for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSql
     'querySql', 'next', 'stats', 'compact', 'compactBounded', 'estimateCompactionSpace',
     'verify', 'erase', 'punch', 'refold', 'estimateRefoldSpace',
     'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
-    'backup', 'seal', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
+    'backup', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
     'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
@@ -169,14 +169,14 @@ const contractOperations = Object.freeze([
   'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
   'explainScan', 'schema', 'readContent', 'snapshot',
   ...(native.capabilities().sql ? ['querySql'] : []),
-  'seal', 'verify', 'spaceUsage', 'compactBounded', 'refold', 'erase', 'close',
+  'backup', 'verify', 'spaceUsage', 'compactBounded', 'refold', 'erase', 'close',
 ]);
 
 function capabilities() {
   const compiled = native.capabilities();
   return {
     ...compiled,
-    contractVersion: 1,
+    contractVersion: 2,
     profile: 'native',
     operations: [...contractOperations],
     partFormat: {

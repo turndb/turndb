@@ -33,3 +33,20 @@ fn help_mentions_the_version_verb() {
         "help does not list `version`"
     );
 }
+
+#[test]
+fn help_names_backup_as_the_only_shipping_operation() {
+    let out = turndb().arg("help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("backup    <STORE> <OUT>"), "help does not list `backup`: {help}");
+    assert!(!help.contains("seal"), "the retired shipping operation survived in help: {help}");
+
+    let retired = turndb().arg("seal").output().unwrap();
+    assert!(!retired.status.success(), "the retired `seal` command must not remain callable");
+    assert!(
+        String::from_utf8_lossy(&retired.stderr).contains("unknown verb \"seal\""),
+        "the retired command must fail as absent, got: {}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+}

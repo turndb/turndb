@@ -222,7 +222,7 @@ fn strict_tail_scan_refuses_without_truncating_valid_large_frames() {
 }
 
 #[test]
-fn a_budget_refusal_never_calls_the_sealed_backup_invalid() {
+fn a_budget_refusal_never_calls_the_backup_invalid() {
     let dir = ScopedDir::new("backup-classification");
     let source = dir.join("source");
     let artifact = dir.join("backup.turndb");
@@ -232,7 +232,7 @@ fn a_budget_refusal_never_calls_the_sealed_backup_invalid() {
     store.backup(&artifact).unwrap();
     drop(store);
 
-    // Under a starved frame budget the sealed backup refuses as exhaustion — a statement about
+    // Under a starved frame budget the backup refuses as exhaustion — a statement about
     // the BUDGET, and it must classify as one.
     let error = turndb::store::open_read_container_with_limits(
         &artifact,

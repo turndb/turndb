@@ -1304,7 +1304,7 @@ pub fn open_read_container_at_with_limits(
 /// can still grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingleFileKind {
-    /// Sealed: footer at EOF, immutable, writer-less by definition.
+    /// Footer-addressed, immutable, and writer-less by definition.
     Pack,
     /// Growable: alternating superblocks at the head, appended beyond the committed tail.
     Container,
@@ -1543,6 +1543,99 @@ pub struct StoreVerification {
     pub unidentified_content_values: usize,
 }
 
+fn verify_committed_store(
+    parts: &[Arc<Part>],
+    fold_store: &Fold,
+    chain: ChainReport,
+    control: &crate::control::OperationControl,
+) -> Result<StoreVerification> {
+    let fold =
+        verification_integrity("verify fold frames", fold_store.scrub_with_control(control))?;
+    let mut part_sections = 0usize;
+    for part in parts {
+        control.check("store verification")?;
+        let sections = verification_integrity(
+            "verify immutable part sections",
+            part.verify_sections_with_control(control),
+        )?;
+        part_sections = part_sections
+            .checked_add(sections)
+            .ok_or_else(|| anyhow::anyhow!("verified part section count overflow"))?;
+    }
+    let ids = verification_integrity("enumerate committed records", read::ids(parts))?;
+    let mut content_values = 0usize;
+    let mut content_bytes = 0u64;
+    let mut content_identities = 0usize;
+    let mut unidentified_content_values = 0usize;
+    for id in &ids {
+        control.check("store verification")?;
+        let record = verification_integrity("decode committed record", read::get(parts, id))?
+            .ok_or_else(|| {
+                anyhow::Error::new(crate::error::IntegrityError::new(
+                    "decode committed record",
+                    anyhow::anyhow!("live id {id:?} disappeared during verification"),
+                ))
+            })?;
+        for content in &record.contents {
+            control.check("store verification")?;
+            let bytes = verification_integrity(
+                "reconstruct committed content",
+                read::reconstruct_content(parts, fold_store, id, &content.name),
+            )?
+            .ok_or_else(|| {
+                anyhow::Error::new(crate::error::IntegrityError::new(
+                    "reconstruct committed content",
+                    anyhow::anyhow!(
+                        "record {id:?} lost named content {:?} during verification",
+                        content.name
+                    ),
+                ))
+            })?;
+            content_values = content_values
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("verified content value count overflow"))?;
+            content_bytes = content_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("verified content byte count overflow"))?;
+            match content.identity {
+                Some(want) => {
+                    let got = crate::types::ContentHash::of(&bytes);
+                    if got != want {
+                        return Err(crate::error::IntegrityError::new(
+                            "verify committed content identity",
+                            anyhow::anyhow!(
+                                "record {id:?} content {:?} hashes to {got} but claims {want}",
+                                content.name
+                            ),
+                        )
+                        .into());
+                    }
+                    content_identities = content_identities.checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("verified content identity count overflow")
+                    })?;
+                }
+                None => {
+                    unidentified_content_values =
+                        unidentified_content_values.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("unidentified content value count overflow")
+                        })?;
+                }
+            }
+        }
+    }
+    Ok(StoreVerification {
+        chain,
+        fold,
+        parts: parts.len(),
+        part_sections,
+        records: ids.len(),
+        content_values,
+        content_bytes,
+        content_identities,
+        unidentified_content_values,
+    })
+}
+
 /// The retained-chain walk for a directory session's own verify. The layout is retired as a
 /// public surface; a converter-opened session still answers `verify` honestly while it lives.
 fn verify_chain_dir(
@@ -1599,23 +1692,56 @@ fn verify_chain_dir(
     Ok(report)
 }
 
-/// Copy a single-file store's committed snapshot into a fresh, SEALED container at `out`.
+/// Best-effort cleanup ownership for an artifact that has not crossed its publication rename.
+struct UnpublishedArtifact {
+    path: PathBuf,
+    armed: bool,
+}
+
+fn backup_staging_paths(out: &Path) -> (PathBuf, PathBuf) {
+    let mut staging = out.as_os_str().to_os_string();
+    staging.push(".backing-up");
+    let mut legacy = out.as_os_str().to_os_string();
+    legacy.push(".sealing");
+    (PathBuf::from(staging), PathBuf::from(legacy))
+}
+
+impl UnpublishedArtifact {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn published(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnpublishedArtifact {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = crate::vfs::unlink(&self.path);
+        }
+    }
+}
+
+/// Copy a single-file store's committed snapshot into a fresh container at `out`.
 ///
 /// What a pack carries, in the pack's spirit: `MANIFEST`, every part it names, and the live
-/// generation's members — no retained log (snapshots of an immutable artifact are meaningless),
-/// no writer state. Staged beside the destination, committed sealed, verified member by member,
-/// then published with a rename that refuses to replace. A crash leaves staging litter and an
-/// untouched destination.
-fn seal_container_copy(
+/// generation's members — no retained log and no writer state. Staged beside the destination,
+/// committed, fully verified as a store, then published with a rename that refuses to replace. A
+/// crash leaves staging litter and an untouched destination.
+fn backup_container_copy(
     container: &std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
     manifest: &Manifest,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
     out: &Path,
     control: &crate::control::OperationControl,
 ) -> Result<crate::pack::BackupStats> {
-    let mut staging = out.as_os_str().to_os_string();
-    staging.push(".sealing");
-    let staging = PathBuf::from(staging);
+    let (staging, legacy_staging) = backup_staging_paths(out);
+    let _ = crate::vfs::unlink(&legacy_staging);
     let _ = crate::vfs::unlink(&staging);
+    let mut unpublished = UnpublishedArtifact::new(staging.clone());
     let mut fresh = crate::container::Container::create(&staging)?;
 
     let c = container.lock().expect("container lock poisoned");
@@ -1643,10 +1769,12 @@ fn seal_container_copy(
     }
     drop(c);
     control.check("backup")?;
-    fresh.commit_sealed()?;
-    fresh.verify()?;
+    fresh.commit()?;
     drop(fresh);
+    verify_container_artifact(&staging, cfg, read_limits, control)
+        .with_context(|| format!("verify staged backup {}", staging.display()))?;
     crate::vfs::rename_noreplace(&staging, out)?;
+    unpublished.published();
     if let Some(parent) = out.parent() {
         // The published name is the result; a failed directory sync means it may not survive a
         // crash, and the operation reports that rather than success.
@@ -1712,8 +1840,77 @@ fn verify_chain_container(
             bail!("MANIFEST diverges from its retained copy at commit {newest}");
         }
         report.links += 1;
+    } else if c.contains("MANIFEST") {
+        // Snapshot artifacts intentionally omit retained history. Their live manifest is still
+        // authority, so its part pins must be checked directly rather than disappearing with the
+        // chain that normally duplicates the live revision.
+        let bytes = c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
+        let manifest = Manifest::parse(&bytes).context("live manifest is corrupt")?;
+        for part in &manifest.parts {
+            control.check("manifest verification")?;
+            match &part.b3 {
+                Some(want) => {
+                    let reader = c.extent(&part.file).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "part {} named by the live manifest is not held by the container",
+                            part.file
+                        )
+                    })?;
+                    let got = hash_reader_with_control(&reader, control, "manifest verification")?
+                        .to_hex()
+                        .to_string();
+                    if *want != got {
+                        bail!(
+                            "part {} drifted from the digest the live manifest pinned",
+                            part.file
+                        );
+                    }
+                    report.part_digests += 1;
+                }
+                None => report.undigested += 1,
+            }
+        }
+    } else if c.seq() != 0 {
+        // Sequence zero is the one valid manifestless state: a newly created store before its
+        // first publication. Once any container state has committed, losing MANIFEST is losing
+        // the authority for every remaining member, never a return to emptiness.
+        bail!("committed container sequence {} has no MANIFEST authority", c.seq());
     }
     Ok(report)
+}
+
+/// Validate exactly the container bytes that an artifact publication would make reachable.
+/// This is read-only: it verifies the member directory and payload checksums, opens every
+/// manifest-named part and fold member, walks the retained chain, scrubs every section/frame, and
+/// reconstructs every live named content value.
+fn verify_container_artifact(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<(usize, u64, u64, StoreVerification)> {
+    let container = verification_integrity(
+        "open container for verification",
+        crate::container::Container::open(path),
+    )?;
+    let members = verification_integrity("verify container members", container.verify())?;
+    let member_bytes = container.member_bytes();
+    let chain = verification_integrity(
+        "verify retained manifest chain",
+        verify_chain_container(&container, control),
+    )?;
+    drop(container);
+
+    let store = verification_integrity(
+        "open container store for verification",
+        open_read_container_with_limits(path, cfg, read_limits),
+    )?;
+    let commit = store.manifest.commit;
+    let report = verification_integrity(
+        "verify complete container store",
+        verify_committed_store(&store.parts, &store.fold, chain, control),
+    )?;
+    Ok((members, member_bytes, commit, report))
 }
 
 fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
@@ -1833,12 +2030,6 @@ pub fn recover_manifest_file_with_limits_and_control(
     let read_limits = read_limits.validate()?;
     control.check("manifest recovery")?;
     let mut container = crate::container::Container::open(path)?;
-    if container.sealed() {
-        bail!(
-            "{} is sealed; sealed is final — recovery mutates, so recover a copy instead",
-            path.display()
-        );
-    }
     container.lock_writer()?;
     control.check("manifest recovery")?;
     if container
@@ -2175,9 +2366,6 @@ fn recover_store_from_reclaim_anchor(
     let anchor = crate::container::Container::open(&names.anchor)
         .with_context(|| format!("open reclaim anchor {}", names.anchor.display()))?;
     anchor.lock_writer().with_context(|| "another recovery of this store is in progress")?;
-    if anchor.sealed() {
-        bail!("reclaim anchor {} is sealed; not a reclaim's output", names.anchor.display());
-    }
     let manifest = Manifest::parse(&anchor.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
     let control = crate::control::OperationControl::default();
     validate_recovery_candidate_container(
@@ -2424,10 +2612,10 @@ pub fn verify_chain_file(path: &Path) -> Result<ChainReport> {
     verify_chain_container(&c, &crate::control::OperationControl::default())
 }
 
-/// Restore a single-file backup: verify every member of `src` against its recorded checksums,
-/// then publish a byte-identical copy at `dst` with a rename that refuses to replace. The
-/// backup IS a store — sealed by `backup`, final by flag — so restoring is verified copying,
-/// and a crash leaves staging litter and an untouched destination.
+/// Restore a single-file backup: copy `src` into staging, fully verify that exact staged store,
+/// then publish it at `dst` with a rename that refuses to replace. The backup is itself a store,
+/// so restoring is verified copying, and a crash leaves staging litter and an untouched
+/// destination.
 pub fn restore_file(src: &Path, dst: &Path) -> Result<crate::pack::RestoreStats> {
     restore_file_with_control(src, dst, &crate::control::OperationControl::default())
 }
@@ -2441,15 +2629,10 @@ pub fn restore_file_with_control(
 ) -> Result<crate::pack::RestoreStats> {
     control.check("backup restore")?;
     crate::pack::ensure_destination_available(dst)?;
-    let c = crate::container::Container::open(src)?;
-    // A member failing its checksum is CORRUPTION, and the refusal must classify as such —
-    // the same integrity wrapper every verification path speaks through.
-    let members = verification_integrity("verify backup before restoring", c.verify())?;
-    drop(c);
-    control.check("backup restore")?;
     let mut staging = dst.as_os_str().to_os_string();
     staging.push(".restoring");
     let staging = PathBuf::from(staging);
+    crate::pack::ensure_source_is_not_staging(src, &staging)?;
     let _ = crate::vfs::unlink(&staging);
     // The copy goes through the vfs seam in bounded chunks and is fsynced before anything
     // depends on it: the publishing rename must never make bytes reachable that a crash could
@@ -2473,13 +2656,19 @@ pub fn restore_file_with_control(
         }
         crate::vfs::sync_file(&to, &staging)?;
     }
-    // Restoring births a WRITABLE store: the backup stays sealed forever, and the copy is a new
-    // file whose life is just starting. The unseal happens on the staging side of the rename, so
-    // the destination is never observable sealed.
-    {
-        let mut fresh = crate::container::Container::open(&staging)?;
-        fresh.clear_seal_for_restore()?;
-    }
+    let (members, bytes, commit, _) = match verify_container_artifact(
+        &staging,
+        FoldCfg::default(),
+        ReadLimits::default(),
+        control,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = crate::vfs::unlink(&staging);
+            return Err(error)
+                .with_context(|| format!("verify staged restore {}", staging.display()));
+        }
+    };
     if let Err(interrupted) = control.check("backup restore publication") {
         let _ = crate::vfs::unlink(&staging);
         return Err(interrupted.into());
@@ -2490,12 +2679,6 @@ pub fn restore_file_with_control(
             format!("sync {} after publishing {}", parent.display(), dst.display())
         })?;
     }
-    // Member bytes, not file length: the same accounting the backup reported, so a consumer can
-    // compare the two stats and see the identity they describe.
-    let restored = crate::container::Container::open(dst)?;
-    let bytes = restored.member_bytes();
-    let commit =
-        Manifest::parse(&restored.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?.commit;
     Ok(crate::pack::RestoreStats { files: members, bytes, commit })
 }
 
@@ -2510,7 +2693,7 @@ pub struct ConvertStats {
     pub commit: u64,
 }
 
-/// Convert an old layout — a store directory, or a sealed pack — into a single-file store.
+/// Convert an old layout — a store directory, or an immutable pack — into a single-file store.
 ///
 /// This is the one door those layouts keep. A directory store is opened with the writer role
 /// (which settles its WAL: acknowledged records ride along, exactly as a reopen would carry
@@ -2976,9 +3159,6 @@ impl Store {
                 Err(e) => return Err(e),
             }
         };
-        if container.sealed() {
-            bail!("{} is sealed; sealed is final — a writer cannot open it", path.display());
-        }
         container.lock_writer()?;
         // The store is present, so it is authority: every transient name beside it — reclaim
         // material, a Windows pending publish, a merge's scratch, an artifact staging — is dead by
@@ -3491,97 +3671,7 @@ impl Store {
                 }
             },
         )?;
-        let fold =
-            verification_integrity("verify fold frames", self.fold.scrub_with_control(control))?;
-        let mut part_sections = 0usize;
-        for part in &self.parts {
-            control.check("store verification")?;
-            let sections = verification_integrity(
-                "verify immutable part sections",
-                part.verify_sections_with_control(control),
-            )?;
-            part_sections = part_sections
-                .checked_add(sections)
-                .ok_or_else(|| anyhow::anyhow!("verified part section count overflow"))?;
-        }
-        // Reconstruct every named value in the committed snapshot. Section and frame checks prove
-        // the storage containers; this proves the references inside them resolve to the exact
-        // content identities the records claim. Deliberately use the committed read core rather
-        // than `Store::ids`/`Store::reconstruct_content`, which include staged memtable state.
-        let ids = verification_integrity("enumerate committed records", read::ids(&self.parts))?;
-        let mut content_values = 0usize;
-        let mut content_bytes = 0u64;
-        let mut content_identities = 0usize;
-        let mut unidentified_content_values = 0usize;
-        for id in &ids {
-            control.check("store verification")?;
-            let record =
-                verification_integrity("decode committed record", read::get(&self.parts, id))?
-                    .ok_or_else(|| {
-                        anyhow::Error::new(crate::error::IntegrityError::new(
-                            "decode committed record",
-                            anyhow::anyhow!("live id {id:?} disappeared during verification"),
-                        ))
-                    })?;
-            for content in &record.contents {
-                control.check("store verification")?;
-                let bytes = verification_integrity(
-                    "reconstruct committed content",
-                    read::reconstruct_content(&self.parts, &self.fold, id, &content.name),
-                )?
-                .ok_or_else(|| {
-                    anyhow::Error::new(crate::error::IntegrityError::new(
-                        "reconstruct committed content",
-                        anyhow::anyhow!(
-                            "record {id:?} lost named content {:?} during verification",
-                            content.name
-                        ),
-                    ))
-                })?;
-                content_values = content_values
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("verified content value count overflow"))?;
-                content_bytes = content_bytes
-                    .checked_add(bytes.len() as u64)
-                    .ok_or_else(|| anyhow::anyhow!("verified content byte count overflow"))?;
-                match content.identity {
-                    Some(want) => {
-                        let got = crate::types::ContentHash::of(&bytes);
-                        if got != want {
-                            return Err(crate::error::IntegrityError::new(
-                                "verify committed content identity",
-                                anyhow::anyhow!(
-                                    "record {id:?} content {:?} hashes to {got} but claims {want}",
-                                    content.name
-                                ),
-                            )
-                            .into());
-                        }
-                        content_identities =
-                            content_identities.checked_add(1).ok_or_else(|| {
-                                anyhow::anyhow!("verified content identity count overflow")
-                            })?;
-                    }
-                    None => {
-                        unidentified_content_values =
-                            unidentified_content_values.checked_add(1).ok_or_else(|| {
-                                anyhow::anyhow!("unidentified content value count overflow")
-                            })?;
-                    }
-                }
-            }
-        }
-        Ok(StoreVerification {
-            chain,
-            fold,
-            parts: self.parts.len(),
-            part_sections,
-            records: ids.len(),
-            content_values,
-            content_bytes,
-            content_identities,
-            unidentified_content_values,
-        })
+        verify_committed_store(&self.parts, &self.fold, chain, control)
     }
 
     /// Exact file-size and physical-row distribution for the current live immutable parts.
@@ -3991,7 +4081,7 @@ impl Store {
         result
     }
 
-    /// Settle every accepted operation and publish a verified, immutable backup artifact.
+    /// Settle every accepted operation and publish a verified, self-contained backup store.
     ///
     /// The destination must not exist. Holding `&mut self` prevents this process from changing the
     /// manifest while the packer walks the files it names — that part holds everywhere. Excluding a
@@ -4004,7 +4094,7 @@ impl Store {
 
     /// [`Store::backup`] with cooperative cancellation before atomic artifact publication.
     ///
-    /// Sync/flush may publish an equivalent immutable representation of earlier accepted writes in
+    /// Sync/flush may publish an equivalent representation of earlier accepted writes in
     /// the source store. Cancellation never publishes the backup destination.
     pub fn backup_with_control(
         &mut self,
@@ -4028,16 +4118,26 @@ impl Store {
     ) -> Result<crate::pack::BackupStats> {
         control.check("backup")?;
         crate::pack::ensure_destination_available(out)?;
+        if let Home::File { path, .. } = &self.home {
+            let (staging, legacy_staging) = backup_staging_paths(out);
+            crate::pack::ensure_source_is_not_staging(path, &staging)?;
+            crate::pack::ensure_source_is_not_staging(path, &legacy_staging)?;
+        }
         self.sync_with_control(control)?;
         self.flush_with_control(control)?;
         control.check("backup")?;
         match &self.home {
-            // A backup of a single-file store IS a sealed container: the members a pack would
-            // carry — MANIFEST, the live parts, the live generation — one aligned extent each,
-            // flagged final, verified whole, and published only with a no-replace rename.
-            Home::File { container, .. } => {
-                seal_container_copy(container, &self.manifest, out, control)
-            }
+            // A backup of a single-file store is a self-contained container: the members a pack
+            // would carry — MANIFEST, the live parts, the live generation — one aligned extent
+            // each, verified whole, and published only with a no-replace rename.
+            Home::File { container, .. } => backup_container_copy(
+                container,
+                &self.manifest,
+                self.cfg,
+                self.read_limits,
+                out,
+                control,
+            ),
             // The one directory session left is the converter's, and its whole life is settle,
             // checkpoint, close. The pack writer is gone; converting IS the backup of this layout.
             Home::Dir(dir) => bail!(
@@ -5488,7 +5588,7 @@ impl Store {
 
     /// Reclaim erased space IN PLACE: punch every fold block no live record can reach.
     ///
-    /// The cheap half of erasure, and the one a sealed store wants. A re-fold reclaims the same
+    /// The cheap half of erasure when a full rewrite is not requested. A re-fold reclaims the same
     /// bytes by rewriting the world — correct, thorough, and O(store); this walks the live
     /// records' piece references, finds blocks nothing reaches, records them in the manifest, and
     /// deallocates their extents. Offsets do not move, so no part is rebuilt and no reader is

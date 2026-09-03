@@ -47,7 +47,7 @@ Work may overlap; gates may not be reordered.
 ## The entrances
 
 The product has several entrances, and they serve different people. The CLI is the **operator's
-porch** — evaluate, inspect, seal, recover; "point turndb at your traces and measure" lives
+porch** — evaluate, inspect, back up, recover; "point turndb at your traces and measure" lives
 there. The viewer is the **reader's porch**: a link someone opens. The server is the
 **deployment's porch**. The entrance that decides adoption is none of these: it is the **SDKs** —
 npm install, pip install, open a path, write — the way SQLite is adopted, by being everywhere and
@@ -56,7 +56,7 @@ TypeScript; Python follows because the agent ecosystem's center of gravity lives
 may grow a bespoke surface. Every binding is a thin shell over one baseline:
 
 * one **capability contract** — what every Tier-1 binding exposes: open/put/sync/flush,
-  structured scan, content reads, seal, maintenance, typed error classes, explicit capability
+  structured scan, content reads, backup, maintenance, typed error classes, explicit capability
   reporting where a platform gives something up;
 * one **query contract, serializable as data** — the structured scan request and its Arrow IPC
   and row results, the same shape in-process, over N-API, over wasm, over HTTP. SQL stays an
@@ -223,9 +223,9 @@ anything is published against it.
 - **Reclamation in place comes back.** Freed extents are never reused, but on Linux a dead extent
   in the single file can be hole-punched — the existing `punch` invariant ("reclaim without moving
   an offset") applied to the container; rewrite remains the portable fallback.
-- The pack becomes the *sealed* state of a container — one format, a finalized bit — and `unpack`
-  and every restore-to-directory path go away. Restore produces a `.turndb`; copying a store is
-  `cp`.
+- Backup produces a self-contained ordinary container — one format and one lifecycle — and
+  `unpack` and every restore-to-directory path go away. Restore produces a `.turndb`; copying a
+  store is `cp`.
 - The purge: CLI commands, binding constructors, examples, and docs stop accepting or producing
   directory stores, and the layout is not preserved internally either — once the native path
   passes its sweeps, the directory store's only surviving reader is the one-shot converter that
@@ -315,7 +315,7 @@ The contracts above, written down and enforced, then the bindings rebased onto t
 - The capability contract and the query contract as documents with conformance tests — the
   three-path differential gate extended to run per binding, so a binding cannot drift from the
   engine's answers.
-- The Node binding rebased onto the single-file store: `open_file` semantics, seal, the space
+- The Node binding rebased onto the single-file store: `open_file` semantics, backup, the space
   operations, the query contract as its query surface. CommandSuite-ready, and CommandSuite is
   the gate's consumer.
 - Python Tier 1: a PyO3 binding on the actor discipline the Node binding proved, same contract,
@@ -443,7 +443,7 @@ while the product gains a server the way SQLite gained litestream and sqld — b
   (importer formats accepted directly), query endpoint speaking Arrow IPC, health and metrics from
   the existing pull-based surfaces.
 - The distribution loop that the earlier phases make possible, as a supported workflow: the server
-  writes live stores, seals history into containers on a schedule, and publishes them to static
+  writes live stores, backs up history into containers on a schedule, and publishes them to static
   hosting — where Phase 3 viewers query them with no server involvement. Write centrally, read
   anywhere, pay for compute only at the write path.
 - Multi-store tenancy (one store per member/project, which the id design already anticipates)

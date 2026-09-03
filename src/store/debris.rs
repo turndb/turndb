@@ -44,7 +44,8 @@ pub enum DebrisKind {
     /// `<part>.s<n>.tmp` (directory layout): the part builder's spool, for either part form
     /// (`part-<seq>.part`, or a merged `part-<lo>-<hi>.part`).
     PartBuilderSpool,
-    /// `<artifact>.sealing`, `.restoring`, `.converting`: an artifact operation's staging file.
+    /// Current or legacy backup staging, `.restoring`, or `.converting`: an artifact operation's
+    /// staging file. Legacy names are recognized for upgrade cleanup but never produced.
     ArtifactStaging,
     /// `<store>-hot/`: a 0.1.x working session (CHANGELOG.md, 0.1.0 and 0.1.2) that may hold
     /// acknowledged, unfolded writes only that release can settle. Reported, never removed: a
@@ -216,6 +217,7 @@ fn single_file_finals(store: &Path) -> Vec<PathBuf> {
         names.anchor,
         names.candidate_tmp,
         names.candidate,
+        with_suffix(store, ".backing-up"),
         with_suffix(store, ".sealing"),
         with_suffix(store, ".restoring"),
         with_suffix(store, ".converting"),
@@ -248,7 +250,7 @@ pub(crate) fn scan_single_file(store: &Path, read_limits: ReadLimits) -> Result<
     consider(with_suffix(store, "-hot"), DebrisKind::LegacyHotDirectory, true);
     // The store's own artifact staging: an operation whose destination was `<store>` and died
     // before publishing. Beside a present store it is dead; beside an absent one, reported.
-    for suffix in [".sealing", ".restoring", ".converting"] {
+    for suffix in [".backing-up", ".sealing", ".restoring", ".converting"] {
         consider(with_suffix(store, suffix), DebrisKind::ArtifactStaging, false);
     }
     let finals: Vec<std::ffi::OsString> = single_file_finals(store)
@@ -698,11 +700,13 @@ mod tests {
     fn artifact_stagings_are_reported_and_never_removed_by_a_reader() {
         let d = scratch("artifact");
         let out = d.join("backup.turndb");
-        std::fs::write(&out, b"sealed").unwrap();
-        std::fs::write(d.join("backup.turndb.sealing"), b"x").unwrap();
+        std::fs::write(&out, b"backup").unwrap();
+        std::fs::write(d.join("backup.turndb.backing-up"), b"x").unwrap();
+        std::fs::write(d.join("backup.turndb.sealing"), b"legacy").unwrap();
         let r = debris_report(&out).unwrap();
-        assert_eq!(r.entries.len(), 1);
-        assert_eq!(r.entries[0].kind, DebrisKind::ArtifactStaging);
+        assert_eq!(r.entries.len(), 2);
+        assert!(r.entries.iter().all(|entry| entry.kind == DebrisKind::ArtifactStaging));
+        assert!(d.join("backup.turndb.backing-up").exists());
         assert!(d.join("backup.turndb.sealing").exists());
         let _ = std::fs::remove_dir_all(&d);
     }

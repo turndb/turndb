@@ -9,9 +9,10 @@ import { capabilities, open, openFile, TurndbError } from '../index.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const conformanceDir = resolve(here, '../../../conformance/v1');
+const capabilityConformanceDir = resolve(here, '../../../conformance/v2');
 const corpus = JSON.parse(await readFile(join(conformanceDir, 'corpus.json'), 'utf8'));
 const capabilitySchema = JSON.parse(
-  await readFile(join(conformanceDir, 'capabilities.schema.json'), 'utf8'),
+  await readFile(join(capabilityConformanceDir, 'capabilities.schema.json'), 'utf8'),
 );
 
 function scalarToPortable(scalar) {
@@ -199,10 +200,10 @@ async function temporaryPath(t) {
   return join(root, 'fixture.turndb');
 }
 
-test('portable capability response implements contract v1', async () => {
+test('portable capability response implements contract v2', async () => {
   const profile = await capabilities();
   for (const field of capabilitySchema.required) assert(Object.hasOwn(profile, field), field);
-  assert.equal(profile.contractVersion, 1);
+  assert.equal(profile.contractVersion, 2);
   assert.equal(profile.profile, 'wasi');
   assert.equal(profile.writerExclusion, 'embedder_enforced');
   assert.equal(profile.threads, false);

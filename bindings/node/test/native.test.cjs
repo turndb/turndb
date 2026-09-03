@@ -20,11 +20,11 @@ function temporaryStore(t) {
 
 test('reports the native capability profile without a portable fallback', () => {
   assert.deepEqual(capabilities(), {
-    contractVersion: 1,
+    contractVersion: 2,
     profile: 'native',
     operations: [
       'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
-      'explainScan', 'schema', 'readContent', 'snapshot', 'querySql', 'seal', 'verify', 'spaceUsage',
+      'explainScan', 'schema', 'readContent', 'snapshot', 'querySql', 'backup', 'verify', 'spaceUsage',
       'compactBounded', 'refold', 'erase', 'close',
     ],
     partFormat: { write: 2, readMax: 2 },
@@ -857,7 +857,7 @@ test('backs up an actor-ordered cut and safely restores a writable store', async
   );
   const backup = await store.backup(artifact);
   assert(backup.files >= 3n);
-  // Member payload bytes: the sealed file adds its superblocks, alignment, and directory.
+  // Member payload bytes: the backup file adds its superblocks, alignment, and directory.
   assert(backup.bytes > 0n && backup.bytes <= BigInt(fs.statSync(artifact).size));
   assert(backup.commit > 0n);
 
@@ -1463,7 +1463,7 @@ test('discovers typed field and content namespaces without reading values', asyn
   });
 });
 
-test('serves a store held in one file, live or sealed, entirely from Node', async (t) => {
+test('serves a live store and its backup from one file, entirely from Node', async (t) => {
   const dir = temporaryStore(t);
   const store = await NativeStore.open(dir);
   const body = Buffer.from(JSON.stringify([{ role: 'user', content: 'single file' }]));
@@ -1482,36 +1482,34 @@ test('serves a store held in one file, live or sealed, entirely from Node', asyn
 
   assert.equal(singleFileKind(dir), 'container', 'the store IS the single-file form');
 
-  const sealed = path.join(os.tmpdir(), `${path.basename(dir)}.sealed.turndb`);
-  t.after(() => fs.rmSync(sealed, { force: true }));
-  await store.backup(sealed);
+  const backup = path.join(os.tmpdir(), `${path.basename(dir)}.backup.turndb`);
+  t.after(() => fs.rmSync(backup, { force: true }));
+  await store.backup(backup);
   await store.close(false);
-  assert.equal(singleFileKind(sealed), 'container', 'a sealed snapshot is a container by magic');
+  assert.equal(singleFileKind(backup), 'container', 'a backup is a container by magic');
 
-  // The live file and its sealed snapshot answer identically, read directly as files.
+  // The live file and its backup answer identically, read directly as files.
   const fromLive = await NativeSnapshot.openFile(dir);
   const want = await fromLive.scan();
-  const snapshot = await NativeSnapshot.openFile(sealed);
+  const snapshot = await NativeSnapshot.openFile(backup);
   const got = await snapshot.scan();
   assert.deepEqual(
     got.rows.map((row) => row.id),
     want.rows.map((row) => row.id),
-    'the sealed snapshot must page the same ids',
+    'the backup must page the same ids',
   );
   assert.deepEqual(
     await snapshot.readContent('trace/0001#input', 'body'),
     body,
-    'the sealed snapshot must reconstruct byte-exact',
+    'the backup must reconstruct byte-exact',
   );
   await snapshot.close();
   await fromLive.close();
 
-  // Sealed is final: no writer, ever.
-  await assert.rejects(
-    NativeStore.open(sealed),
-    (error) => error instanceof TurnDbError && /sealed/.test(error.message),
-    'a sealed snapshot must refuse a writer',
-  );
+  // A backup is an ordinary independent store, so it can continue on its own lifecycle.
+  const backupWriter = await NativeStore.open(backup);
+  await backupWriter.write([{ kind: 'delete', id: 'trace/0001#input' }], true);
+  await backupWriter.close();
 
   const plain = `${dir}.plain`;
   fs.writeFileSync(plain, Buffer.alloc(16384, 0x2e));

@@ -1,4 +1,4 @@
-//! Python contract-v1 binding. One worker owns each mutable store; Python only submits commands.
+//! Python binding. One worker owns each mutable store; Python only submits commands.
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -84,7 +84,7 @@ enum Operation {
     Write { operations: Vec<WriteOp>, durable: bool },
     Sync,
     Flush,
-    Seal(PathBuf),
+    Backup(PathBuf),
     Scan(ScanRequest),
     Explain(ScanRequest),
     ReadContent { id: String, name: String },
@@ -272,7 +272,7 @@ fn run_writer_operation(store: &mut EngineStore, operation: Operation) -> Result
         }
         Operation::Sync => store.sync().map(|_| Value::Null),
         Operation::Flush => store.flush().map(|part| Value::Bool(part.is_some())),
-        Operation::Seal(path) => store.backup(&path).map(|result| {
+        Operation::Backup(path) => store.backup(&path).map(|result| {
             json!({
                 "files": result.files.to_string(),
                 "bytes": result.bytes.to_string(),
@@ -811,11 +811,11 @@ impl PyStore {
         value.as_bool().ok_or_else(|| TurnDbError::new_err("invalid flush response"))
     }
 
-    fn seal(&self, py: Python<'_>, path: String) -> PyResult<PyObject> {
+    fn backup(&self, py: Python<'_>, path: String) -> PyResult<PyObject> {
         if path.is_empty() {
-            return Err(InvalidArgumentError::new_err("seal path must not be empty"));
+            return Err(InvalidArgumentError::new_err("backup path must not be empty"));
         }
-        run_value(py, &self.actor, Operation::Seal(PathBuf::from(path)))
+        run_value(py, &self.actor, Operation::Backup(PathBuf::from(path)))
     }
 
     fn scan(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
@@ -896,11 +896,11 @@ fn capabilities(py: Python<'_>) -> PyResult<PyObject> {
     value_to_py(
         py,
         json!({
-            "contractVersion": 1,
+            "contractVersion": 2,
             "profile": "native",
             "operations": [
                 "openWriter", "openSnapshot", "compiledCapabilities", "write", "sync", "flush",
-                "scan", "explainScan", "schema", "readContent", "snapshot", "seal", "verify", "spaceUsage",
+                "scan", "explainScan", "schema", "readContent", "snapshot", "backup", "verify", "spaceUsage",
                 "compactBounded", "refold", "erase", "close"
             ],
             "partFormat": { "write": compiled.part_format_write, "readMax": compiled.part_format_read_max },

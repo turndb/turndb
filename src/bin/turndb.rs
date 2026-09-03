@@ -1,8 +1,8 @@
 //! The `turndb` CLI — the operator's porch on the product.
 //!
-//! A store you can inspect, verify, query, seal, and recover from a command line with no server
+//! A store you can inspect, verify, query, back up, and recover from a command line with no server
 //! running is a store an auditor can trust. Every verb takes a `.turndb` file — the only layout a
-//! store has. The retired layouts (store directories, sealed packs) keep exactly one door:
+//! store has. The retired layouts (store directories and immutable packs) keep exactly one door:
 //! `convert`.
 //!
 //! Argument parsing is by hand, on purpose: the crate's dependency discipline does not bend for
@@ -19,7 +19,7 @@ turndb — the database for AI traces, in one file
 
 usage: turndb <verb> [args]
 
-  reading (STORE is a .turndb file, live or sealed):
+  reading (STORE is a .turndb file):
     inspect   <STORE>            what is inside: manifest, parts, fold, members, snapshots
     ids       <STORE>            every live record id, one per line
     get       <STORE> <ID>       reconstruct one record's content to stdout, byte-exact
@@ -48,8 +48,8 @@ usage: turndb <verb> [args]
                                  returns edge bytes and fragmentation that punch cannot
 
   shipping:
-    seal      <STORE> <OUT>      the committed snapshot as one SEALED file: no retained log, no
-                                 writer ever again, published only if OUT does not exist
+    backup    <STORE> <OUT>      the committed snapshot as one self-contained store: no retained
+                                 log, published only if OUT does not exist
 
   converting (the one door retired layouts keep):
     convert   <SRC> <OUT>        store directory or pack -> single-file store, verified whole
@@ -118,7 +118,7 @@ fn open_read(path: &Path) -> Result<ReadStore> {
             path.display()
         ),
         Source::Pack => bail!(
-            "{} is a sealed pack — a retired layout; convert it first:\n  turndb convert {} <OUT>.turndb",
+            "{} is an immutable pack — a retired layout; convert it first:\n  turndb convert {} <OUT>.turndb",
             path.display(),
             path.display()
         ),
@@ -275,12 +275,12 @@ fn run(args: &[String]) -> Result<()> {
             println!("{imported} records into {}", file.display());
             Ok(())
         }
-        "seal" => {
+        "backup" => {
             let mut s = open_writer(&arg(0, "STORE")?)?;
             let out = arg(1, "OUT")?;
             let st = s.backup(&out)?;
             println!(
-                "sealed commit {} into {}: {} members, {} bytes",
+                "backed up commit {} into {}: {} members, {} bytes",
                 st.commit,
                 out.display(),
                 st.files,
@@ -343,7 +343,7 @@ fn inspect(path: &Path) -> Result<()> {
     let rs = open_read(path)?;
     let m = rs.manifest();
     let c = turndb::container::Container::open(path)?;
-    println!("store: {}{}", path.display(), if c.sealed() { " (sealed)" } else { "" });
+    println!("store: {}", path.display());
     println!(
         "manifest: commit {}, next_seq {}, fold generation {}, tail (seg {}, off {})",
         m.commit, m.next_seq, m.fold_gen, m.fold_seg, m.fold_off
@@ -385,7 +385,7 @@ fn verify(path: &Path, deep: bool) -> Result<()> {
     }
     println!("parts: {} sections pass their checksums", sections);
     // The chain: prev-links across the retained window and every part pin hashed against the
-    // extents the file actually holds. A sealed snapshot carries no retained log, so its chain
+    // extents the file actually holds. A backup carries no retained log, so its chain
     // is the live manifest's pins alone — and those are checked either way.
     let chain = turndb::store::verify_chain_file(path).context("chain verification failed")?;
     let mut pins = 0usize;

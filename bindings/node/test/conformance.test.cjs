@@ -8,9 +8,10 @@ const test = require('node:test');
 const { capabilities, NativeSnapshot, NativeStore, TurnDbError } = require('..');
 
 const conformanceDir = path.resolve(__dirname, '../../../conformance/v1');
+const capabilityConformanceDir = path.resolve(__dirname, '../../../conformance/v2');
 const corpus = JSON.parse(fs.readFileSync(path.join(conformanceDir, 'corpus.json'), 'utf8'));
 const capabilitySchema = JSON.parse(
-  fs.readFileSync(path.join(conformanceDir, 'capabilities.schema.json'), 'utf8'),
+  fs.readFileSync(path.join(capabilityConformanceDir, 'capabilities.schema.json'), 'utf8'),
 );
 
 function temporaryStore(t, name = 'fixture.turndb') {
@@ -250,9 +251,9 @@ async function assertSource(handle, source) {
   }
 }
 
-test('native capability response implements contract v1', () => {
+test('native capability response implements contract v2', () => {
   const profile = capabilities();
-  assert.equal(profile.contractVersion, 1);
+  assert.equal(profile.contractVersion, 2);
   assert.equal(profile.profile, 'native');
   for (const field of capabilitySchema.required) assert(Object.hasOwn(profile, field), field);
   assert.equal(profile.partFormat.write, profile.partFormatWrite);
@@ -316,14 +317,14 @@ test('native writer and snapshots replay the shared corpus', async (t) => {
     }
   }
   for (const [source, snapshot] of snapshots) await assertSource(snapshot, source);
-  const sealedPath = `${file}.sealed.turndb`;
-  const sealed = await store.seal(sealedPath);
-  assert(sealed.bytes > 0n);
-  const sealedSnapshot = await NativeSnapshot.openFile(sealedPath);
+  const backupPath = `${file}.backup.turndb`;
+  const backup = await store.backup(backupPath);
+  assert(backup.bytes > 0n);
+  const backupSnapshot = await NativeSnapshot.openFile(backupPath);
   try {
-    await assertSource(sealedSnapshot, 'snapshot-v2');
+    await assertSource(backupSnapshot, 'snapshot-v2');
   } finally {
-    await sealedSnapshot.close();
+    await backupSnapshot.close();
   }
 });
 

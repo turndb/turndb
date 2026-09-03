@@ -86,20 +86,20 @@ try {
   assert.equal(verified.status, 0, `verify exited ${verified.status}: ${detail(verified)}`);
   assert.match(verified.stdout, /reconstruct byte-exact/, 'deep verify must report reconstruction');
 
-  // The store IS the single-file form; sealing ships its snapshot with the same binary.
-  const sealedOut = path.join(work, 'snapshot.turndb');
-  const sealed = cli(['seal', store, sealedOut]);
-  assert.equal(sealed.status, 0, `seal exited ${sealed.status}: ${detail(sealed)}`);
-  const inspected = cli(['inspect', sealedOut]);
+  // The store IS the single-file form; backup ships its snapshot with the same binary.
+  const backupOut = path.join(work, 'snapshot.turndb');
+  const backup = cli(['backup', store, backupOut]);
+  assert.equal(backup.status, 0, `backup exited ${backup.status}: ${detail(backup)}`);
+  const inspected = cli(['inspect', backupOut]);
   assert.equal(inspected.status, 0, `inspect exited ${inspected.status}: ${detail(inspected)}`);
-  assert.match(inspected.stdout, /\(sealed\)/, 'a sealed snapshot must be reported as one');
+  assert.match(inspected.stdout, /^store: .*snapshot\.turndb$/m, 'the backup must inspect as a store');
 
   // A refusal must be a refusal: nonzero status and a message on stderr, not a stack trace.
   const missing = cli(['inspect', path.join(work, 'nope')]);
   assert.notEqual(missing.status, 0, 'a missing store must exit nonzero');
   assert.match(missing.stderr, /^turndb: /m, 'errors must carry the CLI prefix');
 
-  console.log('cli install: help, import, ids, verify --deep, seal, inspect, refusal');
+  console.log('cli install: help, import, ids, verify --deep, backup, inspect, refusal');
 } finally {
   fs.rmSync(work, { recursive: true, force: true });
 }

@@ -958,54 +958,64 @@ fn an_extension_after_an_intervening_member_takes_a_fresh_aligned_extent() {
 }
 
 #[test]
-fn sealed_is_final() {
-    let root = tmp("sealed");
+fn revision_two_finalization_bit_is_ignored_and_retired_on_write() {
+    let root = tmp("v2-final-bit");
     std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("sealed.turndb");
+    let ct = root.join("old.turndb");
 
-    // Staged content commits and seals in one flip.
     let mut c = Container::create(&ct).unwrap();
-    c.put_bytes("kept", b"the last bytes this file will ever gain").unwrap();
-    let seq = c.commit_sealed().unwrap();
-    assert_eq!(seq, 1);
-    assert!(c.sealed());
-
-    // Every mutation refuses, on this handle and on a fresh one.
-    assert!(c.put_bytes("more", b"x").unwrap_err().to_string().contains("sealed"));
-    assert!(c.append_stream("kept", 1, |_, _| Ok(())).unwrap_err().to_string().contains("sealed"));
-    assert!(c.remove("kept").unwrap_err().to_string().contains("sealed"));
-    assert!(c.commit().unwrap_err().to_string().contains("sealed"));
-    assert!(c.commit_sealed().unwrap_err().to_string().contains("sealed"));
-    drop(c);
-
-    let reopened = Container::open(&ct).unwrap();
-    assert!(reopened.sealed(), "the flag must survive a reopen");
-    assert_eq!(
-        reopened.read_file_bounded("kept", 1024).unwrap(),
-        b"the last bytes this file will ever gain"
-    );
-    assert_eq!(reopened.verify().unwrap(), 1, "sealed refuses writes, never reads");
-    drop(reopened);
-
-    // Reclaim rewrites, and a sealed container is final: refuse, do not quietly unseal.
-    assert!(turndb::container::reclaim(&ct).unwrap_err().to_string().contains("sealed"));
-
-    // The flag is byte 50 bit 0 of the live slot, inside the checksummed prefix.
-    let bytes = std::fs::read(&ct).unwrap();
-    let live = newest_slot(&bytes);
-    assert_eq!(bytes[live + 50] & 1, 1);
-
-    // Sealing with nothing staged is a pure flip: same directory, one more commit, final.
-    let ct2 = root.join("sealed-flip.turndb");
-    let mut c = Container::create(&ct2).unwrap();
     c.put_bytes("kept", b"payload").unwrap();
     c.commit().unwrap();
-    let sealed_at = c.commit_sealed().unwrap();
-    assert_eq!(sealed_at, 2, "a pure seal is its own commit");
     drop(c);
-    let r = Container::open(&ct2).unwrap();
-    assert!(r.sealed());
-    assert_eq!(r.read_file_bounded("kept", 64).unwrap(), b"payload");
+
+    // Recast the live slot as revision 2 carrying its historical finalization bit. The directory
+    // representation is the same, so only the version, bit, and checksum change.
+    let mut bytes = std::fs::read(&ct).unwrap();
+    let live = newest_slot(&bytes);
+    let mut current_with_reserved_bit = bytes.clone();
+    current_with_reserved_bit[live + 50] = 1;
+    let digest = blake3::hash(&current_with_reserved_bit[live..live + 52]);
+    current_with_reserved_bit[live + 52..live + 56].copy_from_slice(&digest.as_bytes()[0..4]);
+    let bad_current = root.join("bad-current.turndb");
+    std::fs::write(&bad_current, current_with_reserved_bit).unwrap();
+    let error = match Container::open(&bad_current) {
+        Ok(_) => panic!("revision 3 must refuse a nonzero reserved byte"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("reserved bits"), "wrong revision-3 refusal: {error}");
+
+    bytes[live + 49] = 2;
+    bytes[live + 50] = 1;
+    let digest = blake3::hash(&bytes[live..live + 52]);
+    bytes[live + 52..live + 56].copy_from_slice(&digest.as_bytes()[0..4]);
+    std::fs::write(&ct, &bytes).unwrap();
+
+    let mut unknown_v2 = bytes.clone();
+    unknown_v2[live + 50] = 2;
+    let digest = blake3::hash(&unknown_v2[live..live + 52]);
+    unknown_v2[live + 52..live + 56].copy_from_slice(&digest.as_bytes()[0..4]);
+    let bad_v2 = root.join("bad-v2.turndb");
+    std::fs::write(&bad_v2, unknown_v2).unwrap();
+    let error = match Container::open(&bad_v2) {
+        Ok(_) => panic!("revision 2 must still refuse unknown flag bits"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("revision-2 flags"), "wrong revision-2 refusal: {error}");
+
+    // The old bit carries no lifecycle semantics: reads and writes both work. The first commit
+    // publishes revision 3 and restores bytes 50..52 to their reserved-zero state.
+    let mut c = Container::open(&ct).unwrap();
+    assert_eq!(c.read_file_bounded("kept", 64).unwrap(), b"payload");
+    c.put_bytes("more", b"continued").unwrap();
+    c.commit().unwrap();
+    drop(c);
+
+    let bytes = std::fs::read(&ct).unwrap();
+    let live = newest_slot(&bytes);
+    assert_eq!(bytes[live + 49], CONTAINER_VERSION);
+    assert_eq!(&bytes[live + 50..live + 52], &[0, 0]);
+    let r = Container::open(&ct).unwrap();
+    assert_eq!(r.read_file_bounded("more", 64).unwrap(), b"continued");
     std::fs::remove_dir_all(&root).ok();
 }
 

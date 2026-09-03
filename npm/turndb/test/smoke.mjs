@@ -14,7 +14,7 @@ async function withStore(fn, opts) {
 
 test('capabilities describe the WASI guest rather than its host', async () => {
   const reachable = await capabilities();
-  assert.equal(reachable.contractVersion, 1);
+  assert.equal(reachable.contractVersion, 2);
   assert.equal(reachable.profile, 'wasi');
   assert.equal(reachable.writerExclusion, 'embedder_enforced');
   assert.deepEqual(reachable.partFormat, { write: 2, readMax: 2 });
@@ -27,7 +27,7 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   assert.equal(reachable.limits.lifecycleEvents, 256);
   assert.equal(reachable.unavailable.allocatedBytes, 'absent');
   assert.equal(reachable.unavailable.atomicNoReplacePublication, 'absent');
-  assert.equal(reachable.operations.includes('seal'), false);
+  assert.equal(reachable.operations.includes('backup'), false);
   const c = await compiledCapabilities();
   assert.equal(c.portable_wasm, true);
   assert.equal(c.writer_exclusion, 'embedder_enforced');

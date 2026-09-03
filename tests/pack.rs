@@ -159,7 +159,10 @@ fn online_backup_is_an_exact_settled_cut_and_restore_is_writable() {
         .unwrap();
 
     let artifact = root.join("snapshot.turndb");
+    let legacy_staging = root.join("snapshot.turndb.sealing");
+    std::fs::write(&legacy_staging, b"interrupted pre-upgrade backup").unwrap();
     let backed_up = store.backup(&artifact).unwrap();
+    assert!(!legacy_staging.exists(), "a retry removes recognized legacy backup staging");
     assert!(backed_up.files >= 3);
     assert_eq!(backed_up.commit, store.manifest().commit);
 
@@ -167,7 +170,7 @@ fn online_backup_is_an_exact_settled_cut_and_restore_is_writable() {
     store.sync().unwrap();
     store.flush().unwrap();
 
-    // Restoring is member-verified copying of the sealed cut into a new, writable file.
+    // Restoring fully verifies the staged copy of the backup cut before publishing a writable file.
     let restored_path = root.join("restored.turndb");
     let restored = turndb::store::restore_file(&artifact, &restored_path).unwrap();
     assert_eq!(restored.files, backed_up.files);
@@ -177,18 +180,17 @@ fn online_backup_is_an_exact_settled_cut_and_restore_is_writable() {
     assert!(reopened.reconstruct("before").unwrap().is_some());
     assert!(
         reopened.reconstruct("after").unwrap().is_none(),
-        "backup must remain an immutable cut"
+        "backup must remain the point-in-time cut it published"
     );
     reopened.put("restored-write", &[Span::Lit(b"works")], vec![]).unwrap();
     reopened.sync().unwrap();
     reopened.flush().unwrap();
     assert!(reopened.reconstruct("restored-write").unwrap().is_some());
     drop(reopened);
-    // The backup itself stays sealed: finality binds the artifact, not its restored copies.
-    assert!(
-        turndb::container::Container::open(&artifact).unwrap().sealed(),
-        "restoring must never unseal the backup"
-    );
+    // The backup is already an ordinary store; restore does not mutate the source artifact.
+    let backup = Store::open_file(&artifact, cfg()).unwrap();
+    assert!(backup.reconstruct("before").unwrap().is_some());
+    backup.close().unwrap();
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -217,6 +219,24 @@ fn backup_and_restore_never_replace_destinations_or_publish_corruption() {
     let error = turndb::store::restore_file(&artifact, &ct).unwrap_err();
     assert!(error.to_string().contains("exists"), "restore must refuse a live path: {error:#}");
 
+    // A committed container can never become an empty store merely by losing its manifest. The
+    // remaining members are self-consistent bytes, but without authority they are corruption.
+    let authorityless_path = root.join("authorityless.turndb");
+    std::fs::copy(&artifact, &authorityless_path).unwrap();
+    let mut authorityless = turndb::container::Container::open(&authorityless_path).unwrap();
+    assert!(authorityless.remove("MANIFEST").unwrap());
+    authorityless.commit().unwrap();
+    drop(authorityless);
+    let absent = root.join("authorityless-must-remain-absent.turndb");
+    let error = turndb::store::restore_file(&authorityless_path, &absent).unwrap_err();
+    assert_eq!(
+        turndb::error::classify(&error),
+        turndb::error::ErrorClass::Corruption,
+        "a committed store without manifest authority is corruption: {error:#}"
+    );
+    assert!(!absent.exists());
+    assert!(!root.join("authorityless-must-remain-absent.turndb.restoring").exists());
+
     // A backup whose member bytes drifted must refuse restoration and leave nothing behind.
     let mut corrupt = std::fs::read(&artifact).unwrap();
     let at = turndb::container::REGION_START as usize;
@@ -239,6 +259,108 @@ fn backup_and_restore_never_replace_destinations_or_publish_corruption() {
             .contains(".restoring")),
         "a refused restore must remove its staging"
     );
+
+    // Member checksums alone are insufficient: a self-consistent container whose MANIFEST names
+    // members it does not carry must also refuse before publication.
+    let valid = turndb::container::Container::open(&artifact).unwrap();
+    let manifest = valid.read_file_bounded("MANIFEST", turndb::store::MAX_MANIFEST_BYTES).unwrap();
+    drop(valid);
+    let inconsistent_path = root.join("inconsistent.turndb");
+    let mut inconsistent = turndb::container::Container::create(&inconsistent_path).unwrap();
+    inconsistent.put_bytes("MANIFEST", &manifest).unwrap();
+    inconsistent.commit().unwrap();
+    drop(inconsistent);
+    let absent = root.join("must-also-remain-absent.turndb");
+    let error = turndb::store::restore_file(&inconsistent_path, &absent).unwrap_err();
+    assert_eq!(
+        turndb::error::classify(&error),
+        turndb::error::ErrorClass::Corruption,
+        "a manifest that names absent storage is corruption: {error:#}"
+    );
+    assert!(!absent.exists());
+
+    let malformed_path = root.join("malformed.turndb");
+    std::fs::write(&malformed_path, b"present, but not a container").unwrap();
+    let absent = root.join("malformed-must-remain-absent.turndb");
+    let error = turndb::store::restore_file(&malformed_path, &absent).unwrap_err();
+    assert_eq!(
+        turndb::error::classify(&error),
+        turndb::error::ErrorClass::Corruption,
+        "explicit artifact validation classifies malformed persisted bytes: {error:#}"
+    );
+    assert!(!absent.exists());
+    assert!(!root.join("malformed-must-remain-absent.turndb.restoring").exists());
+
+    // A replacement part can be internally valid and reconstruct perfectly while still violating
+    // the live manifest's BLAKE3 authority pin. Artifacts omit retained manifests, so the live
+    // pins themselves are load-bearing verification evidence.
+    let other_source = root.join("other-source.turndb");
+    let mut other = Store::open_file(&other_source, cfg()).unwrap();
+    other.put("other", &[Span::Piece(b"different but internally valid content")], vec![]).unwrap();
+    let other_artifact = root.join("other-artifact.turndb");
+    other.backup(&other_artifact).unwrap();
+    other.close().unwrap();
+
+    let authority = turndb::container::Container::open(&artifact).unwrap();
+    let replacement = turndb::container::Container::open(&other_artifact).unwrap();
+    let hybrid_path = root.join("hybrid.turndb");
+    let mut hybrid = turndb::container::Container::create(&hybrid_path).unwrap();
+    for name in replacement.names() {
+        let source = if name == "MANIFEST" { &authority } else { &replacement };
+        let bytes = source.read_file_bounded(name, u64::MAX).unwrap();
+        hybrid.put_bytes(name, &bytes).unwrap();
+    }
+    hybrid.commit().unwrap();
+    drop(hybrid);
+    let absent = root.join("hybrid-must-remain-absent.turndb");
+    let error = turndb::store::restore_file(&hybrid_path, &absent).unwrap_err();
+    assert_eq!(
+        turndb::error::classify(&error),
+        turndb::error::ErrorClass::Corruption,
+        "a valid replacement part must fail the live manifest pin: {error:#}"
+    );
+    assert!(!absent.exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn artifact_staging_names_can_never_alias_and_delete_the_source() {
+    let root = tmp("staging-alias");
+    std::fs::create_dir_all(&root).unwrap();
+
+    for (stem, suffix) in [("current", ".backing-up"), ("legacy", ".sealing")] {
+        let destination = root.join(format!("{stem}.turndb"));
+        let source = root.join(format!("{stem}.turndb{suffix}"));
+        let mut store = Store::open_file(&source, cfg()).unwrap();
+        store.put("still-live", &[Span::Lit(b"not yet settled")], vec![]).unwrap();
+        let error = store.backup(&destination).unwrap_err();
+        assert_eq!(turndb::error::classify(&error), turndb::error::ErrorClass::InvalidArgument);
+        assert!(source.exists(), "{suffix} collision removed the source pathname");
+        assert!(!destination.exists());
+        assert!(store.reconstruct("still-live").unwrap().is_some());
+        store.close().unwrap();
+    }
+
+    let near_source = root.join("near.turndb.backing-up-copy");
+    let near_destination = root.join("near.turndb");
+    let mut near = Store::open_file(&near_source, cfg()).unwrap();
+    near.put("valid", &[Span::Lit(b"nearest valid name")], vec![]).unwrap();
+    near.backup(&near_destination).unwrap();
+    assert!(near_source.exists());
+    assert!(near_destination.exists());
+    near.close().unwrap();
+
+    let restore_source = root.join("restore-target.turndb.restoring");
+    let restore_destination = root.join("restore-target.turndb");
+    let mut origin = Store::open_file(&root.join("origin.turndb"), cfg()).unwrap();
+    origin.put("kept", &[Span::Lit(b"restore source")], vec![]).unwrap();
+    origin.backup(&restore_source).unwrap();
+    origin.close().unwrap();
+    let error = turndb::store::restore_file(&restore_source, &restore_destination).unwrap_err();
+    assert_eq!(turndb::error::classify(&error), turndb::error::ErrorClass::InvalidArgument);
+    assert!(restore_source.exists(), "restore collision removed the source pathname");
+    assert!(!restore_destination.exists());
+
     std::fs::remove_dir_all(&root).ok();
 }
 

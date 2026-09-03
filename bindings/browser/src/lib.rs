@@ -122,7 +122,7 @@ mod wasm {
         pub fn capabilities() -> Result<JsValue, JsValue> {
             let compiled = turndb::capabilities::capabilities();
             output(json!({
-                "contractVersion": 1,
+                "contractVersion": 2,
                 "profile": "browser",
                 "operations": ["openSnapshot", "compiledCapabilities", "scan", "explainScan", "schema", "readContent", "close"],
                 "partFormat": { "readMax": compiled.part_format_read_max },

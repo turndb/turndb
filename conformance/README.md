@@ -1,24 +1,28 @@
 # TurnDB conformance corpus
 
-`v1/` is the language-neutral semantic gate for Phase 3. Package versions and on-disk format
-versions can change without changing this directory; incompatible contract semantics require a new
-versioned directory.
+`v1/` is the frozen language-neutral query/runner contract and its original capability contract.
+`v2/` advances only the capability profile after the `seal` operation was retired in favor of
+`backup`; query requests and runner messages remain v1. Package versions and on-disk format versions
+are independent of both contract versions. Incompatible semantics add a versioned artifact instead
+of rewriting an old one.
 
 The corpus is independent input and expected data. A runner must replay `corpus.json.steps`, compare
-point reads and scans with `views` and `queries`, and validate its public capability response against
-`capabilities.schema.json` and `capabilities.json`. It must not create expected results by asking a
-different binding at test time.
+point reads and scans with `v1/views` and `v1/queries`, and validate its public capability response
+against `v2/capabilities.schema.json` and `v2/capabilities.json`. It must not create expected results
+by asking a different binding at test time.
 
-`fixture.turndb.hex` is the byte-exact published-v2 container encoded as lowercase hex so repository
+`v1/fixture.turndb.hex` is immutable evidence of the byte-exact published-v2 container, encoded as
+lowercase hex so repository
 patches and reviews remain textual. Runners decode whitespace-separated hex to obtain the actual
 `.turndb` file. The Rust gate proves both directions: replaying the operations produces exactly those
 bytes, and a reader opened on those bytes produces the published-v2 goldens. Read-only/browser
 runners use this fixture without needing a writer.
 
-Regenerate the fixture after an intentional writer-layout change with
-`TURNDB_UPDATE_CONFORMANCE_FIXTURE=1 cargo test --test conformance
-rust_store_replays_the_shared_query_corpus`, review the textual diff, then rerun the command without
-the environment variable to prove that the generator and checked-in bytes agree.
+`v2/fixture.turndb.hex` is the current revision-3 writer's byte-exact output for the same corpus.
+Writer-layout changes add a new fixture; they never regenerate an older one in place. The current
+fixture may be regenerated with `TURNDB_UPDATE_CONFORMANCE_FIXTURE=1 cargo test --test conformance
+rust_store_replays_the_shared_query_corpus`, followed by the same command without the environment
+variable.
 
 ## Runner protocol v1
 

@@ -46,7 +46,7 @@ try {
   const bytes = Buffer.from(hex.replaceAll(/\s/g, ''), 'hex');
   const database = await BrowserDatabase.open(wasm, new BufferReadAt(bytes, 'fixture.turndb'));
   const capabilities = database.capabilities();
-  assert.equal(capabilities.contractVersion, 1);
+  assert.equal(capabilities.contractVersion, 2);
   assert.equal(capabilities.profile, 'browser');
   assert.equal(capabilities.writerExclusion, 'read_only');
   assert(capabilities.operations.includes('scan'));
