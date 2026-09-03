@@ -1,0 +1,28 @@
+{
+  "name": "@turndb/native-darwin-arm64",
+  "version": "0.1.8",
+  "private": true,
+  "cpu": [
+    "arm64"
+  ],
+  "main": "turndb.darwin-arm64.node",
+  "files": [
+    "turndb.darwin-arm64.node",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.html"
+  ],
+  "description": "Native N-API embedding interface for TurnDB",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22 <27"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/turndb/turndb.git",
+    "directory": "bindings/node"
+  },
+  "os": [
+    "darwin"
+  ]
+}

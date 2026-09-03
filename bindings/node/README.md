@@ -5,8 +5,10 @@ compatibility rather than one V8 or Node release. Each `NativeStore` owns a dedi
 a bounded command queue; filesystem, compression, scan, and sync work do not run on the JavaScript
 event loop.
 
-Version 0.1.0 is published on npm. Prebuilt distribution targets are Linux x86-64 glibc and Windows
-x86-64 MSVC, installed and exercised on Node 22, 24, and 26. On a supported host, install it with:
+Version 0.1.0 is published on npm. Prebuilt distribution targets are Linux x86-64 and arm64 (glibc
+2.17 or newer), macOS x86-64 and Apple silicon, and Windows x86-64 MSVC, each installed and
+exercised on its own hardware; the Node majors proven per target are in the prebuild contract
+linked below. On a supported host, install it with:
 
 ```sh
 npm install @turndb/native
@@ -34,7 +36,8 @@ message arrays onto the content-bearing attributes used by the exporter, and pre
 return value or exception. This keeps OpenAI-, Anthropic-, and framework-specific adapters to a
 one-call description instead of another storage mapping.
 
-Its closed Node range is `>=22 <27`; the required Linux x86-64 matrix is Node 22, 24, and 26.
+Its closed Node range is `>=22 <27`; the required Linux x86-64 and arm64 matrices are Node 22, 24,
+and 26.
 Support claims come from that tested matrix, not from N-API 6 alone; see the repository's
 [support and compatibility policy](https://github.com/turndb/turndb/blob/main/docs/support-and-compatibility.md).
 
@@ -43,8 +46,9 @@ platform prebuild. It intentionally does not fall back to `turndb-wasm`: native 
 threads, and physical reclamation are capabilities, not implementation details that may disappear
 silently.
 
-The root package is platform-neutral and selects `@turndb/native-linux-x64-gnu` as an optional
-dependency. Publication goes through the owner-gated staged release workflow.
+The root package is platform-neutral and selects one `@turndb/native-<platform slice>` optional
+dependency through npm's `os`, `cpu` and `libc` metadata. Publication goes through the owner-gated
+staged release workflow.
 See the [native prebuild and release contract](https://github.com/turndb/turndb/blob/main/docs/native-prebuilds.md) for clean-install
 commands, artifact measurements, the glibc floor, and first-release gates.
 

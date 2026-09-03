@@ -42,7 +42,10 @@ function packageJson(tarball) {
   );
 }
 
-const expectedTargets = ['linux-x64-gnu', 'win32-x64-msvc'];
+// In the order the manifest filenames sort, which is the order the set is compared in.
+const expectedTargets = [
+  'darwin-arm64', 'darwin-x64', 'linux-arm64-gnu', 'linux-x64-gnu', 'win32-x64-msvc',
+];
 const manifestNames = fs.readdirSync(dist)
   .filter((name) => /^prebuild-manifest-.+\.json$/.test(name))
   .sort();

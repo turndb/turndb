@@ -23,6 +23,24 @@ const target = (() => {
       package: '@turndb/native-linux-x64-gnu',
     };
   }
+  if (process.platform === 'linux' && process.arch === 'arm64' && libc === 'gnu') {
+    return {
+      suffix: 'linux-arm64-gnu',
+      package: '@turndb/native-linux-arm64-gnu',
+    };
+  }
+  if (process.platform === 'darwin' && process.arch === 'x64') {
+    return {
+      suffix: 'darwin-x64',
+      package: '@turndb/native-darwin-x64',
+    };
+  }
+  if (process.platform === 'darwin' && process.arch === 'arm64') {
+    return {
+      suffix: 'darwin-arm64',
+      package: '@turndb/native-darwin-arm64',
+    };
+  }
   if (process.platform === 'win32' && process.arch === 'x64') {
     return {
       suffix: 'win32-x64-msvc',

@@ -85,8 +85,15 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
     assert_eq!(native["napi"]["binaryName"], "turndb");
     assert_eq!(
         native["napi"]["targets"],
-        serde_json::json!(["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]),
-        "every configured target needs its own build, package, and runtime evidence"
+        serde_json::json!([
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+        ]),
+        "every configured target needs its own build, package, and runtime evidence — the \
+         CI job blocks asserted below are that evidence"
     );
     // The selector must request exactly the platform package this tree builds, so derive the
     // expectation instead of writing the version twice. A literal here passes whenever the
@@ -144,6 +151,47 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
         );
     }
 
+    // The slices added after 0.1.8, held to the same shape: a platform package selects itself by
+    // `os`/`cpu` (and `libc` on Linux), names exactly its own binary as `main`, and ships the
+    // legal payload.
+    for (slice, os, cpu, libc) in [
+        ("linux-arm64-gnu", "linux", "arm64", Some("glibc")),
+        ("darwin-x64", "darwin", "x64", None),
+        ("darwin-arm64", "darwin", "arm64", None),
+    ] {
+        let platform: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(format!("{root}/bindings/node/npm/{slice}/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(platform["name"], format!("@turndb/native-{slice}"), "{slice}");
+        assert_eq!(platform["version"], native["version"], "{slice}");
+        assert_eq!(platform["private"], true, "{slice}");
+        assert_eq!(platform["main"], format!("turndb.{slice}.node"), "{slice}");
+        assert_eq!(platform["os"], serde_json::json!([os]), "{slice}");
+        assert_eq!(platform["cpu"], serde_json::json!([cpu]), "{slice}");
+        match libc {
+            Some(libc) => assert_eq!(platform["libc"], serde_json::json!([libc]), "{slice}"),
+            None => assert!(platform.get("libc").is_none(), "{slice}: no libc selector"),
+        }
+        for legal in ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.html"] {
+            assert!(
+                platform["files"].as_array().unwrap().iter().any(|entry| entry == legal),
+                "{slice}: native platform package must declare {legal} in its payload"
+            );
+        }
+    }
+    // Completeness, both ways: every slice directory is pinned by the selector and every pin has
+    // a slice directory. A pin without a package installs cleanly and cannot run; a package
+    // without a pin is never installed.
+    let pinned: std::collections::BTreeSet<String> =
+        native["optionalDependencies"].as_object().unwrap().keys().cloned().collect();
+    let on_disk: std::collections::BTreeSet<String> =
+        fs::read_dir(format!("{root}/bindings/node/npm"))
+            .unwrap()
+            .map(|e| format!("@turndb/native-{}", e.unwrap().file_name().to_string_lossy()))
+            .collect();
+    assert_eq!(pinned, on_disk, "selector pins and platform package directories must agree");
+
     // Normalised: a checkout that converted the file to CRLF must not fail the exact-line search.
     let ci = fs::read_to_string(format!("{root}/.github/workflows/ci.yml"))
         .unwrap()
@@ -163,6 +211,27 @@ fn node_engine_claims_are_closed_and_match_the_ci_majors() {
     assert!(prebuild_install_job.contains("needs: native-prebuild"));
     assert!(prebuild_install_job.contains("node: ['22', '24', '26']"));
     assert!(prebuild_install_job.contains("scripts/test-prebuild.cjs"));
+
+    // Linux arm64: cross-built, then installed and exercised on arm64 hardware on every major.
+    let arm64_install_job = ci_job_block(&ci, "native-prebuild-arm64-install");
+    assert!(arm64_install_job.contains("needs: native-prebuild-arm64"));
+    assert!(arm64_install_job.contains("runs-on: ubuntu-22.04-arm"));
+    assert!(arm64_install_job.contains("node: ['22', '24', '26']"));
+    assert!(arm64_install_job.contains("scripts/test-prebuild.cjs"));
+
+    // macOS, both architectures: the build host exercises Node 24; the install matrix covers the
+    // other two claimed majors on the same hardware, so together they are the full range.
+    let macos_package_job = ci_job_block(&ci, "macos-native-package");
+    assert!(macos_package_job.contains("node-version: '24'"));
+    assert!(macos_package_job.contains("scripts/test-prebuild.cjs"));
+    for arch in ["x64", "arm64"] {
+        assert!(macos_package_job.contains(&format!("- arch: {arch}")), "macOS package: {arch}");
+    }
+    let macos_install_job = ci_job_block(&ci, "macos-native-install");
+    assert!(macos_install_job.contains("needs: macos-native-package"));
+    assert!(macos_install_job.contains("node: ['22', '26']"));
+    assert!(macos_install_job.contains("arch: [x64, arm64]"));
+    assert!(macos_install_job.contains("scripts/test-prebuild.cjs"));
 }
 
 fn guarded_python_publish_job(workflow: &str) -> Result<&str, String> {
