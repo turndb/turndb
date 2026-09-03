@@ -1803,7 +1803,8 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
-#[cfg(target_os = "linux")]
+// Where in-place punch exists on a Unix host: Linux and, since the macOS gate, macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn every_punch_crash_leaves_declared_blocks_retryable() {
     let root = tmp("punch");
@@ -3663,7 +3664,7 @@ fn every_workload_sync_failure_is_reported_and_recovers_to_an_acked_consistent_s
 /// its whole crash contract is: at every crash state, every record answers exactly as before,
 /// and reopening never refuses. A punch that could disturb an answer would mean the free list
 /// lied about a byte being free.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn every_single_file_punch_crash_disturbs_nothing() {
     let root = tmp("native-free-punch");
