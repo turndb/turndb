@@ -842,10 +842,15 @@ jobs:
         run: cargo test --features dst --test dst -- --nocapture
 
       # The in-place punch's space return on this platform, measured and printed, not asserted:
-      # `F_PUNCHHOLE` on APFS is exact on the bytes and best-effort on the blocks, and the fold
-      # test asserts deallocation on Linux only until this number has been read.
+      # `F_PUNCHHOLE` on APFS is exact on the bytes and best-effort on the blocks, and the test
+      # asserts deallocation on Linux only until this number has been read. The step is red
+      # unless the measurement line was printed: its first version named the wrong test binary
+      # and passed green having run zero tests.
       - name: punch space return (measured)
-        run: cargo test --test fold punching_reclaims_erased_bytes_in_place -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test --test store punching_reclaims_erased_bytes_in_place -- --nocapture 2>&1 | tee "$RUNNER_TEMP/punch.txt"
+          grep -E 'allocated bytes before punch [0-9]+, after [0-9]+' "$RUNNER_TEMP/punch.txt"
 
       # tests/cross_os.rs: this host's build of the reference store must be byte-identical to the
       # Linux x86-64 fixture and the fixture must open here (Linux → macOS). The build is emitted
