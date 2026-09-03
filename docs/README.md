@@ -1,8 +1,11 @@
 # Documentation index
 
-Every file under `docs/` other than this index, by its own title. `FORMAT.md` (normative on-disk
-format), `ROADMAP.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md` and `SUPPORT.md` live at the
-repository root.
+Every file under `docs/` other than this index, by its own title. `ONTOLOGY.md` (the closed semantic
+model), `FORMAT.md` (normative on-disk format), `ROADMAP.md`,
+`CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md` and `SUPPORT.md` live at the repository root.
+
+Start with the root [ontology](../ONTOLOGY.md) to understand which concepts, relations, states, and
+transitions TurnDB admits. Its rule is closed-world: **if it is not on the list, it does not exist**.
 
 Start with the [embedding contract](embedding-contract.md) if you are integrating TurnDB, the
 [install guide](install.md) if you want a packaged entrance, the

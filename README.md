@@ -8,8 +8,11 @@ Single-writer enforcement is platform-dependent: the engine enforces it on Unix 
 [What it does not do](#what-it-does-not-do) and [FORMAT.md](FORMAT.md#the-writer-lock) for the
 normative statement.
 
-**Status: pre-1.0, format version 2, not frozen.** [FORMAT.md](FORMAT.md) is normative: where it
-and the code disagree, one of them is a bug.
+**Status: pre-1.0, format version 2, not frozen.** [ONTOLOGY.md](ONTOLOGY.md) is the working authority
+for TurnDB's closed semantic model: **if it is not on the list, it does not exist**. It defines the
+concepts, relations, axioms, and forbidden equivalences to which every surface will be recalibrated.
+[FORMAT.md](FORMAT.md) remains normative for the on-disk format: where it and the code disagree, one
+of them is a bug.
 
 ## What problem it solves
 
