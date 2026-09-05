@@ -50,12 +50,27 @@ pub(crate) fn same_file(a: &File, b: &File) -> io::Result<bool> {
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
+/// Windows identity is the volume serial number plus the 64-bit file index, read through
+/// `GetFileInformationByHandle`. `std`'s `MetadataExt::volume_serial_number` and `file_index`
+/// expose the same fields but sit behind the unstable `windows_by_handle` feature, so they cannot
+/// be used on the pinned stable toolchain.
 #[cfg(windows)]
 pub(crate) fn same_file(a: &File, b: &File) -> io::Result<bool> {
-    use std::os::windows::fs::MetadataExt;
-    let a = a.metadata()?;
-    let b = b.metadata()?;
-    Ok(a.volume_serial_number() == b.volume_serial_number() && a.file_index() == b.file_index())
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    fn identity(f: &File) -> io::Result<(u32, u32, u32)> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle stays open for the borrow of `f`, and `info` is a valid, writable
+        // out-parameter of exactly the type the call fills.
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    }
+    Ok(identity(a)? == identity(b)?)
 }
 
 #[cfg(target_os = "wasi")]
