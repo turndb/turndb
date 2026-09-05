@@ -11,7 +11,7 @@
 //!                                  ▼
 //!                          larger parts
 //!
-//!        fold ── append-only content, shared by every part, written once, never rewritten
+//!        fold ── stable content locations shared by every part
 //! ```
 //!
 //! Two ideas fused. **Content addressing**: a piece of content is identified by BLAKE3 of its bytes
@@ -20,13 +20,14 @@
 //!
 //! # Why the fusion is worth it
 //!
-//! In a conventional LSM, compaction rewrites data — merge two 1 GiB parts, write 2 GiB. That write
+//! In a conventional LSM, merging rewrites data — merge two 1 GiB parts, write 2 GiB. That write
 //! amplification is the tax every tiering strategy exists to manage.
 //!
-//! Here, **compaction never touches content.** Pieces live in the fold, addressed by hash, written
-//! once. A part is a bundle of *references plus columns*, so merging rewrites references and columns
+//! Here, **part merging never touches content.** Pieces live in the fold, addressed by hash, written
+//! once until refold replaces the generation or declared content punch removes an unreachable
+//! payload. A part is a bundle of *references plus columns*, so merging rewrites references and columns
 //! and nothing else — on trace-shaped data that is a small fraction of the bytes. Content addressing
-//! is what decouples compaction cost from data volume, and that is what lets a trace store behave
+//! is what decouples part-merge cost from data volume, and that is what lets a trace store behave
 //! like a database instead of a write-once archive.
 //!
 //! # The cardinal invariant
@@ -44,6 +45,7 @@
 // backticked identifier. The remainder is a separate problem and is not closed by this.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod backup;
 pub mod capabilities;
 pub mod carve;
 pub mod container;
@@ -52,7 +54,6 @@ pub mod error;
 pub mod fold;
 mod io_trace;
 pub mod observability;
-pub mod pack;
 pub mod part;
 #[cfg(feature = "columnar")]
 pub mod query;

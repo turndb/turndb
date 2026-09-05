@@ -1,8 +1,9 @@
 //! The write-ahead log — the ACK point, and the only thing standing between a crash and lost data.
 //!
 //! A frame holds the **carved result**: the record's id, named content programs, and attributes. Never
-//! raw input, because replaying raw input would re-run the carve and make recovery depend on whichever
-//! carve logic happened to be compiled in. Carved frames replay exactly, forever.
+//! raw input, because replaying raw input would re-run the carve and make WAL replay depend on whichever
+//! carve logic happened to be compiled in. Carved frames replay exactly under the one current
+//! draft identity; no earlier or alternate WAL grammar is accepted.
 //!
 //! Piece bytes ride along **only for dedup misses** — content that was new when it was written. A
 //! hit's content was already durable (it is either below the last committed fold tail, or it is
@@ -14,8 +15,9 @@
 //! ```
 
 use crate::part::idcol::{get_varint, put_varint};
-use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record};
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -28,25 +30,22 @@ pub type CarvedRecord = (Record, Vec<(PieceHash, Vec<u8>)>);
 /// A [`CarvedRecord`] plus whether it is a tombstone — the unit a batch frames.
 pub type FramedRecord = (Record, Vec<(PieceHash, Vec<u8>)>, bool);
 
-pub const FRAME_TAG: u8 = 0x57;
 /// A DELETION. Its payload is the id alone — a tombstone has no body, no attributes and no content, so
 /// it costs a frame and nothing else.
-pub const TOMB_TAG: u8 = 0x58;
-/// A BATCH COMMIT. Everything since the previous commit point that carries an in-batch tag is
+pub const TOMB_TAG: u8 = 0xD1;
+/// A BATCH COMPLETION. Everything since the previous completed batch boundary that carries an in-batch tag is
 /// applied by this frame, and is applied not at all without it. Its payload is the member count,
 /// as a varint — redundant with what replay observed, and checked against it, because a marker
-/// sealing a different number of frames than the writer put down means the log is not what was
+/// committing a different number of frames than the writer put down means the log is not what was
 /// written.
-pub const BATCH_COMMIT_TAG: u8 = 0x59;
-/// [`FRAME_TAG`], inside a batch: applied only when a [`BATCH_COMMIT_TAG`] seals it.
-pub const BATCH_FRAME_TAG: u8 = 0x5A;
+pub const BATCH_COMPLETE_TAG: u8 = 0xD2;
 /// [`TOMB_TAG`], inside a batch.
-pub const BATCH_TOMB_TAG: u8 = 0x5B;
-/// A version-2 general record: named content programs, exact whole-value identities, and the
-/// complete scalar attribute type system.
-pub const RECORD_V2_TAG: u8 = 0x5C;
-/// [`RECORD_V2_TAG`], inside a batch.
-pub const BATCH_RECORD_V2_TAG: u8 = 0x5D;
+pub const BATCH_TOMB_TAG: u8 = 0xD3;
+/// A general record: named content programs, exact whole-value identities, and the complete scalar
+/// attribute type system.
+pub const RECORD_TAG: u8 = 0xD4;
+/// [`RECORD_TAG`], inside a batch.
+pub const BATCH_RECORD_TAG: u8 = 0xD5;
 const HDR: usize = 13; // tag + seq + len
 const CRC: usize = 4;
 
@@ -118,6 +117,9 @@ fn get_ops(b: &[u8], at: &mut usize) -> Result<Vec<BodyOp>> {
                 h.copy_from_slice(take(b, at, 32)?);
                 let len = u32::try_from(get_varint(b, at)?)
                     .context("wal: piece length exceeds the format's u32 limit")?;
+                if len == 0 {
+                    bail!("wal: piece length must be non-zero");
+                }
                 ops.push(BodyOp::Piece { hash: PieceHash(h), len });
             }
             t => bail!("wal: unknown content op tag {t}"),
@@ -145,12 +147,15 @@ fn put_attrs(out: &mut Vec<u8>, attrs: &[(String, AttrValue)]) {
     }
 }
 
-fn get_attrs(b: &[u8], at: &mut usize, revision_two: bool) -> Result<Vec<(String, AttrValue)>> {
+fn get_attrs(b: &[u8], at: &mut usize) -> Result<Vec<(String, AttrValue)>> {
     let n_attrs = usize::try_from(get_varint(b, at)?)
         .context("wal: attribute count exceeds this platform's address space")?;
     let mut attrs = Vec::with_capacity(n_attrs.min(b.len()));
     for _ in 0..n_attrs {
         let key = String::from_utf8(get_bytes(b, at)?.to_vec())?;
+        if key.is_empty() {
+            bail!("wal: attribute name must not be empty");
+        }
         let tag = *b.get(*at).ok_or_else(|| anyhow::anyhow!("wal: truncated attr"))?;
         *at += 1;
         let v = match tag {
@@ -159,15 +164,15 @@ fn get_attrs(b: &[u8], at: &mut usize, revision_two: bool) -> Result<Vec<(String
             2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
                 take(b, at, 8)?.try_into().unwrap(),
             ))),
-            3 => AttrValue::Bool(take(b, at, 1)?[0] != 0),
-            4 if revision_two => {
-                AttrValue::UInt(u64::from_le_bytes(take(b, at, 8)?.try_into().unwrap()))
-            }
-            5 if revision_two => AttrValue::Bytes(get_bytes(b, at)?.to_vec()),
-            6 if revision_two => {
-                AttrValue::TimestampNs(i64::from_le_bytes(take(b, at, 8)?.try_into().unwrap()))
-            }
-            7 if revision_two => AttrValue::Null,
+            3 => match take(b, at, 1)?[0] {
+                0 => AttrValue::Bool(false),
+                1 => AttrValue::Bool(true),
+                other => bail!("wal: invalid boolean byte {other}"),
+            },
+            4 => AttrValue::UInt(u64::from_le_bytes(take(b, at, 8)?.try_into().unwrap())),
+            5 => AttrValue::Bytes(get_bytes(b, at)?.to_vec()),
+            6 => AttrValue::TimestampNs(i64::from_le_bytes(take(b, at, 8)?.try_into().unwrap())),
+            7 => AttrValue::Null,
             t => bail!("wal: unknown attr type tag {t}"),
         };
         attrs.push((key, v));
@@ -190,30 +195,82 @@ fn get_novel(b: &[u8], at: &mut usize) -> Result<Vec<(PieceHash, Vec<u8>)>> {
     for _ in 0..n_novel {
         let mut h = [0u8; 32];
         h.copy_from_slice(take(b, at, 32)?);
-        novel.push((PieceHash(h), get_bytes(b, at)?.to_vec()));
+        let bytes = get_bytes(b, at)?.to_vec();
+        if bytes.is_empty() {
+            bail!("wal: novel piece bytes must be non-empty");
+        }
+        if PieceHash::of(&bytes).0 != h {
+            bail!("wal: novel piece bytes do not match their BLAKE3 identity");
+        }
+        novel.push((PieceHash(h), bytes));
     }
     Ok(novel)
 }
 
-/// Encode the general record payload written by version 2.
-pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
-    crate::types::validate_contents(&r.contents)?;
-    if r.id.is_empty() {
-        bail!("record id must not be empty");
+/// Verify every content program whose pieces are wholly carried by this frame. Programs referring
+/// to an earlier durable piece are completed against the fold referenced by current authority
+/// during Store WAL replay.
+fn verify_frame_local_identities(record: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
+    let mut pieces = HashMap::with_capacity(novel.len());
+    for (hash, bytes) in novel {
+        if pieces.insert(*hash, bytes.as_slice()).is_some() {
+            bail!("wal: duplicate novel piece identity {hash}");
+        }
     }
+    for content in &record.contents {
+        let mut hasher = blake3::Hasher::new();
+        let mut complete = true;
+        for op in &content.ops {
+            match op {
+                BodyOp::Lit(bytes) => {
+                    hasher.update(bytes);
+                }
+                BodyOp::Piece { hash, len } => match pieces.get(hash) {
+                    Some(bytes) => {
+                        if bytes.len() != usize::try_from(*len).unwrap_or(usize::MAX) {
+                            bail!(
+                                "wal: content {:?} declares piece {hash} length {len}, actual {}",
+                                content.name,
+                                bytes.len()
+                            );
+                        }
+                        hasher.update(bytes);
+                    }
+                    None => {
+                        complete = false;
+                    }
+                },
+            }
+        }
+        if complete {
+            let declared = content.identity.ok_or_else(|| {
+                anyhow::anyhow!("wal: content {:?} has no identity", content.name)
+            })?;
+            let actual = ContentHash(hasher.finalize().into());
+            if actual != declared {
+                bail!(
+                    "wal: content {:?} identity is {declared}, reconstructed bytes are {actual}",
+                    content.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encode the current general-record payload.
+pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
+    validate_record_for_wal(r, novel)?;
     put_bytes(out, r.id.as_bytes());
     put_varint(out, r.contents.len() as u64);
     let mut contents: Vec<&Content> = r.contents.iter().collect();
     contents.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
     for content in contents {
         put_bytes(out, content.name.as_bytes());
-        match content.identity {
-            Some(identity) => {
-                out.push(1);
-                out.extend_from_slice(&identity.0);
-            }
-            None => out.push(0),
-        }
+        let identity = content.identity.ok_or_else(|| {
+            anyhow::anyhow!("content {:?} has no reconstructed-byte identity", content.name)
+        })?;
+        out.extend_from_slice(&identity.0);
         put_ops(out, &content.ops);
     }
     put_attrs(out, &r.attrs);
@@ -221,12 +278,28 @@ pub fn encode_record(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>
     Ok(())
 }
 
-#[cfg(test)]
-fn encode_record_v1(out: &mut Vec<u8>, r: &Record, novel: &[(PieceHash, Vec<u8>)]) {
-    put_bytes(out, r.id.as_bytes());
-    put_ops(out, r.body().unwrap_or(&[]));
-    put_attrs(out, &r.attrs);
-    put_novel(out, novel);
+fn validate_record_for_wal(r: &Record, novel: &[(PieceHash, Vec<u8>)]) -> Result<()> {
+    crate::types::validate_contents(&r.contents)?;
+    if r.id.is_empty() {
+        bail!("record id must not be empty");
+    }
+    if r.attrs.iter().any(|(key, _)| key.is_empty()) {
+        bail!("attribute name must not be empty");
+    }
+    let mut identities = std::collections::HashSet::with_capacity(novel.len());
+    for (hash, bytes) in novel {
+        if bytes.is_empty() {
+            bail!("novel piece bytes must be non-empty");
+        }
+        if PieceHash::of(bytes) != *hash {
+            bail!("novel piece bytes do not match their BLAKE3 identity");
+        }
+        if !identities.insert(*hash) {
+            bail!("duplicate novel piece identity {hash}");
+        }
+    }
+    verify_frame_local_identities(r, novel)?;
+    Ok(())
 }
 
 /// Decode a record payload. Replay hands this only frames whose crc verified, but the crc is a
@@ -239,42 +312,29 @@ pub fn decode_record(b: &[u8]) -> Result<CarvedRecord> {
     let n_contents = usize::try_from(get_varint(b, &mut at)?)
         .context("wal: content count exceeds this platform's address space")?;
     let mut contents = Vec::with_capacity(n_contents.min(b.len()));
+    let mut previous_name: Option<Vec<u8>> = None;
     for _ in 0..n_contents {
-        let name = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
-        let marker =
-            *b.get(at).ok_or_else(|| anyhow::anyhow!("wal: content identity marker is missing"))?;
-        at += 1;
-        let identity = match marker {
-            0 => None,
-            1 => {
-                let mut digest = [0u8; 32];
-                digest.copy_from_slice(take(b, &mut at, 32)?);
-                Some(ContentHash(digest))
-            }
-            marker => bail!("wal: unknown content identity marker {marker}"),
-        };
+        let name_bytes = get_bytes(b, &mut at)?.to_vec();
+        if previous_name.as_deref().is_some_and(|previous| previous >= name_bytes.as_slice()) {
+            bail!("wal: content names are duplicated or out of canonical UTF-8 order");
+        }
+        previous_name = Some(name_bytes.clone());
+        let name = String::from_utf8(name_bytes)?;
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(take(b, &mut at, 32)?);
+        let identity = Some(ContentHash(digest));
         let mut content = Content::new(name, get_ops(b, &mut at)?);
         content.identity = identity;
         contents.push(content);
     }
-    let attrs = get_attrs(b, &mut at, true)?;
+    let attrs = get_attrs(b, &mut at)?;
     let novel = get_novel(b, &mut at)?;
     if at != b.len() {
         bail!("wal: record has {} trailing bytes", b.len() - at);
     }
-    Ok((Record::new(id, contents, attrs)?, novel))
-}
-
-fn decode_record_v1(b: &[u8]) -> Result<CarvedRecord> {
-    let mut at = 0usize;
-    let id = String::from_utf8(get_bytes(b, &mut at)?.to_vec())?;
-    let body = get_ops(b, &mut at)?;
-    let attrs = get_attrs(b, &mut at, false)?;
-    let novel = get_novel(b, &mut at)?;
-    if at != b.len() {
-        bail!("wal: legacy record has {} trailing bytes", b.len() - at);
-    }
-    Ok((Record::new(id, vec![Content::new(BODY_CONTENT, body)], attrs)?, novel))
+    let record = Record::new(id, contents, attrs)?;
+    verify_frame_local_identities(&record, &novel)?;
+    Ok((record, novel))
 }
 
 /// Buffered writes are EXPLICIT here — an owned buffer flushed through the [`crate::vfs`] seam —
@@ -335,7 +395,7 @@ impl Wal {
         }
         let file_len = f.metadata()?.len();
         if valid_bytes > file_len {
-            bail!("WAL recovery boundary {valid_bytes} runs past the file's {file_len} bytes");
+            bail!("WAL replay boundary {valid_bytes} runs past the file's {file_len} bytes");
         }
         if valid_bytes < file_len {
             crate::vfs::set_len(&f, path, valid_bytes)?;
@@ -370,7 +430,10 @@ impl Wal {
             return Ok(());
         }
         crate::vfs::write_all_at(&self.f, &self.path, &self.buf, self.file_len)?;
-        self.file_len += self.buf.len() as u64;
+        self.file_len = self
+            .file_len
+            .checked_add(self.buf.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("WAL byte length overflow"))?;
         self.buf.clear();
         Ok(())
     }
@@ -385,26 +448,50 @@ impl Wal {
             bail!("wal frame payload of {} bytes exceeds the u32 length field", payload.len());
         }
         self.admit_additional_frames(1)?;
-        let mut hdr = Vec::with_capacity(HDR);
-        hdr.push(tag);
-        hdr.extend_from_slice(&seq.to_le_bytes());
-        hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let frame_len = HDR
+            .checked_add(payload.len())
+            .and_then(|len| len.checked_add(CRC))
+            .ok_or_else(|| anyhow::anyhow!("WAL frame allocation length overflow"))?;
+        let projected = self
+            .buf
+            .len()
+            .checked_add(frame_len)
+            .ok_or_else(|| anyhow::anyhow!("WAL buffer length overflow"))?;
+
+        // Flush only frames whose append calls already returned success. If the write fails, the
+        // current call has not entered the buffer and can never surface during a later sync/replay.
+        // A single large frame may exceed BUF_FLUSH until the next append or explicit sync; that is
+        // the price of keeping the acceptance boundary independent of an ambiguous file write.
+        if !self.buf.is_empty() && projected >= BUF_FLUSH {
+            self.flush_buf()?;
+        }
+
+        let mut hdr = [0u8; HDR];
+        hdr[0] = tag;
+        hdr[1..9].copy_from_slice(&seq.to_le_bytes());
+        hdr[9..13].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         let mut crc = crc32fast::Hasher::new();
         crc.update(&hdr);
         crc.update(payload);
         let c = crc.finalize();
+        self.buf
+            .try_reserve(frame_len)
+            .map_err(|error| anyhow::anyhow!("reserve WAL frame buffer: {error}"))?;
         self.buf.extend_from_slice(&hdr);
         self.buf.extend_from_slice(payload);
         self.buf.extend_from_slice(&c.to_le_bytes());
-        if self.buf.len() >= BUF_FLUSH {
-            self.flush_buf()?;
-        }
-        self.frame_count += 1;
+        self.frame_count = self
+            .frame_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("WAL frame count overflow"))?;
         Ok(())
     }
 
     /// Log a deletion. Durable on the next [`Wal::sync`], exactly like a put.
     pub fn append_tomb(&mut self, seq: u64, id: &str) -> Result<()> {
+        if id.is_empty() {
+            bail!("record id must not be empty");
+        }
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         scratch.extend_from_slice(id.as_bytes());
@@ -417,18 +504,37 @@ impl Wal {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         let encoded = encode_record(&mut scratch, r, novel);
-        let res = encoded.and_then(|()| self.append_frame(RECORD_V2_TAG, seq, &scratch));
+        let res = encoded.and_then(|()| self.append_frame(RECORD_TAG, seq, &scratch));
         self.scratch = scratch;
         res
     }
 
     /// Append records and tombstones as ONE atomic unit: the members under in-batch tags, then the
-    /// commit marker that seals them. Replay applies all of them or none — a crash anywhere before
-    /// the marker lands leaves members that no marker seals, and they are discarded.
+    /// completion marker that completes them. Replay applies all of them or none — a crash anywhere
+    /// before the marker lands leaves members with no completing marker, and they are discarded.
     ///
     /// `items`: `(record, novel, is_tombstone)`; a tombstone's record carries only its id.
     pub fn append_batch(&mut self, seq: u64, items: &[FramedRecord]) -> Result<()> {
-        self.admit_additional_frames(items.len() as u64 + 1)?;
+        if items.is_empty() {
+            bail!("a WAL batch must contain at least one mutation");
+        }
+        for (record, novel, tombstone) in items {
+            if record.id.is_empty() {
+                bail!("record id must not be empty");
+            }
+            if *tombstone {
+                if !record.contents.is_empty() || !record.attrs.is_empty() || !novel.is_empty() {
+                    bail!("a WAL tombstone may carry only its record id");
+                }
+            } else {
+                validate_record_for_wal(record, novel)?;
+            }
+        }
+        let batch_frames = u64::try_from(items.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("WAL batch frame count overflow"))?;
+        self.admit_additional_frames(batch_frames)?;
         for (r, novel, tomb) in items {
             let mut scratch = std::mem::take(&mut self.scratch);
             scratch.clear();
@@ -437,7 +543,7 @@ impl Wal {
                 BATCH_TOMB_TAG
             } else {
                 encode_record(&mut scratch, r, novel)?;
-                BATCH_RECORD_V2_TAG
+                BATCH_RECORD_TAG
             };
             let res = self.append_frame(tag, seq, &scratch);
             self.scratch = scratch;
@@ -445,7 +551,7 @@ impl Wal {
         }
         let mut count = Vec::with_capacity(4);
         put_varint(&mut count, items.len() as u64);
-        self.append_frame(BATCH_COMMIT_TAG, seq, &count)
+        self.append_frame(BATCH_COMPLETE_TAG, seq, &count)
     }
 
     /// The ACK point. Nothing may be reported durable before this returns.
@@ -459,9 +565,12 @@ impl Wal {
     pub fn truncate(&mut self) -> Result<()> {
         self.buf.clear();
         crate::vfs::set_len(&self.f, &self.path, 0)?;
-        crate::vfs::sync_file(&self.f, &self.path)?;
+        // `set_len` has already changed the live file. Update the append cursor before its
+        // durability barrier so a reported sync failure cannot leave this handle appending after
+        // the old length and creating an unauthenticated zero hole.
         self.file_len = 0;
         self.frame_count = 0;
+        crate::vfs::sync_file(&self.f, &self.path)?;
         Ok(())
     }
 
@@ -469,13 +578,14 @@ impl Wal {
         self.file_len + self.buf.len() as u64
     }
 
-    /// Every intact, COMMITTED frame, in order. Stops at the first torn or corrupt one — a partial
-    /// tail is the end of the log, not an error, because a crash mid-append leaves exactly that.
+    /// Every intact, COMMITTED frame, in order. Stops at a structurally short tail or a
+    /// checksum-failing final frame — crash-tear evidence. An I/O failure inside the snapshotted
+    /// file length propagates and can never authorize truncation of unread durable input.
     ///
-    /// Batch members ride in a holding pen until their commit marker seals them. The marker seals
+    /// Batch members ride in a holding pen until their completion marker completes them. The marker completes
     /// exactly the `count` members immediately before it; members before those belong to a batch
     /// whose marker never landed — an append that errored partway — and are discarded, exactly as
-    /// an unsealed run at the end of the log is. A standalone frame arriving over a non-empty pen
+    /// an uncommitted run at the end of the log is. A standalone frame arriving over a non-empty pen
     /// discards the pen the same way: whatever batch those members belonged to never committed.
     pub fn replay(path: &Path) -> Result<Vec<Frame>> {
         Self::replay_with_limits(path, crate::read_limits::ReadLimits::default())
@@ -509,11 +619,11 @@ impl Wal {
         let mut off = 0u64;
         let mut hdr = [0u8; HDR];
         loop {
-            if off + HDR as u64 + CRC as u64 > len
-                || crate::sys::read_exact_at(&f, &mut hdr, off).is_err()
-            {
+            if len.saturating_sub(off) < (HDR + CRC) as u64 {
                 break;
             }
+            crate::sys::read_exact_at(&f, &mut hdr, off)
+                .with_context(|| format!("read WAL frame header at byte {off}"))?;
             // An unknown tag is AMBIGUOUS and the two readings are opposite: a crash mid-append
             // leaves garbage here (stop, the log ends), but a newer writer's frame type also lands
             // here (refuse, or silently discard committed records). Treating both as "end of log" —
@@ -524,35 +634,37 @@ impl Wal {
             // So defer the decision until after the crc, below.
             let known = matches!(
                 hdr[0],
-                FRAME_TAG
-                    | TOMB_TAG
-                    | BATCH_COMMIT_TAG
-                    | BATCH_FRAME_TAG
-                    | BATCH_TOMB_TAG
-                    | RECORD_V2_TAG
-                    | BATCH_RECORD_V2_TAG
+                TOMB_TAG | BATCH_COMPLETE_TAG | BATCH_TOMB_TAG | RECORD_TAG | BATCH_RECORD_TAG
             );
             let seq = u64::from_le_bytes(hdr[1..9].try_into().unwrap());
             let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
-            let end = off + HDR as u64 + plen as u64 + CRC as u64;
+            let end = off
+                .checked_add(HDR as u64)
+                .and_then(|end| end.checked_add(plen as u64))
+                .and_then(|end| end.checked_add(CRC as u64))
+                .ok_or_else(|| anyhow::anyhow!("WAL frame end overflows"))?;
             if end > len {
                 break;
             }
             read_limits.admit_wal_frames(physical_frames.saturating_add(1))?;
             read_limits.admit("WAL frame", plen as u64, plen as u64)?;
             let mut payload = vec![0u8; plen];
-            if crate::sys::read_exact_at(&f, &mut payload, off + HDR as u64).is_err() {
-                break;
-            }
+            crate::sys::read_exact_at(&f, &mut payload, off + HDR as u64)
+                .with_context(|| format!("read WAL frame payload at byte {off}"))?;
             let mut cb = [0u8; CRC];
-            if crate::sys::read_exact_at(&f, &mut cb, off + HDR as u64 + plen as u64).is_err() {
-                break;
-            }
+            crate::sys::read_exact_at(&f, &mut cb, off + HDR as u64 + plen as u64)
+                .with_context(|| format!("read WAL frame checksum at byte {off}"))?;
             let mut crc = crc32fast::Hasher::new();
             crc.update(&hdr);
             crc.update(&payload);
             if crc.finalize() != u32::from_le_bytes(cb) {
-                break; // torn write: the log genuinely ends here
+                if end == len {
+                    break; // only the final complete frame may be a torn write
+                }
+                bail!(
+                    "wal frame at byte {off} fails its checksum with {} later bytes present",
+                    len - end
+                );
             }
             if !known {
                 // Checksums correctly, so it was written deliberately — by a build that knows a frame
@@ -565,30 +677,43 @@ impl Wal {
                 );
             }
             match hdr[0] {
-                BATCH_COMMIT_TAG => {
+                BATCH_COMPLETE_TAG => {
                     let mut at = 0usize;
-                    let Ok(n) = get_varint(&payload, &mut at) else { break };
+                    let n = get_varint(&payload, &mut at)
+                        .context("wal batch completion has a malformed member count")?;
                     if at != payload.len() {
-                        break; // a malformed marker cannot say what it seals
+                        bail!("wal batch completion has {} trailing bytes", payload.len() - at);
                     }
-                    let n = n as usize;
+                    let n = usize::try_from(n)
+                        .context("wal batch member count exceeds this platform's address space")?;
+                    if n == 0 {
+                        bail!("wal batch completion marker cannot name zero members");
+                    }
                     if n > pending.len() {
-                        // The frame chain is unbroken back to the last commit point, so a marker
-                        // sealing more members than preceded it means the log is not what a writer
+                        // The frame chain is unbroken back to the last completed batch boundary, so a marker
+                        // Committing more members than preceded it means the log is not what a writer
                         // put down. That is corruption that CHECKSUMS, and it must not quietly
                         // shrink a batch.
                         bail!(
-                            "wal batch commit seals {n} frames but only {} precede it",
+                            "wal batch completion names {n} frames but only {} precede it",
                             pending.len()
                         );
                     }
                     let start = pending.len() - n;
-                    // Members before the sealed run belong to a batch whose marker never landed.
+                    if pending[start..].iter().any(|member| member.seq != seq) {
+                        bail!(
+                            "wal batch completion sequence {seq} differs from one or more member sequences"
+                        );
+                    }
+                    // Members before the committed run belong to a batch whose marker never landed.
                     out.extend(pending.drain(..).skip(start));
                     pending_start = None;
                 }
                 TOMB_TAG | BATCH_TOMB_TAG => {
-                    let Ok(id) = String::from_utf8(payload) else { break };
+                    let id = String::from_utf8(payload).context("wal tombstone id is not UTF-8")?;
+                    if id.is_empty() {
+                        bail!("wal tombstone id is empty");
+                    }
                     let fr = Frame {
                         seq,
                         tomb: true,
@@ -606,27 +731,19 @@ impl Wal {
                         out.push(fr);
                     }
                 }
-                FRAME_TAG | BATCH_FRAME_TAG | RECORD_V2_TAG | BATCH_RECORD_V2_TAG => {
-                    let decoded = if matches!(hdr[0], FRAME_TAG | BATCH_FRAME_TAG) {
-                        decode_record_v1(&payload)
-                    } else {
-                        decode_record(&payload)
-                    };
-                    match decoded {
-                        Ok((record, novel)) => {
-                            let fr = Frame { seq, tomb: false, record, novel };
-                            if matches!(hdr[0], BATCH_FRAME_TAG | BATCH_RECORD_V2_TAG) {
-                                if pending.is_empty() {
-                                    pending_start = Some((off, physical_frames));
-                                }
-                                pending.push(fr);
-                            } else {
-                                pending.clear();
-                                pending_start = None;
-                                out.push(fr);
-                            }
+                RECORD_TAG | BATCH_RECORD_TAG => {
+                    let (record, novel) = decode_record(&payload)
+                        .context("wal record frame carries an invalid current-format payload")?;
+                    let fr = Frame { seq, tomb: false, record, novel };
+                    if hdr[0] == BATCH_RECORD_TAG {
+                        if pending.is_empty() {
+                            pending_start = Some((off, physical_frames));
                         }
-                        Err(_) => break,
+                        pending.push(fr);
+                    } else {
+                        pending.clear();
+                        pending_start = None;
+                        out.push(fr);
                     }
                 }
                 _ => unreachable!("known WAL tag was not handled"),
@@ -634,7 +751,7 @@ impl Wal {
             physical_frames += 1;
             off = end;
         }
-        // An unsealed run at the end of the log is a batch that never committed.
+        // An uncommitted run at the end of the log is a batch that never completed.
         let (valid_bytes, physical_frames) = pending_start.unwrap_or((off, physical_frames));
         Ok(ReplayState { frames: out, physical_frames, valid_bytes })
     }
@@ -643,6 +760,7 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::BODY_CONTENT;
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -652,12 +770,13 @@ mod tests {
         (
             Record {
                 id: "genai:aé#in".into(),
-                contents: vec![Content::new(
+                contents: vec![Content::identified(
                     BODY_CONTENT,
                     vec![
                         BodyOp::Lit(b"[".to_vec()),
                         BodyOp::Piece { hash: h, len: bytes.len() as u32 },
                     ],
+                    ContentHash::of(&[b"[".as_slice(), bytes.as_slice()].concat()),
                 )],
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
@@ -719,43 +838,116 @@ mod tests {
     }
 
     #[test]
-    fn two_record_generations_replay_together() {
-        let d = std::env::temp_dir().join(format!("turndb-wal-mixed-{}", std::process::id()));
+    fn record_wire_refuses_noncanonical_content_order() {
+        let mut bytes = Vec::new();
+        put_bytes(&mut bytes, b"record");
+        put_varint(&mut bytes, 2);
+        let identity = ContentHash::of(b"");
+        for name in [b"z".as_slice(), b"a".as_slice()] {
+            put_bytes(&mut bytes, name);
+            bytes.extend_from_slice(&identity.0);
+            put_ops(&mut bytes, &[]);
+        }
+        put_attrs(&mut bytes, &[]);
+        put_novel(&mut bytes, &[]);
+        assert!(
+            decode_record(&bytes).unwrap_err().to_string().contains("canonical"),
+            "the reader must not sort hostile WAL bytes into a valid semantic record"
+        );
+    }
+
+    #[test]
+    fn record_wire_refuses_false_content_identity_and_empty_attribute_name() {
+        let mut false_identity = Vec::new();
+        put_bytes(&mut false_identity, b"record");
+        put_varint(&mut false_identity, 1);
+        put_bytes(&mut false_identity, b"body");
+        false_identity.extend_from_slice(&ContentHash::of(b"different").0);
+        put_ops(&mut false_identity, &[BodyOp::Lit(b"actual".to_vec())]);
+        put_attrs(&mut false_identity, &[]);
+        put_novel(&mut false_identity, &[]);
+        assert!(decode_record(&false_identity).is_err());
+
+        let mut empty_attr = Vec::new();
+        put_bytes(&mut empty_attr, b"record");
+        put_varint(&mut empty_attr, 0);
+        put_attrs(&mut empty_attr, &[(String::new(), AttrValue::Null)]);
+        put_novel(&mut empty_attr, &[]);
+        assert!(decode_record(&empty_attr).is_err());
+
+        let mut zero_piece = Vec::new();
+        put_bytes(&mut zero_piece, b"record");
+        put_varint(&mut zero_piece, 1);
+        put_bytes(&mut zero_piece, b"body");
+        zero_piece.extend_from_slice(&ContentHash::of(b"").0);
+        put_ops(&mut zero_piece, &[BodyOp::Piece { hash: PieceHash::of(b""), len: 0 }]);
+        put_attrs(&mut zero_piece, &[]);
+        put_novel(&mut zero_piece, &[]);
+        assert!(decode_record(&zero_piece).is_err(), "a zero-length piece op must refuse");
+
+        let mut zero_novel = Vec::new();
+        put_bytes(&mut zero_novel, b"record");
+        put_varint(&mut zero_novel, 0);
+        put_attrs(&mut zero_novel, &[]);
+        put_novel(&mut zero_novel, &[(PieceHash::of(b""), Vec::new())]);
+        assert!(decode_record(&zero_novel).is_err(), "empty novel piece bytes must refuse");
+    }
+
+    #[test]
+    fn public_wal_writers_refuse_unreplayable_records_before_buffering_frames() {
+        let d =
+            std::env::temp_dir().join(format!("turndb-wal-writer-shape-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("wal");
-        let (mut legacy, novel) = rec();
-        legacy.attrs.truncate(5); // version 1 knows only the original scalar tags
-        let identified = Record::new(
-            "v2",
-            vec![Content::identified(
-                "response",
-                vec![BodyOp::Lit(b"identified".to_vec())],
-                ContentHash::of(b"identified"),
+        let mut wal = Wal::open(&p).unwrap();
+
+        assert!(wal.append_batch(1, &[]).is_err());
+        assert_eq!(wal.bytes(), 0, "an empty batch must not write a marker the reader refuses");
+
+        assert!(wal.append_tomb(1, "").is_err());
+        assert_eq!(wal.bytes(), 0);
+
+        let invalid = Record {
+            id: "invalid".into(),
+            contents: Vec::new(),
+            attrs: vec![(String::new(), AttrValue::Null)],
+        };
+        assert!(wal.append(1, &invalid, &[]).is_err());
+        assert_eq!(wal.bytes(), 0);
+
+        let zero_piece = Record {
+            id: "zero-piece".into(),
+            contents: vec![Content::identified(
+                "body",
+                vec![BodyOp::Piece { hash: PieceHash::of(b""), len: 0 }],
+                ContentHash::of(b""),
             )],
-            vec![],
-        )
-        .unwrap();
-        let (mut current, current_novel) = rec();
-        current.id = "v2-full".into();
-        {
-            let mut w = Wal::open(&p).unwrap();
-            // The v1 payload is produced by the retained legacy encoder, independently of the
-            // current writer, so this replays real version-1 bytes rather than round-tripping.
-            let mut old_payload = Vec::new();
-            encode_record_v1(&mut old_payload, &legacy, &novel);
-            w.append_frame(FRAME_TAG, 1, &old_payload).unwrap();
-            w.append(1, &identified, &[]).unwrap();
-            w.append(1, &current, &current_novel).unwrap();
-            w.sync().unwrap();
-        }
-        let replay = Wal::replay(&p).unwrap();
-        assert_eq!(replay.len(), 3);
-        assert_eq!(replay[0].record.contents, legacy.contents);
-        assert_eq!(replay[0].record.contents[0].name, BODY_CONTENT);
-        assert_eq!(replay[1].record, identified);
-        assert_eq!(replay[1].record.contents[0].identity, Some(ContentHash::of(b"identified")));
-        assert_eq!(replay[2].record, current);
-        std::fs::remove_dir_all(&d).ok();
+            attrs: Vec::new(),
+        };
+        assert!(wal.append(1, &zero_piece, &[]).is_err());
+        assert_eq!(wal.bytes(), 0, "zero-length piece refusal must precede WAL buffering");
+
+        let empty_novel = vec![(PieceHash::of(b""), Vec::new())];
+        let (valid, _) = rec();
+        assert!(wal.append(1, &valid, &empty_novel).is_err());
+        assert_eq!(wal.bytes(), 0, "empty novel-piece refusal must precede WAL buffering");
+
+        let (valid, novel) = rec();
+        assert!(wal
+            .append_batch(1, &[(valid, novel, false), (invalid, Vec::new(), false)])
+            .is_err());
+        assert_eq!(wal.bytes(), 0, "a late invalid batch member must precede every frame");
+
+        let tomb_with_payload = Record {
+            id: "deleted".into(),
+            contents: Vec::new(),
+            attrs: vec![("hidden".into(), AttrValue::Bool(true))],
+        };
+        assert!(wal.append_batch(1, &[(tomb_with_payload, Vec::new(), true)]).is_err());
+        assert_eq!(wal.bytes(), 0);
+        drop(wal);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 0);
+        std::fs::remove_dir_all(d).ok();
     }
 
     #[test]
@@ -776,7 +968,7 @@ mod tests {
         // a crash mid-append: a frame header promising more than landed
         {
             let mut f = OpenOptions::new().append(true).open(&p).unwrap();
-            f.write_all(&[FRAME_TAG, 9, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0]).unwrap();
+            f.write_all(&[RECORD_TAG, 9, 0, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0]).unwrap();
             f.write_all(b"short").unwrap();
             f.sync_all().unwrap();
         }
@@ -784,6 +976,27 @@ mod tests {
         assert_eq!(frames.len(), 5, "a torn tail is the end of the log, not an error");
         assert_eq!(frames[4].seq, 5);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_checksum_failure_before_later_frames_is_corruption_not_a_torn_tail() {
+        let d = std::env::temp_dir().join(format!("turndb-wal-middle-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("wal");
+        let (r, novel) = rec();
+        let mut writer = Wal::open(&p).unwrap();
+        writer.append(1, &r, &novel).unwrap();
+        writer.append(1, &r, &novel).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let mut bytes = std::fs::read(&p).unwrap();
+        let first_payload = HDR;
+        bytes[first_payload] ^= 1;
+        std::fs::write(&p, bytes).unwrap();
+        let error = Wal::replay(&p).err().expect("middle checksum damage must refuse").to_string();
+        assert!(error.contains("later bytes"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(d).ok();
     }
 
     #[test]
@@ -814,18 +1027,18 @@ mod tests {
             w.sync().unwrap();
         }
         let f = Wal::replay(&p).unwrap();
-        assert_eq!(f.len(), 4, "standalone + three sealed members");
+        assert_eq!(f.len(), 4, "standalone + three committed members");
         assert!(f[2].tomb && f[2].record.id == "z");
         assert_eq!(f[3].record.id, "b");
 
-        // Tear the marker off: the members are unsealed and contribute NOTHING.
+        // Tear the marker off: the members are uncommitted and contribute NOTHING.
         let flen = std::fs::metadata(&p).unwrap().len();
         let fh = OpenOptions::new().write(true).open(&p).unwrap();
         fh.set_len(flen - (HDR as u64 + 1 + CRC as u64)).unwrap();
         let f = Wal::replay(&p).unwrap();
-        assert_eq!(f.len(), 1, "an unsealed batch must not replay a prefix of itself");
+        assert_eq!(f.len(), 1, "an uncommitted batch must not replay a prefix of itself");
 
-        // A sealed batch after the abandoned run: its marker seals ITS members, not the strays.
+        // A committed batch after the abandoned run: its marker commits ITS members, not the strays.
         {
             let mut w = Wal::open(&p).unwrap();
             w.append_batch(3, &[(b.clone(), nb.clone(), false)]).unwrap();
@@ -846,10 +1059,70 @@ mod tests {
             let mut w = Wal::open(&p2).unwrap();
             let mut count = Vec::new();
             put_varint(&mut count, 5);
-            w.append_frame(BATCH_COMMIT_TAG, 1, &count).unwrap();
+            w.append_frame(BATCH_COMPLETE_TAG, 1, &count).unwrap();
             w.sync().unwrap();
         }
-        assert!(Wal::replay(&p2).is_err(), "a marker sealing absent frames must refuse the log");
+        assert!(Wal::replay(&p2).is_err(), "a marker naming absent frames must refuse the log");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_batch_marker_must_carry_its_members_sequence() {
+        let d = std::env::temp_dir().join(format!("turndb-wal-batch-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("wal");
+        let (r, novel) = rec();
+        let mut writer = Wal::open(&p).unwrap();
+        writer.append_batch(7, &[(r, novel, false)]).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let mut bytes = std::fs::read(&p).unwrap();
+        let first_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let marker = HDR + first_len + CRC;
+        assert_eq!(bytes[marker], BATCH_COMPLETE_TAG);
+        bytes[marker + 1..marker + 9].copy_from_slice(&8u64.to_le_bytes());
+        let marker_len =
+            u32::from_le_bytes(bytes[marker + 9..marker + 13].try_into().unwrap()) as usize;
+        let checksum_at = marker + HDR + marker_len;
+        let checksum = crc32fast::hash(&bytes[marker..checksum_at]);
+        bytes[checksum_at..checksum_at + CRC].copy_from_slice(&checksum.to_le_bytes());
+        std::fs::write(&p, bytes).unwrap();
+
+        let error =
+            Wal::replay(&p).err().expect("marker sequence mismatch must refuse").to_string();
+        assert!(error.contains("differs"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn checksum_valid_malformed_current_frames_are_refused() {
+        let d = std::env::temp_dir().join(format!(
+            "turndb-wal-semantic-corruption-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+
+        let cases: &[(u8, &[u8])] = &[
+            (BATCH_COMPLETE_TAG, &[0x80]), // unterminated varint
+            (BATCH_COMPLETE_TAG, &[0, 0]), // trailing byte
+            (TOMB_TAG, &[0xff]),           // invalid UTF-8
+            (TOMB_TAG, b""),               // empty id
+            (RECORD_TAG, &[0]),            // empty id followed by a truncated content count
+        ];
+        for (index, &(tag, payload)) in cases.iter().enumerate() {
+            let path = d.join(format!("case-{index}.wal"));
+            {
+                let mut wal = Wal::open(&path).unwrap();
+                wal.append_frame(tag, 1, payload).unwrap();
+                wal.sync().unwrap();
+            }
+            assert!(
+                Wal::replay(&path).is_err(),
+                "checksum-valid malformed frame case {index} must be corruption, not a torn tail"
+            );
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -20,9 +20,9 @@ use turndb::{AttrValue, ContentHash, Record};
 
 const CORPUS_JSON: &str = include_str!("../conformance/v1/corpus.json");
 const QUERY_SCHEMA_JSON: &str = include_str!("../conformance/v1/query.schema.json");
-const CAPABILITIES_SCHEMA_JSON: &str = include_str!("../conformance/v1/capabilities.schema.json");
-const CAPABILITIES_JSON: &str = include_str!("../conformance/v1/capabilities.json");
-const CONTAINER_HEX: &str = include_str!("../conformance/v1/fixture.turndb.hex");
+const CAPABILITIES_SCHEMA_JSON: &str = include_str!("../conformance/v2/capabilities.schema.json");
+const CAPABILITIES_JSON: &str = include_str!("../conformance/v2/capabilities.json");
+const CURRENT_CONTAINER_HEX: &str = include_str!("../conformance/v1/fixture.turndb.hex");
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,7 +231,7 @@ fn contract_artifacts_are_complete_and_mutation_sensitive() {
     assert_eq!(query_schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
     assert_eq!(capabilities_schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
     assert_eq!(query_schema["$defs"]["scalar"]["oneOf"].as_array().unwrap().len(), 8);
-    assert_eq!(capabilities["contractVersion"], 1);
+    assert_eq!(capabilities["contractVersion"], 2);
     assert_eq!(corpus.contract_version, 1);
 
     let operations = capabilities_schema["$defs"]["operation"]["enum"].as_array().unwrap();
@@ -270,7 +270,6 @@ fn compiled_core_satisfies_capability_contract_invariants() {
         "explainScan",
         "schema",
         "readContent",
-        "seal",
         "verify",
         "spaceUsage",
         "compactBounded",
@@ -278,14 +277,17 @@ fn compiled_core_satisfies_capability_contract_invariants() {
         "erase",
         "close",
     ];
+    if turndb::backup::ATOMIC_RESTORE {
+        operations.push("backup");
+    }
     if core.sql {
         operations.push("querySql");
     }
     let native = json!({
-        "contractVersion": 1,
+        "contractVersion": 2,
         "profile": "native",
         "operations": operations,
-        "partFormat": { "write": core.part_format_write, "readMax": core.part_format_read_max },
+        "draftFormatEpoch": core.draft_format_epoch,
         "writerExclusion": match turndb::capabilities::capabilities().writer_exclusion {
             turndb::capabilities::WriterExclusion::OsEnforced => "os_enforced",
             turndb::capabilities::WriterExclusion::EmbedderEnforced => "embedder_enforced",
@@ -295,8 +297,8 @@ fn compiled_core_satisfies_capability_contract_invariants() {
         "columnar": core.columnar,
         "sql": core.sql,
         "arrowIpc": core.columnar,
-        "reclamation": if turndb::capabilities::capabilities().allocated_space_usage {
-            "punch_or_refold"
+        "reclamation": if turndb::capabilities::capabilities().in_place_deallocation {
+            "content_punch_or_refold"
         } else {
             "refold_only"
         },
@@ -308,10 +310,10 @@ fn compiled_core_satisfies_capability_contract_invariants() {
     // The reduced profiles make platform loss explicit; the same invariant interpreter validates
     // them, so changing one rule exercises more than the native happy path.
     let browser = json!({
-        "contractVersion": 1,
+        "contractVersion": 2,
         "profile": "browser",
         "operations": ["openSnapshot", "compiledCapabilities", "scan", "explainScan", "schema", "readContent", "close"],
-        "partFormat": { "readMax": core.part_format_read_max },
+        "draftFormatEpoch": core.draft_format_epoch,
         "writerExclusion": "read_only",
         "positionedIo": true,
         "threads": false,
@@ -325,10 +327,10 @@ fn compiled_core_satisfies_capability_contract_invariants() {
     validate_invariants(&browser, &fixture);
 
     let wasi = json!({
-        "contractVersion": 1,
+        "contractVersion": 2,
         "profile": "wasi",
-        "operations": ["openWriter", "openSnapshot", "compiledCapabilities", "write", "sync", "flush", "scan", "explainScan", "schema", "readContent", "close"],
-        "partFormat": { "write": core.part_format_write, "readMax": core.part_format_read_max },
+        "operations": ["openWriter", "compiledCapabilities", "write", "sync", "flush", "scan", "verify", "spaceUsage", "refold", "erase", "close"],
+        "draftFormatEpoch": core.draft_format_epoch,
         "writerExclusion": "embedder_enforced",
         "positionedIo": true,
         "threads": false,
@@ -407,20 +409,20 @@ fn rust_store_replays_the_shared_query_corpus() {
     }
     assert_eq!(
         generated,
-        decode_hex(CONTAINER_HEX).unwrap(),
-        "the checked-in read-only fixture must be regenerated from corpus.json"
+        decode_hex(CURRENT_CONTAINER_HEX).unwrap(),
+        "the current-writer fixture must match corpus.json byte for byte"
     );
 }
 
 #[test]
-fn checked_in_container_matches_the_published_v2_view() {
+fn checked_in_container_matches_the_current_view() {
     let corpus: Corpus = serde_json::from_str(CORPUS_JSON).unwrap();
-    let dir = temp_dir("physical-fixture-v1");
+    let dir = temp_dir("physical-fixture");
     std::fs::create_dir_all(&dir).unwrap();
     let _remove = RemoveOnDrop(dir.clone());
     let path = dir.join("fixture.turndb");
-    let bytes = decode_hex(CONTAINER_HEX).unwrap();
-    assert_eq!(bytes.len(), 45_650, "fixture completeness guard");
+    let bytes = decode_hex(CURRENT_CONTAINER_HEX).unwrap();
+    assert!(bytes.len() > 8192, "fixture completeness guard");
     std::fs::write(&path, bytes).unwrap();
     let reader = open_read_container(&path, fold_cfg()).unwrap();
     assert_source_cases("snapshot-v2", &reader, &corpus);
@@ -447,12 +449,12 @@ impl turndb::readat::ReadAt for MemorySource {
 }
 
 #[test]
-fn arbitrary_positioned_source_matches_the_published_v2_view() {
+fn arbitrary_positioned_source_matches_the_current_view() {
     let corpus: Corpus = serde_json::from_str(CORPUS_JSON).unwrap();
-    let bytes = Arc::new(decode_hex(CONTAINER_HEX).unwrap());
+    let bytes = Arc::new(decode_hex(CURRENT_CONTAINER_HEX).unwrap());
     let reader = turndb::store::open_read_container_source(
         Arc::new(MemorySource(bytes)),
-        "memory://conformance-v1",
+        "memory://conformance",
         fold_cfg(),
         turndb::read_limits::ReadLimits::default(),
     )
@@ -920,7 +922,7 @@ fn validate_profile_shape(profile: &Value, schema: &Value) {
     for field in schema["required"].as_array().unwrap() {
         assert!(object.contains_key(field.as_str().unwrap()), "missing capability field {field}");
     }
-    assert_eq!(profile["contractVersion"], 1);
+    assert_eq!(profile["contractVersion"], 2);
     let allowed_profiles = schema["properties"]["profile"]["enum"].as_array().unwrap();
     assert!(allowed_profiles.contains(&profile["profile"]));
     let allowed_operations: HashSet<_> =
@@ -928,7 +930,7 @@ fn validate_profile_shape(profile: &Value, schema: &Value) {
     for operation in profile["operations"].as_array().unwrap() {
         assert!(allowed_operations.contains(operation), "unknown operation {operation}");
     }
-    assert!(profile["partFormat"]["readMax"].as_u64().is_some());
+    assert!(profile["draftFormatEpoch"].as_u64().is_some());
     assert!(profile["positionedIo"].is_boolean());
     assert!(profile["threads"].is_boolean());
     assert!(profile["columnar"].is_boolean());
@@ -975,10 +977,6 @@ fn assert_then(profile: &Value, consequence: &Value, name: &str) {
                         "capability invariant {name:?} forbids operation {operation}"
                     );
                 }
-            }
-            "partFormatWriteAbsent" => {
-                assert_eq!(*expected, true);
-                assert!(profile["partFormat"].get("write").is_none(), "invariant {name:?}");
             }
             "cancellationScan" => assert_eq!(profile["cancellation"]["scan"], *expected),
             _ => assert_eq!(profile[key], *expected, "capability invariant {name:?}, field {key}"),

@@ -19,7 +19,7 @@ Fold statistics are:
 - `fold_blocks_touched`: distinct logical block ids containing selected pieces consulted by the
   reconstruction path;
 - `fold_block_cache_hits` and `fold_block_cache_misses`: decompressed block-cache access counts for
-  blocks already sealed into fold segments;
+  blocks already closed into fold segments;
 - `fold_stored_bytes_read`: complete stored fold frame bytes, including the frame header, requested
   from segment readers on misses;
 - `fold_raw_bytes_decoded`: uncompressed block bytes produced by those misses.
@@ -34,8 +34,8 @@ bytes measure codec work and cache admission, not bytes retained in the returned
 
 ## Cache and concurrency semantics
 
-Part section caches and fold block caches are shared by immutable snapshots. Global before/after
-counter subtraction would therefore be contaminated by another snapshot reading concurrently.
+Part section caches and fold block caches are shared by immutable read views. Global before/after
+counter subtraction would therefore be contaminated by another read view reading concurrently.
 TurnDB instead installs an internal scope around the synchronous Rust scan call. Low-level part and
 fold readers report only to that scope, and nested scopes are isolated. A concurrent scan cannot add
 its reads to this page's statistics.
@@ -58,6 +58,6 @@ future precision split between counters and byte totals.
 
 These metrics describe the storage-native structured pager. `durationNs` separately reports complete
 successful page execution, including validation and cursor preparation but excluding native actor
-queue wait. They do not instrument SQL execution, measure OS-level I/O, or replace the constant-work whole-store health snapshot.
+queue wait. They do not instrument SQL execution, measure OS-level I/O, or replace the constant-work whole-store health observation.
 `explain_scan` separately describes logical requirements and pre-resolution physical scope; its own
 id-structure reads are not returned as page I/O statistics and may warm caches before a later page.

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 pub const SEG_HDR_LEN: u64 = 48;
 
 /// Identity assertion, not a version. A mismatch refuses — there is no negotiation anywhere.
-pub const MAGIC: &[u8; 8] = b"TURNFOLD";
+pub const MAGIC: &[u8; 8] = b"TDBFLD01";
 
 /// Segment flag: this segment's block payloads are ENCRYPTED.
 ///
@@ -25,8 +25,11 @@ pub const SEG_FLAG_ENCRYPTED: u32 = 1 << 0;
 /// Default roll threshold. Bounded so a crash-time tail scan stays short and mmap granularity stays sane.
 pub const SEG_MAX_DEFAULT: u32 = 1 << 30;
 
-/// Format bound. `Loc.block_off` is a `u32`, so a block start must fit in one.
-pub const SEG_MAX_LIMIT: u64 = 1 << 32;
+/// Largest segment length representable by the persisted u32 tail and block offsets. A segment is
+/// therefore strictly smaller than 2^32 bytes.
+pub const SEG_MAX_LIMIT: u64 = u32::MAX as u64;
+/// Largest segment number representable by the exact eight-digit member namespace.
+pub const MAX_SEGMENT_NUMBER: u32 = 99_999_999;
 
 /// Block id and byte offset entries reconstructed for one segment.
 pub type BlockDirectory = Vec<(u32, u32)>;
@@ -38,11 +41,10 @@ pub fn seg_name(n: u32) -> String {
     format!("seg-{n:08}.fold")
 }
 
-/// Parse a segment file name **numerically**. Lexicographic ordering breaks once the `%08` width is
-/// exceeded, and a mis-ordered segment list corrupts recovery.
+/// Parse the one exact eight-decimal-digit segment member spelling.
 pub fn parse_seg_name(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("seg-")?.strip_suffix(".fold")?;
-    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+    if rest.len() != 8 || !rest.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     rest.parse::<u32>().ok()
@@ -111,22 +113,60 @@ pub fn fsync_dir(dir: &Path) -> Result<()> {
 
 /// Create segment `n` with its header durable before any frame can follow it.
 ///
-/// `O_EXCL`: a leftover file is never appended to. Combined with fsyncing the header before returning,
-/// this makes "file exists but is shorter than a header" provably hold no durable frame — which is what
-/// lets recovery delete such a file safely.
+/// The complete header is synchronized under an exact numbered staging name before a no-replace
+/// rename installs `seg-N.fold`. A short final-name segment is therefore never current protocol
+/// debris and writer open refuses it without mutation.
 pub fn create(dir: &Path, n: u32, dict_id: [u8; 32]) -> Result<File> {
     create_flagged(dir, n, dict_id, 0)
 }
 
-/// [`create`], with segment flags — how an encrypted segment announces itself.
-pub fn create_flagged(dir: &Path, n: u32, dict_id: [u8; 32], flags: u32) -> Result<File> {
+/// Internal construction seam. The current format writes only zero flags; the parameter remains
+/// here so every write-side implementation checks that invariant at its byte-production boundary.
+pub(crate) fn create_flagged(dir: &Path, n: u32, dict_id: [u8; 32], flags: u32) -> Result<File> {
+    if n > MAX_SEGMENT_NUMBER {
+        bail!("segment number {n} exceeds the current member namespace");
+    }
+    if flags != 0 {
+        bail!("current fold segments require zero flags");
+    }
     let path = dir.join(seg_name(n));
-    let f = crate::vfs::create_new(&path)
-        .with_context(|| format!("create segment {}", path.display()))?;
-    crate::vfs::write_all_at(&f, &path, &SegHeader { seg: n, flags, dict_id }.encode(), 0)?;
-    crate::vfs::sync_file(&f, &path)?;
+    let (staging, f) = crate::vfs::create_numbered_staging(&path, "creating")
+        .with_context(|| format!("create segment staging beside {}", path.display()))?;
+    let initialized = (|| -> Result<()> {
+        crate::vfs::write_all_at(&f, &staging, &SegHeader { seg: n, flags, dict_id }.encode(), 0)?;
+        crate::vfs::sync_file(&f, &staging)?;
+        crate::vfs::rename_noreplace(&staging, &path)
+            .with_context(|| format!("install segment {}", path.display()))?;
+        Ok(())
+    })();
+    if initialized.is_err() {
+        let _ = crate::vfs::unlink(&staging);
+        initialized?;
+    }
     fsync_dir(dir)?;
     Ok(f)
+}
+
+/// Exact crash-staging spelling for a segment birth.
+pub(crate) fn is_birth_staging_name(name: &std::ffi::OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    let Some(marker) = bytes.windows(b".creating-".len()).position(|w| w == b".creating-") else {
+        return false;
+    };
+    let (final_name, suffix) = bytes.split_at(marker);
+    if parse_seg_name(std::str::from_utf8(final_name).unwrap_or("")).is_none() {
+        return false;
+    }
+    let Some(numbers) = suffix.strip_prefix(b".creating-") else { return false };
+    let Some(dash) = numbers.iter().position(|&byte| byte == b'-') else { return false };
+    let (pid, serial_with_dash) = numbers.split_at(dash);
+    let serial = &serial_with_dash[1..];
+    !pid.is_empty()
+        && !serial.is_empty()
+        && pid.iter().all(u8::is_ascii_digit)
+        && serial.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(pid).ok().and_then(|v| v.parse::<u32>().ok()).is_some()
+        && std::str::from_utf8(serial).ok().and_then(|v| v.parse::<u64>().ok()).is_some()
 }
 
 /// Read-only handle — never opens for write, so a reader cannot damage a store it does not own.
@@ -144,10 +184,10 @@ pub fn open_rw(dir: &Path, n: u32) -> Result<File> {
 /// Deallocate `len` bytes at `off` — the extents are freed and read back as zeros, and the file's
 /// length is untouched, so every offset in it still means what it meant.
 ///
-/// This is the one operation that destroys committed fold bytes in place. It is a Linux
-/// filesystem feature (ext4, xfs, btrfs, tmpfs...); where the kernel or filesystem declines, the
-/// error surfaces and the caller falls back to a re-fold, which reclaims the same space by
-/// rewriting rather than by punching.
+/// This is the one operation that destroys committed fold bytes in place. TurnDB implements it
+/// through Linux hole punching and Windows sparse-range zeroing; where the operating system or
+/// filesystem declines, the error surfaces and the caller falls back to a re-fold, which reclaims
+/// the same space by rewriting rather than by punching.
 ///
 /// **Only a block's PAYLOAD is ever punched, never its header.** The frame chain is walked by
 /// reading a header and stepping over `stored` bytes, so a punched header would end the chain and
@@ -168,10 +208,10 @@ pub fn punch(f: &File, path: &Path, off: u64, len: u64) -> Result<()> {
 /// it plus every `(block_id, offset)` seen, which is how the block directory is rebuilt at open.
 ///
 /// This is how the fold finds its own last good byte with no external length authority. It never
-/// decompresses: read 12 bytes, hash `12 + stored`, advance. The first failure of any kind is the end
-/// of good data — during a tail scan a bad frame is a boundary, not an error — except a frame the
-/// manifest declares PUNCHED, which the `punched` parameter of the `_with_limits` variants lets the
-/// walk step over. This convenience wrapper has no manifest in hand and passes no declaration.
+/// decompresses: read 12 bytes, hash `12 + stored`, advance. A structurally invalid frame or
+/// checksum failure ends good data; an underlying positioned-read failure propagates. A frame the
+/// manifest declares PUNCHED is stepped over by the `punched` parameter of the `_with_limits`
+/// variants. This convenience wrapper has no manifest in hand and passes no declaration.
 pub fn scan_tail(f: &dyn ReadAt, file_len: u64, has_dict: bool) -> Result<(u64, Vec<(u32, u32)>)> {
     scan_tail_with_limits(f, file_len, has_dict, &[], crate::read_limits::ReadLimits::default())
 }
@@ -186,6 +226,9 @@ pub fn scan_tail_with_limits(
     punched: &[(u32, u32)],
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(u64, Vec<(u32, u32)>)> {
+    if file_len > SEG_MAX_LIMIT {
+        bail!("segment is {file_len} bytes, over the {SEG_MAX_LIMIT} format bound");
+    }
     scan_tail_controlled_with_limits(
         f,
         file_len,
@@ -230,6 +273,9 @@ pub fn scan_tail_controlled_with_limits(
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(u64, Vec<(u32, u32)>)> {
     let read_limits = read_limits.validate()?;
+    if file_len > SEG_MAX_LIMIT {
+        bail!("segment is {file_len} bytes, over the {SEG_MAX_LIMIT} format bound");
+    }
     let mut off = SEG_HDR_LEN;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
@@ -238,38 +284,63 @@ pub fn scan_tail_controlled_with_limits(
     let mut dir: Vec<(u32, u32)> = Vec::new();
     loop {
         control.check(operation)?;
-        if off + (block::BLOCK_OVERHEAD as u64) > file_len {
+        if file_len.saturating_sub(off) < block::BLOCK_OVERHEAD as u64 {
             break; // cannot hold even an empty block
         }
-        if f.read_exact_at(&mut hdr, off).is_err() {
+        f.read_exact_at(&mut hdr, off)
+            .with_context(|| format!("read fold block header at byte {off}"))?;
+        let parsed = block::parse_hdr(&hdr, has_dict);
+        let raw = u32::from_le_bytes(hdr[2..6].try_into().unwrap());
+        let stored = u32::from_le_bytes(hdr[6..10].try_into().unwrap());
+        let end = off
+            .checked_add(BLOCK_HDR_LEN as u64)
+            .and_then(|at| at.checked_add(u64::from(stored)))
+            .and_then(|at| at.checked_add(BLOCK_XSUM_LEN as u64))
+            .ok_or_else(|| anyhow::anyhow!("fold block frame end overflows at byte {off}"))?;
+        if let Err(error) = parsed.as_ref() {
+            if end > file_len {
+                break; // an invalid-looking header whose advertised final frame never landed
+            }
+            read_limits.admit("unrecognized fold block", u64::from(stored), u64::from(raw))?;
+            let span = BLOCK_HDR_LEN
+                .checked_add(stored as usize)
+                .and_then(|len| len.checked_add(BLOCK_XSUM_LEN))
+                .ok_or_else(|| anyhow::anyhow!("fold block allocation length overflows"))?;
+            payload.resize(span, 0);
+            f.read_exact_at(&mut payload[..span], off)
+                .with_context(|| format!("read unrecognized fold block frame at byte {off}"))?;
+            let checksum_at = BLOCK_HDR_LEN + stored as usize;
+            if block::xsum(&payload[..checksum_at])
+                == payload[checksum_at..checksum_at + BLOCK_XSUM_LEN]
+            {
+                return Err(anyhow::anyhow!("{error}"))
+                    .with_context(|| format!("checksumming fold frame at byte {off} has an invalid current-format header"));
+            }
+            if end < file_len {
+                bail!(
+                    "invalid fold frame at byte {off} has {} later bytes; refusing instead of truncating",
+                    file_len - end
+                );
+            }
             break;
         }
-        let h = match block::parse_hdr(&hdr, has_dict) {
-            Ok(h) => h,
-            Err(_) => break,
-        };
+        let h = parsed.expect("checked above");
         // Unlike checksum damage, a valid header outside runtime policy is not a crash-tail
-        // boundary. Surface the typed refusal so writer recovery never truncates a valid committed
+        // boundary. Surface the typed refusal so directory-fold writer open never truncates a valid
         // block merely because this process was opened with a smaller budget.
         read_limits.admit(
             format!("fold block {}", h.block_id),
             u64::from(h.stored),
             u64::from(h.raw),
         )?;
-        let end =
-            match off.checked_add(BLOCK_HDR_LEN as u64 + h.stored as u64 + BLOCK_XSUM_LEN as u64) {
-                Some(e) => e,
-                None => break,
-            };
         if end > file_len {
             break; // the promised payload/checksum never fully reached disk
         }
         // verify the whole block frame's bytes
-        let span = (BLOCK_HDR_LEN + h.stored as usize + BLOCK_XSUM_LEN) as usize;
+        let span = block::frame_span_usize(h.stored)?;
         payload.resize(span, 0);
-        if f.read_exact_at(&mut payload[..span], off).is_err() {
-            break;
-        }
+        f.read_exact_at(&mut payload[..span], off)
+            .with_context(|| format!("read fold block frame at byte {off}"))?;
         control.check(operation)?;
         if block::verify_frame_bytes(&payload[..span], has_dict).is_err() {
             // A PUNCHED block: header intact (punch never touches it — that is what keeps the
@@ -282,25 +353,25 @@ pub fn scan_tail_controlled_with_limits(
             // frame is stepped over whatever its payload holds, and its location is retained so a
             // later read reports ERASED by name instead of resolving into damage.
             //
-            // The all-zero test survives beside the declaration because a historical committed
-            // prefix can predate the declaration reaching this open. It is deliberately not
-            // widened: an UNDECLARED checksum-failing frame with nonzero payload bytes is damage,
-            // and damage still ends the walk — the skip is authorized by the declaration, never
-            // guessed from the payload.
             let declared = punched.iter().any(|&(lo, hi)| (lo..=hi).contains(&h.block_id));
-            let body = &payload[BLOCK_HDR_LEN..span - BLOCK_XSUM_LEN];
-            if declared || (h.stored > 0 && body.iter().all(|&b| b == 0)) {
+            if declared {
                 read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
                 read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
-                dir.push((h.block_id, off as u32));
+                dir.push((h.block_id, u32::try_from(off).context("block offset exceeds u32")?));
                 off = end;
                 continue;
+            }
+            if end < file_len {
+                bail!(
+                    "fold frame at byte {off} fails its checksum with {} later bytes present",
+                    file_len - end
+                );
             }
             break;
         }
         read_limits.admit_fold_blocks(dir.len() as u64 + 1)?;
         read_limits.admit_fold_blocks(u64::from(h.block_id) + 1)?;
-        dir.push((h.block_id, off as u32));
+        dir.push((h.block_id, u32::try_from(off).context("block offset exceeds u32")?));
         off = end;
     }
     Ok((off, dir))
@@ -317,15 +388,14 @@ pub struct FoldTail {
 // The directory sidecar — advisory, derived, and the answer to O(segment) opens
 // ---------------------------------------------------------------------------------------------
 
-/// Sidecar magic. `seg-NNNNNNNN.dir` beside a segment carries what `scan_tail` would recompute:
-/// the block ids and offsets, and the scan end. The retired directory writer emits one when a
-/// segment seals; the live container writer also stages one for the active segment at every
-/// commit so a ranged cold open never scans content payload.
-pub const DIR_MAGIC: &[u8; 8] = b"TURNSDIR";
+/// Sidecar magic. A `seg-NNNNNNNN.dir` member beside a segment carries what `scan_tail` would
+/// recompute: the block ids and offsets, and the scan end. The container writer stages one for
+/// every committed segment so a ranged cold open never scans content payload.
+pub const DIR_MAGIC: &[u8; 8] = b"TDBSDR01";
 
 /// ```text
 /// offset  size  field
-///      0     8  MAGIC = "TURNSDIR"
+///      0     8  MAGIC = "TDBSDR01"
 ///      8     4  seg          must match the filename AND the segment beside it
 ///     12     4  tail         scan end; for a sealed segment this IS the file length
 ///     16     4  n_entries
@@ -334,6 +404,15 @@ pub const DIR_MAGIC: &[u8; 8] = b"TURNSDIR";
 /// ```
 pub fn dir_path(dir: &Path, n: u32) -> PathBuf {
     dir.join(format!("seg-{n:08}.dir"))
+}
+
+/// Parse the exact temporary-sidecar spelling emitted by [`write_dir_sidecar`].
+pub(crate) fn parse_dir_tmp_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("seg-")?.strip_suffix(".dir.tmp")?;
+    if rest.len() != 8 || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u32>().ok()
 }
 
 /// Write a directory-layout sidecar for a sealed segment. ADVISORY, so tmp + rename but no fsync
@@ -367,7 +446,7 @@ pub fn encode_dir_sidecar(n: u32, tail: u32, entries: &[(u32, u32)]) -> Vec<u8> 
 /// The sidecar's entries, or `None` — absent, damaged, or not describing this file's bytes. The
 /// caller rescans on `None`; it must never trust a sidecar this refused.
 ///
-/// `tail == file_len` is the staleness gate, not a nicety: recovery can truncate a once-sealed
+/// `tail == file_len` is the staleness gate, not a nicety: directory-fold crash-tail repair can truncate a once-sealed
 /// segment back into being the active one, and its leftover sidecar then describes blocks past
 /// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
 /// means the sidecar and the segment parted ways.
@@ -438,7 +517,7 @@ pub fn read_dir_sidecar_bytes_with_limits(
     Ok((bytes.len() as u64 <= max).then_some(bytes))
 }
 
-/// [`read_dir_sidecar`]'s validation core, over bytes from ANY source — a directory or a pack.
+/// [`read_dir_sidecar`]'s validation core, over bytes from any positioned byte source.
 pub fn parse_dir_sidecar(b: &[u8], n: u32, file_len: u64) -> Option<DirectorySidecar> {
     parse_dir_sidecar_with_limits(b, n, file_len, crate::read_limits::ReadLimits::default())
         .ok()
@@ -478,6 +557,46 @@ pub fn parse_dir_sidecar_with_limits(
     Ok(Some((tail, entries)))
 }
 
+/// Prove that parsed advisory entries describe the authoritative frame-header chain exactly.
+///
+/// A sidecar checksum authenticates only the sidecar's own bytes. Before its entries can replace a
+/// segment scan, each offset and block id must agree with the header at the next contiguous frame
+/// boundary, and the final frame must end exactly at `file_len`. Header/read damage returns `false`
+/// so the caller falls back to the authoritative scan. A genuine runtime-admission refusal remains
+/// an error: silently rescanning must not turn an explicit resource policy into a crash-tail guess.
+pub fn validate_dir_sidecar_entries(
+    segment: &dyn ReadAt,
+    file_len: u64,
+    has_dict: bool,
+    entries: &[(u32, u32)],
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<bool> {
+    let mut expected = SEG_HDR_LEN;
+    let mut header = [0u8; BLOCK_HDR_LEN];
+    for &(block_id, offset) in entries {
+        if u64::from(offset) != expected || segment.read_exact_at(&mut header, expected).is_err() {
+            return Ok(false);
+        }
+        let parsed = match block::parse_hdr(&header, has_dict) {
+            Ok(parsed) => parsed,
+            Err(_) => return Ok(false),
+        };
+        if parsed.block_id != block_id {
+            return Ok(false);
+        }
+        read_limits.admit(
+            format!("fold block {}", parsed.block_id),
+            u64::from(parsed.stored),
+            u64::from(parsed.raw),
+        )?;
+        expected = match expected.checked_add(parsed.frame_len()) {
+            Some(end) if end <= file_len => end,
+            _ => return Ok(false),
+        };
+    }
+    Ok(expected == file_len)
+}
+
 /// The full path of a segment, for callers that need it (tests, introspection).
 pub fn seg_path(dir: &Path, n: u32) -> PathBuf {
     dir.join(seg_name(n))
@@ -487,13 +606,26 @@ pub fn seg_path(dir: &Path, n: u32) -> PathBuf {
 mod tests {
     use super::*;
 
+    struct NoRead;
+
+    impl ReadAt for NoRead {
+        fn read_exact_at(&self, _buf: &mut [u8], _off: u64) -> std::io::Result<()> {
+            panic!("an over-bound segment must be refused before any read")
+        }
+
+        fn len(&self) -> std::io::Result<u64> {
+            Ok(SEG_MAX_LIMIT + 1)
+        }
+    }
+
     #[test]
     fn seg_names_parse_numerically() {
         assert_eq!(seg_name(0), "seg-00000000.fold");
         assert_eq!(parse_seg_name("seg-00000000.fold"), Some(0));
         assert_eq!(parse_seg_name("seg-00000042.fold"), Some(42));
         // past the %08 width, numeric parsing still works where lexicographic ordering would fail
-        assert_eq!(parse_seg_name("seg-123456789.fold"), Some(123_456_789));
+        assert_eq!(parse_seg_name("seg-123456789.fold"), None);
+        assert_eq!(parse_seg_name("seg-0000000.fold"), None);
         assert_eq!(parse_seg_name("seg-.fold"), None);
         assert_eq!(parse_seg_name("seg-00x0.fold"), None);
         assert_eq!(parse_seg_name("nope.fold"), None);
@@ -514,6 +646,12 @@ mod tests {
         let mut bad = b;
         bad[0] = b'X';
         assert!(SegHeader::decode(&bad, 5).is_err());
+        let mut discarded = b;
+        discarded[..8].copy_from_slice(b"TURNFOLD");
+        assert!(
+            SegHeader::decode(&discarded, 5).is_err(),
+            "the discarded fold magic must not open"
+        );
 
         // Both the reserved encryption bit and any unknown bit refuse rather than negotiate.
         let mut flagged = b;
@@ -534,5 +672,17 @@ mod tests {
         let got = read_dir_sidecar_bytes(&dir, 0, file_len);
         std::fs::remove_dir_all(dir).ok();
         assert!(got.is_none(), "an impossible sparse sidecar must be ignored before allocation");
+    }
+
+    #[test]
+    fn every_tail_scan_entry_point_enforces_the_u32_segment_domain() {
+        assert!(scan_tail_controlled(
+            &NoRead,
+            SEG_MAX_LIMIT + 1,
+            false,
+            &crate::control::OperationControl::default(),
+            "test scan",
+        )
+        .is_err());
     }
 }

@@ -18,8 +18,9 @@ spec.loader.exec_module(native)
 import turndb  # noqa: E402
 
 CONF = ROOT / "conformance" / "v1"
+CAPABILITY_CONF = ROOT / "conformance" / "v2"
 CORPUS = json.loads((CONF / "corpus.json").read_text())
-CAPABILITY_SCHEMA = json.loads((CONF / "capabilities.schema.json").read_text())
+CAPABILITY_SCHEMA = json.loads((CAPABILITY_CONF / "capabilities.schema.json").read_text())
 
 
 def view_for(source):
@@ -126,7 +127,7 @@ class ConformanceTest(unittest.TestCase):
         profile = turndb.capabilities()
         for field in CAPABILITY_SCHEMA["required"]:
             self.assertIn(field, profile)
-        self.assertEqual(profile["contractVersion"], 1)
+        self.assertEqual(profile["contractVersion"], 2)
         self.assertEqual(profile["profile"], "native")
         self.assertEqual(profile["binding"], "python")
         self.assertEqual(profile["writerExclusion"], "os_enforced")
@@ -174,14 +175,14 @@ class ConformanceTest(unittest.TestCase):
                 assert_source(self, snapshots[1], "snapshot-v2")
                 self.assertEqual(store.verify()["state"], "valid")
                 self.assertGreater(int(store.space_usage()["total"]["logicalBytes"]), 0)
-                sealed_path = str(pathlib.Path(root) / "sealed.turndb")
-                sealed = store.seal(sealed_path)
-                self.assertGreater(int(sealed["bytes"]), 0)
-                sealed_snapshot = turndb.Snapshot.open(sealed_path)
+                backup_path = str(pathlib.Path(root) / "backup.turndb")
+                backup = store.backup(backup_path)
+                self.assertGreater(int(backup["bytes"]), 0)
+                backup_snapshot = turndb.Snapshot.open(backup_path)
                 try:
-                    assert_source(self, sealed_snapshot, "snapshot-v2")
+                    assert_source(self, backup_snapshot, "snapshot-v2")
                 finally:
-                    sealed_snapshot.close()
+                    backup_snapshot.close()
             finally:
                 for snapshot in snapshots:
                     snapshot.close()

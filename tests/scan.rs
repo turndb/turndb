@@ -68,7 +68,7 @@ fn section_location(bytes: &[u8], wanted: &str) -> (usize, u8) {
         let _raw = turndb::part::idcol::get_varint(&toc, &mut at).unwrap();
         let codec = toc[at];
         at += 1;
-        at += 4; // revision-1+ checksum
+        at += 4; // stored-section checksum
         if name == wanted {
             return (offset, codec);
         }
@@ -1213,8 +1213,7 @@ fn a_generous_deadline_and_an_uncancelled_token_admit_a_complete_page() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// The migrated suites build single-file stores inside their temp directories: the parent is
-/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+/// Build the suite's single-file store inside its cleanup directory.
 fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).ok();
     dir.join("s.turndb")

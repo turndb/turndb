@@ -1,8 +1,8 @@
 //! The native-reader half of the interop proof: open a portable build's store and verify it exactly.
 //!
-//! Migration needs both directions. A backfill may run as a native binary while a Node process serves
+//! Interoperability needs both directions. A native binary may write while a Node process serves
 //! reads, or the lightweight package may ingest before native maintenance takes over. The two builds
-//! use different zstd implementations of the same format, so shared source types are not proof.
+//! use different zstd implementations of the same current draft, so shared source types are not proof.
 use anyhow::Result;
 use turndb::fold::FoldCfg;
 use turndb::types::AttrValue;

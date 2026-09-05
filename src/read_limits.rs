@@ -233,7 +233,7 @@ mod tests {
             limits.admit("frame", 11, 20),
             Err(ReadAdmissionError::StoredFrameTooLarge { actual: 11, allowed: 10, .. })
         ));
-        limits.admit_directory_entries("store directory", 100_000).unwrap();
+        limits.admit_directory_entries("container members", 100_000).unwrap();
         assert!(matches!(
             limits.admit_wal_frames(100_001),
             Err(ReadAdmissionError::ObjectCountTooLarge { actual: 100_001, .. })

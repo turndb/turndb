@@ -3,15 +3,12 @@
 //! Everything that MUTATES fold storage — appending a sealed frame, making the active segment
 //! durable, sealing one segment and creating the next, punching a dead block's payload — goes
 //! through this trait. The read side needs nothing: every segment reader is an `Arc<dyn ReadAt>`
-//! from the moment it is built, which is what already lets a sealed fold be served out of a pack
-//! extent or a container member.
+//! from the moment it is built, which lets a closed fold be served from a container-member extent.
 //!
-//! Two homes exist. [`DirSegments`] is the directory store's write side, byte-for-byte the code
-//! that always lived in the fold: one file per segment, rename-published sidecars, fsync as the
-//! durability barrier. The container-backed implementation lands with the native store's write
-//! path — segments as growing members of the live file, durability deferred to the commit that
-//! names them. [`NoSegments`] is a read-only fold's answer to every write: a refusal, exactly as
-//! the old `active_f: None` was.
+//! Two homes exist. [`DirSegments`] is the fold builder's staging implementation: one file per
+//! segment, rename-published sidecars, and fsync as the durability barrier. The container-backed
+//! implementation writes segments as growing members of the live file, with durability deferred
+//! to the commit that names them. [`NoSegments`] refuses every write for a read-only fold.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -31,27 +28,27 @@ pub(crate) trait SegmentStore: Send + Sync {
     /// store owns where the bytes land.
     fn append(&mut self, seg: u32, off: u32, frame: &[u8]) -> Result<()>;
 
-    /// Durability for every append to `seg` so far. The directory store fsyncs the segment file.
+    /// Durability for every append to `seg` so far. File-backed staging fsyncs the segment file.
     /// An implementation whose durability belongs to an enclosing commit protocol may make this a
     /// no-op — and then the protocol's own barrier MUST order these bytes before anything that
     /// names them, because the fold's contract ("no part may name a Loc at or beyond a tail sync
     /// has not returned") is discharged at that barrier instead of here.
     fn sync(&mut self, seg: u32) -> Result<()>;
 
-    /// Head-room check before a roll creates what it creates. A directory store admits two more
-    /// directory entries; a store whose own layer already admits member growth may accept.
+    /// Head-room check before a roll creates what it creates. File-backed staging admits two more
+    /// directory entries; a container layer may instead admit member growth.
     fn admit_roll(&self) -> Result<()>;
 
-    /// Advisory sidecar for a segment being sealed. The retired directory implementation keeps
-    /// its historical best-effort behavior. A container propagates staging failure so a current
-    /// commit never publishes a segment that ranged readers must scan merely to open.
+    /// Advisory sidecar for a segment being sealed. File-backed staging is best-effort. A container
+    /// propagates staging failure so a current commit never publishes a segment that ranged readers
+    /// must scan merely to open.
     fn write_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()>;
 
-    /// Publishable open metadata for the active segment at a commit boundary. The retired
-    /// directory writer may omit it and pay a scan on reopen. A container writer must stage it in
+    /// Publishable open metadata for the active segment at a commit boundary. File-backed staging
+    /// may omit it and pay a scan on reopen. A container writer must stage it in
     /// the same commit as the segment tail: ranged readers otherwise have to fetch the active
     /// segment's block payloads merely to open the store.
-    fn checkpoint_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()>;
+    fn stage_active_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()>;
 
     /// Create segment `next` — header durable before this returns, where the store has its own
     /// durability — make it the active append target, and hand back its reader.
@@ -67,7 +64,7 @@ pub(crate) trait SegmentStore: Send + Sync {
     fn punch(&mut self, seg: u32, off: u64, len: u64) -> Result<()>;
 }
 
-/// The directory store's write side: one file per segment under the fold directory.
+/// The fold builder's file-backed staging side: one file per segment under its work directory.
 pub(crate) struct DirSegments {
     dir: PathBuf,
     active: u32,
@@ -115,7 +112,12 @@ impl SegmentStore for DirSegments {
         Ok(())
     }
 
-    fn checkpoint_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) -> Result<()> {
+    fn stage_active_sidecar(
+        &mut self,
+        _seg: u32,
+        _tail: u32,
+        _entries: &[(u32, u32)],
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -145,7 +147,7 @@ impl SegmentStore for DirSegments {
 /// the container commit that publishes them.
 pub(crate) struct ContainerSegments {
     container: std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
-    /// `fold` for generation 0, `fold-NNNN` above it — the same namespace every checkpoint wrote.
+    /// `fold` for generation 0 and `fold-NNNN` above it: the manifest-selected generation namespace.
     prefix: String,
 }
 
@@ -203,7 +205,7 @@ impl SegmentStore for ContainerSegments {
         self.container.lock().expect("container lock poisoned").put_bytes(&name, &bytes)
     }
 
-    fn checkpoint_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
+    fn stage_active_sidecar(&mut self, seg: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
         let name = format!("{}/seg-{seg:08}.dir", self.prefix);
         let bytes = segment::encode_dir_sidecar(seg, tail, entries);
         self.container.lock().expect("container lock poisoned").put_bytes(&name, &bytes)
@@ -215,6 +217,9 @@ impl SegmentStore for ContainerSegments {
         dict_id: [u8; 32],
         flags: u32,
     ) -> Result<Arc<dyn ReadAt>> {
+        if flags != 0 {
+            bail!("current fold segments require zero flags");
+        }
         let name = self.member(next);
         let header = segment::SegHeader { seg: next, flags, dict_id }.encode();
         {
@@ -247,8 +252,13 @@ impl SegmentStore for NoSegments {
     fn write_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) -> Result<()> {
         bail!("read-only fold cannot write a sidecar")
     }
-    fn checkpoint_sidecar(&mut self, _seg: u32, _tail: u32, _entries: &[(u32, u32)]) -> Result<()> {
-        bail!("read-only fold cannot checkpoint a sidecar")
+    fn stage_active_sidecar(
+        &mut self,
+        _seg: u32,
+        _tail: u32,
+        _entries: &[(u32, u32)],
+    ) -> Result<()> {
+        bail!("read-only fold cannot stage an active-segment sidecar")
     }
     fn create_segment(
         &mut self,

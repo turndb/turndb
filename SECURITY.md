@@ -13,13 +13,13 @@ see it there, it is not enabled yet — use email.
 
 Useful reports include the affected commit, the platform and binding
 (native Rust, native Node addon, or portable WASI), and either a
-reproduction or a store directory / pack file that triggers the
+reproduction or a `.turndb` container that triggers the
 behaviour. If a store reproduces it, say so rather than attaching it
 until we have agreed a channel — an adversarial store is the payload.
 
 **We aim to acknowledge within 72 hours.** We do not commit to a patch
-window yet: TurnDB is pre-1.0 with a single released version and no
-release history to base a commitment on. This section will gain a
+window yet: TurnDB is pre-1.0 and does not yet have a release history long enough to base a
+commitment on. This section will gain a
 concrete remediation commitment as that history accumulates.
 
 If the issue is in a dependency rather than in TurnDB, please still tell
@@ -28,9 +28,8 @@ us so we can pin, patch or fork.
 ## Supported versions
 
 **There is no supported-version window yet.** TurnDB is pre-1.0, and
-version 0.1.0 (released 2026-08-06) is the only published release: the
-`turndb` crate on crates.io, the portable `turndb` npm package, and
-`@turndb/native`.
+the current published line is 0.1.8: the `turndb` crate on crates.io, the portable `turndb` npm
+package, Python package, and `@turndb/native`/CLI packages described by the support matrix.
 
 Security fixes land on `main` and reach the registries with the next
 release. If you need a fix before then, build from source at a commit
@@ -50,18 +49,18 @@ from, the host**:
 
 | Surface | What it means |
 |---|---|
-| A store directory | Its `MANIFEST`, fold generations, parts, WAL and retained history — any of which may be malformed, truncated, adversarial, or from a future format version |
-| A pack file | An offline artifact supplied for `restore` or inspection, including its embedded paths |
+| A store container | Its superblocks, member directory, manifests, fold members, parts, retained history, and WAL sidecar — any of which may be malformed, truncated, adversarial, or use an unrecognized physical identity |
+| A backup container | An offline current-draft artifact supplied for restore or inspection |
 | Binding inputs | Values crossing the Node or WASI boundary: out-of-range integers, oversized work requests, stale handles, cancellation, concurrent calls |
 
 And what we are protecting is the **host**: its process (no panic, no
 unbounded allocation, no wild read), and its filesystem (a crafted store
-must not read or write outside the directory it was given).
+must not read or write outside the paths it was given).
 
 **Full threat model, in scope and out, is
 [`docs/security-review.md`](docs/security-review.md).** It is an
-engineering threat review of the version-2 storage core, version-1 pack,
-native Node binding and portable WASI binding **as of 2026-08-03** — and
+engineering threat review of the current draft storage core,
+native Node binding and portable WASI binding — and
 it says plainly what it is not: not formal verification, and not an
 independent third-party audit. **Its own caveat carries as much weight:
 findings remain useful only if new format fields, parsers and binding
@@ -78,7 +77,7 @@ These are design positions. Each is argued in
   is plaintext and explicitly refuses its reserved encryption flag.
   CRC32 and BLAKE3 detect drift and bind identities; they are not keyed
   authenticity. Encrypt the filesystem, not the store.
-- **An attacker who can write the live store directory concurrently.**
+- **An attacker who can write the container used by an open store concurrently.**
   Writer locking coordinates cooperating writers. It is not a sandbox
   against a hostile filesystem peer, and path inspection cannot close
   time-of-check/time-of-use replacement races.
@@ -96,14 +95,14 @@ Each is documented in full in its authoritative place; the short form:
   OS-enforced on Unix via `flock`; under WASI there is no advisory
   locking and the engine cannot enforce it, so the obligation is the
   embedder's. The measured consequence, and why a clean `verify()` does
-  not settle it, is in [`FORMAT.md`](FORMAT.md#the-writer-lock).
+  not mitigate it, is in [`FORMAT.md`](FORMAT.md#store-shape).
   **This is a correctness and durability property, not only a security
   one** — an embedder who gets it wrong loses acknowledged writes
   silently.
-- **Concurrent hostile filesystem mutation is not contained.** Canonical
-  backup checks protect an offline supplied store, but are not an
-  `openat2(RESOLVE_BENEATH)` sandbox. **Applications must not grant
-  untrusted writers access to an actively opened store directory.**
+- **Concurrent hostile filesystem mutation is not contained.** Full
+  backup verification protects an offline supplied store, but does not make
+  a hostile filesystem peer safe. **Applications must not grant untrusted
+  writers access to an open store or its WAL sidecar.**
 - **CPU budgets are cooperative, not preemptive.** One zstd frame
   decode/encode and one part encoding unit are intentionally
   uninterruptible. Admission limits and worker isolation are the

@@ -16,7 +16,22 @@ use turndb::store::{Span, Store};
 use turndb::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
 
 fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
-    vec![Content::new(BODY_CONTENT, ops)]
+    let identity = match ops.as_slice() {
+        [BodyOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
+        ops if ops.iter().all(|op| matches!(op, BodyOp::Lit(_))) => {
+            let bytes = ops
+                .iter()
+                .flat_map(|op| match op {
+                    BodyOp::Lit(bytes) => bytes.as_slice(),
+                    BodyOp::Piece { .. } => unreachable!(),
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            turndb::ContentHash::of(&bytes)
+        }
+        _ => return vec![Content::new(BODY_CONTENT, ops)],
+    };
+    vec![Content::identified(BODY_CONTENT, ops, identity)]
 }
 
 fn tmp(tag: &str) -> PathBuf {
@@ -113,11 +128,15 @@ fn build_part(dir: &Path) -> (Vec<u8>, Fold) {
         let p = fold.put(body.as_bytes()).unwrap();
         records.push(Record {
             id: format!("rec:{i:03}"),
-            contents: body_content(vec![
-                BodyOp::Lit(b"[".to_vec()),
-                BodyOp::Piece { hash: p.hash, len: p.loc.raw },
-                BodyOp::Lit(b"]".to_vec()),
-            ]),
+            contents: vec![Content::identified(
+                BODY_CONTENT,
+                vec![
+                    BodyOp::Lit(b"[".to_vec()),
+                    BodyOp::Piece { hash: p.hash, len: p.loc.raw },
+                    BodyOp::Lit(b"]".to_vec()),
+                ],
+                turndb::ContentHash::of(format!("[{body}]").as_bytes()),
+            )],
             attrs: vec![
                 ("model".into(), AttrValue::Str(format!("m{}", i % 3))),
                 ("n".into(), AttrValue::Int(i as i64)),
@@ -196,7 +215,7 @@ fn wal_replay_never_panics_on_damage() {
     }
     let pristine = std::fs::read(&path).unwrap();
     let target = dir.join("WAL.mutant");
-    storm("wal", &pristine, &target, 8000, 0x57A1, |p| {
+    storm("wal", &pristine, &target, 8000, 0xD4A1, |p| {
         let _ = Wal::replay(p);
     });
     std::fs::remove_dir_all(&dir).ok();
@@ -211,10 +230,14 @@ fn wal_record_decode_never_panics_on_damage() {
     let h = turndb::PieceHash::of(&body_bytes);
     let r = Record {
         id: "d:1".into(),
-        contents: body_content(vec![
-            BodyOp::Lit(b"[".to_vec()),
-            BodyOp::Piece { hash: h, len: body_bytes.len() as u32 },
-        ]),
+        contents: vec![Content::identified(
+            BODY_CONTENT,
+            vec![
+                BodyOp::Lit(b"[".to_vec()),
+                BodyOp::Piece { hash: h, len: body_bytes.len() as u32 },
+            ],
+            turndb::ContentHash::of(&[b"[".as_slice(), body_bytes.as_slice()].concat()),
+        )],
         attrs: vec![
             ("s".into(), AttrValue::Str("v".into())),
             ("i".into(), AttrValue::Int(-9)),
@@ -263,35 +286,6 @@ fn fold_open_never_panics_on_damage() {
         for (loc, hash) in locs.iter().take(16) {
             let _ = f.read_verified(*loc, *hash);
         }
-    });
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn pack_open_never_panics_on_damage() {
-    let dir = tmp("pack");
-    std::fs::create_dir_all(&dir).unwrap();
-    // The pack WRITER is gone; the checked-in version-one consumer artifact is the pack every
-    // surviving reader must still take, so it is also the pack the storm mutates.
-    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
-    let hex = std::fs::read_to_string(&hex_path).unwrap();
-    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
-    let pristine: Vec<u8> = digits
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect();
-    let target = dir.join("mutant.turndb");
-    storm("pack", &pristine, &target, 2500, 0x9AC4, |p| {
-        // the full read stack over a damaged pack: footer, TOC, manifest, fold, parts
-        let Ok(pack) = turndb::pack::Pack::open(p) else { return };
-        let _ = pack.verify();
-        let Ok(rs) = turndb::store::open_read_pack(p, FoldCfg::default()) else { return };
-        let _ = rs.ids();
-        let _ = rs.reconstruct("legacy/0001");
-        // And the surviving write-side door a pack still walks through: conversion.
-        let _ = turndb::store::convert_to_file(p, &p.with_extension("converted"));
-        let _ = std::fs::remove_file(p.with_extension("converted"));
     });
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -1,7 +1,7 @@
 /**
  * turndb — a content-addressed columnar store for AI traces.
  *
- * `put` is not durable; `sync()` is the ACK point. `flush()` is separate again: it seals writes
+ * `put` is not durable; `sync()` is the ACK point. `flush()` is separate again: it publishes writes
  * into the columnar plane for OTHER readers. This handle sees its own unflushed writes without
  * either.
  */
@@ -47,7 +47,7 @@ export interface OpenOptions {
   level?: number;
   /** Worst-case complete WAL frame bytes admitted for one record; defaults to 64 MiB. */
   maxRecordBytes?: number;
-  /** Member frames plus commit marker admitted for one atomic batch; defaults to 256 MiB. */
+  /** Member frames plus completion marker admitted for one atomic batch; defaults to 256 MiB. */
   maxBatchBytes?: number;
   /** Ordered members admitted in one atomic batch; defaults to 4,096. */
   maxBatchRecords?: number;
@@ -138,7 +138,7 @@ export interface ProjectedContent {
   present: boolean;
   len?: bigint;
   pieces?: number;
-  /** BLAKE3 of the exact reconstructed bytes; unavailable for values written by legacy formats. */
+  /** BLAKE3 of the exact reconstructed bytes. */
   identity?: string;
   /** Present only for a value selected with `mode: 'bytes'`. */
   bytes?: Uint8Array;
@@ -235,19 +235,19 @@ export type BindingOperation =
 
 export type ContractOperation =
   | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
-  | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal'
+  | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'backup'
   | 'verify' | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close';
 
 /** What is actually callable through this npm/WASI binding. */
 export interface Capabilities {
-  contractVersion: 1;
+  contractVersion: 2;
   profile: 'wasi';
   binding: 'wasi';
   /** Stable Tier-1 contract operations. */
   operations: ContractOperation[];
   /** Package-specific convenience methods retained outside the cross-binding contract. */
   bindingOperations: BindingOperation[];
-  partFormat: { write: number; readMax: number };
+  draftFormatEpoch: number;
   writerExclusion: 'embedder_enforced';
   positionedIo: true;
   threads: false;
@@ -267,14 +267,13 @@ export interface Capabilities {
   unavailable: {
     allocatedBytes: 'absent';
     cancellationToken: 'absent';
-    atomicNoReplacePublication: 'absent';
+    atomicNoReplaceInstallation: 'absent';
   };
 }
 
 /** Mechanisms and format facts compiled into the guest, independent of binding reachability. */
 export interface CompiledCapabilities {
-  part_format_write: number;
-  part_format_read_max: number;
+  draft_format_epoch: number;
   writer_exclusion: 'os_enforced' | 'embedder_enforced';
   positioned_io: boolean;
   threads: boolean;
@@ -285,8 +284,8 @@ export interface CompiledCapabilities {
   read_admission_limits: true;
   object_count_admission: true;
   store_space_usage: true;
+  in_place_deallocation: boolean;
   allocated_space_usage: boolean;
-  format_migration: true;
   operation_metrics: true;
   part_distribution: true;
   content_liveness: true;
@@ -326,18 +325,17 @@ export interface DeadlineOptions { timeoutMs?: number }
 
 export interface Metrics {
   /** Per-handle counters. They start fresh each time the store is opened. */
-  openRecovery: OperationMetrics;
+  openWalReplay: OperationMetrics;
   recoveredWalFrames: bigint;
   sync: OperationMetrics;
   flush: OperationMetrics;
-  compaction: OperationMetrics;
+  merge: OperationMetrics;
   backup: OperationMetrics;
   verification: OperationMetrics;
   verificationCorruptionFailures: bigint;
-  punch: OperationMetrics;
+  contentPunch: OperationMetrics;
   refold: OperationMetrics;
   erase: OperationMetrics;
-  formatMigration: OperationMetrics;
   foldedContent: { pieces: bigint; dedupHits: bigint; logicalBytes: bigint; novelBytes: bigint };
 }
 
@@ -369,7 +367,9 @@ export interface FoldBlockSpace {
 }
 
 export interface ContentLiveness {
+  /** Distinct physical piece locations required by visible row programs. */
   livePieces: bigint;
+  /** Sum of the logical lengths of those physical locations. */
   liveLogicalBytes: bigint;
   deadLogicalBytes: bigint;
   strandedDeadLogicalBytes: bigint;
@@ -379,7 +379,7 @@ export interface ContentLiveness {
 
 export type MeasuredBytes = { state: 'measured'; bytes: bigint } | { state: 'absent' };
 export interface SpaceAmount {
-  files: number;
+  members: number;
   logicalBytes: bigint;
   allocatedBytes: MeasuredBytes;
 }
@@ -453,31 +453,32 @@ export declare class TurndbError extends Error {
 }
 
 export interface VerificationReport {
-  /** Verification covers committed state; sync and flush staged writes before calling to include them. */
-  scope: 'committed_snapshot';
-  /** `incomplete` means verification succeeded but a legacy identity/digest was unavailable. */
-  state: 'valid' | 'incomplete';
+  /** Verification covers the current manifest revision; synchronize and publish pending changes first to include them. */
+  scope: 'current_manifest_revision';
+  state: 'valid';
   retainedManifests: { state: 'verified' | 'not_applicable'; count: number };
-  chain: { links: number; partDigests: number; undigestedParts: number };
+  chain: { links: number; partDigests: number };
+  /** Parts referenced by current authority; retained-only parts are verified but not counted here. */
   parts: number;
+  /** Sections in current-authority parts; retained-only section work is outside this counter. */
   partSections: number;
   fold: {
     segments: number;
     blocks: number;
     bytes: bigint;
-    /** Crash residue outside the committed snapshot, reported rather than absorbed into `valid`. */
+    /** Crash residue outside current store authority, reported rather than absorbed into `valid`. */
     trailingUncommittedBytes: bigint;
   };
   records: number;
   contentValues: number;
   contentBytes: bigint;
   contentIdentities: number;
-  unidentifiedContentValues: number;
 }
 
 export interface StoreHealth {
   /** The handle answered. This is deliberately not an integrity verdict. */
   state: 'available';
+  /** Public store-authority encoding: 0 is the canonical origin; positive is a manifest revision. */
   commit: bigint;
   foldGeneration: number;
   parts: number;
@@ -548,19 +549,19 @@ export declare class Store {
   /** Tombstone a record. Not durable until {@link Store.sync}. */
   delete(id: string): void;
   /** Make everything written so far durable. **The ACK point.** */
-  /** Last cancellable checkpoint: immediately before WAL fsync. */
+  /** Last cancellable checkpoint: before delayed authority acknowledgement, if needed, and WAL fsync. */
   sync(options?: DeadlineOptions): void;
-  /** Seal the memtable into an immutable part, making writes visible to other readers. */
+  /** Publish the memtable as an immutable part, making writes visible to other readers. */
   /** Last cancellable checkpoint: immediately before manifest publication. */
   flush(options?: DeadlineOptions): void;
   /**
-   * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
+   * Total merge when the referenced part list reaches the engine's threshold. Returns whether a merge ran.
    *
    * The stall is the caller's: wall time is linear in the store's on-disk content (~5s/GB at
    * level 19, wasm — synthetic stores up to 1.9 GB, a single workstation; level 3 unmeasured), on the
    * calling thread. Never fires on its own — schedule it when a
    * multi-second pause is acceptable, or bound the pause with {@link Store.maybeCompact}. Only
-   * total merges settle deletes.
+   * total merges drop tombstones.
    */
   autoCompact(options?: DeadlineOptions): boolean;
   /**
@@ -568,7 +569,7 @@ export declare class Store {
    * of them (default 4). Returns whether a merge ran.
    *
    * The latency-budget dial: the stall is capped by the merged run instead of the whole store.
-   * Bounded merges never settle deletes — run {@link Store.autoCompact} occasionally if the store
+   * Bounded merges never drop tombstones — run {@link Store.autoCompact} occasionally if the store
    * sees deletions.
    */
   maybeCompact(opts?: { trigger?: number; run?: number; timeoutMs?: number }): boolean;
@@ -598,7 +599,7 @@ export declare class Store {
    */
   scan(request?: ScanRequest): ScanPage;
   stats(): Stats;
-  /** Verify every integrity leg in the committed snapshot, returning exact counts. */
+  /** Verify every integrity leg in current store authority, returning exact counts. */
   verify(options?: DeadlineOptions): VerificationReport;
   /** Cheap operational facts; not a substitute for {@link Store.verify}. */
   health(): StoreHealth;
@@ -663,11 +664,7 @@ export type OpenFileOptions = Pick<
 >;
 
 /**
- * Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
- *
- * Which form it is comes from the file's magic, not its extension, and both answer reads
- * identically. Neither has a writer role to take, so this open cannot contend with anything and
- * needs no WAL replay; in exchange the returned handle **refuses every mutating method**
+ * Open a TurnDB container read-only. It needs no WAL replay and **refuses every mutating method**
  * (`putBody`, `applyBatch`, `write`, `delete`, `sync`, `flush`, compaction, erasure) with a
  * `TurndbError` naming the handle as read-only.
  *
@@ -679,13 +676,6 @@ export type OpenFileOptions = Pick<
  */
 export declare function openFile(file: string, opts?: OpenFileOptions): Promise<Store>;
 
-/**
- * Which single-file form a path holds, or `null` for a directory or a file carrying neither magic.
- *
- * Reading does not need this — {@link openFile} dispatches on its own — but tooling that must know
- * whether a file can still be appended to before it plans to does.
- */
-export declare function singleFileKind(file: string): Promise<'pack' | 'container' | null>;
 
 /**
  * The first id that cannot start with `prefix`, or `null` when the range is unbounded above.

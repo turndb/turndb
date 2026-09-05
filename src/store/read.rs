@@ -1,4 +1,4 @@
-//! The read core: everything answerable from committed parts plus the fold.
+//! The read core: everything answerable from parts and the fold referenced by one store authority.
 //!
 //! # Why this exists
 //!
@@ -15,9 +15,9 @@
 //!
 //! # What lives here and what does not
 //!
-//! Only what the COMMITTED state can answer. A writer's memtable is newer than every part and is
-//! layered on top by `Store`; it has no place here, because `ReadStore` has no memtable and pretending
-//! otherwise is how the two drifted apart before.
+//! Only what a manifest revision can answer. A writer's pending change set is newer than every part
+//! and is layered on top by `Store`; it has no place here, because `ReadStore` never includes pending
+//! record versions and pretending otherwise is how the two drifted apart before.
 //!
 //! # Version resolution, in one rule
 //!
@@ -242,7 +242,7 @@ pub(crate) fn reconstruct_projected_content(
         anyhow::bail!("committed reconstruction received a memtable row")
     };
     let part = parts.get(part_index).ok_or_else(|| {
-        anyhow::anyhow!("resolved part {part_index} is outside the immutable snapshot")
+        anyhow::anyhow!("resolved part {part_index} is outside the immutable read view")
     })?;
     if row >= part.len() {
         anyhow::bail!(
@@ -255,12 +255,12 @@ pub(crate) fn reconstruct_projected_content(
     part.reconstruct_projected_content(content, fold)
 }
 
-/// Whether `id` exists in the committed state — cheaper than [`get`], since no record is decoded.
+/// Whether `id` is present in this manifest revision — cheaper than [`get`], since no record is decoded.
 pub fn exists(parts: &[Arc<Part>], id: &str) -> Result<bool> {
     Ok(locate(parts, id)?.is_some())
 }
 
-/// The part and row holding the LIVE version of `id`, if there is one.
+/// The part and row holding the resolved present version of `id`, if there is one.
 ///
 /// The single place the newest-wins-and-tombstones-are-absent rule is written down.
 fn locate<'a>(parts: &'a [Arc<Part>], id: &str) -> Result<Option<(&'a Arc<Part>, usize)>> {

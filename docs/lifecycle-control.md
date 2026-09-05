@@ -10,71 +10,98 @@ typed reason. Existing no-options methods remain and delegate to controlled vari
 
 Controlled operations currently include:
 
-- Durability entry through `Store::sync_with_control` and memtable publication through
+- Durability entry through `Store::sync_with_control` and pending-change-set publication through
   `Store::flush_with_control`.
-- Part compaction through `merge_range_with_control` and `auto_compact_with_control`.
+- Part merge through `merge_range_with_control` and `auto_compact_with_control`.
 - Manifest-chain, part-section, and fold-frame verification.
-- In-place punching through `punch_unreferenced_with_control`.
+- Content punch through `punch_unreferenced_with_control`.
 - Generational content rewriting through `refold_with_control`.
 - The read-only planning phase of strong record erasure through `erase_ids_with_control`.
-- Backup sealing/verification through `Store::backup_with_control`; validation of retired pack
-  artifacts through `Pack::open_with_control` and `Pack::verify_with_control`.
-- Member-verified restore publication through `store::restore_file_with_control`.
+- Backup construction and full staged-store verification through `Store::backup_with_control`.
+- Full staged-store verification and restore artifact installation through
+  `store::restore_file_with_control`.
 - Offline candidate validation/publication through
-  `store::recover_manifest_file_with_limits_and_control`.
-- Store inventory and Node maintenance-space preflight while traversing or settling the
-  actor-ordered store cut.
-- Format migration status, preflight, and one-part atomic publication.
+  `store::promote_manifest_file_with_limits_and_control`.
+- Store inventory and Node maintenance-space preflight while traversing the current manifest
+  revision or synchronizing and publishing earlier accepted mutations.
 
 Checkpoints occur between records, dictionary entries, sections, fold frames, copied pieces, rebuilt
 parts, and independently punchable blocks. An individual unit is not split, so cancellation latency
 is bounded by the largest unit currently being read, compressed, written, or checksummed rather than
 by a real-time scheduler guarantee.
 
+## Transient protocol names
+
+These names are exhaustive protocol state beside a store:
+
+| shape | owner |
+|---|---|
+| `<final>.publish-<pid>-<n>` | Windows staging for installation of any newly created protocol file (the suffix is a physical protocol spelling) |
+| `<final>.creating-<pid>-<n>` | container or standalone fold-segment birth before final-name installation |
+| `<store>.reclaiming` | reclaim staging |
+| `<store>.reclaimed` | reclaim anchor |
+| `<store>.reclaim-candidate` and `.tmp` | Windows reclaim candidate |
+| `<store>-tmp/` | merge/refold spool directory |
+| `<artifact>.backing-up-<pid>-<n>` | backup staging |
+| `<destination>.restoring-<pid>-<n>` | restore staging |
+
+Recognition follows only the exact forms above; both numeric fields must fit their declared integer
+domains. A present store proves these names are dead and writer open removes them. Beside an absent
+store, `CreationStaging` cannot contain acknowledged state and does not block a competing complete
+birth; a reclaim anchor may reconstruct and reinstate the store. Every other recognized name makes
+creation refuse without mutation. No other suffix has TurnDB meaning.
+
 ## Atomicity and restart behavior
 
 Each operation deliberately interprets interruption according to its publication protocol:
 
-- **Sync** checks once before WAL fsync. Once the durability boundary begins, TurnDB reports its real
-  outcome and does not claim cancellation after accepted writes may have become durable.
-- **Flush** checks during memtable/locator planning, after part construction, during bounded digest
+- **Durability synchronization (`sync`)** checks once before its durability boundary. That boundary
+  first completes any delayed publication acknowledgement required by the accepted mutations, then
+  fsyncs the WAL. Once it begins, TurnDB reports its real outcome and does not claim cancellation
+  after either dependency may have become durable.
+- **Flush** checks during pending-change-set/locator planning, after part construction, during bounded digest
   reads, and immediately before manifest publication. Cancellation may leave fold bytes durably
-  sealed but unreachable; it removes the unpublished part and preserves the live memtable/manifest.
-  Part encoding remains one uninterruptible work unit. Once manifest commit begins, ordinary crash
-  recovery owns the result.
-- **Compaction** writes an unreachable output part. Cancellation before manifest publication removes
-  that part and leaves the live part set unchanged. Once manifest commit begins, cancellation is no
-  longer observed because the crash-safe commit protocol owns the outcome.
-- **Verification** is read-only after the embedding actor settles earlier writes. It returns no
+  persisted but unreachable; it removes the unpublished part and preserves the pending change set and current manifest revision.
+  Part encoding remains one uninterruptible work unit. Once manifest-revision publication begins,
+  the interrupted-publication protocol owns the result.
+- **Part merge** writes an unreachable output part. Cancellation before manifest publication removes
+  that part and leaves the current manifest revision's part references unchanged. Once manifest-revision publication begins,
+  cancellation is no longer observed because the publication protocol owns the outcome.
+- **Verification** is read-only after the embedding actor synchronizes, publishes, and settles earlier accepted mutations. It returns no
   partial success report.
-- **Refold** builds an unpublished fold generation and replacement parts. Cancellation removes all
-  staged artifacts and preserves the live generation byte-exact. Once generation commit begins,
+- **Refold** is a no-op when the current authority references no parts. Otherwise it builds an
+  unpublished fold generation and replacement parts. Cancellation removes all
+  staged artifacts and preserves the fold generation referenced by the current manifest revision byte-exact. Once refold publication begins,
   TurnDB finishes handle, retention, and orphan cleanup without another cancellation checkpoint.
-- **Punching** publishes the complete erased-block declaration before deallocating any bytes.
-  Cancellation may therefore leave safe durable progress: some declared unreachable blocks have not
-  yet been punched. A later call retries every declared block still present. This retry behavior also
-  closes the same window after a process crash.
-- **Strong erasure** accepts cancellation while determining which requested ids are present. Once its
-  atomic tombstone batch is applied, cancellation is deferred until total merge and refold complete.
+- **Content punch** publishes the complete erased-block declaration before deallocating any bytes.
+  It begins deallocation only after that publication is acknowledged. Cancellation may therefore
+  leave safe durable progress: some declared unreachable blocks have not yet been punched. A later
+  call retries every declared block still present. This retry behavior also closes the same window
+  after a process crash.
+- **Strong erasure** accepts cancellation while determining which requested ids are present. If none
+  resolves to a record, it returns without a transition. Once an atomic tombstone batch is applied,
+  cancellation is deferred until total merge and any non-no-op refold complete.
   Returning `cancelled` after logical deletion but before physical removal would make a retry mistake
-  those ids for previously absent records and falsely report success.
-- **Backup** seals and verifies into a private sibling file. Cancellation removes unpublished
-  staging and leaves the requested artifact absent. The no-replace publication is the final
-  checkpoint; once the artifact exists, TurnDB reports the publication outcome rather than
+  those ids for record slots that previously resolved to absence and falsely report success.
+- **Backup** builds and fully verifies a store in a private sibling file. Cancellation removes uninstalled
+  staging and leaves the requested artifact absent. The no-replace artifact installation is the final
+  checkpoint; once the artifact exists, TurnDB reports the installation outcome rather than
   cancellation.
-- **Restore** verifies the backup and copies it into a private sibling file. Cancellation removes
-  staging and leaves the destination absent. The atomic no-replace rename is its final checkpoint.
-- **Manifest recovery** takes the writer lock — `flock` on the store file — while it discovers and
-  completely validates retained candidates. **That lock excludes a live writer only on Unix**; on
-  `wasm32-wasip1` it always succeeds, so recovery is not protected from a concurrent writer and the
+- **Restore** copies the backup into a private sibling file, then fully verifies that exact staging
+  store. Cancellation removes staging and leaves the destination absent. The atomic no-replace
+  rename is its final checkpoint.
+- **Manifest promotion** takes the writer lock — `flock` on Unix or `LockFileEx` on Windows, on the
+  store container handle — while it discovers and completely validates retained candidates.
+  **That lock excludes another open writer on native builds**; on
+  `wasm32-wasip1` it always succeeds, so promotion is not protected from a concurrent writer and the
   exclusion is the embedder's, exactly as for ordinary writes — see
-  [the writer lock](../FORMAT.md#the-writer-lock). Cancellation leaves the damaged live manifest and
+  [the store shape](../FORMAT.md#store-shape). Cancellation leaves the damaged current MANIFEST and
   retained history unchanged. Promotion is its final checkpoint; after it begins, TurnDB reports the
   actual outcome.
 
-An actor operation may have settled earlier accepted writes before a later checkpoint stops its main
-work. That publication is ordered prerequisite work, not a partially published compaction or refold.
-An already-expired deadline is checked before settling and therefore has no lifecycle side effect.
+An actor operation may have synchronized and published earlier accepted mutations before a later checkpoint stops its main
+work. That publication is ordered prerequisite work, not a partially published part merge or refold.
+An already-expired deadline is checked before that prerequisite work and therefore has no lifecycle side effect.
 
 ## Node API
 
@@ -90,11 +117,11 @@ const result = await store.compact(true, {
 await store.sync({ timeoutMs: 30_000 });
 await store.flush({ signal: abort.signal });
 await store.verify({ timeoutMs: 30_000 });
-await store.punch({ signal: abort.signal });
+await store.contentPunch({ signal: abort.signal });
 await store.refold({ timeoutMs: 120_000 });
 await store.erase(ids, { signal: abort.signal });
-await store.backup('snapshot.turndb', { signal: abort.signal });
-await restoreBackup('snapshot.turndb', 'restored', { timeoutMs: 120_000 });
+await store.backup('backup.turndb', { signal: abort.signal });
+await restoreBackup('backup.turndb', 'restored', { timeoutMs: 120_000 });
 await recoverManifest('damaged-store', {
   maxRollbackCommits: 0n,
   timeoutMs: 120_000,
@@ -103,7 +130,7 @@ await recoverManifest('damaged-store', {
 ```
 
 `timeoutMs` is converted to an absolute deadline before submission, so writer-actor queue time and
-restore/recovery worker-scheduling time count. Zero is a deterministic pre-mutation refusal. A signal
+restore/manifest-promotion worker-scheduling time count. Zero is a deterministic pre-mutation refusal. A signal
 aborted before submission is rejected at the JavaScript boundary; later aborts set the Rust token directly.
 Both conditions reject with
 `TurnDbError.code === "CANCELLED"`; the message distinguishes cancellation from deadline expiry.
@@ -111,5 +138,5 @@ Dropping or ignoring the Promise does not cancel the operation—pass a signal w
 required.
 
 The native capability profile reports `lifecycleCancellation: true`. SQL planning/pulls expose their
-own interruption controls. Sync intentionally has only a pre-fsync checkpoint, and flush's part
+own interruption controls. Durability synchronization intentionally has only a pre-boundary checkpoint, and flush's part
 encoder remains an indivisible work unit; neither is represented as asynchronously killable work.

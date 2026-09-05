@@ -17,8 +17,8 @@
 //!   * whatever else is present is byte-exact too — a half-applied batch, a resurrected record,
 //!     or drifted content is a failure even if no ack covered it.
 //!
-//! Beyond the mixed write path, each PUBLICATION PROTOCOL gets its own crash sweep: backup,
-//! restore, manifest recovery promotion, content-hole punching, format migration, conversion, the
+//! Beyond the mixed write path, each authority or namespace-change protocol gets its own crash sweep: backup,
+//! restore, manifest recovery promotion, content-hole punching, the
 //! container session cycle, merge, erasure, and free-space punching each run once for real, and
 //! then every op prefix × durability variant is replayed against protocol-specific invariants.
 //! Container superblock alternation is also proven from each recorded trace directly — see
@@ -32,7 +32,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use turndb::container::ReclaimProtocol;
 use turndb::fold::FoldCfg;
-use turndb::store::{Batch, ContentSpans, RecoveryOptions, Span, Store};
+use turndb::store::{Batch, ContentSpans, ManifestPromotionOptions, Span, Store};
 use turndb::vfs::record::{self, Op};
 use turndb::{AttrValue, BODY_CONTENT};
 
@@ -1025,7 +1025,6 @@ fn check_state(
                         turndb::store::DebrisKind::PendingPublish
                             | turndb::store::DebrisKind::ReclaimStaging
                             | turndb::store::DebrisKind::ReclaimCandidate
-                            | turndb::store::DebrisKind::LegacyHotDirectory
                     )
                 };
                 // And nothing else sits in the directory: every entry beside the absent store
@@ -1120,13 +1119,11 @@ fn check_state(
 /// materializing each crash state under `stage` and handing it to `check`. Returns the number of
 /// states checked. Every prefix and every variant is checked — nothing is subsampled.
 /// After open-and-recover, a directory holds only live names plus reported debris — never a
-/// silently accumulated transient (obj-mtg0jtf1-l, outcome c). Every `*.turndb` file and every
-/// directory-layout store in `dir` is opened as a writer (sealed artifacts are readers only)
-/// and closed; then `debris_report` beside a PRESENT store must be empty — the open removed
+/// silently accumulated transient (obj-mtg0jtf1-l, outcome c). Every `*.turndb` file in `dir` is
+/// opened as a writer and closed; then `debris_report` beside a PRESENT store must be empty — the open removed
 /// what the protocol proves dead — and beside an absent store every remaining transient is
 /// one the report names, which is the definition of "reported". Anything the report does not
-/// recognise and that is not a store, an artifact, or a directory layout's own file is an
-/// unexplained leave-behind, and fails.
+/// recognise and that is not a store or an artifact is an unexplained leave-behind, and fails.
 fn assert_directory_settled(dir: &Path, what: &str) {
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
     // Every entry is observed, or the state fails: a per-entry read error is not a clean
@@ -1145,7 +1142,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
             turndb::store::DebrisKind::PendingPublish
                 | turndb::store::DebrisKind::ReclaimStaging
                 | turndb::store::DebrisKind::ReclaimCandidate
-                | turndb::store::DebrisKind::LegacyHotDirectory
+                | turndb::store::DebrisKind::ArtifactStaging
         )
     };
     let wal_of = |base: &Path| {
@@ -1160,49 +1157,38 @@ fn assert_directory_settled(dir: &Path, what: &str) {
     let describe = |report: &turndb::store::DebrisReport| {
         report.entries.iter().map(|e| (e.path.display().to_string(), e.kind)).collect::<Vec<_>>()
     };
-    // Stores and artifacts: `<name>.turndb` files, and directory-layout stores.
+    // Stores and artifacts are `<name>.turndb` files.
     let mut stores: Vec<PathBuf> = Vec::new();
     let mut known: BTreeSet<PathBuf> = BTreeSet::new();
     for p in &entries {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let is_file_store = p.is_file() && name.ends_with(".turndb");
-        let is_dir_store = p.is_dir()
-            && (p.join("MANIFEST").exists() || p.join("fold").exists() || p.join("WAL").exists());
-        if is_file_store || is_dir_store {
+        if is_file_store {
             stores.push(p.clone());
         }
     }
     for store in &stores {
         known.insert(store.clone());
         known.insert(wal_of(store)); // a present store's sidecar: recovery input, settled by open
-        let sealed = store.is_file()
-            && turndb::container::Container::open(store).map(|c| c.sealed()).unwrap_or(false);
-        // The report BEFORE this assertion's own writer open: whatever that open removes must
-        // have been reported here, or it vanished unreported.
+                                     // The report BEFORE this assertion's own writer open: whatever that open removes must
+                                     // have been reported here, or it vanished unreported.
         let before = report_of(store);
         for e in &before.entries {
             known.insert(e.path.clone());
         }
-        // A directory-layout store has no public writer open (its one door is `convert`), so
-        // it gets the report-only check below; a single-file store is opened as a writer.
-        let opened: Option<Result<u64, String>> = if !sealed && store.is_file() {
-            Some(match Store::open_file(store, cfg) {
-                Ok(s) => {
-                    let removed = s.metrics().debris_removed;
-                    s.close()
-                        .unwrap_or_else(|e| panic!("{what}: close {}: {e:#}", store.display()));
-                    Ok(removed)
-                }
-                Err(e) => Err(format!("{e:#}")),
-            })
-        } else {
-            None
+        let opened: Result<u64, String> = match Store::open_file(store, cfg) {
+            Ok(s) => {
+                let removed = s.metrics().debris_removed;
+                s.close().unwrap_or_else(|e| panic!("{what}: close {}: {e:#}", store.display()));
+                Ok(removed)
+            }
+            Err(e) => Err(format!("{e:#}")),
         };
         let report = report_of(store);
         match opened {
             // A successful writer open removed everything the protocol proves dead — and
             // counted exactly what the report before it named.
-            Some(Ok(removed)) => {
+            Ok(removed) => {
                 assert!(
                     report.entries.is_empty(),
                     "{what}: transient names survived a writer open beside present {}: {:?}",
@@ -1220,7 +1206,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
             // A writer refusal is a report in its own right — proven structurally: the report is
             // non-empty, every kind is in the never-removed / refusal vocabulary, and the error
             // names every reported path. The string alone classifies nothing.
-            Some(Err(text)) => {
+            Err(text) => {
                 assert!(
                     !report.entries.is_empty()
                         && report.entries.iter().all(|e| refusal_kind(e.kind))
@@ -1230,8 +1216,6 @@ fn assert_directory_settled(dir: &Path, what: &str) {
                     describe(&report)
                 );
             }
-            // Sealed artifacts and directory-layout stores: readers only; the report is allowed.
-            None => {}
         }
         for e in &report.entries {
             known.insert(e.path.clone());
@@ -1240,8 +1224,8 @@ fn assert_directory_settled(dir: &Path, what: &str) {
     // A transient beside an ABSENT store or artifact — an operation's staging file, or a Windows
     // pending temp of any of the store's names — is reported by `debris_report(<store>)`, whose
     // finals include the staging and reclaim names. Derive the store's name from the entry:
-    // strip a pending-publish suffix, then any staging, reclaim or sidecar suffix. An absent
-    // base's exact `-wal` is recovery input and allowed, nothing suffix-wide.
+    // strip a numbered publication/artifact suffix, then any reclaim or sidecar suffix. An absent
+    // base's exact `-wal` is ambiguous recovery input and therefore reported as creation-blocking.
     for p in &entries {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let mut base = name.clone();
@@ -1254,17 +1238,25 @@ fn assert_directory_settled(dir: &Path, what: &str) {
                 }
             }
         }
+        for marker in [".backing-up-", ".restoring-"] {
+            if let Some(at) = base.rfind(marker) {
+                let tail = &base[at + marker.len()..];
+                let mut parts = tail.split('-');
+                if let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) {
+                    if pid.parse::<u32>().is_ok() && n.parse::<u64>().is_ok() {
+                        base.truncate(at);
+                        break;
+                    }
+                }
+            }
+        }
         for suffix in [
-            ".sealing",
-            ".restoring",
-            ".converting",
             ".reclaiming",
             ".reclaimed",
             ".reclaim-candidate.tmp",
             ".reclaim-candidate",
             "-wal",
             "-tmp",
-            "-hot",
         ] {
             if let Some(b) = base.strip_suffix(suffix) {
                 base = b.to_string();
@@ -1300,7 +1292,7 @@ fn assert_directory_settled(dir: &Path, what: &str) {
         }
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         // Fixture inputs the sweeps place beside stores are named here explicitly.
-        let is_input = name == "pack.bin" || name.ends_with(".jsonl");
+        let is_input = name.ends_with(".jsonl");
         if !is_input {
             unexplained.push(name);
         }
@@ -1309,23 +1301,6 @@ fn assert_directory_settled(dir: &Path, what: &str) {
         unexplained.is_empty(),
         "{what}: unexplained files after open-and-recover: {unexplained:?}"
     );
-}
-
-/// Windows leaves the pending temp of a conversion's staging name beside the converted store when
-/// the sync that would have published it failed; the re-run unlinks the staging name, not its
-/// temp, and the next writer open removes it. The assertion attributes that removal to the report
-/// taken before its own open — the shape the `windows x64` run of #147 hit.
-#[test]
-fn settled_assertion_accounts_for_what_its_own_writer_open_removes() {
-    let root = tmp("settled-own-open");
-    unpack_dir_fixture(&root.join("store"));
-    let file = root.join("state.turndb");
-    turndb::store::convert_to_file(&root.join("store"), &file).unwrap();
-    let stray = root.join("state.turndb.converting.publish-3580-8116");
-    std::fs::write(&stray, b"partial").unwrap();
-    assert_directory_settled(&root, "own-open");
-    assert!(!stray.exists(), "the writer open removes the pending temp of the staging name");
-    std::fs::remove_dir_all(&root).ok();
 }
 
 fn replay_recorded(
@@ -1458,76 +1433,9 @@ fn flip_member_byte(store: &Path, name: &str, at_frac: f32) {
     f.sync_all().unwrap();
 }
 
-/// Materialize the checked-in 0.1.3 directory-store fixture: the retired layout exactly as its
-/// last writer left it, non-empty WAL included. The conversion sweep drives the ONE door the
-/// layout has left, so its input must be an artifact this codebase can no longer produce.
-fn unpack_dir_fixture(into: &Path) {
-    let hex_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/directory-store-0.1.3.hex");
-    let text = std::fs::read_to_string(&hex_path).unwrap();
-    let mut name: Option<std::path::PathBuf> = None;
-    let mut hex = String::new();
-    let flush = |name: &Option<std::path::PathBuf>, hex: &str| {
-        if let Some(path) = name {
-            let bytes: Vec<u8> = (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                .collect();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, bytes).unwrap();
-        }
-    };
-    for line in text.lines() {
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("== ") {
-            flush(&name, &hex);
-            hex.clear();
-            name = Some(into.join(rest.split_whitespace().next().unwrap()));
-        } else {
-            hex.push_str(line.trim());
-        }
-    }
-    flush(&name, &hex);
-}
-
-/// The fixture generator's body function, byte for byte (xorshift64 over the seed).
-fn fixture_body(seed: u64, len: usize) -> Vec<u8> {
-    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x >> 32) as u8
-        })
-        .collect()
-}
-
-/// Every id -> body the converted 0.1.3 fixture must serve: two flushed rounds minus the
-/// deleted record, plus the WAL-only record whose replay is the conversion's hardest promise.
-fn fixture_expectations() -> BTreeMap<String, Vec<u8>> {
-    let mut want = BTreeMap::new();
-    for round in 0..2u64 {
-        for i in 0..6u64 {
-            let id = format!("fix:{round}:{i}");
-            if id == "fix:0:0" {
-                continue;
-            }
-            let mut body = b"[".to_vec();
-            body.extend_from_slice(&fixture_body(round * 10 + i, 1800));
-            body.extend_from_slice(b"]");
-            want.insert(id, body);
-        }
-    }
-    want.insert("fix:wal:only".to_string(), fixture_body(999, 700));
-    want
-}
-
-/// A backup of a single-file store is a sealed container published by a no-replace rename. The
+/// A backup of a single-file store is a container installed by a no-replace rename. The
 /// sweep's claim: the SOURCE file answers identically at every crash point, and the artifact is
-/// all-or-nothing at its final name — absent, or complete, sealed, and byte-exact.
+/// all-or-nothing at its final name — absent, or complete and byte-exact.
 #[test]
 fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing() {
     let root = tmp("backup");
@@ -1569,7 +1477,7 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
             "crash point {k} {variant:?}: source store gained or lost records"
         );
         drop(src);
-        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete SEALED
+        // The ARTIFACT is all-or-nothing at its final name: absent, or a complete
         // container that verifies and serves every record byte-exact. (Staging litter beside
         // it is allowed — it is inert bytes at a name nothing resolves.)
         let dst = stage.join("backup.turndb");
@@ -1577,13 +1485,12 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
             let c = turndb::container::Container::open(&dst).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: a torn artifact sits at the FINAL name: {e:#}")
             });
-            assert!(c.sealed(), "crash point {k} {variant:?}: a published backup must be sealed");
             c.verify().unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: published backup fails verification: {e:#}")
+                panic!("crash point {k} {variant:?}: installed backup fails verification: {e:#}")
             });
             drop(c);
             let rs = turndb::store::open_read_container(&dst, cfg).unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: published backup refuses a reader: {e:#}")
+                panic!("crash point {k} {variant:?}: installed backup refuses a reader: {e:#}")
             });
             for (id, body) in &want {
                 assert_eq!(
@@ -1599,15 +1506,15 @@ fn every_backup_crash_leaves_the_source_intact_and_the_artifact_all_or_nothing()
     std::fs::remove_dir_all(&stage).ok();
 }
 
-/// Restoring is member-verified copying of a sealed backup into a fresh writable file, staged
-/// and published by a no-replace rename. The destination is all-or-nothing at its final name,
+/// Restoring copies a backup into a fresh writable staging file, fully verifies that exact store,
+/// and installs it by a no-replace rename. The destination is all-or-nothing at its final name,
 /// and a crash is always recoverable by simply re-running the restore.
 #[test]
 fn every_restore_crash_leaves_the_destination_all_or_nothing() {
     let root = tmp("restore");
     std::fs::create_dir_all(&root).unwrap();
     let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
-    // The source store lives OUTSIDE the modeled root: only the sealed artifact and the restore
+    // The source store lives OUTSIDE the modeled root: only the backup artifact and the restore
     // protocol itself are under test here.
     let srcroot = tmp("restore-src");
     std::fs::create_dir_all(&srcroot).unwrap();
@@ -1634,14 +1541,10 @@ fn every_restore_crash_leaves_the_destination_all_or_nothing() {
         let dst = stage.join("restored.turndb");
         if dst.exists() {
             // Published means COMPLETE: the final name only ever appears via the no-replace
-            // rename of a fully verified, unsealed staging copy.
+            // rename of a fully verified staging copy.
             let c = turndb::container::Container::open(&dst).unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: a partial file sits at the FINAL name: {e:#}")
             });
-            assert!(
-                !c.sealed(),
-                "crash point {k} {variant:?}: the restored copy must be born writable"
-            );
             c.verify().unwrap_or_else(|e| {
                 panic!("crash point {k} {variant:?}: restored store fails verification: {e:#}")
             });
@@ -1717,10 +1620,10 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
     let mut base = Fs::new(Model::Posix);
     base.seed_durable(&root);
     record::arm();
-    let report = turndb::store::recover_manifest_file(
+    let report = turndb::store::promote_manifest_file(
         &file,
         cfg,
-        RecoveryOptions { max_rollback_commits: 2 },
+        ManifestPromotionOptions { max_rollback_commits: 2 },
     )
     .unwrap();
     let ops = record::disarm();
@@ -1754,10 +1657,10 @@ fn every_recovery_crash_converges_on_the_promoted_timeline() {
         let store = match Store::open_file(&f, cfg) {
             Ok(s) => s,
             Err(_) => {
-                let r = turndb::store::recover_manifest_file(
+                let r = turndb::store::promote_manifest_file(
                     &f,
                     cfg,
-                    RecoveryOptions { max_rollback_commits: 2 },
+                    ManifestPromotionOptions { max_rollback_commits: 2 },
                 )
                 .unwrap_or_else(|e| {
                     panic!("crash point {k} {variant:?}: recovery cannot resume: {e:#}")
@@ -1887,183 +1790,87 @@ fn every_punch_crash_leaves_declared_blocks_retryable() {
     std::fs::remove_dir_all(&stage).ok();
 }
 
-/// Decode the checked-in hex dump of the version-one consumer artifact.
-fn revision_one_pack_bytes() -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
-    let hex = std::fs::read_to_string(&path).unwrap();
-    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
-    assert_eq!(digits.len() % 2, 0, "fixture hex must hold whole bytes");
-    digits
-        .chunks(2)
-        .map(|pair| {
-            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
-                .expect("fixture holds only hex digits")
-        })
-        .collect()
-}
-
+/// Red-tested with the delayed container acknowledgement removed from content punch: after the
+/// injected final declaration sync failure, retry recorded `PunchHole` before any successful
+/// `SyncFile` of the selected container state, permitting a crash to revive undeclared holes.
+#[cfg(target_os = "linux")]
 #[test]
-fn every_format_migration_crash_preserves_contents_and_resumes() {
-    let root = tmp("migrate");
-    std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("legacy.turndb");
-    // Materialize the REAL version-1 artifact — not a synthetic fixture — and convert it into
-    // the modeled root. The conversion protocol has its own sweep below; here it is baseline.
-    let pack_path = tmp("migrate-pack");
-    std::fs::write(&pack_path, revision_one_pack_bytes()).unwrap();
-    turndb::store::convert_to_file(&pack_path, &work).unwrap();
-    std::fs::remove_file(&pack_path).ok();
-    let cfg = FoldCfg::default();
-    let want: [(&str, &[u8]); 2] =
-        [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
-
-    let mut base = Fs::new(Model::Posix);
-    base.seed_durable(&root);
-    record::arm();
-    {
-        let mut s = Store::open_file(&work, cfg).unwrap();
-        assert_eq!(s.format_migration_status().unwrap().legacy_parts, 2, "fixture shape moved");
-        // One legacy part rewritten and atomically published per step, twice, to completion.
-        assert!(s.migrate_format_step().unwrap().is_some());
-        assert!(s.migrate_format_step().unwrap().is_some());
-        assert!(s.migrate_format_step().unwrap().is_none());
-    }
-    let ops = record::disarm();
-    assert!(ops.len() > 20, "the migration must exercise a real op stream, got {}", ops.len());
-
-    let stage = tmp("migrate-stage");
-    let checked = replay_recorded("migration", &base, &root, &ops, &stage, |stage, k, variant| {
-        let dir = stage.join("legacy.turndb");
-        // Migration is commit-protocol work throughout: no crash point may leave a store that
-        // refuses to open.
-        let mut s = Store::open_file(&dir, cfg).unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: open refused mid-migration: {e:#}")
-        });
-        let check_contents = |s: &Store, when: &str| {
-            for (id, bytes) in &want {
-                assert_eq!(
-                    s.reconstruct_content(id, BODY_CONTENT).unwrap().as_deref(),
-                    Some(*bytes),
-                    "crash point {k} {variant:?}: {id} drifted {when}"
-                );
-                let rec = s.get(id).unwrap().unwrap();
-                assert_eq!(rec.contents.len(), 1, "crash point {k} {variant:?}");
-                // Version-1 values carry no whole-value identity; neither migration nor crash
-                // recovery may invent one — an identity is computed at ingest over the original
-                // bytes or it does not exist.
-                assert!(
-                    rec.contents[0].identity.is_none(),
-                    "crash point {k} {variant:?}: identity invented for {id} {when}"
-                );
-                let n = if *id == "legacy/0001" { 1 } else { 2 };
-                assert_eq!(
-                    rec.attrs,
-                    vec![
-                        ("source".to_string(), AttrValue::Str("qualification".into())),
-                        ("n".to_string(), AttrValue::Int(n)),
-                    ],
-                    "crash point {k} {variant:?}: attrs drifted for {id} {when}"
-                );
+fn content_punch_retry_acknowledges_a_selected_declaration_before_deallocation() {
+    fn prepared(path: &Path) -> Store {
+        let cfg = FoldCfg { block_target: 1, ..Default::default() };
+        let body = |seed: u64| {
+            let mut out = Vec::with_capacity(32 * 1024);
+            let mut hash = blake3::hash(&seed.to_le_bytes());
+            while out.len() < 32 * 1024 {
+                out.extend_from_slice(hash.as_bytes());
+                hash = blake3::hash(hash.as_bytes());
             }
+            out.truncate(32 * 1024);
+            out
         };
-        check_contents(&s, "after reopen");
-        // Resume to completion. Each step retires one legacy part, so the loop is bounded by
-        // the fixture's part count; completion is proven by the status report, not by the loop
-        // merely ending.
-        let mut steps = 0usize;
-        while s
-            .migrate_format_step()
-            .unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: migration cannot resume: {e:#}")
-            })
-            .is_some()
-        {
-            steps += 1;
-            assert!(steps <= 2, "crash point {k} {variant:?}: more steps than legacy parts");
-        }
-        let status = s.format_migration_status().unwrap();
-        assert_eq!(
-            (status.legacy_parts, status.current_parts),
-            (0, 2),
-            "crash point {k} {variant:?}: migration did not complete"
-        );
-        check_contents(&s, "after completed migration");
-    });
-    println!("dst migration: {checked} crash states checked across {} ops", ops.len());
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&stage).ok();
+        let mut store = Store::open_file(path, cfg).unwrap();
+        store.put("k", &[Span::Piece(&body(1))], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.put("k", &[Span::Piece(&body(2))], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store
+    }
+
+    let baseline_root = tmp("punch-ack-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.punch_unreferenced().unwrap();
+    let baseline_ops = record::disarm();
+    let first_deallocation = baseline_ops
+        .iter()
+        .position(|op| matches!(op, Op::PunchHole { path, .. } if path == &baseline_path))
+        .expect("content punch must deallocate a dead block after declaring it");
+    let final_sync = baseline_ops[..first_deallocation]
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_path))
+        .expect("content-punch declaration publication ends with a container sync");
+    let target = sync_index_of(&baseline_ops, final_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("punch-ack-retry");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.punch_unreferenced().expect_err("the final declaration sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    record::arm();
+    let stats = store.punch_unreferenced().unwrap();
+    let retry_ops = record::disarm();
+    assert!(stats.blocks_punched > 0);
+    let acknowledgement = retry_ops
+        .iter()
+        .position(|op| matches!(op, Op::SyncFile { path: candidate } if candidate == &path))
+        .expect("retry must acknowledge the selected declaration");
+    let deallocation = retry_ops
+        .iter()
+        .position(|op| matches!(op, Op::PunchHole { path: candidate, .. } if candidate == &path))
+        .expect("retry must deallocate the declared dead block");
+    assert!(
+        acknowledgement < deallocation,
+        "the selected declaration must be durable before its payload is destroyed: {retry_ops:?}"
+    );
+    store.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
 }
 
 /// A HashMap is deliberately not used for the namespaces: iteration order feeds materialization,
 /// and nondeterministic iteration would make a failing seed unreproducible.
 #[allow(dead_code)]
 fn _model_is_deterministic(_: &HashMap<(), ()>) {}
-
-/// Conversion is the retired directory layout's ONE remaining door, and its input is by
-/// definition an artifact this codebase can no longer produce — so the sweep drives it over the
-/// checked-in 0.1.3 fixture, unsettled WAL included. The claim: the destination is
-/// all-or-nothing at its final name, and every crash state — including any state the settle
-/// left the SOURCE directory in — is recovered by simply re-running the conversion.
-#[test]
-fn every_conversion_crash_is_recovered_by_rerunning_the_conversion() {
-    let root = tmp("convert");
-    std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("store");
-    unpack_dir_fixture(&work);
-    let want = fixture_expectations();
-    let cfg = FoldCfg::default();
-    let container = root.join("state.turndb");
-
-    let mut base = Fs::new(Model::Posix);
-    base.seed_durable(&root);
-    record::arm();
-    turndb::store::convert_to_file(&work, &container).unwrap();
-    let ops = record::disarm();
-    assert!(ops.len() > 10, "the conversion must exercise a real op stream, got {}", ops.len());
-    assert_slot_alternation("conversion", &ops);
-
-    let stage = tmp("convert-stage");
-    let checked = replay_recorded("conversion", &base, &root, &ops, &stage, |stage, k, variant| {
-        let file = stage.join("state.turndb");
-        if !file.exists() {
-            // The crash landed before publication: re-running the conversion is the whole
-            // recovery story — the settle resumes from whatever state the source directory is
-            // in (its own recovery included), and stale staging must never block the retry.
-            turndb::store::convert_to_file(&stage.join("store"), &file).unwrap_or_else(|e| {
-                panic!("crash point {k} {variant:?}: conversion cannot be re-run: {e:#}")
-            });
-        }
-        // Published means COMPLETE: a whole, verified container serving the fixture's entire
-        // contents — the WAL-only record included, because the settle replays it before the
-        // copy walks the members.
-        let c = turndb::container::Container::open(&file).unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: a torn file sits at the FINAL name: {e:#}")
-        });
-        c.verify().unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: converted store fails verification: {e:#}")
-        });
-        drop(c);
-        let rs = turndb::store::open_read_container(&file, cfg).unwrap_or_else(|e| {
-            panic!("crash point {k} {variant:?}: converted store refuses a reader: {e:#}")
-        });
-        assert_eq!(
-            rs.ids().unwrap().len(),
-            want.len(),
-            "crash point {k} {variant:?}: converted store gained or lost records"
-        );
-        for (id, body) in &want {
-            assert_eq!(
-                rs.reconstruct(id).unwrap().as_deref(),
-                Some(body.as_slice()),
-                "crash point {k} {variant:?}: converted record {id} drifted"
-            );
-        }
-    });
-    println!("dst conversion: {checked} crash states checked across {} ops", ops.len());
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&stage).ok();
-}
 
 /// The NATIVE single-file session: `Store::open_file`, writes, an ACK, a flush — the protocol
 /// whose superblock flip is the linearization point — more writes, another ACK that is never
@@ -2599,6 +2406,15 @@ fn injected_cause(e: &anyhow::Error) -> Option<usize> {
     })
 }
 
+fn injected_write_cause(e: &anyhow::Error) -> Option<usize> {
+    e.chain().find_map(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<record::InjectedWriteFailure>())
+            .map(|f| f.attempt)
+    })
+}
+
 /// Run `op` with the sync at attempted index `target` failing. Returns the error and the ops
 /// recorded up to the failure (the failed sync is absent by construction).
 fn run_with_failed_sync<T>(
@@ -2748,46 +2564,8 @@ fn a_failed_directory_sync_after_container_create_is_reported_and_leaves_no_stor
 }
 
 #[test]
-fn a_failed_directory_sync_after_recreating_an_interrupted_container_is_reported() {
-    let root = tmp("syncfail-recreate");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("s.turndb");
-    let cfg = FoldCfg::default();
-    let short = || std::fs::write(&path, vec![0u8; 100]).unwrap(); // shorter than the slots
-    short();
-    record::arm();
-    Store::open_file(&path, cfg).unwrap().close().unwrap();
-    let ops = record::disarm();
-    // Locate: the first SyncDir after the first SyncFile of the store file — the rebirth's.
-    let sf = ops.iter().position(|o| matches!(o, Op::SyncFile { path: p } if *p == path)).unwrap();
-    let sd = sf + ops[sf..].iter().position(|o| matches!(o, Op::SyncDir { .. })).unwrap();
-    let target = sync_index_of(&ops, sd);
-    std::fs::remove_file(&path).unwrap();
-    let _ = std::fs::remove_file(root.join("s.turndb-wal"));
-    short();
-
-    let mut base = Fs::new(Model::Posix);
-    base.seed_durable(&root);
-    let (err, ops) = run_with_failed_sync(target, || Store::open_file(&path, cfg).map(|_| ()));
-    assert!(format!("{err:#}").contains("after creating"), "{err:#}");
-    converges("recreate", "recreate", &base, &root, &root, &ops, |dir, what| {
-        let p = dir.join("s.turndb");
-        if p.exists() && std::fs::metadata(&p).unwrap().len() > turndb::container::REGION_START {
-            turndb::container::Container::open(&p)
-                .unwrap_or_else(|e| panic!("{what}: a reborn container must open: {e:#}"));
-        }
-        // An interrupted or absent file is exactly what a writer open finishes.
-        Store::open_file(&p, cfg)
-            .unwrap_or_else(|e| panic!("{what}: writer open: {e:#}"))
-            .close()
-            .unwrap();
-    });
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn a_failed_directory_sync_after_backup_publication_is_reported_and_the_artifact_is_all_or_nothing()
-{
+fn a_failed_directory_sync_after_backup_installation_is_reported_and_the_artifact_is_all_or_nothing(
+) {
     let root = tmp("syncfail-backup");
     std::fs::create_dir_all(&root).unwrap();
     let (file, cfg, want) = settled_store(&root, 300);
@@ -2812,21 +2590,21 @@ fn a_failed_directory_sync_after_backup_publication_is_reported_and_the_artifact
         let _ = s.close();
         r.map(|_| ())
     });
-    assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
+    assert!(format!("{err:#}").contains("after installing"), "{err:#}");
     converges("backup", "backup", &base, &root, &root, &ops, |dir, what| {
         serves_all(&dir.join("s.turndb"), &want, cfg, what);
         let b = dir.join("backup.turndb");
         if b.exists() {
             let c = turndb::container::Container::open(&b)
-                .unwrap_or_else(|e| panic!("{what}: a published backup must open: {e:#}"));
-            c.verify().unwrap_or_else(|e| panic!("{what}: published backup verify: {e:#}"));
+                .unwrap_or_else(|e| panic!("{what}: an installed backup must open: {e:#}"));
+            c.verify().unwrap_or_else(|e| panic!("{what}: installed backup verify: {e:#}"));
         }
     });
     std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
-fn a_failed_directory_sync_after_restore_publication_is_reported_and_the_destination_is_all_or_nothing(
+fn a_failed_directory_sync_after_restore_installation_is_reported_and_the_destination_is_all_or_nothing(
 ) {
     let root = tmp("syncfail-restore");
     std::fs::create_dir_all(&root).unwrap();
@@ -2851,53 +2629,11 @@ fn a_failed_directory_sync_after_restore_publication_is_reported_and_the_destina
     base.seed_durable(&root);
     let (err, ops) =
         run_with_failed_sync(target, || turndb::store::restore_file(&origin, &dest).map(|_| ()));
-    assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
+    assert!(format!("{err:#}").contains("after installing"), "{err:#}");
     converges("restore", "restore", &base, &root, &root, &ops, |dir, what| {
         let d = dir.join("restored.turndb");
         if d.exists() {
             serves_all(&d, &want, cfg, what);
-        }
-    });
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn a_failed_directory_sync_after_conversion_publication_is_reported_and_rerunning_converges() {
-    let root = tmp("syncfail-convert");
-    std::fs::create_dir_all(&root).unwrap();
-    let work = root.join("store");
-    unpack_dir_fixture(&work);
-    let want = fixture_expectations();
-    let cfg = FoldCfg::default();
-    let container = root.join("state.turndb");
-    record::arm();
-    turndb::store::convert_to_file(&work, &container).unwrap();
-    let ops = record::disarm();
-    let target = sync_index_of(&ops, last_sync_pos(&ops));
-    std::fs::remove_file(&container).unwrap();
-    std::fs::remove_dir_all(&work).unwrap();
-    unpack_dir_fixture(&work);
-
-    let mut base = Fs::new(Model::Posix);
-    base.seed_durable(&root);
-    let (err, ops) = run_with_failed_sync(target, || {
-        turndb::store::convert_to_file(&work, &container).map(|_| ())
-    });
-    assert!(format!("{err:#}").contains("after publishing"), "{err:#}");
-    converges("convert", "convert", &base, &root, &root, &ops, |dir, what| {
-        let file = dir.join("state.turndb");
-        if !file.exists() {
-            turndb::store::convert_to_file(&dir.join("store"), &file)
-                .unwrap_or_else(|e| panic!("{what}: conversion cannot be re-run: {e:#}"));
-        }
-        let rs = turndb::store::open_read_container(&file, cfg)
-            .unwrap_or_else(|e| panic!("{what}: converted store refuses a reader: {e:#}"));
-        for (id, body) in &want {
-            assert_eq!(
-                rs.reconstruct(id).unwrap().as_deref(),
-                Some(body.as_slice()),
-                "{what}: {id}"
-            );
         }
     });
     std::fs::remove_dir_all(&root).ok();
@@ -3036,6 +2772,45 @@ fn a_failed_directory_sync_after_anchor_recovery_cleanup_is_reported_and_the_sto
     std::fs::remove_dir_all(&snapshot).ok();
 }
 
+/// Red-tested with the parent-directory sync removed from recognized-debris cleanup: this test
+/// failed at the assertion that the unlink is immediately followed by its durability barrier.
+#[test]
+fn a_failed_directory_sync_after_writer_open_debris_cleanup_is_reported() {
+    let root = tmp("syncfail-open-debris");
+    std::fs::create_dir_all(&root).unwrap();
+    let (file, cfg, want) = settled_store(&root, 550);
+    let mut debris_name = file.as_os_str().to_os_string();
+    debris_name.push(".backing-up-123-1");
+    let debris = PathBuf::from(debris_name);
+    std::fs::write(&debris, b"recognized interrupted backup stage").unwrap();
+
+    record::arm();
+    let opened = Store::open_file(&file, cfg).unwrap();
+    assert_eq!(opened.metrics().debris_removed, 1);
+    drop(opened);
+    let ops = record::disarm();
+    let unlink = ops
+        .iter()
+        .position(|op| matches!(op, Op::Unlink { path } if path == &debris))
+        .expect("writer open removes its exact recognized debris");
+    assert!(
+        matches!(ops.get(unlink + 1), Some(Op::SyncDir { .. })),
+        "recognized debris removal must be followed immediately by its directory barrier: {:?}",
+        &ops[unlink..ops.len().min(unlink + 3)]
+    );
+    let target = sync_index_of(&ops, unlink + 1);
+    std::fs::write(&debris, b"recognized interrupted backup stage").unwrap();
+
+    let mut base = Fs::new(Model::Posix);
+    base.seed_durable(&root);
+    let (err, ops) = run_with_failed_sync(target, || Store::open_file(&file, cfg).map(|_| ()));
+    assert!(format!("{err:#}").contains("after removing recognized store debris"), "{err:#}");
+    converges("open-debris", "open-debris", &base, &root, &root, &ops, |dir, what| {
+        serves_all(&dir.join("s.turndb"), &want, cfg, what);
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn a_failed_directory_sync_after_close_removes_the_wal_is_reported_and_the_store_serves_everything()
 {
@@ -3137,10 +2912,727 @@ fn short_err(e: &anyhow::Error) -> String {
     }
 }
 
+/// Red-tested by removing the failed-flip authority reload in `Container::flip`: after the
+/// injected final publication sync failure, this test observed the predecessor sequence through
+/// the live handle while a fresh open selected the just-written successor slot.
+#[test]
+fn a_failed_final_container_sync_reconciles_or_poisoned_refuses_handle_reuse() {
+    let root = tmp("container-final-sync-reconcile");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut container = turndb::container::Container::create(&path).unwrap();
+    container.put_bytes("one", b"first").unwrap();
+    container.commit().unwrap();
+    container.put_bytes("two", b"second").unwrap();
+
+    let guard = record::fail_sync_after(1);
+    let error = container.commit().err().expect("the final publication sync must fail");
+    assert_eq!(guard.fired_at(), Some(1));
+    assert_eq!(injected_cause(&error), Some(1));
+    drop(guard);
+
+    let reopened = turndb::container::Container::open(&path).unwrap();
+    assert_eq!(container.seq(), reopened.seq(), "the live handle must adopt selected authority");
+    assert_eq!(container.read_file_bounded("one", 16).unwrap(), b"first");
+    assert_eq!(container.read_file_bounded("two", 16).unwrap(), b"second");
+    drop(reopened);
+
+    container.put_bytes("three", b"third").unwrap();
+    container.commit().unwrap();
+    drop(container);
+    let final_state = turndb::container::Container::open(&path).unwrap();
+    assert_eq!(final_state.read_file_bounded("one", 16).unwrap(), b"first");
+    assert_eq!(final_state.read_file_bounded("two", 16).unwrap(), b"second");
+    assert_eq!(final_state.read_file_bounded("three", 16).unwrap(), b"third");
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested by returning immediately from `Store::flush` when the successor manifest was
+/// selected but its final fsync failed: the next flush returned `Some` and attempted to publish
+/// the same logical change from stale Store state instead of observing an empty pending set.
+/// Red-tested again with the delayed container acknowledgement removed: the retry's first
+/// recorded mutation became WAL `SetLen(0)` instead of a `SyncFile` for the selected container.
+/// Red-tested a third time with reopened containers marked acknowledged: after dropping and
+/// reopening the failed writer, settlement again truncated the WAL before any container sync.
+#[test]
+fn a_store_adopts_a_selected_manifest_before_returning_its_final_sync_error() {
+    fn prepared(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("first", &[Span::Lit(b"one")], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+
+    let baseline_root = tmp("store-final-sync-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let ops = record::disarm();
+    let final_container_sync = ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_path))
+        .expect("flush must end container publication with a file sync");
+    let target = sync_index_of(&ops, final_container_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("store-final-sync-adopt");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.flush().err().expect("the final publication sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    assert_eq!(store.reconstruct("first").unwrap().as_deref(), Some(b"one".as_slice()));
+    record::arm();
+    assert!(
+        store.flush().unwrap().is_none(),
+        "the selected manifest revision must already have emptied the pending set"
+    );
+    let retry_ops = record::disarm();
+    let acknowledgement = retry_ops
+        .iter()
+        .position(|op| matches!(op, Op::SyncFile { path: candidate } if candidate == &path))
+        .expect("retry must acknowledge the selected container before settlement");
+    let settlement = retry_ops
+        .iter()
+        .position(|op| matches!(op, Op::SetLen { path: candidate, len: 0 } if candidate == &wal_of(&path)))
+        .expect("retry must settle the redundant WAL");
+    assert!(
+        acknowledgement < settlement,
+        "container durability must precede destruction of replay input: {retry_ops:?}"
+    );
+    store.put("second", &[Span::Lit(b"two")], vec![]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.close().unwrap();
+
+    let reader = turndb::store::open_read_container(&path, cfg4k()).unwrap();
+    assert_eq!(reader.reconstruct("first").unwrap().as_deref(), Some(b"one".as_slice()));
+    assert_eq!(reader.reconstruct("second").unwrap().as_deref(), Some(b"two".as_slice()));
+
+    let reopened_path = root.join("reopened.turndb");
+    let mut failed = prepared(&reopened_path);
+    let guard = record::fail_sync_after(target);
+    let error = failed.flush().err().expect("the reopened case must reach the same final barrier");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+    drop(failed);
+
+    let mut reopened = Store::open_file(&reopened_path, cfg4k()).unwrap();
+    record::arm();
+    assert!(reopened.flush().unwrap().is_none());
+    let reopened_ops = record::disarm();
+    let acknowledgement = reopened_ops
+        .iter()
+        .position(
+            |op| matches!(op, Op::SyncFile { path: candidate } if candidate == &reopened_path),
+        )
+        .expect("reopened settlement must establish a fresh durability barrier");
+    let settlement = reopened_ops
+        .iter()
+        .position(|op| matches!(op, Op::SetLen { path: candidate, len: 0 } if candidate == &wal_of(&reopened_path)))
+        .expect("reopened settlement must remove redundant replay input");
+    assert!(
+        acknowledgement < settlement,
+        "reopened authority must be acknowledged before WAL destruction: {reopened_ops:?}"
+    );
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested with the container acknowledgement removed from `Store::sync`: after a flush's final
+/// container fsync failed with the successor selected, a second accepted mutation synchronized only
+/// the WAL. Materializing the durable crash state therefore restored the predecessor container with
+/// WAL frames spanning two publication sequences, and writer open refused instead of recovering
+/// both acknowledged records.
+#[test]
+fn a_new_wal_acknowledgement_first_makes_its_selected_manifest_dependency_durable() {
+    fn prepared(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("first", &[Span::Lit(b"one")], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+
+    let baseline_root = tmp("dependent-wal-sync-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let baseline_ops = record::disarm();
+    let final_container_sync = baseline_ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_path))
+        .expect("flush must end container publication with a file sync");
+    let target = sync_index_of(&baseline_ops, final_container_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("dependent-wal-sync");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let mut before = Fs::new(Model::Posix);
+    before.seed_durable(&root);
+
+    record::arm();
+    let guard = record::fail_sync_after(target);
+    let error = store.flush().expect_err("the final publication sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    store.put("second", &[Span::Lit(b"two")], vec![]).unwrap();
+    store.sync().expect("the second mutation must receive its durability acknowledgement");
+    let ops = record::disarm();
+    drop(store);
+
+    let mut crashed = before;
+    for op in &ops {
+        crashed.apply(op);
+    }
+    let stage = tmp("dependent-wal-sync-crash");
+    assert!(materialize(&crashed, Variant::DurableOnly, &root, &stage));
+    let recovered_path = stage.join("store.turndb");
+    let recovered = Store::open_file(&recovered_path, cfg4k())
+        .expect("the durable crash state must recover both acknowledged mutations");
+    assert_eq!(recovered.reconstruct("first").unwrap().as_deref(), Some(b"one".as_slice()));
+    assert_eq!(recovered.reconstruct("second").unwrap().as_deref(), Some(b"two".as_slice()));
+    recovered.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+    std::fs::remove_dir_all(stage).ok();
+}
+
+/// Red-tested with the unconditional current-state acknowledgement removed from `Store::close`:
+/// after a merge selected its successor but its final sync failed, close emitted no `SyncFile` for
+/// the container because there was no WAL, yet returned success without completing the delayed
+/// publication acknowledgement.
+#[test]
+fn close_acknowledges_a_selected_wal_free_maintenance_publication() {
+    fn prepared(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        for round in 0..2 {
+            store.put(&format!("record:{round}"), &[Span::Lit(b"value")], vec![]).unwrap();
+            store.sync().unwrap();
+            store.flush().unwrap();
+        }
+        store.close().unwrap();
+        Store::open_file(path, cfg4k()).unwrap()
+    }
+
+    let baseline_root = tmp("close-maintenance-ack-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.merge_range(0, 2).unwrap().unwrap();
+    let baseline_ops = record::disarm();
+    let final_sync = baseline_ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_path))
+        .expect("merge must end container publication with a file sync");
+    let target = sync_index_of(&baseline_ops, final_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("close-maintenance-ack");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.merge_range(0, 2).expect_err("the final merge sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    record::arm();
+    store.close().unwrap();
+    let close_ops = record::disarm();
+    assert!(
+        close_ops.iter().any(|op| matches!(op, Op::SyncFile { path: candidate } if candidate == &path)),
+        "close must complete the delayed publication acknowledgement without relying on WAL state: {close_ops:?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested by clearing the Container poison after predecessor reconciliation: the injected
+/// superblock-slot write failure left the predecessor selected, yet the same Store accepted a
+/// second mutation with fold state that no longer matched its reloaded container directory.
+#[test]
+fn a_store_requires_reopen_when_a_failed_slot_write_leaves_the_predecessor_selected() {
+    fn prepared(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("first", &[Span::Piece(&body_for(77))], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+
+    let baseline_root = tmp("store-slot-write-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let ops = record::disarm();
+    let slot_write = ops
+        .iter()
+        .rposition(|op| {
+            matches!(op, Op::WriteAt { path, off, data }
+                if path == &baseline_path && (*off == 0 || *off == 4096) && data.len() == 4096)
+        })
+        .expect("flush must write one container authority slot");
+    let target = ops[..slot_write].iter().filter(|op| matches!(op, Op::WriteAt { .. })).count();
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("store-slot-write-reopen");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let guard = record::fail_write_after(target);
+    let error = store.flush().err().expect("the authority-slot write must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_write_cause(&error), Some(target));
+    drop(guard);
+
+    let error = store
+        .put("second", &[Span::Lit(b"must not be accepted")], vec![])
+        .expect_err("a predecessor-reconciled writer must require reopen");
+    assert!(format!("{error:#}").contains("reopen"), "{error:#}");
+    drop(store);
+
+    let mut reopened = Store::open_file(&path, cfg4k()).unwrap();
+    assert_eq!(
+        reopened.reconstruct("first").unwrap().as_deref(),
+        Some(body_for(77).as_slice()),
+        "the synchronized WAL must replay the first mutation"
+    );
+    assert!(reopened.reconstruct("second").unwrap().is_none());
+    reopened.flush().unwrap();
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested against append-then-flush buffering: the second `put` returned the injected WAL
+/// write error but its complete frame remained buffered, and a third `put` flushed and accepted
+/// it. The failure was at `tests/dst.rs::failed_wal_acceptance_poison...`: the same handle accepted
+/// `third` instead of requiring reopen, so the failed mutation could later replay as accepted.
+#[test]
+fn failed_wal_acceptance_poisons_fold_dedup_state_until_reopen() {
+    let root = tmp("wal-acceptance-poison");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = Store::open_file(&path, cfg4k()).unwrap();
+
+    // Stay just below the 1 MiB WAL buffer threshold, then make the next record cross it after
+    // adding a folded piece. No storage write occurs between arming the fault and the WAL flush.
+    let first = vec![b'a'; 900 * 1024];
+    store.put("first", &[Span::Lit(&first)], vec![]).unwrap();
+    let piece = vec![b'b'; 200 * 1024];
+    let guard = record::fail_write_after(0);
+    let error = store
+        .put("failed", &[Span::Piece(&piece)], vec![])
+        .expect_err("crossing the WAL buffer threshold must reach the injected write failure");
+    assert_eq!(guard.fired_at(), Some(0), "the intended WAL write must fail: {error:#}");
+    drop(guard);
+
+    let error = store
+        .put("third", &[Span::Piece(&piece)], vec![])
+        .expect_err("fold state from failed acceptance requires reopen");
+    assert!(format!("{error:#}").contains("reopen"), "{error:#}");
+    drop(store);
+
+    let reopened = Store::open_file(&path, cfg4k()).unwrap();
+    assert!(reopened.reconstruct("failed").unwrap().is_none());
+    assert!(reopened.reconstruct("third").unwrap().is_none());
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested with the Fold failed-write check disabled: an injected block append failed after the
+/// current piece entered the Fold dedup window, then retrying those bytes returned the leaked
+/// location as a hit and accepted a WAL frame with no novel bytes. This test failed when `retry`
+/// returned `Ok(())`; crash/reopen could not reconstruct the mutation it had acknowledged.
+#[test]
+fn failed_fold_append_poisons_store_acceptance_until_reopen() {
+    let root = tmp("fold-append-poisons-store");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = Store::open_file(&path, cfg4k()).unwrap();
+
+    let guard = record::fail_write_after(0);
+    let mut failed = None;
+    for n in 0..1_024u32 {
+        let mut piece = vec![0u8; 8 * 1024];
+        piece[..4].copy_from_slice(&n.to_le_bytes());
+        match store.put(&format!("candidate-{n}"), &[Span::Piece(&piece)], vec![]) {
+            Ok(()) => {}
+            Err(error) => {
+                failed = Some((piece, error));
+                break;
+            }
+        }
+    }
+    let (failed_piece, error) = failed.expect("the injected Fold append failure must be observed");
+    assert_eq!(guard.fired_at(), Some(0), "the first physical Fold append must fail: {error:#}");
+    drop(guard);
+
+    let error = store
+        .put("retry", &[Span::Piece(&failed_piece)], vec![])
+        .expect_err("the failed Fold pipeline requires reopen before another acceptance");
+    assert!(format!("{error:#}").contains("reopen"), "{error:#}");
+    drop(store);
+
+    let reopened = Store::open_file(&path, cfg4k()).unwrap();
+    assert!(reopened.reconstruct("retry").unwrap().is_none());
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested without pre-flip commit poisoning: the injected container-directory write failed
+/// after `finish_member`, then content punch published the abandoned merged part with its own
+/// declaration. Reopen failed closed because that unreferenced part was outside the Store member
+/// namespace. The failure was observed here when the same handle accepted content punch instead
+/// of requiring reopen and the merged member became selected state.
+#[test]
+fn failed_merge_preparation_cannot_leak_staging_into_another_publication() {
+    fn prepared(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("id", &[Span::Piece(b"obsolete folded bytes")], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.put("id", &[Span::Piece(b"current folded bytes")], vec![]).unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.part_count(), 2);
+        store
+    }
+
+    let baseline_root = tmp("merge-preparation-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.merge_range(0, 2).unwrap().unwrap();
+    let ops = record::disarm();
+    let slot_write = ops
+        .iter()
+        .rposition(|op| {
+            matches!(op, Op::WriteAt { path, off, data }
+                if path == &baseline_path && (*off == 0 || *off == 4096) && data.len() == 4096)
+        })
+        .expect("merge publication must write a container authority slot");
+    let fail_at = ops[..slot_write]
+        .iter()
+        .rposition(|op| matches!(op, Op::WriteAt { .. }))
+        .expect("merge must stage a manifest after finishing its output member");
+    let target = ops[..fail_at].iter().filter(|op| matches!(op, Op::WriteAt { .. })).count();
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("merge-preparation-failure");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let guard = record::fail_write_after(target);
+    let error = store.merge_range(0, 2).expect_err("merge preparation write must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_write_cause(&error), Some(target));
+    drop(guard);
+
+    let error = store
+        .punch_unreferenced()
+        .expect_err("a preparation-failed merge requires reopen before another publication");
+    assert!(format!("{error:#}").contains("reopen"), "{error:#}");
+    drop(store);
+
+    let abandoned = "part-00000001-00000002.part";
+    assert!(
+        !turndb::container::Container::open(&path).unwrap().contains(abandoned),
+        "the failed merge output must remain outside selected state"
+    );
+    let mut reopened = Store::open_file(&path, cfg4k()).unwrap();
+    reopened.punch_unreferenced().unwrap();
+    reopened.close().unwrap();
+    assert_eq!(
+        Store::open_file(&path, cfg4k()).unwrap().reconstruct("id").unwrap().as_deref(),
+        Some(b"current folded bytes".as_slice())
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested by leaving `failed_publication_selected` set across publication attempts: after an
+/// earlier successor-selecting final-sync error was acknowledged, a later pre-flip directory
+/// write error inherited `Some(true)`. The failed second successor then looked selected and the
+/// assertion below found the same Container still writable instead of requiring reopen.
+#[test]
+fn publication_outcome_evidence_cannot_leak_into_the_next_attempt() {
+    fn staged(path: &Path) -> turndb::container::Container {
+        let mut container = turndb::container::Container::create(path).unwrap();
+        container.put_bytes("first", b"selected successor").unwrap();
+        container
+    }
+
+    let baseline_root = tmp("container-outcome-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("container.turndb");
+    let mut baseline = staged(&baseline_path);
+    record::arm();
+    baseline.commit().unwrap();
+    let ops = record::disarm();
+    let final_sync = last_sync_pos(&ops);
+    let sync_target = sync_index_of(&ops, final_sync);
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("container-outcome-stale");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("container.turndb");
+    let mut container = staged(&path);
+    let guard = record::fail_sync_after(sync_target);
+    let error = container.commit().expect_err("the final publication sync must fail");
+    assert_eq!(guard.fired_at(), Some(sync_target));
+    assert_eq!(injected_cause(&error), Some(sync_target));
+    drop(guard);
+    assert!(container.contains("first"), "the successor must nevertheless be selected");
+    container.commit().unwrap(); // delayed acknowledgement of that selected state
+
+    container.put_bytes("second", b"must not become selected").unwrap();
+    let guard = record::fail_write_after(0);
+    let error = container.commit().expect_err("the next attempt's directory write must fail");
+    assert_eq!(guard.fired_at(), Some(0));
+    assert_eq!(injected_write_cause(&error), Some(0));
+    drop(guard);
+    let error = container
+        .put_bytes("third", b"must require reopen")
+        .expect_err("pre-flip failure must poison this attempt independently");
+    assert!(format!("{error:#}").contains("reopen"), "{error:#}");
+    drop(container);
+
+    let reopened = turndb::container::Container::open(&path).unwrap();
+    assert!(reopened.contains("first"));
+    assert!(!reopened.contains("second"));
+    assert!(!reopened.contains("third"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested by poisoning Fold only on the final segment append: an injected segment-birth write
+/// made `roll()` fail after the compression pool had drained the next block. A retry then reported
+/// a successful old tail even though the accepted second block had been dropped. The failure was
+/// at the retry assertion below, where `sync()` returned `Ok(FoldTail { .. })` instead of requiring
+/// reopen. Segment birth is staged, so the failed attempt also leaves no unidentified final-name
+/// segment and a fresh handle recovers the one fully written block.
+#[test]
+fn a_roll_failure_cannot_be_retried_as_a_successful_tail_after_dropping_a_block() {
+    fn incompressible(seed_byte: u8, len: usize) -> Vec<u8> {
+        let mut seed = [seed_byte; 32];
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
+            seed = blake3::hash(&seed).into();
+            bytes.extend_from_slice(&seed);
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    let root = tmp("fold-roll-poison");
+    let dir = root.join("fold");
+    let cfg =
+        FoldCfg { block_target: 6_000, seg_max: 7_000, compress_threads: 1, ..FoldCfg::default() };
+    let mut fold = turndb::fold::Fold::open(&dir, cfg).unwrap();
+    fold.put(&incompressible(1, 6_000)).unwrap();
+    fold.sync().unwrap();
+    fold.put(&incompressible(2, 6_000)).unwrap();
+
+    let guard = record::fail_write_after(0);
+    let error = fold.sync().expect_err("rolling the second block must hit the sidecar write fault");
+    assert_eq!(guard.fired_at(), Some(0), "the intended roll write must fail: {error:#}");
+    drop(guard);
+    let error =
+        fold.sync().expect_err("a drained block cannot be recovered by retrying the handle");
+    assert!(format!("{error:#}").contains("poisoned"), "{error:#}");
+    drop(fold);
+
+    assert!(
+        !dir.join("seg-00000001.fold").exists(),
+        "a failed staged birth must not expose an unidentified final-name segment"
+    );
+    let reopened = turndb::fold::Fold::open(&dir, cfg).unwrap();
+    assert_eq!(reopened.block_ids().len(), 1, "reopen recovers the one fully written block");
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested by removing `Store::close`'s redundant-WAL retry: the injected truncate sync
+/// failed after publication, the retry reported success, and this test found the unsettled WAL
+/// sidecar still present without a successful barrier or unlink.
+#[test]
+fn close_retries_wal_settlement_after_publication_outlives_a_truncate_sync_failure() {
+    fn staged(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("record", &[Span::Lit(b"value")], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+    fn wal_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push("-wal");
+        PathBuf::from(value)
+    }
+
+    let baseline_root = tmp("close-wal-retry-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = staged(&baseline_path);
+    let baseline_wal = wal_path(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let ops = record::disarm();
+    let truncate_sync = ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_wal))
+        .expect("flush must synchronize the truncated WAL");
+    let target = sync_index_of(&ops, truncate_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(&baseline_root).ok();
+
+    let root = tmp("close-wal-retry");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let wal = wal_path(&path);
+    let mut store = staged(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.flush().err().expect("the WAL truncate sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+    assert!(wal.exists(), "the failed barrier leaves the unsettled WAL name present");
+
+    store.close().unwrap();
+    assert!(!wal.exists(), "successful close must leave exactly the container");
+    let reader = turndb::store::open_read_container(&path, cfg4k()).unwrap();
+    assert_eq!(reader.reconstruct("record").unwrap().as_deref(), Some(b"value".as_slice()));
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested with `Wal::truncate` leaving its old append cursor in memory until after the failing
+/// sync: the next synchronized put wrote beyond a zero hole, and reopen failed with an unknown WAL
+/// tag instead of replaying the newly durable record.
+#[test]
+fn a_truncate_sync_failure_cannot_make_the_next_durable_wal_append_skip_bytes() {
+    fn wal_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push("-wal");
+        PathBuf::from(value)
+    }
+    fn staged(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("published", &[Span::Lit(b"first")], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+
+    let baseline_root = tmp("wal-cursor-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let baseline_wal = wal_path(&baseline_path);
+    let mut baseline = staged(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let ops = record::disarm();
+    let truncate_sync = ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_wal))
+        .expect("flush must synchronize its WAL truncation");
+    let target = sync_index_of(&ops, truncate_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("wal-cursor-after-sync-failure");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = staged(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.flush().expect_err("the WAL truncation barrier must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    store.put("wal-only", &[Span::Lit(b"second")], vec![]).unwrap();
+    store.sync().unwrap();
+    drop(store);
+    let reopened = Store::open_file(&path, cfg4k()).unwrap();
+    assert_eq!(reopened.reconstruct("published").unwrap().as_deref(), Some(b"first".as_slice()));
+    assert_eq!(reopened.reconstruct("wal-only").unwrap().as_deref(), Some(b"second".as_slice()));
+    reopened.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// Red-tested by restoring the empty-pending `flush` no-op: after a selected publication and an
+/// injected WAL-truncate sync failure, backup succeeded but `health().wal_frames` remained nonzero,
+/// contradicting the backup composite's promised source settlement.
+#[test]
+fn backup_retries_redundant_wal_settlement_before_installing_the_artifact() {
+    fn staged(path: &Path) -> Store {
+        let mut store = Store::open_file(path, cfg4k()).unwrap();
+        store.put("record", &[Span::Lit(b"value")], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+    fn wal_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push("-wal");
+        PathBuf::from(value)
+    }
+
+    let baseline_root = tmp("backup-settlement-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let baseline_wal = wal_path(&baseline_path);
+    let mut baseline = staged(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let ops = record::disarm();
+    let truncate_sync = ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_wal))
+        .expect("flush must synchronize the truncated WAL");
+    let target = sync_index_of(&ops, truncate_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("backup-settlement-retry");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let artifact = root.join("backup.turndb");
+    let mut store = staged(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.flush().err().expect("the WAL truncate sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    store.backup(&artifact).unwrap();
+    assert_eq!(store.health().wal_frames, 0, "backup must leave no WAL replay input");
+    let reader = turndb::store::open_read_container(&artifact, cfg4k()).unwrap();
+    assert_eq!(reader.reconstruct("record").unwrap().as_deref(), Some(b"value".as_slice()));
+    store.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn cfg4k() -> FoldCfg {
     FoldCfg { block_target: 4 * 1024, ..Default::default() }
 }
 
+/// Red-tested by disabling `UninstalledArtifact` cleanup: the first pre-installation sync failure
+/// left a numbered `backup.turndb.backing-up-<pid>-<n>` file, and this test failed at the
+/// staging-removal assertion below.
 #[test]
 fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
     let cfg = cfg4k();
@@ -3150,6 +3642,17 @@ fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
         |root, _| {
             let mut s = Store::open_file(&root.join("store.turndb"), cfg)?;
             let r = s.backup(&root.join("backup.turndb")).map(|_| ());
+            if r.is_err() {
+                assert!(
+                    std::fs::read_dir(root)?.all(|entry| !entry
+                        .map(|entry| entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("backup.turndb.backing-up-"))
+                        .unwrap_or(false)),
+                    "a reported pre-installation backup failure removes its staging file"
+                );
+            }
             let c = s.close();
             r.and(c)
         },
@@ -3159,7 +3662,6 @@ fn every_backup_sync_failure_is_reported_and_the_artifact_is_all_or_nothing() {
             if b.exists() {
                 let c = turndb::container::Container::open(&b)
                     .unwrap_or_else(|e| panic!("{what}: a torn artifact at the FINAL name: {e:#}"));
-                assert!(c.sealed(), "{what}: a published backup must be sealed");
                 c.verify().unwrap_or_else(|e| panic!("{what}: backup verify: {e:#}"));
                 let rs = turndb::store::open_read_container(&b, cfg).unwrap();
                 for (id, body) in want {
@@ -3202,39 +3704,6 @@ fn every_restore_sync_failure_is_reported_and_the_destination_is_all_or_nothing(
         },
     );
     println!("dst sync-failure restore: {n} syncs, each failed once, both models");
-}
-
-#[test]
-fn every_conversion_sync_failure_is_reported_and_rerunning_converges() {
-    let cfg = FoldCfg::default();
-    let n = sync_failure_variant(
-        "conversion",
-        |root| {
-            unpack_dir_fixture(&root.join("store"));
-            fixture_expectations()
-        },
-        |root, _| {
-            turndb::store::convert_to_file(&root.join("store"), &root.join("state.turndb"))
-                .map(|_| ())
-        },
-        |dir, want, what| {
-            let file = dir.join("state.turndb");
-            if !file.exists() {
-                turndb::store::convert_to_file(&dir.join("store"), &file)
-                    .unwrap_or_else(|e| panic!("{what}: conversion cannot be re-run: {e:#}"));
-            }
-            let rs = turndb::store::open_read_container(&file, cfg)
-                .unwrap_or_else(|e| panic!("{what}: converted store refuses a reader: {e:#}"));
-            for (id, body) in want {
-                assert_eq!(
-                    rs.reconstruct(id).unwrap().as_deref(),
-                    Some(body.as_slice()),
-                    "{what}: {id}"
-                );
-            }
-        },
-    );
-    println!("dst sync-failure conversion: {n} syncs, each failed once, both models");
 }
 
 /// Every attempted sync of each reclaim protocol fails once, under the model(s) that protocol is
@@ -3474,10 +3943,10 @@ fn every_recovery_sync_failure_is_reported_and_converges_on_the_promoted_timelin
             per_commit[1].clone()
         },
         |root, _| {
-            turndb::store::recover_manifest_file(
+            turndb::store::promote_manifest_file(
                 &root.join("s.turndb"),
                 cfg,
-                RecoveryOptions { max_rollback_commits: 2 },
+                ManifestPromotionOptions { max_rollback_commits: 2 },
             )
             .map(|r| assert_eq!(r.commit, 2))
         },
@@ -3486,10 +3955,10 @@ fn every_recovery_sync_failure_is_reported_and_converges_on_the_promoted_timelin
             let store = match Store::open_file(&f, cfg) {
                 Ok(s) => s,
                 Err(_) => {
-                    let r = turndb::store::recover_manifest_file(
+                    let r = turndb::store::promote_manifest_file(
                         &f,
                         cfg,
-                        RecoveryOptions { max_rollback_commits: 2 },
+                        ManifestPromotionOptions { max_rollback_commits: 2 },
                     )
                     .unwrap_or_else(|e| panic!("{what}: recovery cannot resume: {e:#}"));
                     assert_eq!(r.commit, 2, "{what}: re-run recovery promoted a different commit");
@@ -3511,50 +3980,6 @@ fn every_recovery_sync_failure_is_reported_and_converges_on_the_promoted_timelin
         },
     );
     println!("dst sync-failure recovery: {n} syncs, each failed once, both models");
-}
-
-#[test]
-fn every_migration_sync_failure_is_reported_and_resumes() {
-    let cfg = FoldCfg::default();
-    let want: [(&str, &[u8]); 2] =
-        [("legacy/0001", b"revision one request"), ("legacy/0002", b"revision one response")];
-    let n = sync_failure_variant(
-        "migration",
-        |root| {
-            let pack = root.join("pack.bin");
-            std::fs::write(&pack, revision_one_pack_bytes()).unwrap();
-            turndb::store::convert_to_file(&pack, &root.join("legacy.turndb")).unwrap();
-            std::fs::remove_file(&pack).unwrap();
-        },
-        |root, _| {
-            let mut s = Store::open_file(&root.join("legacy.turndb"), cfg)?;
-            while s.migrate_format_step()?.is_some() {}
-            Ok(())
-        },
-        |dir, _, what| {
-            let mut s = Store::open_file(&dir.join("legacy.turndb"), cfg)
-                .unwrap_or_else(|e| panic!("{what}: open refused mid-migration: {e:#}"));
-            let mut steps = 0usize;
-            while s
-                .migrate_format_step()
-                .unwrap_or_else(|e| panic!("{what}: cannot resume: {e:#}"))
-                .is_some()
-            {
-                steps += 1;
-                assert!(steps <= 2, "{what}: more steps than legacy parts");
-            }
-            let status = s.format_migration_status().unwrap();
-            assert_eq!((status.legacy_parts, status.current_parts), (0, 2), "{what}: incomplete");
-            for (id, bytes) in &want {
-                assert_eq!(
-                    s.reconstruct_content(id, BODY_CONTENT).unwrap().as_deref(),
-                    Some(*bytes),
-                    "{what}: {id}"
-                );
-            }
-        },
-    );
-    println!("dst sync-failure migration: {n} syncs, each failed once, both models");
 }
 
 /// The main workload, fallible: the same writes as `run_workload`, returning at the first error
@@ -3747,6 +4172,85 @@ fn every_single_file_punch_crash_disturbs_nothing() {
     println!("dst single-file free punch: {checked} crash states checked across {} ops", ops.len());
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&stage).ok();
+}
+
+/// Red-tested with the free-space acknowledgement gate removed: after a selected publication's
+/// final sync failed, `PunchHole` was the first recorded operation instead of a container
+/// `SyncFile`, so a crash could have selected a predecessor that still referenced those extents.
+#[cfg(target_os = "linux")]
+#[test]
+fn free_space_punch_acknowledges_the_selected_state_before_deallocation() {
+    fn prepared(path: &Path) -> Store {
+        let cfg = FoldCfg { block_target: 4 * 1024, ..Default::default() };
+        let body = |seed: u64| {
+            let mut out = Vec::with_capacity(16 * 1024);
+            let mut hash = blake3::hash(&seed.to_le_bytes());
+            while out.len() < 16 * 1024 {
+                out.extend_from_slice(hash.as_bytes());
+                hash = blake3::hash(hash.as_bytes());
+            }
+            out.truncate(16 * 1024);
+            out
+        };
+        let mut store = Store::open_file(path, cfg).unwrap();
+        for index in 0..4u64 {
+            store.put(&format!("base:{index}"), &[Span::Piece(&body(index))], vec![]).unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.erase_ids(&["base:0".to_string()]).unwrap();
+        for revision in 0..4u64 {
+            store
+                .put(&format!("age:{revision}"), &[Span::Piece(&body(100 + revision))], vec![])
+                .unwrap();
+            store.sync().unwrap();
+            store.flush().unwrap();
+        }
+        store.put("pending", &[Span::Lit(b"publication")], vec![]).unwrap();
+        store.sync().unwrap();
+        store
+    }
+
+    let baseline_root = tmp("free-punch-ack-baseline");
+    std::fs::create_dir_all(&baseline_root).unwrap();
+    let baseline_path = baseline_root.join("store.turndb");
+    let mut baseline = prepared(&baseline_path);
+    record::arm();
+    baseline.flush().unwrap();
+    let baseline_ops = record::disarm();
+    let final_sync = baseline_ops
+        .iter()
+        .rposition(|op| matches!(op, Op::SyncFile { path } if path == &baseline_path))
+        .expect("publication ends with a container sync");
+    let target = sync_index_of(&baseline_ops, final_sync);
+    baseline.close().unwrap();
+    std::fs::remove_dir_all(baseline_root).ok();
+
+    let root = tmp("free-punch-ack");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = prepared(&path);
+    let guard = record::fail_sync_after(target);
+    let error = store.flush().expect_err("the final publication sync must fail");
+    assert_eq!(guard.fired_at(), Some(target));
+    assert_eq!(injected_cause(&error), Some(target));
+    drop(guard);
+
+    record::arm();
+    let stats = store.punch_free_space().unwrap();
+    let ops = record::disarm();
+    assert!(stats.punched_bytes > 0, "the fixture must expose eligible free extents: {stats:?}");
+    let acknowledgement = ops
+        .iter()
+        .position(|op| matches!(op, Op::SyncFile { path: candidate } if candidate == &path))
+        .expect("free-space punch must acknowledge selected authority");
+    let deallocation = ops
+        .iter()
+        .position(|op| matches!(op, Op::PunchHole { path: candidate, .. } if candidate == &path))
+        .expect("the fixture must record deallocation");
+    assert!(acknowledgement < deallocation, "authority barrier must precede punch: {ops:?}");
+    store.close().unwrap();
+    std::fs::remove_dir_all(root).ok();
 }
 
 /// The WAL sidecar beside a single-file store, by the same rule the engine uses.

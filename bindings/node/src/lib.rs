@@ -8,9 +8,8 @@
 mod actor;
 
 use actor::{
-    Actor, ActorFault, BoundedCompactResult, CompactResult, CompactionSpaceResult,
-    FormatMigrationPreflightResult, FormatMigrationStepResult, OwnedContent, RefoldSpaceResult,
-    VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
+    Actor, ActorFault, BoundedCompactResult, CompactResult, CompactionSpaceResult, OwnedContent,
+    RefoldSpaceResult, VerifyResult, WriteOp, DEFAULT_QUEUE_CAPACITY, MAX_QUEUE_CAPACITY,
 };
 use napi::bindgen_prelude::{AbortSignal, BigInt, Buffer, PromiseRaw};
 use napi::{Env, Error, Result, Status};
@@ -291,8 +290,7 @@ pub struct NativeSqlBatch {
 
 #[napi(object)]
 pub struct NativeCapabilities {
-    pub part_format_write: u8,
-    pub part_format_read_max: u8,
+    pub draft_format_epoch: u8,
     pub writer_exclusion: String,
     pub positioned_io: bool,
     pub threads: bool,
@@ -307,8 +305,8 @@ pub struct NativeCapabilities {
     pub read_admission_limits: bool,
     pub object_count_admission: bool,
     pub store_space_usage: bool,
+    pub in_place_deallocation: bool,
     pub allocated_space_usage: bool,
-    pub format_migration: bool,
     pub operation_metrics: bool,
     pub part_distribution: bool,
     pub content_liveness: bool,
@@ -329,7 +327,7 @@ pub struct NativeCapabilities {
     pub immutable_snapshots: bool,
     pub lifecycle_operations: bool,
     pub backup_restore: bool,
-    pub recovery_controls: bool,
+    pub manifest_promotion_controls: bool,
     pub health_snapshots: bool,
     pub schema_discovery: bool,
     pub scan_explanation: bool,
@@ -351,8 +349,7 @@ pub struct NativeCapabilities {
 pub fn capabilities() -> NativeCapabilities {
     let c = turndb::capabilities::capabilities();
     NativeCapabilities {
-        part_format_write: c.part_format_write,
-        part_format_read_max: c.part_format_read_max,
+        draft_format_epoch: c.draft_format_epoch,
         writer_exclusion: match c.writer_exclusion {
             turndb::capabilities::WriterExclusion::OsEnforced => "os_enforced",
             turndb::capabilities::WriterExclusion::EmbedderEnforced => "embedder_enforced",
@@ -371,8 +368,8 @@ pub fn capabilities() -> NativeCapabilities {
         read_admission_limits: c.read_admission_limits,
         object_count_admission: c.object_count_admission,
         store_space_usage: c.store_space_usage,
+        in_place_deallocation: c.in_place_deallocation,
         allocated_space_usage: c.allocated_space_usage,
-        format_migration: c.format_migration,
         operation_metrics: c.operation_metrics,
         part_distribution: c.part_distribution,
         content_liveness: c.content_liveness,
@@ -392,8 +389,8 @@ pub fn capabilities() -> NativeCapabilities {
         max_fold_blocks_default: BigInt::from(c.max_fold_blocks_default),
         immutable_snapshots: true,
         lifecycle_operations: true,
-        backup_restore: turndb::pack::ATOMIC_RESTORE,
-        recovery_controls: true,
+        backup_restore: turndb::backup::ATOMIC_RESTORE,
+        manifest_promotion_controls: true,
         health_snapshots: true,
         schema_discovery: true,
         scan_explanation: true,
@@ -545,56 +542,6 @@ pub struct NativeRefoldSpaceResult {
 }
 
 #[napi(object)]
-pub struct NativeFormatMigrationStatus {
-    pub target_part_version: u8,
-    pub live_parts: BigInt,
-    pub current_parts: BigInt,
-    pub legacy_parts: BigInt,
-    pub legacy_rows: BigInt,
-    pub legacy_bytes: BigInt,
-    pub retained_legacy_parts: BigInt,
-    pub retained_legacy_rows: BigInt,
-    pub retained_legacy_bytes: BigInt,
-}
-
-#[napi(object)]
-pub struct NativeFormatMigrationPlan {
-    pub part_index: BigInt,
-    pub source_part_version: u8,
-    pub seq_lo: BigInt,
-    pub seq_hi: BigInt,
-    pub input_rows: BigInt,
-    pub input_bytes: BigInt,
-    pub input_sections: BigInt,
-    pub input_raw_section_bytes: BigInt,
-    pub estimated_stage_bytes: BigInt,
-    pub estimate_is_hard_bound: bool,
-    pub retained_input_bytes_after_commit: BigInt,
-    pub filesystem_available_bytes: Option<BigInt>,
-}
-
-#[napi(object)]
-pub struct NativeFormatMigrationPreflightResult {
-    pub flushed: bool,
-    pub status: NativeFormatMigrationStatus,
-    pub estimate: Option<NativeFormatMigrationPlan>,
-}
-
-#[napi(object)]
-pub struct NativeFormatMigrationStep {
-    pub plan: NativeFormatMigrationPlan,
-    pub output_bytes: BigInt,
-    pub remaining_legacy_parts: BigInt,
-    pub rewrite: NativeMergeStats,
-}
-
-#[napi(object)]
-pub struct NativeFormatMigrationStepResult {
-    pub flushed: bool,
-    pub step: Option<NativeFormatMigrationStep>,
-}
-
-#[napi(object)]
 pub struct NativeBoundedCompactResult {
     pub flushed: bool,
     pub parts_before: BigInt,
@@ -608,7 +555,6 @@ pub struct NativeBoundedCompactResult {
 pub struct NativeVerifyResult {
     pub manifest_links: BigInt,
     pub part_digests: BigInt,
-    pub undigested_parts: BigInt,
     pub parts: BigInt,
     pub part_sections: BigInt,
     pub fold_segments: u32,
@@ -619,13 +565,13 @@ pub struct NativeVerifyResult {
 
 #[napi(object)]
 pub struct NativeBackupResult {
-    pub files: BigInt,
+    pub members: BigInt,
     pub bytes: BigInt,
     pub commit: BigInt,
 }
 
 #[napi(object, object_to_js = false)]
-pub struct NativeRecoveryOptions {
+pub struct NativeManifestPromotionOptions {
     pub max_rollback_commits: Option<BigInt>,
     pub max_stored_frame_bytes: Option<BigInt>,
     pub max_decoded_frame_bytes: Option<BigInt>,
@@ -649,7 +595,7 @@ pub struct NativeRestoreOptions {
 }
 
 #[napi(object)]
-pub struct NativeRecoveryResult {
+pub struct NativeManifestPromotionResult {
     pub commit: BigInt,
     pub rollback_commits: BigInt,
     pub records: BigInt,
@@ -735,17 +681,17 @@ pub struct NativeOperationMetrics {
 
 #[napi(object)]
 pub struct NativeStoreMetrics {
-    pub open_recovery: NativeOperationMetrics,
+    pub open_wal_replay: NativeOperationMetrics,
     pub recovered_wal_frames: BigInt,
     pub sync: NativeOperationMetrics,
     pub flush: NativeOperationMetrics,
-    pub compaction: NativeOperationMetrics,
+    pub merge: NativeOperationMetrics,
     pub backup: NativeOperationMetrics,
     pub verification: NativeOperationMetrics,
     pub verification_corruption_failures: BigInt,
-    pub punch: NativeOperationMetrics,
+    pub content_punch: NativeOperationMetrics,
     pub refold: NativeOperationMetrics,
-    pub format_migration: NativeOperationMetrics,
+    pub erase: NativeOperationMetrics,
     pub folded_content: NativeFoldedContentMetrics,
 }
 
@@ -809,7 +755,7 @@ pub struct NativeLifecycleEventBatch {
 
 #[napi(object)]
 pub struct NativeSpaceAmount {
-    pub files: BigInt,
+    pub members: BigInt,
     pub logical_bytes: BigInt,
     pub allocated_bytes: Option<BigInt>,
 }
@@ -1081,7 +1027,8 @@ impl SnapshotState {
     }
 }
 
-/// An immutable manifest snapshot. Independent operations may execute concurrently.
+/// An immutable read view pinned to one store authority. Independent operations may execute
+/// concurrently.
 #[napi]
 pub struct NativeSnapshot {
     state: Arc<SnapshotState>,
@@ -1142,11 +1089,9 @@ impl NativeSnapshot {
         }
     }
 
-    /// Open a snapshot over a store held in ONE FILE — a sealed pack or a growable container.
+    /// Open a read-only snapshot over a current-draft container.
     ///
-    /// Which of the two it is comes from the file's magic, not its extension, and both answer
-    /// reads identically: same manifest, same parts, same fold, same SQL. There is no writer role
-    /// to take and no WAL to replay, so unlike a directory open this cannot contend with a writer.
+    /// This takes no writer role and replays no WAL, so it cannot contend with a writer.
     #[napi(factory)]
     pub async fn open_file(
         path: String,
@@ -1187,7 +1132,7 @@ impl NativeSnapshot {
         }
     }
 
-    /// Open one retained manifest commit. Retention is bounded and erasure can purge history.
+    /// Open one retained manifest revision. Retention is bounded and erasure can purge history.
     #[napi(factory)]
     pub async fn open_at(
         path: String,
@@ -1327,20 +1272,6 @@ impl NativeSnapshot {
     }
 }
 
-/// Which single-file form a path holds: `"pack"` if sealed, `"container"` if it can still grow,
-/// `null` for a directory or anything carrying neither magic.
-///
-/// Reading does not need this — [`NativeSnapshot::open_file`] dispatches on its own. It is here
-/// for tooling that must know whether a file can be appended to before it plans to.
-#[napi]
-pub fn single_file_kind(path: String) -> Option<String> {
-    match turndb::store::single_file_kind(&PathBuf::from(path)) {
-        Some(turndb::store::SingleFileKind::Pack) => Some("pack".to_string()),
-        Some(turndb::store::SingleFileKind::Container) => Some("container".to_string()),
-        None => None,
-    }
-}
-
 /// Retained commits currently available to [`NativeSnapshot::open_at`].
 #[napi]
 pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
@@ -1356,7 +1287,7 @@ pub async fn retained_commits(path: String) -> Result<Vec<BigInt>> {
     Ok(commits.into_iter().map(BigInt::from).collect())
 }
 
-/// Validate and restore one immutable backup into a destination that must not exist.
+/// Validate and restore one backup into a destination that must not exist.
 #[napi]
 pub fn restore_backup<'env>(
     env: &'env Env,
@@ -1390,31 +1321,12 @@ pub fn restore_backup<'env>(
         napi::tokio::task::spawn_blocking(move || {
             let src = PathBuf::from(backup_path);
             let dst = PathBuf::from(destination_path);
-            // A backup is a sealed single-file store now: restoring is member-verified copying.
-            // Packs remain restorable as the retired artifacts they are.
-            match turndb::store::single_file_kind(&src) {
-                Some(turndb::store::SingleFileKind::Container) => {
-                    turndb::store::restore_file_with_control(&src, &dst, &control)
-                }
-                // A pack is a retired artifact; restoring one births a writable single-file
-                // store through the same door everything retired walks: convert.
-                _ => {
-                    let _ = read_limits;
-                    control.check("backup restore")?;
-                    turndb::store::convert_to_file(&src, &dst).map(|stats| {
-                        turndb::pack::RestoreStats {
-                            files: stats.members,
-                            bytes: stats.bytes,
-                            commit: stats.commit,
-                        }
-                    })
-                }
-            }
+            turndb::store::restore_file_with_control_and_limits(&src, &dst, read_limits, &control)
         })
         .await
         .map_err(|error| failure("join TurnDB backup restore", error))?
         .map(|stats| NativeBackupResult {
-            files: BigInt::from(stats.files as u64),
+            members: BigInt::from(stats.members as u64),
             bytes: BigInt::from(stats.bytes),
             commit: BigInt::from(stats.commit),
         })
@@ -1422,13 +1334,13 @@ pub fn restore_backup<'env>(
     })
 }
 
-/// Exclusively validate and promote a retained manifest over a damaged live commit point.
+/// Exclusively validate and promote a retained manifest revision over damaged current authority.
 #[napi]
 pub fn recover_manifest<'env>(
     env: &'env Env,
     path: String,
-    options: Option<NativeRecoveryOptions>,
-) -> Result<PromiseRaw<'env, NativeRecoveryResult>> {
+    options: Option<NativeManifestPromotionOptions>,
+) -> Result<PromiseRaw<'env, NativeManifestPromotionResult>> {
     if path.is_empty() {
         return Err(Error::new(Status::InvalidArg, "store path must not be empty"));
     }
@@ -1455,17 +1367,17 @@ pub fn recover_manifest<'env>(
     };
     env.spawn_future(async move {
         napi::tokio::task::spawn_blocking(move || {
-            turndb::store::recover_manifest_file_with_limits_and_control(
+            turndb::store::promote_manifest_file_with_limits_and_control(
                 &PathBuf::from(path),
                 FoldCfg::default(),
-                turndb::store::RecoveryOptions { max_rollback_commits },
+                turndb::store::ManifestPromotionOptions { max_rollback_commits },
                 read_limits,
                 &control,
             )
         })
         .await
-        .map_err(|error| failure("join TurnDB manifest recovery", error))?
-        .map(|report| NativeRecoveryResult {
+        .map_err(|error| failure("join TurnDB manifest promotion", error))?
+        .map(|report| NativeManifestPromotionResult {
             commit: BigInt::from(report.commit),
             rollback_commits: BigInt::from(report.rollback_commits),
             records: BigInt::from(report.records as u64),
@@ -1476,7 +1388,7 @@ pub fn recover_manifest<'env>(
             fold_blocks: BigInt::from(report.fold_blocks as u64),
             fold_bytes: BigInt::from(report.fold_bytes),
         })
-        .map_err(|error| engine_failure("recover TurnDB manifest", error))
+        .map_err(|error| engine_failure("promote TurnDB manifest", error))
     })
 }
 
@@ -1491,7 +1403,7 @@ pub struct NativeStore {
 
 #[napi]
 impl NativeStore {
-    /// Open a writer. Resolves only after recovery and writer-lock acquisition complete.
+    /// Open a writer. Resolves only after WAL replay and writer-lock acquisition complete.
     #[napi(factory)]
     pub async fn open(path: String, options: Option<NativeOpenOptions>) -> Result<NativeStore> {
         if path.is_empty() {
@@ -1610,7 +1522,7 @@ impl NativeStore {
         })
     }
 
-    /// Seal the current memtable into an immutable part. Returns whether a part was written.
+    /// Publish the current memtable as an immutable part. Returns whether a part was written.
     #[napi]
     pub fn flush<'env>(
         &self,
@@ -1684,7 +1596,8 @@ impl NativeStore {
         Ok(NativeSnapshot::from_store(store))
     }
 
-    /// Settle earlier writes and compact. `full=true` merges every live part; false uses policy.
+    /// Synchronize and publish earlier writes, then merge parts. `full=true` selects every part;
+    /// false uses policy.
     #[napi]
     pub fn compact<'env>(
         &self,
@@ -1703,7 +1616,8 @@ impl NativeStore {
         })
     }
 
-    /// Settle earlier writes, then publish one contiguous merge within exact physical-input bounds.
+    /// Synchronize and publish earlier writes, then publish one contiguous merge within exact
+    /// physical-input bounds.
     #[napi]
     pub fn compact_bounded<'env>(
         &self,
@@ -1725,7 +1639,8 @@ impl NativeStore {
         })
     }
 
-    /// Settle earlier writes and estimate temporary space for the selected compaction plan.
+    /// Synchronize and publish earlier writes, then estimate temporary space for the selected
+    /// merge plan.
     #[napi]
     pub fn estimate_compaction_space<'env>(
         &self,
@@ -1745,61 +1660,8 @@ impl NativeStore {
         })
     }
 
-    /// Inspect live immutable-part migration progress without changing store state.
-    #[napi]
-    pub fn format_migration_status<'env>(
-        &self,
-        env: &'env Env,
-        options: Option<NativeLifecycleOptions>,
-    ) -> Result<PromiseRaw<'env, NativeFormatMigrationStatus>> {
-        let actor = self.actor.clone();
-        let control = decode_lifecycle(options);
-        env.spawn_future(async move {
-            actor
-                .format_migration_status(control)
-                .await
-                .map(encode_format_migration_status)
-                .map_err(|error| engine_failure("read TurnDB format migration status", error))
-        })
-    }
-
-    /// Settle earlier writes and preflight the next resumable format migration step.
-    #[napi]
-    pub fn estimate_format_migration_space<'env>(
-        &self,
-        env: &'env Env,
-        options: Option<NativeLifecycleOptions>,
-    ) -> Result<PromiseRaw<'env, NativeFormatMigrationPreflightResult>> {
-        let actor = self.actor.clone();
-        let control = decode_lifecycle(options);
-        env.spawn_future(async move {
-            actor
-                .estimate_format_migration_space(control)
-                .await
-                .map(encode_format_migration_preflight)
-                .map_err(|error| engine_failure("preflight TurnDB format migration", error))
-        })
-    }
-
-    /// Settle earlier writes and atomically upgrade one legacy immutable part.
-    #[napi]
-    pub fn migrate_format_step<'env>(
-        &self,
-        env: &'env Env,
-        options: Option<NativeLifecycleOptions>,
-    ) -> Result<PromiseRaw<'env, NativeFormatMigrationStepResult>> {
-        let actor = self.actor.clone();
-        let control = decode_lifecycle(options);
-        env.spawn_future(async move {
-            actor
-                .migrate_format_step(control)
-                .await
-                .map(encode_format_migration_step_result)
-                .map_err(|error| engine_failure("migrate TurnDB format", error))
-        })
-    }
-
-    /// Settle earlier writes, then verify manifest pins, every part section, and every fold frame.
+    /// Synchronize and publish earlier writes, then verify manifest pins, every part section, and
+    /// every fold frame.
     #[napi]
     pub fn verify<'env>(
         &self,
@@ -1817,7 +1679,8 @@ impl NativeStore {
         })
     }
 
-    /// Settle earlier writes and publish a verified backup without replacing an existing path.
+    /// Synchronize and publish earlier writes, then install a verified backup without replacing an
+    /// existing path.
     #[napi]
     pub fn backup<'env>(
         &self,
@@ -1835,23 +1698,12 @@ impl NativeStore {
                 .backup(PathBuf::from(path), control)
                 .await
                 .map(|stats| NativeBackupResult {
-                    files: BigInt::from(stats.files as u64),
+                    members: BigInt::from(stats.members as u64),
                     bytes: BigInt::from(stats.bytes),
                     commit: BigInt::from(stats.commit),
                 })
                 .map_err(|error| engine_failure("backup TurnDB store", error))
         })
-    }
-
-    /// Contract-v1 name for publishing an immutable single-file snapshot.
-    #[napi]
-    pub fn seal<'env>(
-        &self,
-        env: &'env Env,
-        path: String,
-        options: Option<NativeLifecycleOptions>,
-    ) -> Result<PromiseRaw<'env, NativeBackupResult>> {
-        self.backup(env, path, options)
     }
 
     /// Physically erase ids from this store, including retained history. External copies are out of scope.
@@ -1880,7 +1732,7 @@ impl NativeStore {
 
     /// Reclaim unreachable fold blocks in place where the platform supports punching.
     #[napi]
-    pub fn punch<'env>(
+    pub fn content_punch<'env>(
         &self,
         env: &'env Env,
         options: Option<NativeLifecycleOptions>,
@@ -1889,7 +1741,7 @@ impl NativeStore {
         let control = decode_lifecycle(options);
         env.spawn_future(async move {
             actor
-                .punch(control)
+                .content_punch(control)
                 .await
                 .map(|stats| NativePunchResult {
                     blocks_examined: BigInt::from(stats.blocks_examined as u64),
@@ -1917,7 +1769,7 @@ impl NativeStore {
         })
     }
 
-    /// Settle earlier writes and estimate duplicate-generation space for refold.
+    /// Synchronize and publish earlier writes, then estimate duplicate-generation space for refold.
     #[napi]
     pub fn estimate_refold_space<'env>(
         &self,
@@ -1973,7 +1825,7 @@ impl NativeStore {
             .map_err(|error| engine_failure("read TurnDB lifecycle events", error))
     }
 
-    /// Inspect exact live immutable-part file-size and physical-row distribution.
+    /// Inspect exact live immutable-part member-size and physical-row distribution.
     #[napi]
     pub fn part_distribution<'env>(
         &self,
@@ -2009,7 +1861,7 @@ impl NativeStore {
         })
     }
 
-    /// Traverse and classify store files for maintenance-space preflight.
+    /// Traverse and classify store members, free extents, and WAL storage for maintenance preflight.
     #[napi]
     pub fn space_usage<'env>(
         &self,
@@ -2042,7 +1894,7 @@ impl NativeStore {
     pub async fn close(&self, durable: Option<bool>) -> Result<()> {
         // A durable close settles the store to exactly one file inside the actor: writes
         // synced, memtable flushed, the emptied WAL sidecar removed. There is no fold-back and
-        // no working directory — the store was the file the whole time.
+        // the store remains the same container throughout.
         self.actor
             .close(durable.unwrap_or(true))
             .await
@@ -2954,65 +2806,6 @@ fn encode_compaction_space(result: CompactionSpaceResult) -> NativeCompactionSpa
     }
 }
 
-fn encode_format_migration_status(
-    status: turndb::store::FormatMigrationStatus,
-) -> NativeFormatMigrationStatus {
-    NativeFormatMigrationStatus {
-        target_part_version: status.target_part_version,
-        live_parts: BigInt::from(status.live_parts as u64),
-        current_parts: BigInt::from(status.current_parts as u64),
-        legacy_parts: BigInt::from(status.legacy_parts as u64),
-        legacy_rows: BigInt::from(status.legacy_rows),
-        legacy_bytes: BigInt::from(status.legacy_bytes),
-        retained_legacy_parts: BigInt::from(status.retained_legacy_parts as u64),
-        retained_legacy_rows: BigInt::from(status.retained_legacy_rows),
-        retained_legacy_bytes: BigInt::from(status.retained_legacy_bytes),
-    }
-}
-
-fn encode_format_migration_plan(
-    plan: turndb::store::FormatMigrationPlan,
-) -> NativeFormatMigrationPlan {
-    NativeFormatMigrationPlan {
-        part_index: BigInt::from(plan.part_index as u64),
-        source_part_version: plan.source_part_version,
-        seq_lo: BigInt::from(plan.seq_lo),
-        seq_hi: BigInt::from(plan.seq_hi),
-        input_rows: BigInt::from(plan.input_rows),
-        input_bytes: BigInt::from(plan.input_bytes),
-        input_sections: BigInt::from(plan.input_sections as u64),
-        input_raw_section_bytes: BigInt::from(plan.input_raw_section_bytes),
-        estimated_stage_bytes: BigInt::from(plan.estimated_stage_bytes),
-        estimate_is_hard_bound: plan.estimate_is_hard_bound,
-        retained_input_bytes_after_commit: BigInt::from(plan.retained_input_bytes_after_commit),
-        filesystem_available_bytes: plan.filesystem_available_bytes.map(BigInt::from),
-    }
-}
-
-fn encode_format_migration_preflight(
-    result: FormatMigrationPreflightResult,
-) -> NativeFormatMigrationPreflightResult {
-    NativeFormatMigrationPreflightResult {
-        flushed: result.flushed,
-        status: encode_format_migration_status(result.status),
-        estimate: result.estimate.map(encode_format_migration_plan),
-    }
-}
-
-fn encode_format_migration_step_result(
-    result: FormatMigrationStepResult,
-) -> NativeFormatMigrationStepResult {
-    NativeFormatMigrationStepResult {
-        flushed: result.flushed,
-        step: result.step.map(|step| NativeFormatMigrationStep {
-            plan: encode_format_migration_plan(step.plan),
-            output_bytes: BigInt::from(step.output_bytes),
-            remaining_legacy_parts: BigInt::from(step.remaining_legacy_parts as u64),
-            rewrite: encode_merge(step.rewrite),
-        }),
-    }
-}
-
 fn encode_bounded_compact(result: BoundedCompactResult) -> NativeBoundedCompactResult {
     let (plan, output_bytes, merge) = match result.compaction {
         Some(compaction) => (
@@ -3036,7 +2829,6 @@ fn encode_verify(result: VerifyResult) -> NativeVerifyResult {
     NativeVerifyResult {
         manifest_links: BigInt::from(result.chain.links as u64),
         part_digests: BigInt::from(result.chain.part_digests as u64),
-        undigested_parts: BigInt::from(result.chain.undigested as u64),
         parts: BigInt::from(result.parts as u64),
         part_sections: BigInt::from(result.part_sections as u64),
         fold_segments: result.fold.segments,
@@ -3127,17 +2919,17 @@ fn encode_operation_metrics(
 
 fn encode_store_metrics(metrics: turndb::observability::StoreMetrics) -> NativeStoreMetrics {
     NativeStoreMetrics {
-        open_recovery: encode_operation_metrics(metrics.open_recovery),
+        open_wal_replay: encode_operation_metrics(metrics.open_wal_replay),
         recovered_wal_frames: BigInt::from(metrics.recovered_wal_frames),
         sync: encode_operation_metrics(metrics.sync),
         flush: encode_operation_metrics(metrics.flush),
-        compaction: encode_operation_metrics(metrics.compaction),
+        merge: encode_operation_metrics(metrics.merge),
         backup: encode_operation_metrics(metrics.backup),
         verification: encode_operation_metrics(metrics.verification),
         verification_corruption_failures: BigInt::from(metrics.verification_corruption_failures),
-        punch: encode_operation_metrics(metrics.punch),
+        content_punch: encode_operation_metrics(metrics.content_punch),
         refold: encode_operation_metrics(metrics.refold),
-        format_migration: encode_operation_metrics(metrics.format_migration),
+        erase: encode_operation_metrics(metrics.erase),
         folded_content: NativeFoldedContentMetrics {
             pieces: BigInt::from(metrics.folded_content.pieces),
             dedup_hits: BigInt::from(metrics.folded_content.dedup_hits),
@@ -3207,7 +2999,7 @@ fn encode_lifecycle_events(
 
 fn encode_space_amount(amount: turndb::store::SpaceAmount) -> NativeSpaceAmount {
     NativeSpaceAmount {
-        files: BigInt::from(amount.files as u64),
+        members: BigInt::from(amount.members as u64),
         logical_bytes: BigInt::from(amount.logical_bytes),
         allocated_bytes: amount.allocated_bytes.map(BigInt::from),
     }

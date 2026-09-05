@@ -46,7 +46,10 @@ pub fn probe_encoded(sec: &[u8], h: &PieceHash) -> bool {
         return false;
     }
     let m = u64::from_le_bytes(sec[0..8].try_into().unwrap());
-    if m == 0 {
+    let Some(bytes) = usize::try_from(m.div_ceil(8)).ok().and_then(|n| n.checked_add(8)) else {
+        return false;
+    };
+    if m == 0 || sec.len() != bytes {
         return false;
     }
     let bits = &sec[8..];
@@ -58,9 +61,36 @@ pub fn probe_encoded(sec: &[u8], h: &PieceHash) -> bool {
 }
 
 impl Bloom {
+    pub fn encoded_len_for_capacity(n: usize) -> Result<usize> {
+        let count = u64::try_from(n).map_err(|_| anyhow::anyhow!("piece count exceeds u64"))?;
+        let m = count
+            .max(1)
+            .checked_mul(BITS_PER)
+            .ok_or_else(|| anyhow::anyhow!("bloom bit count overflows"))?
+            .max(64);
+        usize::try_from(m.div_ceil(8))
+            .ok()
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or_else(|| anyhow::anyhow!("bloom encoding exceeds this process's address space"))
+    }
+
+    pub fn try_with_capacity(n: usize) -> Result<Bloom> {
+        let encoded = Self::encoded_len_for_capacity(n)?;
+        let bytes = encoded - 8;
+        let count = u64::try_from(n).map_err(|_| anyhow::anyhow!("piece count exceeds u64"))?;
+        let m = count
+            .max(1)
+            .checked_mul(BITS_PER)
+            .ok_or_else(|| anyhow::anyhow!("bloom bit count overflows"))?
+            .max(64);
+        let mut bits = Vec::new();
+        bits.try_reserve_exact(bytes).map_err(|error| anyhow::anyhow!(error))?;
+        bits.resize(bytes, 0);
+        Ok(Bloom { bits, m })
+    }
+
     pub fn with_capacity(n: usize) -> Bloom {
-        let m = ((n as u64).max(1) * BITS_PER).max(64);
-        Bloom { bits: vec![0u8; m.div_ceil(8) as usize], m }
+        Self::try_with_capacity(n).expect("Bloom capacity must be representable")
     }
 
     pub fn insert(&mut self, h: &PieceHash) {
@@ -79,10 +109,20 @@ impl Bloom {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + self.bits.len());
+        self.try_encode().expect("Bloom encoding capacity was admitted at construction")
+    }
+
+    pub fn try_encode(&self) -> Result<Vec<u8>> {
+        let capacity = self
+            .bits
+            .len()
+            .checked_add(8)
+            .ok_or_else(|| anyhow::anyhow!("bloom encoding length overflows"))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(capacity).map_err(|error| anyhow::anyhow!(error))?;
         out.extend_from_slice(&self.m.to_le_bytes());
         out.extend_from_slice(&self.bits);
-        out
+        Ok(out)
     }
 
     pub fn decode(b: &[u8]) -> Result<Bloom> {
@@ -90,10 +130,45 @@ impl Bloom {
             bail!("bloom section truncated");
         }
         let m = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        if m == 0 || b.len() - 8 < m.div_ceil(8) as usize {
+        let bytes = usize::try_from(m.div_ceil(8))
+            .ok()
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(|| anyhow::anyhow!("bloom bit count exceeds this platform"))?;
+        if m == 0 || b.len() != bytes {
             bail!("bloom bit array does not match its declared size");
         }
         Ok(Bloom { m, bits: b[8..].to_vec() })
+    }
+
+    /// Validate the exact current-format filter parameters and prove that every authoritative
+    /// piece identity remains a possible hit. Extra set bits are harmless false positives; a
+    /// missing required bit would let an advisory structure change a logical dedup answer.
+    pub fn validate_current(b: &[u8], hashes: &[u8]) -> Result<()> {
+        if !hashes.len().is_multiple_of(32) {
+            bail!("piece hash column ends with a partial identity");
+        }
+        let filter = Bloom::decode(b)?;
+        let pieces = u64::try_from(hashes.len() / 32)
+            .map_err(|_| anyhow::anyhow!("piece count exceeds u64"))?;
+        let expected_m = pieces
+            .max(1)
+            .checked_mul(BITS_PER)
+            .ok_or_else(|| anyhow::anyhow!("bloom bit count overflows"))?
+            .max(64);
+        if filter.m != expected_m {
+            bail!(
+                "bloom bit count {} does not match the current-format value {expected_m}",
+                filter.m
+            );
+        }
+        for encoded in hashes.chunks_exact(32) {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(encoded);
+            if !filter.maybe_contains(&PieceHash(hash)) {
+                bail!("bloom filter has a false negative for a declared piece identity");
+            }
+        }
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize {
@@ -145,6 +220,14 @@ mod tests {
             assert!(back.maybe_contains(h));
         }
         assert!(Bloom::decode(&[0u8; 4]).is_err(), "a truncated section must refuse");
+    }
+
+    #[test]
+    fn trailing_bytes_are_outside_the_current_bloom_grammar() {
+        let mut encoded = Bloom::with_capacity(1).encode();
+        encoded.push(0);
+        assert!(Bloom::decode(&encoded).is_err());
+        assert!(!probe_encoded(&encoded, &PieceHash::of(b"piece")));
     }
 
     #[test]

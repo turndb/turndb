@@ -152,8 +152,9 @@ impl ContentOp {
         }
     }
 
-    /// Whether this op contributes no bytes. A zero-length piece is legal — an empty message part
-    /// carves to one — so this is a real question, not a lint appeasement.
+    /// Whether this op contributes no bytes. Public ingest accepts an empty piece span but
+    /// canonicalizes it to an empty literal, so persisted piece references always name real fold
+    /// bytes.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -172,8 +173,7 @@ pub type BodyOp = ContentOp;
 pub struct Content {
     pub name: String,
     pub ops: Vec<ContentOp>,
-    /// Exact reconstructed-byte identity when the ingest or on-disk format carried it. Legacy
-    /// records leave this unavailable rather than substituting a program or piece hash.
+    /// Exact reconstructed-byte identity. Newly constructed content receives it during ingest.
     pub identity: Option<ContentHash>,
 }
 
@@ -261,6 +261,9 @@ pub fn validate_contents(contents: &[Content]) -> anyhow::Result<()> {
         }
         if !names.insert(content.name.as_str()) {
             anyhow::bail!("duplicate content name {:?}", content.name);
+        }
+        if content.ops.iter().any(|op| matches!(op, ContentOp::Piece { len: 0, .. })) {
+            anyhow::bail!("a persisted piece reference must contain at least one byte");
         }
     }
     Ok(())

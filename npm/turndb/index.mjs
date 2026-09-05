@@ -14,7 +14,7 @@
  *
  * ## Durability, in one sentence
  *
- * `put` is not durable; `sync()` is the ACK point. `flush()` is a separate thing again — it seals
+ * `put` is not durable; `sync()` is the ACK point. `flush()` is a separate thing again — it publishes
  * writes into the columnar plane so OTHER readers can see them. This handle sees its own unflushed
  * writes without either.
  *
@@ -22,7 +22,7 @@
  *
  * **This package is always the `wasm32-wasip1` build** — the host OS does not switch it onto the
  * native engine — and WASI has no advisory locking, so the engine **cannot** enforce exclusion.
- * The native build's `flock` is not in play here, on any host.
+ * The native build's OS-enforced container lock is not in play here, on any host.
  *
  * The host layer permits only one live `Store` in a process, but that is not cross-process
  * exclusion. The obligation is still the embedder's: **at most one open writer per store file
@@ -39,7 +39,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 
 const WASM_PATH = join(dirname(fileURLToPath(import.meta.url)), 'turndb.wasm');
 
-/** Where the store directory is mounted inside the sandbox. Callers never see this. */
+/** Where the store's parent directory is mounted inside the sandbox. Callers never see this. */
 const GUEST_ROOT = '/store';
 /** Preview1 reserves 0..2 for stdio, so our only preopen is descriptor 3. */
 const GUEST_ROOT_FD = 3;
@@ -169,7 +169,7 @@ function readProfile(runtime, exportName) {
 }
 
 const contractOperations = Object.freeze([
-  'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+  'openWriter', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
   'verify', 'spaceUsage', 'refold', 'erase', 'close',
 ]);
 
@@ -178,14 +178,11 @@ function contractProfile(runtime) {
   const compiled = readProfile(runtime, 'tdb_capabilities');
   return {
     ...binding,
-    contractVersion: 1,
+    contractVersion: 2,
     profile: 'wasi',
     operations: [...contractOperations],
     bindingOperations: binding.operations,
-    partFormat: {
-      write: compiled.part_format_write,
-      readMax: compiled.part_format_read_max,
-    },
+    draftFormatEpoch: compiled.draft_format_epoch,
     writerExclusion: 'embedder_enforced',
     positionedIo: compiled.positioned_io,
     threads: compiled.threads,
@@ -691,7 +688,7 @@ export class Store {
   }
 
   /**
-   * Seal the memtable into an immutable part.
+   * Publish the memtable as an immutable part.
    *
    * Separate from {@link sync} on purpose: this handle already sees its own unflushed writes, so
    * flushing is about making them visible to OTHER readers and to the columnar plane. Flushing too
@@ -706,15 +703,15 @@ export class Store {
   }
 
   /**
-   * Total merge when the live part list reaches the engine's threshold. Returns whether a merge ran.
+   * Total merge when the referenced part list reaches the engine's threshold. Returns whether a merge ran.
    *
    * The stall is the caller's: this build runs the merge on the calling thread, and a total
    * merge's wall time is linear in the store's on-disk content (~5s/GB at level 19, wasm —
    * measured on synthetic stores up to 1.9 GB, a single workstation; level 3 unmeasured). It never fires
    * on its own — nothing compacts inside `putBody`/`sync`/`flush` — so
    * schedule it when a multi-second pause is acceptable, or use {@link Store.maybeCompact} to
-   * bound the pause instead. Total merges are also the only ones that settle deletes: a tombstone
-   * can only be dropped when the merge covers every live part.
+   * bound the pause instead. Total merges are also the only ones that drop tombstones: a tombstone
+   * can only be dropped when the merge covers every part referenced by the current manifest revision.
    */
   autoCompact({ timeoutMs: timeout } = {}) {
     this.#alive();
@@ -731,7 +728,7 @@ export class Store {
    * The dial for callers with a latency budget: the merge's input — and therefore the stall — is
    * capped at the oldest `run` parts instead of the whole store. Call it after flushes; repeated
    * calls amortize what {@link Store.autoCompact} would do in one linear-in-the-store pause.
-   * The trade: bounded merges never settle deletes (tombstones are carried, not dropped), so run a
+   * The trade: bounded merges never drop tombstones (they are carried forward), so run a
    * total merge occasionally if the store sees deletions.
    *
    * @param {{trigger?: number, run?: number}} [opts]  Defaults `trigger: 8` (the engine's own
@@ -861,11 +858,10 @@ export class Store {
   }
 
   /**
-   * Verify the complete committed snapshot and return exact evidence for every leg.
+   * Verify current store authority and return exact evidence for every integrity leg.
    *
    * Staged writes are outside this scope. Call {@link sync} and {@link flush} first when they must
-   * be included. `incomplete` is a successful verification with an explicitly unestablished legacy
-   * fact; corruption throws `TurndbError` with `code === 'CORRUPTION'`.
+   * be included. Corruption throws `TurndbError` with `code === 'CORRUPTION'`.
    */
   verify({ timeoutMs: timeout } = {}) {
     this.#alive();
@@ -914,8 +910,8 @@ export class Store {
     this.#check(this.#exports.tdb_metrics(this.#handle));
     const metrics = JSON.parse(this.#outText());
     const operationKeys = [
-      'openRecovery', 'sync', 'flush', 'compaction', 'backup', 'verification', 'punch',
-      'refold', 'erase', 'formatMigration',
+      'openWalReplay', 'sync', 'flush', 'merge', 'backup', 'verification', 'contentPunch',
+      'refold', 'erase',
     ];
     for (const key of operationKeys) {
       for (const field of [
@@ -959,7 +955,7 @@ export class Store {
     }
   }
 
-  /** Exact live/dead/reclaimable content facts for a flushed committed snapshot. */
+  /** Exact live/dead/reclaimable content facts for a read view pinned to current store authority. */
   contentLiveness({ timeoutMs: timeout } = {}) {
     this.#alive();
     const value = timeoutMs(timeout);
@@ -1098,7 +1094,7 @@ function wasiFor(hostDir) {
     version: 'preview1',
     args: ['turndb'],
     env: {},
-    // Only the current store directory is reachable from inside. The engine cannot see the rest of
+    // Only the current store's parent directory is reachable from inside. The engine cannot see the rest of
     // the filesystem even if asked, which is a property of the target worth keeping.
     preopens: { [GUEST_ROOT]: hostDir },
     returnOnExit: true,
@@ -1210,8 +1206,7 @@ export async function open(dir, opts = {}) {
   const maxFoldBlocks = openLimit(opts.maxFoldBlocks, 'maxFoldBlocks');
   const hostPath = resolve(dir);
   const hostDir = dirname(hostPath);
-  // The engine creates parent directories exactly as the retired directory open always did — but
-  // WASI preopens the host directory before the guest runs, so the engine never gets the chance.
+  // WASI preopens the host directory before the guest runs, so create the parent first.
   // Without this the first call a new user makes fails inside `uvwasi_init` with a bare errno
   // that names neither the path nor the cause. The preopen is the PARENT: the store is one file
   // inside it, and its `-wal` sidecar lives beside it under the same mount.
@@ -1233,7 +1228,7 @@ export async function open(dir, opts = {}) {
     const ptr = instance.exports.tdb_alloc(path.length);
     new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
     try {
-      handle = instance.exports.tdb_open_v3(
+      handle = instance.exports.tdb_open(
         ptr,
         path.length,
         opts.blockTarget ?? 0,
@@ -1280,11 +1275,7 @@ export async function open(dir, opts = {}) {
 }
 
 /**
- * Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
- *
- * Which form it is comes from the file's magic, not its extension, and both answer reads
- * identically. Neither has a writer role to take, so this open cannot contend with anything; the
- * returned handle refuses every mutating method.
+ * Open a TurnDB container read-only. The returned handle refuses every mutating method.
  *
  * WASI preopens directories, not files, so the file's parent is what the guest is given and the
  * file is named inside it.
@@ -1308,7 +1299,7 @@ export async function openFile(file, opts = {}) {
   } catch (cause) {
     if (cause instanceof TurndbError) throw cause;
     throw new TurndbError(
-      `opening ${hostFile}: no such pack or container`,
+      `opening ${hostFile}: no such TurnDB container`,
       cause.code === 'ENOENT' ? 'NOT_FOUND' : 'INVALID_ARGUMENT',
     );
   }
@@ -1361,32 +1352,4 @@ export async function openFile(file, opts = {}) {
   });
 }
 
-/**
- * Which single-file form a path holds: `'pack'`, `'container'`, or `null` for a directory or a
- * file carrying neither magic. Reading does not need this — {@link openFile} dispatches on its
- * own — but tooling that must know whether a file can still be appended to does.
- */
-export async function singleFileKind(file) {
-  const hostFile = resolve(file);
-  const runtime = await acquireRuntime(dirname(hostFile));
-  try {
-    const { instance } = runtime;
-    const enc = new TextEncoder();
-    const path = enc.encode(`${GUEST_ROOT}/${basename(hostFile)}`);
-    const ptr = instance.exports.tdb_alloc(path.length);
-    new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
-    try {
-      if (instance.exports.tdb_single_file_kind(ptr, path.length) < 0) return null;
-    } finally {
-      instance.exports.tdb_free(ptr, path.length);
-    }
-    const op = instance.exports.tdb_out_ptr();
-    const ol = instance.exports.tdb_out_len();
-    const out = new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer, op, ol));
-    return JSON.parse(out);
-  } finally {
-    releaseRuntime(runtime);
-  }
-}
-
-export default { open, openFile, singleFileKind, capabilities, compiledCapabilities, Store, TurndbError };
+export default { open, openFile, capabilities, compiledCapabilities, Store, TurndbError };

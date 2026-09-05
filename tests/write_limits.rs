@@ -41,10 +41,11 @@ fn limits(record: u64, batch: u64) -> WriteLimits {
 #[test]
 fn record_limit_is_an_exact_inclusive_framed_wal_boundary() {
     let dir = tmp("record-boundary");
-    // Revision-4 record with id "x", content name "body", one literal op, no attrs or novel pieces:
-    // 63 bytes of framing/metadata plus the literal bytes.
+    // Current record with id "x", content name "body", one literal op, no attrs or novel pieces:
+    // 62 bytes of framing/metadata plus the literal bytes. Whole-content identity is mandatory and
+    // therefore carries no optional presence marker.
     let mut store =
-        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(67, 1_000))
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(66, 1_000))
             .unwrap();
     store.put("x", &[Span::Lit(b"1234")], vec![]).unwrap();
     let before = store.health();
@@ -52,7 +53,7 @@ fn record_limit_is_an_exact_inclusive_framed_wal_boundary() {
     let error = store.put("y", &[Span::Lit(b"12345")], vec![]).unwrap_err();
     assert_eq!(
         error.downcast_ref::<WriteAdmissionError>(),
-        Some(&WriteAdmissionError::RecordTooLarge { item: None, actual: 68, allowed: 67 })
+        Some(&WriteAdmissionError::RecordTooLarge { item: None, actual: 67, allowed: 66 })
     );
     assert_eq!(store.health(), before, "a refused record changes no engine state");
     assert!(store.get("y").unwrap().is_none());
@@ -69,15 +70,15 @@ fn worst_case_measurement_does_not_depend_on_dedup_state() {
         store.flush().unwrap();
     }
 
-    // The all-novel upper bound is 132 bytes. It remains the admission size even though the piece
+    // The all-novel upper bound is 131 bytes. It remains the admission size even though the piece
     // is already durable and this particular write would carry no novel bytes.
     let mut store =
-        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(131, 1_000))
+        Store::open_file_with_limits(&store_file(&dir), FoldCfg::default(), limits(130, 1_000))
             .unwrap();
     let error = store.put("y", &[Span::Piece(bytes)], vec![]).unwrap_err();
     assert_eq!(
         error.downcast_ref::<WriteAdmissionError>(),
-        Some(&WriteAdmissionError::RecordTooLarge { item: None, actual: 132, allowed: 131 })
+        Some(&WriteAdmissionError::RecordTooLarge { item: None, actual: 131, allowed: 130 })
     );
 }
 
@@ -194,8 +195,7 @@ fn invalid_policy_is_refused_before_the_store_file_is_created() {
     std::fs::remove_dir_all(&*dir).ok();
 }
 
-/// The migrated suites build single-file stores inside their temp directories: the parent is
-/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+/// Build the suite's single-file store inside its cleanup directory.
 fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).ok();
     dir.join("s.turndb")

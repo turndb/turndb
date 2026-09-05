@@ -1,7 +1,7 @@
 //! One store, every OS: the bytes TurnDB writes do not depend on the platform that wrote them.
 //!
 //! A reference store is built here from fixed inputs and compared BYTE FOR BYTE with a checked-in
-//! copy made on Linux (`tests/fixtures/cross-os-reference.turndb.hex`). On Windows CI that is the
+//! current-writer copy made on Linux (`tests/fixtures/cross-os-reference.turndb.hex`). On Windows CI that is the
 //! Linux→Windows direction; the Windows job also emits its own build as an artifact, and a Linux
 //! job compares that back (`TURNDB_CROSS_OS_STORE`) — Windows→Linux. Each direction also opens,
 //! verifies and reads the foreign bytes, so "opens" and "identical" are both asserted, and a
@@ -79,12 +79,15 @@ fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE)
 }
 
-fn read_fixture() -> Vec<u8> {
-    let hex = std::fs::read_to_string(fixture_path()).unwrap_or_else(|e| {
-        panic!("{FIXTURE}: {e} (generate with TURNDB_WRITE_CROSS_OS_FIXTURE=1)")
-    });
+fn read_hex_fixture(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+    let hex = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{name}: {e}"));
     let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
     (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+}
+
+fn read_fixture() -> Vec<u8> {
+    read_hex_fixture(FIXTURE)
 }
 
 fn write_fixture(bytes: &[u8]) {

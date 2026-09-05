@@ -280,7 +280,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The fold's own dedup window resolves a hash we just wrote. (A general hash->Loc lookup across sealed
+/// The fold's own dedup window resolves a hash we just wrote. (A general hash->Loc lookup across published
 /// parts arrives with the part layer; within one session everything is still in the window.)
 fn fold_lookup(fold: &Fold, h: PieceHash) -> Option<turndb::fold::Loc> {
     fold.lookup(h)

@@ -68,17 +68,20 @@ async function flip(path, offset = undefined) {
 // rather than mutating the wrong artifact.
 const ALIGN = 4096;
 
-function liveDirOff(buf) {
-  const seq0 = buf.readBigUInt64LE(8);
-  const seq1 = buf.readBigUInt64LE(4096 + 8);
-  const slot = seq1 > seq0 ? 4096 : 0;
-  return Number(buf.readBigUInt64LE(slot + 16));
+function manifestStarts(buf) {
+  const signature = Buffer.from('{"draft_epoch":1,"parts":');
+  const offsets = [];
+  for (let at = buf.indexOf(signature); at !== -1; at = buf.indexOf(signature, at + 1)) {
+    offsets.push(at);
+  }
+  assert.ok(offsets.length >= 2, 'current and retained manifest payloads must both be present');
+  return offsets;
 }
 
 // The N-th part member's aligned start, anchored by its footer magic. Valid while each part in
 // the fixture is smaller than one alignment block, which these fixtures assert.
 function partStart(buf, nth = 0) {
-  const magic = Buffer.from('TURNPART');
+  const magic = Buffer.from('TDBPRT01');
   let at = -1;
   for (let i = 0; i <= nth; i += 1) {
     at = buf.indexOf(magic, at + 1);
@@ -96,19 +99,18 @@ function corruption(error) {
   return true;
 }
 
-test('verify reports exact committed-snapshot evidence and health makes no integrity claim', async () => {
+test('verify reports exact current-manifest-revision evidence and health makes no integrity claim', async () => {
   const { dir, store } = await fixture('clean');
   try {
     assert.equal(store.get('missing/id'), null, 'absence remains null');
     const report = store.verify();
-    assert.equal(report.scope, 'committed_snapshot');
+    assert.equal(report.scope, 'current_manifest_revision');
     assert.equal(report.state, 'valid');
     assert.deepEqual(report.retainedManifests, { state: 'verified', count: 2 });
     assert.equal(report.records, 3);
     assert.equal(report.contentValues, 4);
     assert.equal(report.contentBytes, 16n);
     assert.equal(report.contentIdentities, 4);
-    assert.equal(report.unidentifiedContentValues, 0);
     assert.ok(report.parts > 0);
     assert.ok(report.partSections > 0);
     assert.ok(report.fold.blocks > 0);
@@ -124,25 +126,15 @@ test('verify reports exact committed-snapshot evidence and health makes no integ
   }
 });
 
-test('a mutated part is corruption, never an absent record', async () => {
+test('a mutated part is refused as corruption during store open', async () => {
   const { dir, store } = await fixture('part');
   store.close();
   try {
-    // The first section starts at member offset zero. Damage its payload rather than the
-    // footer/TOC so the part remains openable and verification exercises the section checksum.
+    // The first section starts at member offset zero. Current open validates its structural
+    // semantics, so damage is refused before a handle can report a false absent record.
     const image = await readFile(dir);
     await flip(dir, partStart(image, 0) + 16);
-    const reopened = await open(dir);
-    try {
-      assert.throws(() => reopened.verify(), corruption);
-      assert.throws(
-        () => reopened.get('member/0001'),
-        corruption,
-        'a corrupt record must throw rather than arrive as absence',
-      );
-    } finally {
-      reopened.close();
-    }
+    await assert.rejects(open(dir), corruption);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -155,7 +147,7 @@ test('a mutated fold frame is typed store-open corruption', async () => {
     // The virgin segment member is the first member in the region; its frames follow the
     // 48-byte header. Prove the geometry before cutting.
     const image = await readFile(dir);
-    assert.equal(image.subarray(2 * ALIGN, 2 * ALIGN + 8).toString(), 'TURNFOLD');
+    assert.equal(image.subarray(2 * ALIGN, 2 * ALIGN + 8).toString(), 'TDBFLD01');
     await flip(dir, 2 * ALIGN + 52);
     await assert.rejects(open(dir), corruption);
   } finally {
@@ -163,35 +155,30 @@ test('a mutated fold frame is typed store-open corruption', async () => {
   }
 });
 
-test('a mutated live manifest is typed store-open corruption', async () => {
+test('a mutated current manifest is typed store-open corruption', async () => {
   const { dir, store } = await fixture('live-manifest');
   store.close();
   try {
     const image = await readFile(dir);
-    await flip(dir, liveDirOff(image) - 2);
+    const starts = manifestStarts(image);
+    await flip(dir, starts[starts.length - 1] + 40);
     await assert.rejects(open(dir), corruption);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('the newest retained manifest is verified explicitly rather than absorbed by scope', async () => {
+test('a damaged retained manifest is refused during writer open', async () => {
   const { dir, store } = await fixture('retained-manifest');
   store.close();
   try {
-    // The newest retained copy is the member staged immediately before the MANIFEST restage:
-    // one alignment block above the manifest, which sits one block above the live directory.
+    // Each revision writes its retained copy before current MANIFEST. The final two canonical JSON
+    // payloads are therefore the newest retained authority and the current authority.
     const image = await readFile(dir);
-    const manifestStart = Math.floor((liveDirOff(image) - 1) / ALIGN) * ALIGN;
-    const retainedStart = manifestStart - ALIGN;
-    assert.equal(image[retainedStart], '{'.charCodeAt(0), 'the retained member must be JSON');
+    const starts = manifestStarts(image);
+    const retainedStart = starts[starts.length - 2];
     await flip(dir, retainedStart + 40);
-    const reopened = await open(dir);
-    try {
-      assert.throws(() => reopened.verify(), corruption);
-    } finally {
-      reopened.close();
-    }
+    await assert.rejects(open(dir), corruption);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

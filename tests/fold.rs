@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use turndb::fold::{Fold, FoldCfg, FoldTail};
+use turndb::read_limits::ReadLimits;
 use turndb::PieceHash;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -14,10 +15,20 @@ fn tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("turndb-fold-{tag}-{}-{n}", std::process::id()))
 }
 
-/// A corpus with the shapes a trace store actually sees: tiny, large, repeated, binary, empty.
+fn noise_piece(seed: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut hash = blake3::hash(&seed.to_le_bytes());
+    while out.len() < len {
+        out.extend_from_slice(hash.as_bytes());
+        hash = blake3::hash(hash.as_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// A corpus with the shapes a trace store actually sees: tiny, large, repeated, and binary.
 fn corpus() -> Vec<Vec<u8>> {
     let mut v: Vec<Vec<u8>> = vec![
-        Vec::new(),
         b"x".to_vec(),
         b"{\"role\":\"user\",\"content\":\"hello\"}".to_vec(),
         "a long shared system prompt. ".repeat(200).into_bytes(),
@@ -44,6 +55,21 @@ fn corpus() -> Vec<Vec<u8>> {
         );
     }
     v
+}
+
+#[test]
+fn an_empty_physical_piece_is_refused_without_changing_the_fold() {
+    let dir = tmp("empty-piece");
+    let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
+    let before = f.disk_bytes();
+    let error = f.put(b"").unwrap_err().to_string();
+    assert!(error.contains("at least one byte"), "unexpected refusal: {error}");
+    assert_eq!(f.disk_bytes(), before, "refusal must precede every fold mutation");
+    f.sync().unwrap();
+    drop(f);
+    let reopened = Fold::open(&dir, FoldCfg::default()).unwrap();
+    assert_eq!(reopened.block_ids().len(), 0);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -305,6 +331,51 @@ fn committed_tail_discards_uncommitted_frames() {
 }
 
 #[test]
+fn a_later_crash_segment_never_masks_lost_bytes_in_the_committed_segment() {
+    let dir = tmp("later-segment-masks-committed-loss");
+    let cfg = FoldCfg { seg_max: 96 * 1024, block_target: 24 * 1024, ..Default::default() };
+    let committed = {
+        let mut fold = Fold::open(&dir, cfg).unwrap();
+        for seed in 0..12 {
+            fold.put(&noise_piece(seed, 24 * 1024)).unwrap();
+        }
+        let committed = fold.sync().unwrap();
+        assert!(committed.seg > 0, "the committed authority must already span segments");
+        for seed in 100..112 {
+            fold.put(&noise_piece(seed, 24 * 1024)).unwrap();
+        }
+        fold.sync().unwrap();
+        assert!(fold.tail().seg > committed.seg, "the test needs a later physical segment");
+        committed
+    };
+
+    let committed_path = dir.join(format!("seg-{:08}.fold", committed.seg));
+    let later_path = dir.join(format!("seg-{:08}.fold", committed.seg + 1));
+    assert!(later_path.exists());
+    let damaged_len = u64::from(committed.off) - 1;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&committed_path)
+        .unwrap()
+        .set_len(damaged_len)
+        .unwrap();
+    let later_before = std::fs::read(&later_path).unwrap();
+
+    let error = match Fold::open_at(&dir, cfg, Some(committed), &[]) {
+        Ok(_) => panic!("a later segment must not hide lost committed bytes"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("lost durable bytes"), "unexpected refusal: {error}");
+    assert_eq!(std::fs::metadata(&committed_path).unwrap().len(), damaged_len);
+    assert_eq!(
+        std::fs::read(&later_path).unwrap(),
+        later_before,
+        "refusal must not unlink later evidence"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn read_only_committed_prefix_ignores_damaged_later_bytes() {
     let dir = tmp("read-prefix");
     let keep = b"content named by the retained manifest".to_vec();
@@ -345,17 +416,17 @@ fn read_only_committed_prefix_ignores_damaged_later_bytes() {
 }
 
 #[test]
-fn dedup_window_seals_without_affecting_reads() {
+fn dedup_window_releases_without_affecting_reads() {
     let dir = tmp("window");
     let mut f = Fold::open(&dir, FoldCfg::default()).unwrap();
-    let blob = b"content spanning a seal".to_vec();
+    let blob = b"content spanning a dedup-window release".to_vec();
     let p = f.put(&blob).unwrap();
     assert_eq!(f.window_len(), 1);
-    f.seal_window();
+    f.release_dedup_window();
     assert_eq!(f.window_len(), 0);
     // the window is an accelerator, not a source of truth: reads are unaffected
     assert_eq!(f.read(p.loc).unwrap(), blob);
-    // and re-putting after a seal is merely a duplicate append, never wrong
+    // and re-putting after a release is merely a duplicate append, never wrong
     let again = f.put(&blob).unwrap();
     assert_eq!(f.read(again.loc).unwrap(), blob);
     std::fs::remove_dir_all(&dir).ok();
@@ -438,6 +509,17 @@ fn a_configuration_that_would_overflow_is_refused_at_open() {
         );
     }
 
+    let too_many_threads = FoldCfg { compress_threads: usize::MAX, ..FoldCfg::default() };
+    let thread_path = d.join("too-many-threads");
+    assert!(
+        Fold::open(&thread_path, too_many_threads).is_err(),
+        "an unrepresentable compression-worker request must be refused instead of overflowing"
+    );
+    assert!(
+        !thread_path.exists(),
+        "invalid runtime configuration must be refused before creating an artifact"
+    );
+
     // and the defaults are, of course, accepted
     assert!(Fold::open(&d.join("ok"), FoldCfg::default()).is_ok());
     std::fs::remove_dir_all(&d).ok();
@@ -519,6 +601,56 @@ fn a_committed_tail_beyond_the_data_is_refused() {
 }
 
 #[test]
+fn a_committed_tail_without_its_segment_refuses_before_mutation() {
+    use turndb::container::Container;
+
+    let absent = tmp("absent-committed-fold");
+    let error =
+        match Fold::open_at(&absent, FoldCfg::default(), Some(FoldTail { seg: 0, off: 48 }), &[]) {
+            Ok(_) => panic!("a committed tail cannot create an absent fold directory"),
+            Err(error) => error.to_string(),
+        };
+    assert!(error.contains("absent fold directory"), "unexpected refusal: {error}");
+    assert!(!absent.exists(), "refusal must not create an unidentified directory");
+
+    let dir = tmp("missing-committed-segment");
+    std::fs::create_dir_all(&dir).unwrap();
+    let neighbor = dir.join("unowned.tmp");
+    std::fs::write(&neighbor, b"adjacent evidence").unwrap();
+
+    let committed = FoldTail { seg: 0, off: 0 };
+    let error = match Fold::open_at(&dir, FoldCfg::default(), Some(committed), &[]) {
+        Ok(_) => panic!("a committed tail without a segment must refuse"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("holds no segment"), "unexpected refusal: {error}");
+    assert!(!dir.join("WRITER.lock").exists(), "refusal must precede lock creation");
+    assert!(!dir.join("seg-00000000.fold").exists(), "refusal must not invent fold bytes");
+    assert_eq!(std::fs::read(&neighbor).unwrap(), b"adjacent evidence");
+
+    let container_path = dir.join("store.turndb");
+    let container =
+        std::sync::Arc::new(std::sync::Mutex::new(Container::create(&container_path).unwrap()));
+    let before = container.lock().unwrap().names().map(str::to_owned).collect::<Vec<_>>();
+    let error = match Fold::open_container_writer(
+        container.clone(),
+        0,
+        FoldCfg::default(),
+        Some(committed),
+        &[],
+        ReadLimits::default(),
+    ) {
+        Ok(_) => panic!("container authority cannot name an absent fold segment"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("holds no fold segment"), "unexpected refusal: {error}");
+    let after = container.lock().unwrap().names().map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(after, before, "refusal must not stage a replacement segment");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn sealed_segments_carry_sidecars_and_survive_losing_them() {
     // The directory sidecar is what makes open O(active segment) instead of O(store) — and it is
     // ADVISORY: absent, torn, or stale, the segment is rescanned and the answer is identical.
@@ -551,7 +683,7 @@ fn sealed_segments_carry_sidecars_and_survive_losing_them() {
     assert_eq!(
         sidecars(),
         segs - 1,
-        "every SEALED segment rolls with a sidecar; the active has none"
+        "every sealed segment rolls with a sidecar; the active has none"
     );
 
     // Reads through sidecar-built directories are byte-exact.
@@ -604,6 +736,59 @@ fn sealed_segments_carry_sidecars_and_survive_losing_them() {
             );
         }
     }
+
+    // A self-checksummed sidecar can still lie about the authoritative segment. Point its first
+    // entry one byte into the real frame, repair the sidecar CRC, and require a frame scan plus
+    // regeneration rather than trusting the impossible index.
+    let mut impossible = std::fs::read(&p).unwrap();
+    assert!(impossible.len() >= 28, "the fixture needs at least one indexed block");
+    let offset = u32::from_le_bytes(impossible[24..28].try_into().unwrap());
+    impossible[24..28].copy_from_slice(&(offset + 1).to_le_bytes());
+    let n = impossible.len();
+    let crc = crc32fast::hash(&impossible[..n - 4]);
+    impossible[n - 4..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&p, &impossible).unwrap();
+    {
+        let f = Fold::open(&dir, cfg).unwrap();
+        for (loc, hash, b) in &want {
+            assert_eq!(
+                &f.read_verified(*loc, *hash).unwrap(),
+                b,
+                "self-consistent but impossible sidecar must fall back to frame scan"
+            );
+        }
+    }
+    assert_ne!(std::fs::read(&p).unwrap(), impossible, "writer must replace the false sidecar");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_missing_sidecar_never_turns_closed_segment_damage_into_a_shorter_history() {
+    let dir = tmp("closed-segment-fallback");
+    let cfg = FoldCfg { seg_max: 128 * 1024, block_target: 16 * 1024, ..Default::default() };
+    {
+        let mut fold = Fold::open(&dir, cfg).unwrap();
+        for bytes in corpus() {
+            fold.put(&bytes).unwrap();
+        }
+        fold.sync().unwrap();
+        assert!(fold.segment_count() > 1, "fixture must close its first segment");
+    }
+
+    let segment = dir.join("seg-00000000.fold");
+    let sidecar = dir.join("seg-00000000.dir");
+    std::fs::remove_file(&sidecar).unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x80;
+    std::fs::write(&segment, &bytes).unwrap();
+
+    let error = Fold::open(&dir, cfg)
+        .err()
+        .expect("a damaged closed segment must refuse rather than shorten")
+        .to_string();
+    assert!(error.contains("closed fold segment"), "unexpected refusal: {error}");
+    assert_eq!(std::fs::read(&segment).unwrap(), bytes, "writer open must not truncate damage");
+    assert!(!sidecar.exists(), "writer open must not legitimize a short scan with a sidecar");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -622,7 +807,7 @@ fn scrub_verifies_every_frame_and_condemns_a_damaged_sealed_segment() {
         assert!(report.blocks > 2, "a real fold scrubs real blocks: {report:?}");
         assert_eq!(report.trailing_uncommitted, 0, "a synced fold has no residue");
     }
-    // one flipped byte inside a SEALED segment's frame region must condemn it
+    // one flipped byte inside a sealed segment's frame region must condemn it
     let seg0 = dir.join("seg-00000000.fold");
     let mut b = std::fs::read(&seg0).unwrap();
     let mid = 48 + (b.len() - 48) / 2;
@@ -661,6 +846,125 @@ fn a_segment_claiming_encryption_or_an_unknown_flag_refuses() {
     b[12..16].copy_from_slice(&(1u32 << 17).to_le_bytes());
     std::fs::write(&seg, &b).unwrap();
     assert!(Fold::open_read(&dir, FoldCfg::default()).is_err(), "unknown flags must refuse");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn directory_readers_refuse_a_dictionary_whose_name_does_not_bind_its_bytes() {
+    use turndb::fold::segment::SegHeader;
+
+    let dir = tmp("dictionary-name-identity");
+    {
+        let mut fold = Fold::open(&dir, FoldCfg::default()).unwrap();
+        fold.put(b"a block whose segment claims a dictionary").unwrap();
+        fold.sync().unwrap();
+    }
+    let dictionary = b"current dictionary bytes";
+    let digest: [u8; 32] = blake3::hash(dictionary).into();
+    let segment = dir.join("seg-00000000.fold");
+    std::fs::remove_file(dir.join("WRITER.lock")).unwrap();
+    let mut segment_bytes = std::fs::read(&segment).unwrap();
+    segment_bytes[..48].copy_from_slice(&SegHeader { seg: 0, flags: 0, dict_id: digest }.encode());
+    std::fs::write(&segment, &segment_bytes).unwrap();
+    let wrong = dir.join("zdict-wrong.zd");
+    std::fs::write(&wrong, dictionary).unwrap();
+    let owned_tmp = dir.join("seg-00000000.dir.tmp");
+    std::fs::write(&owned_tmp, b"owned crash evidence").unwrap();
+
+    let read_error = match Fold::open_read(&dir, FoldCfg::default()) {
+        Ok(_) => panic!("a mismatched dictionary filename must not satisfy its segment"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(read_error.contains("not 64 lowercase hexadecimal digits"), "{read_error}");
+    let write_error = match Fold::open(&dir, FoldCfg::default()) {
+        Ok(_) => panic!("reader and writer must reject the same dictionary namespace"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(write_error.contains("unreadable"), "{write_error}");
+    assert!(!dir.join("WRITER.lock").exists(), "dictionary refusal must precede lock creation");
+    assert_eq!(std::fs::read(&segment).unwrap(), segment_bytes);
+    assert_eq!(std::fs::read(&wrong).unwrap(), dictionary);
+    assert_eq!(std::fs::read(&owned_tmp).unwrap(), b"owned crash evidence");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_checksummed_unknown_block_header_refuses_writer_open_without_truncation() {
+    use turndb::fold::block::{self, BLOCK_HDR_LEN, BLOCK_XSUM_LEN};
+    use turndb::fold::segment::SEG_HDR_LEN;
+
+    let dir = tmp("unknown-checksummed-block");
+    {
+        let mut fold = Fold::open(&dir, FoldCfg::default()).unwrap();
+        fold.put(b"one complete current block").unwrap();
+        fold.sync().unwrap();
+    }
+    let segment = dir.join("seg-00000000.fold");
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let frame = SEG_HDR_LEN as usize;
+    let stored = u32::from_le_bytes(bytes[frame + 6..frame + 10].try_into().unwrap()) as usize;
+    bytes[frame + 1] = 0x7f; // unknown codec, but an otherwise complete deliberate frame
+    let checksum = frame + BLOCK_HDR_LEN + stored;
+    let sum = block::xsum(&bytes[frame..checksum]);
+    bytes[checksum..checksum + BLOCK_XSUM_LEN].copy_from_slice(&sum);
+    std::fs::write(&segment, &bytes).unwrap();
+    let neighbor = dir.join("unowned.tmp");
+    std::fs::write(&neighbor, b"adjacent evidence").unwrap();
+
+    let error = match Fold::open(&dir, FoldCfg::default()) {
+        Ok(_) => panic!("a checksumming unknown codec must refuse"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("checksumming fold frame"), "{error}");
+    assert_eq!(std::fs::read(&segment).unwrap(), bytes, "refusal must not truncate the segment");
+    assert_eq!(std::fs::read(&neighbor).unwrap(), b"adjacent evidence");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn writer_open_never_repairs_a_short_final_name_segment() {
+    use turndb::fold::segment::{SegHeader, MAGIC};
+
+    let dir = tmp("segment-birth-prefix");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("seg-00000000.fold");
+    let debris = dir.join("unidentified.tmp");
+    std::fs::write(&debris, b"unowned").unwrap();
+
+    for unknown in [Vec::new(), b"not-a-current-format-segment"[..12].to_vec()] {
+        std::fs::write(&path, &unknown).unwrap();
+        let err = match Fold::open(&dir, FoldCfg::default()) {
+            Ok(_) => panic!("an unidentified short segment must refuse"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("truncated current-format header"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), unknown, "refusal must not mutate unknown bytes");
+        assert_eq!(
+            std::fs::read(&debris).unwrap(),
+            b"unowned",
+            "identity refusal precedes debris cleanup"
+        );
+        assert!(!dir.join("WRITER.lock").exists(), "identity refusal must not create a lock file");
+    }
+
+    let header = SegHeader { seg: 0, flags: 0, dict_id: [0u8; 32] }.encode();
+    std::fs::write(&path, &header[..MAGIC.len()]).unwrap();
+    let err = match Fold::open(&dir, FoldCfg::default()) {
+        Ok(_) => panic!("even a current-magic prefix at the final name must refuse"),
+        Err(err) => format!("{err:#}"),
+    };
+    assert!(err.contains("truncated current-format header"), "{err}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        &header[..MAGIC.len()],
+        "a current prefix is not evidence authorizing in-place completion"
+    );
+    assert_eq!(
+        std::fs::read(&debris).unwrap(),
+        b"unowned",
+        "successful open must not treat an arbitrary .tmp neighbor as owned debris"
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }
 

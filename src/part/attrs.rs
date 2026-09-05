@@ -15,7 +15,7 @@
 use super::Part;
 use crate::part::idcol::{get_varint, put_varint};
 use crate::types::{AttrValue, Record};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
@@ -39,6 +39,75 @@ pub const RID_DENSE: u8 = 0;
 /// Ascending deltas as varints. Repeats (a duplicated key on one row) encode as a zero.
 pub const RID_DELTA: u8 = 1;
 
+/// Prove the row-layout stream is the one exact framing described by its offsets and column
+/// metadata. This is an open-time structural check: point reads may then select one row without
+/// leaving malformed neighboring rows latent.
+pub(crate) fn validate_layout(part: &Part, meta: &[(String, u8, usize, u8)]) -> Result<()> {
+    let layout = part.section_bytes("layout")?;
+    let offsets = part.nums("layout.off", 8)?;
+    let expected = part
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("attribute layout offset count overflows"))?;
+    if offsets.len() != expected {
+        bail!("attribute layout has {} offsets, expected {expected}", offsets.len());
+    }
+    if offsets.first().copied() != Some(0) {
+        bail!("attribute layout must begin at byte zero");
+    }
+    let column_rows = meta
+        .iter()
+        .enumerate()
+        .map(|(column, (_, _, occurrences, kind))| rids(part, column, *occurrences, *kind))
+        .collect::<Result<Vec<_>>>()?;
+    let mut occurrences = vec![0usize; meta.len()];
+    for row in 0..part.len() {
+        let start = usize::try_from(offsets[row])
+            .with_context(|| format!("row {row} layout offset exceeds this platform"))?;
+        let end = usize::try_from(offsets[row + 1])
+            .with_context(|| format!("row {row} layout end exceeds this platform"))?;
+        if start > end || end > layout.len() {
+            bail!("row {row} layout offsets [{start}, {end}) are outside the layout stream");
+        }
+        let mut at = start;
+        let count = usize::try_from(get_varint(&layout[..end], &mut at)?)
+            .context("attribute count exceeds this platform's address space")?;
+        for _ in 0..count {
+            let column = usize::try_from(get_varint(&layout[..end], &mut at)?)
+                .context("attribute column ordinal exceeds this platform's address space")?;
+            let seen = occurrences
+                .get_mut(column)
+                .ok_or_else(|| anyhow::anyhow!("row {row} names absent column {column}"))?;
+            if column_rows[column].get(*seen).copied().map(|rid| rid as usize) != Some(row) {
+                bail!(
+                    "row {row} layout occurrence {} for column {column} disagrees with its row ids",
+                    *seen
+                );
+            }
+            *seen = seen
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("attribute occurrence count overflows"))?;
+        }
+        if at != end {
+            bail!("row {row} layout has {} trailing bytes", end - at);
+        }
+    }
+    let final_offset = usize::try_from(*offsets.last().expect("one offset is required"))
+        .context("attribute layout final offset exceeds this platform")?;
+    if final_offset != layout.len() {
+        bail!(
+            "attribute layout final offset is {final_offset}, but stream has {} bytes",
+            layout.len()
+        );
+    }
+    for (column, (actual, (_, _, declared, _))) in occurrences.iter().zip(meta.iter()).enumerate() {
+        if actual != declared {
+            bail!("attribute column {column} has {actual} layout occurrences, declared {declared}");
+        }
+    }
+    Ok(())
+}
+
 pub struct BuiltCol {
     /// Empty when `kind == RID_DENSE`.
     pub rid: Vec<u8>,
@@ -59,6 +128,7 @@ pub struct BuiltCols {
 
 /// Build every column plus the per-row layout, from rows already in id order.
 pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
+    u32::try_from(rows.len()).context("attribute row count exceeds the u32 row-id domain")?;
     // Column ordinals are assigned in sorted (key, tag) order so the same input always yields the
     // same ordinals — insertion order would make the output depend on arrival order.
     let mut keys: BTreeMap<(String, u8), usize> = BTreeMap::new();
@@ -108,6 +178,8 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
                     .collect();
                 distinct.sort_unstable();
                 distinct.dedup();
+                u32::try_from(distinct.len())
+                    .context("string dictionary exceeds the u32 ordinal domain")?;
                 put_varint(&mut dict_bytes, distinct.len() as u64);
                 for s in &distinct {
                     put_varint(&mut dict_bytes, s.len() as u64);
@@ -166,6 +238,8 @@ pub fn build(rows: &[&Record]) -> Result<BuiltCols> {
                     .collect();
                 distinct.sort_unstable();
                 distinct.dedup();
+                u32::try_from(distinct.len())
+                    .context("binary dictionary exceeds the u32 ordinal domain")?;
                 put_varint(&mut dict_bytes, distinct.len() as u64);
                 for bytes in &distinct {
                     put_varint(&mut dict_bytes, bytes.len() as u64);
@@ -304,6 +378,14 @@ impl ZoneAcc {
         }
     }
 
+    pub fn encoded_len(&self) -> usize {
+        if !self.seen || self.poisoned {
+            1
+        } else {
+            17
+        }
+    }
+
     /// One entry: a presence byte, then 8-byte min and max when present.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         if !self.seen || self.poisoned {
@@ -343,8 +425,104 @@ pub fn encode_zones(zones: &[ZoneAcc]) -> Vec<u8> {
     out
 }
 
+pub fn try_encode_zones(zones: &[ZoneAcc]) -> Result<Vec<u8>> {
+    let mut count = zones.len() as u64;
+    let mut count_bytes = 1usize;
+    while count >= 0x80 {
+        count >>= 7;
+        count_bytes += 1;
+    }
+    let capacity = zones.iter().try_fold(count_bytes, |total, zone| {
+        total.checked_add(zone.encoded_len()).context("zone section length overflows")
+    })?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity).map_err(|error| anyhow::anyhow!(error))?;
+    put_varint(&mut out, zones.len() as u64);
+    for zone in zones {
+        zone.encode_into(&mut out);
+    }
+    Ok(out)
+}
+
+fn parse_zones(
+    bytes: &[u8],
+    meta: &[(String, u8, usize, u8)],
+) -> Result<Vec<Option<(AttrValue, AttrValue)>>> {
+    let mut at = 0usize;
+    let count = usize::try_from(get_varint(bytes, &mut at)?)
+        .context("zone entry count exceeds this platform's address space")?;
+    if count != meta.len() {
+        bail!("zone carries {count} entries for {} attribute columns", meta.len());
+    }
+    let mut zones = Vec::with_capacity(count);
+    for (column, (_, tag, _, _)) in meta.iter().enumerate() {
+        let flag =
+            *bytes.get(at).ok_or_else(|| anyhow::anyhow!("zone entry {column} is missing"))?;
+        at += 1;
+        match flag {
+            0 => zones.push(None),
+            1 => {
+                if !matches!(*tag, 1 | 2 | 3 | 4 | 6) {
+                    bail!("zone entry {column} declares bounds for unbounded type tag {tag}");
+                }
+                let end = at
+                    .checked_add(16)
+                    .ok_or_else(|| anyhow::anyhow!("zone entry {column} end overflows"))?;
+                if end > bytes.len() {
+                    bail!("zone entry {column} is truncated");
+                }
+                let lo = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+                let hi = u64::from_le_bytes(bytes[at + 8..end].try_into().unwrap());
+                at = end;
+                let bounds = match *tag {
+                    1 => {
+                        let (lo, hi) = (lo as i64, hi as i64);
+                        if lo > hi {
+                            bail!("zone entry {column} has inverted signed bounds");
+                        }
+                        (AttrValue::Int(lo), AttrValue::Int(hi))
+                    }
+                    2 => {
+                        let (lo, hi) = (f64::from_bits(lo), f64::from_bits(hi));
+                        if lo.is_nan() || hi.is_nan() || lo > hi {
+                            bail!("zone entry {column} has unusable float bounds");
+                        }
+                        (AttrValue::Float(lo), AttrValue::Float(hi))
+                    }
+                    3 => {
+                        if lo > 1 || hi > 1 || lo > hi {
+                            bail!("zone entry {column} has non-boolean or inverted bounds");
+                        }
+                        (AttrValue::Bool(lo == 1), AttrValue::Bool(hi == 1))
+                    }
+                    4 => {
+                        if lo > hi {
+                            bail!("zone entry {column} has inverted unsigned bounds");
+                        }
+                        (AttrValue::UInt(lo), AttrValue::UInt(hi))
+                    }
+                    6 => {
+                        let (lo, hi) = (lo as i64, hi as i64);
+                        if lo > hi {
+                            bail!("zone entry {column} has inverted timestamp bounds");
+                        }
+                        (AttrValue::TimestampNs(lo), AttrValue::TimestampNs(hi))
+                    }
+                    _ => unreachable!("bounded tags checked above"),
+                };
+                zones.push(Some(bounds));
+            }
+            other => bail!("zone entry {column} has unknown presence flag {other}"),
+        }
+    }
+    if at != bytes.len() {
+        bail!("zone has {} trailing bytes", bytes.len() - at);
+    }
+    Ok(zones)
+}
+
 /// Column `c`'s zone, as `(min, max)` in the column's own type. `None` when the section is absent
-/// (an older part), the ordinal is out of range, the column declared itself unprunable, or the
+/// (the advisory section is absent), the ordinal is out of range, the column declared itself unprunable, or the
 /// section is malformed — a zone map may only ever WIDEN what a reader scans, never wrongly
 /// narrow it, so every doubt resolves to "no pruning".
 pub fn read_zone(part: &Part, c: usize) -> Result<Option<(AttrValue, AttrValue)>> {
@@ -352,69 +530,97 @@ pub fn read_zone(part: &Part, c: usize) -> Result<Option<(AttrValue, AttrValue)>
         return Ok(None);
     }
     let meta = read_meta(part)?;
-    let Some((_, tag, _, _)) = meta.get(c) else {
+    if c >= meta.len() {
+        return Ok(None);
+    }
+    let Some(bytes) = part.verified_advisory_section("zone")? else { return Ok(None) };
+    let Some((minimum, maximum)) =
+        parse_zones(&bytes, &meta).ok().and_then(|zones| zones.get(c).cloned().flatten())
+    else {
         return Ok(None);
     };
-    let b = part.section_bytes("zone")?;
-    let mut at = 0usize;
-    let Ok(n) = get_varint(&b, &mut at) else {
-        return Ok(None);
-    };
-    if c as u64 >= n {
-        return Ok(None);
+
+    // A checksum proves the advisory bytes were read faithfully, not that their claim is true.
+    // Trust a bound for negative pruning only after proving that it contains every authoritative
+    // column value. This deliberately makes a forged-but-checksummed broad zone harmless and a
+    // narrow one unusable; advisory metadata may improve work, never change an answer.
+    let (_, tag, occurrences, _) = meta[c];
+    let values = part.section_bytes(&format!("col.val.{c}"))?;
+    for occurrence in 0..occurrences {
+        let value = value_at(tag, &values, occurrence, &[], &[])?;
+        let contains = match (&minimum, &maximum, &value) {
+            (AttrValue::Int(lo), AttrValue::Int(hi), AttrValue::Int(value)) => {
+                lo <= value && value <= hi
+            }
+            (AttrValue::Float(lo), AttrValue::Float(hi), AttrValue::Float(value)) => {
+                !value.is_nan() && lo <= value && value <= hi
+            }
+            (AttrValue::Bool(lo), AttrValue::Bool(hi), AttrValue::Bool(value)) => {
+                lo <= value && value <= hi
+            }
+            (AttrValue::UInt(lo), AttrValue::UInt(hi), AttrValue::UInt(value)) => {
+                lo <= value && value <= hi
+            }
+            (
+                AttrValue::TimestampNs(lo),
+                AttrValue::TimestampNs(hi),
+                AttrValue::TimestampNs(value),
+            ) => lo <= value && value <= hi,
+            _ => false,
+        };
+        if !contains {
+            return Ok(None);
+        }
     }
-    // walk entries to ordinal c — entries are 1 or 17 bytes, decided by their presence byte
-    for _ in 0..c {
-        let Some(&flag) = b.get(at) else { return Ok(None) };
-        at += if flag == 1 { 17 } else { 1 };
-    }
-    let Some(&flag) = b.get(at) else { return Ok(None) };
-    if flag != 1 {
-        return Ok(None);
-    }
-    if 16 > b.len().saturating_sub(at + 1) {
-        return Ok(None);
-    }
-    let lo = u64::from_le_bytes(b[at + 1..at + 9].try_into().unwrap());
-    let hi = u64::from_le_bytes(b[at + 9..at + 17].try_into().unwrap());
-    Ok(match tag {
-        1 => Some((AttrValue::Int(lo as i64), AttrValue::Int(hi as i64))),
-        2 => Some((AttrValue::Float(f64::from_bits(lo)), AttrValue::Float(f64::from_bits(hi)))),
-        3 => Some((AttrValue::Bool(lo != 0), AttrValue::Bool(hi != 0))),
-        4 => Some((AttrValue::UInt(lo), AttrValue::UInt(hi))),
-        6 => Some((AttrValue::TimestampNs(lo as i64), AttrValue::TimestampNs(hi as i64))),
-        _ => None,
-    })
+    Ok(Some((minimum, maximum)))
 }
 
 /// `(key, tag, occurrences, rid_kind)` per column, in ordinal order.
 ///
-/// This — like every reader below — parses section bytes that carry NO verified checksum on the
-/// read path (that is `verify_sections`' deliberate territory). Corrupt bytes must surface as
-/// errors, never as panics or wild allocations: every slice is bounds-checked first, and every
+/// This — like every reader below — receives section bytes only after `Part::sect` verifies their
+/// stored checksum. Structural corruption must still surface as errors, never as panics or wild
+/// allocations: every slice is bounds-checked first, and every
 /// count is capped by the bytes that would have to carry it before it sizes an allocation.
 pub fn read_meta(part: &Part) -> Result<Vec<(String, u8, usize, u8)>> {
     let m = part.section_bytes("colmeta")?;
     let mut at = 0usize;
-    let n = get_varint(&m, &mut at)? as usize;
+    let n = usize::try_from(get_varint(&m, &mut at)?)
+        .context("attribute-column count exceeds this platform's address space")?;
     let mut out = Vec::with_capacity(n.min(m.len()));
-    for _ in 0..n {
-        let kl = get_varint(&m, &mut at)? as usize;
+    let mut previous: Option<(Vec<u8>, u8)> = None;
+    for column in 0..n {
+        let kl = usize::try_from(get_varint(&m, &mut at)?)
+            .context("attribute name length exceeds this platform's address space")?;
         // `kl >= len - at`, never `at + kl + 1 > len`: the sum can overflow, the subtraction cannot.
-        if kl >= m.len() - at {
+        if kl == 0 || kl >= m.len() - at {
             bail!("colmeta entry runs past the section");
         }
-        let key = String::from_utf8(m[at..at + kl].to_vec())?;
+        let key_bytes = m[at..at + kl].to_vec();
+        let key = String::from_utf8(key_bytes.clone())?;
         at += kl;
         let tag = m[at];
         at += 1;
-        let occ = get_varint(&m, &mut at)? as usize;
+        if tag > 7 {
+            bail!("attribute column {column} carries unknown type tag {tag}");
+        }
+        if previous.as_ref().is_some_and(|prior| prior >= &(key_bytes.clone(), tag)) {
+            bail!("attribute columns are duplicated or out of canonical order");
+        }
+        previous = Some((key_bytes, tag));
+        let occ = usize::try_from(get_varint(&m, &mut at)?)
+            .context("attribute occurrence count exceeds this platform's address space")?;
+        if occ == 0 {
+            bail!("attribute column {column} has no occurrences");
+        }
         if at >= m.len() {
             bail!("colmeta entry is truncated before its rid kind");
         }
         let kind = m[at];
         at += 1;
         out.push((key, tag, occ, kind));
+    }
+    if at != m.len() {
+        bail!("colmeta has {} trailing bytes", m.len() - at);
     }
     Ok(out)
 }
@@ -430,15 +636,24 @@ pub fn read_dict(part: &Part, c: usize) -> Result<std::sync::Arc<Vec<String>>> {
     }
     let b = part.section_bytes(&name)?;
     let mut at = 0usize;
-    let n = get_varint(&b, &mut at)? as usize;
+    let n = usize::try_from(get_varint(&b, &mut at)?)
+        .context("string dictionary count exceeds this platform's address space")?;
     let mut out = Vec::with_capacity(n.min(b.len()));
-    for _ in 0..n {
-        let l = get_varint(&b, &mut at)? as usize;
+    for entry in 0..n {
+        let l = usize::try_from(get_varint(&b, &mut at)?)
+            .context("string dictionary entry length exceeds this platform")?;
         if l > b.len() - at {
             bail!("column dictionary entry runs past the section");
         }
-        out.push(String::from_utf8(b[at..at + l].to_vec())?);
+        let value = String::from_utf8(b[at..at + l].to_vec())?;
+        if out.last().is_some_and(|previous| previous >= &value) {
+            bail!("string dictionary entry {entry} is duplicated or out of order");
+        }
+        out.push(value);
         at += l;
+    }
+    if at != b.len() {
+        bail!("string dictionary has {} trailing bytes", b.len() - at);
     }
     Ok(part.dict_put(c, out))
 }
@@ -454,15 +669,24 @@ pub fn read_binary_dict(part: &Part, c: usize) -> Result<std::sync::Arc<Vec<Vec<
     }
     let b = part.section_bytes(&name)?;
     let mut at = 0usize;
-    let n = get_varint(&b, &mut at)? as usize;
+    let n = usize::try_from(get_varint(&b, &mut at)?)
+        .context("binary dictionary count exceeds this platform's address space")?;
     let mut out = Vec::with_capacity(n.min(b.len()));
-    for _ in 0..n {
-        let l = get_varint(&b, &mut at)? as usize;
+    for entry in 0..n {
+        let l = usize::try_from(get_varint(&b, &mut at)?)
+            .context("binary dictionary entry length exceeds this platform")?;
         if l > b.len() - at {
             bail!("binary column dictionary entry runs past the section");
         }
-        out.push(b[at..at + l].to_vec());
+        let value = b[at..at + l].to_vec();
+        if out.last().is_some_and(|previous| previous >= &value) {
+            bail!("binary dictionary entry {entry} is duplicated or out of order");
+        }
+        out.push(value);
         at += l;
+    }
+    if at != b.len() {
+        bail!("binary dictionary has {} trailing bytes", b.len() - at);
     }
     Ok(part.binary_dict_put(c, out))
 }
@@ -493,7 +717,13 @@ pub fn rids(part: &Part, c: usize, occ: usize, kind: u8) -> Result<std::sync::Ar
                     .ok()
                     .and_then(|d| cur.checked_add(d))
                     .ok_or_else(|| anyhow::anyhow!("rid delta overflows the u32 row space"))?;
+                if cur as usize >= part.len() {
+                    bail!("attribute row id {cur} is outside a part of {} rows", part.len());
+                }
                 out.push(cur);
+            }
+            if at != b.len() {
+                bail!("attribute row ids have {} trailing bytes", b.len() - at);
             }
             out
         }
@@ -527,7 +757,11 @@ fn value_at(
         2 => AttrValue::Float(f64::from_bits(u64::from_le_bytes(
             val[at..at + 8].try_into().unwrap(),
         ))),
-        3 => AttrValue::Bool(val[at] != 0),
+        3 => match val[at] {
+            0 => AttrValue::Bool(false),
+            1 => AttrValue::Bool(true),
+            other => bail!("invalid boolean column byte {other}"),
+        },
         4 => AttrValue::UInt(u64::from_le_bytes(val[at..at + 8].try_into().unwrap())),
         5 => {
             let ord = u32::from_le_bytes(val[at..at + 4].try_into().unwrap()) as usize;
@@ -596,10 +830,14 @@ pub fn read_rows_selected(
         }
         let mut at = usize::try_from(offs[r])
             .map_err(|_| anyhow::anyhow!("row {r} layout offset exceeds this platform"))?;
-        let n = get_varint(&layout, &mut at)? as usize;
+        let end = usize::try_from(offs[r + 1])
+            .map_err(|_| anyhow::anyhow!("row {r} layout end exceeds this platform"))?;
+        let n = usize::try_from(get_varint(&layout[..end], &mut at)?)
+            .context("attribute count exceeds this platform's address space")?;
         let mut columns = Vec::with_capacity(n.min(layout.len()));
         for _ in 0..n {
-            let c = get_varint(&layout, &mut at)? as usize;
+            let c = usize::try_from(get_varint(&layout[..end], &mut at)?)
+                .context("attribute column ordinal exceeds this platform's address space")?;
             if c >= meta.len() {
                 bail!("layout names column {c} which does not exist");
             }
@@ -689,11 +927,15 @@ fn read_row_filtered(
     }
     let layout = part.section_bytes("layout")?;
     let offs = part.nums("layout.off", 8)?;
-    if r + 1 >= offs.len() {
+    if r >= offs.len().saturating_sub(1) {
         bail!("row {r} out of range for the layout");
     }
-    let mut at = offs[r] as usize;
-    let n = get_varint(&layout, &mut at)? as usize;
+    let mut at = usize::try_from(offs[r])
+        .map_err(|_| anyhow::anyhow!("row {r} layout offset exceeds this platform"))?;
+    let end = usize::try_from(offs[r + 1])
+        .map_err(|_| anyhow::anyhow!("row {r} layout end exceeds this platform"))?;
+    let n = usize::try_from(get_varint(&layout[..end], &mut at)?)
+        .context("attribute count exceeds this platform's address space")?;
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -704,7 +946,8 @@ fn read_row_filtered(
     let mut cursor: std::collections::HashMap<usize, (usize, usize)> =
         std::collections::HashMap::new();
     for _ in 0..n {
-        let c = get_varint(&layout, &mut at)? as usize;
+        let c = usize::try_from(get_varint(&layout[..end], &mut at)?)
+            .context("attribute column ordinal exceeds this platform's address space")?;
         let (key, tag, occ, kind) = meta
             .get(c)
             .ok_or_else(|| anyhow::anyhow!("layout names column {c} which does not exist"))?;
@@ -728,8 +971,15 @@ fn read_row_filtered(
         let (first, used) = entry;
         let dict = if *tag == 0 { read_dict(part, c)? } else { Default::default() };
         let binary_dict = if *tag == 5 { read_binary_dict(part, c)? } else { Default::default() };
+        let occurrence = first
+            .checked_add(used)
+            .ok_or_else(|| anyhow::anyhow!("row {r} column {c} occurrence overflows"))?;
+        let column_rows = rids(part, c, *occ, *kind)?;
+        if column_rows.get(occurrence).copied().map(|row| row as usize) != Some(r) {
+            bail!("row {r} names more occurrences of column {c} than its row ids contain");
+        }
         let val = part.section_bytes(&format!("col.val.{c}"))?;
-        out.push((key.clone(), value_at(*tag, &val, first + used, &dict, &binary_dict)?));
+        out.push((key.clone(), value_at(*tag, &val, occurrence, &dict, &binary_dict)?));
         cursor.insert(c, (first, used + 1));
     }
     Ok(out)

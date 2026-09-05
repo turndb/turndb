@@ -373,7 +373,7 @@ async function main() {
       checked++;
       try {
         assert.deepEqual(pWalk, nWalk);
-        assert.equal(pWalk.length, RECORDS, 'the traversal must cover every live record');
+        assert.equal(pWalk.length, RECORDS, 'the traversal must cover every present record');
         assert.equal(new Set(pWalk).size, pWalk.length, 'no id twice');
         assert.ok(!pWalk.includes('m/alice/0007'), 'the tombstoned id must not reappear');
         console.log(`  ok   paged traversal agrees across bindings (${pWalk.length} rows)`);

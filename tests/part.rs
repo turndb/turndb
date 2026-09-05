@@ -8,7 +8,20 @@ use turndb::part::{self, Part};
 use turndb::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
 
 fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
-    vec![Content::new(BODY_CONTENT, ops)]
+    let identity = match ops.as_slice() {
+        [BodyOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
+        ops if ops.iter().all(|op| matches!(op, BodyOp::Lit(_))) => {
+            let mut bytes = Vec::new();
+            for op in ops {
+                if let BodyOp::Lit(literal) = op {
+                    bytes.extend_from_slice(literal);
+                }
+            }
+            turndb::ContentHash::of(&bytes)
+        }
+        _ => panic!("mixed test content must state its reconstructed bytes"),
+    };
+    vec![Content::identified(BODY_CONTENT, ops, identity)]
 }
 
 fn tmp(tag: &str) -> PathBuf {
@@ -53,13 +66,26 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         Record {
             // interleaving that column storage alone cannot reproduce: a, b, a
             id: "rec:interleaved".into(),
-            contents: body_content(vec![
-                BodyOp::Lit(b"[".to_vec()),
-                BodyOp::Piece { hash: p2.hash, len: p2.loc.raw },
-                BodyOp::Lit(b",".to_vec()),
-                BodyOp::Piece { hash: p3.hash, len: p3.loc.raw },
-                BodyOp::Lit(b"]".to_vec()),
-            ]),
+            contents: vec![Content::identified(
+                BODY_CONTENT,
+                vec![
+                    BodyOp::Lit(b"[".to_vec()),
+                    BodyOp::Piece { hash: p2.hash, len: p2.loc.raw },
+                    BodyOp::Lit(b",".to_vec()),
+                    BodyOp::Piece { hash: p3.hash, len: p3.loc.raw },
+                    BodyOp::Lit(b"]".to_vec()),
+                ],
+                turndb::ContentHash::of(
+                    &[
+                        b"[".as_slice(),
+                        b"a second distinct piece of content",
+                        b",",
+                        &"long body ".repeat(500).into_bytes(),
+                        b"]",
+                    ]
+                    .concat(),
+                ),
+            )],
             attrs: vec![
                 ("a".into(), AttrValue::Str("one".into())),
                 ("b".into(), AttrValue::Bool(true)),
@@ -92,6 +118,10 @@ fn records_round_trip_byte_exact() {
 
     let p = Part::open(&path).unwrap();
     assert_eq!(p.len(), recs.len());
+    assert!(
+        turndb::part::attrs::read_row(&p, usize::MAX).is_err(),
+        "a hostile public row index must refuse instead of overflowing"
+    );
 
     // ids come back sorted, and every one is findable
     let ids = p.ids().unwrap();
@@ -176,21 +206,35 @@ fn scales_to_many_records_with_shared_content() {
         })
         .collect();
     let recs: Vec<Record> = (0..2000)
-        .map(|i| Record {
-            id: format!("genai:trace{:05}:span{:03}#input", i / 7, i % 7),
-            contents: body_content(
-                (0..(i % 9 + 1))
-                    .map(|k| {
-                        let p = &pieces[(i + k) % pieces.len()];
-                        BodyOp::Piece { hash: p.hash, len: p.loc.raw }
-                    })
-                    .collect(),
-            ),
-            attrs: vec![
-                ("model".into(), AttrValue::Str(format!("claude-{}", i % 3))),
-                ("tokens".into(), AttrValue::Int((i * 13 % 997) as i64)),
-                ("ok".into(), AttrValue::Bool(i % 2 == 0)),
-            ],
+        .map(|i| {
+            let indexes: Vec<_> = (0..(i % 9 + 1)).map(|k| (i + k) % pieces.len()).collect();
+            let ops = indexes
+                .iter()
+                .map(|&index| {
+                    let p = &pieces[index];
+                    BodyOp::Piece { hash: p.hash, len: p.loc.raw }
+                })
+                .collect();
+            let bytes = indexes
+                .iter()
+                .flat_map(|index| {
+                    format!("shared message body number {index}, with padding to give it size")
+                        .into_bytes()
+                })
+                .collect::<Vec<_>>();
+            Record {
+                id: format!("genai:trace{:05}:span{:03}#input", i / 7, i % 7),
+                contents: vec![Content::identified(
+                    BODY_CONTENT,
+                    ops,
+                    turndb::ContentHash::of(&bytes),
+                )],
+                attrs: vec![
+                    ("model".into(), AttrValue::Str(format!("claude-{}", i % 3))),
+                    ("tokens".into(), AttrValue::Int((i * 13 % 997) as i64)),
+                    ("ok".into(), AttrValue::Bool(i % 2 == 0)),
+                ],
+            }
         })
         .collect();
 
@@ -402,22 +446,81 @@ fn set_version(path: &std::path::Path, version: u8) {
     std::fs::write(path, &b).unwrap();
 }
 
+fn section_offset(bytes: &[u8], wanted: &str) -> usize {
+    fn varint(bytes: &[u8], at: &mut usize) -> u64 {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*at];
+            *at += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    let footer = bytes.len() - part::FOOTER_LEN as usize;
+    let toc_offset =
+        u64::from_le_bytes(bytes[footer + 8..footer + 16].try_into().unwrap()) as usize;
+    let toc_stored =
+        u32::from_le_bytes(bytes[footer + 16..footer + 20].try_into().unwrap()) as usize;
+    let toc_raw = u32::from_le_bytes(bytes[footer + 20..footer + 24].try_into().unwrap()) as usize;
+    let toc = match bytes[footer + 44] {
+        0 => bytes[toc_offset..toc_offset + toc_stored].to_vec(),
+        1 => zstd::bulk::decompress(&bytes[toc_offset..toc_offset + toc_stored], toc_raw).unwrap(),
+        codec => panic!("unexpected TOC codec {codec}"),
+    };
+    let mut at = 0usize;
+    let count = varint(&toc, &mut at);
+    for _ in 0..count {
+        let name_len = varint(&toc, &mut at) as usize;
+        let name = std::str::from_utf8(&toc[at..at + name_len]).unwrap();
+        at += name_len;
+        let offset = varint(&toc, &mut at) as usize;
+        let _stored = varint(&toc, &mut at);
+        let _raw = varint(&toc, &mut at);
+        at += 1; // codec
+        at += 4; // stored-byte checksum
+        if name == wanted {
+            return offset;
+        }
+    }
+    panic!("part has no section {wanted}");
+}
+
 #[test]
 fn a_part_from_a_newer_writer_is_refused_not_misparsed() {
     let d = tmp("version");
     let (path, _fold) = a_part(&d);
     assert!(Part::open(&path).is_ok());
 
-    set_version(&path, part::PART_VERSION + 1);
+    set_version(&path, part::PART_DRAFT_EPOCH + 1);
     let e = match Part::open(&path) {
         Err(e) => e.to_string(),
         Ok(_) => panic!("a newer format version must not open"),
     };
-    assert!(e.contains("format version"), "expected a version refusal, got: {e}");
+    assert!(e.contains("draft epoch"), "expected an epoch refusal, got: {e}");
 
     // and the current version still opens, so the check is not simply rejecting everything
-    set_version(&path, part::PART_VERSION);
+    set_version(&path, part::PART_DRAFT_EPOCH);
     assert!(Part::open(&path).is_ok());
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_part_from_the_discarded_format_is_refused() {
+    let d = tmp("discarded-magic");
+    let (path, _fold) = a_part(&d);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let footer = bytes.len() - 56;
+    bytes[footer..footer + 8].copy_from_slice(b"TURNPART");
+    let digest = blake3::hash(&bytes[footer..bytes.len() - 4]);
+    let end = bytes.len();
+    bytes[end - 4..].copy_from_slice(&digest.as_bytes()[..4]);
+    std::fs::write(&path, bytes).unwrap();
+    assert!(Part::open(&path).is_err(), "the discarded part magic must not open");
     std::fs::remove_dir_all(&d).ok();
 }
 
@@ -430,11 +533,12 @@ fn every_section_carries_a_checksum_that_catches_a_flipped_bit() {
     assert!(n >= 8, "a part should have checksummed sections; got {n}");
     drop(p);
 
-    // Flip one byte inside the id section and confirm it is caught. The footer still verifies, which
-    // is the point: before this, a corrupt section produced wrong ANSWERS, not an error.
+    // Flip one stored byte inside an advisory section not needed to establish the part's
+    // structural schema.
+    // The footer still verifies; explicit verification must detect the payload drift.
     let mut b = std::fs::read(&path).unwrap();
-    // the first section starts at offset 0 of the file
-    b[16] ^= 0xFF;
+    let at = section_offset(&b, "zone");
+    b[at] ^= 0xFF;
     std::fs::write(&path, &b).unwrap();
 
     let p = Part::open(&path).unwrap();
@@ -444,30 +548,47 @@ fn every_section_carries_a_checksum_that_catches_a_flipped_bit() {
 }
 
 #[test]
-fn verification_is_opt_in_and_reads_do_not_pay_for_it() {
-    // The FIELD is a format decision, taken now. WHEN to verify is runtime policy, deliberately left
-    // to the caller — content is already verified per piece on every read, and hashing whole sections
-    // on the read path would be a tax proportional to the part rather than to the query.
-    let d = tmp("optin");
+fn a_damaged_zone_widens_to_no_pruning() {
+    let d = tmp("zone-xsum");
     let (path, fold) = a_part(&d);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = section_offset(&bytes, "zone");
+    bytes[at] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+
+    let part = Part::open(&path).unwrap();
+    assert_eq!(
+        part.zone(0).unwrap(),
+        None,
+        "unverified advisory bytes must never become negative-pruning evidence"
+    );
+    drop(fold);
+    std::fs::remove_dir_all(d).ok();
+}
+
+#[test]
+fn an_uncached_section_changed_after_open_is_never_silently_consumed() {
+    // An already-open read view may outlive container retention and later encounter storage that
+    // free-space punch deallocated. Every uncached section read must therefore prove its stored
+    // checksum instead of decoding zeros or changed bytes into a different logical answer.
+    let d = tmp("read-xsum");
+    let (path, fold) = a_part(&d);
+    let p = Part::open(&path).unwrap();
     let mut b = std::fs::read(&path).unwrap();
-    b[16] ^= 0xFF;
+    let at = section_offset(&b, "ids");
+    b[at] ^= 0xFF;
     std::fs::write(&path, &b).unwrap();
 
-    let p = Part::open(&path).unwrap();
-    assert!(p.verify_sections().is_err(), "the checker must see the damage");
-    // ...while an ordinary read does not run it. Whether this particular read errors or returns junk
-    // depends on where the bit landed; what matters is that no checksum work happened.
-    let _ = p.record(0);
+    assert!(p.ids().is_err(), "an ordinary read must detect changed section bytes");
     drop(fold);
     std::fs::remove_dir_all(&d).ok();
 }
 
 #[test]
 fn a_part_reads_identically_out_of_an_embedded_extent() {
-    // The pack concept, proven at the part level: a part is footer-addressed, so it can live at an
-    // offset inside a bigger file and be read through a bounded extent with no code knowing the
-    // difference. Byte-identical answers, and no read may wander outside the extent.
+    // A part is footer-addressed, so it can live at an offset inside a container and be read through
+    // a bounded extent with no code knowing the difference. Answers are byte-identical, and no read
+    // may wander outside the extent.
     let d = tmp("embedded");
     std::fs::create_dir_all(&d).unwrap();
     let mut fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
@@ -477,7 +598,7 @@ fn a_part_reads_identically_out_of_an_embedded_extent() {
     fold.sync().unwrap();
     let part_bytes = std::fs::read(&path).unwrap();
 
-    // A "pack": garbage, the part, more garbage. Only the extent bounds say where the part is.
+    // Surround the part with unrelated member bytes. Only the extent bounds say where it is.
     let packish = d.join("packish.bin");
     let prefix = b"NOT-A-PART-PREFIX-0123456789".repeat(7);
     let mut whole = prefix.clone();
@@ -589,6 +710,85 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
         "spools must be cleaned up"
     );
     drop(fold);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn streaming_builder_emits_only_self_openable_current_parts() {
+    let d = tmp("stream-builder-boundary");
+    std::fs::create_dir_all(&d).unwrap();
+
+    let invalid = d.join("invalid.part");
+    let error = turndb::part::builder::StreamBuilder::new(
+        &invalid,
+        3,
+        vec![(turndb::fold::Loc { block_id: 0, in_off: 0, raw: 0 }, turndb::PieceHash::of(b""))],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .err()
+    .expect("a zero-length physical dictionary entry must be refused");
+    assert!(error.to_string().contains("zero-length"));
+    assert!(!invalid.exists(), "argument refusal must precede artifact creation");
+
+    let over_budget = d.join("over-budget.part");
+    let limits =
+        turndb::read_limits::ReadLimits { max_decoded_frame_bytes: 16, ..Default::default() };
+    let error = turndb::part::builder::StreamBuilder::new_with_limits(
+        &over_budget,
+        3,
+        vec![(turndb::fold::Loc { block_id: 0, in_off: 0, raw: 1 }, turndb::PieceHash::of(b"x"))],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        limits,
+    )
+    .err()
+    .expect("derived piece-hash expansion must be admitted before allocation");
+    assert!(error.to_string().contains("pdict.hash"), "unexpected refusal: {error:#}");
+    assert!(!over_budget.exists(), "derived-section refusal must precede artifact creation");
+
+    let valid = d.join("valid.part");
+    let mut builder = turndb::part::builder::StreamBuilder::new(
+        &valid,
+        3,
+        Vec::new(),
+        vec![BODY_CONTENT.into()],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(builder.push(&[0xff], false, &[], &[]).is_err());
+    assert!(builder
+        .push(b"record", false, &[Content::new(BODY_CONTENT, Vec::new())], &[])
+        .is_err());
+    let missing = turndb::PieceHash::of(b"x");
+    assert!(builder
+        .push(
+            b"record",
+            false,
+            &[Content::identified(
+                BODY_CONTENT,
+                vec![BodyOp::Piece { hash: missing, len: 1 }],
+                turndb::ContentHash(missing.0),
+            )],
+            &[],
+        )
+        .is_err());
+    builder
+        .push(
+            b"record",
+            false,
+            &[Content::identified(BODY_CONTENT, Vec::new(), turndb::ContentHash::of(b""))],
+            &[],
+        )
+        .unwrap();
+    builder.finish(1, 1).unwrap();
+    let opened = Part::open(&valid).unwrap();
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened.record(0).unwrap().id, "record");
+
     std::fs::remove_dir_all(&d).ok();
 }
 

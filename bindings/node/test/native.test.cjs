@@ -8,8 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const {
   capabilities, NativeSnapshot, NativeSqlQuery, NativeStore, recoverManifest,
-  retainedCommits, singleFileKind,
-  restoreBackup, TurnDbError,
+  retainedCommits, restoreBackup, TurnDbError,
 } = require('..');
 
 function temporaryStore(t) {
@@ -19,19 +18,20 @@ function temporaryStore(t) {
 }
 
 test('reports the native capability profile without a portable fallback', () => {
+  const atomicArtifactInstallation = ['linux', 'darwin'].includes(process.platform);
+  const operations = [
+    'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+    'explainScan', 'schema', 'readContent', 'snapshot', 'querySql',
+  ];
+  if (atomicArtifactInstallation) operations.push('backup');
+  operations.push('verify', 'spaceUsage', 'compactBounded', 'refold', 'erase', 'close');
   assert.deepEqual(capabilities(), {
-    contractVersion: 1,
+    contractVersion: 2,
     profile: 'native',
-    operations: [
-      'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
-      'explainScan', 'schema', 'readContent', 'snapshot', 'querySql', 'seal', 'verify', 'spaceUsage',
-      'compactBounded', 'refold', 'erase', 'close',
-    ],
-    partFormat: { write: 2, readMax: 2 },
-    reclamation: process.platform === 'win32' ? 'refold_only' : 'punch_or_refold',
+    operations,
+    draftFormatEpoch: 1,
+    reclamation: ['linux', 'win32'].includes(process.platform) ? 'content_punch_or_refold' : 'refold_only',
     cancellation: { scan: true, lifecycle: true },
-    partFormatWrite: 2,
-    partFormatReadMax: 2,
     writerExclusion: 'os_enforced',
     positionedIo: true,
     threads: true,
@@ -46,8 +46,8 @@ test('reports the native capability profile without a portable fallback', () => 
     readAdmissionLimits: true,
     objectCountAdmission: true,
     storeSpaceUsage: true,
-    allocatedSpaceUsage: process.platform !== 'win32',
-    formatMigration: true,
+    inPlaceDeallocation: ['linux', 'win32'].includes(process.platform),
+    allocatedSpaceUsage: false,
     operationMetrics: true,
     partDistribution: true,
     contentLiveness: true,
@@ -67,8 +67,8 @@ test('reports the native capability profile without a portable fallback', () => 
     maxFoldBlocksDefault: 1000000n,
     immutableSnapshots: true,
     lifecycleOperations: true,
-    backupRestore: true,
-    recoveryControls: true,
+    backupRestore: atomicArtifactInstallation,
+    manifestPromotionControls: true,
     healthSnapshots: true,
     schemaDiscovery: true,
     scanExplanation: true,
@@ -856,8 +856,8 @@ test('backs up an actor-ordered cut and safely restores a writable store', async
     (error) => error instanceof TurnDbError && error.code === 'CANCELLED',
   );
   const backup = await store.backup(artifact);
-  assert(backup.files >= 3n);
-  // Member payload bytes: the sealed file adds its superblocks, alignment, and directory.
+  assert(backup.members >= 3n);
+  // Member payload bytes: the backup file adds its superblocks, alignment, and directory.
   assert(backup.bytes > 0n && backup.bytes <= BigInt(fs.statSync(artifact).size));
   assert(backup.commit > 0n);
 
@@ -918,19 +918,24 @@ test('recovers only a fully validated retained manifest under writer exclusion',
   await store.write([{
     kind: 'put',
     id: 'survives',
-    contents: [{ name: 'payload', bytes: Buffer.from('content validated during recovery') }],
+    contents: [{ name: 'payload', bytes: Buffer.from('content validated during WAL replay') }],
   }]);
   await store.flush();
   await store.close();
 
-  // Member surgery on the single file: the live slot is the one with the higher seq (u64 LE at
-  // slot+8); its directory begins at dir_off (u64 LE at slot+16); the MANIFEST member is
-  // restaged immediately before the directory each commit, so its tail sits at dir_off.
+  // Member surgery on the single file: each manifest-revision publication writes current
+  // the retained twin followed by current MANIFEST. Corrupt the final canonical-JSON occurrence so
+  // the current member fails while the preceding retained copy remains promotion authority. This
+  // deliberately does not assume the member is adjacent to the container directory.
   const damageManifest = () => {
     const bytes = Buffer.from(fs.readFileSync(dir));
-    const slot = bytes.readBigUInt64LE(4096 + 8) > bytes.readBigUInt64LE(8) ? 4096 : 0;
-    const dirOff = Number(bytes.readBigUInt64LE(slot + 16));
-    bytes[dirOff - 2] ^= 0xff;
+    const signature = Buffer.from('{"draft_epoch":1,"parts":');
+    const offsets = [];
+    for (let at = bytes.indexOf(signature); at !== -1; at = bytes.indexOf(signature, at + 1)) {
+      offsets.push(at);
+    }
+    assert(offsets.length >= 2, 'current and retained manifest payloads must both be present');
+    bytes[offsets[offsets.length - 1] + signature.length] ^= 0xff;
     fs.writeFileSync(dir, bytes);
     return bytes;
   };
@@ -1078,7 +1083,7 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.deepEqual((await store.scan()).rows.map(({ id }) => id), ['r0', 'r2']);
   assert.equal(await store.readContent('r1', 'payload'), null);
 
-  const punched = await store.punch();
+  const punched = await store.contentPunch();
   assert.equal(typeof punched.blocksExamined, 'bigint');
   assert.equal(typeof punched.blocksPunched, 'bigint');
   const refoldPreflight = await store.estimateRefoldSpace();
@@ -1102,7 +1107,7 @@ test('runs compaction verification and physical erasure through the actor', asyn
   assert.equal(events.gap, false);
   assert.equal(events.droppedEvents, 0n);
   assert.equal(events.events[0].sequence, 1n);
-  assert.equal(events.events[0].operation, 'open_recovery');
+  assert.equal(events.events[0].operation, 'open_wal_replay');
   assert.equal(events.events[0].outcome, 'succeeded');
   assert.equal(events.events[0].errorClass, undefined);
   assert.equal(events.latestSequence, events.events.at(-1).sequence);
@@ -1214,7 +1219,7 @@ test('lifecycle deadlines and aborts refuse at safe pre-mutation checkpoints', a
   await cancelled(store.flush({ timeoutMs: 0 }));
   await cancelled(store.compact(true, { timeoutMs: 0 }));
   await cancelled(store.verify({ timeoutMs: 0 }));
-  await cancelled(store.punch({ timeoutMs: 0 }));
+  await cancelled(store.contentPunch({ timeoutMs: 0 }));
   await cancelled(store.refold({ timeoutMs: 0 }));
   await cancelled(store.erase(['still-present'], { timeoutMs: 0 }));
 
@@ -1242,7 +1247,7 @@ test('classifies verified persisted-byte damage as corruption', async (t) => {
 
   // The part member's aligned start, anchored by its footer magic inside the store file.
   const image = fs.readFileSync(dir);
-  const footer = image.indexOf(Buffer.from('TURNPART'));
+  const footer = image.indexOf(Buffer.from('TDBPRT01'));
   assert(footer > 0, 'the flushed part must exist in the store file');
   const partStart = Math.floor(footer / 4096) * 4096;
   const fd = fs.openSync(dir, 'r+');
@@ -1299,32 +1304,11 @@ test('reports cheap health across staging and publication', async (t) => {
   assert.equal(published.foldCompressionLevel, 19);
   assert.equal(typeof published.partCacheBudget, 'bigint');
 
-  const migration = await store.formatMigrationStatus();
-  assert.deepEqual(migration, {
-    targetPartVersion: 2,
-    liveParts: 1n,
-    currentParts: 1n,
-    legacyParts: 0n,
-    legacyRows: 0n,
-    legacyBytes: 0n,
-    retainedLegacyParts: 0n,
-    retainedLegacyRows: 0n,
-    retainedLegacyBytes: 0n,
-  });
-  const migrationPreflight = await store.estimateFormatMigrationSpace();
-  assert.equal(migrationPreflight.flushed, false);
-  assert.deepEqual(migrationPreflight.status, migration);
-  assert.equal(migrationPreflight.estimate, undefined);
-  const migrationStep = await store.migrateFormatStep();
-  assert.equal(migrationStep.flushed, false);
-  assert.equal(migrationStep.step, undefined);
   const metrics = await store.metrics();
-  assert.equal(metrics.openRecovery.attempts, 1n);
-  assert.equal(metrics.openRecovery.succeeded, 1n);
-  assert.equal(metrics.formatMigration.attempts, 1n);
-  assert.equal(metrics.formatMigration.succeeded, 1n);
-  assert(metrics.flush.attempts >= 3n);
-  for (const operation of [metrics.openRecovery, metrics.sync, metrics.flush, metrics.formatMigration]) {
+  assert.equal(metrics.openWalReplay.attempts, 1n);
+  assert.equal(metrics.openWalReplay.succeeded, 1n);
+  assert.equal(metrics.flush.attempts, 1n, 'the one explicit flush is the only flush operation');
+  for (const operation of [metrics.openWalReplay, metrics.sync, metrics.flush]) {
     assert.equal(
       operation.attempts,
       operation.succeeded + operation.failed + operation.cancelled,
@@ -1350,15 +1334,15 @@ test('reports cheap health across staging and publication', async (t) => {
   assert.equal(liveness.reclaimableBlocks.blocks, 0n);
 
   const space = await store.spaceUsage();
-  assert(space.live.files > 0n);
-  assert(space.retainedOnly.files > 0n);
+  assert(space.live.members > 0n);
+  assert(space.retainedOnly.members > 0n);
   // The unclassified bucket answers for bytes no reachable name claims — the free list. One
   // commit frees nothing (there is no predecessor to supersede), so after this test's single
   // flush it is exactly empty; churn is what fills it, and the store suite proves that side.
   assert.equal(space.unclassified.logicalBytes, 0n);
   assert.equal(
-    space.total.files,
-    space.live.files + space.retainedOnly.files + space.unclassified.files,
+    space.total.members,
+    space.live.members + space.retainedOnly.members + space.unclassified.members,
   );
   assert.equal(
     space.total.logicalBytes,
@@ -1366,13 +1350,8 @@ test('reports cheap health across staging and publication', async (t) => {
       + space.retainedOnly.logicalBytes
       + space.unclassified.logicalBytes,
   );
-  if (capabilities().allocatedSpaceUsage) {
-    assert.equal(typeof space.total.allocatedBytes, 'bigint');
-    assert.equal(typeof space.filesystemAvailableBytes, 'bigint');
-  } else {
-    assert.equal(space.total.allocatedBytes, undefined);
-    assert.equal(space.filesystemAvailableBytes, undefined);
-  }
+  assert.equal(space.total.allocatedBytes, undefined);
+  assert.equal(typeof space.filesystemAvailableBytes, 'bigint');
 
   const cancelled = new AbortController();
   cancelled.abort();
@@ -1463,7 +1442,7 @@ test('discovers typed field and content namespaces without reading values', asyn
   });
 });
 
-test('serves a store held in one file, live or sealed, entirely from Node', async (t) => {
+test('serves a live store and its backup from one file, entirely from Node', async (t) => {
   const dir = temporaryStore(t);
   const store = await NativeStore.open(dir);
   const body = Buffer.from(JSON.stringify([{ role: 'user', content: 'single file' }]));
@@ -1480,38 +1459,33 @@ test('serves a store held in one file, live or sealed, entirely from Node', asyn
   );
   await store.flush();
 
-  assert.equal(singleFileKind(dir), 'container', 'the store IS the single-file form');
-
-  const sealed = path.join(os.tmpdir(), `${path.basename(dir)}.sealed.turndb`);
-  t.after(() => fs.rmSync(sealed, { force: true }));
-  await store.backup(sealed);
+  const backup = path.join(os.tmpdir(), `${path.basename(dir)}.backup.turndb`);
+  t.after(() => fs.rmSync(backup, { force: true }));
+  await store.backup(backup);
   await store.close(false);
-  assert.equal(singleFileKind(sealed), 'container', 'a sealed snapshot is a container by magic');
 
-  // The live file and its sealed snapshot answer identically, read directly as files.
+  // The live file and its backup answer identically, read directly as files.
   const fromLive = await NativeSnapshot.openFile(dir);
   const want = await fromLive.scan();
-  const snapshot = await NativeSnapshot.openFile(sealed);
+  const snapshot = await NativeSnapshot.openFile(backup);
   const got = await snapshot.scan();
   assert.deepEqual(
     got.rows.map((row) => row.id),
     want.rows.map((row) => row.id),
-    'the sealed snapshot must page the same ids',
+    'the backup must page the same ids',
   );
   assert.deepEqual(
     await snapshot.readContent('trace/0001#input', 'body'),
     body,
-    'the sealed snapshot must reconstruct byte-exact',
+    'the backup must reconstruct byte-exact',
   );
   await snapshot.close();
   await fromLive.close();
 
-  // Sealed is final: no writer, ever.
-  await assert.rejects(
-    NativeStore.open(sealed),
-    (error) => error instanceof TurnDbError && /sealed/.test(error.message),
-    'a sealed snapshot must refuse a writer',
-  );
+  // A backup is an ordinary independent store, so it can continue on its own lifecycle.
+  const backupWriter = await NativeStore.open(backup);
+  await backupWriter.write([{ kind: 'delete', id: 'trace/0001#input' }], true);
+  await backupWriter.close();
 
   const plain = `${dir}.plain`;
   fs.writeFileSync(plain, Buffer.alloc(16384, 0x2e));
@@ -1536,7 +1510,6 @@ test('writes a store held in one file, end to end from Node', async (t) => {
   await store.close();
 
   // The promise of the shape: after a clean close the file is the only artifact.
-  assert.equal(singleFileKind(file), 'container');
   assert.equal(fs.existsSync(`${file}-wal`), false, 'a clean close removes the WAL sidecar');
 
   const snapshot = await NativeSnapshot.openFile(file);
@@ -1561,13 +1534,11 @@ test('a file store closed without a single write is still a store', async (t) =>
   const dir = temporaryStore(t);
   const file = path.join(dir, 'empty.turndb');
 
-  // Applying nothing is not an error, and a directory store says so by having no MANIFEST at all.
-  // A container cannot: its members are its state, so one holding no MANIFEST named no store and
-  // every later open refused the file it had just been asked to create.
+  // Applying nothing is not an error. The container still publishes an empty current state so a
+  // later open recognizes it as a store.
   const store = await NativeStore.openFile(file);
   await store.close();
 
-  assert.equal(singleFileKind(file), 'container');
   assert.equal(fs.existsSync(`${file}-wal`), false, 'a clean close removes the WAL sidecar');
 
   const snapshot = await NativeSnapshot.openFile(file);

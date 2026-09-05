@@ -54,10 +54,8 @@ use turndb::types::AttrValue;
 
 /// What a handle addresses.
 ///
-/// A directory open takes the writer role and can mutate; a single-file open — pack or container —
-/// is a reader and never can, because neither form has a writer role to take. Both answer the read
-/// surface identically, so the read entry points accept either and the mutating ones refuse a
-/// reader by name rather than by a confusing failure further down.
+/// A writer handle mutates one container; a reader handle pins an immutable read view to one store
+/// authority. Read entry points accept either, while mutating entry points refuse a reader handle.
 enum Handle {
     Writer(Box<Store>),
     Reader(Box<ReadStore>),
@@ -232,9 +230,8 @@ unsafe fn text<'a>(ptr: *const u8, len: u32) -> Result<&'a str, std::str::Utf8Er
     std::str::from_utf8(slice(ptr, len))
 }
 
-/// Resolve a handle that must be able to MUTATE. A single-file handle is refused here by name: a
-/// pack is immutable by definition and a container is opened read-only by this binding, so every
-/// write verb needs the directory form.
+/// Resolve a handle that must be able to mutate. A read-only container handle is refused here by
+/// name, so every write verb requires a writer handle.
 fn with_store<T>(h: i32, f: impl FnOnce(&mut Store) -> Result<T, i32>) -> Result<T, i32> {
     STORES.with(|s| {
         let mut s = s.borrow_mut();
@@ -454,7 +451,7 @@ pub extern "C" fn tdb_binding_capabilities() -> i32 {
         "unavailable": {
             "allocatedBytes": "absent",
             "cancellationToken": "absent",
-            "atomicNoReplacePublication": "absent",
+            "atomicNoReplaceInstallation": "absent",
         },
     });
     match serde_json::to_vec(&value) {
@@ -466,83 +463,13 @@ pub extern "C" fn tdb_binding_capabilities() -> i32 {
     }
 }
 
-/// Open (or create) a store. Returns a handle, or -1.
-///
-/// Numeric options are 0 for the engine defaults.
+/// Open or create a current-draft store with the complete admission profile. Returns a handle or
+/// `-1`. Numeric options are `0` for engine defaults.
 ///
 /// # Safety
 /// `dir` must be valid UTF-8 of `dir_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn tdb_open(
-    dir: *const u8,
-    dir_len: u32,
-    block_target: u32,
-    level: i32,
-    max_record_bytes: u32,
-    max_batch_bytes: u32,
-    max_batch_records: u32,
-    max_identifier_bytes: u32,
-) -> i32 {
-    // Keep the original ABI for direct embedders. New readers use `tdb_open_v3`; zero selects the
-    // same compiled defaults here.
-    unsafe {
-        tdb_open_v2(
-            dir,
-            dir_len,
-            block_target,
-            level,
-            max_record_bytes,
-            max_batch_bytes,
-            max_batch_records,
-            max_identifier_bytes,
-            0,
-            0,
-        )
-    }
-}
-
-/// Open with explicit atomic persisted-frame admission. Numeric options are 0 for defaults.
-///
-/// # Safety
-/// `dir` must be valid UTF-8 of `dir_len` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn tdb_open_v2(
-    dir: *const u8,
-    dir_len: u32,
-    block_target: u32,
-    level: i32,
-    max_record_bytes: u32,
-    max_batch_bytes: u32,
-    max_batch_records: u32,
-    max_identifier_bytes: u32,
-    max_stored_frame_bytes: u32,
-    max_decoded_frame_bytes: u32,
-) -> i32 {
-    unsafe {
-        tdb_open_v3(
-            dir,
-            dir_len,
-            block_target,
-            level,
-            max_record_bytes,
-            max_batch_bytes,
-            max_batch_records,
-            max_identifier_bytes,
-            max_stored_frame_bytes,
-            max_decoded_frame_bytes,
-            0,
-            0,
-            0,
-        )
-    }
-}
-
-/// Open with explicit atomic-frame and object-count admission. Numeric options are 0 for defaults.
-///
-/// # Safety
-/// `dir` must be valid UTF-8 of `dir_len` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn tdb_open_v3(
     dir: *const u8,
     dir_len: u32,
     block_target: u32,
@@ -639,11 +566,9 @@ pub unsafe extern "C" fn tdb_open_v3(
     }
 }
 
-/// Open a store held in ONE FILE — a sealed pack or a growable container — READ-ONLY.
+/// Open a current-draft container READ-ONLY.
 ///
-/// Which form it is comes from the file's magic, not its extension. Neither has a writer role to
-/// take, so this is the one open in this binding that cannot contend with anything, and every
-/// mutating verb refuses the handle it returns.
+/// This open does not take the writer role, and every mutating verb refuses the handle it returns.
 ///
 /// The whole file is addressed by range, so a host that can serve positioned reads over a blob —
 /// which is what `File.slice()` is — can serve one of these.
@@ -710,27 +635,6 @@ pub unsafe extern "C" fn tdb_open_file(
         }),
         Err(e) => fail_engine(e),
     }
-}
-
-/// Whether a path holds a single-file store, as JSON: `"pack"`, `"container"`, or `null`.
-///
-/// # Safety
-///
-/// `path` must point to `path_len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn tdb_single_file_kind(path: *const u8, path_len: u32) -> i32 {
-    clear_err();
-    let path = match text(path, path_len) {
-        Ok(p) => p,
-        Err(e) => return fail_invalid(format!("store path is not UTF-8: {e}")),
-    };
-    let kind = match turndb::store::single_file_kind(Path::new(path)) {
-        Some(turndb::store::SingleFileKind::Pack) => serde_json::Value::from("pack"),
-        Some(turndb::store::SingleFileKind::Container) => serde_json::Value::from("container"),
-        None => serde_json::Value::Null,
-    };
-    set_out(kind.to_string().as_bytes());
-    0
 }
 
 /// Close a store, dropping the handle. Flushes nothing — call [`tdb_sync`] first if the writes
@@ -1009,8 +913,9 @@ pub extern "C" fn tdb_sync(h: i32) -> i32 {
     with_store(h, |s| s.sync().map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
-/// Deadline-aware [`tdb_sync`]. The final cancellable checkpoint is before WAL fsync; once fsync
-/// starts, the acknowledgement boundary is uninterruptible.
+/// Deadline-aware [`tdb_sync`]. The final cancellable checkpoint is before the durability boundary,
+/// which may first complete delayed authority acknowledgement and then fsyncs the WAL. Once that
+/// boundary starts, the acknowledgement outcome is uninterruptible.
 #[no_mangle]
 pub extern "C" fn tdb_sync_with_timeout(h: i32, timeout_ms: u32) -> i32 {
     clear_err();
@@ -1018,7 +923,7 @@ pub extern "C" fn tdb_sync_with_timeout(h: i32, timeout_ms: u32) -> i32 {
     with_store(h, |s| s.sync_with_control(&control).map_err(fail_engine)).map_or(-1, |_| 0)
 }
 
-/// Seal the memtable into an immutable part. Reads through this handle do not need it — the writer
+/// Publish the memtable as an immutable part. Reads through this handle do not need it — the writer
 /// sees its own unflushed writes — but the columnar plane and any other reader do.
 #[no_mangle]
 pub extern "C" fn tdb_flush(h: i32) -> i32 {
@@ -1544,18 +1449,17 @@ pub extern "C" fn tdb_metrics(h: i32) -> i32 {
     match with_store(h, |store| Ok(store.metrics())) {
         Ok(metrics) => {
             let value = serde_json::json!({
-                "openRecovery": encode_operation_metrics(metrics.open_recovery),
+                "openWalReplay": encode_operation_metrics(metrics.open_wal_replay),
                 "recoveredWalFrames": metrics.recovered_wal_frames.to_string(),
                 "sync": encode_operation_metrics(metrics.sync),
                 "flush": encode_operation_metrics(metrics.flush),
-                "compaction": encode_operation_metrics(metrics.compaction),
+                "merge": encode_operation_metrics(metrics.merge),
                 "backup": encode_operation_metrics(metrics.backup),
                 "verification": encode_operation_metrics(metrics.verification),
                 "verificationCorruptionFailures": metrics.verification_corruption_failures.to_string(),
-                "punch": encode_operation_metrics(metrics.punch),
+                "contentPunch": encode_operation_metrics(metrics.content_punch),
                 "refold": encode_operation_metrics(metrics.refold),
                 "erase": encode_operation_metrics(metrics.erase),
-                "formatMigration": encode_operation_metrics(metrics.format_migration),
                 "foldedContent": {
                     "pieces": metrics.folded_content.pieces.to_string(),
                     "dedupHits": metrics.folded_content.dedup_hits.to_string(),
@@ -1625,7 +1529,7 @@ pub unsafe extern "C" fn tdb_lifecycle_events(h: i32, json: *const u8, json_len:
     }
 }
 
-/// Exact content reachability for a settled committed snapshot.
+/// Exact content reachability for the current manifest revision.
 fn encode_content_liveness(report: turndb::observability::ContentLiveness) -> i32 {
     let block = |value: turndb::observability::FoldBlockSpace| {
         serde_json::json!({
@@ -1668,7 +1572,7 @@ pub extern "C" fn tdb_content_liveness_with_timeout(h: i32, timeout_ms: u32) -> 
 
 fn encode_space_amount(value: turndb::store::SpaceAmount) -> serde_json::Value {
     serde_json::json!({
-        "files": value.files,
+        "members": value.members,
         "logicalBytes": value.logical_bytes.to_string(),
         "allocatedBytes": match value.allocated_bytes {
             Some(bytes) => serde_json::json!({ "state": "measured", "bytes": bytes.to_string() }),
@@ -1864,15 +1768,14 @@ pub unsafe extern "C" fn tdb_erase_ids_with_timeout(
     }
 }
 
-/// Verify every integrity leg in the committed snapshot and return exact evidence as JSON.
+/// Verify every integrity leg in current store authority and return exact evidence as JSON.
 ///
-/// Staged memtable/WAL state is deliberately outside this scope. A caller that wants current
-/// writes included must make them durable and flush them before calling this operation.
+/// The pending change set and its WAL replay input are deliberately outside this scope. A caller
+/// that wants accepted mutations included must synchronize and publish before this operation.
 fn encode_verification_report(report: turndb::store::StoreVerification) -> i32 {
-    let incomplete = report.chain.undigested > 0 || report.unidentified_content_values > 0;
     let value = serde_json::json!({
-        "scope": "committed_snapshot",
-        "state": if incomplete { "incomplete" } else { "valid" },
+        "scope": "current_manifest_revision",
+        "state": "valid",
         "retainedManifests": {
             "state": if report.chain.retained_manifests == 0 { "not_applicable" } else { "verified" },
             "count": report.chain.retained_manifests,
@@ -1880,7 +1783,6 @@ fn encode_verification_report(report: turndb::store::StoreVerification) -> i32 {
         "chain": {
             "links": report.chain.links,
             "partDigests": report.chain.part_digests,
-            "undigestedParts": report.chain.undigested,
         },
         "parts": report.parts,
         "partSections": report.part_sections,
@@ -1894,7 +1796,6 @@ fn encode_verification_report(report: turndb::store::StoreVerification) -> i32 {
         "contentValues": report.content_values,
         "contentBytes": report.content_bytes.to_string(),
         "contentIdentities": report.content_identities,
-        "unidentifiedContentValues": report.unidentified_content_values,
     });
     match serde_json::to_vec(&value) {
         Ok(bytes) => {

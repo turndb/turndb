@@ -1,8 +1,9 @@
 # Contributing to turndb
 
-turndb is an embedded, content-addressed columnar store for AI traces. Before changing anything,
-read [FORMAT.md](FORMAT.md). It is **normative**: where it and the code disagree, one of them is a
-bug, and finding out which is the first job.
+turndb is an embedded, content-addressed columnar store for AI traces. Before changing public
+concepts or lifecycle claims, read [ONTOLOGY.md](ONTOLOGY.md); before changing storage behavior,
+read [FORMAT.md](FORMAT.md). Each is normative in its domain: where either and the code disagree,
+one of them is a bug, and finding out which is the first job.
 
 ## Branching
 

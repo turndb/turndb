@@ -1,35 +1,37 @@
-//! The store: WAL, memtable, flush, manifest, recovery — the layer that turns a fold and some parts
-//! into a database.
+//! The store: WAL, pending change set, publication, manifest revisions, and WAL replay — the layer
+//! that turns a fold and parts into a database.
 //!
 //! # Substrate
 //!
-//! A store is a **directory**, and reading one requires nothing but the files. There is no daemon in
-//! this design; a server is a *role* a process takes when it holds the writer lock, not a thing the
-//! format depends on. (That lock is enforced by the OS on Unix and **not enforced on
-//! `wasm32-wasip1`** — there the single-writer invariant is the embedder's to maintain, since
-//! there is no advisory lock to hold. See `src/sys.rs` and FORMAT.md.)
+//! A store is one container file plus a transient WAL sidecar while a writer has pending changes.
+//! There is no daemon in this design; a server is a *role* a process takes when it holds the writer
+//! lock, not a thing the format depends on. (That lock is enforced by the OS on native Unix and
+//! Windows and **not enforced on `wasm32-wasip1`** — there the single-writer invariant is the
+//! embedder's to maintain, since there is no advisory lock to hold. See `src/sys.rs` and FORMAT.md.)
 //!
 //! [`open_read_container`] takes no lock, replays nothing, and is safe to run
-//! concurrently with a writer — parts are immutable and the fold is append-only, so a reader pinned to
-//! a manifest sees a consistent store with no coordination at all.
+//! concurrently with a writer — parts are immutable and ordinary fold writes append without moving
+//! existing locations, so a reader pinned to a store authority sees a consistent store with no
+//! coordination at all. Declared content punch is the explicit operation that can end an older
+//! view's readability.
 //!
-//! # The commit point
+//! # Publication authority
 //!
-//! The manifest is the only one. It names the live parts, the fold tail, and the log cursor;
-//! everything else — the block directory, the dedup index, part contents — is derived. It is written
-//! tmp + fsync + rename + fsync-dir, so a crash either sees the old manifest or the new one.
+//! The container superblock flip is the only publication point. Its directory selects one manifest
+//! revision (or the canonical origin), which names the referenced parts, fold tail, and WAL sequence
+//! cursor. Everything else — block indexes, dedup indexes, and part contents — is subordinate evidence.
 //!
-//! # Ordering, and why recovery is simple
+//! # Ordering and WAL replay
 //!
 //! ```text
-//! put    -> fold.put (no fsync)  +  WAL append
-//! sync   -> WAL fsync                        <- the ACK point
-//! flush  -> fold.sync -> write part -> commit manifest -> truncate WAL
+//! acceptance      -> fold.put (no fsync) + WAL append
+//! synchronization -> acknowledge selected container authority if needed -> WAL fsync
+//! publication     -> fold.sync -> write part -> stage manifest revision -> flip container state
+//! settlement      -> truncate WAL replay input
 //! ```
-//! Recovery does not try to work out how far the fold got. It **truncates the fold to the tail the
-//! manifest committed** and replays the log, which carries the bytes of every piece that was new.
-//! Anything the fold wrote past that tail is discarded and regenerated, so there is no window in
-//! which a part could reference content that never landed.
+//! Writer open resolves the current store authority without truncating committed container members,
+//! then WAL replay reconstructs the pending change set from complete valid input. Each frame carries
+//! the bytes of every piece that was new, so replay never depends on unpublished fold bytes.
 
 pub mod debris;
 pub mod read;
@@ -47,8 +49,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wal::Wal;
 
@@ -75,7 +76,7 @@ pub const DEFAULT_MAX_BATCH_BYTES: u64 = 256 << 20;
 pub const DEFAULT_MAX_BATCH_RECORDS: usize = 4_096;
 /// Default UTF-8 byte ceiling for ids and field/content names: 4 KiB.
 pub const DEFAULT_MAX_IDENTIFIER_BYTES: usize = 4 << 10;
-/// Maximum committed-manifest bytes accepted from disk or a pack under the default format reader.
+/// Maximum committed-manifest bytes accepted from a container under the default format reader.
 /// A maintained store's manifest is orders of magnitude smaller; this prevents an untrusted sparse
 /// file from becoming an unbounded `read_to_end` allocation before JSON parsing can refuse it.
 pub const MAX_MANIFEST_BYTES: u64 = 64 << 20;
@@ -406,7 +407,7 @@ fn input_record_admission_bytes(
         }
         validate_spans(&content.spans)?;
         add_size(&mut size, bytes_field_size(content.name.len()));
-        add_size(&mut size, 1 + 32); // present whole-content identity
+        add_size(&mut size, 32);
         add_size(&mut size, varint_bytes(content.spans.len() as u64));
         let mut novel = 0u64;
         for span in &content.spans {
@@ -415,12 +416,21 @@ fn input_record_admission_bytes(
                     add_size(&mut size, 1u64.saturating_add(bytes_field_size(bytes.len())))
                 }
                 Span::Piece(bytes) => {
-                    read_limits.admit("new fold block", bytes.len() as u64, bytes.len() as u64)?;
-                    add_size(
-                        &mut size,
-                        1u64.saturating_add(32).saturating_add(varint_bytes(bytes.len() as u64)),
-                    );
-                    add_size(&mut novel, 32u64.saturating_add(bytes_field_size(bytes.len())));
+                    if bytes.is_empty() {
+                        add_size(&mut size, 1u64.saturating_add(bytes_field_size(0)));
+                    } else {
+                        read_limits.admit(
+                            "new fold block",
+                            bytes.len() as u64,
+                            bytes.len() as u64,
+                        )?;
+                        add_size(
+                            &mut size,
+                            1u64.saturating_add(32)
+                                .saturating_add(varint_bytes(bytes.len() as u64)),
+                        );
+                        add_size(&mut novel, 32u64.saturating_add(bytes_field_size(bytes.len())));
+                    }
                 }
             }
         }
@@ -434,7 +444,7 @@ fn input_record_admission_bytes(
     let piece_count = contents
         .iter()
         .flat_map(|content| content.spans.iter())
-        .filter(|span| matches!(span, Span::Piece(_)))
+        .filter(|span| matches!(span, Span::Piece(bytes) if !bytes.is_empty()))
         .count() as u64;
     add_size(&mut size, varint_bytes(piece_count));
     if size > limits.max_record_bytes {
@@ -518,15 +528,24 @@ fn owned_record_admission_bytes(
                     add_size(&mut size, 1u64.saturating_add(bytes_field_size(bytes.len())))
                 }
                 OwnedSpan::Piece(bytes) => {
-                    read_limits.admit("new fold block", bytes.len() as u64, bytes.len() as u64)?;
-                    u32::try_from(bytes.len())
-                        .context("one folded piece exceeds the format's u32 length")?;
-                    piece_count = piece_count.saturating_add(1);
-                    add_size(
-                        &mut size,
-                        1u64.saturating_add(32).saturating_add(varint_bytes(bytes.len() as u64)),
-                    );
-                    add_size(&mut novel, 32u64.saturating_add(bytes_field_size(bytes.len())));
+                    if bytes.is_empty() {
+                        add_size(&mut size, 1u64.saturating_add(bytes_field_size(0)));
+                    } else {
+                        read_limits.admit(
+                            "new fold block",
+                            bytes.len() as u64,
+                            bytes.len() as u64,
+                        )?;
+                        u32::try_from(bytes.len())
+                            .context("one folded piece exceeds the format's u32 length")?;
+                        piece_count = piece_count.saturating_add(1);
+                        add_size(
+                            &mut size,
+                            1u64.saturating_add(32)
+                                .saturating_add(varint_bytes(bytes.len() as u64)),
+                        );
+                        add_size(&mut novel, 32u64.saturating_add(bytes_field_size(bytes.len())));
+                    }
                 }
             }
         }
@@ -570,169 +589,240 @@ fn delete_admission_bytes(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PartRef {
-    pub file: String,
+    pub member: String,
     pub seq_lo: u64,
     pub seq_hi: u64,
     pub records: u32,
-    /// BLAKE3 of the part file's bytes, hex — the manifest PINNING the part. Content is pinned
+    /// BLAKE3 of the part member's logical bytes, hex — the manifest PINNING the part. Content is pinned
     /// transitively from here: this digest covers `pdict.hash`, which carries per-piece BLAKE3,
     /// so a fold that drifted from what a part expects is detectable without any segment-level
-    /// digest. Absent in manifests written before the chain existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub b3: Option<String>,
+    /// digest. Every current part reference carries one.
+    pub b3: String,
 }
 
-/// How many committed manifests are RETAINED beside the live one, as `MANIFEST.<commit>`.
+/// Identity of the one draft manifest schema this build writes and accepts.
+pub const DRAFT_FORMAT_EPOCH: u8 = 1;
+
+/// How many manifest revisions are retained beside the current one, as `MANIFEST.<commit>`.
 ///
-/// Retention is what turns the commit point into a log: every file a retained manifest names
-/// survives the sweep, so a reader holding any manifest in the window sees its whole snapshot on
-/// disk, and a corrupt `MANIFEST` is recoverable by explicit promotion instead of surgery. The
-/// window is a count of COMMITS, not time — each flush, merge, or re-fold advances it by one.
+/// Retention is what makes recent authority reopenable: every member a retained manifest revision
+/// names survives the sweep, so a read view pinned within the window keeps its required bytes, and
+/// corrupt current authority can be replaced by explicit manifest promotion. The window is a count
+/// of manifest revisions, not time — each publication by flush, merge, or refold advances it by one.
 pub const MANIFEST_RETAIN: usize = 4;
 
-/// The committed state of the store. Small, atomic, and the only source of truth about what is live.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+/// In-memory fields used for store authority.
+///
+/// A persisted value is a manifest revision and has `commit > 0`. The default value with
+/// `commit == 0` is the implementation and public-result encoding of the canonical origin; it is
+/// never persisted or interpreted as manifest revision zero.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// Required schema discriminator. This is an exact identity, not a compatibility range.
+    pub draft_epoch: u8,
     pub parts: Vec<PartRef>,
-    /// Which fold generation is live. A re-fold writes a new one and names it here, so the swap IS the
-    /// manifest commit. Absent in stores written before re-folding existed, which serde reads as 0 —
-    /// the original `fold/` directory, needing no migration.
-    #[serde(default)]
+    /// Which fold generation this revision references. A refold writes a new one and names it here,
+    /// so the swap is one publication.
     pub fold_gen: u32,
     pub fold_seg: u32,
     pub fold_off: u32,
     pub next_seq: u64,
-    /// Monotonic commit counter — the retained log's namespace. `next_seq` cannot serve here: it
-    /// only advances at flush, and merges and re-folds commit without flushing. Absent in stores
-    /// written before the log existed, which serde reads as 0.
-    #[serde(default)]
+    /// Monotonic manifest-revision counter — the retained-history namespace. `next_seq` cannot
+    /// serve here: it only advances at flush, while merge and refold can publish without flushing.
     pub commit: u64,
     /// Block ids whose bytes were PUNCHED out of the fold, as inclusive `[lo, hi]` ranges (erasure
     /// tends to hit runs of blocks, and ranges keep the manifest small). Authoritative, and that
     /// is the point: a punched block reads back as zeros, which is indistinguishable from
     /// corruption unless something says otherwise. This says otherwise.
     ///
-    /// Ranges are ascending and disjoint. Absent in manifests written before punching existed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Ranges are ascending and disjoint.
     pub punched: Vec<(u32, u32)>,
-    /// BLAKE3 of the PREVIOUS manifest's exact bytes, hex — the commit log as a hash chain, at
-    /// zero marginal cost. Absent on a store's first commit and in manifests written before the
-    /// chain existed.
+    /// BLAKE3 of the previous manifest revision's exact bytes, hex — retained history as a hash chain, at
+    /// zero marginal cost. `None` only on a store's first commit.
     ///
     /// This is an INTEGRITY check, not a security claim: it catches a manifest that was replaced,
     /// reordered, or restored out of band, which section checksums cannot see because each one is
     /// individually valid. Pruned manifests take their bytes with them, so the chain is verifiable
     /// across the retained window and says nothing about what is no longer there.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev: Option<String>,
 }
 
-fn safe_part_file_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('\\') {
-        return false;
+impl Default for Manifest {
+    fn default() -> Self {
+        Self {
+            draft_epoch: DRAFT_FORMAT_EPOCH,
+            parts: Vec::new(),
+            fold_gen: 0,
+            fold_seg: 0,
+            fold_off: 0,
+            next_seq: 0,
+            commit: 0,
+            punched: Vec::new(),
+            prev: None,
+        }
     }
-    let mut components = Path::new(name).components();
-    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn canonical_part_member_shape(name: &str) -> bool {
+    let Some(body) = name.strip_prefix("part-").and_then(|rest| rest.strip_suffix(".part")) else {
+        return false;
+    };
+    let fields = body.split('-').collect::<Vec<_>>();
+    match fields.as_slice() {
+        [one] => one.parse::<u64>().is_ok_and(|seq| name == format!("part-{seq:08}.part")),
+        [lo, hi] => lo
+            .parse::<u64>()
+            .ok()
+            .zip(hi.parse::<u64>().ok())
+            .is_some_and(|(lo, hi)| name == format!("part-{lo:08}-{hi:08}.part")),
+        [generation, lo, hi] => generation
+            .strip_prefix('r')
+            .filter(|value| value.len() == 4)
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|generation| (1..=crate::fold::MAX_FOLD_GENERATION).contains(generation))
+            .zip(lo.parse::<u64>().ok())
+            .zip(hi.parse::<u64>().ok())
+            .is_some_and(|((generation, lo), hi)| {
+                name == format!("part-r{generation:04}-{lo:08}-{hi:08}.part")
+            }),
+        _ => false,
+    }
+}
+
+fn valid_part_member_name(name: &str, seq_lo: u64, seq_hi: u64, fold_gen: u32) -> bool {
+    let ordinary = if seq_lo == seq_hi {
+        name == format!("part-{seq_lo:08}.part")
+    } else {
+        name == format!("part-{seq_lo:08}-{seq_hi:08}.part")
+    };
+    ordinary
+        || (fold_gen != 0 && name == format!("part-r{fold_gen:04}-{seq_lo:08}-{seq_hi:08}.part"))
 }
 
 fn valid_blake3_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Read the one small authoritative file through a hard allocation boundary. Metadata is checked
-/// first for the common/sparse-file case and `take(max + 1)` closes a concurrent-growth race.
-pub(crate) fn read_manifest_file(path: &Path) -> Result<Vec<u8>> {
-    let file = crate::vfs::open_read(path)?;
-    let announced = file.metadata()?.len();
-    if announced > MAX_MANIFEST_BYTES {
-        bail!(
-            "MANIFEST at {} is {announced} bytes, exceeding the supported {MAX_MANIFEST_BYTES}-byte limit",
-            path.display()
-        );
+fn valid_fold_dictionary_member(name: &str) -> bool {
+    let Some(hash) = name.strip_prefix("zdict-").and_then(|rest| rest.strip_suffix(".zd")) else {
+        return false;
+    };
+    hash.len() == 64
+        && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn fold_sidecar_member(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("seg-")?.strip_suffix(".dir")?;
+    if digits.len() != 8 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    let capacity =
-        usize::try_from(announced).context("MANIFEST length does not fit this platform")?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(capacity).context("reserve MANIFEST buffer")?;
-    file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-        bail!(
-            "MANIFEST at {} grew past the supported {MAX_MANIFEST_BYTES}-byte limit while reading",
-            path.display()
-        );
+    digits.parse().ok()
+}
+
+fn exact_fold_member_name(name: &str) -> bool {
+    let Some((_, rest)) = name.split_once('/') else { return false };
+    fold_generation_of_member(name).is_some()
+        && (crate::fold::segment::parse_seg_name(rest).is_some()
+            || fold_sidecar_member(rest).is_some()
+            || valid_fold_dictionary_member(rest))
+}
+
+fn validate_manifest_promotion_member_namespace(names: &[String]) -> Result<()> {
+    for name in names {
+        let retained = name.strip_prefix("MANIFEST.").is_some_and(|suffix| {
+            suffix.parse::<u64>().is_ok_and(|revision| *name == format!("MANIFEST.{revision:08}"))
+        });
+        if name == "MANIFEST"
+            || retained
+            || canonical_part_member_shape(name)
+            || exact_fold_member_name(name)
+        {
+            continue;
+        }
+        bail!("container member {name:?} is outside the current Store member namespace");
     }
-    Ok(bytes)
+    Ok(())
+}
+
+/// Enforce the exhaustive member namespace of one current-format Store container.
+///
+/// `Container` remains a generic low-level envelope, but a Store admits only its current manifest,
+/// canonical retained-manifest names, parts referenced by current or retained authority, and exact
+/// fold-member forms inside a referenced generation. An unrecognized member is not an extension:
+/// it is a different physical format identity and must fail closed.
+fn validate_store_member_namespace(
+    names: &[String],
+    current: Option<&Manifest>,
+    mut read_member: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let mut admitted = HashSet::new();
+    let mut generations = HashSet::new();
+    if let Some(manifest) = current {
+        admitted.insert("MANIFEST".to_string());
+        admitted.extend(manifest.parts.iter().map(|part| part.member.clone()));
+        generations.insert(manifest.fold_gen);
+    } else if !names.is_empty() {
+        bail!("canonical-origin store carries container members");
+    }
+
+    for name in names.iter().filter(|name| name.starts_with("MANIFEST.")) {
+        let suffix = &name["MANIFEST.".len()..];
+        let commit = suffix
+            .parse::<u64>()
+            .with_context(|| format!("retained manifest member {name:?} has no revision number"))?;
+        if *name != format!("MANIFEST.{commit:08}") {
+            bail!("retained manifest member {name:?} is not in canonical revision form");
+        }
+        let manifest = Manifest::parse(&read_member(name)?)
+            .with_context(|| format!("retained manifest member {name:?} is invalid"))?;
+        if manifest.commit != commit {
+            bail!("retained member {name:?} contains manifest revision {}", manifest.commit);
+        }
+        admitted.insert(name.clone());
+        admitted.extend(manifest.parts.into_iter().map(|part| part.member));
+        generations.insert(manifest.fold_gen);
+    }
+
+    for name in names {
+        if admitted.contains(name) {
+            continue;
+        }
+        if let Some(generation) = fold_generation_of_member(name) {
+            let rest = name.split_once('/').expect("fold member has a slash").1;
+            let exact_member = crate::fold::segment::parse_seg_name(rest).is_some()
+                || fold_sidecar_member(rest).is_some()
+                || valid_fold_dictionary_member(rest);
+            if generations.contains(&generation) && exact_member {
+                continue;
+            }
+        }
+        bail!("container member {name:?} is outside the current Store member namespace");
+    }
+    Ok(())
 }
 
 impl Manifest {
-    /// A MISSING manifest is a new store. An UNREADABLE one is an error.
+    /// Parse manifest bytes, requiring and verifying its checksum trailer.
     ///
-    /// These were conflated, and the orphan sweep made the conflation destructive: a transient EACCES
-    /// or EIO yielded an empty manifest, and the sweep then unlinked every part it did not name. One
-    /// unreadable byte turned a live store into an empty directory.
-    #[cfg(test)]
-    fn load(dir: &Path) -> Result<Manifest> {
-        Self::load_with_limits(dir, ReadLimits::default())
-    }
-
-    fn load_with_limits(dir: &Path, read_limits: ReadLimits) -> Result<Manifest> {
-        let path = dir.join("MANIFEST");
-        match read_manifest_file(&path) {
-            Ok(b) => Manifest::parse(&b),
-            Err(e)
-                if e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                // A missing manifest is a new store — UNLESS a commit log exists, in which case
-                // this store has committed before and `MANIFEST` was lost. Opening it as new
-                // would be the destructive conflation all over again, one deletion further
-                // upstream: an empty manifest followed by the sweep.
-                let retained = list_retained_with_limits(dir, read_limits)?;
-                if retained.is_empty() {
-                    Ok(Manifest::default())
-                } else {
-                    bail!(
-                        "MANIFEST is missing but {} retained commits exist at {} — a damaged \
-                         store, not a new one; recover_manifest() can promote the newest intact copy",
-                        retained.len(),
-                        dir.display()
-                    )
-                }
-            }
-            Err(e) => Err(e.context(format!(
-                "cannot read {} — refusing to treat an unreadable manifest as an empty store",
-                path.display()
-            ))),
+    /// The manifest is the authority whose corruption could otherwise hide durable content with no
+    /// error: a flipped bit that still parses — a shortened `fold_off`, a wrong generation — must
+    /// not become a believable read boundary. Every other structure refuses corruption; this
+    /// closes the authority gap.
+    ///
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
+        let (payload, want) = checksum_trailer(bytes)
+            .ok_or_else(|| anyhow::anyhow!("MANIFEST lacks the required checksum trailer"))?;
+        let got = crc32fast::hash(payload);
+        if got != want {
+            bail!(
+                "MANIFEST fails its checksum (crc32 {got:08x}, recorded {want:08x}) — \
+                 refusing to open from corrupt manifest authority"
+            );
         }
-    }
-
-    /// Parse manifest bytes, verifying the checksum trailer when one is present.
-    ///
-    /// The manifest is the one file whose corruption used to be able to DESTROY data with no error
-    /// anywhere: it is parsed JSON, so a flipped bit that still parses — a shortened `fold_off`, a
-    /// wrong generation — was believed, and recovery then truncated durable fold bytes to match it.
-    /// Every other structure in the store refuses corruption; this closes the last gap.
-    ///
-    /// A manifest written before the trailer existed is bare compact JSON and is accepted as-is:
-    /// the trailer is recognised by SHAPE (a final line `crc32=XXXXXXXX`), which compact JSON cannot
-    /// end with. Corruption cannot demote a checksummed manifest to a legacy one either way it
-    /// lands: mangling the trailer leaves trailing bytes that JSON parsing refuses, and mangling
-    /// the payload fails the checksum.
-    fn parse(bytes: &[u8]) -> Result<Manifest> {
-        let payload = match checksum_trailer(bytes) {
-            Some((payload, want)) => {
-                let got = crc32fast::hash(payload);
-                if got != want {
-                    bail!(
-                        "MANIFEST fails its checksum (crc32 {got:08x}, recorded {want:08x}) — \
-                         refusing to open from a corrupt commit point"
-                    );
-                }
-                payload
-            }
-            None => bytes,
-        };
         if payload.len() as u64 > MAX_MANIFEST_BYTES {
             bail!(
                 "MANIFEST is {} bytes, exceeding the supported {MAX_MANIFEST_BYTES}-byte limit",
@@ -740,31 +830,89 @@ impl Manifest {
             );
         }
         let manifest: Manifest = serde_json::from_slice(payload).context("corrupt MANIFEST")?;
+        if serde_json::to_vec(&manifest)? != payload {
+            bail!("MANIFEST JSON is not in the one canonical current encoding");
+        }
         manifest.validate()
     }
 
     /// Validate semantic fields before any one of them becomes a filesystem path or allocation
     /// input. JSON syntax and a checksum prove faithful bytes, not safe meaning.
     fn validate(self) -> Result<Manifest> {
-        let mut files = HashSet::with_capacity(self.parts.len());
+        if self.draft_epoch != DRAFT_FORMAT_EPOCH {
+            bail!(
+                "MANIFEST declares draft epoch {}; this build accepts exactly {}",
+                self.draft_epoch,
+                DRAFT_FORMAT_EPOCH
+            );
+        }
+        match (self.commit, self.prev.is_some()) {
+            (0, _) => bail!("a persisted MANIFEST cannot have commit zero"),
+            (1, false) => {}
+            (1, true) => bail!("the origin MANIFEST must not name a predecessor"),
+            (_, true) => {}
+            (_, false) => bail!("MANIFEST revision {} must name its predecessor", self.commit),
+        }
+        if self.fold_gen > crate::fold::MAX_FOLD_GENERATION {
+            bail!("MANIFEST fold generation {} is outside the current namespace", self.fold_gen);
+        }
+        if self.fold_seg > crate::fold::segment::MAX_SEGMENT_NUMBER {
+            bail!("MANIFEST fold segment {} is outside the current namespace", self.fold_seg);
+        }
+        if u64::from(self.fold_off) < crate::fold::segment::SEG_HDR_LEN {
+            bail!("a persisted MANIFEST must commit a complete fold segment header");
+        }
+        let mut members = HashSet::with_capacity(self.parts.len());
+        let mut previous_part_hi: Option<u64> = None;
         for part in &self.parts {
-            if !safe_part_file_name(&part.file) {
-                bail!("MANIFEST part file {:?} is not one store-local path component", part.file);
-            }
-            if !files.insert(part.file.as_str()) {
-                bail!("MANIFEST names part file {:?} more than once", part.file);
-            }
-            if part.seq_lo > part.seq_hi {
+            if !valid_part_member_name(&part.member, part.seq_lo, part.seq_hi, self.fold_gen) {
                 bail!(
-                    "MANIFEST part {:?} has inverted sequence range {}..{}",
-                    part.file,
+                    "MANIFEST part member {:?} is not the canonical name for sequence interval {}..={}",
+                    part.member,
                     part.seq_lo,
                     part.seq_hi
                 );
             }
-            if part.b3.as_deref().is_some_and(|digest| !valid_blake3_hex(digest)) {
-                bail!("MANIFEST part {:?} carries an invalid BLAKE3 digest", part.file);
+            if !members.insert(part.member.as_str()) {
+                bail!("MANIFEST names part member {:?} more than once", part.member);
             }
+            if part.seq_lo > part.seq_hi {
+                bail!(
+                    "MANIFEST part {:?} has inverted sequence range {}..{}",
+                    part.member,
+                    part.seq_lo,
+                    part.seq_hi
+                );
+            }
+            let expected_lo = match previous_part_hi {
+                Some(previous) => match previous.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        bail!("MANIFEST part sequence intervals exceed the u64 sequence domain")
+                    }
+                },
+                None => 1,
+            };
+            if part.seq_lo != expected_lo {
+                bail!(
+                    "MANIFEST part sequence intervals must begin at one and remain contiguous; expected {expected_lo}, found {}",
+                    part.seq_lo
+                );
+            }
+            previous_part_hi = Some(part.seq_hi);
+            if !valid_blake3_hex(&part.b3) {
+                bail!("MANIFEST part {:?} lacks a valid BLAKE3 digest", part.member);
+            }
+        }
+        match previous_part_hi {
+            Some(highest) if self.next_seq != highest => bail!(
+                "MANIFEST next_seq {} differs from the highest published part sequence {highest}",
+                self.next_seq
+            ),
+            None if self.next_seq != 0 => {
+                bail!("a MANIFEST without parts must have next_seq zero")
+            }
+            _ => {}
         }
         if self.prev.as_deref().is_some_and(|digest| !valid_blake3_hex(digest)) {
             bail!("MANIFEST carries an invalid previous-manifest BLAKE3 digest");
@@ -787,97 +935,37 @@ impl Manifest {
         Ok(buf)
     }
 
-    /// tmp + fsync + rename + fsync-dir: a crash sees either the old manifest or the new one.
-    ///
-    /// Bumps the commit counter, and writes the retained copy `MANIFEST.<commit>` BEFORE the
-    /// rename: if the live manifest is later corrupted, the copy of the very state it carried is
-    /// what recovery promotes. A crash between the copy and the rename leaves a retained manifest
-    /// describing a commit that never took effect. That residue is NOT the old state plus a
-    /// counter bump — the caller mutates the manifest before committing, so the copy names files
-    /// (a new part, a moved fold tail) the live manifest does not. Data-before-pointers makes
-    /// those files durable, but the commit's authority is the rename that never happened:
-    /// whatever the crashed commit acknowledged is still in the WAL, and writer open durably
-    /// removes the residue before replaying it, precisely so the counters this manifest restarts
-    /// cannot re-create a file name the residue still claims a digest for.
-    ///
-    /// One directory fsync at the end covers both dirents. Pruning runs last and is best-effort —
-    /// a retained manifest that outlives its window is swept space, never a correctness problem,
-    /// because it is OLDER than live: everything it pins, the live chain pins or has aged out.
-    #[cfg(test)]
-    fn commit(&mut self, dir: &Path) -> Result<()> {
-        self.commit_with_limits(dir, ReadLimits::default())
-    }
-
-    fn commit_with_limits(&mut self, dir: &Path, read_limits: ReadLimits) -> Result<()> {
-        // Admission precedes the first mutation. A commit creates one retained name and one
-        // temporary name before the rename, so reserve both against the current directory count.
-        let retained_before = list_retained_with_limits(dir, read_limits)?;
-        let directory_entries = count_directory_entries(dir, read_limits, "store directory")?;
-        read_limits.admit_directory_entries(
-            "store directory during manifest commit",
-            directory_entries.saturating_add(2),
-        )?;
-        self.commit += 1;
-        // Chain onto whatever is being replaced. Hashed from disk rather than from memory,
-        // because the chain's claim is about the BYTES a verifier can read back.
-        self.prev = read_manifest_file(&dir.join("MANIFEST"))
-            .ok()
-            .map(|b| blake3::hash(&b).to_hex().to_string());
-        let bytes = self.encode()?;
-        {
-            let p = retained_path(dir, self.commit);
-            let f = crate::vfs::create(&p)?;
-            crate::vfs::write_all_at(&f, &p, &bytes, 0)?;
-            crate::vfs::sync_file(&f, &p)?;
-        }
-        // The retained copy's NAME is made durable before the live name is touched. On Windows
-        // the replace-rename below can leave neither the old nor the new `MANIFEST` after a crash
-        // (tests/dst.rs, `rename-neither`), and the copy published here is then the manifest a
-        // recovery promotes. One directory fsync per commit on POSIX, in a layout that is
-        // convert-only.
-        crate::vfs::sync_dir(dir)?;
-        let tmp = dir.join("MANIFEST.tmp");
-        let f = crate::vfs::create(&tmp)?;
-        crate::vfs::write_all_at(&f, &tmp, &bytes, 0)?;
-        crate::vfs::sync_file(&f, &tmp)?;
-        drop(f);
-        crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
-        crate::vfs::sync_dir(dir)?;
-        for c in retained_before {
-            if c + (MANIFEST_RETAIN as u64) <= self.commit {
-                let _ = crate::vfs::unlink(&retained_path(dir, c));
-            }
-        }
-        Ok(())
-    }
-
-    /// [`Manifest::commit_with_limits`]'s single-file form: stage this commit's members. The
+    /// Stage a container manifest revision and its retained copy. The
     /// caller's superblock flip — not this — is the linearization point, so everything a flush
     /// staged (fold extents, the part, these manifests, the sweep's frees) publishes as ONE
-    /// atomic state. The directory protocol's five steps — retained copy, tmp, fsync, rename,
-    /// dir fsync — collapse into two staged members, and the prune that was best-effort-after
-    /// becomes part of the same commit it belongs to.
+    /// atomic state. Retention pruning is part of the same commit it belongs to.
     fn commit_into_container(&mut self, c: &mut crate::container::Container) -> Result<()> {
-        self.commit += 1;
         // Chain onto whatever is being replaced — from the member's bytes, because the chain's
-        // claim is about what a verifier can read back.
-        self.prev = c
-            .read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)
-            .ok()
-            .map(|b| blake3::hash(&b).to_hex().to_string());
+        // claim is about what a verifier can read back. Only actual absence means origin; an I/O
+        // failure while reading existing authority must never fabricate a predecessor-free
+        // revision.
+        let predecessor = if c.contains("MANIFEST") {
+            Some(c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)
+        } else {
+            None
+        };
+        self.commit = self.commit.checked_add(1).context("MANIFEST revision space exhausted")?;
+        self.prev = predecessor.map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+        self.clone().validate()?;
         let bytes = self.encode()?;
         c.put_bytes(&format!("MANIFEST.{:08}", self.commit), &bytes)?;
         c.put_bytes("MANIFEST", &bytes)?;
+        let oldest_retained = self.commit.saturating_sub(MANIFEST_RETAIN as u64);
         for commit in container_retained_commits(c) {
-            if commit + (MANIFEST_RETAIN as u64) <= self.commit {
-                let _ = c.remove(&format!("MANIFEST.{commit:08}"));
+            if commit <= oldest_retained {
+                c.remove(&format!("MANIFEST.{commit:08}"))?;
             }
         }
         Ok(())
     }
 
     fn fold_tail(&self) -> Option<FoldTail> {
-        if self.next_seq == 0 && self.parts.is_empty() && self.fold_off == 0 {
+        if self.commit == 0 {
             None
         } else {
             Some(FoldTail { seg: self.fold_seg, off: self.fold_off })
@@ -885,11 +973,35 @@ impl Manifest {
     }
 }
 
-/// The `(payload, recorded crc32)` of a checksummed manifest, or `None` for one written before the
-/// trailer existed. Recognition is by exact shape — a final line `crc32=` plus eight hex digits —
-/// so a legacy manifest (compact JSON, which cannot end that way) is never misread as checksummed,
-/// and a checksummed one whose trailer is damaged falls through to JSON parsing, which refuses the
-/// trailing bytes rather than silently accepting the payload unverified.
+fn open_manifest_part(
+    reader: Box<dyn crate::readat::ReadAt>,
+    reference: &PartRef,
+    cache: Arc<SectionCache>,
+    read_limits: ReadLimits,
+) -> Result<Part> {
+    let part = Part::open_reader_with_limits(reader, cache, read_limits)?;
+    let meta = part.meta();
+    if meta.n_records != reference.records
+        || meta.seq_lo != reference.seq_lo
+        || meta.seq_hi != reference.seq_hi
+    {
+        bail!(
+            "MANIFEST metadata for {} disagrees with its part footer: manifest rows/range \
+             {}/{}..{}, part rows/range {}/{}..{}",
+            reference.member,
+            reference.records,
+            reference.seq_lo,
+            reference.seq_hi,
+            meta.n_records,
+            meta.seq_lo,
+            meta.seq_hi
+        );
+    }
+    Ok(part)
+}
+
+/// The `(payload, recorded crc32)` of a checksummed manifest. Recognition is by exact shape: a
+/// final line `crc32=` plus eight hex digits.
 fn checksum_trailer(bytes: &[u8]) -> Option<(&[u8], u32)> {
     let pos = bytes.iter().rposition(|&b| b == b'\n')?;
     let tail = &bytes[pos + 1..];
@@ -897,130 +1009,124 @@ fn checksum_trailer(bytes: &[u8]) -> Option<(&[u8], u32)> {
         return None;
     }
     let hex = std::str::from_utf8(&tail[6..]).ok()?;
+    if !hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return None;
+    }
     let want = u32::from_str_radix(hex, 16).ok()?;
     Some((&bytes[..pos], want))
 }
 
-fn retained_path(dir: &Path, commit: u64) -> PathBuf {
-    dir.join(format!("MANIFEST.{commit:08}"))
-}
-
-fn list_retained_with_limits(dir: &Path, read_limits: ReadLimits) -> Result<Vec<u64>> {
-    let read_limits = read_limits.validate()?;
-    let mut out = Vec::new();
-    let rd = std::fs::read_dir(dir).with_context(|| {
-        format!("read store directory {} for retained manifests", dir.display())
-    })?;
-    let mut visited = 0u64;
-    for e in rd {
-        visited = visited.saturating_add(1);
-        read_limits.admit_directory_entries("store directory", visited)?;
-        let e = e?;
-        let name = e.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_prefix("MANIFEST.") {
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-                if let Ok(n) = rest.parse::<u64>() {
-                    out.push(n);
-                }
-            }
-        }
-    }
-    out.sort_unstable();
-    Ok(out)
-}
-
-fn count_directory_entries(
-    dir: &Path,
+fn container_sidecar_bytes(
+    container: &crate::container::Container,
+    name: &str,
+    segment_len: u64,
     read_limits: ReadLimits,
-    label: &'static str,
-) -> Result<u64> {
-    let mut visited = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        visited = visited.saturating_add(1);
-        read_limits.admit_directory_entries(label, visited)?;
-        entry?;
-    }
-    Ok(visited)
+) -> Result<Option<Vec<u8>>> {
+    let Some(stored) = container.member_len(name) else { return Ok(None) };
+    read_limits.admit_stored(format!("fold directory sidecar {name}"), stored)?;
+    Ok(Some(
+        container
+            .read_file_bounded(name, crate::fold::segment::max_dir_sidecar_bytes(segment_len))?,
+    ))
 }
 
-/// Open a READER over a pack — the store in one file, served through bounded extents.
-///
-/// Everything [`ReadStore`] can do over a directory it does here identically: same manifest, same
-/// parts, same fold, same version resolution. There is no writer role to take — a pack is
-/// immutable by definition — and no retry loop to need, because nothing can sweep files out from
-/// under an open handle on an immutable artifact.
-pub fn open_read_pack(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
-    open_read_pack_with_limits(path, cfg, ReadLimits::default())
+fn container_reader_sidecar_bytes(
+    container: &crate::container::ContainerReader,
+    name: &str,
+    segment_len: u64,
+    read_limits: ReadLimits,
+) -> Result<Option<Vec<u8>>> {
+    let Some(extent) = container.extent(name) else { return Ok(None) };
+    let stored = crate::readat::ReadAt::len(&extent)?;
+    read_limits.admit_stored(format!("fold directory sidecar {name}"), stored)?;
+    Ok(Some(
+        container
+            .read_file_bounded(name, crate::fold::segment::max_dir_sidecar_bytes(segment_len))?,
+    ))
 }
 
-/// Open a packed reader with explicit frame and persistent object-count admission.
-pub fn open_read_pack_with_limits(
-    path: &Path,
+/// Open the exact fold view described by `manifest` from the supplied container handle. Keeping
+/// the extents tied to this handle matters during verification: a concurrent path replacement
+/// must never cause bytes from another inode to determine which checksums are exempt here.
+fn open_fold_from_container(
+    container: &crate::container::Container,
+    manifest: &Manifest,
     cfg: FoldCfg,
+    label: &Path,
     read_limits: ReadLimits,
-) -> Result<ReadStore> {
-    let read_limits = read_limits.validate()?;
-    let pack = crate::pack::Pack::open(path)?;
-    let manifest = Manifest::parse(&pack.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
-
-    let fold_rel = if manifest.fold_gen == 0 {
-        "fold".to_string()
-    } else {
-        format!("fold-{:04}", manifest.fold_gen)
-    };
+) -> Result<Fold> {
+    let fold_rel = crate::fold::fold_member_prefix(manifest.fold_gen);
+    let fold_tail = manifest.fold_tail();
+    let names = container.names().map(String::from).collect::<Vec<_>>();
     let mut segs = Vec::new();
+    let mut present_segments = HashSet::new();
     let mut dict_files = Vec::new();
-    for name in pack.names().map(String::from).collect::<Vec<_>>() {
+    let mut sidecars = HashSet::new();
+    for name in names {
         let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
-        if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
-            let extent = pack.file(&name).expect("name came from this pack's TOC");
+        if let Some(number) = crate::fold::segment::parse_seg_name(rest) {
+            present_segments.insert(number);
+            let extent = container.extent(&name).expect("name came from this container");
             let segment_len = crate::readat::ReadAt::len(&extent)?;
+            let tail = fold_tail.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "container has fold segment {number} but its manifest declares no fold tail"
+                )
+            })?;
+            if number > tail.seg {
+                bail!(
+                    "container has fold segment {number} beyond manifest tail segment {}",
+                    tail.seg
+                );
+            }
+            if number == tail.seg && segment_len != u64::from(tail.off) {
+                bail!(
+                    "manifest fold tail is segment {}, offset {}, but that member is {segment_len} bytes",
+                    tail.seg,
+                    tail.off
+                );
+            }
+            let reader: Arc<dyn crate::readat::ReadAt> = if number == tail.seg {
+                Arc::new(crate::readat::Slice::new(extent, 0, u64::from(tail.off)))
+            } else {
+                Arc::new(extent)
+            };
             segs.push(crate::fold::SegmentInput {
-                seg: n,
-                reader: Arc::new(extent) as Arc<dyn crate::readat::ReadAt>,
-                // Advisory: an overlarge sidecar is ignored and the segment is scanned instead.
-                sidecar: pack
-                    .read_file_bounded(
-                        &format!("{fold_rel}/seg-{n:08}.dir"),
-                        crate::fold::segment::max_dir_sidecar_bytes(segment_len)
-                            .min(read_limits.max_stored_frame_bytes),
-                    )
-                    .ok(),
+                seg: number,
+                reader,
+                sidecar: container_sidecar_bytes(
+                    container,
+                    &format!("{fold_rel}/seg-{number:08}.dir"),
+                    segment_len,
+                    read_limits,
+                )?,
             });
-        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
-            dict_files.push(pack.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        } else if let Some(number) = fold_sidecar_member(rest) {
+            sidecars.insert(number);
+        } else if valid_fold_dictionary_member(rest) {
+            let bytes = container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?;
+            let exact = format!("zdict-{}.zd", PieceHash::of(&bytes).to_hex());
+            if rest != exact {
+                bail!("fold dictionary member {name:?} does not match its content identity");
+            }
+            dict_files.push(bytes);
+        } else {
+            bail!("container member {name:?} is not in the current fold namespace");
         }
     }
-    let fold = Fold::open_read_from_with_limits(
-        segs,
-        dict_files,
-        cfg,
-        path,
-        &manifest.punched,
-        read_limits,
-    )?;
-
-    let pcache = SectionCache::shared();
-    let mut parts = Vec::with_capacity(manifest.parts.len());
-    for p in &manifest.parts {
-        let ext = pack.file(&p.file).ok_or_else(|| {
-            anyhow::anyhow!("pack manifest names {} but the pack does not hold it", p.file)
-        })?;
-        parts.push(Arc::new(Part::open_reader_with_limits(
-            Box::new(ext),
-            pcache.clone(),
-            read_limits,
-        )?));
+    if let Some(orphan) = sidecars.iter().find(|number| !segs.iter().any(|seg| seg.seg == **number))
+    {
+        bail!("fold sidecar seg-{orphan:08}.dir has no corresponding segment");
     }
-    Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
+    if let Some(tail) = fold_tail {
+        if !present_segments.contains(&tail.seg) {
+            bail!("manifest fold tail names absent segment {}", tail.seg);
+        }
+    }
+    Fold::open_read_from_with_limits(segs, dict_files, cfg, label, &manifest.punched, read_limits)
 }
 
-/// Open a READER over a container — the store in one **mutable** file.
-///
-/// Identical in every observable way to opening the directory it was checkpointed from: same
-/// manifest, same parts, same fold, same version resolution. The difference from a pack is only
-/// that the file this reads can still grow — a container names its state in a superblock rather
-/// than a footer at EOF, so appending does not invalidate the state a reader already resolved.
+/// Open a reader over a container, the store's single physical form.
 pub fn open_read_container(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
     open_read_container_with_limits(path, cfg, ReadLimits::default())
 }
@@ -1031,6 +1137,16 @@ pub fn open_read_container_with_limits(
     cfg: FoldCfg,
     read_limits: ReadLimits,
 ) -> Result<ReadStore> {
+    debris::validate_store_path(path)?;
+    open_read_container_with_limits_internal(path, cfg, read_limits)
+}
+
+fn open_read_container_with_limits_internal(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    crate::fold::validate_cfg(cfg)?;
     if !path.exists() && crate::container::reclaim_names(path).anchor.exists() {
         bail!(
             "{} is absent but its reclaim anchor {} exists: a reclaim's replace was interrupted; \
@@ -1040,71 +1156,52 @@ pub fn open_read_container_with_limits(
         );
     }
     let read_limits = read_limits.validate()?;
-    let container = crate::container::Container::open(path)?;
-    // Absent means a store nothing has flushed yet — the directory reader's rule, with the same
-    // tripwire: retained commits beside a missing manifest are damage, not emptiness.
-    let manifest = if container.contains("MANIFEST") {
+    let container = crate::container::Container::open_internal_with_limits(path, read_limits)?;
+    open_read_container_handle(&container, cfg, path, read_limits)
+}
+
+/// Build the current read view entirely from one already-open container handle. Integrity and
+/// writer-preflight callers must never combine a directory/manifest from one inode with parts or a
+/// fold reopened from another path identity.
+fn open_read_container_handle(
+    container: &crate::container::Container,
+    cfg: FoldCfg,
+    label: &Path,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    crate::fold::validate_cfg(cfg)?;
+    let read_limits = read_limits.validate()?;
+    // Absent means a store nothing has flushed yet, with one tripwire: retained commits beside a
+    // missing manifest are damage, not emptiness.
+    let has_manifest = container.contains("MANIFEST");
+    let manifest = if has_manifest {
         Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?
-    } else if container_retained_commits(&container).is_empty() {
+    } else if container.committed_is_empty_birth() {
         Manifest::default()
     } else {
         bail!(
-            "MANIFEST is missing but retained commits exist in {} — a damaged store, not a new \
-             one",
-            path.display()
+            "container {} has no MANIFEST authority but is not the exact empty sequence-zero \
+             birth state",
+            label.display(),
         );
     };
+    let names = container.names().map(String::from).collect::<Vec<_>>();
+    validate_store_member_namespace(&names, has_manifest.then_some(&manifest), |name| {
+        container.read_file_bounded(name, MAX_MANIFEST_BYTES)
+    })?;
 
-    let fold_rel = if manifest.fold_gen == 0 {
-        "fold".to_string()
-    } else {
-        format!("fold-{:04}", manifest.fold_gen)
-    };
-    let mut segs = Vec::new();
-    let mut dict_files = Vec::new();
-    for name in container.names().map(String::from).collect::<Vec<_>>() {
-        let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
-        if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
-            let extent = container.extent(&name).expect("name came from this directory");
-            let segment_len = crate::readat::ReadAt::len(&extent)?;
-            segs.push(crate::fold::SegmentInput {
-                seg: n,
-                reader: Arc::new(extent) as Arc<dyn crate::readat::ReadAt>,
-                sidecar: container
-                    .read_file_bounded(
-                        &format!("{fold_rel}/seg-{n:08}.dir"),
-                        crate::fold::segment::max_dir_sidecar_bytes(segment_len)
-                            .min(read_limits.max_stored_frame_bytes),
-                    )
-                    .ok(),
-            });
-        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
-            dict_files.push(container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
-        }
-    }
-    let fold = Fold::open_read_from_with_limits(
-        segs,
-        dict_files,
-        cfg,
-        path,
-        &manifest.punched,
-        read_limits,
-    )?;
+    let fold = open_fold_from_container(container, &manifest, cfg, label, read_limits)?;
 
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     for p in &manifest.parts {
-        let ext = container.extent(&p.file).ok_or_else(|| {
+        let ext = container.extent(&p.member).ok_or_else(|| {
             anyhow::anyhow!(
                 "container manifest names {} but the container does not hold it",
-                p.file
+                p.member
             )
         })?;
-        parts.push(Arc::new(Part::open_reader_with_limits(
-            Box::new(ext),
-            pcache.clone(),
-            read_limits,
-        )?));
+        parts.push(Arc::new(open_manifest_part(Box::new(ext), p, pcache.clone(), read_limits)?));
     }
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
@@ -1121,51 +1218,90 @@ pub fn open_read_container_source(
     read_limits: ReadLimits,
 ) -> Result<ReadStore> {
     let read_limits = read_limits.validate()?;
-    let container = crate::container::ContainerReader::open(source, label)?;
-    if container.len() as u64 > read_limits.max_directory_entries {
-        bail!(
-            "container {label} holds {} directory entries, over the configured limit {}",
-            container.len(),
-            read_limits.max_directory_entries
-        );
-    }
-    let manifest = if container.contains("MANIFEST") {
+    let container =
+        crate::container::ContainerReader::open_with_limits(source, label, read_limits)?;
+    let has_manifest = container.contains("MANIFEST");
+    let manifest = if has_manifest {
         Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?
-    } else if !container.names().any(|name| {
-        name.strip_prefix("MANIFEST.")
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
-    }) {
+    } else if container.committed_is_empty_birth() {
         Manifest::default()
     } else {
-        bail!(
-            "MANIFEST is missing but retained commits exist in {label} — a damaged store, not a new one"
-        )
+        bail!("container {label} has no MANIFEST authority but is not the exact empty sequence-zero birth state")
     };
+    let names = container.names().map(String::from).collect::<Vec<_>>();
+    validate_store_member_namespace(&names, has_manifest.then_some(&manifest), |name| {
+        container.read_file_bounded(name, MAX_MANIFEST_BYTES)
+    })?;
     let fold_rel = if manifest.fold_gen == 0 {
         "fold".to_string()
     } else {
         format!("fold-{:04}", manifest.fold_gen)
     };
+    let fold_tail = manifest.fold_tail();
     let mut segs = Vec::new();
+    let mut present_segments = HashSet::new();
     let mut dict_files = Vec::new();
-    for name in container.names().map(String::from).collect::<Vec<_>>() {
+    let mut sidecars = HashSet::new();
+    for name in names {
         let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
         if let Some(number) = crate::fold::segment::parse_seg_name(rest) {
+            present_segments.insert(number);
             let extent = container.extent(&name).expect("name came from this directory");
             let segment_len = crate::readat::ReadAt::len(&extent)?;
+            let tail = fold_tail.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "container has fold segment {number} but its manifest declares no fold tail"
+                )
+            })?;
+            if number > tail.seg {
+                bail!(
+                    "container has fold segment {number} beyond manifest tail segment {}",
+                    tail.seg
+                );
+            }
+            if number == tail.seg && segment_len != u64::from(tail.off) {
+                bail!(
+                    "manifest fold tail is segment {}, offset {}, but that member is {segment_len} bytes",
+                    tail.seg,
+                    tail.off
+                );
+            }
+            let reader: Arc<dyn crate::readat::ReadAt> = if number == tail.seg {
+                Arc::new(crate::readat::Slice::new(extent, 0, u64::from(tail.off)))
+            } else {
+                Arc::new(extent)
+            };
             segs.push(crate::fold::SegmentInput {
                 seg: number,
-                reader: Arc::new(extent) as Arc<dyn crate::readat::ReadAt>,
-                sidecar: container
-                    .read_file_bounded(
-                        &format!("{fold_rel}/seg-{number:08}.dir"),
-                        crate::fold::segment::max_dir_sidecar_bytes(segment_len)
-                            .min(read_limits.max_stored_frame_bytes),
-                    )
-                    .ok(),
+                reader,
+                sidecar: container_reader_sidecar_bytes(
+                    &container,
+                    &format!("{fold_rel}/seg-{number:08}.dir"),
+                    segment_len,
+                    read_limits,
+                )?,
             });
-        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
-            dict_files.push(container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        } else if let Some(number) = fold_sidecar_member(rest) {
+            // Opened alongside its exact segment name above; advisory absence is allowed.
+            sidecars.insert(number);
+        } else if valid_fold_dictionary_member(rest) {
+            let bytes = container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?;
+            let exact = format!("zdict-{}.zd", PieceHash::of(&bytes).to_hex());
+            if rest != exact {
+                bail!("fold dictionary member {name:?} does not match its content identity");
+            }
+            dict_files.push(bytes);
+        } else {
+            bail!("container member {name:?} is not in the current fold namespace");
+        }
+    }
+    if let Some(orphan) = sidecars.iter().find(|number| !segs.iter().any(|seg| seg.seg == **number))
+    {
+        bail!("fold sidecar seg-{orphan:08}.dir has no corresponding segment");
+    }
+    if let Some(tail) = fold_tail {
+        if !present_segments.contains(&tail.seg) {
+            bail!("manifest fold tail names absent segment {}", tail.seg);
         }
     }
     let fold = Fold::open_read_from_with_limits(
@@ -1179,14 +1315,15 @@ pub fn open_read_container_source(
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     for part in &manifest.parts {
-        let extent = container.extent(&part.file).ok_or_else(|| {
+        let extent = container.extent(&part.member).ok_or_else(|| {
             anyhow::anyhow!(
                 "container manifest names {} but the container does not hold it",
-                part.file
+                part.member
             )
         })?;
-        parts.push(Arc::new(Part::open_reader_with_limits(
+        parts.push(Arc::new(open_manifest_part(
             Box::new(extent),
+            part,
             pcache.clone(),
             read_limits,
         )?));
@@ -1194,12 +1331,162 @@ pub fn open_read_container_source(
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
-/// Open a retained snapshot of a single-file store: the store exactly as commit `commit` left it.
+/// Prove the whole-value identities asserted by WAL replay before writer open mutates any store byte.
+/// A frame carries only newly introduced piece bytes, so resolution spans the current store authority and
+/// every earlier frame in this same WAL.
+fn verify_replay_identities(frames: &[wal::Frame], current: &ReadStore) -> Result<()> {
+    let pending_sequence = current.manifest.next_seq.checked_add(1);
+    let mut saw_pending = false;
+    let mut pending: HashMap<PieceHash, Vec<u8>> = HashMap::new();
+    for frame in frames {
+        let redundant = current.manifest.commit != 0 && frame.seq == current.manifest.next_seq;
+        let is_pending = Some(frame.seq) == pending_sequence;
+        if !redundant && !is_pending {
+            bail!(
+                "WAL frame carries sequence {}, expected the current record-version sequence {} or its representable successor",
+                frame.seq,
+                current.manifest.next_seq,
+            );
+        }
+        if redundant && saw_pending {
+            bail!("WAL returns from pending sequence to already-published sequence");
+        }
+        saw_pending |= is_pending;
+        for (hash, bytes) in &frame.novel {
+            if pending.insert(*hash, bytes.clone()).is_some() {
+                bail!("WAL repeats novel piece identity {hash}");
+            }
+        }
+        for content in &frame.record.contents {
+            let mut hasher = blake3::Hasher::new();
+            for op in &content.ops {
+                match op {
+                    BodyOp::Lit(bytes) => {
+                        hasher.update(bytes);
+                    }
+                    BodyOp::Piece { hash, len } => {
+                        let owned;
+                        let bytes = if let Some(bytes) = pending.get(hash) {
+                            bytes.as_slice()
+                        } else {
+                            let loc = locate_verified_piece(&current.parts, &current.fold, hash)?
+                                .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "WAL content {:?} references absent piece {hash}",
+                                    content.name
+                                )
+                            })?;
+                            owned = current.fold.read_verified(loc, *hash)?;
+                            owned.as_slice()
+                        };
+                        let declared_len = usize::try_from(*len)
+                            .context("WAL piece length exceeds this platform")?;
+                        if bytes.len() != declared_len {
+                            bail!(
+                                "WAL content {:?} declares piece {hash} length {len}, actual {}",
+                                content.name,
+                                bytes.len()
+                            );
+                        }
+                        hasher.update(bytes);
+                    }
+                }
+            }
+            let declared = content.identity.ok_or_else(|| {
+                anyhow::anyhow!("WAL content {:?} has no whole-value identity", content.name)
+            })?;
+            let actual = ContentHash(hasher.finalize().into());
+            if actual != declared {
+                bail!(
+                    "WAL content {:?} identity is {declared}, reconstructed bytes are {actual}",
+                    content.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one piece through the pending Fold window and then the authoritative Part dictionaries.
+/// A punched dictionary entry is historical residue, not a lookup result; continue through older
+/// parts until a readable mapping is found. Acceptance and WAL replay must use this same rule or a
+/// mutation can be accepted without bytes that its next open knows how to recover.
+fn locate_verified_piece(
+    parts: &[Arc<Part>],
+    fold: &Fold,
+    hash: &PieceHash,
+) -> Result<Option<Loc>> {
+    fold.ensure_no_failed_write()?;
+    if let Some(location) = fold.lookup(*hash) {
+        return Ok(Some(location));
+    }
+    for part in parts.iter().rev() {
+        if let Some(location) = part.find_piece(hash)? {
+            if fold.is_punched(location.block_id) {
+                continue;
+            }
+            fold.read_verified(location, *hash)
+                .with_context(|| format!("piece dictionary mapped {hash} to invalid fold bytes"))?;
+            return Ok(Some(location));
+        }
+    }
+    Ok(None)
+}
+
+/// Exact physical piece locations required by the rows visible under one store authority.
 ///
-/// The retained manifest names the state; `punched` comes from the LIVE manifest, exactly as the
-/// directory form insists, because erasure is declared by the live commit and a retained copy
-/// predates every punch that followed it. Fold readers are bounded to the snapshot's exact tail,
-/// so nothing this handle serves can wander into bytes its commit never named.
+/// Programs are interpreted through their owning Part dictionaries, exactly like reconstruction.
+/// A content identity may legitimately occur at several Fold locations; keying by `Loc` preserves
+/// every such location so maintenance cannot punch one merely because another copy is readable.
+fn live_fold_pieces_with_control(
+    parts: &[Arc<Part>],
+    fold: &Fold,
+    control: &crate::control::OperationControl,
+) -> Result<BTreeMap<Loc, PieceHash>> {
+    let visible = read::visibility(parts)?;
+    let mut pieces = BTreeMap::new();
+    for (part_index, rows) in visible.rows.iter().enumerate() {
+        let part = &parts[part_index];
+        for &row in rows {
+            control.check("content reachability")?;
+            for content in part.record(row)?.contents {
+                for operation in content.ops {
+                    let BodyOp::Piece { hash, len } = operation else { continue };
+                    let location = part.find_piece(&hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "a record resolved by current authority references absent piece {hash} in its owning Part"
+                        )
+                    })?;
+                    if location.raw != len {
+                        bail!(
+                            "live piece {hash} is {} bytes but its record says {len}",
+                            location.raw
+                        );
+                    }
+                    fold.visit_verified(location, hash, |_| {}).with_context(|| {
+                        format!(
+                            "record resolved by current authority maps piece {hash} to invalid Fold bytes"
+                        )
+                    })?;
+                    if let Some(existing) = pieces.insert(location, hash) {
+                        if existing != hash {
+                            bail!(
+                                "live Fold location {location:?} carries conflicting piece identities {existing} and {hash}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(pieces)
+}
+
+/// Open a read view at retained manifest revision `commit`.
+///
+/// The retained manifest names the state; `punched` comes from the current manifest revision because
+/// content deallocation is declared by current authority and a retained copy predates later content
+/// punches. Fold readers are bounded to the retained revision's exact tail.
 pub fn open_read_container_at(path: &Path, cfg: FoldCfg, commit: u64) -> Result<ReadStore> {
     open_read_container_at_with_limits(path, cfg, commit, ReadLimits::default())
 }
@@ -1212,36 +1499,63 @@ pub fn open_read_container_at_with_limits(
     read_limits: ReadLimits,
 ) -> Result<ReadStore> {
     let read_limits = read_limits.validate()?;
-    let c = crate::container::Container::open(path)?;
-    let bytes = c
-        .read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)
-        .with_context(|| format!("retained commit {commit} is not held by {}", path.display()))?;
-    let mut manifest = Manifest::parse(&bytes)?;
-    let live = Manifest::parse(&c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)
+    debris::validate_store_path(path)?;
+    let c = crate::container::Container::open_internal_with_limits(path, read_limits)?;
+    let bytes =
+        c.read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES).with_context(
+            || format!("retained manifest revision {commit} is not held by {}", path.display()),
+        )?;
+    let manifest = Manifest::parse(&bytes)?;
+    let current = Manifest::parse(&c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)
         .with_context(|| {
             format!(
-                "retained snapshot at commit {commit} needs the live manifest in {} to tell \
+                "retained read view at manifest revision {commit} needs current manifest authority in {} to tell \
                  erased blocks from damaged ones, and it could not be read",
                 path.display()
             )
         })?;
-    if live.fold_gen != manifest.fold_gen {
+    let names = c.names().map(String::from).collect::<Vec<_>>();
+    validate_store_member_namespace(&names, Some(&current), |name| {
+        c.read_file_bounded(name, MAX_MANIFEST_BYTES)
+    })?;
+    verification_integrity(
+        "verify retained authority chain before opening a retained read view",
+        verify_chain_container(&c, read_limits, &crate::control::OperationControl::default()),
+    )?;
+    open_retained_from_container(&c, path, cfg, commit, manifest, &current, names, read_limits)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_retained_from_container(
+    c: &crate::container::Container,
+    path: &Path,
+    cfg: FoldCfg,
+    commit: u64,
+    mut manifest: Manifest,
+    current: &Manifest,
+    names: Vec<String>,
+    read_limits: ReadLimits,
+) -> Result<ReadStore> {
+    if current.fold_gen != manifest.fold_gen {
         bail!(
-            "retained commit {commit} is from fold generation {} but the live store is at {} — \
-             a re-fold purges the retained log, so this snapshot has no erasure authority",
+            "retained manifest revision {commit} is from fold generation {} but current authority references {} — \
+             a refold purges retained history, so this read view has no content-punch authority",
             manifest.fold_gen,
-            live.fold_gen
+            current.fold_gen
         );
     }
-    manifest.punched = live.punched;
+    manifest.punched.clone_from(&current.punched);
 
     let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
     let tail = manifest.fold_tail();
     let mut segs = Vec::new();
     let mut dict_files = Vec::new();
-    for name in c.names().map(String::from).collect::<Vec<_>>() {
+    let mut present_segments = HashSet::new();
+    let mut sidecars = HashSet::new();
+    for name in names {
         let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else { continue };
         if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            present_segments.insert(n);
             let extent = c.extent(&name).expect("name came from this container");
             let full_len = crate::readat::ReadAt::len(&extent)?;
             let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
@@ -1257,21 +1571,38 @@ pub fn open_read_container_at_with_limits(
                 seg: n,
                 reader,
                 sidecar: if whole {
-                    c.read_file_bounded(
+                    container_sidecar_bytes(
+                        c,
                         &format!("{prefix}/seg-{n:08}.dir"),
-                        crate::fold::segment::max_dir_sidecar_bytes(len)
-                            .min(read_limits.max_stored_frame_bytes),
-                    )
-                    .ok()
+                        len,
+                        read_limits,
+                    )?
                 } else {
                     None
                 },
             });
-        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
-            dict_files.push(c.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        } else if let Some(number) = fold_sidecar_member(rest) {
+            sidecars.insert(number);
+        } else if valid_fold_dictionary_member(rest) {
+            let bytes = c.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?;
+            let exact = format!("zdict-{}.zd", PieceHash::of(&bytes).to_hex());
+            if rest != exact {
+                bail!("fold dictionary member {name:?} does not match its content identity");
+            }
+            dict_files.push(bytes);
+        } else {
+            bail!("container member {name:?} is not in the current fold namespace");
         }
     }
-    let fold = Fold::open_read_from_with_limits(
+    if let Some(orphan) = sidecars.iter().find(|number| !present_segments.contains(number)) {
+        bail!("fold sidecar seg-{orphan:08}.dir has no corresponding segment");
+    }
+    if let Some(tail) = tail {
+        if !present_segments.contains(&tail.seg) {
+            bail!("retained manifest fold tail names absent segment {}", tail.seg);
+        }
+    }
+    let fold = Fold::open_retained_read_from_with_limits(
         segs,
         dict_files,
         cfg,
@@ -1282,70 +1613,18 @@ pub fn open_read_container_at_with_limits(
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     for p in &manifest.parts {
-        let ext = c.extent(&p.file).ok_or_else(|| {
+        let ext = c.extent(&p.member).ok_or_else(|| {
             anyhow::anyhow!(
                 "retained commit {commit} names {} but the container does not hold it",
-                p.file
+                p.member
             )
         })?;
-        parts.push(Arc::new(Part::open_reader_with_limits(
-            Box::new(ext),
-            pcache.clone(),
-            read_limits,
-        )?));
+        parts.push(Arc::new(open_manifest_part(Box::new(ext), p, pcache.clone(), read_limits)?));
     }
     Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
 }
 
-/// Which single-file form a path holds.
-///
-/// Told apart by magic rather than by extension, because the extension is the user's to choose and
-/// the magic is the format's. Both forms answer reads identically; they differ in whether the file
-/// can still grow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SingleFileKind {
-    /// Sealed: footer at EOF, immutable, writer-less by definition.
-    Pack,
-    /// Growable: alternating superblocks at the head, appended beyond the committed tail.
-    Container,
-}
-
-/// Classify a single-file store by its magic.
-///
-/// The two forms carry their magic in different places, which is the addressing difference that
-/// separates them: a container is superblock-addressed, so its magic is the first eight bytes; a
-/// pack is footer-addressed, so its magic begins the footer at EOF. Checking only one position
-/// finds only one form.
-///
-/// A path that is not a regular file, or that carries neither magic, is reported as `None` rather
-/// than guessed at — callers that also accept directories dispatch on that.
-pub fn single_file_kind(path: &Path) -> Option<SingleFileKind> {
-    if !path.is_file() {
-        return None;
-    }
-    let f = crate::vfs::open_read(path).ok()?;
-    let len = f.metadata().ok()?.len();
-
-    let mut magic = [0u8; 8];
-    if len >= crate::container::REGION_START
-        && crate::sys::read_exact_at(&f, &mut magic, 0).is_ok()
-        && &magic == crate::container::MAGIC
-    {
-        return Some(SingleFileKind::Container);
-    }
-    if len >= crate::pack::FOOTER_LEN
-        && crate::sys::read_exact_at(&f, &mut magic, len - crate::pack::FOOTER_LEN).is_ok()
-        && &magic == crate::pack::MAGIC
-    {
-        return Some(SingleFileKind::Pack);
-    }
-    None
-}
-
-/// Open a READER over whichever single-file form the path holds.
-///
-/// The one entry a consumer needs when it has a `.turndb` and does not care which form produced
-/// it. A directory is refused here — the directory layout is retired, and `convert` is its door.
+/// Open a reader over the current TurnDB container format.
 pub fn open_read_file(path: &Path, cfg: FoldCfg) -> Result<ReadStore> {
     open_read_file_with_limits(path, cfg, ReadLimits::default())
 }
@@ -1356,182 +1635,33 @@ pub fn open_read_file_with_limits(
     cfg: FoldCfg,
     read_limits: ReadLimits,
 ) -> Result<ReadStore> {
-    match single_file_kind(path) {
-        Some(SingleFileKind::Container) => open_read_container_with_limits(path, cfg, read_limits),
-        Some(SingleFileKind::Pack) => open_read_pack_with_limits(path, cfg, read_limits),
-        None => bail!("{} is not a turndb pack or container (no recognised magic)", path.display()),
-    }
-}
-
-/// Checkpoint a store directory into a container, creating it or growing one that exists.
-///
-/// This is the directory→file transition, and it is incremental by construction: parts and rolled
-/// fold segments are immutable and uniquely named, so a member already present under the same name
-/// and length is skipped rather than rewritten. Only `MANIFEST` and the live segment are restaged
-/// every time.
-///
-/// The source must be quiescent — a non-empty WAL means writes exist that no manifest names yet.
-/// [`convert_to_file`] is the only caller and settles the source first; the directory layout has
-/// no other door left.
-fn checkpoint_into_container(dir: &Path, out: &Path) -> Result<u64> {
-    let wal = dir.join("WAL");
-    if wal.metadata().map(|m| m.len()).unwrap_or(0) != 0 {
-        bail!("checkpoint refuses a store with a non-empty WAL: settle it with sync and flush");
-    }
-    let manifest = Manifest::load_with_limits(dir, ReadLimits::default())?;
-    let mut container = if out.exists() {
-        crate::container::Container::open(out)?
-    } else {
-        crate::container::Container::create(out)?
-    };
-
-    let mut names: Vec<String> = vec!["MANIFEST".to_string()];
-    for p in &manifest.parts {
-        names.push(p.file.clone());
-    }
-    let fold_rel = if manifest.fold_gen == 0 {
-        "fold".to_string()
-    } else {
-        format!("fold-{:04}", manifest.fold_gen)
-    };
-    let fold_path = refold::fold_dir(dir, manifest.fold_gen);
-    let mut fold_names: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&fold_path) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let keep = name.ends_with(".fold")
-                || name.ends_with(".dir")
-                || (name.starts_with("zdict-") && name.ends_with(".zd"));
-            if keep {
-                fold_names.push(format!("{fold_rel}/{name}"));
-            }
-        }
-    }
-    fold_names.sort();
-    names.extend(fold_names);
-
-    for name in &names {
-        let src = dir.join(name);
-        // A store that never applies a record never commits, and a directory store announces
-        // itself as new precisely by having no MANIFEST — `Manifest::load_with_limits` is explicit
-        // about that. A container has no equivalent affordance: its members ARE its state, so one
-        // holding no MANIFEST names no store and every later command refuses it. Writing the
-        // manifest the loader just handed us keeps the empty store openable without teaching the
-        // container reader a second way to be empty, and without committing behind the back of a
-        // Store this checkpoint may not own — `checkpoint()` runs with the writer still open.
-        if name == "MANIFEST" && !src.exists() {
-            container.put_bytes(name, &manifest.encode()?)?;
-            continue;
-        }
-        // A member the working directory does not hold is one the session never copied out —
-        // the container is already its only home and there is nothing to move. Deciding this on
-        // presence rather than on a length comparison matters: `metadata` on a missing file yields
-        // zero, which reads as "a different length" and sends an absent member to `ingest`, which
-        // then fails on a file that was never supposed to exist.
-        if !src.exists() {
-            if container.contains(name) {
-                continue;
-            }
-            bail!("MANIFEST names {name} but neither {} nor the container holds it", dir.display());
-        }
-        let src_len = std::fs::metadata(&src)?.len();
-        // MANIFEST and the live segment change in place; an immutable member of the same length is
-        // already the same bytes, because parts and rolled segments are never rewritten.
-        let immutable = name != "MANIFEST" && !name.ends_with(".dir");
-        if immutable {
-            if let Some(existing) = container.extent(name) {
-                if crate::readat::ReadAt::len(&existing)? == src_len {
-                    continue;
-                }
-            }
-        }
-        container.ingest(name, &src)?;
-    }
-    container.commit()
-}
-
-fn load_retained(dir: &Path, commit: u64) -> Result<Manifest> {
-    let p = retained_path(dir, commit);
-    let b = read_manifest_file(&p).with_context(|| {
-        format!("no retained manifest {} — the retention window has moved past it", p.display())
-    })?;
-    Manifest::parse(&b).with_context(|| format!("retained manifest {} is corrupt", p.display()))
-}
-
-/// Delete every file that no manifest — live or retained — names. THE deletion path: flush, merge,
-/// re-fold, and writer open all converge here, so there is exactly one place that decides
-/// reachability. A file a retained manifest names is a live snapshot's file and survives; it is
-/// swept only when the window prunes past its last naming manifest.
-///
-/// A retained manifest that fails its checksum (a torn copy from a crash) pins nothing — it can
-/// describe no snapshot anyone can open.
-fn sweep_unreachable_with_limits(dir: &Path, read_limits: ReadLimits) -> Result<()> {
-    let mut keep: Vec<Manifest> = vec![Manifest::load_with_limits(dir, read_limits)?];
-    for c in list_retained_with_limits(dir, read_limits)? {
-        if let Ok(m) = load_retained(dir, c) {
-            keep.push(m);
-        }
-    }
-    let live_parts: HashSet<&str> =
-        keep.iter().flat_map(|m| m.parts.iter().map(|p| p.file.as_str())).collect();
-    let live_gens: HashSet<u32> = keep.iter().map(|m| m.fold_gen).collect();
-    let rd = std::fs::read_dir(dir)
-        .with_context(|| format!("read store directory {} for orphan cleanup", dir.display()))?;
-    let mut visited = 0u64;
-    for e in rd {
-        visited = visited.saturating_add(1);
-        read_limits.admit_directory_entries("store directory", visited)?;
-        let e = e?;
-        let n = e.file_name().to_string_lossy().to_string();
-        if n.starts_with("part-") && n.ends_with(".part") && !live_parts.contains(n.as_str()) {
-            let _ = crate::vfs::unlink(&e.path());
-        }
-        if e.path().is_dir() {
-            if let Some(g) = refold::parse_fold_gen(&n) {
-                if !live_gens.contains(&g) {
-                    let _ = crate::vfs::remove_tree(&e.path());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_refold_stage(dir: &Path, generation: u32, built: &[refold::RefoldedPart]) {
-    let fold = refold::fold_dir(dir, generation);
-    if fold.exists() {
-        let _ = crate::vfs::remove_tree(&fold);
-    }
-    for (file, ..) in built {
-        let path = dir.join(file);
-        if path.exists() {
-            let _ = crate::vfs::unlink(&path);
-        }
-    }
+    open_read_container_with_limits(path, cfg, read_limits)
 }
 
 /// What [`verify_chain_file`] checked.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChainReport {
-    /// Retained manifest files parsed and checked. Zero is an explicit empty/new-store result.
+    /// Retained manifest members parsed and checked. Zero is an explicit empty/new-store result.
     pub retained_manifests: usize,
-    /// prev-links verified across the retained window (newest retained == live MANIFEST included).
+    /// Predecessor links verified across the retained window, including equality between the newest
+    /// retained revision and current `MANIFEST`.
     pub links: usize,
-    /// part digests verified against their files, across every retained manifest.
+    /// Part digests verified against their members, across every retained manifest revision.
     pub part_digests: usize,
-    /// parts whose manifest entry predates digests — reported, because "verified" must never
-    /// silently include "had nothing to verify".
-    pub undigested: usize,
 }
 
-/// Evidence returned by a complete committed-store verification pass.
+/// Evidence returned by complete verification of one current store authority.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreVerification {
     pub chain: ChainReport,
     pub fold: crate::fold::FoldScrub,
+    /// Distinct parts referenced by the current manifest revision. Retained-only parts are also
+    /// verified but are not included in this current-authority count.
     pub parts: usize,
+    /// Sections in parts referenced by the current manifest revision. Retained-only section work
+    /// is evidenced by the retained-chain checks rather than added to this count.
     pub part_sections: usize,
-    /// Distinct live records in the committed snapshot, reconstructed below.
+    /// Distinct record slots resolved by the read view pinned to current store authority.
     pub records: usize,
     /// Named content values reconstructed byte-exactly.
     pub content_values: usize,
@@ -1539,99 +1669,232 @@ pub struct StoreVerification {
     pub content_bytes: u64,
     /// Reconstructed values whose stored whole-value BLAKE3 identity was checked.
     pub content_identities: usize,
-    /// Legacy values carrying no whole-value identity. Reconstruction still checks every piece.
-    pub unidentified_content_values: usize,
 }
 
-/// The retained-chain walk for a directory session's own verify. The layout is retired as a
-/// public surface; a converter-opened session still answers `verify` honestly while it lives.
-fn verify_chain_dir(
-    dir: &Path,
-    read_limits: ReadLimits,
+#[derive(Clone, Copy, Debug, Default)]
+struct VerifiedVisibleContent {
+    records: usize,
+    values: usize,
+    bytes: u64,
+    identities: usize,
+}
+
+fn verify_visible_content(
+    parts: &[Arc<Part>],
+    fold: &Fold,
     control: &crate::control::OperationControl,
-) -> Result<ChainReport> {
-    let mut report = ChainReport::default();
-    let commits = list_retained_with_limits(dir, read_limits)?;
-    report.retained_manifests = commits.len();
-    let mut prev_bytes: Option<Vec<u8>> = None;
-    for &c in &commits {
-        control.check("manifest verification")?;
-        let bytes = read_manifest_file(&retained_path(dir, c))?;
-        let m =
-            Manifest::parse(&bytes).with_context(|| format!("retained manifest {c} is corrupt"))?;
-        if let (Some(want), Some(pb)) = (&m.prev, &prev_bytes) {
-            let got = blake3::hash(pb).to_hex().to_string();
-            if *want != got {
-                bail!("manifest chain broken: commit {c} names prev {want} but commit {} hashes to {got}", c - 1);
-            }
-            report.links += 1;
-        }
-        for p in &m.parts {
-            control.check("manifest verification")?;
-            match &p.b3 {
-                Some(want) => {
-                    let got = hash_file_with_control(
-                        &dir.join(&p.file),
-                        control,
-                        "manifest verification",
-                    )
-                    .with_context(|| format!("part {} named by commit {c}", p.file))?
-                    .to_hex()
-                    .to_string();
-                    if *want != got {
-                        bail!("part {} drifted from the digest commit {c} pinned", p.file);
-                    }
-                    report.part_digests += 1;
-                }
-                None => report.undigested += 1,
+) -> Result<VerifiedVisibleContent> {
+    let visible = verification_integrity("enumerate committed records", read::visibility(parts))?;
+    let mut report = VerifiedVisibleContent::default();
+    for (part_index, rows) in visible.rows.iter().enumerate() {
+        let part = &parts[part_index];
+        for &row in rows {
+            control.check("store verification")?;
+            let record = verification_integrity("decode committed record", part.record(row))?;
+            report.records = report
+                .records
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("verified record count overflow"))?;
+            for content in &record.contents {
+                control.check("store verification")?;
+                let bytes = verification_integrity(
+                    "verify committed content",
+                    part.verify_projected_content_with_control(content, fold, control),
+                )?;
+                report.values = report
+                    .values
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("verified content value count overflow"))?;
+                report.bytes = report
+                    .bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| anyhow::anyhow!("verified content byte count overflow"))?;
+                report.identities = report
+                    .identities
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("verified content identity count overflow"))?;
             }
         }
-        prev_bytes = Some(bytes);
-    }
-    // The live MANIFEST must be byte-identical to its retained copy — same commit, same bytes.
-    if let (Some(&newest), Some(pb)) = (commits.last(), &prev_bytes) {
-        let live = read_manifest_file(&dir.join("MANIFEST"))?;
-        if live != *pb {
-            bail!("MANIFEST diverges from its retained copy at commit {newest}");
-        }
-        report.links += 1;
     }
     Ok(report)
 }
 
-/// Copy a single-file store's committed snapshot into a fresh, SEALED container at `out`.
+fn verify_retained_visible_content(
+    parts: &[Arc<Part>],
+    fold: &Fold,
+    control: &crate::control::OperationControl,
+) -> Result<()> {
+    let visible = verification_integrity("enumerate retained records", read::visibility(parts))?;
+    for (part_index, rows) in visible.rows.iter().enumerate() {
+        let part = &parts[part_index];
+        for &row in rows {
+            control.check("retained-authority verification")?;
+            let record = verification_integrity("decode retained record", part.record(row))?;
+            for content in &record.contents {
+                verification_integrity(
+                    "verify retained content",
+                    part.verify_retained_projected_content_with_control(content, fold, control),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_committed_store(
+    parts: &[Arc<Part>],
+    fold_store: &Fold,
+    chain: ChainReport,
+    control: &crate::control::OperationControl,
+) -> Result<StoreVerification> {
+    let fold =
+        verification_integrity("verify fold frames", fold_store.scrub_with_control(control))?;
+    let mut part_sections = 0usize;
+    for part in parts {
+        control.check("store verification")?;
+        let sections = verification_integrity(
+            "verify immutable part sections",
+            part.verify_sections_with_control(control),
+        )?;
+        verification_integrity(
+            "verify every physical part row",
+            part.verify_semantics_with_control(control),
+        )?;
+        verification_integrity(
+            "verify every operational piece dictionary entry",
+            part.verify_piece_dictionary_with_control(fold_store, control),
+        )?;
+        part_sections = part_sections
+            .checked_add(sections)
+            .ok_or_else(|| anyhow::anyhow!("verified part section count overflow"))?;
+    }
+    let content = verify_visible_content(parts, fold_store, control)?;
+    Ok(StoreVerification {
+        chain,
+        fold,
+        parts: parts.len(),
+        part_sections,
+        records: content.records,
+        content_values: content.values,
+        content_bytes: content.bytes,
+        content_identities: content.identities,
+    })
+}
+
+fn verify_retained_piece_dictionaries(
+    container: &crate::container::Container,
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<usize> {
+    if !container.contains("MANIFEST") {
+        return Ok(0);
+    }
+    let current = Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+    let names = container.names().map(String::from).collect::<Vec<_>>();
+    let mut verified_pieces = 0usize;
+    for commit in container_retained_commits(container) {
+        control.check("piece dictionary verification")?;
+        // A retained authority ends at its own fold tail. Checking its dictionary against the
+        // current, longer fold would falsely prove a location introduced only by a later revision.
+        // The retained opener also applies the current manifest's punched declaration, which is
+        // the authority for intentionally unavailable historical payloads.
+        let manifest = Manifest::parse(
+            &container.read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)?,
+        )?;
+        let retained = open_retained_from_container(
+            container,
+            path,
+            cfg,
+            commit,
+            manifest,
+            &current,
+            names.clone(),
+            read_limits,
+        )?;
+        for part in &retained.parts {
+            verified_pieces = verified_pieces
+                .checked_add(part.verify_piece_dictionary_with_control(&retained.fold, control)?)
+                .ok_or_else(|| anyhow::anyhow!("verified piece count overflow"))?;
+        }
+        verification_integrity(
+            "verify retained-authority content",
+            verify_retained_visible_content(&retained.parts, &retained.fold, control),
+        )?;
+    }
+    Ok(verified_pieces)
+}
+
+/// Best-effort cleanup ownership for an artifact that has not crossed its installation rename.
+struct UninstalledArtifact {
+    path: PathBuf,
+    armed: bool,
+}
+
+fn artifact_staging_path(out: &Path, operation: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut staging = out.as_os_str().to_os_string();
+    staging.push(format!(".{operation}-{}-{serial}", crate::vfs::protocol_process_id()));
+    PathBuf::from(staging)
+}
+
+impl UninstalledArtifact {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn installed(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UninstalledArtifact {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = crate::vfs::unlink(&self.path);
+        }
+    }
+}
+
+/// Copy a single-file store's current store authority into a fresh container at `out`.
 ///
-/// What a pack carries, in the pack's spirit: `MANIFEST`, every part it names, and the live
-/// generation's members — no retained log (snapshots of an immutable artifact are meaningless),
-/// no writer state. Staged beside the destination, committed sealed, verified member by member,
-/// then published with a rename that refuses to replace. A crash leaves staging litter and an
-/// untouched destination.
-fn seal_container_copy(
+/// The backup carries `MANIFEST`, every part it names, and the fold generation referenced by the
+/// selected authority — no
+/// retained log and no writer state. Staged beside the destination,
+/// committed, fully verified as a store, then installed with a rename that refuses to replace. A
+/// crash leaves staging litter and an untouched destination.
+fn backup_container_copy(
     container: &std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
     manifest: &Manifest,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
     out: &Path,
+    staging: &Path,
     control: &crate::control::OperationControl,
-) -> Result<crate::pack::BackupStats> {
-    let mut staging = out.as_os_str().to_os_string();
-    staging.push(".sealing");
-    let staging = PathBuf::from(staging);
-    let _ = crate::vfs::unlink(&staging);
-    let mut fresh = crate::container::Container::create(&staging)?;
+) -> Result<crate::backup::BackupStats> {
+    let mut fresh = crate::container::Container::create_staging(staging)?;
+    let mut uninstalled = UninstalledArtifact::new(staging.to_path_buf());
 
     let c = container.lock().expect("container lock poisoned");
     let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
-    let mut names: Vec<String> = vec!["MANIFEST".to_string()];
-    names.extend(manifest.parts.iter().map(|p| p.file.clone()));
-    let mut fold_members: Vec<String> =
-        c.names().filter(|n| n.starts_with(&format!("{prefix}/"))).map(String::from).collect();
-    fold_members.sort();
-    names.extend(fold_members);
+    let mut names = Vec::new();
+    if manifest.commit != 0 {
+        names.push("MANIFEST".to_string());
+        names.extend(manifest.parts.iter().map(|p| p.member.clone()));
+        let mut fold_members: Vec<String> =
+            c.names().filter(|n| n.starts_with(&format!("{prefix}/"))).map(String::from).collect();
+        fold_members.sort();
+        names.extend(fold_members);
+    }
 
     let mut bytes = 0u64;
     for name in &names {
         control.check("backup")?;
         let reader = c.extent(name).ok_or_else(|| {
-            anyhow::anyhow!("the committed snapshot names {name} but the container lost it")
+            anyhow::anyhow!("the current manifest revision names {name} but the container lost it")
         })?;
         let len = crate::readat::ReadAt::len(&reader)?;
         fresh.put_stream(name, len, |at, into| {
@@ -1643,36 +1906,108 @@ fn seal_container_copy(
     }
     drop(c);
     control.check("backup")?;
-    fresh.commit_sealed()?;
-    fresh.verify()?;
+    fresh.commit()?;
     drop(fresh);
-    crate::vfs::rename_noreplace(&staging, out)?;
+    verify_container_artifact(staging, cfg, read_limits, control)
+        .with_context(|| format!("verify staged backup {}", staging.display()))?;
+    crate::vfs::rename_noreplace(staging, out)?;
+    uninstalled.installed();
     if let Some(parent) = out.parent() {
-        // The published name is the result; a failed directory sync means it may not survive a
+        // The installed name is the result; a failed directory sync means it may not survive a
         // crash, and the operation reports that rather than success.
         crate::vfs::sync_dir(parent).with_context(|| {
-            format!("sync {} after publishing {}", parent.display(), out.display())
+            format!("sync {} after installing {}", parent.display(), out.display())
         })?;
     }
-    Ok(crate::pack::BackupStats { files: names.len(), bytes, commit: manifest.commit })
+    Ok(crate::backup::BackupStats { members: names.len(), bytes, commit: manifest.commit })
 }
 
-/// [`verify_chain`] over a single-file store's members: the same walk, the same claims, with
-/// files replaced by members and no filesystem between the evidence and the check.
+/// [`verify_chain`] over a single-file store's members: the same walk and claims, with no
+/// filesystem namespace between the evidence and the check.
 fn verify_chain_container(
     c: &crate::container::Container,
+    read_limits: ReadLimits,
     control: &crate::control::OperationControl,
 ) -> Result<ChainReport> {
+    let names = c.names().map(String::from).collect::<Vec<_>>();
+    let current = if c.contains("MANIFEST") {
+        Some(Manifest::parse(&c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?)
+    } else {
+        None
+    };
+    validate_store_member_namespace(&names, current.as_ref(), |name| {
+        c.read_file_bounded(name, MAX_MANIFEST_BYTES)
+    })?;
     let mut report = ChainReport::default();
+    let part_cache = SectionCache::shared();
+    let mut verified_parts = HashSet::new();
+    for name in c.names().filter(|name| name.starts_with("MANIFEST.")) {
+        let rest = &name["MANIFEST.".len()..];
+        let commit = rest
+            .parse::<u64>()
+            .with_context(|| format!("retained manifest member {name:?} has no commit number"))?;
+        if name != format!("MANIFEST.{commit:08}") {
+            bail!("retained manifest member {name:?} is not in canonical commit form");
+        }
+    }
     let commits = container_retained_commits(c);
+    if commits.len() > MANIFEST_RETAIN {
+        bail!(
+            "container retains {} manifest revisions, over the current-format limit of {MANIFEST_RETAIN}",
+            commits.len()
+        );
+    }
     report.retained_manifests = commits.len();
     let mut prev_bytes: Option<Vec<u8>> = None;
+    let mut prev_commit: Option<u64> = None;
+    let mut prev_next_seq: Option<u64> = None;
+    let mut prev_fold_tail: Option<(u32, u32)> = None;
     for &commit in &commits {
         control.check("manifest verification")?;
         let bytes = c.read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)?;
         let m = Manifest::parse(&bytes)
             .with_context(|| format!("retained manifest {commit} is corrupt"))?;
-        if let (Some(want), Some(pb)) = (&m.prev, &prev_bytes) {
+        if m.commit != commit {
+            bail!("retained member MANIFEST.{commit:08} contains manifest revision {}", m.commit);
+        }
+        if current.as_ref().is_some_and(|authority| m.fold_gen != authority.fold_gen) {
+            bail!(
+                "retained manifest revision {commit} references fold generation {}, but current authority references {}; refold must purge its predecessors",
+                m.fold_gen,
+                current.as_ref().expect("checked as present").fold_gen
+            );
+        }
+        if let Some(previous) = prev_commit {
+            let expected = previous
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("retained manifest revision order overflows"))?;
+            if commit != expected {
+                bail!(
+                    "manifest chain has a revision gap: retained revision {previous} is followed by {commit}, expected {expected}"
+                );
+            }
+        }
+        if prev_next_seq.is_some_and(|previous| m.next_seq < previous) {
+            bail!(
+                "manifest chain moves the record-version cursor backward from {} to {} at revision {commit}",
+                prev_next_seq.expect("checked as present"),
+                m.next_seq
+            );
+        }
+        let fold_tail = (m.fold_seg, m.fold_off);
+        if prev_fold_tail.is_some_and(|previous| fold_tail < previous) {
+            bail!(
+                "manifest chain moves the fold tail backward from {:?} to {:?} at revision {commit}",
+                prev_fold_tail.expect("checked as present"),
+                fold_tail
+            );
+        }
+        if let Some(pb) = &prev_bytes {
+            let want = m.prev.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "manifest chain broken: retained commit {commit} has no predecessor digest"
+                )
+            })?;
             let got = blake3::hash(pb).to_hex().to_string();
             if *want != got {
                 bail!(
@@ -1684,27 +2019,40 @@ fn verify_chain_container(
         }
         for p in &m.parts {
             control.check("manifest verification")?;
-            match &p.b3 {
-                Some(want) => {
-                    let reader = c.extent(&p.file).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "part {} named by commit {commit} is not held by the container",
-                            p.file
-                        )
-                    })?;
-                    let got = hash_reader_with_control(&reader, control, "manifest verification")
-                        .with_context(|| format!("part {} named by commit {commit}", p.file))?
-                        .to_hex()
-                        .to_string();
-                    if *want != got {
-                        bail!("part {} drifted from the digest commit {commit} pinned", p.file);
-                    }
-                    report.part_digests += 1;
+            {
+                let want = &p.b3;
+                let reader = c.extent(&p.member).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "part {} named by commit {commit} is not held by the container",
+                        p.member
+                    )
+                })?;
+                let got = hash_reader_with_control(&reader, control, "manifest verification")
+                    .with_context(|| format!("part {} named by commit {commit}", p.member))?
+                    .to_hex()
+                    .to_string();
+                if *want != got {
+                    bail!("part {} drifted from the digest commit {commit} pinned", p.member);
                 }
-                None => report.undigested += 1,
+                report.part_digests += 1;
+            }
+            if verified_parts.insert(p.member.clone()) {
+                let reader = c.extent(&p.member).expect("part presence proved while hashing");
+                let part = open_manifest_part(Box::new(reader), p, part_cache.clone(), read_limits)
+                    .with_context(|| {
+                        format!("open part {} named by retained manifest {commit}", p.member)
+                    })?;
+                part.verify_sections_with_control(control)
+                    .with_context(|| format!("verify sections of retained part {}", p.member))?;
+                part.verify_semantics_with_control(control).with_context(|| {
+                    format!("verify physical rows of retained part {}", p.member)
+                })?;
             }
         }
         prev_bytes = Some(bytes);
+        prev_commit = Some(commit);
+        prev_next_seq = Some(m.next_seq);
+        prev_fold_tail = Some(fold_tail);
     }
     if let (Some(&newest), Some(pb)) = (commits.last(), &prev_bytes) {
         let live = c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
@@ -1712,8 +2060,102 @@ fn verify_chain_container(
             bail!("MANIFEST diverges from its retained copy at commit {newest}");
         }
         report.links += 1;
+    } else if c.contains("MANIFEST") {
+        // Backup artifacts intentionally omit retained history. Their current manifest is still
+        // authority, so its part pins must be checked directly rather than disappearing with the
+        // chain that normally duplicates the live revision.
+        let bytes = c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
+        let manifest = Manifest::parse(&bytes).context("current manifest is corrupt")?;
+        for part in &manifest.parts {
+            control.check("manifest verification")?;
+            {
+                let want = &part.b3;
+                let reader = c.extent(&part.member).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "part {} named by the current manifest revision is not held by the container",
+                        part.member
+                    )
+                })?;
+                let got = hash_reader_with_control(&reader, control, "manifest verification")?
+                    .to_hex()
+                    .to_string();
+                if *want != got {
+                    bail!(
+                        "part {} drifted from the digest the current manifest revision pinned",
+                        part.member
+                    );
+                }
+                report.part_digests += 1;
+            }
+            if verified_parts.insert(part.member.clone()) {
+                let reader = c.extent(&part.member).expect("part presence proved while hashing");
+                let opened =
+                    open_manifest_part(Box::new(reader), part, part_cache.clone(), read_limits)
+                        .with_context(|| {
+                            format!(
+                                "open part {} named by the current manifest revision",
+                                part.member
+                            )
+                        })?;
+                opened
+                    .verify_sections_with_control(control)
+                    .with_context(|| format!("verify sections of current part {}", part.member))?;
+                opened.verify_semantics_with_control(control).with_context(|| {
+                    format!("verify physical rows of current part {}", part.member)
+                })?;
+            }
+        }
+    } else if !c.committed_is_empty_birth() {
+        // Sequence zero is the one valid manifestless state: a newly created store before its
+        // first publication. Once any container state has committed, losing MANIFEST is losing
+        // the authority for every remaining member, never a return to emptiness.
+        bail!("committed container sequence {} has no MANIFEST authority", c.seq());
     }
     Ok(report)
+}
+
+/// Validate exactly the container bytes that artifact installation would make reachable.
+/// This is read-only: it verifies the member directory and payload checksums, opens every
+/// manifest-named part and fold member, walks the retained chain, scrubs every section/frame, and
+/// reconstructs every live named content value.
+pub(crate) fn verify_container_artifact(
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<(usize, u64, u64, StoreVerification)> {
+    let container = verification_integrity(
+        "open container for verification",
+        crate::container::Container::open_internal_with_limits(path, read_limits),
+    )?;
+    read_limits.admit_directory_entries(
+        format!("container {} member directory", path.display()),
+        container.len() as u64,
+    )?;
+    let members = verification_integrity(
+        "verify container members",
+        container.verify_with_store_profile_and_control(cfg, read_limits, control),
+    )?;
+    let member_bytes = container.member_bytes();
+    let chain = verification_integrity(
+        "verify retained manifest chain",
+        verify_chain_container(&container, read_limits, control),
+    )?;
+    let store = verification_integrity(
+        "open container store for verification",
+        open_read_container_handle(&container, cfg, path, read_limits),
+    )?;
+    verification_integrity(
+        "verify retained-authority piece dictionaries",
+        verify_retained_piece_dictionaries(&container, path, cfg, read_limits, control),
+    )?;
+    drop(container);
+    let commit = store.manifest.commit;
+    let report = verification_integrity(
+        "verify complete container store",
+        verify_committed_store(&store.parts, &store.fold, chain, control),
+    )?;
+    Ok((members, member_bytes, commit, report))
 }
 
 fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
@@ -1726,42 +2168,17 @@ fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result
     })
 }
 
-/// Complete the one narrowly recognizable first-commit crash window.
-///
-/// This intentionally checks only manifest syntax because it runs before the ordinary writer open
-/// performs the same fold/part validation it would perform had the rename landed. It is private so
-/// operator recovery cannot bypass [`recover_manifest`]'s exclusive whole-candidate validation.
-#[cfg(test)]
-fn complete_first_commit(dir: &Path) -> Result<u64> {
-    complete_first_commit_with_limits(dir, ReadLimits::default())
-}
-
-fn complete_first_commit_with_limits(dir: &Path, read_limits: ReadLimits) -> Result<u64> {
-    if Manifest::load_with_limits(dir, read_limits).is_ok() {
-        bail!("MANIFEST at {} is intact — refusing to roll back a healthy store", dir.display());
-    }
-    for c in list_retained_with_limits(dir, read_limits)?.into_iter().rev() {
-        if load_retained(dir, c).is_err() {
-            continue;
-        }
-        let bytes = read_manifest_file(&retained_path(dir, c))?;
-        promote_manifest_with_limits(dir, c, &bytes, read_limits)?;
-        return Ok(c);
-    }
-    bail!("MANIFEST at {} is damaged and no retained manifest is intact", dir.display());
-}
-
-/// Explicit bounds for checked operator recovery.
+/// Explicit rollback bounds for checked manifest promotion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RecoveryOptions {
+pub struct ManifestPromotionOptions {
     /// Maximum number of newer retained commits that may be abandoned. Zero repairs only to the
     /// newest retained commit and is the safe default.
     pub max_rollback_commits: u64,
 }
 
-/// Evidence returned after checked manifest recovery.
+/// Evidence returned after checked manifest promotion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RecoveryReport {
+pub struct ManifestPromotionReport {
     pub commit: u64,
     pub rollback_commits: u64,
     pub records: usize,
@@ -1774,45 +2191,138 @@ pub struct RecoveryReport {
 }
 
 #[derive(Debug)]
-pub enum RecoveryError {
+pub enum ManifestPromotionError {
     Healthy(PathBuf),
     RollbackLimit { needed: u64, allowed: u64 },
     NoUsableCandidate { examined: usize, reason: String },
 }
 
-impl std::fmt::Display for RecoveryError {
+impl std::fmt::Display for ManifestPromotionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecoveryError::Healthy(path) => write!(
+            ManifestPromotionError::Healthy(path) => write!(
                 f,
-                "MANIFEST at {} is intact; refusing recovery of a healthy store",
+                "MANIFEST at {} is intact; refusing manifest promotion for an intact store",
                 path.display()
             ),
-            RecoveryError::RollbackLimit { needed, allowed } => write!(
+            ManifestPromotionError::RollbackLimit { needed, allowed } => write!(
                 f,
-                "recovery needs to abandon {needed} newer retained commits but only {allowed} were authorized"
+                "manifest promotion needs to abandon {needed} newer retained revisions but only {allowed} were authorized"
             ),
-            RecoveryError::NoUsableCandidate { examined, reason } => write!(
+            ManifestPromotionError::NoUsableCandidate { examined, reason } => write!(
                 f,
-                "none of {examined} retained manifests is a fully readable recovery candidate: {reason}"
+                "none of {examined} retained manifest revisions is a fully readable promotion candidate: {reason}"
             ),
         }
     }
 }
 
-impl std::error::Error for RecoveryError {}
+impl std::error::Error for ManifestPromotionError {}
 
-/// Checked manifest recovery for a single-file store: writer role by `flock` on the file itself, a
-/// healthy refusal by the same rule, candidates validated whole at their exact tails, and
-/// promotion as ONE flip that restages `MANIFEST` verbatim and removes the abandoned newer
-/// retained members in the same atomic state. The directory protocol's prune-before-promote
-/// ordering — two durable steps a crash could land between — has nothing to order here.
-pub fn recover_manifest_file(
+fn validate_surviving_promotion_history(
+    container: &crate::container::Container,
     path: &Path,
     cfg: FoldCfg,
-    options: RecoveryOptions,
-) -> Result<RecoveryReport> {
-    recover_manifest_file_with_limits_and_control(
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+    selected_commit: u64,
+) -> Result<HashSet<String>> {
+    let commits = container_retained_commits(container)
+        .into_iter()
+        .filter(|commit| *commit <= selected_commit)
+        .collect::<Vec<_>>();
+    if commits.last().copied() != Some(selected_commit) {
+        bail!("selected manifest revision {selected_commit} has no retained member");
+    }
+    let mut previous_commit: Option<u64> = None;
+    let mut previous_bytes: Option<Vec<u8>> = None;
+    let mut previous_next_seq: Option<u64> = None;
+    let mut previous_fold_tail: Option<(u32, u32)> = None;
+    let mut fold_generation = None;
+    let mut admitted_parts = HashSet::new();
+    for commit in commits {
+        control.check("manifest promotion retained-history validation")?;
+        let bytes =
+            container.read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)?;
+        let manifest = Manifest::parse(&bytes)
+            .with_context(|| format!("surviving retained manifest revision {commit} is invalid"))?;
+        if manifest.commit != commit {
+            bail!(
+                "retained member MANIFEST.{commit:08} contains manifest revision {}",
+                manifest.commit
+            );
+        }
+        if let Some(expected_generation) = fold_generation {
+            if manifest.fold_gen != expected_generation {
+                bail!(
+                    "surviving retained history crosses fold generations {expected_generation} and {}",
+                    manifest.fold_gen
+                );
+            }
+        } else {
+            fold_generation = Some(manifest.fold_gen);
+        }
+        if let Some(previous) = previous_commit {
+            let expected = previous
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("retained manifest revision order overflows"))?;
+            if commit != expected {
+                bail!(
+                    "surviving manifest chain has a revision gap: {previous} is followed by {commit}"
+                );
+            }
+            let expected_hash =
+                blake3::hash(previous_bytes.as_ref().expect("previous commit has retained bytes"))
+                    .to_hex()
+                    .to_string();
+            if manifest.prev.as_deref() != Some(expected_hash.as_str()) {
+                bail!("surviving manifest chain is broken at revision {commit}");
+            }
+        }
+        if previous_next_seq.is_some_and(|previous| manifest.next_seq < previous) {
+            bail!(
+                "surviving manifest chain moves the record-version cursor backward from {} to {} at revision {commit}",
+                previous_next_seq.expect("checked as present"),
+                manifest.next_seq
+            );
+        }
+        let fold_tail = (manifest.fold_seg, manifest.fold_off);
+        if previous_fold_tail.is_some_and(|previous| fold_tail < previous) {
+            bail!(
+                "surviving manifest chain moves the fold tail backward from {:?} to {:?} at revision {commit}",
+                previous_fold_tail.expect("checked as present"),
+                fold_tail
+            );
+        }
+        admitted_parts.extend(manifest.parts.iter().map(|part| part.member.clone()));
+        let next_seq = manifest.next_seq;
+        validate_recovery_candidate_container(
+            container,
+            path,
+            cfg,
+            manifest,
+            read_limits,
+            control,
+        )?;
+        previous_commit = Some(commit);
+        previous_next_seq = Some(next_seq);
+        previous_fold_tail = Some(fold_tail);
+        previous_bytes = Some(bytes);
+    }
+    Ok(admitted_parts)
+}
+
+/// Checked manifest promotion for a single-file store: OS-enforced writer role on native container
+/// handles, a
+/// healthy refusal by the same rule, candidates validated whole at their exact tails, and
+/// promotion as ONE flip that restages `MANIFEST` verbatim and removes the abandoned newer
+/// retained members in the same atomic state.
+pub fn promote_manifest_file(
+    path: &Path,
+    cfg: FoldCfg,
+    options: ManifestPromotionOptions,
+) -> Result<ManifestPromotionReport> {
+    promote_manifest_file_with_limits_and_control(
         path,
         cfg,
         options,
@@ -1821,49 +2331,60 @@ pub fn recover_manifest_file(
     )
 }
 
-/// [`recover_manifest_file`] with explicit admission and cooperative cancellation; the last
+/// [`promote_manifest_file`] with explicit admission and cooperative cancellation; the last
 /// checkpoint is immediately before the publishing flip.
-pub fn recover_manifest_file_with_limits_and_control(
+pub fn promote_manifest_file_with_limits_and_control(
     path: &Path,
     cfg: FoldCfg,
-    options: RecoveryOptions,
+    options: ManifestPromotionOptions,
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
-) -> Result<RecoveryReport> {
+) -> Result<ManifestPromotionReport> {
+    debris::validate_store_path(path)?;
+    crate::fold::validate_cfg(cfg)?;
     let read_limits = read_limits.validate()?;
-    control.check("manifest recovery")?;
-    let mut container = crate::container::Container::open(path)?;
-    if container.sealed() {
-        bail!(
-            "{} is sealed; sealed is final — recovery mutates, so recover a copy instead",
-            path.display()
-        );
-    }
-    container.lock_writer()?;
-    control.check("manifest recovery")?;
-    if container
-        .read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)
-        .ok()
-        .and_then(|b| Manifest::parse(&b).ok())
-        .is_some()
-    {
-        return Err(RecoveryError::Healthy(path.to_path_buf()).into());
+    control.check("manifest promotion")?;
+    let mut container = crate::container::Container::open_internal_with_limits(path, read_limits)?
+        .lock_writer_current()?;
+    control.check("manifest promotion")?;
+    if container.contains("MANIFEST") {
+        let current = container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
+        if Manifest::parse(&current).is_ok() {
+            return Err(ManifestPromotionError::Healthy(path.to_path_buf()).into());
+        }
     }
     let commits = container_retained_commits(&container);
+    let member_names = container.names().map(String::from).collect::<Vec<_>>();
+    validate_manifest_promotion_member_namespace(&member_names)?;
+    let mut retained_generation = None;
+    for &revision in &commits {
+        let bytes =
+            container.read_file_bounded(&format!("MANIFEST.{revision:08}"), MAX_MANIFEST_BYTES)?;
+        let Ok(candidate) = Manifest::parse(&bytes) else { continue };
+        if candidate.commit != revision {
+            bail!(
+                "retained member MANIFEST.{revision:08} contains manifest revision {}",
+                candidate.commit
+            );
+        }
+        if let Some(expected) = retained_generation {
+            if candidate.fold_gen != expected {
+                bail!(
+                    "retained manifest history crosses fold generations {expected} and {}; refold must purge its predecessors",
+                    candidate.fold_gen
+                );
+            }
+        } else {
+            retained_generation = Some(candidate.fold_gen);
+        }
+    }
     let newest = commits.last().copied().unwrap_or(0);
     let mut examined = 0usize;
     let mut last_reason = "no retained manifests exist".to_string();
     for c in commits.into_iter().rev() {
-        control.check("manifest recovery validation")?;
+        control.check("manifest promotion validation")?;
         examined += 1;
-        let bytes =
-            match container.read_file_bounded(&format!("MANIFEST.{c:08}"), MAX_MANIFEST_BYTES) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    last_reason = error.to_string();
-                    continue;
-                }
-            };
+        let bytes = container.read_file_bounded(&format!("MANIFEST.{c:08}"), MAX_MANIFEST_BYTES)?;
         let manifest = match Manifest::parse(&bytes) {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -1877,26 +2398,62 @@ pub fn recover_manifest_file_with_limits_and_control(
             &container,
             path,
             cfg,
-            manifest,
+            manifest.clone(),
             read_limits,
             control,
         ) {
             Ok(mut report) => {
                 let rollback_commits = newest.saturating_sub(c);
                 if rollback_commits > options.max_rollback_commits {
-                    return Err(RecoveryError::RollbackLimit {
+                    return Err(ManifestPromotionError::RollbackLimit {
                         needed: rollback_commits,
                         allowed: options.max_rollback_commits,
                     }
                     .into());
                 }
+                let admitted_parts = match validate_surviving_promotion_history(
+                    &container,
+                    path,
+                    cfg,
+                    read_limits,
+                    control,
+                    c,
+                ) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        if matches!(
+                            crate::error::classify(&error),
+                            crate::error::ErrorClass::Cancelled
+                                | crate::error::ErrorClass::ResourceExhausted
+                                | crate::error::ErrorClass::Io
+                                | crate::error::ErrorClass::NotFound
+                                | crate::error::ErrorClass::Unsupported
+                        ) {
+                            return Err(error);
+                        }
+                        last_reason = error.to_string();
+                        continue;
+                    }
+                };
                 // No cancellation checkpoint after this point: promotion is one flip, and its
-                // actual outcome must be reported.
-                control.check("manifest recovery publication")?;
+                // selected authority or an explicit ambiguous-durability error must be reported.
+                control.check("manifest promotion publication")?;
                 container.put_bytes("MANIFEST", &bytes)?;
-                for newer in container_retained_commits(&container) {
-                    if newer > c {
-                        let _ = container.remove(&format!("MANIFEST.{newer:08}"));
+                for name in container.names().map(String::from).collect::<Vec<_>>() {
+                    if let Some(revision) =
+                        name.strip_prefix("MANIFEST.").and_then(|suffix| suffix.parse::<u64>().ok())
+                    {
+                        if revision > c {
+                            container.remove(&name)?;
+                        }
+                        continue;
+                    }
+                    let unreferenced_part =
+                        canonical_part_member_shape(&name) && !admitted_parts.contains(&name);
+                    let abandoned_fold = exact_fold_member_name(&name)
+                        && fold_generation_of_member(&name) != Some(cand_gen);
+                    if unreferenced_part || abandoned_fold {
+                        container.remove(&name)?;
                     }
                 }
                 // The abandoned commits may have grown the fold past the candidate's tail —
@@ -1913,16 +2470,18 @@ pub fn recover_manifest_file_with_limits_and_control(
                     let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
                     if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
                         if n > keep_seg {
-                            let _ = container.remove(&name);
+                            container.remove(&name)?;
                         } else if n == keep_seg && container.member_len(&name) != Some(keep_len) {
                             let ext = container.extent(&name).ok_or_else(|| {
-                                anyhow::anyhow!("container lost member {name} mid-recovery")
+                                anyhow::anyhow!(
+                                    "container lost member {name} during manifest promotion"
+                                )
                             })?;
                             container.put_stream(&name, keep_len, |at, into| {
                                 crate::readat::ReadAt::read_exact_at(&ext, into, at)
                             })?;
-                            // A sidecar describes the SEALED segment this member no longer is.
-                            let _ = container.remove(&format!("{fold_rel}/seg-{n:08}.dir"));
+                            // A sidecar describes the sealed segment this member no longer is.
+                            container.remove(&format!("{fold_rel}/seg-{n:08}.dir"))?;
                         }
                     } else if let Some(n) = rest
                         .strip_prefix("seg-")
@@ -1930,11 +2489,22 @@ pub fn recover_manifest_file_with_limits_and_control(
                         .and_then(|digits| digits.parse::<u32>().ok())
                     {
                         if n > keep_seg {
-                            let _ = container.remove(&name);
+                            container.remove(&name)?;
                         }
                     }
                 }
-                container.commit()?;
+                let final_names = container.names().map(String::from).collect::<Vec<_>>();
+                validate_store_member_namespace(&final_names, Some(&manifest), |name| {
+                    container.read_file_bounded(name, MAX_MANIFEST_BYTES)
+                })?;
+                if let Err(error) = container.commit() {
+                    if container.failed_publication_selected() == Some(true) {
+                        return Err(error).context(
+                            "manifest promotion is selected by the current container state, but its final synchronization failed; reopen to determine crash durability",
+                        );
+                    }
+                    return Err(error).context("publish the promoted manifest revision");
+                }
                 report.commit = c;
                 report.rollback_commits = rollback_commits;
                 return Ok(report);
@@ -1944,6 +2514,9 @@ pub fn recover_manifest_file_with_limits_and_control(
                     crate::error::classify(&error),
                     crate::error::ErrorClass::Cancelled
                         | crate::error::ErrorClass::ResourceExhausted
+                        | crate::error::ErrorClass::Io
+                        | crate::error::ErrorClass::NotFound
+                        | crate::error::ErrorClass::Unsupported
                 ) {
                     return Err(error);
                 }
@@ -1951,7 +2524,7 @@ pub fn recover_manifest_file_with_limits_and_control(
             }
         }
     }
-    Err(RecoveryError::NoUsableCandidate { examined, reason: last_reason }.into())
+    Err(ManifestPromotionError::NoUsableCandidate { examined, reason: last_reason }.into())
 }
 
 /// The home-neutral half of candidate validation: every visible record's every content value
@@ -1960,57 +2533,29 @@ fn validate_candidate_records(
     reader: &ReadStore,
     control: &crate::control::OperationControl,
 ) -> Result<(usize, usize)> {
-    let ids = reader.ids()?;
+    let visible = read::visibility(&reader.parts)?;
+    let mut records = 0usize;
     let mut content_values = 0usize;
-    for id in &ids {
-        control.check("manifest recovery validation")?;
-        let record = reader.get(id)?.expect("ids returns visible records");
-        for content in record.contents {
-            control.check("manifest recovery validation")?;
-            let mut identity = blake3::Hasher::new();
-            for op in content.ops {
-                control.check("manifest recovery validation")?;
-                match op {
-                    BodyOp::Lit(bytes) => {
-                        identity.update(&bytes);
-                    }
-                    BodyOp::Piece { hash, len } => {
-                        let mut loc = None;
-                        for part in reader.parts.iter().rev() {
-                            if let Some(found) = part.lookup_piece(&hash)? {
-                                loc = Some(found);
-                                break;
-                            }
-                        }
-                        let loc = loc.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "candidate record {id:?} references absent piece {hash}"
-                            )
-                        })?;
-                        let bytes = reader.fold.read_verified(loc, hash)?;
-                        if bytes.len() != len as usize {
-                            bail!(
-                                "candidate record {id:?} says piece {hash} is {len} bytes but it is {}",
-                                bytes.len()
-                            );
-                        }
-                        identity.update(&bytes);
-                    }
-                }
+    for (part_index, rows) in visible.rows.iter().enumerate() {
+        let part = &reader.parts[part_index];
+        for &row in rows {
+            control.check("manifest promotion validation")?;
+            let record = part.record(row)?;
+            records = records
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("candidate record count overflow"))?;
+            for content in &record.contents {
+                control.check("manifest promotion validation")?;
+                // Interpret the program through the owning Part—the same authority ordinary reads
+                // use—and hash each literal/piece incrementally rather than allocating the value.
+                part.verify_projected_content_with_control(content, &reader.fold, control)?;
+                content_values = content_values
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("candidate content count overflow"))?;
             }
-            if let Some(want) = content.identity {
-                let got = ContentHash(identity.finalize().into());
-                if got != want {
-                    bail!(
-                        "candidate record {id:?} content {:?} has identity {got}, expected {want}",
-                        content.name
-                    );
-                }
-            }
-            content_values += 1;
         }
     }
-    Ok((ids.len(), content_values))
+    Ok((records, content_values))
 }
 
 /// [`validate_recovery_candidate`] for a candidate held as members: the fold opens over extent
@@ -2024,15 +2569,18 @@ fn validate_recovery_candidate_container(
     manifest: Manifest,
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
-) -> Result<RecoveryReport> {
-    control.check("manifest recovery validation")?;
+) -> Result<ManifestPromotionReport> {
+    control.check("manifest promotion validation")?;
     let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
     let tail = manifest.fold_tail();
     let mut segs = Vec::new();
     let mut dict_files = Vec::new();
+    let mut present_segments = HashSet::new();
+    let mut sidecars = HashSet::new();
     for name in c.names().map(String::from).collect::<Vec<_>>() {
         let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else { continue };
         if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
+            present_segments.insert(n);
             let extent = c.extent(&name).expect("name came from this container");
             let full_len = crate::readat::ReadAt::len(&extent)?;
             let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
@@ -2050,18 +2598,35 @@ fn validate_recovery_candidate_container(
                 // A sidecar describes a segment's full length; for a candidate-bounded segment
                 // it would fail its own staleness gate, so it is only offered when whole.
                 sidecar: if whole {
-                    c.read_file_bounded(
+                    container_sidecar_bytes(
+                        c,
                         &format!("{prefix}/seg-{n:08}.dir"),
-                        crate::fold::segment::max_dir_sidecar_bytes(len)
-                            .min(read_limits.max_stored_frame_bytes),
-                    )
-                    .ok()
+                        len,
+                        read_limits,
+                    )?
                 } else {
                     None
                 },
             });
-        } else if rest.starts_with("zdict-") && rest.ends_with(".zd") {
-            dict_files.push(c.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?);
+        } else if let Some(number) = fold_sidecar_member(rest) {
+            sidecars.insert(number);
+        } else if valid_fold_dictionary_member(rest) {
+            let bytes = c.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?;
+            let exact = format!("zdict-{}.zd", PieceHash::of(&bytes).to_hex());
+            if rest != exact {
+                bail!("fold dictionary member {name:?} does not match its content identity");
+            }
+            dict_files.push(bytes);
+        } else {
+            bail!("container member {name:?} is not in the current fold namespace");
+        }
+    }
+    if let Some(orphan) = sidecars.iter().find(|number| !present_segments.contains(number)) {
+        bail!("fold sidecar seg-{orphan:08}.dir has no corresponding segment");
+    }
+    if let Some(tail) = tail {
+        if !present_segments.contains(&tail.seg) {
+            bail!("manifest-promotion candidate tail names absent segment {}", tail.seg);
         }
     }
     let fold = Fold::open_read_from_with_limits(
@@ -2077,34 +2642,34 @@ fn validate_recovery_candidate_container(
     let mut parts = Vec::with_capacity(manifest.parts.len());
     let mut part_sections = 0usize;
     for part_ref in &manifest.parts {
-        control.check("manifest recovery validation")?;
-        let reader = c.extent(&part_ref.file).ok_or_else(|| {
+        control.check("manifest promotion validation")?;
+        let reader = c.extent(&part_ref.member).ok_or_else(|| {
             anyhow::anyhow!(
                 "candidate commit {} names part {} but the container does not hold it",
                 manifest.commit,
-                part_ref.file
+                part_ref.member
             )
         })?;
-        if let Some(want) = &part_ref.b3 {
-            let got = hash_reader_with_control(&reader, control, "manifest recovery validation")?
-                .to_hex()
-                .to_string();
-            if &got != want {
-                bail!(
-                    "candidate commit {} names part {} with the wrong digest",
-                    manifest.commit,
-                    part_ref.file
-                );
-            }
+        let got = hash_reader_with_control(&reader, control, "manifest promotion validation")?
+            .to_hex()
+            .to_string();
+        if got != part_ref.b3 {
+            bail!(
+                "candidate commit {} names part {} with the wrong digest",
+                manifest.commit,
+                part_ref.member
+            );
         }
         let part =
-            Arc::new(Part::open_reader_with_limits(Box::new(reader), pcache.clone(), read_limits)?);
+            Arc::new(open_manifest_part(Box::new(reader), part_ref, pcache.clone(), read_limits)?);
         part_sections += part.verify_sections_with_control(control)?;
+        part.verify_semantics_with_control(control)?;
+        part.verify_piece_dictionary_with_control(&fold, control)?;
         parts.push(part);
     }
     let reader = ReadStore { fold: Arc::new(fold), parts, manifest, read_limits };
     let (records, content_values) = validate_candidate_records(&reader, control)?;
-    Ok(RecoveryReport {
+    Ok(ManifestPromotionReport {
         records,
         content_values,
         parts: reader.parts.len(),
@@ -2112,11 +2677,11 @@ fn validate_recovery_candidate_container(
         fold_segments: scrub.segments,
         fold_blocks: scrub.blocks,
         fold_bytes: scrub.bytes,
-        ..RecoveryReport::default()
+        ..ManifestPromotionReport::default()
     })
 }
 
-/// [`hash_file_with_control`] for bytes that live behind a reader — a member of the live file.
+/// Hash bytes that live behind a bounded reader.
 fn hash_reader_with_control(
     reader: &dyn crate::readat::ReadAt,
     control: &crate::control::OperationControl,
@@ -2136,67 +2701,41 @@ fn hash_reader_with_control(
     Ok(hasher.finalize())
 }
 
-fn hash_file_with_control(
-    path: &Path,
-    control: &crate::control::OperationControl,
-    operation: &'static str,
-) -> Result<blake3::Hash> {
-    use std::io::Read;
-
-    let mut file = crate::vfs::open_read(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        control.check(operation)?;
-        let read = file.read(&mut buf)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hasher.finalize())
-}
-
-/// `<store>` is absent and `<store>.reclaimed` — a reclaim's anchor — is present: promote the
+/// `<store>` is absent and `<store>.reclaimed` — a reclaim's anchor — is present: reinstate the
 /// anchor to the store's name, or refuse. One contender at a time: the anchor's own writer lock
 /// is the exclusion, so a second recoverer sees `WriterLocked`. The anchor is validated whole
 /// (fold at its tail scrubbed, every part by digest and sections, every record reconstructed —
-/// the same bar as manifest recovery) BEFORE anything is created; a corrupt or incomplete anchor
-/// refuses and leaves everything as found. Promotion is a copy to a fresh candidate, fsynced,
-/// writer-locked, and published at `<store>` by a write-through no-replace rename — a name taken
+/// the same bar as manifest promotion) BEFORE anything is created; a corrupt or incomplete anchor
+/// refuses and leaves everything as found. Reinstatement is a copy to a fresh candidate, fsynced,
+/// writer-locked, and placed at `<store>` by a write-through no-replace rename — a name taken
 /// meanwhile refuses with the anchor intact — after which the anchor is unlinked (laggable). A
 /// crash at any point re-enters here on the next writer open and converges.
-fn recover_store_from_reclaim_anchor(
+fn restore_store_from_reclaim_anchor(
     path: &Path,
     cfg: FoldCfg,
     read_limits: ReadLimits,
 ) -> Result<()> {
     let names = crate::container::reclaim_names(path);
-    let anchor = crate::container::Container::open(&names.anchor)
-        .with_context(|| format!("open reclaim anchor {}", names.anchor.display()))?;
-    anchor.lock_writer().with_context(|| "another recovery of this store is in progress")?;
-    if anchor.sealed() {
-        bail!("reclaim anchor {} is sealed; not a reclaim's output", names.anchor.display());
-    }
-    let manifest = Manifest::parse(&anchor.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+    let anchor = crate::container::Container::open_internal_with_limits(&names.anchor, read_limits)
+        .with_context(|| format!("open reclaim anchor {}", names.anchor.display()))?
+        .lock_writer_current()
+        .with_context(|| "another interrupted-reclaim restoration is in progress")?;
     let control = crate::control::OperationControl::default();
-    validate_recovery_candidate_container(
-        &anchor,
-        &names.anchor,
-        cfg,
-        manifest,
-        read_limits,
-        &control,
-    )
-    .with_context(|| {
+    verify_container_artifact(&names.anchor, cfg, read_limits, &control).with_context(|| {
         format!(
             "reclaim anchor {} does not validate whole; the store is not recreated from it",
             names.anchor.display()
         )
     })?;
+    if !anchor.is_current_path_file(&names.anchor)? {
+        bail!("reclaim anchor changed identity while it was being validated");
+    }
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let _ = crate::vfs::unlink(&names.candidate_tmp);
-    let _ = crate::vfs::unlink(&names.candidate);
+    crate::vfs::unlink_if_exists(&names.candidate_tmp).with_context(|| {
+        format!("remove stale reclaim candidate {}", names.candidate_tmp.display())
+    })?;
+    crate::vfs::unlink_if_exists(&names.candidate)
+        .with_context(|| format!("remove stale reclaim candidate {}", names.candidate.display()))?;
     crate::container::copy_container_bytes_pub(&names.anchor, &names.candidate_tmp)?;
     crate::vfs::sync_dir(&parent)?;
     crate::vfs::rename_noreplace(&names.candidate_tmp, &names.candidate)?;
@@ -2205,214 +2744,29 @@ fn recover_store_from_reclaim_anchor(
     if !crate::sys::lock_exclusive(&new_store)? {
         return Err(crate::fold::WriterLocked { path: names.candidate.clone() }.into());
     }
-    crate::container::Container::open(&names.candidate)?.verify()?;
+    verify_container_artifact(&names.candidate, cfg, read_limits, &control)?;
     crate::vfs::rename_noreplace(&names.candidate, path).with_context(|| {
         format!("{} was taken while the reclaim anchor was being promoted", path.display())
     })?;
     crate::vfs::sync_dir(&parent)?;
     drop(anchor);
-    let _ = crate::vfs::unlink(&names.anchor);
+    crate::vfs::unlink_if_exists(&names.anchor)
+        .with_context(|| format!("remove reclaim anchor {}", names.anchor.display()))?;
     crate::vfs::sync_dir(&parent)
         .with_context(|| format!("sync {} after removing the reclaim anchor", parent.display()))?;
     drop(new_store);
     Ok(())
 }
 
-/// Promote retained `commit` to the live `MANIFEST` of a directory-layout store, but only after
-/// validating the candidate whole — the same bar as [`recover_manifest_file`]'s candidates, on
-/// files instead of container members. Used by open when the live manifest is absent beside a
-/// commit log; the caller has already established that shape.
-fn promote_newest_retained_if_whole(
-    dir: &Path,
-    cfg: FoldCfg,
-    commit: u64,
-    read_limits: ReadLimits,
-) -> Result<()> {
-    let bytes = read_manifest_file(&retained_path(dir, commit))?;
-    let manifest = Manifest::parse(&bytes)?;
-    if manifest.commit != commit {
-        bail!(
-            "retained copy {} carries commit {}, not the commit its name claims",
-            retained_path(dir, commit).display(),
-            manifest.commit
-        );
-    }
-    let control = crate::control::OperationControl::default();
-    validate_recovery_candidate_dir(dir, cfg, manifest, read_limits, &control)?;
-    promote_manifest_with_limits(dir, commit, &bytes, read_limits)
-}
-
-/// [`validate_recovery_candidate_container`] for the directory layout: the candidate's fold,
-/// bounded at its tail and scrubbed; every part it names, by digest where recorded and by
-/// section checksums always; then every record it serves, reconstructed byte for byte.
-fn validate_recovery_candidate_dir(
-    dir: &Path,
-    cfg: FoldCfg,
-    manifest: Manifest,
-    read_limits: ReadLimits,
-    control: &crate::control::OperationControl,
-) -> Result<RecoveryReport> {
-    control.check("manifest recovery validation")?;
-    let fold_dir = refold::fold_dir(dir, manifest.fold_gen);
-    let tail = manifest.fold_tail();
-    let mut segs = Vec::new();
-    let mut dict_files = Vec::new();
-    let mut entries = 0u64;
-    for entry in std::fs::read_dir(&fold_dir).with_context(|| {
-        format!("candidate commit {} names fold {}", manifest.commit, fold_dir.display())
-    })? {
-        control.check("manifest recovery validation")?;
-        entries = entries.saturating_add(1);
-        read_limits.admit_directory_entries("candidate fold directory", entries)?;
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(n) = crate::fold::segment::parse_seg_name(&name) {
-            let file = crate::vfs::open_read(&entry.path())?;
-            let full_len = crate::readat::ReadAt::len(&file)?;
-            let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
-                Some(t) if n > t.seg => continue,
-                Some(t) if n == t.seg => (
-                    Arc::new(crate::readat::Slice::new(file, 0, u64::from(t.off))),
-                    u64::from(t.off),
-                    u64::from(t.off) == full_len,
-                ),
-                _ => (Arc::new(file), full_len, true),
-            };
-            segs.push(crate::fold::SegmentInput {
-                seg: n,
-                reader,
-                sidecar: if whole {
-                    read_bounded(
-                        &fold_dir.join(format!("seg-{n:08}.dir")),
-                        crate::fold::segment::max_dir_sidecar_bytes(len)
-                            .min(read_limits.max_stored_frame_bytes),
-                    )
-                    .ok()
-                } else {
-                    None
-                },
-            });
-        } else if name.starts_with("zdict-") && name.ends_with(".zd") {
-            dict_files.push(read_bounded(&entry.path(), crate::fold::MAX_DICTIONARY_BYTES)?);
-        }
-    }
-    let fold = Fold::open_read_from_with_limits(
-        segs,
-        dict_files,
-        cfg,
-        &fold_dir,
-        &manifest.punched,
-        read_limits,
-    )?;
-    let scrub = fold.scrub_with_control(control)?;
-    let pcache = SectionCache::shared();
-    let mut parts = Vec::with_capacity(manifest.parts.len());
-    let mut part_sections = 0usize;
-    for part_ref in &manifest.parts {
-        control.check("manifest recovery validation")?;
-        let path = dir.join(&part_ref.file);
-        if !path.is_file() {
-            bail!(
-                "candidate commit {} names part {} but the directory does not hold it",
-                manifest.commit,
-                part_ref.file
-            );
-        }
-        if let Some(want) = &part_ref.b3 {
-            let got = hash_file_with_control(&path, control, "manifest recovery validation")?
-                .to_hex()
-                .to_string();
-            if &got != want {
-                bail!(
-                    "candidate commit {} names part {} with the wrong digest",
-                    manifest.commit,
-                    part_ref.file
-                );
-            }
-        }
-        let part = Arc::new(Part::open_in_with_limits(&path, pcache.clone(), read_limits)?);
-        part_sections += part.verify_sections_with_control(control)?;
-        parts.push(part);
-    }
-    let reader = ReadStore { fold: Arc::new(fold), parts, manifest, read_limits };
-    let (records, content_values) = validate_candidate_records(&reader, control)?;
-    Ok(RecoveryReport {
-        records,
-        content_values,
-        parts: reader.parts.len(),
-        part_sections,
-        fold_segments: scrub.segments,
-        fold_blocks: scrub.blocks,
-        fold_bytes: scrub.bytes,
-        ..RecoveryReport::default()
-    })
-}
-
-/// Read a whole small file, refusing one larger than `max` rather than allocating for it.
-fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let file = crate::vfs::open_read(path)?;
-    let announced = file.metadata()?.len();
-    if announced > max {
-        bail!("{} is {announced} bytes, over the {max}-byte limit", path.display());
-    }
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(announced as usize).context("reserve read buffer")?;
-    file.take(max + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        bail!("{} grew past the {max}-byte limit while reading", path.display());
-    }
-    Ok(bytes)
-}
-
-fn promote_manifest_with_limits(
-    dir: &Path,
-    commit: u64,
-    bytes: &[u8],
-    read_limits: ReadLimits,
-) -> Result<()> {
-    // Recovery stages one temporary name before publication. If MANIFEST is absent, the rename
-    // also leaves one additional persistent root entry. Reserve that worst case before changing
-    // the supplied directory; the abandonment pruning below only removes entries, so the
-    // reservation is not affected by it.
-    let directory_entries = count_directory_entries(dir, read_limits, "store directory")?;
-    read_limits.admit_directory_entries(
-        "store directory during manifest recovery",
-        directory_entries.saturating_add(1),
-    )?;
-    // Abandonment becomes durable BEFORE the new timeline publishes. The reverse order left a
-    // window where the promoted MANIFEST and the abandoned newer retained manifests were both
-    // durable: a crash there resurrected the abandoned timeline, a re-run of recovery would see
-    // the chain diverge, treat the store as damaged, and — because the resurrected commits are
-    // genuine descendants that can validate — promote the exact history the operator authorized
-    // abandoning. Pruning first converges instead: a crash before the rename leaves the damaged
-    // manifest and fewer candidates, and re-running recovery promotes the same target. The
-    // unlinks are propagated, not best-effort — an abandonment that cannot be made durable must
-    // not be reported as one.
-    let mut abandoned = false;
-    for retained in list_retained_with_limits(dir, read_limits)? {
-        if retained > commit {
-            crate::vfs::unlink(&retained_path(dir, retained))?;
-            abandoned = true;
-        }
-    }
-    if abandoned {
-        crate::vfs::sync_dir(dir)?;
-    }
-    let tmp = dir.join("MANIFEST.tmp");
-    let f = crate::vfs::create(&tmp)?;
-    crate::vfs::write_all_at(&f, &tmp, bytes, 0)?;
-    crate::vfs::sync_file(&f, &tmp)?;
-    drop(f);
-    crate::vfs::rename(&tmp, &dir.join("MANIFEST"))?;
-    crate::vfs::sync_dir(dir)?;
-    Ok(())
-}
-
-/// The retained snapshot commits a single-file store holds, oldest first — the commits
+/// The retained manifest revisions a single-file store holds, oldest first — the revisions
 /// [`open_read_container_at`] can still serve.
 pub fn retained_commits_file(path: &Path) -> Result<Vec<u64>> {
     let c = crate::container::Container::open(path)?;
+    verify_chain_container(
+        &c,
+        ReadLimits::default(),
+        &crate::control::OperationControl::default(),
+    )?;
     Ok(container_retained_commits(&c))
 }
 
@@ -2421,46 +2775,77 @@ pub fn retained_commits_file(path: &Path) -> Result<Vec<u64>> {
 /// manifest checked byte-identical to its newest retained copy.
 pub fn verify_chain_file(path: &Path) -> Result<ChainReport> {
     let c = crate::container::Container::open(path)?;
-    verify_chain_container(&c, &crate::control::OperationControl::default())
+    verify_chain_container(&c, ReadLimits::default(), &crate::control::OperationControl::default())
 }
 
-/// Restore a single-file backup: verify every member of `src` against its recorded checksums,
-/// then publish a byte-identical copy at `dst` with a rename that refuses to replace. The
-/// backup IS a store — sealed by `backup`, final by flag — so restoring is verified copying,
-/// and a crash leaves staging litter and an untouched destination.
-pub fn restore_file(src: &Path, dst: &Path) -> Result<crate::pack::RestoreStats> {
-    restore_file_with_control(src, dst, &crate::control::OperationControl::default())
+/// Restore a single-file backup: copy `src` into staging, fully verify that exact staged store,
+/// then install it at `dst` with a rename that refuses to replace. The backup is itself a store,
+/// so restoring is verified copying, and a crash leaves staging litter and an untouched
+/// destination.
+pub fn restore_file(src: &Path, dst: &Path) -> Result<crate::backup::RestoreStats> {
+    restore_file_with_control_and_limits(
+        src,
+        dst,
+        ReadLimits::default(),
+        &crate::control::OperationControl::default(),
+    )
+}
+
+/// [`restore_file`] with explicit admission limits for the staged artifact.
+pub fn restore_file_with_limits(
+    src: &Path,
+    dst: &Path,
+    read_limits: ReadLimits,
+) -> Result<crate::backup::RestoreStats> {
+    restore_file_with_control_and_limits(
+        src,
+        dst,
+        read_limits,
+        &crate::control::OperationControl::default(),
+    )
 }
 
 /// [`restore_file`] with cooperative cancellation; the last checkpoint is immediately before the
-/// publishing rename, and a cancelled restore removes its staging and never publishes.
+/// installing rename, and a cancelled restore removes its staging and never installs.
 pub fn restore_file_with_control(
     src: &Path,
     dst: &Path,
     control: &crate::control::OperationControl,
-) -> Result<crate::pack::RestoreStats> {
+) -> Result<crate::backup::RestoreStats> {
+    restore_file_with_control_and_limits(src, dst, ReadLimits::default(), control)
+}
+
+/// [`restore_file`] with both explicit staged-artifact admission and cooperative cancellation.
+pub fn restore_file_with_control_and_limits(
+    src: &Path,
+    dst: &Path,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<crate::backup::RestoreStats> {
+    if !crate::backup::ATOMIC_RESTORE {
+        return Err(crate::backup::BackupError::Unsupported(
+            "this target has no atomic no-replace artifact-installation primitive".to_string(),
+        )
+        .into());
+    }
+    let read_limits = read_limits.validate()?;
+    debris::validate_store_path(src)?;
+    debris::validate_store_path(dst)?;
     control.check("backup restore")?;
-    crate::pack::ensure_destination_available(dst)?;
-    let c = crate::container::Container::open(src)?;
-    // A member failing its checksum is CORRUPTION, and the refusal must classify as such —
-    // the same integrity wrapper every verification path speaks through.
-    let members = verification_integrity("verify backup before restoring", c.verify())?;
-    drop(c);
-    control.check("backup restore")?;
-    let mut staging = dst.as_os_str().to_os_string();
-    staging.push(".restoring");
-    let staging = PathBuf::from(staging);
-    let _ = crate::vfs::unlink(&staging);
+    crate::backup::ensure_destination_available(dst)?;
+    let staging = artifact_staging_path(dst, "restoring");
+    crate::backup::ensure_source_is_not_staging(src, &staging)?;
     // The copy goes through the vfs seam in bounded chunks and is fsynced before anything
-    // depends on it: the publishing rename must never make bytes reachable that a crash could
+    // depends on it: the installing rename must never make bytes reachable that a crash could
     // still take back — and a copy the crash simulator cannot see is a copy the crash-safety
     // argument does not cover.
-    {
+    let mut uninstalled = {
         use std::io::Read;
         let mut from =
             crate::vfs::open_read(src).with_context(|| format!("open backup {}", src.display()))?;
-        let to = crate::vfs::create(&staging)
+        let to = crate::vfs::create_new_staging(&staging)
             .with_context(|| format!("stage restore at {}", staging.display()))?;
+        let cleanup = UninstalledArtifact::new(staging.clone());
         let mut buf = vec![0u8; 1 << 20];
         let mut at = 0u64;
         loop {
@@ -2472,127 +2857,20 @@ pub fn restore_file_with_control(
             at += n as u64;
         }
         crate::vfs::sync_file(&to, &staging)?;
-    }
-    // Restoring births a WRITABLE store: the backup stays sealed forever, and the copy is a new
-    // file whose life is just starting. The unseal happens on the staging side of the rename, so
-    // the destination is never observable sealed.
-    {
-        let mut fresh = crate::container::Container::open(&staging)?;
-        fresh.clear_seal_for_restore()?;
-    }
-    if let Err(interrupted) = control.check("backup restore publication") {
-        let _ = crate::vfs::unlink(&staging);
-        return Err(interrupted.into());
-    }
+        cleanup
+    };
+    let (members, bytes, commit, _) =
+        verify_container_artifact(&staging, FoldCfg::default(), read_limits, control)
+            .with_context(|| format!("verify staged restore {}", staging.display()))?;
+    control.check("backup restore installation")?;
     crate::vfs::rename_noreplace(&staging, dst)?;
+    uninstalled.installed();
     if let Some(parent) = dst.parent() {
         crate::vfs::sync_dir(parent).with_context(|| {
-            format!("sync {} after publishing {}", parent.display(), dst.display())
+            format!("sync {} after installing {}", parent.display(), dst.display())
         })?;
     }
-    // Member bytes, not file length: the same accounting the backup reported, so a consumer can
-    // compare the two stats and see the identity they describe.
-    let restored = crate::container::Container::open(dst)?;
-    let bytes = restored.member_bytes();
-    let commit =
-        Manifest::parse(&restored.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?.commit;
-    Ok(crate::pack::RestoreStats { files: members, bytes, commit })
-}
-
-/// What a conversion carried forward.
-#[derive(Clone, Copy, Debug)]
-pub struct ConvertStats {
-    /// Members written into the fresh store.
-    pub members: usize,
-    /// Bytes those members hold.
-    pub bytes: u64,
-    /// The manifest commit the converted store opens at, unchanged from the source.
-    pub commit: u64,
-}
-
-/// Convert an old layout — a store directory, or a sealed pack — into a single-file store.
-///
-/// This is the one door those layouts keep. A directory store is opened with the writer role
-/// (which settles its WAL: acknowledged records ride along, exactly as a reopen would carry
-/// them), flushed if it held staged records, and its committed snapshot copied member by member.
-/// A pack is copied straight from its extents. Either way the output is a fresh, WRITABLE
-/// single-file store carrying the source's manifest verbatim — same commit counter, same part
-/// pins, same punched declaration — verified whole before this returns, refused rather than
-/// replacing anything at `out`.
-///
-/// The retained commit log deliberately does not convert: it pins the source's history, and the
-/// converted file starts its history at the commit it carries — the same posture a pack has
-/// always taken.
-pub fn convert_to_file(src: &Path, out: &Path) -> Result<ConvertStats> {
-    if !src.exists() {
-        // Typed absence: a missing source is NOT_FOUND, never a shrug about unrecognized layouts.
-        return Err(anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{} does not exist", src.display()),
-        )));
-    }
-    crate::pack::ensure_destination_available(out)?;
-    // The converted store is BUILT in staging and published with a rename that refuses to
-    // replace: a crash mid-conversion leaves staging litter and an absent destination, and
-    // re-running the conversion is always the whole recovery story.
-    let mut staging = out.as_os_str().to_os_string();
-    staging.push(".converting");
-    let staging = PathBuf::from(staging);
-    let _ = crate::vfs::unlink(&staging);
-    let stats = if src.is_dir() {
-        // The writer role settles the WAL and replays acknowledged records into the memtable;
-        // one flush makes them part of the committed snapshot the copy walks.
-        let mut store = Store::open(src, FoldCfg::default())?;
-        store.sync()?;
-        store.flush()?;
-        drop(store);
-        let commit = checkpoint_into_container(src, &staging)?;
-        let fresh = crate::container::Container::open(&staging)?;
-        fresh.verify()?;
-        ConvertStats { members: fresh.len(), bytes: fresh.member_bytes(), commit }
-    } else {
-        let kind = single_file_kind(src).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} is neither a store directory, a pack, nor a container",
-                src.display()
-            )
-        })?;
-        match kind {
-            SingleFileKind::Container => bail!(
-                "{} is already a single-file store; a writer open upgrades its revision in place",
-                src.display()
-            ),
-            SingleFileKind::Pack => {
-                let pack = crate::pack::Pack::open(src)?;
-                let mut fresh = crate::container::Container::create(&staging)?;
-                let mut members = 0usize;
-                let mut bytes = 0u64;
-                for name in pack.names().map(String::from).collect::<Vec<_>>() {
-                    let reader = pack.file(&name).expect("name came from this pack");
-                    let len = crate::readat::ReadAt::len(&reader)?;
-                    fresh.put_stream(&name, len, |at, into| {
-                        crate::readat::ReadAt::read_exact_at(&reader, into, at)
-                    })?;
-                    members += 1;
-                    bytes += len;
-                }
-                fresh.commit()?;
-                fresh.verify()?;
-                let manifest =
-                    Manifest::parse(&fresh.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
-                ConvertStats { members, bytes, commit: manifest.commit }
-            }
-        }
-    };
-    crate::vfs::rename_noreplace(&staging, out)?;
-    if let Some(parent) = out.parent() {
-        // The published name is the result; a failed directory sync means it may not survive a
-        // crash, and the operation reports that rather than success.
-        crate::vfs::sync_dir(parent).with_context(|| {
-            format!("sync {} after publishing {}", parent.display(), out.display())
-        })?;
-    }
-    Ok(stats)
+    Ok(crate::backup::RestoreStats { members, bytes, commit })
 }
 
 /// Retained commit numbers held as `MANIFEST.NNNNNNNN` members, parsed numerically exactly as
@@ -2616,11 +2894,43 @@ fn fold_generation_of_member(name: &str) -> Option<u32> {
     } else {
         let digits = prefix.strip_prefix("fold-")?;
         if digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()) {
-            digits.parse().ok()
+            digits
+                .parse::<u32>()
+                .ok()
+                .filter(|generation| (1..=crate::fold::MAX_FOLD_GENERATION).contains(generation))
         } else {
             None
         }
     }
+}
+
+/// Fold segment members whose outer container checksum was intentionally invalidated by content
+/// punch. Their frame-level validation remains mandatory; only the redundant whole-member CRC is
+/// inapplicable after an authorized payload has been deallocated or partially deallocated.
+pub(crate) fn verified_punched_fold_members(
+    container: &crate::container::Container,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+) -> Result<HashSet<String>> {
+    if !container.contains("MANIFEST") {
+        return Ok(HashSet::new());
+    }
+    let manifest = Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
+    if manifest.punched.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let fold = open_fold_from_container(container, &manifest, cfg, container.path(), read_limits)?;
+    fold.scrub_with_control(control)?;
+    let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
+    let punched =
+        |block_id: u32| manifest.punched.iter().any(|&(lo, hi)| (lo..=hi).contains(&block_id));
+    Ok(fold
+        .block_inventory_with_control(control)?
+        .into_iter()
+        .filter(|block| punched(block.block_id))
+        .map(|block| format!("{prefix}/{}", crate::fold::segment::seg_name(block.segment)))
+        .collect())
 }
 
 /// The sweep's single-file form: move members no manifest — live or retained — names onto the
@@ -2633,14 +2943,16 @@ fn sweep_unreachable_container(
     _read_limits: ReadLimits,
 ) -> Result<()> {
     let mut keep_parts: std::collections::HashSet<String> =
-        live.parts.iter().map(|p| p.file.clone()).collect();
+        live.parts.iter().map(|p| p.member.clone()).collect();
     let mut keep_gens: std::collections::HashSet<u32> = std::iter::once(live.fold_gen).collect();
     for commit in container_retained_commits(c) {
         let name = format!("MANIFEST.{commit:08}");
-        // A retained copy that fails to read or parse pins nothing — identical to the file rule.
-        let Ok(bytes) = c.read_file_bounded(&name, MAX_MANIFEST_BYTES) else { continue };
-        let Ok(m) = Manifest::parse(&bytes) else { continue };
-        keep_parts.extend(m.parts.into_iter().map(|p| p.file));
+        let bytes = c
+            .read_file_bounded(&name, MAX_MANIFEST_BYTES)
+            .with_context(|| format!("read retained manifest {commit} before member sweep"))?;
+        let m = Manifest::parse(&bytes)
+            .with_context(|| format!("validate retained manifest {commit} before member sweep"))?;
+        keep_parts.extend(m.parts.into_iter().map(|p| p.member));
         keep_gens.insert(m.fold_gen);
     }
     let names: Vec<String> = c.names().map(String::from).collect();
@@ -2653,7 +2965,7 @@ fn sweep_unreachable_container(
             false
         };
         if unreachable {
-            let _ = c.remove(&name);
+            c.remove(&name)?;
         }
     }
     Ok(())
@@ -2677,31 +2989,9 @@ fn file_tmp_dir(store: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Where a store lives: a directory of files, or one container file. Everything the engine does
-/// is home-neutral above the storage seams; what branches here is only placement — where a part
-/// lands, how a manifest publishes, what a sweep frees.
-enum Home {
-    Dir(PathBuf),
-    File { path: PathBuf, container: std::sync::Arc<std::sync::Mutex<crate::container::Container>> },
-}
-
-impl Home {
-    /// The directory a directory store lives in. A refusal for a single-file store — used by
-    /// operations not yet taught the single-file protocol, so an unconverted path refuses loudly
-    /// instead of inventing filesystem locations that do not exist.
-    fn dir(&self) -> Result<&Path> {
-        match self {
-            Home::Dir(dir) => Ok(dir),
-            Home::File { path, .. } => bail!(
-                "{} is a single-file store; this operation has not yet been taught its protocol",
-                path.display()
-            ),
-        }
-    }
-}
-
 pub struct Store {
-    home: Home,
+    path: PathBuf,
+    container: std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
     fold: Fold,
     parts: Vec<Arc<Part>>,
     manifest: Manifest,
@@ -2721,6 +3011,10 @@ pub struct Store {
     pcache: Arc<SectionCache>,
     metrics: crate::observability::StoreMetrics,
     events: crate::observability::EventJournal,
+    /// Fold state may already contain content for a mutation whose WAL append failed. Reusing that
+    /// dedup state could let a later WAL frame omit bytes replay cannot find, so only reopen may
+    /// discard the unpublished fold tail and restore a coherent acceptance boundary.
+    requires_reopen: bool,
 }
 
 /// Cheap operational state for an embedder's health and metrics endpoint.
@@ -2730,6 +3024,8 @@ pub struct Store {
 /// cheap snapshot rather than hidden behind a surprisingly expensive getter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreHealth {
+    /// Public store-authority encoding: zero is the canonical origin; a positive value is the
+    /// current manifest revision.
     pub commit: u64,
     pub fold_generation: u32,
     pub parts: usize,
@@ -2760,32 +3056,22 @@ pub struct StoreHealth {
     pub punched_blocks: u64,
 }
 
-/// File bytes in one reachability class.
+/// Member bytes in one reachability class.
 ///
-/// `logical_bytes` is portable file length. `allocated_bytes` measures filesystem blocks and is
-/// `None` where the platform cannot report sparse allocation honestly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `logical_bytes` is portable member length. `allocated_bytes` is `None` until single-file extent
+/// attribution can report real filesystem allocation rather than inventing a structural zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpaceAmount {
-    pub files: usize,
+    pub members: usize,
     pub logical_bytes: u64,
     pub allocated_bytes: Option<u64>,
-}
-
-impl Default for SpaceAmount {
-    fn default() -> Self {
-        SpaceAmount {
-            files: 0,
-            logical_bytes: 0,
-            allocated_bytes: if cfg!(any(unix, windows)) { Some(0) } else { None },
-        }
-    }
 }
 
 /// Exact reachability-aware storage facts for preflight and operational reporting.
 ///
 /// Categories are disjoint. `retained_only` is not garbage: bounded time-travel manifests still
-/// require it. `unclassified` is deliberately not called reclaimable because an embedder may have
-/// placed an unrelated file in the directory and TurnDB has no authority to delete it.
+/// require it. `unclassified` is deliberately not called reclaimable: it includes both unnamed
+/// free extents and named members for which neither live nor retained manifest grants authority.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreSpaceUsage {
     pub live: SpaceAmount,
@@ -2807,47 +3093,6 @@ pub struct RefoldSpaceEstimate {
     pub estimated_stage_bytes: u64,
     pub estimate_is_hard_bound: bool,
     pub filesystem_available_bytes: Option<u64>,
-}
-
-/// Exact progress of upgrading the current live immutable-part set to this build's format.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FormatMigrationStatus {
-    pub target_part_version: u8,
-    pub live_parts: usize,
-    pub current_parts: usize,
-    pub legacy_parts: usize,
-    pub legacy_rows: u64,
-    pub legacy_bytes: u64,
-    /// Unique legacy parts pinned only by retained manifests, not counted in `legacy_parts`.
-    pub retained_legacy_parts: usize,
-    pub retained_legacy_rows: u64,
-    pub retained_legacy_bytes: u64,
-}
-
-/// Exact source facts and an advisory stage estimate for one resumable migration step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FormatMigrationPlan {
-    pub part_index: usize,
-    pub source_part_version: u8,
-    pub seq_lo: u64,
-    pub seq_hi: u64,
-    pub input_rows: u64,
-    pub input_bytes: u64,
-    pub input_sections: usize,
-    pub input_raw_section_bytes: u64,
-    pub estimated_stage_bytes: u64,
-    pub estimate_is_hard_bound: bool,
-    pub retained_input_bytes_after_commit: u64,
-    pub filesystem_available_bytes: Option<u64>,
-}
-
-/// Evidence returned after atomically publishing one migrated part.
-#[derive(Clone, Copy, Debug)]
-pub struct FormatMigrationStep {
-    pub plan: FormatMigrationPlan,
-    pub output_bytes: u64,
-    pub remaining_legacy_parts: usize,
-    pub rewrite: crate::part::merge::MergeStats,
 }
 
 /// Refuse an inverted scan range before it reaches `BTreeMap::range`, which PANICS on
@@ -2873,18 +3118,35 @@ impl Store {
     /// taste — see that method's numbers.
     pub const AUTO_COMPACT_K: usize = 8;
 
-    /// Open a writer over the retired directory layout — the converter's private door, and no
-    /// one else's. Takes the writer lock (through the fold's lock file) and recovers, exactly as
-    /// every directory session always did, because a conversion must settle the WAL it finds.
-    pub(crate) fn open(dir: &Path, cfg: FoldCfg) -> Result<Store> {
-        Self::open_with_options(dir, StoreOptions { fold: cfg, ..StoreOptions::default() })
+    fn ensure_writer_usable(&self) -> Result<()> {
+        if self.requires_reopen {
+            bail!("writer requires reopen after a failed staged operation");
+        }
+        self.fold.ensure_no_failed_write()?;
+        self.container.lock().expect("container lock poisoned").ensure_store_writer_usable()
+    }
+
+    fn discard_staged_and_require_reopen(
+        &mut self,
+        operation: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        self.requires_reopen = true;
+        match self.container.lock().expect("container lock poisoned").discard_staged() {
+            Ok(()) => error.context(format!(
+                "{operation} failed after staging began; staged authority discarded and writer requires reopen"
+            )),
+            Err(cleanup) => cleanup.context(format!(
+                "{operation} failed ({error:#}); discarding its staged authority also failed and writer requires reopen"
+            )),
+        }
     }
 
     /// Open a writer over the single-file store — THE way a store opens for writing.
     ///
-    /// `path` names a container; an absent path becomes a new, empty store, exactly as an absent
-    /// directory does. Beside it while open: `<path>-wal`, replayed here if a crash left it, and
-    /// nothing else. Writer exclusion is `flock` on the file itself, kernel-released on death.
+    /// `path` names a container; an absent path becomes a new, empty store. Beside it while open:
+    /// `<path>-wal`, replayed here if a crash left it. Native writer exclusion uses `flock` on Unix
+    /// and `LockFileEx` on Windows, on the container handle, and is OS-released on death.
     pub fn open_file(path: &Path, cfg: FoldCfg) -> Result<Store> {
         Self::open_file_with_options(path, StoreOptions { fold: cfg, ..StoreOptions::default() })
     }
@@ -2905,29 +3167,15 @@ impl Store {
     pub fn open_file_with_options(path: &Path, options: StoreOptions) -> Result<Store> {
         let recovery_started = std::time::Instant::now();
         let StoreOptions { fold: cfg, write_limits, read_limits, part_cache_bytes } = options;
+        debris::validate_store_path(path)?;
+        crate::fold::validate_cfg(cfg)?;
         let write_limits = write_limits.validate()?;
         let read_limits = read_limits.validate()?;
         if part_cache_bytes < crate::part::cache::BUDGET_MIN {
             bail!("part_cache_bytes must be at least {}", crate::part::cache::BUDGET_MIN);
         }
         if path.is_dir() {
-            bail!(
-                "{} is a directory; a store is one file — the directory layout is retired, and \
-                 `convert` is its one door",
-                path.display()
-            );
-        }
-        // A 0.1.x working session beside the store (CHANGELOG, 0.1.0/0.1.2) may hold acknowledged
-        // writes only that release can settle: refuse, name it, never remove it.
-        let legacy = debris::refusal_beside(path, read_limits)?;
-        if !legacy.is_empty() {
-            bail!(
-                "{} has a 0.1.x working directory beside it ({}), which may hold acknowledged \
-                 writes only that release can settle; open it with the release that wrote it, or \
-                 move it aside deliberately — this release never removes it",
-                path.display(),
-                legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-            );
+            bail!("{} is a directory; a TurnDB store is one current-format file", path.display());
         }
         let reclaim = crate::container::reclaim_names(path);
         if !path.exists() && !reclaim.anchor.exists() {
@@ -2948,74 +3196,89 @@ impl Store {
             // A reclaim's replace crashed in the state the ANCHOR protocol admits — the store's
             // name gone, the anchor intact. That protocol runs where a replace over an open
             // destination is not durable (`sys::replace_open_durability`), but the anchor is a
-            // file beside the store and travels with it, so recovery runs on every platform.
-            // Recover from the anchor, or refuse; never create.
-            recover_store_from_reclaim_anchor(path, cfg, read_limits)?;
+            // file beside the store and travels with it, so interrupted-reclaim completion runs on
+            // every platform. Restore from the anchor, or refuse; never create.
+            restore_store_from_reclaim_anchor(path, cfg, read_limits)?;
         }
         let container = if !path.exists() {
-            // The parent directories are created exactly as the directory store's open always
-            // created its own — the friendliness embedders relied on, kept.
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     crate::vfs::mkdir_all(parent)?;
                 }
             }
-            crate::container::Container::create(path)?
+            crate::container::Container::create_internal_with_limits(path, read_limits)?
         } else {
-            match crate::container::Container::open(path) {
-                Ok(c) => c,
-                // A crash inside creation leaves a file no longer than the superblock region —
-                // short slots, torn slots, or both dropped entirely — and such a file provably
-                // names no member byte: nothing durable lives below REGION_START. The writer's
-                // create-if-absent contract finishes the birth. One byte longer and the refusal
-                // stands: a mature store with both slots smashed holds someone's members, and
-                // re-birthing it would be data loss wearing recovery's clothes.
-                Err(_) if std::fs::metadata(path)?.len() <= crate::container::REGION_START => {
-                    crate::container::Container::recreate_interrupted(path)?
-                }
-                Err(e) => return Err(e),
-            }
+            crate::container::Container::open_internal_with_limits(path, read_limits)?
         };
-        if container.sealed() {
-            bail!("{} is sealed; sealed is final — a writer cannot open it", path.display());
-        }
-        container.lock_writer()?;
-        // The store is present, so it is authority: every transient name beside it — reclaim
-        // material, a Windows pending publish, a merge's scratch, an artifact staging — is dead by
-        // the protocol and removed here, counted on success; a removal that fails is this open's
-        // error with the path and the cause (#126), and nothing is counted.
-        let debris_removed = debris::remove_beside_present_store(path, read_limits)?;
+        let container = container.lock_writer_current()?;
 
         // The manifest is a member. Missing means a new store — UNLESS retained commits exist,
-        // which is the same tripwire the directory store fires: this store has committed before
+        // This store has committed before
         // and MANIFEST was lost, and opening it as new buries the loss.
         let manifest = if container.contains("MANIFEST") {
             let bytes = container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
-            verification_integrity("open committed manifest", Manifest::parse(&bytes))?
+            verification_integrity("open current manifest revision", Manifest::parse(&bytes))?
         } else {
-            let retained = container_retained_commits(&container);
-            if retained.is_empty() {
+            if container.committed_is_empty_birth() {
                 Manifest::default()
             } else {
                 return verification_integrity(
-                    "open committed manifest",
+                    "open current manifest revision",
                     Err(anyhow::anyhow!(
-                        "MANIFEST is missing but {} retained commits exist in {} — a damaged \
-                         store, not a new one",
-                        retained.len(),
-                        path.display()
+                        "container {} has no MANIFEST authority but is not the exact empty \
+                         sequence-zero birth state",
+                        path.display(),
                     )),
                 );
             }
         };
+        // Validate every structure referenced by current authority and the complete current WAL
+        // before any cleanup or writer-open mutation. An unknown/corrupt artifact is refused byte-for-
+        // byte, including its adjacent evidence.
+        let current = verification_integrity(
+            "preflight current store authority",
+            open_read_container_handle(&container, cfg, path, read_limits),
+        )?;
+        let wal_path = file_wal_path(path);
+        let mut replay = Wal::replay_state_with_limits(&wal_path, read_limits)?;
+        verification_integrity(
+            "preflight WAL content identities",
+            verify_replay_identities(&replay.frames, &current),
+        )?;
+        let verification_control = crate::control::OperationControl::default();
+        // Publication can become current before the now-redundant WAL prefix is truncated. Its
+        // frames remain integrity input above, but they are already represented by the current
+        // manifest and must not become pending record versions or be published a second time.
+        if manifest.commit != 0 {
+            replay.frames.retain(|frame| frame.seq != manifest.next_seq);
+        }
+        let chain = verification_integrity(
+            "preflight retained manifest chain",
+            verify_chain_container(&container, read_limits, &verification_control),
+        )?;
+        verification_integrity(
+            "preflight complete current store authority",
+            verify_committed_store(&current.parts, &current.fold, chain, &verification_control),
+        )?;
+        verification_integrity(
+            "preflight retained-authority piece dictionaries",
+            verify_retained_piece_dictionaries(
+                &container,
+                path,
+                cfg,
+                read_limits,
+                &verification_control,
+            ),
+        )?;
+        drop(current);
         let retained_commit_count = container_retained_commits(&container).len();
         let container = std::sync::Arc::new(std::sync::Mutex::new(container));
 
-        // No residue reconciliation and no fold truncation: a retained commit newer than live
-        // cannot exist (one flip names everything), and the committed extent lists ARE the
-        // truncation. The recovery passes the directory open performs here are unaskable.
+        // No residue reconciliation and no fold truncation: a retained manifest revision newer than
+        // current cannot exist (one flip names everything), and the selected extent lists are the
+        // complete authority. No writer-open mutation begins until current state and WAL validate.
         let fold = verification_integrity(
-            "open committed fold",
+            "open fold referenced by current authority",
             Fold::open_container_writer(
                 container.clone(),
                 manifest.fold_gen,
@@ -3030,20 +3293,23 @@ impl Store {
         let mut parts = Vec::with_capacity(manifest.parts.len());
         for p in &manifest.parts {
             let reader =
-                container.lock().expect("container lock poisoned").extent(&p.file).ok_or_else(
+                container.lock().expect("container lock poisoned").extent(&p.member).ok_or_else(
                     || {
                         anyhow::anyhow!(
                             "MANIFEST names part {} but {} does not hold it",
-                            p.file,
+                            p.member,
                             path.display()
                         )
                     },
                 )?;
             parts.push(Arc::new(verification_integrity(
                 "open committed part",
-                Part::open_reader_with_limits(Box::new(reader), pcache.clone(), read_limits),
+                open_manifest_part(Box::new(reader), p, pcache.clone(), read_limits),
             )?));
         }
+
+        // Only now has every committed storage plane and WAL frame proved intelligible.
+        let debris_removed = debris::remove_beside_present_store(path, read_limits)?;
 
         // Stage the sweep's frees now; they publish with the first flip that has anything else
         // to say. Nothing reads a free-listed member meanwhile — no manifest names it.
@@ -3058,8 +3324,6 @@ impl Store {
             let _ = crate::vfs::remove_tree(&tmp_dir);
         }
 
-        let wal_path = file_wal_path(path);
-        let replay = Wal::replay_state_with_limits(&wal_path, read_limits)?;
         let recovered_wal_frames = u64::try_from(replay.frames.len()).unwrap_or(u64::MAX);
         let physical_wal_frames = replay.physical_frames;
         let valid_wal_bytes = replay.valid_bytes;
@@ -3071,10 +3335,18 @@ impl Store {
                 // Resolve through both tiers before re-folding, exactly as the write path does.
                 // The crash window between the flip and the WAL truncate replays frames whose
                 // pieces the just-committed part already holds; re-appending them would leak the
-                // bytes into the file for nothing. (The directory open still re-appends there —
-                // a space cost, not a correctness one — and inherits this fix when it converges.)
-                let known = fold.lookup(*h).is_some()
-                    || parts.iter().rev().any(|p| matches!(p.lookup_piece(h), Ok(Some(_))));
+                // bytes into the file for nothing.
+                let mut known = fold.lookup(*h).is_some();
+                if !known {
+                    for part in parts.iter().rev() {
+                        if let Some(location) = part.find_piece(h)? {
+                            if !fold.is_punched(location.block_id) {
+                                known = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if !known {
                     let put = fold.put_hashed(bytes, *h)?;
                     debug_assert_eq!(put.hash, *h);
@@ -3096,16 +3368,17 @@ impl Store {
             ..crate::observability::StoreMetrics::default()
         };
         let recovery_duration = recovery_started.elapsed();
-        metrics.open_recovery.observe_success(recovery_duration);
+        metrics.open_wal_replay.observe_success(recovery_duration);
         let mut events = crate::observability::EventJournal::default();
         let recovery_result: Result<()> = Ok(());
         events.observe(
-            crate::observability::LifecycleOperation::OpenRecovery,
+            crate::observability::LifecycleOperation::OpenWalReplay,
             recovery_duration,
             &recovery_result,
         );
         Ok(Store {
-            home: Home::File { path: path.to_path_buf(), container },
+            path: path.to_path_buf(),
+            container,
             fold,
             parts,
             manifest,
@@ -3119,6 +3392,7 @@ impl Store {
             pcache,
             metrics,
             events,
+            requires_reopen: false,
         })
     }
 
@@ -3127,219 +3401,39 @@ impl Store {
     /// removed. A store dropped without closing keeps its sidecar — present-at-open means crash,
     /// and the next open replays it — so close is a tidy, never a requirement.
     pub fn close(mut self) -> Result<()> {
+        self.ensure_writer_usable()?;
         if !self.mem.is_empty() {
             self.flush()?;
         }
-        if let Home::File { path, .. } = &self.home {
-            if self.wal.frame_count() == 0 {
-                let wal_path = file_wal_path(path);
-                let _ = crate::vfs::unlink(&wal_path);
-                if let Some(parent) = wal_path.parent() {
-                    // "Exactly one file" is close's promise; it is not durable if this fails.
-                    crate::vfs::sync_dir(parent).with_context(|| {
-                        format!("sync {} after removing the write-ahead log", parent.display())
-                    })?;
+        // Close completes any delayed publication acknowledgement even when the selected
+        // successor came from WAL-free maintenance such as merge or refold.
+        self.container.lock().expect("container lock poisoned").acknowledge_current_state()?;
+        if self.mem.is_empty() && self.wal.frame_count() != 0 {
+            // A publication can succeed before WAL truncation reports a barrier failure. The
+            // handle has already adopted the manifest and cleared the pending set in that case;
+            // retrying close must finish settling the now-redundant WAL rather than return success
+            // with a nonempty sidecar.
+            self.wal.truncate()?;
+        }
+        if self.wal.frame_count() == 0 {
+            let wal_path = file_wal_path(&self.path);
+            match crate::vfs::unlink(&wal_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("remove settled write-ahead log {}", wal_path.display())
+                    });
                 }
+            }
+            if let Some(parent) = wal_path.parent() {
+                // "Exactly one file" is close's promise; it is not durable if this fails.
+                crate::vfs::sync_dir(parent).with_context(|| {
+                    format!("sync {} after removing the write-ahead log", parent.display())
+                })?;
             }
         }
         Ok(())
-    }
-
-    fn open_with_options(dir: &Path, options: StoreOptions) -> Result<Store> {
-        let recovery_started = std::time::Instant::now();
-        let StoreOptions { fold: cfg, write_limits, read_limits, part_cache_bytes } = options;
-        let write_limits = write_limits.validate()?;
-        let read_limits = read_limits.validate()?;
-        if part_cache_bytes < crate::part::cache::BUDGET_MIN {
-            bail!("part_cache_bytes must be at least {}", crate::part::cache::BUDGET_MIN);
-        }
-        crate::vfs::mkdir_all(dir)?;
-        let manifest = match Manifest::load_with_limits(dir, read_limits) {
-            Ok(m) => m,
-            Err(e) => {
-                // A crash inside the FIRST commit is the one state where MANIFEST can be
-                // legitimately absent beside a commit log: the retained copy lands before the
-                // rename, and commit 1 has no previous manifest to leave behind. A log of exactly
-                // [1] with no MANIFEST is that signature — an intact copy COMPLETES the commit
-                // (data before pointers makes promotion indistinguishable from the crash landing
-                // a moment later), a torn copy VOIDS it (nothing was published). Every other
-                // missing-manifest shape means a manifest that once existed is gone, and stays a
-                // refusal. Found by the DST harness at the first flush's commit window.
-                let retained = list_retained_with_limits(dir, read_limits)?;
-                let live_absent = !crate::vfs::exists(&dir.join("MANIFEST"));
-                if live_absent && retained == [1] {
-                    if load_retained(dir, 1).is_ok() {
-                        complete_first_commit_with_limits(dir, read_limits)?;
-                    } else {
-                        crate::vfs::unlink(&retained_path(dir, 1))?;
-                        crate::vfs::sync_dir(dir)?;
-                    }
-                    verification_integrity(
-                        "open committed manifest",
-                        Manifest::load_with_limits(dir, read_limits),
-                    )?
-                } else if live_absent && !retained.is_empty() {
-                    // The one other legitimate shape: a crash INSIDE the manifest publish on a
-                    // platform whose replace-rename can leave neither the old name nor the new
-                    // (Windows; tests/dst.rs `rename-neither`). The commit protocol publishes
-                    // `MANIFEST.<commit>` before it touches the live name, so the newest retained
-                    // copy IS the manifest that was being published — but only if it validates
-                    // whole: the manifest, its fold at the candidate's tail, every part it names
-                    // by digest and section, and every record it serves. Anything less stays the
-                    // refusal below; an absent live manifest beside a damaged newest copy is a
-                    // damaged store, and rolling back to an older copy is an operator's decision
-                    // (`recover`), never an open's.
-                    let newest = *retained.last().expect("non-empty");
-                    match promote_newest_retained_if_whole(dir, cfg, newest, read_limits) {
-                        Ok(()) => verification_integrity(
-                            "open committed manifest",
-                            Manifest::load_with_limits(dir, read_limits),
-                        )?,
-                        Err(why) => {
-                            return verification_integrity(
-                                "open committed manifest",
-                                Err(e.context(format!(
-                                    "MANIFEST is absent and the newest retained copy \
-                                     (commit {newest}) does not validate whole, so it was not \
-                                     promoted: {why:#}"
-                                ))),
-                            );
-                        }
-                    }
-                } else {
-                    return verification_integrity("open committed manifest", Err(e));
-                }
-            }
-        };
-
-        // The live MANIFEST is the only commit point, so a retained name it does not dominate is
-        // residue, not state. Two shapes exist. A retained commit NEWER than live is a commit
-        // that never took effect — a crash between the commit protocol's retained copy and its
-        // rename; whatever it acknowledged is still in the WAL and replays below. A retained
-        // manifest from ANOTHER FOLD GENERATION is a re-fold's purge that lost a race with a
-        // crash, and keeps content the re-fold exists to erase readable. Left in place, either
-        // shape pins files this manifest's counters will re-create by name, so a later flush
-        // would truncate a file a retained manifest still claims a digest for — and verification
-        // would report an inconsistency in a store that is behaving correctly. Removal is durable
-        // and precedes the sweep, which then collects whatever only these names pinned. A torn
-        // retained copy parses as nothing, pins nothing, and is left for window pruning.
-        let mut reconciled = false;
-        for c in list_retained_with_limits(dir, read_limits)? {
-            let stale_timeline = c > manifest.commit;
-            let stale_generation = !stale_timeline
-                && load_retained(dir, c).map(|m| m.fold_gen != manifest.fold_gen).unwrap_or(false);
-            if stale_timeline || stale_generation {
-                crate::vfs::unlink(&retained_path(dir, c))?;
-                reconciled = true;
-            }
-        }
-        if reconciled {
-            crate::vfs::sync_dir(dir)?;
-        }
-
-        let root_entries = count_directory_entries(dir, read_limits, "store directory")?;
-        let fold_path = refold::fold_dir(dir, manifest.fold_gen);
-        let additions = u64::from(!fold_path.exists()) + u64::from(!dir.join("WAL").exists());
-        read_limits.admit_directory_entries(
-            "store directory during writer open",
-            root_entries.saturating_add(additions),
-        )?;
-
-        // Recovery is a truncate, not a negotiation: whatever the fold wrote past the committed tail
-        // is discarded, and the log regenerates it. The punched declaration rides in with the tail
-        // because recovery needs it DURING the scan: a crash mid-punch can leave a declared block's
-        // payload partially zeroed, and without the declaration that frame reads as a torn write
-        // and the committed tail as lost durable bytes.
-        let mut fold = verification_integrity(
-            "open committed fold",
-            Fold::open_at_over_with_limits(
-                &fold_path,
-                cfg,
-                manifest.fold_tail(),
-                &manifest.punched,
-                Vec::new(),
-                read_limits,
-            ),
-        )?;
-
-        let pcache = Arc::new(SectionCache::new(part_cache_bytes));
-        let mut parts = Vec::with_capacity(manifest.parts.len());
-        for p in &manifest.parts {
-            let opened = verification_integrity(
-                "open committed part",
-                Part::open_in_with_limits(&dir.join(&p.file), pcache.clone(), read_limits),
-            )?;
-            parts.push(Arc::new(opened));
-        }
-
-        // A part file or fold generation no manifest names was written by a flush, merge, or
-        // re-fold that crashed before committing, or has aged out of the retention window. Either
-        // way it is unreachable. Safe to unlink even with readers attached: Unix keeps their open
-        // mappings alive.
-        sweep_unreachable_with_limits(dir, read_limits)?;
-        // Crash litter: builder spools and staging files are all *.tmp, and every one of them is
-        // pre-commit garbage. Swept ONLY at writer open, not at flush — an external packer's
-        // staging file must not race a live writer's flush.
-        // Transient names in the directory: staging files by exact grammar, pending publishes
-        // anchored to a valid final name, retained copies past the window — removed, and a
-        // removal that fails is this open's error with the path and the cause.
-        let debris_removed = debris::remove_in_dir_layout(dir, read_limits)?;
-
-        let wal_path = dir.join("WAL");
-        let retained_commit_count = list_retained_with_limits(dir, read_limits)?.len();
-        let replay = Wal::replay_state_with_limits(&wal_path, read_limits)?;
-        let recovered_wal_frames = u64::try_from(replay.frames.len()).unwrap_or(u64::MAX);
-        let physical_wal_frames = replay.physical_frames;
-        let valid_wal_bytes = replay.valid_bytes;
-        let mut mem: BTreeMap<String, Option<Record>> = BTreeMap::new();
-        let mut mem_bytes = 0usize;
-        for f in replay.frames {
-            // Re-fold every piece this frame introduced. Content already below the committed tail
-            // dedups; content discarded by the truncate is written again.
-            for (h, bytes) in &f.novel {
-                let put = fold.put_hashed(bytes, *h)?;
-                debug_assert_eq!(put.hash, *h);
-            }
-            mem_bytes += approx_bytes(&f.record);
-            if f.tomb {
-                mem.insert(f.record.id, None);
-            } else {
-                mem.insert(f.record.id.clone(), Some(f.record));
-            }
-        }
-        let wal =
-            Wal::open_recovered(&wal_path, read_limits, physical_wal_frames, valid_wal_bytes)?;
-
-        let mut metrics = crate::observability::StoreMetrics {
-            recovered_wal_frames,
-            debris_removed,
-            ..crate::observability::StoreMetrics::default()
-        };
-        let recovery_duration = recovery_started.elapsed();
-        metrics.open_recovery.observe_success(recovery_duration);
-        let mut events = crate::observability::EventJournal::default();
-        let recovery_result: Result<()> = Ok(());
-        events.observe(
-            crate::observability::LifecycleOperation::OpenRecovery,
-            recovery_duration,
-            &recovery_result,
-        );
-        Ok(Store {
-            home: Home::Dir(dir.to_path_buf()),
-            fold,
-            parts,
-            manifest,
-            mem,
-            mem_bytes,
-            wal,
-            cfg,
-            write_limits,
-            read_limits,
-            retained_commit_count,
-            pcache,
-            metrics,
-            events,
-        })
     }
 
     /// The policy governing future writes through this handle.
@@ -3363,44 +3457,16 @@ impl Store {
             self.retained_commit_count.saturating_add(1).min(MANIFEST_RETAIN);
     }
 
-    fn admit_store_directory_growth(&self, additional: u64, operation: &str) -> Result<()> {
-        let Home::Dir(dir) = &self.home else {
-            // A single-file store has no directory to fill; member growth is admitted by the
-            // container's own ceilings at staging time.
-            return Ok(());
-        };
-        let current = count_directory_entries(dir, self.read_limits, "store directory")?;
-        self.read_limits.admit_directory_entries(
-            format!("store directory during {operation}"),
-            current.saturating_add(additional),
-        )?;
-        Ok(())
+    /// A referenced part's logical member size.
+    fn part_member_bytes(&self, member: &str) -> Result<u64> {
+        self.container.lock().expect("container lock poisoned").member_len(member).ok_or_else(
+            || anyhow::anyhow!("MANIFEST names part {member} but the container does not hold it"),
+        )
     }
 
-    /// A live part's on-disk size, wherever it lives: file metadata in a directory store, the
-    /// member's logical length in a single-file one.
-    fn part_file_bytes(&self, file: &str) -> Result<u64> {
-        match &self.home {
-            Home::Dir(dir) => Ok(crate::vfs::metadata(&dir.join(file))
-                .with_context(|| format!("measure live part {file}"))?
-                .len()),
-            Home::File { container, .. } => container
-                .lock()
-                .expect("container lock poisoned")
-                .member_len(file)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("MANIFEST names part {file} but the container does not hold it")
-                }),
-        }
-    }
-
-    /// Where filesystem capacity questions are asked: the store directory, or the directory the
-    /// store file lives in.
+    /// Directory containing the store, where filesystem capacity is measured.
     fn fs_probe_path(&self) -> &Path {
-        match &self.home {
-            Home::Dir(dir) => dir,
-            Home::File { path, .. } => path.parent().unwrap_or_else(|| Path::new(".")),
-        }
+        self.path.parent().unwrap_or_else(|| Path::new("."))
     }
 
     /// Monotonic, process-lifetime operation metrics for this writer handle.
@@ -3428,28 +3494,27 @@ impl Store {
     ) {
         use crate::observability::LifecycleOperation;
         match operation {
-            LifecycleOperation::OpenRecovery => {
-                self.metrics.open_recovery.observe(duration, result)
+            LifecycleOperation::OpenWalReplay => {
+                self.metrics.open_wal_replay.observe(duration, result)
             }
             LifecycleOperation::Sync => self.metrics.sync.observe(duration, result),
             LifecycleOperation::Flush => self.metrics.flush.observe(duration, result),
-            LifecycleOperation::Compaction => self.metrics.compaction.observe(duration, result),
+            LifecycleOperation::Merge => self.metrics.merge.observe(duration, result),
             LifecycleOperation::Backup => self.metrics.backup.observe(duration, result),
             LifecycleOperation::Verification => self.metrics.verification.observe(duration, result),
-            LifecycleOperation::Punch => self.metrics.punch.observe(duration, result),
+            LifecycleOperation::ContentPunch => {
+                self.metrics.content_punch.observe(duration, result)
+            }
             LifecycleOperation::Refold => self.metrics.refold.observe(duration, result),
             LifecycleOperation::Erase => self.metrics.erase.observe(duration, result),
-            LifecycleOperation::FormatMigration => {
-                self.metrics.format_migration.observe(duration, result)
-            }
         }
         self.events.observe(operation, duration, result);
     }
 
-    /// Verify the retained manifest chain, all live immutable-part sections, and every fold frame.
+    /// Verify the retained manifest chain, every selected immutable-part section, and every fold frame.
     ///
-    /// This covers the committed snapshot only. A writer that wants the report to include staged
-    /// work must sync and flush first. Failures are classified at this integrity boundary and
+    /// This covers current store authority only. A writer that wants the report to include its
+    /// pending change set must synchronize and publish first. Failures are classified at this integrity boundary and
     /// recorded in [`Store::metrics`].
     pub fn verify(&mut self) -> Result<StoreVerification> {
         self.verify_with_control(&crate::control::OperationControl::default())
@@ -3481,110 +3546,33 @@ impl Store {
         control: &crate::control::OperationControl,
     ) -> Result<StoreVerification> {
         control.check("store verification")?;
+        // The writer fold may contain pieces accepted into the pending change set. Verification
+        // observes one selected store authority, never writer staging.
+        let container =
+            crate::container::Container::open_internal_with_limits(&self.path, self.read_limits)?;
         let chain = verification_integrity(
             "verify retained manifest chain",
-            match &self.home {
-                Home::Dir(dir) => verify_chain_dir(dir, self.read_limits, control),
-                Home::File { container, .. } => {
-                    let c = container.lock().expect("container lock poisoned");
-                    verify_chain_container(&c, control)
-                }
-            },
+            verify_chain_container(&container, self.read_limits, control),
         )?;
-        let fold =
-            verification_integrity("verify fold frames", self.fold.scrub_with_control(control))?;
-        let mut part_sections = 0usize;
-        for part in &self.parts {
-            control.check("store verification")?;
-            let sections = verification_integrity(
-                "verify immutable part sections",
-                part.verify_sections_with_control(control),
-            )?;
-            part_sections = part_sections
-                .checked_add(sections)
-                .ok_or_else(|| anyhow::anyhow!("verified part section count overflow"))?;
-        }
-        // Reconstruct every named value in the committed snapshot. Section and frame checks prove
-        // the storage containers; this proves the references inside them resolve to the exact
-        // content identities the records claim. Deliberately use the committed read core rather
-        // than `Store::ids`/`Store::reconstruct_content`, which include staged memtable state.
-        let ids = verification_integrity("enumerate committed records", read::ids(&self.parts))?;
-        let mut content_values = 0usize;
-        let mut content_bytes = 0u64;
-        let mut content_identities = 0usize;
-        let mut unidentified_content_values = 0usize;
-        for id in &ids {
-            control.check("store verification")?;
-            let record =
-                verification_integrity("decode committed record", read::get(&self.parts, id))?
-                    .ok_or_else(|| {
-                        anyhow::Error::new(crate::error::IntegrityError::new(
-                            "decode committed record",
-                            anyhow::anyhow!("live id {id:?} disappeared during verification"),
-                        ))
-                    })?;
-            for content in &record.contents {
-                control.check("store verification")?;
-                let bytes = verification_integrity(
-                    "reconstruct committed content",
-                    read::reconstruct_content(&self.parts, &self.fold, id, &content.name),
-                )?
-                .ok_or_else(|| {
-                    anyhow::Error::new(crate::error::IntegrityError::new(
-                        "reconstruct committed content",
-                        anyhow::anyhow!(
-                            "record {id:?} lost named content {:?} during verification",
-                            content.name
-                        ),
-                    ))
-                })?;
-                content_values = content_values
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("verified content value count overflow"))?;
-                content_bytes = content_bytes
-                    .checked_add(bytes.len() as u64)
-                    .ok_or_else(|| anyhow::anyhow!("verified content byte count overflow"))?;
-                match content.identity {
-                    Some(want) => {
-                        let got = crate::types::ContentHash::of(&bytes);
-                        if got != want {
-                            return Err(crate::error::IntegrityError::new(
-                                "verify committed content identity",
-                                anyhow::anyhow!(
-                                    "record {id:?} content {:?} hashes to {got} but claims {want}",
-                                    content.name
-                                ),
-                            )
-                            .into());
-                        }
-                        content_identities =
-                            content_identities.checked_add(1).ok_or_else(|| {
-                                anyhow::anyhow!("verified content identity count overflow")
-                            })?;
-                    }
-                    None => {
-                        unidentified_content_values =
-                            unidentified_content_values.checked_add(1).ok_or_else(|| {
-                                anyhow::anyhow!("unidentified content value count overflow")
-                            })?;
-                    }
-                }
-            }
-        }
-        Ok(StoreVerification {
-            chain,
-            fold,
-            parts: self.parts.len(),
-            part_sections,
-            records: ids.len(),
-            content_values,
-            content_bytes,
-            content_identities,
-            unidentified_content_values,
-        })
+        let selected = verification_integrity(
+            "open selected store authority for verification",
+            open_read_container_handle(&container, self.cfg, &self.path, self.read_limits),
+        )?;
+        verification_integrity(
+            "verify retained-authority piece dictionaries",
+            verify_retained_piece_dictionaries(
+                &container,
+                &self.path,
+                self.cfg,
+                self.read_limits,
+                control,
+            ),
+        )?;
+        drop(container);
+        verify_committed_store(&selected.parts, &selected.fold, chain, control)
     }
 
-    /// Exact file-size and physical-row distribution for the current live immutable parts.
+    /// Exact member-size and physical-row distribution for the current live immutable parts.
     pub fn part_distribution(&self) -> Result<crate::observability::PartDistribution> {
         self.part_distribution_with_control(&crate::control::OperationControl::default())
     }
@@ -3601,7 +3589,7 @@ impl Store {
         let mut total_rows = 0u64;
         for part in &self.manifest.parts {
             control.check("part distribution")?;
-            let size = self.part_file_bytes(&part.file)?;
+            let size = self.part_member_bytes(&part.member)?;
             let part_rows = u64::from(part.records);
             total_bytes = total_bytes
                 .checked_add(size)
@@ -3641,11 +3629,12 @@ impl Store {
         })
     }
 
-    /// Inspect exact live, dead, and block-reclaimable folded content for a settled snapshot.
+    /// Inspect exact referenced, unreferenced, and block-reclaimable folded content for the
+    /// current manifest revision.
     ///
-    /// This walks visible record programs and reads each fold block header, but never decompresses
-    /// content. A flushed memtable is required so unpublished references cannot make dead content
-    /// appear safe to reclaim.
+    /// This walks visible record programs and verifies every exact owning-Part piece location.
+    /// A flushed memtable is required so unpublished references cannot make dead content appear
+    /// safe to reclaim.
     pub fn content_liveness(&self) -> Result<crate::observability::ContentLiveness> {
         self.content_liveness_with_control(&crate::control::OperationControl::default())
     }
@@ -3659,15 +3648,15 @@ impl Store {
         if !self.mem.is_empty() {
             bail!("content liveness requires a flushed memtable; call sync() and flush() first");
         }
-        let live_pieces = self.live_fold_pieces_with_control(control)?;
+        let live_pieces = live_fold_pieces_with_control(&self.parts, &self.fold, control)?;
         let live_block_ids: HashSet<u32> =
-            live_pieces.values().map(|location| location.block_id).collect();
+            live_pieces.keys().map(|location| location.block_id).collect();
         let mut report = crate::observability::ContentLiveness {
             live_pieces: u64::try_from(live_pieces.len())
                 .map_err(|_| anyhow::anyhow!("live piece count exceeds u64"))?,
             ..crate::observability::ContentLiveness::default()
         };
-        for location in live_pieces.values() {
+        for location in live_pieces.keys() {
             report.live_logical_bytes = report
                 .live_logical_bytes
                 .checked_add(u64::from(location.raw))
@@ -3717,7 +3706,7 @@ impl Store {
     ///
     /// ```text
     ///   Tier 0   the fold's in-memory window   — this flush's pieces, no I/O
-    ///   Tier 1   every live part's dictionary  — everything ever committed, filter then search
+    ///   Tier 1   every referenced part's dictionary — published content, filter then search
     ///   append   genuinely novel content
     /// ```
     ///
@@ -3729,16 +3718,30 @@ impl Store {
     ///
     /// **Why a Tier-1 hit needs no WAL bytes.** A part is only named by the manifest after its content
     /// was durable, and the committed fold tail only grows — so any location reachable through a part's
-    /// dictionary already sits below the tail that recovery truncates to. The bytes cannot be the ones
+    /// dictionary is already referenced below the current fold tail. The bytes cannot be the ones
     /// a crash discards.
     fn fold_piece(&mut self, b: &[u8]) -> Result<crate::fold::Put> {
         let hash = PieceHash::of(b);
-        let result = if let Some(loc) = self.locate(&hash)? {
-            // Seed the window so further references in this flush interval answer from memory.
-            self.fold.note(hash, loc);
-            crate::fold::Put { hash, loc, deduped: true }
-        } else {
-            self.fold.put_hashed(b, hash)?
+        let result = match (|| -> Result<crate::fold::Put> {
+            if let Some(loc) = self.locate(&hash)? {
+                // Seed the window so further references in this flush interval answer from memory.
+                self.fold.note(hash, loc);
+                Ok(crate::fold::Put { hash, loc, deduped: true })
+            } else {
+                self.fold.put_hashed(b, hash)
+            }
+        })() {
+            Ok(result) => result,
+            Err(error) => {
+                // Another span or batch member may already have staged healthy Fold bytes. No WAL
+                // frame owns them yet, so allowing the handle to continue could later dedup against
+                // bytes that disappear on reopen. Treat every folding-phase failure as requiring
+                // that reopen, even when this individual piece refused before mutation.
+                self.requires_reopen = true;
+                return Err(error).context(
+                    "content folding failed after acceptance staging began; reopen required",
+                );
+            }
         };
         self.metrics.folded_content.observe(b.len(), result.deduped);
         Ok(result)
@@ -3746,6 +3749,7 @@ impl Store {
 
     /// Fold the spans, log the record, and stage it. Durable only after [`Store::sync`].
     pub fn put(&mut self, id: &str, spans: &[Span], attrs: Vec<(String, AttrValue)>) -> Result<()> {
+        self.ensure_writer_usable()?;
         let input = [ContentSpans::new(BODY_CONTENT, spans.to_vec())];
         input_record_admission_bytes(
             id,
@@ -3755,11 +3759,12 @@ impl Store {
             self.read_limits,
             None,
         )?;
+        let sequence = self.pending_sequence()?;
         self.wal.admit_additional_frames(1)?;
         let mut novel = Vec::new();
         let body = self.fold_spans(BODY_CONTENT, spans, &mut novel)?;
         let rec = Record::new(id, vec![body], attrs)?;
-        self.stage_record(rec, novel)
+        self.stage_record(sequence, rec, novel)
     }
 
     /// Fold, log, and stage a general record with independently named content values.
@@ -3769,6 +3774,7 @@ impl Store {
         contents: &[ContentSpans<'_>],
         attrs: Vec<(String, AttrValue)>,
     ) -> Result<()> {
+        self.ensure_writer_usable()?;
         // Validate and meter the whole map before `fold_spans` can append anything to the fold.
         input_record_admission_bytes(
             id,
@@ -3778,6 +3784,7 @@ impl Store {
             self.read_limits,
             None,
         )?;
+        let sequence = self.pending_sequence()?;
         self.wal.admit_additional_frames(1)?;
         let mut novel = Vec::new();
         let mut carved = Vec::with_capacity(contents.len());
@@ -3785,7 +3792,7 @@ impl Store {
             carved.push(self.fold_spans(content.name, &content.spans, &mut novel)?);
         }
         let rec = Record::new(id, carved, attrs)?;
-        self.stage_record(rec, novel)
+        self.stage_record(sequence, rec, novel)
     }
 
     fn fold_spans(
@@ -3804,10 +3811,14 @@ impl Store {
                 }
                 Span::Piece(b) => {
                     identity.update(b);
+                    if b.is_empty() {
+                        ops.push(BodyOp::Lit(Vec::new()));
+                        continue;
+                    }
                     let put = self.fold_piece(b)?;
                     if !put.deduped {
-                        // new content: the log must carry the bytes, because recovery discards
-                        // anything the fold wrote past the committed tail
+                        // New content: the WAL must carry the bytes because writer open ignores
+                        // anything the fold wrote past the tail referenced by current authority.
                         novel.push((put.hash, b.to_vec()));
                     }
                     ops.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
@@ -3817,8 +3828,24 @@ impl Store {
         Ok(Content::identified(name, ops, ContentHash(identity.finalize().into())))
     }
 
-    fn stage_record(&mut self, rec: Record, novel: Vec<(PieceHash, Vec<u8>)>) -> Result<()> {
-        self.wal.append(self.manifest.next_seq, &rec, &novel)?;
+    fn pending_sequence(&self) -> Result<u64> {
+        self.manifest
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("MANIFEST sequence space is exhausted"))
+    }
+
+    fn stage_record(
+        &mut self,
+        sequence: u64,
+        rec: Record,
+        novel: Vec<(PieceHash, Vec<u8>)>,
+    ) -> Result<()> {
+        if let Err(error) = self.wal.append(sequence, &rec, &novel) {
+            self.requires_reopen = true;
+            return Err(error)
+                .context("WAL acceptance failed after fold staging; writer poisoned until reopen");
+        }
         self.mem_bytes += approx_bytes(&rec);
         self.mem.insert(rec.id.clone(), Some(rec));
         Ok(())
@@ -3849,8 +3876,8 @@ impl Store {
     /// Apply a [`Batch`]: every member, or — across a crash — none.
     ///
     /// Fold work happens first, so each member's novel bytes are known; then every member frame
-    /// plus the commit marker goes to the log in one append. Replay applies the members only when
-    /// the marker sealed them, so a crash anywhere inside this call replays nothing of the batch.
+    /// plus the completion marker goes to the log in one append. Replay applies the members only when
+    /// the marker committed them, so a crash anywhere inside this call replays nothing of the batch.
     /// (Content the fold gathered for an unreplayed batch is beyond the committed tail and is
     /// truncated at open, exactly like content from an unsynced put.)
     ///
@@ -3858,6 +3885,7 @@ impl Store {
     /// Within the batch, later members win over earlier ones on the same id, exactly as two puts
     /// would.
     pub fn apply(&mut self, batch: Batch) -> Result<()> {
+        self.ensure_writer_usable()?;
         if batch.items.is_empty() {
             return Ok(());
         }
@@ -3895,7 +3923,12 @@ impl Store {
             }
             .into());
         }
-        self.wal.admit_additional_frames(batch.items.len() as u64 + 1)?;
+        let sequence = self.pending_sequence()?;
+        let batch_frames = u64::try_from(batch.items.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("WAL batch frame count overflow"))?;
+        self.wal.admit_additional_frames(batch_frames)?;
         let mut framed: Vec<crate::store::wal::FramedRecord> =
             Vec::with_capacity(batch.items.len());
         for item in &batch.items {
@@ -3914,6 +3947,10 @@ impl Store {
                                 }
                                 OwnedSpan::Piece(b) => {
                                     identity.update(b);
+                                    if b.is_empty() {
+                                        ops.push(BodyOp::Lit(Vec::new()));
+                                        continue;
+                                    }
                                     let put = self.fold_piece(b)?;
                                     if !put.deduped {
                                         novel.push((put.hash, b.clone()));
@@ -3939,7 +3976,12 @@ impl Store {
                 }
             }
         }
-        self.wal.append_batch(self.manifest.next_seq, &framed)?;
+        if let Err(error) = self.wal.append_batch(sequence, &framed) {
+            self.requires_reopen = true;
+            return Err(error).context(
+                "atomic WAL acceptance failed after fold staging; writer poisoned until reopen",
+            );
+        }
         for (rec, _, tomb) in framed {
             if tomb {
                 self.mem_bytes += rec.id.len() + 32;
@@ -3960,9 +4002,11 @@ impl Store {
     /// separate, deliberate operation, because the fold is shared and the same bytes may be referenced
     /// by records that are still live.
     pub fn delete(&mut self, id: &str) -> Result<()> {
+        self.ensure_writer_usable()?;
         delete_admission_bytes(id, self.write_limits, self.read_limits, None)?;
+        let sequence = self.pending_sequence()?;
         self.wal.admit_additional_frames(1)?;
-        self.wal.append_tomb(self.manifest.next_seq, id)?;
+        self.wal.append_tomb(sequence, id)?;
         self.mem_bytes += id.len() + 32;
         self.mem.insert(id.to_string(), None);
         Ok(())
@@ -3975,12 +4019,20 @@ impl Store {
 
     /// [`Store::sync`] with an interruption checkpoint before entering the durability boundary.
     ///
-    /// Once WAL fsync begins, cancellation is no longer observed: returning cancellation after the
-    /// writes became durable would misreport the acknowledgement outcome.
+    /// Once the durability boundary begins, cancellation is no longer observed. That boundary may
+    /// first acknowledge a previously selected container authority before WAL fsync; returning
+    /// cancellation after either dependency became durable would misreport the outcome.
     pub fn sync_with_control(&mut self, control: &crate::control::OperationControl) -> Result<()> {
         let started = std::time::Instant::now();
         let result = (|| {
+            self.ensure_writer_usable()?;
             control.check("store sync")?;
+            // A newer WAL frame can depend on the manifest revision this handle currently sees.
+            // If an earlier publication selected that revision but its final barrier failed, WAL
+            // fsync alone cannot acknowledge the dependency: a crash could select the predecessor
+            // and leave replay input spanning two publication sequences. Establish the selected
+            // container authority before acknowledging any dependent accepted mutation.
+            self.container.lock().expect("container lock poisoned").acknowledge_current_state()?;
             self.wal.sync()
         })();
         self.observe_lifecycle(
@@ -3991,26 +4043,27 @@ impl Store {
         result
     }
 
-    /// Settle every accepted operation and publish a verified, immutable backup artifact.
+    /// Synchronize and publish every accepted operation, then install a verified, self-contained
+    /// backup store.
     ///
     /// The destination must not exist. Holding `&mut self` prevents this process from changing the
-    /// manifest while the packer walks the files it names — that part holds everywhere. Excluding a
-    /// second writer *process* is the writer lock's job, and the lock is enforced only on Unix: on
+    /// manifest while the backup walks the members it names — that part holds everywhere. Excluding a
+    /// second writer *process* is the writer lock's job; native Unix and Windows enforce it. On
     /// `wasm32-wasip1` it gates nothing, so a concurrent writer is admitted and the artifact may be
-    /// a racing cut. See [the writer lock](https://github.com/turndb/turndb/blob/main/FORMAT.md#the-writer-lock).
-    pub fn backup(&mut self, out: &Path) -> Result<crate::pack::BackupStats> {
+    /// a racing cut. See [the store shape](https://github.com/turndb/turndb/blob/main/FORMAT.md#store-shape).
+    pub fn backup(&mut self, out: &Path) -> Result<crate::backup::BackupStats> {
         self.backup_with_control(out, &crate::control::OperationControl::default())
     }
 
-    /// [`Store::backup`] with cooperative cancellation before atomic artifact publication.
+    /// [`Store::backup`] with cooperative cancellation before atomic artifact installation.
     ///
-    /// Sync/flush may publish an equivalent immutable representation of earlier accepted writes in
-    /// the source store. Cancellation never publishes the backup destination.
+    /// Sync/flush may publish an equivalent representation of earlier accepted writes in
+    /// the source store. Cancellation never installs the backup destination.
     pub fn backup_with_control(
         &mut self,
         out: &Path,
         control: &crate::control::OperationControl,
-    ) -> Result<crate::pack::BackupStats> {
+    ) -> Result<crate::backup::BackupStats> {
         let started = std::time::Instant::now();
         let result = self.backup_inner_with_control(out, control);
         self.observe_lifecycle(
@@ -4025,29 +4078,33 @@ impl Store {
         &mut self,
         out: &Path,
         control: &crate::control::OperationControl,
-    ) -> Result<crate::pack::BackupStats> {
+    ) -> Result<crate::backup::BackupStats> {
+        self.ensure_writer_usable()?;
         control.check("backup")?;
-        crate::pack::ensure_destination_available(out)?;
+        if !crate::backup::ATOMIC_RESTORE {
+            return Err(crate::backup::BackupError::Unsupported(
+                "this target has no atomic no-replace artifact-installation primitive".to_string(),
+            )
+            .into());
+        }
+        crate::backup::ensure_destination_available(out)?;
+        let staging = artifact_staging_path(out, "backing-up");
+        crate::backup::ensure_source_is_not_staging(&self.path, &staging)?;
         self.sync_with_control(control)?;
         self.flush_with_control(control)?;
         control.check("backup")?;
-        match &self.home {
-            // A backup of a single-file store IS a sealed container: the members a pack would
-            // carry — MANIFEST, the live parts, the live generation — one aligned extent each,
-            // flagged final, verified whole, and published only with a no-replace rename.
-            Home::File { container, .. } => {
-                seal_container_copy(container, &self.manifest, out, control)
-            }
-            // The one directory session left is the converter's, and its whole life is settle,
-            // checkpoint, close. The pack writer is gone; converting IS the backup of this layout.
-            Home::Dir(dir) => bail!(
-                "{} is a retired directory layout; convert it to a single-file store first",
-                dir.display()
-            ),
-        }
+        backup_container_copy(
+            &self.container,
+            &self.manifest,
+            self.cfg,
+            self.read_limits,
+            out,
+            &staging,
+            control,
+        )
     }
 
-    /// Seal the memtable into a part and commit it.
+    /// Publish the memtable as a part and commit it.
     ///
     /// Data before pointers, and the manifest last: the fold is durable before a part names any of
     /// it, and the part is durable before the manifest names the part.
@@ -4058,7 +4115,7 @@ impl Store {
     /// [`Store::flush`] with cooperative checks before manifest publication.
     ///
     /// Fold sync may make accepted content bytes durable before a later cancellation, but the live
-    /// manifest and memtable remain unchanged. An unpublished part is removed. Once manifest commit
+    /// manifest revision and pending change set remain unchanged. An unpublished part is removed. Once publication
     /// begins, cancellation is no longer observed and the ordinary crash protocol owns the outcome.
     pub fn flush_with_control(
         &mut self,
@@ -4078,196 +4135,160 @@ impl Store {
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<Option<PartRef>> {
+        self.ensure_writer_usable()?;
         control.check("memtable flush")?;
         if self.mem.is_empty() {
-            return Ok(None);
-        }
-        self.admit_store_directory_growth(3, "memtable flush")?;
-        let tail = self.fold.sync()?;
-        let seq = self.manifest.next_seq + 1;
-        let file = format!("part-{seq:08}.part");
-        let mut recs: Vec<Record> = Vec::with_capacity(self.mem.len());
-        let mut tombs: Vec<bool> = Vec::with_capacity(self.mem.len());
-        for (id, v) in &self.mem {
-            control.check("memtable flush planning")?;
-            match v {
-                Some(r) => {
-                    recs.push(r.clone());
-                    tombs.push(false);
-                }
-                // A tombstone still needs a row, so it gets an empty one carrying only its id.
-                None => {
-                    recs.push(Record { id: id.clone(), contents: Vec::new(), attrs: Vec::new() });
-                    tombs.push(true);
-                }
-            }
-        }
-
-        // Resolve every referenced piece through BOTH tiers, exactly as the write path does.
-        //
-        // A Tier-0-only resolve is correct only while the process that staged the records is still
-        // alive: `fold_piece` notes a Tier-1 hit into the window, so the window covers it. After a
-        // CRASH it does not. Replay re-folds only pieces the WAL carried bytes for, and a Tier-1 hit
-        // carries none by design — the content was already durable in an older part. Those pieces are
-        // then in no window at all, and a Tier-0-only resolve would fail here on every subsequent
-        // flush attempt, permanently: records unreadable, WAL growing without bound. On the
-        // high-duplication corpora this engine exists for, that is nearly every record after the
-        // first flush.
-        let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
-        for r in &recs {
-            control.check("memtable flush planning")?;
-            for content in &r.contents {
-                for op in &content.ops {
-                    control.check("memtable flush planning")?;
-                    let BodyOp::Piece { hash, .. } = op else { continue };
-                    if locs.contains_key(hash) {
-                        continue;
-                    }
-                    let loc = self.locate(hash)?.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "staged piece {hash} is in neither the fold window nor any live part"
-                        )
-                    })?;
-                    locs.insert(*hash, loc);
-                }
-            }
-        }
-        // From here the two homes diverge only in PLACEMENT and PUBLICATION: what a part is,
-        // what the manifest says, and what the memtable becomes are identical either way.
-        let (meta, digest, opened) = match &self.home {
-            Home::Dir(dir) => {
-                let path = dir.join(&file);
-                let meta = match part::build_full_with_limits(
-                    &path,
-                    &recs,
-                    &tombs,
-                    seq,
-                    seq,
-                    self.cfg.level,
-                    |h| locs.get(h).copied(),
-                    &HashMap::new(),
-                    self.read_limits,
-                ) {
-                    Ok(meta) => meta,
-                    Err(error) => {
-                        let _ = crate::vfs::unlink(&path);
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = control.check("memtable flush") {
-                    let _ = crate::vfs::unlink(&path);
-                    return Err(error.into());
-                }
-                let digest = match hash_file_with_control(&path, control, "memtable flush") {
-                    Ok(hash) => hash.to_hex().to_string(),
-                    Err(error) => {
-                        let _ = crate::vfs::unlink(&path);
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = control.check("memtable flush publication") {
-                    let _ = crate::vfs::unlink(&path);
-                    return Err(error.into());
-                }
-                let opened =
-                    Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
-                (meta, digest, opened)
-            }
-            Home::File { container, .. } => {
-                // The part assembles straight into the live file as a member, pinned in the same
-                // pass that writes it — no named file, no rename, no second read for the hash. A
-                // failure abandons the member write: its bytes are uncommitted noise past the
-                // tail, released for whatever stages next.
-                let member =
-                    container.lock().expect("container lock poisoned").begin_member(&file)?;
-                let built = part::build_full_into(
-                    member,
-                    &recs,
-                    &tombs,
-                    seq,
-                    seq,
-                    self.cfg.level,
-                    |h| locs.get(h).copied(),
-                    &HashMap::new(),
-                    self.read_limits,
-                );
-                let (meta, member) = match built {
-                    Ok(v) => v,
-                    Err(error) => {
-                        container.lock().expect("container lock poisoned").abandon_open_member();
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = control.check("memtable flush publication") {
-                    container.lock().expect("container lock poisoned").abandon_open_member();
-                    return Err(error.into());
-                }
-                let digest = {
-                    let mut c = container.lock().expect("container lock poisoned");
-                    PieceHash(c.finish_member(member)?).to_hex()
-                };
-                let reader = container
+            // Publication may have selected the successor before its final barrier reported an
+            // error, leaving only redundant replay input. A retry of the publication primitive is
+            // also the settlement retry; otherwise backup and actor preludes could claim a
+            // settled source while preserving a WAL that replays already-published mutations.
+            if self.wal.frame_count() != 0 {
+                self.container
                     .lock()
                     .expect("container lock poisoned")
-                    .extent(&file)
-                    .expect("the member was staged a moment ago");
-                let opened = Part::open_reader_with_limits(
-                    Box::new(reader),
-                    self.pcache.clone(),
-                    self.read_limits,
-                )?;
-                (meta, digest, opened)
+                    .acknowledge_current_state()?;
+                self.wal.truncate()?;
+            }
+            return Ok(None);
+        }
+        let prepared = (|| -> Result<(Part, Manifest)> {
+            let tail = self.fold.sync()?;
+            let seq = self
+                .manifest
+                .next_seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("MANIFEST sequence space is exhausted"))?;
+            let file = format!("part-{seq:08}.part");
+            let mut recs: Vec<Record> = Vec::with_capacity(self.mem.len());
+            let mut tombs: Vec<bool> = Vec::with_capacity(self.mem.len());
+            for (id, v) in &self.mem {
+                control.check("memtable flush planning")?;
+                match v {
+                    Some(r) => {
+                        recs.push(r.clone());
+                        tombs.push(false);
+                    }
+                    // A tombstone still needs a row, so it gets an empty one carrying only its id.
+                    None => {
+                        recs.push(Record {
+                            id: id.clone(),
+                            contents: Vec::new(),
+                            attrs: Vec::new(),
+                        });
+                        tombs.push(true);
+                    }
+                }
+            }
+
+            // Resolve every referenced piece through both dedup tiers before building the part.
+            let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
+            for record in &recs {
+                control.check("memtable flush planning")?;
+                for content in &record.contents {
+                    for op in &content.ops {
+                        control.check("memtable flush planning")?;
+                        let BodyOp::Piece { hash, .. } = op else { continue };
+                        if locs.contains_key(hash) {
+                            continue;
+                        }
+                        let loc = self.locate(hash)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pending piece {hash} is in neither the fold window nor any referenced part"
+                            )
+                        })?;
+                        locs.insert(*hash, loc);
+                    }
+                }
+            }
+            let member =
+                self.container.lock().expect("container lock poisoned").begin_member(&file)?;
+            let (meta, member) = part::build_full_into(
+                member,
+                &recs,
+                &tombs,
+                seq,
+                seq,
+                self.cfg.level,
+                |hash| locs.get(hash).copied(),
+                &HashMap::new(),
+                self.read_limits,
+            )?;
+            control.check("memtable flush publication")?;
+            let digest = {
+                let mut container = self.container.lock().expect("container lock poisoned");
+                PieceHash(container.finish_member(member)?).to_hex()
+            };
+            let reader = self
+                .container
+                .lock()
+                .expect("container lock poisoned")
+                .extent(&file)
+                .expect("the member was staged a moment ago");
+            let opened = Part::open_reader_with_limits(
+                Box::new(reader),
+                self.pcache.clone(),
+                self.read_limits,
+            )?;
+
+            let mut manifest = self.manifest.clone();
+            manifest.parts.push(PartRef {
+                member: file,
+                seq_lo: seq,
+                seq_hi: seq,
+                records: meta.n_records,
+                b3: digest,
+            });
+            manifest.fold_seg = tail.seg;
+            manifest.fold_off = tail.off;
+            manifest.next_seq = seq;
+            let mut container = self.container.lock().expect("container lock poisoned");
+            manifest.commit_into_container(&mut container)?;
+            sweep_unreachable_container(&mut container, &manifest, self.read_limits)?;
+            Ok((opened, manifest))
+        })();
+        let (opened, m) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(self.discard_staged_and_require_reopen("flush preparation", error));
             }
         };
-
-        let mut m = self.manifest.clone();
-        m.parts.push(PartRef {
-            file: file.clone(),
-            seq_lo: seq,
-            seq_hi: seq,
-            records: meta.n_records,
-            b3: Some(digest),
-        });
-        m.fold_seg = tail.seg;
-        m.fold_off = tail.off;
-        m.next_seq = seq;
-        match &self.home {
-            Home::Dir(dir) => {
-                m.commit_with_limits(dir, self.read_limits)?; // <- the linearization point
-                                                              // The commit may have pruned a retained manifest; whatever only it named is now
-                                                              // sweepable.
-                sweep_unreachable_with_limits(dir, self.read_limits)?;
-            }
-            Home::File { container, .. } => {
-                let mut c = container.lock().expect("container lock poisoned");
-                m.commit_into_container(&mut c)?;
-                // The sweep stages its frees BEFORE the flip, so pruned-manifest space publishes
-                // in the same atomic state that prunes it.
-                sweep_unreachable_container(&mut c, &m, self.read_limits)?;
-                c.commit()?; // <- the linearization point: one flip names everything above
-            }
-        }
+        let mut c = self.container.lock().expect("container lock poisoned");
+        let publication_error = match c.commit() {
+            Ok(_) => None,
+            Err(error) if c.failed_publication_selected() == Some(true) => Some(error),
+            Err(error) => return Err(error),
+        }; // <- the linearization point: one flip names everything above
+        drop(c);
 
         self.parts.push(Arc::new(opened));
         self.manifest = m;
         self.note_manifest_commit();
         self.mem.clear();
         self.mem_bytes = 0;
-        // Release Tier 0 — but only HERE, after the part is committed and open. Sealing any earlier
+        // Release Tier 0 only here, after the part is committed and open. Closing it any earlier
         // would drop the window while the part being built still needs it, and the part cannot answer
         // a Tier-1 lookup until it is committed and in `self.parts`. Everything the window covered is
         // now reachable through that part's dictionary, so nothing is lost but the memory.
-        self.fold.seal_window();
+        self.fold.release_dedup_window();
+        if let Some(error) = publication_error {
+            // The successor is selected but its durability barrier was not acknowledged. Keep the
+            // redundant WAL for retry/reopen, but never leave this live handle behind its own
+            // selected manifest revision.
+            return Err(error).context(
+                "container selected the flushed manifest revision, but its final synchronization failed",
+            );
+        }
         // Only now: the records are in a committed part, so the log that carried them is redundant.
         self.wal.truncate()?;
         Ok(self.manifest.parts.last().cloned())
     }
 
-    /// Merge a CONTIGUOUS run of live parts into one, and publish it atomically.
+    /// Merge a contiguous run of parts referenced by the current manifest revision into one, then
+    /// publish the resulting manifest revision atomically.
     ///
     /// Contiguity is the correctness gate: parts resolve versions by sequence, so merging a
     /// non-adjacent set would drop whatever an excluded part said about a shared id. The range is
-    /// therefore expressed as a slice of the live list, which cannot express a gap.
+    /// therefore expressed as a slice of that ordered part list, which cannot express a gap.
     pub fn merge_range(
         &mut self,
         lo: usize,
@@ -4288,7 +4309,7 @@ impl Store {
         let started = std::time::Instant::now();
         let result = self.merge_range_inner_with_control(lo, len, control);
         self.observe_lifecycle(
-            crate::observability::LifecycleOperation::Compaction,
+            crate::observability::LifecycleOperation::Merge,
             started.elapsed(),
             &result,
         );
@@ -4301,28 +4322,29 @@ impl Store {
         len: usize,
         control: &crate::control::OperationControl,
     ) -> Result<Option<crate::part::merge::MergeStats>> {
+        self.ensure_writer_usable()?;
         control.check("part compaction")?;
-        if len < 2 || lo + len > self.parts.len() {
+        let Some(end) = lo.checked_add(len) else { return Ok(None) };
+        if len < 2 || end > self.parts.len() {
             return Ok(None);
         }
-        self.admit_store_directory_growth(3, "part compaction")?;
-        let inputs: Vec<Arc<Part>> = self.parts[lo..lo + len].to_vec();
+        let inputs: Vec<Arc<Part>> = self.parts[lo..end].to_vec();
         // Named by the sequence RANGE it spans. The output's range strictly contains every input's
         // (the inputs are disjoint and there are at least two), so the name cannot collide with a part
         // this merge is about to replace — which the post-commit sweep would otherwise unlink.
         let seq_lo = self.manifest.parts[lo].seq_lo;
-        let seq_hi = self.manifest.parts[lo + len - 1].seq_hi;
+        let seq_hi = self.manifest.parts[end - 1].seq_hi;
         let file = format!("part-{seq_lo:08}-{seq_hi:08}.part");
         debug_assert!(
-            !self.manifest.parts.iter().any(|p| p.file == file),
-            "merge output {file} collides with a live part"
+            !self.manifest.parts.iter().any(|p| p.member == file),
+            "merge output {file} collides with a referenced part"
         );
         // A tombstone may only be discarded when this merge covers the ENTIRE live list — otherwise a
         // part outside the run could still hold an older version of the deleted id, and dropping the
         // tombstone would resurrect it.
         let total = lo == 0 && len == self.parts.len();
-        // Publish: the merged part is durable before the manifest names it — the part fsync in a
-        // directory, the pre-flip barrier in a single file — and the manifest swap is the single
+        // Publish: the merged part is durable before the manifest names it; the pre-flip barrier
+        // makes the manifest swap the single
         // linearization point. A crash before it leaves the merged output unreachable: an orphan
         // file, or uncommitted noise past the tail. The INPUTS are not deleted here: retained
         // manifests still name them, so a reader inside the retention window keeps a complete
@@ -4330,123 +4352,106 @@ impl Store {
         // Every fallible preparation step and the final cancellation checkpoint happen before
         // commit is attempted. Once commit starts, its ordinary crash protocol—not cancellation—
         // decides the outcome.
-        let (meta, stats, digest, opened) = match &self.home {
-            Home::Dir(dir) => {
-                let path = dir.join(&file);
-                let (meta, stats) = match crate::part::merge::merge_opts_with_control_and_limits(
-                    &path,
-                    &inputs,
-                    self.cfg.level,
-                    total,
-                    control,
-                    self.read_limits,
-                ) {
-                    Ok(built) => built,
-                    Err(error) => {
-                        let _ = crate::vfs::unlink(&path);
-                        return Err(error);
-                    }
-                };
-                let digest =
-                    match hash_file_with_control(&path, control, "part compaction output hashing")
-                        .map(|hash| hash.to_hex().to_string())
-                    {
-                        Ok(digest) => digest,
-                        Err(error) => {
-                            let _ = crate::vfs::unlink(&path);
-                            return Err(error);
-                        }
-                    };
-                if let Err(error) = control.check("part compaction") {
-                    let _ = crate::vfs::unlink(&path);
-                    return Err(error.into());
-                }
-                let opened =
-                    Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
-                (meta, stats, digest, opened)
+        let tmp = file_tmp_dir(&self.path);
+        crate::vfs::mkdir_all(&tmp)?;
+        let member = self.container.lock().expect("container lock poisoned").begin_member(&file)?;
+        let location_is_usable = |location: Loc, hash: PieceHash| -> Result<bool> {
+            self.fold.verify_location_shape(location).with_context(|| {
+                format!("merge input dictionary mapped {hash} to an invalid fold location")
+            })?;
+            if self.fold.is_punched(location.block_id) {
+                return Ok(false);
             }
-            Home::File { container, path } => {
-                // Spools live in the transient scratch directory beside the store; the merged
-                // part streams straight into the live file as a member, pinned in-pass.
-                let tmp = file_tmp_dir(path);
-                crate::vfs::mkdir_all(&tmp)?;
-                let member =
-                    container.lock().expect("container lock poisoned").begin_member(&file)?;
-                let built = crate::part::merge::merge_into_with_control_for_operation(
-                    member,
-                    &tmp.join("m"),
-                    &inputs,
-                    self.cfg.level,
-                    total,
-                    control,
-                    "part compaction",
-                    self.read_limits,
-                );
-                let (meta, stats, member) = match built {
-                    Ok(v) => v,
-                    Err(error) => {
-                        container.lock().expect("container lock poisoned").abandon_open_member();
-                        let _ = crate::vfs::remove_tree(&tmp);
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = control.check("part compaction") {
-                    container.lock().expect("container lock poisoned").abandon_open_member();
-                    let _ = crate::vfs::remove_tree(&tmp);
-                    return Err(error.into());
-                }
-                let digest = {
-                    let mut c = container.lock().expect("container lock poisoned");
-                    PieceHash(c.finish_member(member)?).to_hex()
-                };
+            self.fold.read_verified(location, hash).with_context(|| {
+                format!("merge input dictionary mapped {hash} to invalid fold bytes")
+            })?;
+            Ok(true)
+        };
+        let built = crate::part::merge::merge_into_with_control_for_operation(
+            member,
+            &tmp.join("m"),
+            &inputs,
+            self.cfg.level,
+            total,
+            control,
+            "part compaction",
+            self.read_limits,
+            Some(&location_is_usable),
+        );
+        let (meta, stats, member) = match built {
+            Ok(v) => v,
+            Err(error) => {
+                self.container.lock().expect("container lock poisoned").abandon_open_member();
                 let _ = crate::vfs::remove_tree(&tmp);
-                let reader = container
-                    .lock()
-                    .expect("container lock poisoned")
-                    .extent(&file)
-                    .expect("the member was staged a moment ago");
-                let opened = Part::open_reader_with_limits(
-                    Box::new(reader),
-                    self.pcache.clone(),
-                    self.read_limits,
-                )?;
-                (meta, stats, digest, opened)
+                return Err(error);
             }
         };
-        let mut m = self.manifest.clone();
-        m.parts.splice(
-            lo..lo + len,
-            [PartRef {
-                file: file.clone(),
-                seq_lo: meta.seq_lo,
-                seq_hi: meta.seq_hi,
-                records: meta.n_records,
-                b3: Some(digest),
-            }],
-        );
-        match &self.home {
-            Home::Dir(dir) => {
-                m.commit_with_limits(dir, self.read_limits)?;
-                sweep_unreachable_with_limits(dir, self.read_limits)?;
-            }
-            Home::File { container, .. } => {
-                // A flip publishes EVERYTHING staged — including fold-delta extents appended by
-                // puts since the last flush. The manifest must therefore claim the tail the flip
-                // is about to make durable, or the committed member outgrows the manifest's
-                // claim and the next open refuses the disagreement. (The reopen check that
-                // demands this agreement is what caught the omission.)
-                let t = self.fold.sync()?;
-                m.fold_seg = t.seg;
-                m.fold_off = t.off;
-                let mut c = container.lock().expect("container lock poisoned");
-                m.commit_into_container(&mut c)?;
-                sweep_unreachable_container(&mut c, &m, self.read_limits)?;
-                c.commit()?; // <- the linearization point
-            }
+        if let Err(error) = control.check("part compaction") {
+            self.container.lock().expect("container lock poisoned").abandon_open_member();
+            let _ = crate::vfs::remove_tree(&tmp);
+            return Err(error.into());
         }
+        let digest = {
+            let mut c = self.container.lock().expect("container lock poisoned");
+            PieceHash(c.finish_member(member)?).to_hex()
+        };
+        let _ = crate::vfs::remove_tree(&tmp);
+        let prepared = (|| -> Result<(Part, Manifest)> {
+            let reader = self
+                .container
+                .lock()
+                .expect("container lock poisoned")
+                .extent(&file)
+                .expect("the member was staged a moment ago");
+            let opened = Part::open_reader_with_limits(
+                Box::new(reader),
+                self.pcache.clone(),
+                self.read_limits,
+            )?;
+            let mut m = self.manifest.clone();
+            m.parts.splice(
+                lo..end,
+                [PartRef {
+                    member: file.clone(),
+                    seq_lo: meta.seq_lo,
+                    seq_hi: meta.seq_hi,
+                    records: meta.n_records,
+                    b3: digest,
+                }],
+            );
+            let t = self.fold.sync()?;
+            m.fold_seg = t.seg;
+            m.fold_off = t.off;
+            let mut c = self.container.lock().expect("container lock poisoned");
+            m.commit_into_container(&mut c)?;
+            sweep_unreachable_container(&mut c, &m, self.read_limits)?;
+            Ok((opened, m))
+        })();
+        let (opened, m) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // The merged member has already been registered in the staged directory. No
+                // unrelated later operation may publish it (or a partly staged manifest). Fold
+                // sync may also have advanced in-memory locations, so successful cleanup still
+                // requires reopen before this writer can be trusted again.
+                return Err(self.discard_staged_and_require_reopen("merge preparation", error));
+            }
+        };
+        let mut c = self.container.lock().expect("container lock poisoned");
+        let publication_error = match c.commit() {
+            Ok(_) => None,
+            Err(error) if c.failed_publication_selected() == Some(true) => Some(error),
+            Err(error) => return Err(error),
+        }; // <- the linearization point
+        drop(c);
         self.manifest = m;
         self.note_manifest_commit();
-        self.parts.splice(lo..lo + len, [Arc::new(opened)]);
+        self.parts.splice(lo..end, [Arc::new(opened)]);
+        if let Some(error) = publication_error {
+            return Err(error).context(
+                "container selected the merged manifest revision, but its final synchronization failed",
+            );
+        }
         Ok(Some(stats))
     }
 
@@ -4490,8 +4495,8 @@ impl Store {
     /// real records (examples/compact_bench): the whole policy space lands within 0.008–0.011 ms
     /// per point lookup, so read amp does not discriminate; merge WALL is the only real cost, and
     /// total-at-8 paid 0.7s across the run where tiered(8,4) paid 1.7s for MORE final parts and
-    /// no tombstone settlement. Total merges are also the only ones allowed to drop tombstones,
-    /// so deletes actually settle instead of shadowing forever.
+    /// no tombstone removal. Total merges are also the only ones allowed to drop tombstones,
+    /// so deleted record IDs stop shadowing older versions instead of persisting forever.
     ///
     /// The honest caveat, documented as the dial it is: a total merge costs O(live records) of
     /// wall time, so at some store size a young/old split becomes worth it. That crossover is far
@@ -4507,6 +4512,7 @@ impl Store {
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<Option<crate::part::merge::MergeStats>> {
+        self.ensure_writer_usable()?;
         control.check("part compaction")?;
         if self.parts.len() < Self::AUTO_COMPACT_K {
             return Ok(None);
@@ -4528,7 +4534,7 @@ impl Store {
             .parts
             .iter()
             .map(|part| {
-                let bytes = self.part_file_bytes(&part.file)?;
+                let bytes = self.part_member_bytes(&part.member)?;
                 Ok((u64::from(part.records), bytes))
             })
             .collect::<Result<_>>()?;
@@ -4576,9 +4582,9 @@ impl Store {
         Err(CompactionError::BudgetTooSmall { start_part, input_rows, input_bytes, budget }.into())
     }
 
-    /// Estimate temporary output space for the current bounded-compaction plan.
+    /// Estimate temporary output space for the current bounded-part-merge plan.
     ///
-    /// Input file lengths, section counts/raw bytes, retained-input bytes, and filesystem
+    /// Input member lengths, section counts/raw bytes, retained-input bytes, and filesystem
     /// availability are exact at this cut. `estimated_stage_bytes` is intentionally not a hard
     /// bound: recompression and merged index encoding can change output size. Callers may apply
     /// their own safety factor; TurnDB exposes the basis instead of hiding policy in a boolean.
@@ -4662,6 +4668,7 @@ impl Store {
         budget: CompactionBudget,
         control: &crate::control::OperationControl,
     ) -> Result<Option<BoundedCompaction>> {
+        self.ensure_writer_usable()?;
         control.check("bounded compaction")?;
         let Some(plan) = self.plan_compaction(budget)? else {
             return Ok(None);
@@ -4670,370 +4677,8 @@ impl Store {
             .merge_range_with_control(plan.start_part, plan.input_parts, control)?
             .expect("a compaction plan always contains at least two parts");
         let output = &self.manifest.parts[plan.start_part];
-        let output_bytes = self.part_file_bytes(&output.file)?;
+        let output_bytes = self.part_member_bytes(&output.member)?;
         Ok(Some(BoundedCompaction { plan, output_bytes, merge }))
-    }
-
-    /// Report exact live-part format migration progress without decoding rows or content.
-    pub fn format_migration_status(&self) -> Result<FormatMigrationStatus> {
-        self.format_migration_status_with_control(&crate::control::OperationControl::default())
-    }
-
-    /// [`Store::format_migration_status`] with cooperative part checkpoints.
-    pub fn format_migration_status_with_control(
-        &self,
-        control: &crate::control::OperationControl,
-    ) -> Result<FormatMigrationStatus> {
-        control.check("format migration status")?;
-        let mut status = FormatMigrationStatus {
-            target_part_version: crate::part::PART_VERSION,
-            live_parts: self.parts.len(),
-            ..FormatMigrationStatus::default()
-        };
-        for (part, part_ref) in self.parts.iter().zip(&self.manifest.parts) {
-            control.check("format migration status")?;
-            if part.format_version() == crate::part::PART_VERSION {
-                status.current_parts = status
-                    .current_parts
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("current format part count overflow"))?;
-                continue;
-            }
-            status.legacy_parts = status
-                .legacy_parts
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("legacy format part count overflow"))?;
-            status.legacy_rows = status
-                .legacy_rows
-                .checked_add(u64::from(part_ref.records))
-                .ok_or_else(|| anyhow::anyhow!("legacy format row count overflow"))?;
-            status.legacy_bytes = status
-                .legacy_bytes
-                .checked_add(self.part_file_bytes(&part_ref.file)?)
-                .ok_or_else(|| anyhow::anyhow!("legacy format byte count overflow"))?;
-        }
-        let live_files: HashSet<&str> =
-            self.manifest.parts.iter().map(|part| part.file.as_str()).collect();
-        let mut retained_seen = HashSet::new();
-        let retained_manifests: Vec<(u64, Manifest)> = match &self.home {
-            Home::Dir(dir) => {
-                let mut v = Vec::new();
-                for commit in list_retained_with_limits(dir, self.read_limits)? {
-                    control.check("format migration status")?;
-                    v.push((
-                        commit,
-                        load_retained(dir, commit).with_context(|| {
-                            format!("inspect migration state at retained commit {commit}")
-                        })?,
-                    ));
-                }
-                v
-            }
-            Home::File { container, .. } => {
-                let c = container.lock().expect("container lock poisoned");
-                let mut v = Vec::new();
-                for commit in container_retained_commits(&c) {
-                    control.check("format migration status")?;
-                    let bytes = c
-                        .read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)
-                        .with_context(|| {
-                            format!("inspect migration state at retained commit {commit}")
-                        })?;
-                    v.push((
-                        commit,
-                        Manifest::parse(&bytes).with_context(|| {
-                            format!("inspect migration state at retained commit {commit}")
-                        })?,
-                    ));
-                }
-                v
-            }
-        };
-        for (_, manifest) in retained_manifests {
-            for part_ref in manifest.parts {
-                control.check("format migration status")?;
-                if live_files.contains(part_ref.file.as_str())
-                    || !retained_seen.insert(part_ref.file.clone())
-                {
-                    continue;
-                }
-                let part = match &self.home {
-                    Home::Dir(dir) => Part::open_in_with_limits(
-                        &dir.join(&part_ref.file),
-                        self.pcache.clone(),
-                        self.read_limits,
-                    )?,
-                    Home::File { container, .. } => {
-                        let reader = container
-                            .lock()
-                            .expect("container lock poisoned")
-                            .extent(&part_ref.file)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "retained manifest names {} but the container does not hold it",
-                                    part_ref.file
-                                )
-                            })?;
-                        Part::open_reader_with_limits(
-                            Box::new(reader),
-                            self.pcache.clone(),
-                            self.read_limits,
-                        )?
-                    }
-                };
-                if part.format_version() == crate::part::PART_VERSION {
-                    continue;
-                }
-                status.retained_legacy_parts = status
-                    .retained_legacy_parts
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("retained legacy part count overflow"))?;
-                status.retained_legacy_rows = status
-                    .retained_legacy_rows
-                    .checked_add(u64::from(part_ref.records))
-                    .ok_or_else(|| anyhow::anyhow!("retained legacy row count overflow"))?;
-                status.retained_legacy_bytes = status
-                    .retained_legacy_bytes
-                    .checked_add(self.part_file_bytes(&part_ref.file)?)
-                    .ok_or_else(|| anyhow::anyhow!("retained legacy byte count overflow"))?;
-            }
-        }
-        Ok(status)
-    }
-
-    /// Preflight the oldest remaining live legacy part for one resumable migration step.
-    pub fn estimate_format_migration_space(&self) -> Result<Option<FormatMigrationPlan>> {
-        self.estimate_format_migration_space_with_control(
-            &crate::control::OperationControl::default(),
-        )
-    }
-
-    /// [`Store::estimate_format_migration_space`] with cooperative section checkpoints.
-    pub fn estimate_format_migration_space_with_control(
-        &self,
-        control: &crate::control::OperationControl,
-    ) -> Result<Option<FormatMigrationPlan>> {
-        control.check("format migration preflight")?;
-        if !self.mem.is_empty() {
-            bail!(
-                "format migration preflight requires a flushed memtable; call sync() and flush() first"
-            );
-        }
-        let Some(part_index) =
-            self.parts.iter().position(|part| part.format_version() < crate::part::PART_VERSION)
-        else {
-            return Ok(None);
-        };
-        let part = &self.parts[part_index];
-        let part_ref = &self.manifest.parts[part_index];
-        let input_bytes = self.part_file_bytes(&part_ref.file)?;
-        let mut input_sections = 0usize;
-        let mut input_raw_section_bytes = 0u64;
-        for (_, _, raw, _) in part.sections() {
-            control.check("format migration preflight")?;
-            input_sections = input_sections
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("migration section count overflow"))?;
-            input_raw_section_bytes = input_raw_section_bytes
-                .checked_add(u64::from(raw))
-                .ok_or_else(|| anyhow::anyhow!("migration raw section byte count overflow"))?;
-        }
-        let input_rows = u64::from(part_ref.records);
-        let row_allowance = input_rows
-            .checked_mul(64)
-            .ok_or_else(|| anyhow::anyhow!("migration row framing estimate overflow"))?;
-        let section_allowance = u64::try_from(input_sections)
-            .map_err(|_| anyhow::anyhow!("migration section count exceeds u64"))?
-            .checked_mul(256)
-            .ok_or_else(|| anyhow::anyhow!("migration section framing estimate overflow"))?;
-        let estimated_stage_bytes = input_raw_section_bytes
-            .checked_add(row_allowance)
-            .and_then(|bytes| bytes.checked_add(section_allowance))
-            .and_then(|bytes| bytes.checked_add(1 << 20))
-            .ok_or_else(|| anyhow::anyhow!("migration stage estimate overflow"))?;
-        Ok(Some(FormatMigrationPlan {
-            part_index,
-            source_part_version: part.format_version(),
-            seq_lo: part_ref.seq_lo,
-            seq_hi: part_ref.seq_hi,
-            input_rows,
-            input_bytes,
-            input_sections,
-            input_raw_section_bytes,
-            estimated_stage_bytes,
-            estimate_is_hard_bound: false,
-            retained_input_bytes_after_commit: input_bytes,
-            filesystem_available_bytes: crate::sys::filesystem_available_bytes(
-                self.fs_probe_path(),
-            )
-            .with_context(|| {
-                format!("measure available filesystem bytes at {}", self.fs_probe_path().display())
-            })?,
-        }))
-    }
-
-    /// Atomically rewrite the oldest remaining live legacy part in the current format.
-    ///
-    /// Each call is one durable progress unit. Cancellation removes its unpublished output; after
-    /// publication, reopening observes the migrated part and a later call resumes with the next.
-    /// Content bytes are not rewritten, and unavailable legacy identities remain unavailable.
-    pub fn migrate_format_step(&mut self) -> Result<Option<FormatMigrationStep>> {
-        self.migrate_format_step_with_control(&crate::control::OperationControl::default())
-    }
-
-    /// [`Store::migrate_format_step`] with cooperative checkpoints before publication.
-    pub fn migrate_format_step_with_control(
-        &mut self,
-        control: &crate::control::OperationControl,
-    ) -> Result<Option<FormatMigrationStep>> {
-        let started = std::time::Instant::now();
-        let result = self.migrate_format_step_inner_with_control(control);
-        self.observe_lifecycle(
-            crate::observability::LifecycleOperation::FormatMigration,
-            started.elapsed(),
-            &result,
-        );
-        result
-    }
-
-    fn migrate_format_step_inner_with_control(
-        &mut self,
-        control: &crate::control::OperationControl,
-    ) -> Result<Option<FormatMigrationStep>> {
-        let Some(plan) = self.estimate_format_migration_space_with_control(control)? else {
-            return Ok(None);
-        };
-        self.admit_store_directory_growth(3, "format migration")?;
-        let input = self.parts[plan.part_index].clone();
-        let file = format!(
-            "part-mv{}-{:08}-{:08}.part",
-            crate::part::PART_VERSION,
-            plan.seq_lo,
-            plan.seq_hi
-        );
-        let (meta, rewrite, digest, opened) = match &self.home {
-            Home::Dir(dir) => {
-                let path = dir.join(&file);
-                if path.exists() {
-                    bail!("format migration staging path already exists: {}", path.display());
-                }
-                let (meta, rewrite) =
-                    match crate::part::merge::merge_opts_with_control_for_operation(
-                        &path,
-                        &[input],
-                        self.cfg.level,
-                        false,
-                        control,
-                        "format migration",
-                        self.read_limits,
-                    ) {
-                        Ok(built) => built,
-                        Err(error) => {
-                            let _ = crate::vfs::unlink(&path);
-                            return Err(error);
-                        }
-                    };
-                let digest = match hash_file_with_control(&path, control, "format migration") {
-                    Ok(hash) => hash.to_hex().to_string(),
-                    Err(error) => {
-                        let _ = crate::vfs::unlink(&path);
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = control.check("format migration publication") {
-                    let _ = crate::vfs::unlink(&path);
-                    return Err(error.into());
-                }
-                let opened =
-                    Part::open_in_with_limits(&path, self.pcache.clone(), self.read_limits)?;
-                (meta, rewrite, digest, opened)
-            }
-            Home::File { container, path } => {
-                // One live legacy part rewritten into a member and spliced with one flip — the
-                // merge's placement discipline, applied to the migration's one-part rewrite.
-                if container.lock().expect("container lock poisoned").contains(&file) {
-                    bail!("format migration staging member already exists: {file}");
-                }
-                let tmp = file_tmp_dir(path);
-                crate::vfs::mkdir_all(&tmp)?;
-                let member =
-                    container.lock().expect("container lock poisoned").begin_member(&file)?;
-                let built = crate::part::merge::merge_into_with_control_for_operation(
-                    member,
-                    &tmp.join("m"),
-                    &[input],
-                    self.cfg.level,
-                    false,
-                    control,
-                    "format migration",
-                    self.read_limits,
-                );
-                let (meta, rewrite, member) = match built {
-                    Ok(v) => v,
-                    Err(error) => {
-                        container.lock().expect("container lock poisoned").abandon_open_member();
-                        let _ = crate::vfs::remove_tree(&tmp);
-                        return Err(error);
-                    }
-                };
-                if let Err(error) = control.check("format migration publication") {
-                    container.lock().expect("container lock poisoned").abandon_open_member();
-                    let _ = crate::vfs::remove_tree(&tmp);
-                    return Err(error.into());
-                }
-                let digest = {
-                    let mut c = container.lock().expect("container lock poisoned");
-                    PieceHash(c.finish_member(member)?).to_hex()
-                };
-                let _ = crate::vfs::remove_tree(&tmp);
-                let reader = container
-                    .lock()
-                    .expect("container lock poisoned")
-                    .extent(&file)
-                    .expect("the member was staged a moment ago");
-                let opened = Part::open_reader_with_limits(
-                    Box::new(reader),
-                    self.pcache.clone(),
-                    self.read_limits,
-                )?;
-                (meta, rewrite, digest, opened)
-            }
-        };
-        let output_bytes = self.part_file_bytes(&file)?;
-        let mut manifest = self.manifest.clone();
-        manifest.parts[plan.part_index] = PartRef {
-            file,
-            seq_lo: meta.seq_lo,
-            seq_hi: meta.seq_hi,
-            records: meta.n_records,
-            b3: Some(digest),
-        };
-        match &self.home {
-            Home::Dir(dir) => {
-                manifest.commit_with_limits(dir, self.read_limits)?;
-                sweep_unreachable_with_limits(dir, self.read_limits)?;
-            }
-            Home::File { container, .. } => {
-                // Same rule as the merge: the flip publishes staged fold deltas too, so the
-                // manifest claims the tail it makes durable.
-                let t = self.fold.sync()?;
-                manifest.fold_seg = t.seg;
-                manifest.fold_off = t.off;
-                let mut c = container.lock().expect("container lock poisoned");
-                manifest.commit_into_container(&mut c)?;
-                sweep_unreachable_container(&mut c, &manifest, self.read_limits)?;
-                c.commit()?; // <- the step's publication: one flip, restartable as ever
-            }
-        }
-        self.parts[plan.part_index] = Arc::new(opened);
-        self.manifest = manifest;
-        self.note_manifest_commit();
-        let remaining_legacy_parts = self
-            .parts
-            .iter()
-            .filter(|part| part.format_version() < crate::part::PART_VERSION)
-            .count();
-        Ok(Some(FormatMigrationStep { plan, output_bytes, remaining_legacy_parts, rewrite }))
     }
 
     /// Newest-wins across the committed parts, then the memtable, which is newer than all of them.
@@ -5123,7 +4768,7 @@ impl Store {
     /// Byte-exact named content for `id`, without reconstructing any sibling content value.
     pub fn reconstruct_content(&self, id: &str, name: &str) -> Result<Option<Vec<u8>>> {
         // The memtable is newer than every part, so it is consulted first — and it is the ONLY thing
-        // this adds over the committed read core.
+        // this adds over the current manifest revision.
         if let Some(v) = self.mem.get(id) {
             return match v {
                 Some(r) => self.rebuild_content(r, name),
@@ -5144,15 +4789,7 @@ impl Store {
     /// the in-memory window, and after a crash nothing puts it back there, because the WAL carries no
     /// bytes for content that was already durable.
     fn locate(&self, h: &PieceHash) -> Result<Option<Loc>> {
-        if let Some(l) = self.fold.lookup(*h) {
-            return Ok(Some(l));
-        }
-        for p in self.parts.iter().rev() {
-            if let Some(l) = p.lookup_piece(h)? {
-                return Ok(Some(l));
-            }
-        }
-        Ok(None)
+        locate_verified_piece(&self.parts, &self.fold, h)
     }
 
     fn rebuild_content(&self, r: &Record, name: &str) -> Result<Option<Vec<u8>>> {
@@ -5194,7 +4831,7 @@ impl Store {
         self.mem_bytes
     }
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
-    /// of both; the manifest snapshot it was opened at is already baked into `parts`.
+    /// of both; the store authority it was opened at is already baked into `parts`.
     pub fn into_parts(self) -> (Arc<Fold>, Vec<Arc<Part>>) {
         (Arc::new(self.fold), self.parts)
     }
@@ -5203,7 +4840,8 @@ impl Store {
         self.parts.len()
     }
 
-    /// The live parts, oldest to newest — the writer-side twin of [`ReadStore::parts`].
+    /// Parts referenced by the current manifest revision, oldest to newest — the writer-side twin
+    /// of [`ReadStore::parts`].
     pub fn parts(&self) -> &[Arc<Part>] {
         &self.parts
     }
@@ -5355,24 +4993,25 @@ impl Store {
         Ok(scope)
     }
 
-    /// ERASE records: tombstone, settle, and rewrite until this store no longer references the
-    /// records and its old logical files have been removed.
+    /// ERASE records: publish tombstones and rewrite until this store no longer references the
+    /// records and its old members have been removed.
     ///
     /// This is the compliance path, and it composes three operations that each already existed:
     /// deletes shadow the ids; a TOTAL merge drops the tombstones once nothing remains for them
     /// to shadow; and the re-fold rewrites the fold without the dropped content and rebuilds
     /// every part — so both the bytes AND the columnar metadata (ids, piece lengths, attribute
     /// values) of the erased records are gone when this returns. The re-fold also purges the
-    /// retained commit log, which the erasure story REQUIRES: a snapshot that could still serve
+    /// retained manifest history, which the erasure story requires: a read view that could still serve
     /// the erased record is not erasure.
     ///
     /// What this does NOT promise, stated because overclaiming here is a liability: media-byte
     /// non-recoverability on arbitrary or copy-on-write filesystems, through WASI, or for copies
-    /// already made (packs, replicas, backups). The measurable claims are query absence, logical
+    /// already made (replicas and backups). The measurable claims are query absence, logical
     /// file-length reclamation, and the lifecycle event for this operation.
     ///
     /// Ids that do not exist are counted, not errored: a DSAR naming already-gone data is a
-    /// normal outcome, and the record should say so rather than fail.
+    /// normal outcome, and the record should say so rather than fail. When every requested id is
+    /// already absent, the operation returns statistics without a transition.
     pub fn erase_ids(&mut self, ids: &[String]) -> Result<ErasureStats> {
         self.erase_ids_with_control(ids, &crate::control::OperationControl::default())
     }
@@ -5404,6 +5043,7 @@ impl Store {
         ids: &[String],
         control: &crate::control::OperationControl,
     ) -> Result<ErasureStats> {
+        self.ensure_writer_usable()?;
         let mut tombstoned = 0usize;
         let mut absent = 0usize;
         let mut delete = Vec::new();
@@ -5448,51 +5088,26 @@ impl Store {
         })
     }
 
+    /// Resolve every live program through its owning Part dictionary. One identity may have more
+    /// than one physical location, and every owning location must remain live until the Parts that
+    /// name it stop deciding records.
     fn live_fold_pieces_with_control(
         &self,
         control: &crate::control::OperationControl,
-    ) -> Result<HashMap<PieceHash, Loc>> {
-        let visible = read::visibility(&self.parts)?;
-        let mut pieces: HashMap<PieceHash, Loc> = HashMap::new();
-        for (part_index, rows) in visible.rows.iter().enumerate() {
-            for &row in rows {
-                control.check("content reachability")?;
-                for content in self.parts[part_index].record(row)?.contents {
-                    for operation in content.ops {
-                        let BodyOp::Piece { hash, len } = operation else { continue };
-                        if let Some(existing) = pieces.get(&hash) {
-                            if existing.raw != len {
-                                bail!(
-                                    "live piece {hash} has inconsistent lengths {} and {len}",
-                                    existing.raw
-                                );
-                            }
-                            continue;
-                        }
-                        let location = self.locate(&hash)?.ok_or_else(|| {
-                            anyhow::anyhow!("live record references absent piece {hash}")
-                        })?;
-                        if location.raw != len {
-                            bail!(
-                                "live piece {hash} is {} bytes but its record says {len}",
-                                location.raw
-                            );
-                        }
-                        pieces.insert(hash, location);
-                    }
-                }
-            }
-        }
-        Ok(pieces)
+    ) -> Result<BTreeMap<Loc, PieceHash>> {
+        live_fold_pieces_with_control(&self.parts, &self.fold, control)
     }
 
-    /// Reclaim erased space IN PLACE: punch every fold block no live record can reach.
+    /// Reclaim erased space in place: content-punch every fold block no record resolved by current
+    /// authority can reach.
     ///
-    /// The cheap half of erasure, and the one a sealed store wants. A re-fold reclaims the same
+    /// The cheap half of erasure when a full rewrite is not requested. A re-fold reclaims the same
     /// bytes by rewriting the world — correct, thorough, and O(store); this walks the live
     /// records' piece references, finds blocks nothing reaches, records them in the manifest, and
-    /// deallocates their extents. Offsets do not move, so no part is rebuilt and no reader is
-    /// disturbed.
+    /// deallocates their extents. Offsets do not move, so no current part is rebuilt and no record
+    /// resolved by current authority loses readable content. An older read view, including one
+    /// pinned to a retained manifest revision, may lose readability when this operation punches
+    /// bytes that current authority no longer needs.
     ///
     /// **Order matters and is the whole safety argument**: the manifest names the punched blocks
     /// BEFORE the bytes go, so a crash between the two leaves blocks marked punched that are
@@ -5501,7 +5116,7 @@ impl Store {
     ///
     /// Requires a flushed memtable, for the same reason a re-fold does: staged records reference
     /// content this would otherwise consider unreachable.
-    pub fn punch_unreferenced(&mut self) -> Result<PunchStats> {
+    pub fn punch_unreferenced(&mut self) -> Result<ContentPunchStats> {
         self.punch_unreferenced_with_control(&crate::control::OperationControl::default())
     }
 
@@ -5513,11 +5128,11 @@ impl Store {
     pub fn punch_unreferenced_with_control(
         &mut self,
         control: &crate::control::OperationControl,
-    ) -> Result<PunchStats> {
+    ) -> Result<ContentPunchStats> {
         let started = std::time::Instant::now();
         let result = self.punch_unreferenced_inner_with_control(control);
         self.observe_lifecycle(
-            crate::observability::LifecycleOperation::Punch,
+            crate::observability::LifecycleOperation::ContentPunch,
             started.elapsed(),
             &result,
         );
@@ -5527,15 +5142,16 @@ impl Store {
     fn punch_unreferenced_inner_with_control(
         &mut self,
         control: &crate::control::OperationControl,
-    ) -> Result<PunchStats> {
+    ) -> Result<ContentPunchStats> {
+        self.ensure_writer_usable()?;
         control.check("content punching")?;
         if !self.mem.is_empty() {
             bail!("punching requires a flushed memtable; call sync() and flush() first");
         }
-        // Every block a live record can still reach, via the piece dictionaries of live rows.
+        // Every block a present record can still reach through its owning Part dictionary.
         let live_blocks: HashSet<u32> = self
             .live_fold_pieces_with_control(control)?
-            .values()
+            .keys()
             .map(|location| location.block_id)
             .collect();
         // ... against every block the fold holds.
@@ -5545,48 +5161,74 @@ impl Store {
         let already: HashSet<u32> =
             self.manifest.punched.iter().flat_map(|&(lo, hi)| lo..=hi).collect();
         if dead.is_empty() {
-            return Ok(PunchStats::default());
+            return Ok(ContentPunchStats::default());
         }
 
         // Record first, punch second. Already-declared blocks stay in `dead`: a crash or
         // cancellation can land after this authority is durable but before every hole is punched,
         // and retrying those blocks is how the operation actually resumes.
         if dead.iter().any(|block| !already.contains(block)) {
-            control.check("content punching")?;
-            self.admit_store_directory_growth(2, "content punching")?;
-            let mut m = self.manifest.clone();
-            let mut all: Vec<u32> = already.into_iter().chain(dead.iter().copied()).collect();
-            all.sort_unstable();
-            m.punched = to_ranges(&all);
-            match &self.home {
-                Home::Dir(dir) => m.commit_with_limits(dir, self.read_limits)?,
-                Home::File { container, .. } => {
-                    let t = self.fold.sync()?;
-                    m.fold_seg = t.seg;
-                    m.fold_off = t.off;
-                    let mut c = container.lock().expect("container lock poisoned");
-                    m.commit_into_container(&mut c)?;
-                    c.commit()?; // the declaration is durable BEFORE any byte is destroyed
+            let prepared = (|| -> Result<Manifest> {
+                control.check("content punching")?;
+                let mut manifest = self.manifest.clone();
+                let mut all: Vec<u32> = already.into_iter().chain(dead.iter().copied()).collect();
+                all.sort_unstable();
+                manifest.punched = to_ranges(&all);
+                let tail = self.fold.sync()?;
+                manifest.fold_seg = tail.seg;
+                manifest.fold_off = tail.off;
+                manifest.commit_into_container(
+                    &mut self.container.lock().expect("container lock poisoned"),
+                )?;
+                Ok(manifest)
+            })();
+            let m = match prepared {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return Err(
+                        self.discard_staged_and_require_reopen("content-punch preparation", error)
+                    );
                 }
-            }
+            };
+            let mut c = self.container.lock().expect("container lock poisoned");
+            let publication_error = match c.commit() {
+                Ok(_) => None,
+                Err(error) if c.failed_publication_selected() == Some(true) => Some(error),
+                Err(error) => return Err(error),
+            }; // the declaration is selected BEFORE any byte is destroyed
+            drop(c);
             self.manifest = m;
             self.note_manifest_commit();
+            self.fold.declare_punched(&self.manifest.punched);
+            if let Some(error) = publication_error {
+                return Err(error).context(
+                    "container selected the content-punch declaration, but its final synchronization failed",
+                );
+            }
         }
         // Declare before destroying, the same order the manifest write follows and for the same
         // reason: at no point may a block's bytes be gone while this fold still calls it content.
         self.fold.declare_punched(&self.manifest.punched);
 
+        // A selected declaration whose final publication barrier returned an error is current to
+        // this process but not yet safe as crash authority. Obtain a successful barrier before
+        // destroying bytes; otherwise a crash could revive the predecessor without the punched
+        // declaration while leaving the holes behind.
+        self.container.lock().expect("container lock poisoned").acknowledge_current_state()?;
+
         let punched = self.fold.punch_blocks_with_control(&dead, control)?;
-        Ok(PunchStats { blocks_punched: punched.len(), blocks_examined: dead.len() })
+        Ok(ContentPunchStats { blocks_punched: punched.len(), blocks_examined: dead.len() })
     }
 
     /// Rewrite the fold, keeping only content that live records still reference.
     ///
-    /// The ONLY operation that touches content. Everything else asserts it does not, which is why this
-    /// is a separate call rather than a flag: a reader of the merge path should never have to wonder.
+    /// The only operation that rewrites reachable fold content and rebuilds parts around its new
+    /// locations. Content punch can deallocate payloads already declared unreachable; refold moves
+    /// the content that remains, which is why this is a separate call rather than a merge flag.
     ///
     /// Requires a flushed memtable — staged records reference the old fold, and rebuilding parts under
-    /// them would leave their pieces unresolvable.
+    /// them would leave their pieces unresolvable. Returns no-op statistics without a transition
+    /// when the current authority references no parts.
     pub fn refold(&mut self) -> Result<refold::RefoldStats> {
         self.refold_with_control(&crate::control::OperationControl::default())
     }
@@ -5619,7 +5261,7 @@ impl Store {
         for (part, part_ref) in self.parts.iter().zip(&self.manifest.parts) {
             control.check("refold space preflight")?;
             source_part_bytes = source_part_bytes
-                .checked_add(self.part_file_bytes(&part_ref.file)?)
+                .checked_add(self.part_member_bytes(&part_ref.member)?)
                 .ok_or_else(|| anyhow::anyhow!("refold source part byte count overflow"))?;
             for (_, _, raw, _) in part.sections() {
                 control.check("refold space preflight")?;
@@ -5663,7 +5305,7 @@ impl Store {
 
     /// [`Store::refold`] with cooperative checkpoints before the generation swap.
     ///
-    /// Cancellation removes the unpublished generation and rebuilt parts. Once manifest commit is
+    /// Cancellation removes the unpublished generation and rebuilt parts. Once publication is
     /// attempted, cancellation is no longer observed: the crash-safe commit protocol and mandatory
     /// handle/retention cleanup must run to a definite result.
     pub fn refold_with_control(
@@ -5684,6 +5326,7 @@ impl Store {
         &mut self,
         control: &crate::control::OperationControl,
     ) -> Result<refold::RefoldStats> {
+        self.ensure_writer_usable()?;
         control.check("content refold")?;
         if !self.mem.is_empty() {
             bail!("refold requires a flushed memtable; call sync() and flush() first");
@@ -5691,134 +5334,13 @@ impl Store {
         if self.parts.is_empty() {
             return Ok(refold::RefoldStats::default());
         }
-        if let Home::File { container, .. } = &self.home {
-            let container = container.clone();
-            return self.refold_in_file(container, control);
-        }
-        let dir = self.home.dir()?.to_path_buf();
-        self.admit_store_directory_growth(self.parts.len() as u64 + 3, "content refold")?;
-        let seqs: Vec<(u64, u64)> =
-            self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
-        let (new_gen, built, mut stats) = refold::refold_with_control_and_limits(
-            self.home.dir()?,
-            &self.parts,
-            &seqs,
-            &self.fold,
-            self.manifest.fold_gen,
-            self.cfg,
-            control,
-            self.read_limits,
-        )?;
-
-        // Data before pointers, exactly as everywhere else: the new fold and the new parts are durable
-        // before the manifest names either, and the manifest swap is the instant it takes effect.
-        let new_dir = refold::fold_dir(&dir, new_gen);
-        let prepared = (|| -> Result<Manifest> {
-            let mut m = self.manifest.clone();
-            m.parts = built
-                .iter()
-                .map(|(file, lo, hi, n)| {
-                    control.check("content refold")?;
-                    Ok(PartRef {
-                        file: file.clone(),
-                        seq_lo: *lo,
-                        seq_hi: *hi,
-                        records: *n,
-                        b3: Some(
-                            hash_file_with_control(
-                                &self.home.dir()?.join(file),
-                                control,
-                                "content refold output hashing",
-                            )?
-                            .to_hex()
-                            .to_string(),
-                        ),
-                    })
-                })
-                .collect::<Result<_>>()?;
-            m.fold_gen = new_gen;
-            // Block ids are PER GENERATION. The new fold was rewritten without erased content and
-            // therefore has no holes inherited from the old generation.
-            m.punched.clear();
-            let f = Fold::open_with_limits(&new_dir, self.cfg, self.read_limits)?;
-            let t = f.tail();
-            m.fold_seg = t.seg;
-            m.fold_off = t.off;
-            control.check("content refold")?;
-            Ok(m)
-        })();
-        let mut m = match prepared {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                cleanup_refold_stage(&dir, new_gen, &built);
-                return Err(error);
-            }
-        };
-        // No cancellation checkpoint after this call begins. A failed commit can have durably
-        // written its retained copy, so staged files must remain for ordinary recovery.
-        m.commit_with_limits(self.home.dir()?, self.read_limits)?;
-
-        // Everything past here is cleanup: a crash leaves orphans, which open() sweeps.
-        let old_gen = self.manifest.fold_gen;
-        self.manifest = m;
-        // PURGE the retained log down to this commit alone. Erasure semantics trump snapshots: a
-        // re-fold exists to make dropped content unreachable in this store, and a retained manifest would keep the old
-        // generation — deleted records included — readable for MANIFEST_RETAIN more commits.
-        // Time travel does not cross a re-fold, by design; that is the point of running one.
-        //
-        // The unlinks are durable and propagated, because they are the erasure claim, not window
-        // pruning: a swallowed failure or a lost dirent would leave the old generation readable
-        // through a name this method just promised was gone. The re-fold itself is already
-        // committed when this runs, so an error here means "committed, but the purge is
-        // incomplete — reopen the store", and reopening completes it: writer open durably removes
-        // retained manifests from any other fold generation.
-        for c in list_retained_with_limits(&dir, self.read_limits)? {
-            if c != self.manifest.commit {
-                crate::vfs::unlink(&retained_path(&dir, c)).with_context(|| {
-                    format!(
-                        "re-fold committed, but purging retained manifest {c} failed — reopen \
-                         the store to complete the purge"
-                    )
-                })?;
-            }
-        }
-        crate::vfs::sync_dir(self.home.dir()?)?;
-        self.retained_commit_count = 1;
-        let part_cache_budget = self.pcache.budget();
-        self.pcache = Arc::new(SectionCache::new(part_cache_budget));
-        self.parts.clear();
-        for p in &self.manifest.parts {
-            self.parts.push(Arc::new(Part::open_in_with_limits(
-                &dir.join(&p.file),
-                self.pcache.clone(),
-                self.read_limits,
-            )?));
-        }
-        self.fold = Fold::open_at_with_limits(
-            &new_dir,
-            self.cfg,
-            self.manifest.fold_tail(),
-            // Empty by construction — a new generation has no punched declaration, which is what
-            // `m.punched.clear()` above committed.
-            &self.manifest.punched,
-            self.read_limits,
-        )?;
-        sweep_unreachable_with_limits(self.home.dir()?, self.read_limits)?;
-        // Reported, not swallowed. Claiming `bytes_reclaimed()` while the old generation still
-        // occupies the disk would be a stat that says the opposite of the truth. The re-fold itself
-        // is already committed and correct; this is only honest about what is left behind.
-        if refold::fold_dir(&dir, old_gen).exists() {
-            stats.stale_generation_left = true;
-        }
-        Ok(stats)
+        self.refold_in_file(self.container.clone(), control)
     }
 
     /// The refold's single-file form. The build stages a whole new generation and its rebuilt
     /// parts as uncommitted members; publication is ONE flip carrying the swap, the retained-log
-    /// purge, and the sweep's frees. The directory protocol's hardest ordering problem — a crash
-    /// between the commit and the purge leaving erased content readable through a retained name —
-    /// cannot occur: the purge IS part of the commit. Time travel does not cross a refold, here
-    /// by construction rather than by propagated unlinks.
+    /// purge, and the sweep's frees. A crash cannot land between the swap and purge because they
+    /// are one commit. Time travel does not cross a refold.
     fn refold_in_file(
         &mut self,
         container: std::sync::Arc<std::sync::Mutex<crate::container::Container>>,
@@ -5826,27 +5348,40 @@ impl Store {
     ) -> Result<refold::RefoldStats> {
         let seqs: Vec<(u64, u64)> =
             self.manifest.parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
-        let (new_gen, built, mut stats, nf) =
-            refold::refold_into_container_with_control_and_limits(
-                container.clone(),
-                &self.parts,
-                &seqs,
-                &self.fold,
-                self.manifest.fold_gen,
-                self.cfg,
-                control,
-                self.read_limits,
-            )?;
+        let built_generation = refold::refold_into_container_with_control_and_limits(
+            container.clone(),
+            &self.parts,
+            &seqs,
+            &self.fold,
+            self.manifest.fold_gen,
+            self.cfg,
+            control,
+            self.read_limits,
+        );
+        let (new_gen, built, mut stats, nf) = match built_generation {
+            Ok(built) => built,
+            Err(error) => {
+                return match container.lock().expect("container lock poisoned").discard_staged() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => {
+                        self.requires_reopen = true;
+                        Err(cleanup.context(format!(
+                            "refold build failed ({error:#}); discarding its isolated staged generation also failed and writer requires reopen"
+                        )))
+                    }
+                };
+            }
+        };
 
         let mut m = self.manifest.clone();
         m.parts = built
             .iter()
             .map(|(file, lo, hi, n, b3)| PartRef {
-                file: file.clone(),
+                member: file.clone(),
                 seq_lo: *lo,
                 seq_hi: *hi,
                 records: *n,
-                b3: Some(b3.clone()),
+                b3: b3.clone(),
             })
             .collect();
         m.fold_gen = new_gen;
@@ -5856,52 +5391,104 @@ impl Store {
         m.fold_seg = t.seg;
         m.fold_off = t.off;
         if let Err(error) = control.check("content refold publication") {
-            let _ = container.lock().expect("container lock poisoned").discard_staged();
-            return Err(error.into());
+            return match container.lock().expect("container lock poisoned").discard_staged() {
+                Ok(()) => Err(error.into()),
+                Err(cleanup) => {
+                    self.requires_reopen = true;
+                    Err(cleanup.context(format!(
+                        "content refold was cancelled ({error}); discarding its isolated staged generation also failed and writer requires reopen"
+                    )))
+                }
+            };
         }
-        {
+        let staged = (|| -> Result<()> {
             let mut c = container.lock().expect("container lock poisoned");
-            if let Err(error) = m.commit_into_container(&mut c) {
-                let _ = c.discard_staged();
-                return Err(error);
-            }
+            m.commit_into_container(&mut c)?;
             // The purge, staged into the SAME commit: every retained manifest except this
             // commit's own goes, because a retained name would keep the superseded generation —
             // deleted content included — readable for MANIFEST_RETAIN more commits.
             for commit in container_retained_commits(&c) {
                 if commit != m.commit {
-                    let _ = c.remove(&format!("MANIFEST.{commit:08}"));
+                    c.remove(&format!("MANIFEST.{commit:08}"))?;
                 }
             }
             // With no retained pins left, the sweep frees the old generation and every
             // superseded part in the same state that abandons them.
             sweep_unreachable_container(&mut c, &m, self.read_limits)?;
-            c.commit().context(
-                "re-fold staged completely but the publishing flip failed — nothing was \
-                 published; reopen the store",
-            )?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            return match container.lock().expect("container lock poisoned").discard_staged() {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    self.requires_reopen = true;
+                    Err(cleanup.context(format!(
+                        "refold preparation failed ({error:#}); discarding its isolated staged generation also failed and writer requires reopen"
+                    )))
+                }
+            };
         }
+        // Open every newly staged part while the predecessor is still authoritative. After the
+        // container-state flip, Store adoption must be a nonfallible pointer/state swap; otherwise
+        // a transient extent read can leave this live writer holding the successor manifest, a
+        // partial part list, and the predecessor Fold.
+        let part_cache_budget = self.pcache.budget();
+        let new_cache = Arc::new(SectionCache::new(part_cache_budget));
+        let prepared_parts = (|| -> Result<Vec<Arc<Part>>> {
+            let mut parts = Vec::new();
+            parts.try_reserve_exact(m.parts.len()).context("reserve refolded part handles")?;
+            for part in &m.parts {
+                let reader = container
+                    .lock()
+                    .expect("container lock poisoned")
+                    .extent(&part.member)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("refold staged {} but the container lost it", part.member)
+                    })?;
+                parts.push(Arc::new(Part::open_reader_with_limits(
+                    Box::new(reader),
+                    new_cache.clone(),
+                    self.read_limits,
+                )?));
+            }
+            Ok(parts)
+        })();
+        let prepared_parts = match prepared_parts {
+            Ok(parts) => parts,
+            Err(error) => {
+                return match container.lock().expect("container lock poisoned").discard_staged() {
+                    Ok(()) => Err(error).context("open staged refold parts before publication"),
+                    Err(cleanup) => {
+                        self.requires_reopen = true;
+                        Err(cleanup.context(format!(
+                            "opening staged refold parts failed ({error:#}); discarding them also failed and writer requires reopen"
+                        )))
+                    }
+                };
+            }
+        };
+        let publication_error = {
+            let mut c = container.lock().expect("container lock poisoned");
+            match c.commit() {
+                Ok(_) => None,
+                Err(error) if c.failed_publication_selected() == Some(true) => Some(error),
+                Err(error) => return Err(error).context("publish the rebuilt fold generation"),
+            }
+        };
 
         self.manifest = m;
         self.note_manifest_commit();
         self.retained_commit_count = 1;
-        let part_cache_budget = self.pcache.budget();
-        self.pcache = Arc::new(SectionCache::new(part_cache_budget));
-        self.parts.clear();
-        for p in &self.manifest.parts {
-            let reader =
-                container.lock().expect("container lock poisoned").extent(&p.file).ok_or_else(
-                    || anyhow::anyhow!("refold committed {} but the container lost it", p.file),
-                )?;
-            self.parts.push(Arc::new(Part::open_reader_with_limits(
-                Box::new(reader),
-                self.pcache.clone(),
-                self.read_limits,
-            )?));
-        }
+        self.pcache = new_cache;
+        self.parts = prepared_parts;
         self.fold = nf;
         // Freed in the same flip that abandoned it: there is no stale generation to report.
         stats.stale_generation_left = false;
+        if let Some(error) = publication_error {
+            return Err(error).context(
+                "container selected the refolded manifest revision, but its final synchronization failed",
+            );
+        }
         Ok(stats)
     }
 
@@ -5915,18 +5502,11 @@ impl Store {
     /// in commits) is what keeps a reader holding a recent superblock exact rather than erroring;
     /// a reader older than that reads zeros and fails checksums — detected, never silent.
     ///
-    /// A directory store refuses: it returns space by unlinking, and has nothing to punch.
     pub fn punch_free_space(&mut self) -> Result<crate::container::FreePunchStats> {
-        match &self.home {
-            Home::Dir(_) => bail!(
-                "a directory store returns freed space by unlinking; punch_free_space is the \
-                 single-file store's reclamation"
-            ),
-            Home::File { container, .. } => {
-                let c = container.lock().expect("container lock poisoned");
-                c.punch_free_extents(MANIFEST_RETAIN as u64)
-            }
-        }
+        self.ensure_writer_usable()?;
+        let mut c = self.container.lock().expect("container lock poisoned");
+        c.acknowledge_current_state()?;
+        c.punch_free_extents(MANIFEST_RETAIN as u64)
     }
 
     /// Bytes pinned by every open part's section caches, against their shared budget.
@@ -5938,6 +5518,8 @@ impl Store {
     pub fn dedup_window_len(&self) -> usize {
         self.fold.window_len()
     }
+    /// Return the in-memory authority fields. `commit == 0` encodes the canonical origin and is not
+    /// a manifest revision.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -5986,7 +5568,7 @@ impl Store {
         }
     }
 
-    /// Walk the store directory once and classify every regular file by manifest reachability.
+    /// Classify container bytes by manifest reachability.
     ///
     /// This is intentionally separate from [`Store::health`]: it performs filesystem traversal and
     /// parses the retained window, so callers opt into its cost. No records, column values, or
@@ -6000,13 +5582,8 @@ impl Store {
         &self,
         control: &crate::control::OperationControl,
     ) -> Result<StoreSpaceUsage> {
-        match &self.home {
-            Home::Dir(dir) => store_space_usage(dir, &self.manifest, self.read_limits, control),
-            Home::File { container, path } => {
-                let c = container.lock().expect("container lock poisoned");
-                container_space_usage(&c, path, &self.manifest, self.read_limits, control)
-            }
-        }
+        let c = self.container.lock().expect("container lock poisoned");
+        container_space_usage(&c, &self.path, &self.manifest, self.read_limits, control)
     }
 
     /// Discover attribute names/types and named-content columns without decoding stored values.
@@ -6021,11 +5598,11 @@ impl Store {
 }
 
 /// [`store_space_usage`]'s single-file form: members classified by the same reachability rules
-/// — live manifest, retained manifests, their fold generations — with the WAL sidecar counted
+/// — current manifest revision, retained manifest revisions, and their fold generations — with the WAL sidecar counted
 /// live and the free list counted unclassified: bytes the file holds that no reachable name
-/// claims, which is exactly what that bucket means. `total` is what the store occupies on disk —
-/// the file itself plus its sidecar — so superblocks, the directory, and alignment padding are
-/// inside it, as they are inside the file.
+/// claims, which is exactly what that bucket means. `total` is the additive total of classified
+/// member payload, free extents, and the WAL sidecar. Container superblocks, directory encodings,
+/// and alignment padding are structural overhead and are deliberately outside these buckets.
 fn container_space_usage(
     c: &crate::container::Container,
     path: &Path,
@@ -6034,12 +5611,12 @@ fn container_space_usage(
     control: &crate::control::OperationControl,
 ) -> Result<StoreSpaceUsage> {
     control.check("store space inventory")?;
-    let mut live_files: std::collections::HashSet<String> =
+    let mut live_members: std::collections::HashSet<String> =
         std::iter::once("MANIFEST".to_string()).collect();
-    live_files.extend(live_manifest.parts.iter().map(|p| p.file.clone()));
+    live_members.extend(live_manifest.parts.iter().map(|p| p.member.clone()));
     let live_prefix = crate::fold::fold_member_prefix(live_manifest.fold_gen);
 
-    let mut retained_files: std::collections::HashSet<String> = Default::default();
+    let mut retained_members: std::collections::HashSet<String> = Default::default();
     let mut retained_prefixes: std::collections::HashSet<String> = Default::default();
     for commit in container_retained_commits(c) {
         control.check("store space inventory")?;
@@ -6049,8 +5626,8 @@ fn container_space_usage(
             .with_context(|| format!("account retained manifest {commit}"))?;
         let m = Manifest::parse(&bytes)
             .with_context(|| format!("account retained manifest {commit}"))?;
-        retained_files.insert(name);
-        retained_files.extend(m.parts.into_iter().map(|p| p.file));
+        retained_members.insert(name);
+        retained_members.extend(m.parts.into_iter().map(|p| p.member));
         retained_prefixes.insert(crate::fold::fold_member_prefix(m.fold_gen));
     }
 
@@ -6062,16 +5639,16 @@ fn container_space_usage(
         ..StoreSpaceUsage::default()
     };
     let add = |amount: &mut SpaceAmount, bytes: u64| {
-        amount.files += 1;
+        amount.members += 1;
         amount.logical_bytes += bytes;
     };
     for name in c.names().map(String::from).collect::<Vec<String>>() {
         control.check("store space inventory")?;
         let len = c.member_len(&name).unwrap_or(0);
         let gen = fold_generation_of_member(&name);
-        let is_live = live_files.contains(&name)
+        let is_live = live_members.contains(&name)
             || gen.map(|g| crate::fold::fold_member_prefix(g) == live_prefix).unwrap_or(false);
-        let is_retained = retained_files.contains(&name)
+        let is_retained = retained_members.contains(&name)
             || gen
                 .map(|g| retained_prefixes.contains(&crate::fold::fold_member_prefix(g)))
                 .unwrap_or(false);
@@ -6087,135 +5664,17 @@ fn container_space_usage(
     if let Ok(meta) = std::fs::metadata(&wal) {
         add(&mut usage.live, meta.len());
     }
-    // The free list: bytes present under no reachable name. Zero files — extents are not files.
+    // The free list: bytes present under no reachable name. Zero members — extents are not members.
     usage.unclassified.logical_bytes += c.free_bytes();
     // Totals stay bucket-additive — the accounting identity every consumer of this struct
-    // checks. Structural overhead (superblocks, the directory, alignment padding) is uncounted,
-    // exactly as the directory layout never counted its inodes; the file's own length is one
-    // stat away for anyone asking the other question.
-    usage.total.files = usage.live.files + usage.retained_only.files + usage.unclassified.files;
+    // checks. Structural overhead (superblocks, the directory, alignment padding) is uncounted;
+    // the file's own length is one stat away for anyone asking the other question.
+    usage.total.members =
+        usage.live.members + usage.retained_only.members + usage.unclassified.members;
     usage.total.logical_bytes = usage.live.logical_bytes
         + usage.retained_only.logical_bytes
         + usage.unclassified.logical_bytes;
     Ok(usage)
-}
-
-fn store_space_usage(
-    dir: &Path,
-    live_manifest: &Manifest,
-    read_limits: ReadLimits,
-    control: &crate::control::OperationControl,
-) -> Result<StoreSpaceUsage> {
-    control.check("store space inventory")?;
-    let mut live_files: HashSet<PathBuf> =
-        [PathBuf::from("MANIFEST"), PathBuf::from("WAL")].into_iter().collect();
-    live_files.extend(live_manifest.parts.iter().map(|part| PathBuf::from(&part.file)));
-    let live_fold = fold_relative_dir(dir, live_manifest.fold_gen)?;
-
-    let mut retained_files = HashSet::new();
-    let mut retained_folds = HashSet::new();
-    for commit in list_retained_with_limits(dir, read_limits)? {
-        control.check("store space inventory")?;
-        let retained_path = retained_path(dir, commit);
-        retained_files.insert(relative_store_path(dir, &retained_path)?);
-        let manifest = load_retained(dir, commit)
-            .with_context(|| format!("account retained manifest {commit}"))?;
-        retained_files.extend(manifest.parts.iter().map(|part| PathBuf::from(&part.file)));
-        retained_folds.insert(fold_relative_dir(dir, manifest.fold_gen)?);
-    }
-
-    let mut usage = StoreSpaceUsage {
-        filesystem_available_bytes: crate::sys::filesystem_available_bytes(dir)
-            .with_context(|| format!("measure available filesystem bytes at {}", dir.display()))?,
-        ..StoreSpaceUsage::default()
-    };
-    let reachability = SpaceReachability {
-        live_files: &live_files,
-        live_fold: &live_fold,
-        retained_files: &retained_files,
-        retained_folds: &retained_folds,
-    };
-    account_store_files(dir, dir, &reachability, &mut usage, read_limits, control)?;
-    Ok(usage)
-}
-
-fn fold_relative_dir(dir: &Path, generation: u32) -> Result<PathBuf> {
-    relative_store_path(dir, &refold::fold_dir(dir, generation))
-}
-
-fn relative_store_path(dir: &Path, path: &Path) -> Result<PathBuf> {
-    path.strip_prefix(dir)
-        .map(Path::to_path_buf)
-        .with_context(|| format!("{} is outside store {}", path.display(), dir.display()))
-}
-
-struct SpaceReachability<'a> {
-    live_files: &'a HashSet<PathBuf>,
-    live_fold: &'a Path,
-    retained_files: &'a HashSet<PathBuf>,
-    retained_folds: &'a HashSet<PathBuf>,
-}
-
-fn account_store_files(
-    root: &Path,
-    start: &Path,
-    reachability: &SpaceReachability<'_>,
-    usage: &mut StoreSpaceUsage,
-    read_limits: ReadLimits,
-    control: &crate::control::OperationControl,
-) -> Result<()> {
-    let mut directories = vec![start.to_path_buf()];
-    let mut visited = 0u64;
-    while let Some(dir) = directories.pop() {
-        for entry in std::fs::read_dir(&dir)
-            .with_context(|| format!("read store space directory {}", dir.display()))?
-        {
-            visited = visited.saturating_add(1);
-            read_limits.admit_directory_entries("store filesystem inventory", visited)?;
-            control.check("store space inventory")?;
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                directories.push(entry.path());
-            } else if file_type.is_file() {
-                let path = entry.path();
-                let relative = relative_store_path(root, &path)?;
-                let metadata = entry.metadata()?;
-                add_space(&mut usage.total, &path, &metadata)?;
-                let live = reachability.live_files.contains(&relative)
-                    || relative.starts_with(reachability.live_fold);
-                let retained = reachability.retained_files.contains(&relative)
-                    || reachability.retained_folds.iter().any(|fold| relative.starts_with(fold));
-                if live {
-                    add_space(&mut usage.live, &path, &metadata)?;
-                } else if retained {
-                    add_space(&mut usage.retained_only, &path, &metadata)?;
-                } else {
-                    add_space(&mut usage.unclassified, &path, &metadata)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn add_space(amount: &mut SpaceAmount, path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
-    amount.files =
-        amount.files.checked_add(1).ok_or_else(|| anyhow::anyhow!("store file count overflow"))?;
-    amount.logical_bytes = amount
-        .logical_bytes
-        .checked_add(metadata.len())
-        .ok_or_else(|| anyhow::anyhow!("store logical byte count overflow"))?;
-    amount.allocated_bytes =
-        match (amount.allocated_bytes, crate::sys::allocated_bytes(path, metadata)) {
-            (Some(total), Some(bytes)) => Some(
-                total
-                    .checked_add(bytes)
-                    .ok_or_else(|| anyhow::anyhow!("store allocated byte count overflow"))?,
-            ),
-            _ => None,
-        };
-    Ok(())
 }
 
 /// Exact physical-input bounds for one incremental compaction step.
@@ -6225,7 +5684,7 @@ pub struct CompactionBudget {
     pub max_input_parts: usize,
     /// Maximum physical rows across the admitted input parts.
     pub max_input_rows: u64,
-    /// Maximum sum of the admitted input part file lengths.
+    /// Maximum sum of the admitted input part member lengths.
     pub max_input_bytes: u64,
 }
 
@@ -6252,17 +5711,17 @@ impl CompactionBudget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// An exact contiguous input selection from the current live part list.
+/// An exact contiguous input selection from the part list referenced by current authority.
 pub struct CompactionPlan {
     /// Zero-based index of the oldest selected part.
     pub start_part: usize,
     /// Number of adjacent parts selected.
     pub input_parts: usize,
-    /// Physical rows across the selected files.
+    /// Physical rows across the selected part members.
     pub input_rows: u64,
-    /// Sum of the selected files' exact on-disk lengths.
+    /// Sum of the selected part members' exact logical lengths.
     pub input_bytes: u64,
-    /// Whether this run covers the complete live list and may settle tombstones.
+    /// Whether this run covers the complete referenced part list and may drop tombstones.
     pub drops_tombstones: bool,
 }
 
@@ -6331,7 +5790,7 @@ impl std::error::Error for CompactionError {}
 
 /// What [`Store::punch_unreferenced`] did.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PunchStats {
+pub struct ContentPunchStats {
     pub blocks_examined: usize,
     /// Fewer than examined when blocks sit in the active segment, which is never punched.
     pub blocks_punched: usize,
@@ -6363,7 +5822,7 @@ pub struct ErasureStats {
     pub refold: Option<refold::RefoldStats>,
 }
 
-/// A reader over the committed state. No lock, no writer, no daemon. Clones retain the same
+/// A reader over one store authority. No lock, no writer, no daemon. Clones retain the same
 /// immutable parts and fold handles, making ownership by concurrent query streams cheap.
 #[derive(Clone)]
 pub struct ReadStore {
@@ -6373,7 +5832,7 @@ pub struct ReadStore {
     read_limits: ReadLimits,
 }
 
-/// A read-only store IS the committed read core, with nothing layered on top — so every method here
+/// A read-only store is the authority-pinned read core, with nothing layered on top — so every method here
 /// is a direct delegation, and there is no second implementation to keep in step.
 impl ReadStore {
     /// Atomic persisted-frame admission governing this immutable handle.
@@ -6438,7 +5897,7 @@ impl ReadStore {
         read::ids(&self.parts)
     }
 
-    /// Bounded structured paging over this immutable manifest snapshot.
+    /// Bounded structured paging over this immutable read view.
     pub fn scan(&self, request: &crate::scan::ScanRequest) -> Result<crate::scan::ScanPage> {
         crate::scan::scan_read_store(self, request)
     }
@@ -6540,7 +5999,7 @@ impl ReadStore {
     }
 
     /// Hand the fold and parts to a lens. Consumes the store because the query layer takes ownership
-    /// of both; the manifest snapshot it was opened at is already baked into `parts`.
+    /// of both; the store authority it was opened at is already baked into `parts`.
     pub fn into_parts(self) -> (Arc<Fold>, Vec<Arc<Part>>) {
         (self.fold, self.parts)
     }
@@ -6548,7 +6007,7 @@ impl ReadStore {
     pub fn part_count(&self) -> usize {
         self.parts.len()
     }
-    /// The live parts, oldest to newest — for tools that walk them (verification, inspection).
+    /// Parts referenced by this read view's store authority, oldest to newest.
     pub fn parts(&self) -> &[Arc<Part>] {
         &self.parts
     }
@@ -6556,6 +6015,8 @@ impl ReadStore {
     pub fn fold(&self) -> &Fold {
         &self.fold
     }
+    /// Return the in-memory authority fields. `commit == 0` encodes the canonical origin and is not
+    /// a manifest revision.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -6587,11 +6048,6 @@ fn approx_bytes(r: &Record) -> usize {
         + r.attrs.iter().map(|(k, _)| k.len() + 24).sum::<usize>()
 }
 
-/// Reject a store directory that is obviously not one, before doing anything destructive.
-pub fn looks_like_store(dir: &Path) -> bool {
-    dir.join("MANIFEST").exists() || dir.join("fold").exists()
-}
-
 // Positioned reads are the one thing with no fallback: every read in the engine is "n bytes at
 // offset o", and emulating that with seek-then-read is not safe across threads. Unix and WASI both
 // provide it. What WASI does NOT provide — advisory locking and hole punching — is degraded
@@ -6600,95 +6056,271 @@ pub fn looks_like_store(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
 
-    /// Build a directory-layout store with two commits and close it: `MANIFEST`,
-    /// `MANIFEST.00000001`, `MANIFEST.00000002`, one part per commit.
-    fn two_commit_dir_store(tag: &str) -> (std::path::PathBuf, crate::fold::FoldCfg) {
-        let d = std::env::temp_dir().join(format!(
-            "turndb-promote-{tag}-{}-{}",
+    #[test]
+    fn manifest_promotion_validates_piece_locations_through_each_rows_owning_part() {
+        use crate::fold::block::{self, Loc, CODEC_STORED};
+        use crate::fold::segment::SegHeader;
+        use crate::types::{BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!(
+            "turndb-promotion-owning-part-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
+        let fold_dir = root.join("fold");
+        std::fs::create_dir_all(&fold_dir).unwrap();
+        let bytes = b"same identity at two physical locations";
+        let hash = PieceHash::of(bytes);
+        let mut segment = SegHeader { seg: 0, flags: 0, dict_id: [0; 32] }.encode().to_vec();
+        let mut frame = Vec::new();
+        block::encode(&mut frame, 0, CODEC_STORED, bytes, bytes).unwrap();
+        segment.extend_from_slice(&frame);
+        block::encode(&mut frame, 1, CODEC_STORED, bytes, bytes).unwrap();
+        segment.extend_from_slice(&frame);
+        std::fs::write(fold_dir.join("seg-00000000.fold"), segment).unwrap();
         let cfg = crate::fold::FoldCfg::default();
-        let mut store = super::Store::open(&d, cfg).unwrap();
-        store.put("one", &[crate::store::Span::Piece(b"first commit")], vec![]).unwrap();
+        let fold = crate::fold::Fold::open_read_with_limits(
+            &fold_dir,
+            cfg,
+            &[(0, 0)],
+            crate::read_limits::ReadLimits::default(),
+        )
+        .unwrap();
+        let loc0 = Loc { block_id: 0, in_off: 0, raw: bytes.len() as u32 };
+        let loc1 = Loc { block_id: 1, in_off: 0, raw: bytes.len() as u32 };
+        let record = |id: &str| {
+            Record::new(
+                id,
+                vec![Content::identified(
+                    BODY_CONTENT,
+                    vec![BodyOp::Piece { hash, len: bytes.len() as u32 }],
+                    ContentHash(hash.0),
+                )],
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let p1_path = root.join("p1.part");
+        let p2_path = root.join("p2.part");
+        crate::part::build_full(
+            &p1_path,
+            &[record("owned-by-punched")],
+            &[],
+            1,
+            1,
+            3,
+            |_| Some(loc0),
+            &HashMap::new(),
+        )
+        .unwrap();
+        crate::part::build_full(
+            &p2_path,
+            &[record("unrelated-readable")],
+            &[],
+            2,
+            2,
+            3,
+            |_| Some(loc1),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let reader = super::ReadStore {
+            fold: Arc::new(fold),
+            parts: vec![
+                Arc::new(crate::part::Part::open(&p1_path).unwrap()),
+                Arc::new(crate::part::Part::open(&p2_path).unwrap()),
+            ],
+            manifest: super::Manifest::default(),
+            read_limits: crate::read_limits::ReadLimits::default(),
+        };
+        let error = super::validate_candidate_records(
+            &reader,
+            &crate::control::OperationControl::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("ERASED"), "{error:#}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn content_reachability_preserves_every_owning_location_for_one_piece_identity() {
+        use crate::fold::block::{self, Loc, CODEC_STORED};
+        use crate::fold::segment::SegHeader;
+        use crate::types::{BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!(
+            "turndb-reachability-owning-part-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let fold_dir = root.join("fold");
+        std::fs::create_dir_all(&fold_dir).unwrap();
+        let bytes = b"one identity stored at two locations";
+        let hash = PieceHash::of(bytes);
+        let mut segment = SegHeader { seg: 0, flags: 0, dict_id: [0; 32] }.encode().to_vec();
+        let mut frame = Vec::new();
+        block::encode(&mut frame, 0, CODEC_STORED, bytes, bytes).unwrap();
+        segment.extend_from_slice(&frame);
+        block::encode(&mut frame, 1, CODEC_STORED, bytes, bytes).unwrap();
+        segment.extend_from_slice(&frame);
+        std::fs::write(fold_dir.join("seg-00000000.fold"), segment).unwrap();
+        let fold = crate::fold::Fold::open_read_with_limits(
+            &fold_dir,
+            crate::fold::FoldCfg::default(),
+            &[],
+            crate::read_limits::ReadLimits::default(),
+        )
+        .unwrap();
+        let loc0 = Loc { block_id: 0, in_off: 0, raw: bytes.len() as u32 };
+        let loc1 = Loc { block_id: 1, in_off: 0, raw: bytes.len() as u32 };
+        let record = |id: &str| {
+            Record::new(
+                id,
+                vec![Content::identified(
+                    BODY_CONTENT,
+                    vec![BodyOp::Piece { hash, len: bytes.len() as u32 }],
+                    ContentHash(hash.0),
+                )],
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let p1_path = root.join("p1.part");
+        let p2_path = root.join("p2.part");
+        crate::part::build_full(
+            &p1_path,
+            &[record("row-at-block-zero")],
+            &[],
+            1,
+            1,
+            3,
+            |_| Some(loc0),
+            &HashMap::new(),
+        )
+        .unwrap();
+        crate::part::build_full(
+            &p2_path,
+            &[record("unrelated-row-at-block-one")],
+            &[],
+            2,
+            2,
+            3,
+            |_| Some(loc1),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let parts = vec![
+            Arc::new(crate::part::Part::open(&p1_path).unwrap()),
+            Arc::new(crate::part::Part::open(&p2_path).unwrap()),
+        ];
+        let live = super::live_fold_pieces_with_control(
+            &parts,
+            &fold,
+            &crate::control::OperationControl::default(),
+        )
+        .unwrap();
+        assert_eq!(live.len(), 2, "identity-keyed reachability would collapse one location");
+        assert_eq!(live.get(&loc0), Some(&hash));
+        assert_eq!(live.get(&loc1), Some(&hash));
+        assert_eq!(
+            live.keys().map(|loc| loc.block_id).collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1]),
+            "content punch must retain both blocks named by their owning live rows"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn punched_crc_exemption_names_only_segments_that_contain_declared_blocks() {
+        let root = std::env::temp_dir().join(format!(
+            "turndb-punched-segments-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("store.turndb");
+        let cfg = crate::fold::FoldCfg {
+            block_target: 4 * 1024,
+            seg_max: 16 * 1024,
+            ..Default::default()
+        };
+        let noise = |seed: u64, len: usize| {
+            let mut out = Vec::with_capacity(len);
+            let mut hash = blake3::hash(&seed.to_le_bytes());
+            while out.len() < len {
+                out.extend_from_slice(hash.as_bytes());
+                hash = blake3::hash(hash.as_bytes());
+            }
+            out.truncate(len);
+            out
+        };
+
+        let mut store = super::Store::open_file(&path, cfg).unwrap();
+        store.put("dead", &[super::Span::Piece(&noise(1, 6 * 1024))], vec![]).unwrap();
         store.sync().unwrap();
         store.flush().unwrap();
-        store.put("two", &[crate::store::Span::Piece(b"second commit")], vec![]).unwrap();
+        for index in 0..8u64 {
+            store
+                .put(
+                    &format!("live:{index}"),
+                    &[super::Span::Piece(&noise(10 + index, 6 * 1024))],
+                    vec![],
+                )
+                .unwrap();
+        }
         store.sync().unwrap();
         store.flush().unwrap();
+        store.delete("dead").unwrap();
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.merge_range(0, store.part_count()).unwrap().unwrap();
+        assert!(store.punch_unreferenced().unwrap().blocks_punched > 0);
+
+        let container = crate::container::Container::open_internal(&path).unwrap();
+        let segments = container
+            .names()
+            .filter(|name| name.ends_with(".fold"))
+            .map(String::from)
+            .collect::<std::collections::HashSet<_>>();
+        let ignored = super::verified_punched_fold_members(
+            &container,
+            cfg,
+            crate::read_limits::ReadLimits::default(),
+            &crate::control::OperationControl::default(),
+        )
+        .unwrap();
+        assert!(!ignored.is_empty(), "at least one segment contains a punched block");
+        assert!(
+            ignored.is_subset(&segments) && ignored.len() < segments.len(),
+            "unaffected segments must retain their outer CRC: ignored={ignored:?}, segments={segments:?}"
+        );
+        drop(container);
         store.close().unwrap();
-        assert!(d.join("MANIFEST").is_file());
-        assert!(super::retained_path(&d, 1).is_file() && super::retained_path(&d, 2).is_file());
-        (d, cfg)
+        std::fs::remove_dir_all(root).ok();
     }
 
-    /// The crash state a Windows replace-rename can leave: no live `MANIFEST`, a published
-    /// newest retained copy. Open promotes it and serves both commits.
-    #[test]
-    fn an_absent_manifest_beside_a_whole_newest_retained_copy_is_promoted_at_open() {
-        let (d, cfg) = two_commit_dir_store("whole");
-        std::fs::remove_file(d.join("MANIFEST")).unwrap();
-        let store = super::Store::open(&d, cfg).expect("open promotes the whole newest copy");
-        assert_eq!(store.manifest().commit, 2);
-        assert_eq!(store.reconstruct("one").unwrap().as_deref(), Some(&b"first commit"[..]));
-        assert_eq!(store.reconstruct("two").unwrap().as_deref(), Some(&b"second commit"[..]));
-        drop(store);
-        assert!(d.join("MANIFEST").is_file(), "promotion published the live name");
-        std::fs::remove_dir_all(&d).ok();
+    fn persisted_manifest() -> super::Manifest {
+        super::Manifest { commit: 1, fold_off: 48, ..Default::default() }
     }
 
-    /// Absent live manifest, damaged newest retained copy: refuse. The older copy is intact,
-    /// and it must NOT be promoted — that is a rollback, an operator's decision, not an open's.
-    #[test]
-    fn an_absent_manifest_beside_a_damaged_newest_retained_copy_is_refused_not_rolled_back() {
-        let (d, cfg) = two_commit_dir_store("damaged");
-        std::fs::remove_file(d.join("MANIFEST")).unwrap();
-        let p = super::retained_path(&d, 2);
-        let mut bytes = std::fs::read(&p).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xff;
-        std::fs::write(&p, &bytes).unwrap();
-        let err = match super::Store::open(&d, cfg) {
-            Ok(_) => panic!("a damaged newest copy must not be promoted"),
-            Err(e) => e,
-        };
-        let text = format!("{err:#}");
-        assert!(text.contains("does not validate whole"), "{text}");
-        assert!(!d.join("MANIFEST").exists(), "nothing was published: {text}");
-        assert!(super::retained_path(&d, 1).is_file(), "the older copy is untouched");
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    /// Absent live manifest, newest retained copy intact but a part it names is gone: refuse.
-    /// A manifest checksum alone is not validation.
-    #[test]
-    fn an_absent_manifest_whose_newest_retained_copy_names_a_missing_part_is_refused() {
-        let (d, cfg) = two_commit_dir_store("missing-part");
-        std::fs::remove_file(d.join("MANIFEST")).unwrap();
-        let newest = super::load_retained(&d, 2).unwrap();
-        let part = newest.parts.last().expect("commit 2 wrote a part").file.clone();
-        std::fs::remove_file(d.join(&part)).unwrap();
-        let err = match super::Store::open(&d, cfg) {
-            Ok(_) => panic!("a candidate missing a part must not be promoted"),
-            Err(e) => e,
-        };
-        let text = format!("{err:#}");
-        assert!(text.contains("does not validate whole"), "{text}");
-        assert!(!d.join("MANIFEST").exists(), "nothing was published: {text}");
-        std::fs::remove_dir_all(&d).ok();
-    }
-    fn manifest_bytes_with_part(file: &str) -> Vec<u8> {
-        serde_json::to_vec(&super::Manifest {
+    fn manifest_bytes_with_part(member: &str) -> Vec<u8> {
+        super::Manifest {
             parts: vec![super::PartRef {
-                file: file.into(),
+                member: member.into(),
                 seq_lo: 1,
                 seq_hi: 1,
                 records: 1,
-                b3: None,
+                b3: "00".repeat(32),
             }],
-            next_seq: 2,
-            ..Default::default()
-        })
+            next_seq: 1,
+            ..persisted_manifest()
+        }
+        .encode()
         .unwrap()
     }
 
@@ -6699,330 +6331,242 @@ mod tests {
         {
             let error =
                 super::Manifest::parse(&manifest_bytes_with_part(hostile)).unwrap_err().to_string();
-            assert!(error.contains("store-local path component"), "{hostile:?}: {error}");
+            assert!(error.contains("canonical name"), "{hostile:?}: {error}");
         }
         assert!(
             super::Manifest::parse(&manifest_bytes_with_part("part-00000001.part")).is_ok(),
-            "an ordinary legacy manifest remains accepted"
+            "an ordinary current manifest is accepted"
         );
     }
 
     #[test]
     fn manifest_semantics_reject_ambiguous_or_malformed_authority() {
         let part = super::PartRef {
-            file: "part-00000001.part".into(),
+            member: "part-00000001.part".into(),
             seq_lo: 2,
             seq_hi: 1,
             records: 1,
-            b3: None,
+            b3: "00".repeat(32),
         };
-        let inverted = super::Manifest { parts: vec![part.clone()], ..Default::default() };
-        assert!(super::Manifest::parse(&serde_json::to_vec(&inverted).unwrap()).is_err());
+        let inverted = super::Manifest { parts: vec![part.clone()], ..persisted_manifest() };
+        assert!(super::Manifest::parse(&inverted.encode().unwrap()).is_err());
 
         let duplicate = super::Manifest {
             parts: vec![
                 super::PartRef { seq_lo: 1, seq_hi: 1, ..part.clone() },
                 super::PartRef { seq_lo: 2, seq_hi: 2, ..part.clone() },
             ],
-            ..Default::default()
+            ..persisted_manifest()
         };
-        assert!(super::Manifest::parse(&serde_json::to_vec(&duplicate).unwrap()).is_err());
+        assert!(super::Manifest::parse(&duplicate.encode().unwrap()).is_err());
 
         let bad_digest = super::Manifest {
             parts: vec![super::PartRef {
                 seq_lo: 1,
                 seq_hi: 1,
-                b3: Some("not-a-blake3-digest".into()),
+                b3: "not-a-blake3-digest".into(),
                 ..part
             }],
-            ..Default::default()
+            ..persisted_manifest()
         };
-        assert!(super::Manifest::parse(&serde_json::to_vec(&bad_digest).unwrap()).is_err());
+        assert!(super::Manifest::parse(&bad_digest.encode().unwrap()).is_err());
+
+        let overlapping = super::Manifest {
+            parts: vec![
+                super::PartRef {
+                    member: "part-00000001-00000003.part".into(),
+                    seq_lo: 1,
+                    seq_hi: 3,
+                    records: 1,
+                    b3: "00".repeat(32),
+                },
+                super::PartRef {
+                    member: "part-00000003-00000004.part".into(),
+                    seq_lo: 3,
+                    seq_hi: 4,
+                    records: 1,
+                    b3: "11".repeat(32),
+                },
+            ],
+            ..persisted_manifest()
+        };
+        assert!(super::Manifest::parse(&overlapping.encode().unwrap()).is_err());
+
+        let stale_cursor = super::Manifest {
+            parts: vec![super::PartRef {
+                member: "part-00000001-00000007.part".into(),
+                seq_lo: 1,
+                seq_hi: 7,
+                records: 1,
+                b3: "22".repeat(32),
+            }],
+            next_seq: 6,
+            ..persisted_manifest()
+        };
+        assert!(super::Manifest::parse(&stale_cursor.encode().unwrap()).is_err());
+        let current_cursor = super::Manifest { next_seq: 7, ..stale_cursor };
+        assert!(super::Manifest::parse(&current_cursor.encode().unwrap()).is_ok());
+        let ahead_cursor = super::Manifest { next_seq: 8, ..current_cursor };
+        assert!(super::Manifest::parse(&ahead_cursor.encode().unwrap()).is_err());
+
+        let zero_sequence = super::Manifest {
+            parts: vec![super::PartRef {
+                member: "part-00000000.part".into(),
+                seq_lo: 0,
+                seq_hi: 0,
+                records: 0,
+                b3: "33".repeat(32),
+            }],
+            next_seq: 0,
+            ..persisted_manifest()
+        };
+        assert!(super::Manifest::parse(&zero_sequence.encode().unwrap()).is_err());
+
+        let gap = super::Manifest {
+            parts: vec![
+                super::PartRef {
+                    member: "part-00000001.part".into(),
+                    seq_lo: 1,
+                    seq_hi: 1,
+                    records: 1,
+                    b3: "44".repeat(32),
+                },
+                super::PartRef {
+                    member: "part-00000003.part".into(),
+                    seq_lo: 3,
+                    seq_hi: 3,
+                    records: 1,
+                    b3: "55".repeat(32),
+                },
+            ],
+            next_seq: 3,
+            ..persisted_manifest()
+        };
+        assert!(super::Manifest::parse(&gap.encode().unwrap()).is_err());
 
         let punched = super::Manifest { punched: vec![(5, 9), (9, 12)], ..Default::default() };
-        assert!(super::Manifest::parse(&serde_json::to_vec(&punched).unwrap()).is_err());
+        assert!(super::Manifest::parse(&punched.encode().unwrap()).is_err());
     }
 
     #[test]
-    fn manifest_size_is_refused_before_reading_a_sparse_body() {
-        let d = std::env::temp_dir().join(format!("turndb-manifest-limit-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("MANIFEST");
-        std::fs::File::create(&path).unwrap().set_len(super::MAX_MANIFEST_BYTES + 1).unwrap();
-        let error = format!("{:#}", super::Manifest::load(&d).unwrap_err());
-        std::fs::remove_dir_all(d).ok();
-        assert!(error.contains("exceeding") && error.contains("limit"), "{error}");
+    fn manifest_origin_and_fold_tail_have_one_canonical_shape() {
+        assert!(super::Manifest::parse(&super::Manifest::default().encode().unwrap()).is_err());
+        let origin = persisted_manifest();
+        assert!(super::Manifest::parse(&origin.encode().unwrap()).is_ok());
+
+        let false_origin = super::Manifest { prev: Some("00".repeat(32)), ..origin.clone() };
+        assert!(super::Manifest::parse(&false_origin.encode().unwrap()).is_err());
+        let missing_predecessor = super::Manifest { commit: 2, ..origin.clone() };
+        assert!(super::Manifest::parse(&missing_predecessor.encode().unwrap()).is_err());
+        let unsupported_cursor = super::Manifest { next_seq: 1, ..origin.clone() };
+        assert!(super::Manifest::parse(&unsupported_cursor.encode().unwrap()).is_err());
+        let impossible_tail = super::Manifest { fold_seg: 1, fold_off: 0, ..origin };
+        assert!(super::Manifest::parse(&impossible_tail.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn container_fold_sidecars_obey_explicit_read_limits_without_advisory_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "turndb-sidecar-limits-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("store.turndb");
+        let cfg =
+            crate::fold::FoldCfg { block_target: 1, seg_max: 16 * 1024, ..Default::default() };
+        let mut store = super::Store::open_file(&path, cfg).unwrap();
+        for index in 0..1_200u32 {
+            let bytes = index.to_le_bytes();
+            store
+                .put(&format!("id:{index:04}"), &[super::Span::Piece(&bytes)], Vec::new())
+                .unwrap();
+        }
+        store.sync().unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+
+        let container = crate::container::Container::open(&path).unwrap();
+        let manifest = super::Manifest::parse(
+            &container.read_file_bounded("MANIFEST", super::MAX_MANIFEST_BYTES).unwrap(),
+        )
+        .unwrap();
+        let sidecar_len = container
+            .names()
+            .filter(|name| name.ends_with(".dir"))
+            .filter_map(|name| container.member_len(name))
+            .max()
+            .expect("the small-segment fixture must produce a directory sidecar");
+        assert!(sidecar_len > 1);
+
+        let strict = crate::read_limits::ReadLimits {
+            max_stored_frame_bytes: sidecar_len - 1,
+            ..Default::default()
+        };
+        let error = super::open_fold_from_container(&container, &manifest, cfg, &path, strict)
+            .err()
+            .expect("an over-budget sidecar must refuse rather than fall back");
+        assert_eq!(crate::error::classify(&error), crate::error::ErrorClass::ResourceExhausted);
+        assert!(matches!(
+            error.downcast_ref::<crate::read_limits::ReadAdmissionError>(),
+            Some(crate::read_limits::ReadAdmissionError::StoredFrameTooLarge { frame, .. })
+                if frame.contains("fold directory sidecar")
+        ));
+
+        let nearest = crate::read_limits::ReadLimits {
+            max_stored_frame_bytes: sidecar_len,
+            ..Default::default()
+        };
+        super::open_fold_from_container(&container, &manifest, cfg, &path, nearest)
+            .expect("the inclusive sidecar ceiling must admit the exact current fold");
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// The bug this exists to prevent: corruption that still PARSES. A shortened `fold_off` here
-    /// would have been believed, and recovery would then have truncated durable fold bytes to
-    /// match it — data destroyed by one flipped bit with no error anywhere.
+    /// would have become a false authority boundary and hidden durable fold bytes with no error.
     #[test]
     fn a_flipped_byte_that_still_parses_is_refused() {
         let d = std::env::temp_dir().join(format!("turndb-mancrc-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let mut m = super::Manifest { fold_off: 4096, next_seq: 9, ..Default::default() };
-        m.commit(&d).unwrap();
-
-        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
+        let m = super::Manifest { fold_off: 4096, next_seq: 9, ..Default::default() };
+        let mut b = m.encode().unwrap();
         let at = b.windows(4).position(|w| w == b"4096").expect("fold_off literal in the JSON");
         b[at] = b'1'; // now claims fold_off 1096 — valid JSON, wrong bytes
-        std::fs::write(d.join("MANIFEST"), &b).unwrap();
-
-        let err = super::Manifest::load(&d).unwrap_err().to_string();
+        let err = super::Manifest::parse(&b).unwrap_err().to_string();
         assert!(err.contains("checksum"), "must refuse via the checksum, got: {err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// Damage to the TRAILER must not demote a checksummed manifest to a trusted legacy one.
+    /// Damage to the trailer must never demote a manifest to unchecked JSON.
     #[test]
-    fn a_damaged_trailer_is_not_read_as_legacy() {
+    fn a_damaged_trailer_is_refused() {
         let d = std::env::temp_dir().join(format!("turndb-mantrail-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let mut m = super::Manifest::default();
-        m.commit(&d).unwrap();
-
-        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
+        let mut b = super::Manifest::default().encode().unwrap();
         let at = b.len() - 14; // the 'c' of the final "crc32=XXXXXXXX" line
         b[at] = b'x';
-        std::fs::write(d.join("MANIFEST"), &b).unwrap();
+        assert!(super::Manifest::parse(&b).is_err(), "the required trailer must be exact");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
+    #[test]
+    fn unchecked_or_pre_epoch_manifest_bytes_are_refused() {
+        let old = br#"{"parts":[],"fold_seg":0,"fold_off":0,"next_seq":0}"#;
+        assert!(super::Manifest::parse(old).is_err(), "bare JSON is not a current manifest");
+
+        let current = super::Manifest { draft_epoch: 0, ..Default::default() };
+        let error = super::Manifest::parse(&current.encode().unwrap()).unwrap_err().to_string();
+        assert!(error.contains("draft epoch"), "{error}");
+
+        let mut value = serde_json::to_value(super::Manifest::default()).unwrap();
+        value.as_object_mut().unwrap().insert("discarded_field".into(), true.into());
+        let mut unknown = serde_json::to_vec(&value).unwrap();
+        let crc = crc32fast::hash(&unknown);
+        unknown.extend_from_slice(format!("\ncrc32={crc:08x}").as_bytes());
+        let error = format!("{:#}", super::Manifest::parse(&unknown).unwrap_err());
         assert!(
-            super::Manifest::load(&d).is_err(),
-            "trailing bytes must fail JSON parsing, not be ignored"
+            error.contains("unknown field"),
+            "a checksummed unknown field must refuse: {error}"
         );
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    /// The retained log: every commit leaves a copy, the window prunes, recovery promotes.
-    #[test]
-    fn the_commit_log_retains_prunes_and_recovers() {
-        let d = std::env::temp_dir().join(format!("turndb-manlog-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let mut m = super::Manifest::default();
-        for i in 1..=6u32 {
-            m.fold_off = i * 100; // distinguishable states
-            m.commit(&d).unwrap();
-        }
-        assert_eq!(m.commit, 6);
-        assert_eq!(
-            super::list_retained_with_limits(&d, super::ReadLimits::default()).unwrap(),
-            vec![3, 4, 5, 6],
-            "window of {} commits",
-            super::MANIFEST_RETAIN
-        );
-
-        // Bit rot in MANIFEST: open refuses; recovery promotes the newest copy — same commit,
-        // nothing lost.
-        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
-        b[10] ^= 0xFF;
-        std::fs::write(d.join("MANIFEST"), &b).unwrap();
-        assert!(super::Manifest::load(&d).is_err());
-        assert_eq!(super::complete_first_commit(&d).unwrap(), 6);
-        assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 600);
-
-        // MANIFEST *and* the newest copies damaged: recovery rolls back to the newest intact one
-        // and truncates the log to it — the abandoned copies cannot be promoted later.
-        let mut b = std::fs::read(d.join("MANIFEST")).unwrap();
-        b[10] ^= 0xFF;
-        std::fs::write(d.join("MANIFEST"), &b).unwrap();
-        std::fs::write(super::retained_path(&d, 6), b"garbage").unwrap();
-        std::fs::write(super::retained_path(&d, 5), b"garbage").unwrap();
-        assert_eq!(super::complete_first_commit(&d).unwrap(), 4);
-        assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 400);
-        assert_eq!(
-            super::list_retained_with_limits(&d, super::ReadLimits::default()).unwrap(),
-            vec![3, 4],
-            "the abandoned timeline is cleared"
-        );
-
-        // An intact store refuses rollback.
-        assert!(
-            super::complete_first_commit(&d).is_err(),
-            "recovery of a healthy store must refuse"
-        );
-
-        // A MISSING manifest beside a commit log is damage, not a new store.
-        std::fs::remove_file(d.join("MANIFEST")).unwrap();
-        assert!(super::Manifest::load(&d).is_err(), "missing MANIFEST + commit log must refuse");
-        assert_eq!(super::complete_first_commit(&d).unwrap(), 4);
-        assert_eq!(super::Manifest::load(&d).unwrap().fold_off, 400);
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    fn manifest_roundtrips() {
-        let d = std::env::temp_dir().join(format!("turndb-man-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let mut m = super::Manifest {
-            parts: vec![super::PartRef {
-                file: "p.part".into(),
-                seq_lo: 1,
-                seq_hi: 1,
-                records: 7,
-                b3: None,
-            }],
-            fold_seg: 2,
-            fold_off: 4096,
-            next_seq: 9,
-            fold_gen: 3,
-            commit: 0,
-            prev: None,
-            punched: Vec::new(),
-        };
-        m.commit(&d).unwrap();
-        let got = super::Manifest::load(&d).unwrap();
-        assert_eq!(got.parts.len(), 1);
-        assert_eq!(got.fold_off, 4096);
-        assert_eq!(got.fold_gen, 3);
-        assert_eq!(got.next_seq, 9);
-        assert_eq!(got.commit, 1, "commit() must advance the commit counter");
-        assert!(!d.join("MANIFEST.tmp").exists(), "staging file must not survive a commit");
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    #[test]
-    fn format_migration_is_one_part_atomic_resumable_and_content_preserving() {
-        let d = std::env::temp_dir().join(format!(
-            "turndb-migration-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        let mut fold =
-            crate::fold::Fold::open(&d.join("fold"), crate::fold::FoldCfg::default()).unwrap();
-        fold.sync().unwrap();
-        let tail = fold.tail();
-        drop(fold);
-        let mut part_refs = Vec::new();
-        for (seq, id) in [(1, "legacy-one"), (2, "legacy-two")] {
-            let file = format!("legacy-{seq}.part");
-            let meta = crate::part::build_revision_one_fixture(&d.join(&file), seq, id).unwrap();
-            part_refs.push(super::PartRef {
-                file,
-                seq_lo: meta.seq_lo,
-                seq_hi: meta.seq_hi,
-                records: meta.n_records,
-                b3: None,
-            });
-        }
-        let mut manifest = super::Manifest {
-            parts: part_refs,
-            fold_seg: tail.seg,
-            fold_off: tail.off,
-            next_seq: 2,
-            ..super::Manifest::default()
-        };
-        manifest.commit(&d).unwrap();
-
-        let mut store = super::Store::open(&d, crate::fold::FoldCfg::default()).unwrap();
-        let before = store.format_migration_status().unwrap();
-        assert_eq!(before.legacy_parts, 2);
-        assert_eq!(before.current_parts, 0);
-        let plan = store.estimate_format_migration_space().unwrap().unwrap();
-        assert_eq!(plan.source_part_version, 1);
-        assert_eq!(plan.input_rows, 1);
-        assert!(!plan.estimate_is_hard_bound);
-
-        let cancellation = crate::control::CancellationToken::new();
-        cancellation.cancel();
-        let error = store
-            .migrate_format_step_with_control(&crate::control::OperationControl {
-                deadline: None,
-                cancellation: Some(cancellation),
-            })
-            .unwrap_err();
-        assert!(error.downcast_ref::<crate::control::OperationInterrupted>().is_some());
-        assert_eq!(store.format_migration_status().unwrap().legacy_parts, 2);
-
-        let step = store.migrate_format_step().unwrap().unwrap();
-        assert_eq!(step.plan.part_index, plan.part_index);
-        assert_eq!(step.plan.source_part_version, plan.source_part_version);
-        assert_eq!((step.plan.seq_lo, step.plan.seq_hi), (plan.seq_lo, plan.seq_hi));
-        assert_eq!(step.plan.input_bytes, plan.input_bytes);
-        assert_eq!(step.rewrite.inputs, 1);
-        assert_eq!(step.remaining_legacy_parts, 1);
-        assert!(step.output_bytes <= plan.estimated_stage_bytes);
-        let record = store.get("legacy-one").unwrap().unwrap();
-        assert_eq!(record.contents[0].name, crate::types::BODY_CONTENT);
-        assert_eq!(record.contents[0].identity, None, "migration must not invent identity");
-        assert_eq!(record.contents[0].ops, [crate::BodyOp::Lit(b"legacy".to_vec())]);
-        drop(store);
-
-        let mut reopened = super::Store::open(&d, crate::fold::FoldCfg::default()).unwrap();
-        let midway = reopened.format_migration_status().unwrap();
-        assert_eq!(midway.legacy_parts, 1);
-        assert_eq!(midway.current_parts, 1);
-        assert_eq!(midway.retained_legacy_parts, 1);
-        let resumed = reopened.migrate_format_step().unwrap().unwrap();
-        assert_eq!(resumed.remaining_legacy_parts, 0);
-        assert!(reopened.migrate_format_step().unwrap().is_none());
-        let after = reopened.format_migration_status().unwrap();
-        assert_eq!(after.legacy_parts, 0);
-        assert_eq!(after.current_parts, 2);
-        assert_eq!(after.retained_legacy_parts, 2);
-        assert!(after.retained_legacy_bytes > 0);
-        assert_eq!(reopened.get("legacy-one").unwrap().unwrap(), record);
-        assert!(reopened.get("legacy-two").unwrap().is_some());
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn punching_retries_blocks_already_declared_before_a_crash() {
-        let d = std::env::temp_dir().join(format!(
-            "turndb-punch-resume-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        let cfg = crate::fold::FoldCfg { block_target: 1, ..Default::default() };
-        let mut store = super::Store::open(&d, cfg).unwrap();
-        let old = vec![0x41; 64 * 1024];
-        let live = vec![0x42; 64 * 1024];
-        store.put("k", &[super::Span::Piece(&old)], vec![]).unwrap();
-        store.sync().unwrap();
-        store.flush().unwrap();
-        store.put("k", &[super::Span::Piece(&live)], vec![]).unwrap();
-        store.sync().unwrap();
-        store.flush().unwrap();
-
-        let live_block = store.locate(&crate::PieceHash::of(&live)).unwrap().unwrap().block_id;
-        let dead: Vec<u32> =
-            store.fold.block_ids().into_iter().filter(|&block| block != live_block).collect();
-        assert!(!dead.is_empty());
-
-        // The durable state left by a crash immediately after "record first, punch second".
-        let mut manifest = store.manifest.clone();
-        manifest.punched = super::to_ranges(&dead);
-        manifest.commit(&d).unwrap();
-        store.manifest = manifest;
-        store.fold.declare_punched(&store.manifest.punched);
-
-        let stats = store.punch_unreferenced().unwrap();
-        assert_eq!(stats.blocks_examined, dead.len());
-        assert_eq!(stats.blocks_punched, dead.len(), "declared blocks must be retried");
-        assert_eq!(store.reconstruct("k").unwrap().unwrap(), live);
-        std::fs::remove_dir_all(&d).ok();
-    }
-}
-
-#[cfg(test)]
-mod compat_tests {
-    /// A manifest written before fold generations existed must still load, naming generation 0 — the
-    /// original `fold/` directory. Otherwise this change would silently orphan every existing store.
-    #[test]
-    fn a_manifest_without_fold_gen_reads_as_generation_zero() {
-        let d = std::env::temp_dir().join(format!("turndb-oldman-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("MANIFEST"),
-            br#"{"parts":[],"fold_seg":0,"fold_off":48,"next_seq":4}"#,
-        )
-        .unwrap();
-        let m = super::Manifest::load(&d).unwrap();
-        assert_eq!(m.fold_gen, 0, "a pre-generation manifest must mean the original fold/");
-        assert_eq!(m.next_seq, 4);
-        assert_eq!(super::refold::fold_dir(&d, m.fold_gen), d.join("fold"));
-        std::fs::remove_dir_all(&d).ok();
     }
 }

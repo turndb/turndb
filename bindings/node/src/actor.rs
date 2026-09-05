@@ -14,8 +14,8 @@ use turndb::carve::Carve;
 use turndb::control::OperationControl;
 use turndb::scan::{ScanExplanation, ScanPage, ScanRequest};
 use turndb::store::{
-    Batch, BoundedCompaction, CompactionBudget, ContentSpans, ErasureStats, PunchStats, ReadStore,
-    Store, StoreOptions,
+    Batch, BoundedCompaction, CompactionBudget, ContentPunchStats, ContentSpans, ErasureStats,
+    ReadStore, Store, StoreOptions,
 };
 use turndb::types::AttrValue;
 
@@ -41,17 +41,6 @@ pub(crate) struct CompactionSpaceResult {
 pub(crate) struct RefoldSpaceResult {
     pub flushed: bool,
     pub estimate: Option<turndb::store::RefoldSpaceEstimate>,
-}
-
-pub(crate) struct FormatMigrationPreflightResult {
-    pub flushed: bool,
-    pub status: turndb::store::FormatMigrationStatus,
-    pub estimate: Option<turndb::store::FormatMigrationPlan>,
-}
-
-pub(crate) struct FormatMigrationStepResult {
-    pub flushed: bool,
-    pub step: Option<turndb::store::FormatMigrationStep>,
 }
 
 pub(crate) type VerifyResult = turndb::store::StoreVerification;
@@ -140,18 +129,6 @@ enum Command {
         control: OperationControl,
         reply: oneshot::Sender<Result<CompactionSpaceResult>>,
     },
-    FormatMigrationStatus {
-        control: OperationControl,
-        reply: oneshot::Sender<Result<turndb::store::FormatMigrationStatus>>,
-    },
-    EstimateFormatMigrationSpace {
-        control: OperationControl,
-        reply: oneshot::Sender<Result<FormatMigrationPreflightResult>>,
-    },
-    MigrateFormatStep {
-        control: OperationControl,
-        reply: oneshot::Sender<Result<FormatMigrationStepResult>>,
-    },
     Verify {
         control: OperationControl,
         reply: oneshot::Sender<Result<VerifyResult>>,
@@ -159,16 +136,16 @@ enum Command {
     Backup {
         path: std::path::PathBuf,
         control: OperationControl,
-        reply: oneshot::Sender<Result<turndb::pack::BackupStats>>,
+        reply: oneshot::Sender<Result<turndb::backup::BackupStats>>,
     },
     Erase {
         ids: Vec<String>,
         control: OperationControl,
         reply: oneshot::Sender<Result<ErasureStats>>,
     },
-    Punch {
+    ContentPunch {
         control: OperationControl,
-        reply: oneshot::Sender<Result<PunchStats>>,
+        reply: oneshot::Sender<Result<ContentPunchStats>>,
     },
     Refold {
         control: OperationControl,
@@ -359,28 +336,6 @@ impl Actor {
         .await
     }
 
-    pub async fn format_migration_status(
-        &self,
-        control: OperationControl,
-    ) -> Result<turndb::store::FormatMigrationStatus> {
-        self.receive(self.submit(|reply| Command::FormatMigrationStatus { control, reply })?).await
-    }
-
-    pub async fn estimate_format_migration_space(
-        &self,
-        control: OperationControl,
-    ) -> Result<FormatMigrationPreflightResult> {
-        self.receive(self.submit(|reply| Command::EstimateFormatMigrationSpace { control, reply })?)
-            .await
-    }
-
-    pub async fn migrate_format_step(
-        &self,
-        control: OperationControl,
-    ) -> Result<FormatMigrationStepResult> {
-        self.receive(self.submit(|reply| Command::MigrateFormatStep { control, reply })?).await
-    }
-
     pub async fn verify(&self, control: OperationControl) -> Result<VerifyResult> {
         self.receive(self.submit(|reply| Command::Verify { control, reply })?).await
     }
@@ -389,7 +344,7 @@ impl Actor {
         &self,
         path: std::path::PathBuf,
         control: OperationControl,
-    ) -> Result<turndb::pack::BackupStats> {
+    ) -> Result<turndb::backup::BackupStats> {
         self.receive(self.submit(|reply| Command::Backup { path, control, reply })?).await
     }
 
@@ -397,8 +352,8 @@ impl Actor {
         self.receive(self.submit(|reply| Command::Erase { ids, control, reply })?).await
     }
 
-    pub async fn punch(&self, control: OperationControl) -> Result<PunchStats> {
-        self.receive(self.submit(|reply| Command::Punch { control, reply })?).await
+    pub async fn content_punch(&self, control: OperationControl) -> Result<ContentPunchStats> {
+        self.receive(self.submit(|reply| Command::ContentPunch { control, reply })?).await
     }
 
     pub async fn refold(
@@ -540,34 +495,23 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = estimate_compaction_space(&mut store, budget, &control);
                 let _ = reply.send(result);
             }
-            Command::FormatMigrationStatus { control, reply } => {
-                let _ = reply.send(store.format_migration_status_with_control(&control));
-            }
-            Command::EstimateFormatMigrationSpace { control, reply } => {
-                let result = estimate_format_migration_space(&mut store, &control);
-                let _ = reply.send(result);
-            }
-            Command::MigrateFormatStep { control, reply } => {
-                let result = migrate_format_step(&mut store, &control);
-                let _ = reply.send(result);
-            }
             Command::Verify { control, reply } => {
                 let result = verify(&mut store, &control);
                 let _ = reply.send(result);
             }
             Command::Backup { path, control, reply } => {
-                // Actor order fixes the backup cut: earlier writes are settled by `Store::backup`,
-                // while later commands wait until the verified artifact has been published.
+                // Actor order fixes the backup boundary: earlier writes are synchronized and
+                // published by `Store::backup`, while later commands wait for artifact installation.
                 let _ = reply.send(store.backup_with_control(&path, &control));
             }
             Command::Erase { ids, control, reply } => {
                 let _ = reply.send(store.erase_ids_with_control(&ids, &control));
             }
-            Command::Punch { control, reply } => {
+            Command::ContentPunch { control, reply } => {
                 let result = control
                     .check("content punching")
                     .map_err(anyhow::Error::from)
-                    .and_then(|_| settle(&mut store, &control))
+                    .and_then(|_| publish_pending(&mut store, &control))
                     .and_then(|_| store.punch_unreferenced_with_control(&control));
                 let _ = reply.send(result);
             }
@@ -575,7 +519,7 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 let result = control
                     .check("content refold")
                     .map_err(anyhow::Error::from)
-                    .and_then(|_| settle(&mut store, &control))
+                    .and_then(|_| publish_pending(&mut store, &control))
                     .and_then(|_| store.refold_with_control(&control));
                 let _ = reply.send(result);
             }
@@ -609,15 +553,14 @@ fn run(mut store: Store, path: &Path, rx: mpsc::Receiver<Command>) {
                 // synced, the memtable flushed, the emptied WAL sidecar removed. A non-durable
                 // close deliberately leaves the sidecar — the caller asked not to settle, and
                 // the next open replays it exactly as a crash would.
-                let result = if durable { store.sync() } else { Ok(()) };
-                let settled = durable && result.is_ok();
                 // Close acknowledgement includes releasing the OS writer lock. Sending first and
-                // dropping on function exit leaves a real race for immediate reopen/recovery.
-                if settled {
-                    let _ = store.close();
+                // dropping on function exit leaves a real race for immediate reopen/WAL replay.
+                let result = if durable {
+                    store.sync().and_then(|_| store.close())
                 } else {
                     drop(store);
-                }
+                    Ok(())
+                };
                 let _ = reply.send(result);
                 return;
             }
@@ -652,14 +595,14 @@ fn apply(store: &mut Store, ops: Vec<WriteOp>, durable: bool) -> Result<()> {
     Ok(())
 }
 
-fn settle(store: &mut Store, control: &OperationControl) -> Result<bool> {
+fn publish_pending(store: &mut Store, control: &OperationControl) -> Result<bool> {
     store.sync_with_control(control)?;
     Ok(store.flush_with_control(control)?.is_some())
 }
 
 fn compact(store: &mut Store, full: bool, control: &OperationControl) -> Result<CompactResult> {
     control.check("part compaction")?;
-    let flushed = settle(store, control)?;
+    let flushed = publish_pending(store, control)?;
     control.check("part compaction")?;
     let parts_before = store.part_count();
     let merge = if full {
@@ -676,7 +619,7 @@ fn compact_bounded(
     control: &OperationControl,
 ) -> Result<BoundedCompactResult> {
     control.check("bounded compaction")?;
-    let flushed = settle(store, control)?;
+    let flushed = publish_pending(store, control)?;
     control.check("bounded compaction")?;
     let parts_before = store.part_count();
     let compaction = store.compact_bounded_with_control(budget, control)?;
@@ -689,7 +632,7 @@ fn estimate_compaction_space(
     control: &OperationControl,
 ) -> Result<CompactionSpaceResult> {
     control.check("compaction space preflight")?;
-    let flushed = settle(store, control)?;
+    let flushed = publish_pending(store, control)?;
     control.check("compaction space preflight")?;
     let estimate = store.estimate_compaction_space_with_control(budget, control)?;
     Ok(CompactionSpaceResult { flushed, estimate })
@@ -700,40 +643,17 @@ fn estimate_refold_space(
     control: &OperationControl,
 ) -> Result<RefoldSpaceResult> {
     control.check("refold space preflight")?;
-    let flushed = settle(store, control)?;
+    let flushed = publish_pending(store, control)?;
     control.check("refold space preflight")?;
     let estimate = store.estimate_refold_space_with_control(control)?;
     Ok(RefoldSpaceResult { flushed, estimate })
 }
 
-fn estimate_format_migration_space(
-    store: &mut Store,
-    control: &OperationControl,
-) -> Result<FormatMigrationPreflightResult> {
-    control.check("format migration preflight")?;
-    let flushed = settle(store, control)?;
-    control.check("format migration preflight")?;
-    let status = store.format_migration_status_with_control(control)?;
-    let estimate = store.estimate_format_migration_space_with_control(control)?;
-    Ok(FormatMigrationPreflightResult { flushed, status, estimate })
-}
-
-fn migrate_format_step(
-    store: &mut Store,
-    control: &OperationControl,
-) -> Result<FormatMigrationStepResult> {
-    control.check("format migration")?;
-    let flushed = settle(store, control)?;
-    control.check("format migration")?;
-    let step = store.migrate_format_step_with_control(control)?;
-    Ok(FormatMigrationStepResult { flushed, step })
-}
-
 fn verify(store: &mut Store, control: &OperationControl) -> Result<VerifyResult> {
-    // Settling makes the report cover every operation accepted before this command, and actor
-    // serialization prevents a new manifest from racing the chain walk.
+    // Synchronization and publication make the report cover every operation accepted before this
+    // command, and actor serialization prevents a new manifest from racing the chain walk.
     control.check("store verification")?;
-    settle(store, control)?;
+    publish_pending(store, control)?;
     control.check("store verification")?;
     store.verify_with_control(control)
 }

@@ -142,9 +142,9 @@ fn main() -> anyhow::Result<()> {
             pending.clear();
             samples.clear();
             seen_ids.clear();
-            // NOTE: the dedup window is deliberately NOT sealed here. This harness writes fold and
+            // NOTE: the dedup window is deliberately NOT released here. This harness writes fold and
             // parts directly, with no Store and therefore no Tier-1, so keeping the window resident is
-            // the only way it can measure TRUE GLOBAL dedup. `Store` now seals at every flush and
+            // the only way it can measure TRUE GLOBAL dedup. `Store` now releases it at every flush and
             // recovers the same dedup through Tier-1 lookups against parts' hash columns — so the
             // resident count printed below is the memory that posture COSTS, not a number to match.
             let el = t0.elapsed().as_secs_f64();
@@ -223,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         mib(logical) / secs
     );
     println!(
-        "{:<26}{} distinct pieces resident (global dedup window, not sealed)",
+        "{:<26}{} distinct pieces resident (global dedup window, not released)",
         "dedup window",
         fold.window_len()
     );

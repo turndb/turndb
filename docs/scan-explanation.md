@@ -37,8 +37,8 @@ Physical scope is exact for the effective id range at the handle's consistency p
 - `immutable_parts_with_rows` is the subset containing at least one row in range;
 - `immutable_rows_in_bounds` includes every physical occurrence, including older versions and
   tombstones;
-- `memtable_entries_in_bounds` includes staged puts and deletes for a writer and is zero for an
-  immutable snapshot.
+- `memtable_entries_in_bounds` includes pending record versions and tombstones for a writer and is zero for an
+  immutable read view.
 
 These are pre-resolution work facts, not estimated visible candidates or result cardinality. The
 gap between physical occurrences and later `stats.resolution`/`stats.examined` is useful evidence of
@@ -51,7 +51,7 @@ before and after physical scope collection and returns no partial explanation.
 ## Read behavior and non-guarantees
 
 To produce exact range scope, explanation performs the same binary-search range initialization over
-every live part. It opens sorted id and restart structures and may warm those shared caches. It does
+every part referenced by the current manifest revision. It opens sorted id and restart structures and may warm those shared caches. It does
 not open tombstones, attribute layout/value/rid/dictionary sections, named-content metadata/programs,
 or fold blocks. It performs no content reconstruction and makes no durable mutation.
 

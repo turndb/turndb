@@ -1,16 +1,10 @@
 //! Model-based verification: randomized lifecycles against a reference that is correct by construction.
 //!
-//! # Why not a differential gate against the old engine
+//! # Why the oracle is the input
 //!
-//! The plan once called for checking this rebuild against its predecessor. That predecessor carries the
-//! design this rebuild exists to escape, so its behaviour is not the specification — when two
-//! implementations disagree you learn that they disagree, not which is right. It would also couple the
-//! rebuild to a repo we deliberately left behind: kept buildable, kept API-compatible, and silently
-//! useless the moment either format moved.
-//!
-//! For a content-addressed store none of that is needed, because **the ground truth is the input**. What
+//! For a content-addressed store, **the ground truth is the input**. What
 //! went in must come out, byte for byte. That is checkable directly and it is a stronger claim than
-//! agreement with another implementation, which can be wrong in the same way.
+//! agreement with another implementation, which could share the same defect.
 //!
 //! So the oracle here is a `BTreeMap` — correct by construction, owned outright, no dependency at all.
 //!
@@ -410,8 +404,7 @@ fn crash_never_resurrects_and_never_corrupts() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The migrated suites build single-file stores inside their temp directories: the parent is
-/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+/// Build the suite's single-file store inside its cleanup directory.
 fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).ok();
     dir.join("s.turndb")

@@ -20,31 +20,22 @@ Both qualify schema discovery, arbitrary typed correlation, metadata-only timeli
 reads, identity equality for shared bytes stored under different content names, selective content
 reconstruction, one-call atomic durable ingestion, and restart. A separate live-ingestion case makes
 cursor semantics explicit: structured cursors are checked keyset continuations, so later writes after
-the cursor can appear while later-arriving keys before it do not replay. `snapshot()` is the stable-cut
-mechanism. Another case exits a child process without closing its writer after a durable atomic batch
-and verifies complete WAL recovery through the public Node API.
+the cursor can appear while later-arriving keys before it do not replay. `snapshot()` is the API
+spelling that returns the stable read view. Another case exits a child process without closing its
+writer after a durable atomic batch and verifies complete WAL replay through the public Node API.
 
 The maintenance workflow creates repeated durable/immutable cuts, verifies the bounded retained
-commit window, fully compacts without reading folded content, verifies the result, publishes and
+manifest-revision retention window, performs a total part merge without reading folded content, verifies the result, publishes and
 restores a writable backup, then physically erases one record. It asserts that refold purges retained
 history and leaves no dead or reclaimable content. It also asserts the deliberately narrower erasure
 scope: the backup created beforehand is an external copy and still contains the record.
 
-A checked legacy pack supplies real version-1 bytes for upgrade qualification
-(`qualification/fixtures/revision-one.turndb.hex`): two records, one per part, written and packed
-by an actual version-1 build and deep-verified before check-in. The external harness can only restore it and use
-public Node methods. The workflow preflights and migrates one part, closes and reopens, resumes
-the second part, and verifies that record bytes stay exact while whole-value identities are
-honestly reported unavailable — a version-1 value has none, and migration never invents one.
-Old parts pinned by retained snapshots stay reported
-separately from the current-format live parts.
-
 ## Sustained profile
 
 `bindings/node/qualification/soak.cjs` is a reusable workload driver. Each cycle durably acknowledges
-one atomic batch, flushes an immutable cut, creates both overwritten and tombstoned ids, and
-periodically drains part pressure through compaction units capped at eight inputs. It restarts the
-writer, pages and compares the complete live id set, measures dead content, preflights and performs a
+one atomic batch, publishes one manifest revision, creates both overwritten and tombstoned ids, and
+periodically drains part pressure through part-merge units capped at eight inputs. It restarts the
+writer, pages and compares every record ID whose slot resolves to a record, measures dead content, preflights and performs a
 refold, verifies zero remaining dead/reclaimable bytes, and runs complete store verification. The
 ordinary Node suite runs 64 cycles as a bounded regression profile.
 
@@ -53,19 +44,19 @@ A development-host run of the larger local profile, measured on 2026-08-03:
 ```text
 node qualification/soak.cjs <empty-store-dir> 512
 512 cycles; 8 records/cycle; 2 KiB payloads
-5,630 acknowledged ops; 4,106 live records
-127 bounded compactions; 31 writer restarts; 9 live parts high-water
+5,630 acknowledged ops; 4,106 record slots resolving to records
+127 bounded part merges; 31 writer restarts; 9 current-manifest part references at high water
 2,074,624 dead logical bytes before refold
 25,165 fold bytes before refold; 201 after
 21,472 final logical store bytes; 22,298.89 ms elapsed
 ```
 
 This is lifecycle evidence, not a throughput benchmark: the payload is deliberately compressible and
-the result includes local filesystem/fsync behavior. Running only one eight-input compaction every
+the result includes local filesystem/fsync behavior. Running only one eight-input part merge every
 eight produced parts is insufficient — the merge output is itself a part, so that cadence
 accumulates one part per interval (a high-water of 71 in this profile); draining through additional
 bounded units holds the high-water at 9 without replacing bounded work with an unbounded operation.
-Compaction cadence remains consumer policy; TurnDB supplies exact backlog, plans, limits, and outcomes.
+Part-merge cadence remains consumer policy; TurnDB supplies exact backlog, plans, limits, and outcomes.
 
 The qualification matrix exercises every listed workload property through public consumer seams.
 Consumer concepts must not be added to `src/` to keep it passing.

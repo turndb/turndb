@@ -257,7 +257,7 @@ test('qualifies retention, compaction, backup, restore, and physical erasure as 
   assert.equal((await store.verify()).parts, 1n);
 
   const backup = await store.backup(artifact);
-  // Member payload bytes: the sealed file adds its superblocks, alignment, and directory.
+  // Member payload bytes: the backup file adds its superblocks, alignment, and directory.
   assert(backup.bytes > 0n && backup.bytes <= BigInt(fs.statSync(artifact).size));
   assert.equal(backup.commit, (await store.health()).commit);
   assert.deepEqual((await store.scan()).rows.map(({ id }) => id), expectedIds);
@@ -296,100 +296,6 @@ test('qualifies retention, compaction, backup, restore, and physical erasure as 
 
   // Erasure is scoped to this store. A backup made before it is an external copy by definition.
   assert.deepEqual(await restoredStore.readContent('retention/0003', 'payload'), erasedPayload);
-});
-
-test('upgrades a checked version-one consumer artifact one restartable part at a time', async (t) => {
-  const root = temporaryRoot(t, 'turndb-qualification-upgrade-');
-  const artifact = path.join(root, 'revision-one.turndb');
-  const dir = path.join(root, 'store');
-  materializeHexFixture(
-    path.resolve(__dirname, '../qualification/fixtures/revision-one.turndb.hex'),
-    artifact,
-  );
-  await restoreBackup(artifact, dir);
-  let store = await NativeStore.open(dir);
-  t.after(async () => {
-    try { await store.close(); } catch {}
-  });
-
-  const expected = new Map([
-    ['legacy/0001', Buffer.from('revision one request')],
-    ['legacy/0002', Buffer.from('revision one response')],
-  ]);
-  const contentState = async () => {
-    const page = await store.scan({ contents: [{ name: 'body', mode: 'metadata' }] });
-    assert.equal(page.stats.io.foldBlocksTouched, 0n);
-    return new Map(page.rows.map(({ id, contents }) => {
-      assert.equal(contents.length, 1);
-      assert.equal(contents[0].present, true);
-      // Version-1 values carry no whole-value identity, and migration must not invent one:
-      // an identity is computed at ingest over the original bytes or it does not exist.
-      assert.equal(contents[0].identity, undefined);
-      return [id, { identity: contents[0].identity, len: contents[0].len }];
-    }));
-  };
-  const beforeContent = await contentState();
-  for (const [id, bytes] of expected) {
-    assert.deepEqual(await store.readContent(id, 'body'), bytes);
-    assert.equal(beforeContent.get(id).len, BigInt(bytes.length));
-  }
-  const before = await store.formatMigrationStatus();
-  assert.equal(before.targetPartVersion, 2);
-  assert.equal(before.liveParts, 2n);
-  assert.equal(before.currentParts, 0n);
-  assert.equal(before.legacyParts, 2n);
-  assert.equal(before.legacyRows, 2n);
-
-  const preflight = await store.estimateFormatMigrationSpace();
-  assert.equal(preflight.flushed, false);
-  assert.equal(preflight.status.legacyParts, 2n);
-  assert.equal(preflight.estimate.sourcePartVersion, 1);
-  assert.equal(preflight.estimate.inputRows, 1n);
-  assert.equal(preflight.estimate.estimateIsHardBound, false);
-  const first = await store.migrateFormatStep();
-  assert.equal(first.flushed, false);
-  assert.equal(first.step.plan.sourcePartVersion, 1);
-  assert.equal(first.step.remainingLegacyParts, 1n);
-  assert.equal(first.step.rewrite.inputs, 1n);
-
-  await store.close(false);
-  store = await NativeStore.open(dir);
-  const midway = await store.formatMigrationStatus();
-  assert.equal(midway.currentParts, 1n);
-  assert.equal(midway.legacyParts, 1n);
-  // Packs contain one committed snapshot, not its source store's retained history. The first
-  // migration therefore has no retained-only legacy input yet.
-  assert.equal(midway.retainedLegacyParts, 0n);
-  const second = await store.migrateFormatStep();
-  assert.equal(second.step.remainingLegacyParts, 0n);
-  assert.equal((await store.migrateFormatStep()).step, undefined);
-
-  const after = await store.formatMigrationStatus();
-  assert.equal(after.currentParts, 2n);
-  assert.equal(after.legacyParts, 0n);
-  assert.equal(after.retainedLegacyParts, 1n);
-  const afterContent = await contentState();
-  assert.deepEqual(afterContent, beforeContent);
-  for (const [id, bytes] of expected) {
-    assert.deepEqual(await store.readContent(id, 'body'), bytes);
-  }
-  const attrsPage = await store.scan({ attrs: ['source', 'n'] });
-  assert.deepEqual(
-    attrsPage.rows.map(({ id, attrs }) => [id, attrs]),
-    [
-      ['legacy/0001', [
-        { name: 'source', kind: 'string', stringValue: 'qualification' },
-        { name: 'n', kind: 'int', intValue: 1n },
-      ]],
-      ['legacy/0002', [
-        { name: 'source', kind: 'string', stringValue: 'qualification' },
-        { name: 'n', kind: 'int', intValue: 2n },
-      ]],
-    ],
-  );
-  const verified = await store.verify();
-  assert.equal(verified.parts, 2n);
-  assert.equal(verified.trailingUncommittedBytes, 0n);
 });
 
 test('runs the bounded sustained-ingestion qualification profile', async (t) => {

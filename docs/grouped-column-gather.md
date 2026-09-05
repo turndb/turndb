@@ -1,9 +1,9 @@
 # Grouped column gather
 
-Structured scans hand already resolved live candidates to a bounded physical projection layer. The
+Structured scans hand already resolved candidates to a bounded physical projection layer. The
 layer groups immutable rows by part, gathers only selected or predicate-bearing columns, and restores
 the candidates to their original global id order. It is shared by writer-backed scans and immutable
-reader snapshots; writer memtable rows remain an in-memory overlay.
+reader views; pending record versions remain an in-memory writer overlay.
 
 ## Attribute gather
 

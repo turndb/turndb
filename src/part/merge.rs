@@ -42,7 +42,7 @@ pub struct MergeStats {
     /// Deletions carried forward, because something outside this merge could still hold an older
     /// version of the id.
     pub tombstones_kept: usize,
-    /// Deletions finally discarded — only possible when the merge covered every live part.
+    /// Deletions finally discarded — only possible when the merge covered every referenced part.
     pub tombstones_dropped: usize,
     /// Always zero. Asserted, because "merge never touches the fold" is the load-bearing claim.
     pub fold_bytes_touched: u64,
@@ -101,7 +101,7 @@ impl<'a> KWay<'a> {
 /// [`merge`], with the option to DROP tombstones rather than carry them forward.
 ///
 /// A tombstone exists to shadow older versions of its id. It can only be discarded when there is
-/// nothing left for it to shadow — that is, when the merge covers every live part, so no part outside
+/// nothing left for it to shadow — that is, when the merge covers every referenced part, so no part outside
 /// it can still hold an older version of that id. Dropping one otherwise RESURRECTS deleted data,
 /// which is the worst outcome available here and the reason this is a caller's decision rather than an
 /// inference: only the store knows whether the run it passed is the whole live list.
@@ -188,6 +188,7 @@ pub(crate) fn merge_opts_with_control_for_operation(
         control,
         operation,
         read_limits,
+        None,
     )?;
     Ok((meta, stats))
 }
@@ -203,6 +204,7 @@ pub(crate) fn merge_into_with_control_for_operation<S: crate::vfs::ArtifactSink>
     control: &crate::control::OperationControl,
     operation: &'static str,
     read_limits: crate::read_limits::ReadLimits,
+    location_is_usable: Option<&dyn Fn(Loc, PieceHash) -> Result<bool>>,
 ) -> Result<(PartMeta, MergeStats, S)> {
     control.check(operation)?;
     if inputs.is_empty() {
@@ -231,10 +233,15 @@ pub(crate) fn merge_into_with_control_for_operation<S: crate::vfs::ArtifactSink>
     // sorted in fold order and whose Locs are globally stable — block ids do not move — so this is a
     // gather, never a re-derivation.
     let mut locs: HashMap<PieceHash, Loc> = HashMap::new();
-    for p in &parts {
+    for p in parts.iter().rev() {
         for i in 0..p.piece_count()? {
             control.check(operation)?;
             let (loc, hash) = p.piece(i)?;
+            if let Some(is_usable) = location_is_usable {
+                if !is_usable(loc, hash)? {
+                    continue;
+                }
+            }
             locs.entry(hash).or_insert(loc);
         }
     }
@@ -356,9 +363,10 @@ mod tests {
                 let p = fold.put(body.as_bytes()).unwrap();
                 Record {
                     id: (*id).to_string(),
-                    contents: vec![Content::new(
+                    contents: vec![Content::identified(
                         BODY_CONTENT,
                         vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                        crate::types::ContentHash(p.hash.0),
                     )],
                     attrs: vec![("v".into(), AttrValue::Str((*body).to_string()))],
                 }

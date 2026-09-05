@@ -1,4 +1,4 @@
-"""TurnDB's contract-v1 Python SDK."""
+"""TurnDB's Python SDK."""
 
 from ._native import (
     BusyError,

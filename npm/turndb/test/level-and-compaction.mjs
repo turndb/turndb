@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { open, TurndbError } from '../index.mjs';
 
 function dirBytes(file) {
-  // The store is one file; the settled WAL sidecar is empty or absent after a clean close.
+  // The store is one file; the WAL sidecar is empty or absent after a successful close.
   return statSync(file).size;
 }
 
@@ -72,7 +72,7 @@ test('maybeCompact bounds the merge; autoCompact totals it; both keep every reco
   assert.equal(store.maybeCompact({ trigger: 20 }), false);
   assert.equal(store.stats().parts, 9);
 
-  // Default dial: oldest 4 of 9 merge into 1 -> 6 live parts. Bounded, not total.
+  // Default dial: oldest 4 of 9 merge into 1 -> 6 current-authority parts. Bounded, not total.
   assert.equal(store.maybeCompact(), true);
   assert.equal(store.stats().parts, 6);
 

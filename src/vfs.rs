@@ -16,6 +16,23 @@ use std::fs::File;
 use std::io::Result;
 use std::path::Path;
 
+/// A numeric component for protocol-owned transient names.
+///
+/// WASI has no process identifier: `std::process::id()` traps there instead of returning a
+/// sentinel. One module instance still owns a monotonically increasing serial, and exclusive
+/// creation resolves collisions with another instance, so zero is the honest portable component.
+#[inline]
+pub(crate) fn protocol_process_id() -> u32 {
+    #[cfg(target_os = "wasi")]
+    {
+        0
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::process::id()
+    }
+}
+
 #[cfg(windows)]
 mod publish {
     //! Windows has no directory fsync, so "create a file, then fsync its directory" cannot make a
@@ -155,7 +172,7 @@ pub mod record {
             to: PathBuf,
         },
         /// `hard_link`: atomically publish another name for an already durable file. Unlike
-        /// rename, this refuses when `to` exists, which is the pack writer's no-overwrite gate.
+        /// rename, this refuses when `to` exists, which is artifact installation's no-overwrite gate.
         Link {
             from: PathBuf,
             to: PathBuf,
@@ -209,6 +226,9 @@ pub mod record {
         static SYNC_FAULT: Cell<Option<usize>> = const { Cell::new(None) };
         static SYNC_FIRED: Cell<Option<usize>> = const { Cell::new(None) };
         static SYNC_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static WRITE_FAULT: Cell<Option<usize>> = const { Cell::new(None) };
+        static WRITE_FIRED: Cell<Option<usize>> = const { Cell::new(None) };
+        static WRITE_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// The distinctive cause of an injected sync failure, findable by `downcast_ref` through
@@ -227,6 +247,20 @@ pub mod record {
 
     impl std::error::Error for InjectedSyncFailure {}
 
+    /// Distinctive cause injected before one positioned write reaches the filesystem.
+    #[derive(Debug)]
+    pub struct InjectedWriteFailure {
+        pub attempt: usize,
+    }
+
+    impl std::fmt::Display for InjectedWriteFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "injected write failure at attempted write {}", self.attempt)
+        }
+    }
+
+    impl std::error::Error for InjectedWriteFailure {}
+
     /// An armed sync fault on the current thread. Dropping it — including during a panic's
     /// unwinding — disarms the thread, so no later test on this thread inherits it. The state
     /// is thread-local, so the guard is `!Send` and `!Sync`: it can only be dropped on the
@@ -240,6 +274,22 @@ pub mod record {
     /// ```
     pub struct SyncFault {
         _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    pub struct WriteFault {
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl WriteFault {
+        pub fn fired_at(&self) -> Option<usize> {
+            WRITE_FIRED.with(|f| f.get())
+        }
+    }
+
+    impl Drop for WriteFault {
+        fn drop(&mut self) {
+            WRITE_FAULT.with(|f| f.set(None));
+        }
     }
 
     impl SyncFault {
@@ -269,6 +319,37 @@ pub mod record {
         SYNC_FIRED.with(|f| f.set(None));
         SYNC_ATTEMPTS.with(|a| a.set(0));
         SyncFault { _not_send: std::marker::PhantomData }
+    }
+
+    /// Fail exactly one positioned write on this thread before it mutates the filesystem.
+    pub fn fail_write_after(n: usize) -> WriteFault {
+        WRITE_FAULT.with(|f| f.set(Some(n)));
+        WRITE_FIRED.with(|f| f.set(None));
+        WRITE_ATTEMPTS.with(|a| a.set(0));
+        WriteFault { _not_send: std::marker::PhantomData }
+    }
+
+    pub(super) fn write_fault() -> std::io::Result<()> {
+        let attempt = WRITE_ATTEMPTS.with(|a| {
+            let n = a.get();
+            a.set(n + 1);
+            n
+        });
+        WRITE_FAULT.with(|f| match f.get() {
+            None => Ok(()),
+            Some(0) => {
+                f.set(None);
+                WRITE_FIRED.with(|x| x.set(Some(attempt)));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    InjectedWriteFailure { attempt },
+                ))
+            }
+            Some(left) => {
+                f.set(Some(left - 1));
+                Ok(())
+            }
+        })
     }
 
     /// Consulted by every sync: counts the attempt, and fails exactly once when armed and due.
@@ -378,14 +459,6 @@ pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path)
 }
 
-/// `std::fs::metadata` by name, resolving a pending name (Windows). Records nothing.
-#[inline]
-pub(crate) fn metadata(path: &Path) -> Result<std::fs::Metadata> {
-    #[cfg(windows)]
-    let path = &publish::resolve(path);
-    std::fs::metadata(path)
-}
-
 /// Open read-write, creating if absent — and say whether this call CREATED it, because a caller
 /// that just created a file owes its directory an fsync before anything durable can depend on the
 /// file existing.
@@ -439,8 +512,45 @@ pub(crate) fn create_new(path: &Path) -> Result<File> {
     Ok(f)
 }
 
+/// Exclusively create an already-transient protocol name without Windows' additional
+/// `.publish-*` indirection. The caller owns the exact name and must synchronize, install, and
+/// clean it according to that protocol.
+pub(crate) fn create_new_staging(path: &Path) -> Result<File> {
+    let file = std::fs::OpenOptions::new().create_new(true).write(true).read(true).open(path)?;
+    #[cfg(feature = "dst")]
+    push(Op::Create { path: path.to_path_buf() });
+    Ok(file)
+}
+
+/// Exclusively create a numbered, protocol-owned staging name beside `final_path`. This bypasses
+/// Windows' additional pending-publish indirection because the staging name is already transient:
+/// callers synchronize it and then install it with [`rename_noreplace`].
+pub(crate) fn create_numbered_staging(
+    final_path: &Path,
+    operation: &str,
+) -> Result<(std::path::PathBuf, File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    loop {
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut name = final_path.as_os_str().to_os_string();
+        name.push(format!(".{operation}-{}-{serial}", protocol_process_id()));
+        let path = std::path::PathBuf::from(name);
+        match create_new_staging(&path) {
+            Ok(file) => {
+                return Ok((path, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn write_all_at(f: &File, path: &Path, buf: &[u8], off: u64) -> Result<()> {
+    #[cfg(feature = "dst")]
+    record::write_fault()?;
     crate::sys::write_all_at(f, buf, off)?;
     #[cfg(feature = "dst")]
     push(Op::WriteAt { path: path.to_path_buf(), off, data: buf.to_vec() });
@@ -550,7 +660,8 @@ pub(crate) fn rename_replace_open(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rename that refuses to replace `to` (atomic on Linux and macOS; see `sys::rename_noreplace`).
+/// Install `from` at `to` without replacement (an atomic rename on Linux/macOS, an atomic
+/// hard-link name creation on WASI; see `sys::rename_noreplace`).
 #[inline]
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
@@ -581,6 +692,17 @@ pub(crate) fn unlink(path: &Path) -> Result<()> {
     #[cfg(feature = "dst")]
     push(Op::Unlink { path: path.to_path_buf() });
     Ok(())
+}
+
+/// Remove one owned file name, treating an already absent name as the same completed state while
+/// propagating every other filesystem failure.
+#[inline]
+pub(crate) fn unlink_if_exists(path: &Path) -> Result<()> {
+    match unlink(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Deallocate `len` bytes at `off` in place (`fallocate(PUNCH_HOLE)` where the platform has it).

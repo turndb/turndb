@@ -1,4 +1,4 @@
-//! Sparse named content columns for part format revision 2.
+//! Sparse named content columns for the current draft part format.
 //!
 //! A content name is a physical column. Its programs and offsets are independent sections, so
 //! projecting one named value never decompresses another named value's programs. Every program still
@@ -73,12 +73,12 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
         let mut prog = Vec::new();
         let mut offsets = Vec::with_capacity(values.len() + 1);
         let mut rid = Vec::new();
-        let mut identities = Vec::with_capacity(values.len() * 33);
+        let mut identities = Vec::with_capacity(values.len() * 32);
         let mut previous = 0usize;
         for (occurrence, (row, content)) in values.into_iter().enumerate() {
             offsets.push(prog.len() as u64);
             encode_program(&mut prog, &content.ops, dict_index)?;
-            encode_identity(&mut identities, content);
+            encode_identity(&mut identities, content)?;
             if !dense {
                 let delta = if occurrence == 0 { row } else { row - previous };
                 if occurrence > 0 && delta == 0 {
@@ -111,15 +111,10 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
     Ok(Built { meta, cols })
 }
 
-pub(crate) fn encode_identity(out: &mut Vec<u8>, content: &Content) {
-    match content.identity {
-        Some(identity) => {
-            out.push(1);
-            out.extend_from_slice(&identity.0);
-        }
-        None => {
-            out.push(0);
-            out.extend_from_slice(&[0; 32]);
-        }
-    }
+pub(crate) fn encode_identity(out: &mut Vec<u8>, content: &Content) -> Result<()> {
+    let identity = content.identity.ok_or_else(|| {
+        anyhow::anyhow!("content {:?} has no reconstructed-byte identity", content.name)
+    })?;
+    out.extend_from_slice(&identity.0);
+    Ok(())
 }

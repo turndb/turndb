@@ -30,7 +30,7 @@ npm install @turndb/native
 ```
 
 The package selects `@turndb/native-win32-x64-msvc` through npm's `os` and `cpu` metadata. It
-supports Node 22, 24, and 26 and exposes the native programmatic store, query, erasure, punch/refold,
+supports Node 22, 24, and 26 and exposes the native programmatic store, query, erasure, content-punch/refold,
 and capability surfaces. A missing native slice is an error; the selector never silently substitutes
 the reduced WASI implementation.
 
@@ -58,12 +58,11 @@ required runtime dependencies. The optional `otel` extra is separate.
 
 The Python entrance exposes its actor-owned store and structured-query API. It does not expose the
 CLI's `inspect` or container `reclaim` commands, and it does not expose the Node addon's direct
-`punch()` operation.
+`contentPunch()` operation.
 
 ## Space accounting
 
-For a single-file store, `space_usage` currently reports a structural zero for allocated bytes on
-every platform; it is not an allocation measurement. Logical byte counts remain valid. Directory
-stores use the platform allocation query. The compiled `allocatedSpaceUsage` capability is a
-build-level fact and does not promise that allocation accounting is available for every store
-layout. Tracking: [#153](https://github.com/turndb/turndb/issues/153).
+For a single-file store, `space_usage` reports allocated bytes as absent on every platform; it does
+not fabricate a structural zero. Logical byte counts and filesystem availability remain valid. The
+compiled `allocatedSpaceUsage` capability is therefore false. Tracking:
+[#153](https://github.com/turndb/turndb/issues/153).

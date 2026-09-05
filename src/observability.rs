@@ -12,31 +12,29 @@ pub const EVENT_JOURNAL_CAPACITY: usize = 256;
 /// Stable lifecycle operation names carried by [`LifecycleEvent`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleOperation {
-    OpenRecovery,
+    OpenWalReplay,
     Sync,
     Flush,
-    Compaction,
+    Merge,
     Backup,
     Verification,
-    Punch,
+    ContentPunch,
     Refold,
     Erase,
-    FormatMigration,
 }
 
 impl LifecycleOperation {
     pub const fn name(self) -> &'static str {
         match self {
-            LifecycleOperation::OpenRecovery => "open_recovery",
+            LifecycleOperation::OpenWalReplay => "open_wal_replay",
             LifecycleOperation::Sync => "sync",
             LifecycleOperation::Flush => "flush",
-            LifecycleOperation::Compaction => "compaction",
+            LifecycleOperation::Merge => "merge",
             LifecycleOperation::Backup => "backup",
             LifecycleOperation::Verification => "verification",
-            LifecycleOperation::Punch => "punch",
+            LifecycleOperation::ContentPunch => "content_punch",
             LifecycleOperation::Refold => "refold",
             LifecycleOperation::Erase => "erase",
-            LifecycleOperation::FormatMigration => "format_migration",
         }
     }
 }
@@ -181,23 +179,22 @@ impl OperationMetrics {
 
 /// Cumulative lifecycle metrics since this writer handle opened.
 ///
-/// These counters are not persisted and do not pretend to be a histogram. `open_recovery` can only
+/// These counters are not persisted and do not pretend to be a histogram. `open_wal_replay` can only
 /// describe a successful open because a failed open returns no handle; the error itself carries the
 /// failure evidence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreMetrics {
-    pub open_recovery: OperationMetrics,
+    pub open_wal_replay: OperationMetrics,
     pub recovered_wal_frames: u64,
     pub sync: OperationMetrics,
     pub flush: OperationMetrics,
-    pub compaction: OperationMetrics,
+    pub merge: OperationMetrics,
     pub backup: OperationMetrics,
     pub verification: OperationMetrics,
     pub verification_corruption_failures: u64,
-    pub punch: OperationMetrics,
+    pub content_punch: OperationMetrics,
     pub refold: OperationMetrics,
     pub erase: OperationMetrics,
-    pub format_migration: OperationMetrics,
     pub folded_content: FoldedContentMetrics,
     /// Transient names (`store::DebrisKind`) a successful writer open removed because the
     /// protocol proved them dead — the one disposition a returned `Store` can truthfully report:
@@ -266,14 +263,17 @@ impl FoldBlockSpace {
     }
 }
 
-/// Exact content reachability for a settled store snapshot.
+/// Exact content reachability for the current manifest revision.
 ///
 /// A live block contains at least one piece referenced by a currently visible record. Reclaimable
 /// blocks contain no live pieces and can be removed by punching or refold. Dead bytes inside a live
 /// block are stranded until refold because block compression makes the block the reclamation unit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentLiveness {
+    /// Distinct physical piece locations named by visible row programs. The same content identity
+    /// at two owning-Part locations counts twice because both locations must remain readable.
     pub live_pieces: u64,
+    /// Sum of the logical lengths of those distinct physical piece locations.
     pub live_logical_bytes: u64,
     pub dead_logical_bytes: u64,
     pub stranded_dead_logical_bytes: u64,

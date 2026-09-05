@@ -27,7 +27,7 @@
 //!
 //! # One logical version, from many physical parts
 //!
-//! Parts may contain older versions and tombstones. The lens uses the store's committed read core to
+//! Parts may contain older versions and tombstones. The lens uses the store's newest-first resolution to
 //! resolve those before projection or filtering: the newest row for an id is the only eligible row,
 //! and a newest tombstone makes the id absent. In particular, a predicate that rejects the newest
 //! version can never fall through and reveal an older version that happens to match.
@@ -214,7 +214,7 @@ pub struct Lens {
     schema: SchemaRef,
     /// What each schema field means independently of its collision-safe display name.
     binding: Vec<Binding>,
-    /// The committed newest-wins rows for each part in this lens.
+    /// The resolved newest-wins rows for each part in this lens.
     ///
     /// The `Arc<Part>` is retained so a scan can identify its mask by pointer identity without adding
     /// storage-format identity to `Part`'s public API.
@@ -458,7 +458,7 @@ impl Lens {
             .iter()
             .find(|(p, _)| Arc::ptr_eq(p, part))
             .map(|(_, rows)| rows.clone())
-            .ok_or_else(|| anyhow::anyhow!("part is not a member of this lens snapshot"))?;
+            .ok_or_else(|| anyhow::anyhow!("part is not a member of this lens"))?;
 
         Ok(PartScan {
             n: part.len(),
@@ -642,7 +642,7 @@ pub struct PartScan {
     fetch: Option<usize>,
     /// Pushed-down predicates, resolved to this part's columns. Conjunctive.
     tests: Vec<Test>,
-    /// Rows that survive newest-wins resolution across the whole lens snapshot.
+    /// Rows that survive newest-wins resolution across the whole lens.
     visible: Arc<Vec<usize>>,
 }
 

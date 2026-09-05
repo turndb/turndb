@@ -68,7 +68,7 @@ test('projection returns exactly the requested attributes, in stored order, with
 test('a metadata-only page opens zero fold blocks, and a bytes page opens them', async () => {
   await withStore((s) => {
     seed(s);
-    s.flush(); // fold blocks only exist once content is sealed out of the memtable
+    s.flush(); // published content has durable fold blocks
 
     const meta = s.scan({ prefix: 'm/alice/', contents: [{ name: 'body', mode: 'metadata' }] });
     assert.equal(meta.rows.length, 10);
@@ -188,7 +188,7 @@ test('reverse returns the same rows in the opposite order', async () => {
   });
 });
 
-test('the memtable and the sealed columns answer identically', async () => {
+test('the memtable and the published columns answer identically', async () => {
   await withStore((s) => {
     seed(s);
     const request = {

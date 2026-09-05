@@ -52,19 +52,12 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-pub const MAGIC: &[u8; 8] = b"TURNPART";
+pub const MAGIC: &[u8; 8] = b"TDBPRT01";
 pub const FOOTER_LEN: u64 = 56;
 
-/// The part layout this build writes, and the highest it will read.
-///
-/// The fold could always refuse an unknown future — a segment with unknown `flags` bails rather than
-/// negotiate — and the part could not. Magic plus a footer checksum is no defence, because a future
-/// writer computes a perfectly valid checksum over a layout this reader will then misparse at fixed
-/// offsets. One plane negotiated and the other silently misread.
-///
-/// This claims one of the footer's padding bytes, which cost nothing because they were already
-/// zero-filled: a part written before this existed reads as version 0, which is exactly what it is.
-pub const PART_VERSION: u8 = 2;
+/// The one draft part layout this build writes and reads. Earlier development layouts use different
+/// magic and are not compatibility inputs.
+pub const PART_DRAFT_EPOCH: u8 = 1;
 
 /// Content-program op tags, packed into the low bit of a varint.
 pub(crate) const OP_LIT: u64 = 0;
@@ -107,7 +100,7 @@ pub struct PartMeta {
     pub seq_hi: u64,
 }
 
-/// One named content column declared by a revision-2 part.
+/// One named content column declared by a part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentMeta {
     pub name: String,
@@ -137,11 +130,12 @@ pub fn build(
 /// [`build`], plus dictionary entries to keep even though no record here references them.
 ///
 /// A part's dictionary is normally derived from what its records reference. A MERGE cannot use that
-/// rule alone: the fold is append-only and never forgets, so a piece whose only referencing record was
-/// superseded is still stored, still addressable, and still worth deduping against. Dropping it from
+/// rule alone: ordinary fold writes append and do not forget pieces, so a piece whose only referencing
+/// record was superseded is still stored and addressable until an explicit content punch or refold.
+/// While it remains available, dropping it from
 /// the dictionary would quietly do two harmful things —
 ///
-///  1. lose dedup for content we go on paying to store forever, and
+///  1. lose dedup for content we continue paying to store, and
 ///  2. break resolvability for a record that is staged but not yet flushed, whose piece was matched
 ///     against the very dictionary entry the merge removed. After a crash that record can be neither
 ///     read nor flushed.
@@ -204,13 +198,24 @@ pub fn build_full_with_limits(
     seq_lo: u64,
     seq_hi: u64,
     level: i32,
-    resolve: impl FnMut(&PieceHash) -> Option<Loc>,
+    mut resolve: impl FnMut(&PieceHash) -> Option<Loc>,
     retain: &HashMap<PieceHash, Loc>,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<PartMeta> {
+    validate_build_input(records, tombs, seq_lo, seq_hi)?;
+    read_limits.validate()?;
+    let piece_of = collect_piece_dictionary(records, &mut resolve, retain)?;
     let sink = FilePartSink::create(path)?;
-    let (meta, _) =
-        build_full_into(sink, records, tombs, seq_lo, seq_hi, level, resolve, retain, read_limits)?;
+    let (meta, _) = build_full_resolved_into(
+        sink,
+        records,
+        tombs,
+        seq_lo,
+        seq_hi,
+        level,
+        piece_of,
+        read_limits,
+    )?;
     Ok(meta)
 }
 
@@ -229,9 +234,80 @@ pub(crate) fn build_full_into<S: crate::vfs::ArtifactSink>(
     retain: &HashMap<PieceHash, Loc>,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(PartMeta, S)> {
-    if !tombs.is_empty() && tombs.len() != records.len() {
-        bail!("tombstone flags ({}) must be parallel to records ({})", tombs.len(), records.len());
+    validate_build_input(records, tombs, seq_lo, seq_hi)?;
+    let piece_of = collect_piece_dictionary(records, &mut resolve, retain)?;
+    build_full_resolved_into(sink, records, tombs, seq_lo, seq_hi, level, piece_of, read_limits)
+}
+
+fn collect_piece_dictionary(
+    records: &[Record],
+    resolve: &mut impl FnMut(&PieceHash) -> Option<Loc>,
+    retain: &HashMap<PieceHash, Loc>,
+) -> Result<HashMap<PieceHash, Loc>> {
+    let mut expected_lengths = HashMap::new();
+    for record in records {
+        crate::types::validate_contents(&record.contents)?;
+        for content in &record.contents {
+            for op in &content.ops {
+                let BodyOp::Piece { hash, len } = op else { continue };
+                if let Some(previous) = expected_lengths.insert(*hash, *len) {
+                    if previous != *len {
+                        bail!(
+                            "piece {hash} is referenced with conflicting lengths {previous} and {len}"
+                        );
+                    }
+                }
+            }
+        }
     }
+
+    let mut piece_of = HashMap::with_capacity(expected_lengths.len().saturating_add(retain.len()));
+    for (hash, expected) in expected_lengths {
+        let loc = resolve(&hash)
+            .ok_or_else(|| anyhow::anyhow!("piece {hash} is referenced but not in the fold"))?;
+        if loc.raw != expected {
+            bail!(
+                "piece {hash} is referenced as {expected} bytes but its fold location says {}",
+                loc.raw
+            );
+        }
+        piece_of.insert(hash, loc);
+    }
+    for (hash, loc) in retain {
+        if loc.raw == 0 {
+            bail!("retained piece {hash} has a zero-length fold location");
+        }
+        if let Some(resolved) = piece_of.get(hash) {
+            if resolved != loc {
+                bail!("retained piece {hash} disagrees with its resolved fold location");
+            }
+        } else {
+            piece_of.insert(*hash, *loc);
+        }
+    }
+    let mut location_of = std::collections::BTreeMap::new();
+    for (hash, loc) in &piece_of {
+        if let Some(previous) = location_of.insert(*loc, *hash) {
+            if previous != *hash {
+                bail!("fold location {loc:?} is assigned to both {previous} and {hash}");
+            }
+        }
+    }
+    u32::try_from(piece_of.len()).context("piece dictionary exceeds the u32 ordinal domain")?;
+    Ok(piece_of)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_full_resolved_into<S: crate::vfs::ArtifactSink>(
+    sink: S,
+    records: &[Record],
+    tombs: &[bool],
+    seq_lo: u64,
+    seq_hi: u64,
+    level: i32,
+    piece_of: HashMap<PieceHash, Loc>,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(PartMeta, S)> {
     // ---- order + uniqueness ----
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by(|&a, &b| records[a].id.cmp(&records[b].id));
@@ -243,25 +319,6 @@ pub(crate) fn build_full_into<S: crate::vfs::ArtifactSink>(
     let ids: Vec<String> = order.iter().map(|&i| records[i].id.clone()).collect();
 
     // ---- piece dictionary: distinct locs, sorted in FOLD order ----
-    let mut piece_of: HashMap<PieceHash, Loc> = HashMap::new();
-    for r in records {
-        crate::types::validate_contents(&r.contents)?;
-        for content in &r.contents {
-            for op in &content.ops {
-                if let BodyOp::Piece { hash, .. } = op {
-                    if !piece_of.contains_key(hash) {
-                        let loc = resolve(hash).ok_or_else(|| {
-                            anyhow::anyhow!("piece {hash} is referenced but not in the fold")
-                        })?;
-                        piece_of.insert(*hash, loc);
-                    }
-                }
-            }
-        }
-    }
-    for (h, l) in retain {
-        piece_of.entry(*h).or_insert(*l);
-    }
     let mut dict: Vec<(Loc, PieceHash)> = piece_of.iter().map(|(h, l)| (*l, *h)).collect();
     dict.sort_by_key(|(l, _)| (l.block_id, l.in_off));
     let dict_index: HashMap<PieceHash, u32> =
@@ -297,14 +354,13 @@ pub(crate) fn build_full_into<S: crate::vfs::ArtifactSink>(
     let mut hsort: Vec<u32> = (0..dict.len() as u32).collect();
     hsort.sort_by_key(|&i| dict[i as usize].1 .0);
     w.section("pdict.hsort", &u32s(&hsort))?;
-    let mut bloom = bloom::Bloom::with_capacity(dict.len());
+    let mut bloom = bloom::Bloom::try_with_capacity(dict.len())?;
     for (_, h) in &dict {
         bloom.insert(h);
     }
-    w.section("pdict.bloom", &bloom.encode())?;
-    // Tombstoned ROW ordinals, ascending, delta-varint. Usually empty and always tiny; a section that
-    // is absent means "this part deletes nothing", so parts written before deletion existed read
-    // correctly with no version lever.
+    w.section("pdict.bloom", &bloom.try_encode()?)?;
+    // Tombstoned ROW ordinals, ascending, delta-varint. Usually empty and always tiny; absence means
+    // exactly "this part deletes nothing."
     if !tombs.is_empty() {
         let mut tb = Vec::new();
         let mut prev = 0u64;
@@ -323,17 +379,19 @@ pub(crate) fn build_full_into<S: crate::vfs::ArtifactSink>(
             w.section("tomb", &out)?;
         }
     }
-    w.section("layout", &built.layout)?;
-    w.section("layout.off", &u64s(&built.layout_off))?;
-    w.section("colmeta", &built.meta)?;
-    w.section("zone", &built.zones)?;
-    for (i, c) in built.cols.iter().enumerate() {
-        w.section(&format!("col.val.{i}"), &c.val)?;
-        if !c.rid.is_empty() {
-            w.section(&format!("col.rid.{i}"), &c.rid)?;
-        }
-        if !c.dict.is_empty() {
-            w.section(&format!("col.dict.{i}"), &c.dict)?;
+    if !built.cols.is_empty() {
+        w.section("layout", &built.layout)?;
+        w.section("layout.off", &u64s(&built.layout_off))?;
+        w.section("colmeta", &built.meta)?;
+        w.section("zone", &built.zones)?;
+        for (i, c) in built.cols.iter().enumerate() {
+            w.section(&format!("col.val.{i}"), &c.val)?;
+            if !c.rid.is_empty() {
+                w.section(&format!("col.rid.{i}"), &c.rid)?;
+            }
+            if !c.dict.is_empty() {
+                w.section(&format!("col.dict.{i}"), &c.dict)?;
+            }
         }
     }
     if ids.len() as u64 > u32::MAX as u64 {
@@ -342,6 +400,35 @@ pub(crate) fn build_full_into<S: crate::vfs::ArtifactSink>(
     let meta = PartMeta { n_records: ids.len() as u32, seq_lo, seq_hi };
     let sink = w.finish(meta)?;
     Ok((meta, sink))
+}
+
+fn validate_build_input(
+    records: &[Record],
+    tombs: &[bool],
+    seq_lo: u64,
+    seq_hi: u64,
+) -> Result<()> {
+    u32::try_from(records.len()).context("record count exceeds the u32 part domain")?;
+    if seq_lo > seq_hi {
+        bail!("part sequence interval is inverted: {seq_lo}..{seq_hi}");
+    }
+    if !tombs.is_empty() && tombs.len() != records.len() {
+        bail!("tombstone flags ({}) must be parallel to records ({})", tombs.len(), records.len());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for record in records {
+        if record.id.is_empty() {
+            bail!("record id must not be empty");
+        }
+        if !ids.insert(record.id.as_str()) {
+            bail!("a part cannot hold two versions of id {:?}", record.id);
+        }
+        crate::types::validate_contents(&record.contents)?;
+        if let Some((_, _)) = record.attrs.iter().find(|(key, _)| key.is_empty()) {
+            bail!("attribute name must not be empty");
+        }
+    }
+    Ok(())
 }
 
 fn u32s(v: &[u32]) -> Vec<u8> {
@@ -424,6 +511,8 @@ impl<S: crate::vfs::ArtifactSink> Writer<S> {
         let (codec, payload) = crate::fold::codec::encode(raw, None, self.level)?;
         self.read_limits
             .admit_stored(format!("new part section {name:?}"), payload.len() as u64)?;
+        let next_off =
+            self.off.checked_add(payload.len() as u64).context("part section end overflows")?;
         self.sink
             .write_all_at(&payload, self.off)
             .with_context(|| format!("write section {name:?} of {}", self.sink.describe()))?;
@@ -437,18 +526,11 @@ impl<S: crate::vfs::ArtifactSink> Writer<S> {
                 xsum: crc32fast::hash(&payload),
             },
         ));
-        self.off += payload.len() as u64;
+        self.off = next_off;
         Ok(())
     }
 
-    pub(crate) fn finish(self, meta: PartMeta) -> Result<S> {
-        self.finish_version(meta, PART_VERSION)
-    }
-
-    fn finish_version(mut self, meta: PartMeta, version: u8) -> Result<S> {
-        if version > PART_VERSION {
-            bail!("cannot write unsupported part version {version}");
-        }
+    pub(crate) fn finish(mut self, meta: PartMeta) -> Result<S> {
         if meta.seq_lo > meta.seq_hi {
             bail!(
                 "cannot write a part with inverted sequence range {}..{}",
@@ -471,7 +553,8 @@ impl<S: crate::vfs::ArtifactSink> Writer<S> {
             // where a flipped bit is a wrong query answer with no error anywhere.
             //
             // The FIELD is the format decision and is taken now, because adding it later costs a
-            // version bump. WHEN to verify is runtime policy and is deliberately not decided here:
+            // physical identity rotation. WHEN to verify is runtime policy and is deliberately not
+            // decided here:
             // hashing a 65 MiB section on every read would be a tax worth measuring first.
             toc.extend_from_slice(&s.xsum.to_le_bytes());
         }
@@ -485,6 +568,9 @@ impl<S: crate::vfs::ArtifactSink> Writer<S> {
         }
         self.read_limits.admit("new part TOC", toc_payload.len() as u64, toc.len() as u64)?;
         let toc_off = self.off;
+        let footer_off =
+            toc_off.checked_add(toc_payload.len() as u64).context("part TOC end overflows")?;
+        footer_off.checked_add(FOOTER_LEN).context("part footer end overflows")?;
         self.sink
             .write_all_at(&toc_payload, toc_off)
             .with_context(|| format!("write TOC of {}", self.sink.describe()))?;
@@ -498,7 +584,7 @@ impl<S: crate::vfs::ArtifactSink> Writer<S> {
         foot.extend_from_slice(&meta.seq_lo.to_le_bytes());
         foot.extend_from_slice(&meta.seq_hi.to_le_bytes());
         foot.push(toc_codec);
-        foot.push(version);
+        foot.push(PART_DRAFT_EPOCH);
         // The TOC is where every section's checksum lives, so leaving the TOC itself unchecked made
         // those checksums only as trustworthy as the bytes carrying them. This covers the STORED TOC
         // payload, and the footer's own checksum covers this — so the chain is closed: footer verifies
@@ -513,7 +599,7 @@ impl<S: crate::vfs::ArtifactSink> Writer<S> {
         // The footer lands LAST and is the completeness marker; the sink decides whether the
         // barrier is its own fsync or an enclosing commit's.
         self.sink
-            .write_all_at(&foot, toc_off + toc_payload.len() as u64)
+            .write_all_at(&foot, footer_off)
             .with_context(|| format!("write footer of {}", self.sink.describe()))?;
         self.sink.sync().with_context(|| format!("sync {}", self.sink.describe()))?;
         Ok(self.sink)
@@ -533,9 +619,6 @@ pub struct Part {
     meta: PartMeta,
     /// Identity within the shared cache.
     id: u64,
-    /// The format version this part declares. Decides whether optional fields are PRESENT, which is
-    /// not the same question as whether they are non-zero.
-    version: u8,
     /// Decompressed sections, decoded offset arrays, decoded row indices and string dictionaries — all
     /// four live here, under one BYTE budget shared with every other part.
     ///
@@ -603,7 +686,7 @@ impl Part {
         Part::open_reader_with_limits(Box::new(f), cache, read_limits)
     }
 
-    /// Open from any [`ReadAt`] — a plain file, an extent of a pack, a remote range. The format is
+    /// Open from any [`ReadAt`] — a plain file, a container-member extent, or a remote range. The format is
     /// footer-addressed precisely so that THIS is the only entry a backend needs.
     pub fn open_reader(f: Box<dyn ReadAt>, cache: Arc<SectionCache>) -> Result<Part> {
         Part::open_reader_with_limits(f, cache, crate::read_limits::ReadLimits::default())
@@ -642,10 +725,9 @@ impl Part {
         // The reject-forward lever, matching the fold's `flags`. A part from a newer writer is refused
         // rather than misparsed at offsets that may no longer mean what they did.
         let version = foot[45];
-        if version > PART_VERSION {
+        if version != PART_DRAFT_EPOCH {
             bail!(
-                "part is format version {version}; this build reads up to {PART_VERSION} \
-                 — refusing rather than guessing at its layout"
+                "part declares draft epoch {version}; this build accepts exactly {PART_DRAFT_EPOCH}"
             );
         }
 
@@ -657,13 +739,16 @@ impl Part {
             bail!("part footer reserved bytes are non-zero — refusing rather than guessing at a layout this build does not know");
         }
         let toc_xsum = u32::from_le_bytes(foot[46..50].try_into().unwrap());
-        if toc_off.saturating_add(toc_stored as u64) > len - FOOTER_LEN {
-            bail!("part TOC runs past where the footer says the sections end");
+        let toc_end = toc_off
+            .checked_add(u64::from(toc_stored))
+            .ok_or_else(|| anyhow::anyhow!("part TOC end overflows"))?;
+        if toc_end != len - FOOTER_LEN {
+            bail!("part TOC is not immediately adjacent to its footer");
         }
         read_limits.admit("part TOC", u64::from(toc_stored), u64::from(toc_raw))?;
         let mut tbuf = vec![0u8; toc_stored as usize];
         f.read_exact_at(&mut tbuf, toc_off)?;
-        if version >= 1 && crc32fast::hash(&tbuf) != toc_xsum {
+        if crc32fast::hash(&tbuf) != toc_xsum {
             bail!(
                 "part TOC fails its checksum — every section checksum it carries is untrustworthy"
             );
@@ -674,8 +759,7 @@ impl Part {
         let n = usize::try_from(get_varint(&toc_bytes, &mut at)?)
             .map_err(|_| anyhow::anyhow!("part TOC entry count exceeds this address space"))?;
         // An entry costs several bytes, so the byte count bounds the entry count — checked before
-        // the count sizes an allocation, because `n` is exactly as trustworthy as the TOC carrying
-        // it, and on a version-0 part the TOC has no checksum at all.
+        // the count sizes an allocation.
         let mut toc = HashMap::with_capacity(n.min(toc_bytes.len()));
         for _ in 0..n {
             let nl = usize::try_from(get_varint(&toc_bytes, &mut at)?).map_err(|_| {
@@ -687,6 +771,9 @@ impl Part {
             }
             let name = String::from_utf8(toc_bytes[at..at + nl].to_vec())?;
             at += nl;
+            if name.is_empty() {
+                bail!("part TOC carries an empty section name");
+            }
             let off = get_varint(&toc_bytes, &mut at)?;
             let stored = u32::try_from(get_varint(&toc_bytes, &mut at)?)
                 .map_err(|_| anyhow::anyhow!("part TOC stored length exceeds its u32 field"))?;
@@ -697,22 +784,24 @@ impl Part {
             }
             let codec = toc_bytes[at];
             at += 1;
-            // Presence is decided by VERSION, never by the value. crc32 can legitimately be zero, so
-            // treating zero as "absent" would silently skip a real checksum roughly once in 4 billion.
-            let xsum = if version >= 1 {
-                if at + 4 > toc_bytes.len() {
-                    bail!("part TOC entry {name} is truncated before its checksum");
-                }
-                let x = u32::from_le_bytes(toc_bytes[at..at + 4].try_into().unwrap());
-                at += 4;
-                x
-            } else {
-                0
-            };
-            // A corrupt-but-plausible TOC would otherwise send `sect` to allocate `stored` bytes and
-            // read at an arbitrary offset. The footer is checksummed; the TOC is not, so every entry
-            // is range-checked against the file it claims to live in.
-            if off.saturating_add(stored as u64) > toc_off {
+            if codec > 1 {
+                bail!("part TOC entry {name} has unknown codec {codec}");
+            }
+            if codec == 0 && stored != raw {
+                bail!("stored part section {name} has different stored and raw lengths");
+            }
+            if at + 4 > toc_bytes.len() {
+                bail!("part TOC entry {name} is truncated before its checksum");
+            }
+            let xsum = u32::from_le_bytes(toc_bytes[at..at + 4].try_into().unwrap());
+            at += 4;
+            // An authentic-but-semantically-invalid TOC could otherwise send `sect` to allocate
+            // `stored` bytes and read at an arbitrary offset. Its checksum proves bytes, not range
+            // meaning, so every entry is checked against the part it claims to describe.
+            let end = off
+                .checked_add(u64::from(stored))
+                .ok_or_else(|| anyhow::anyhow!("part TOC entry {name} end overflows"))?;
+            if end > toc_off {
                 bail!("part TOC entry {name} overlaps the TOC or footer");
             }
             if toc.insert(name.clone(), Section { off, stored, raw, codec, xsum }).is_some() {
@@ -722,41 +811,45 @@ impl Part {
         if at != toc_bytes.len() {
             bail!("part TOC has {} trailing bytes after its last entry", toc_bytes.len() - at);
         }
-        if version <= 1 {
-            // In the singular-content layouts, the body offset count corroborates the footer's row
-            // count and is required even for an empty part.
-            match toc.get("prog.off") {
-                Some(s) => {
-                    if s.raw as u64 != (n_records as u64 + 1) * 8 {
-                        bail!(
-                            "footer claims {n_records} records but prog.off holds {} offsets",
-                            s.raw / 8
-                        );
-                    }
-                }
-                None => bail!("part is missing its required prog.off section"),
+        for required in ["ids", "ids.restart", "cmeta", "pdict.loc", "pdict.hash"] {
+            if !toc.contains_key(required) {
+                bail!("part is missing its required {required} section");
             }
-        } else if !toc.contains_key("cmeta") {
-            bail!("revision-2-or-later part is missing its required cmeta section");
         }
-        Ok(Part {
+        let mut ranges: Vec<_> = toc
+            .iter()
+            .filter(|(_, section)| section.stored != 0)
+            .map(|(name, section)| {
+                let end = section
+                    .off
+                    .checked_add(u64::from(section.stored))
+                    .expect("section end checked while parsing");
+                (section.off, end, name.as_str())
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|&(start, _, _)| start);
+        for adjacent in ranges.windows(2) {
+            if adjacent[0].1 > adjacent[1].0 {
+                bail!("part sections {:?} and {:?} overlap", adjacent[0].2, adjacent[1].2);
+            }
+        }
+        let part = Part {
             f,
-            version,
             toc,
             meta: PartMeta { n_records, seq_lo, seq_hi },
             id: cache::next_part_id(),
             cache,
             read_limits,
-        })
+        };
+        part.validate_current_schema()?;
+        // Schema validation is an open-time integrity gate, not query prefetch. Do not let the
+        // sections it inspected make the first operation look warm or consume shared cache budget.
+        part.cache.forget(part.id);
+        Ok(part)
     }
 
     pub fn meta(&self) -> PartMeta {
         self.meta
-    }
-
-    /// On-disk revision declared by this immutable part.
-    pub fn format_version(&self) -> u8 {
-        self.version
     }
 
     pub fn len(&self) -> usize {
@@ -765,6 +858,221 @@ impl Part {
 
     pub fn is_empty(&self) -> bool {
         self.meta.n_records == 0
+    }
+
+    /// Validate the closed current section schema. A section outside the exact singleton names and
+    /// metadata-indexed families below is not part of this draft identity and is refused.
+    fn validate_current_schema(&self) -> Result<()> {
+        let restart_bytes = u64::from(self.meta.n_records.div_ceil(16))
+            .checked_mul(4)
+            .context("id restart size overflows")?;
+        if u64::from(self.toc["ids.restart"].raw) != restart_bytes {
+            bail!("ids.restart length does not match the part's record count");
+        }
+        let ids = self.sect("ids")?;
+        let restarts = self.restarts()?;
+        IdCol::new(&ids, &restarts, self.len()).validate()?;
+
+        let loc_bytes = usize::try_from(self.toc["pdict.loc"].raw)
+            .context("piece-location length exceeds this platform")?;
+        if loc_bytes % Loc::WIDTH != 0 {
+            bail!("pdict.loc ends with a partial {}-byte location", Loc::WIDTH);
+        }
+        let pieces = loc_bytes / Loc::WIDTH;
+        let hash_bytes = pieces.checked_mul(32).context("piece-hash section length overflows")?;
+        if usize::try_from(self.toc["pdict.hash"].raw).ok() != Some(hash_bytes) {
+            bail!("pdict.hash is not parallel to pdict.loc");
+        }
+        let locations = self.sect("pdict.loc")?;
+        let mut previous = None;
+        for encoded in locations.chunks_exact(Loc::WIDTH) {
+            let location = Loc::decode(encoded)?;
+            if location.raw == 0 {
+                bail!("pdict.loc contains a zero-length piece");
+            }
+            if previous.is_some_and(|prior| prior >= location) {
+                bail!("pdict.loc is duplicated or out of canonical fold order");
+            }
+            previous = Some(location);
+        }
+        let hashes = self.sect("pdict.hash")?;
+        let mut unique_hashes = std::collections::HashSet::new();
+        unique_hashes
+            .try_reserve(pieces)
+            .context("reserve piece-identity uniqueness validation")?;
+        for encoded in hashes.chunks_exact(32) {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(encoded);
+            if !unique_hashes.insert(PieceHash(hash)) {
+                bail!("pdict.hash repeats a piece identity");
+            }
+        }
+        let has_hash_order = self.has("pdict.hsort");
+        let has_bloom = self.has("pdict.bloom");
+        if has_hash_order != has_bloom {
+            bail!("pdict.hsort and pdict.bloom must either both be present or both be absent");
+        }
+        if let Some(section) = self.toc.get("pdict.hsort") {
+            let expected = pieces.checked_mul(4).context("piece permutation size overflows")?;
+            if usize::try_from(section.raw).ok() != Some(expected) {
+                bail!("pdict.hsort is not parallel to the piece dictionary");
+            }
+            let ordinals = self.nums("pdict.hsort", 4)?;
+            let hashes = self.sect("pdict.hash")?;
+            let mut seen = vec![false; pieces];
+            for (position, &ordinal) in ordinals.iter().enumerate() {
+                let ordinal = usize::try_from(ordinal)
+                    .context("piece permutation ordinal exceeds this platform")?;
+                if ordinal >= pieces {
+                    bail!("piece permutation points outside the piece dictionary");
+                }
+                if std::mem::replace(&mut seen[ordinal], true) {
+                    bail!("piece permutation repeats ordinal {ordinal}");
+                }
+                if position > 0 {
+                    let prior = ordinals[position - 1] as usize;
+                    let prior_hash = &hashes[prior * 32..prior * 32 + 32];
+                    let hash = &hashes[ordinal * 32..ordinal * 32 + 32];
+                    if prior_hash >= hash {
+                        bail!("piece permutation is not in strict piece-identity order");
+                    }
+                }
+            }
+        }
+        if has_bloom {
+            bloom::Bloom::validate_current(&self.sect("pdict.bloom")?, &self.sect("pdict.hash")?)?;
+        }
+
+        let contents = self.content_meta()?;
+        for (column, content) in contents.iter().enumerate() {
+            let program_name = format!("con.prog.{column}");
+            let offset_name = format!("con.off.{column}");
+            let offsets = self.nums(&offset_name, 8)?;
+            if offsets.first().copied() != Some(0) {
+                bail!("content {:?} program offsets must begin at zero", content.name);
+            }
+            let program_len = u64::from(self.toc[&program_name].raw);
+            if offsets.windows(2).any(|pair| pair[0] > pair[1]) {
+                bail!("content {:?} program offsets are not monotonic", content.name);
+            }
+            if offsets.last().copied() != Some(program_len) {
+                bail!(
+                    "content {:?} final program offset does not equal its program extent",
+                    content.name
+                );
+            }
+        }
+        self.reject_dangling_family("con.prog.", contents.len())?;
+        self.reject_dangling_family("con.off.", contents.len())?;
+        self.reject_dangling_family("con.id.", contents.len())?;
+        self.reject_dangling_family("con.rid.", contents.len())?;
+
+        let shared = ["layout", "layout.off", "colmeta"];
+        let shared_count = shared.iter().filter(|name| self.has(name)).count();
+        if shared_count != 0 && shared_count != shared.len() {
+            bail!("attribute layout, offsets, and metadata must be present or absent together");
+        }
+        let attribute_count = if shared_count == 0 {
+            0
+        } else {
+            let expected_offsets = u64::from(self.meta.n_records)
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(8))
+                .context("attribute layout-offset size overflows")?;
+            if u64::from(self.toc["layout.off"].raw) != expected_offsets {
+                bail!("layout.off length does not match the part's record count");
+            }
+            let meta = attrs::read_meta(self)?;
+            if meta.is_empty() {
+                bail!("attribute sections are present but declare zero columns");
+            }
+            attrs::validate_layout(self, &meta)?;
+            for (column, (_, tag, occurrences, kind)) in meta.iter().enumerate() {
+                let values = format!("col.val.{column}");
+                let rids = format!("col.rid.{column}");
+                let dictionary = format!("col.dict.{column}");
+                if !self.has(&values) {
+                    bail!("attribute column {column} is missing {values}");
+                }
+                let expected_values = occurrences
+                    .checked_mul(attrs::width(*tag))
+                    .context("attribute value-section size overflows")?;
+                if usize::try_from(self.toc[&values].raw).ok() != Some(expected_values) {
+                    bail!("attribute column {column} value length disagrees with colmeta");
+                }
+                match *kind {
+                    attrs::RID_DENSE if *occurrences == self.len() => {
+                        if self.has(&rids) {
+                            bail!("dense attribute column {column} must not carry {rids}");
+                        }
+                    }
+                    attrs::RID_DENSE => {
+                        bail!("dense attribute column {column} does not cover every record")
+                    }
+                    attrs::RID_DELTA => {
+                        if !self.has(&rids) {
+                            bail!("sparse attribute column {column} is missing {rids}");
+                        }
+                    }
+                    other => bail!("attribute column {column} has unknown row-id kind {other}"),
+                }
+                if matches!(*tag, 0 | 5) != self.has(&dictionary) {
+                    bail!("attribute column {column} has an invalid dictionary complement");
+                }
+            }
+            meta.len()
+        };
+        self.reject_dangling_family("col.val.", attribute_count)?;
+        self.reject_dangling_family("col.rid.", attribute_count)?;
+        self.reject_dangling_family("col.dict.", attribute_count)?;
+        if shared_count == 0 && self.has("zone") {
+            bail!("an attribute-free part must not carry an attribute zone section");
+        }
+
+        for name in self.toc.keys() {
+            let singleton = matches!(
+                name.as_str(),
+                "ids"
+                    | "ids.restart"
+                    | "cmeta"
+                    | "pdict.loc"
+                    | "pdict.hash"
+                    | "pdict.hsort"
+                    | "pdict.bloom"
+                    | "tomb"
+                    | "layout"
+                    | "layout.off"
+                    | "colmeta"
+                    | "zone"
+            );
+            let indexed = ["con.prog.", "con.off.", "con.id.", "con.rid."]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                || ["col.val.", "col.rid.", "col.dict."]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix));
+            if !singleton && !indexed {
+                bail!("part carries unknown section {name:?} outside the current draft schema");
+            }
+        }
+
+        // Decode the optional compact list now so partial entries, duplicate ordinals, overflow,
+        // and out-of-range rows cannot remain latent behind a seemingly successful open.
+        let _ = self.tombstones()?;
+        Ok(())
+    }
+
+    fn reject_dangling_family(&self, prefix: &str, count: usize) -> Result<()> {
+        for name in self.toc.keys().filter(|name| name.starts_with(prefix)) {
+            let suffix = &name[prefix.len()..];
+            let ordinal = suffix.parse::<usize>().with_context(|| {
+                format!("known section family {prefix} has invalid member {name}")
+            })?;
+            if suffix != ordinal.to_string() || ordinal >= count {
+                bail!("known section {name} has no corresponding metadata entry");
+            }
+        }
+        Ok(())
     }
 
     /// A section's decompressed bytes, cached after first touch.
@@ -786,6 +1094,10 @@ impl Part {
         )?;
         let mut buf = vec![0u8; s.stored as usize];
         self.f.read_exact_at(&mut buf, s.off)?;
+        let got = crc32fast::hash(&buf);
+        if got != s.xsum {
+            bail!("part section {name:?} fails its checksum: {got:08x} != {:08x}", s.xsum);
+        }
         let raw = crate::fold::codec::decode(s.codec, &buf, s.raw, None)?;
         let arc = Arc::new(raw);
         self.cache.put(self.id, k, Held::Bytes(arc.clone()));
@@ -793,11 +1105,28 @@ impl Part {
         Ok(arc)
     }
 
+    /// Decode advisory bytes only after their stored checksum is proved. A damaged advisory
+    /// section is absence, never evidence for excluding rows. Admission and I/O failures still
+    /// propagate because they are not statements about the advisory bytes' truth.
+    pub(crate) fn verified_advisory_section(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let s = self.toc.get(name).ok_or_else(|| anyhow::anyhow!("part has no section {name}"))?;
+        self.read_limits.admit(
+            format!("part advisory section {name:?}"),
+            u64::from(s.stored),
+            u64::from(s.raw),
+        )?;
+        let mut stored = vec![0u8; s.stored as usize];
+        self.f.read_exact_at(&mut stored, s.off)?;
+        if crc32fast::hash(&stored) != s.xsum {
+            return Ok(None);
+        }
+        Ok(crate::fold::codec::decode(s.codec, &stored, s.raw, None).ok())
+    }
+
     fn has(&self, name: &str) -> bool {
         self.toc.contains_key(name)
     }
 
-    /// All ids, in order.
     /// Every id, in order, decoded once and shared.
     ///
     /// The id column is front-coded, so reading it reconstructs prefixes and validates UTF-8 for every
@@ -888,10 +1217,10 @@ impl Part {
 
     /// Check every section against its recorded checksum.
     ///
-    /// Explicitly NOT done on the read path. Content is already verified per piece on every read; this
-    /// covers the columnar metadata, where the cost is proportional to the whole part rather than to
-    /// what a query touches. Offering it as a deliberate call keeps that a caller's choice — a
-    /// consistency check, a repair tool, an ingest gate — instead of a tax every scan pays.
+    /// Every uncached section read verifies that section's stored checksum, and open-time schema
+    /// validation reads the structural sections it needs. This method is the explicit whole-part
+    /// sweep: it touches every section whether or not a query needs it, making the proportional
+    /// whole-part cost a deliberate verification choice rather than a tax on every scan.
     pub fn verify_sections(&self) -> Result<usize> {
         self.verify_sections_with_control(&crate::control::OperationControl::default())
     }
@@ -902,9 +1231,6 @@ impl Part {
         control: &crate::control::OperationControl,
     ) -> Result<usize> {
         let mut checked = 0usize;
-        if self.version < 1 {
-            return Ok(0); // predates per-section checksums; nothing to check, and that is not an error
-        }
         for (name, s) in &self.toc {
             control.check("part verification")?;
             let mut remaining = u64::from(s.stored);
@@ -928,8 +1254,60 @@ impl Part {
         Ok(checked)
     }
 
-    /// Rows this part deletes, ascending. Empty for a part that deletes nothing, and for every part
-    /// written before deletion existed.
+    /// Decode the complete logical grammar of every physical row and dictionary entry.
+    ///
+    /// This is deliberately stronger than resolving the current record set: superseded rows are
+    /// still current-format bytes, and backup, reclaim, and retained-history verification must not
+    /// preserve an authenticated part whose latent row program or attribute value is malformed.
+    pub fn verify_semantics_with_control(
+        &self,
+        control: &crate::control::OperationControl,
+    ) -> Result<usize> {
+        let piece_count = self.piece_count()?;
+        for ordinal in 0..piece_count {
+            control.check("part semantic verification")?;
+            let _ = self.piece(ordinal)?;
+        }
+
+        for row in 0..self.len() {
+            control.check("part semantic verification")?;
+            let _ = self.record(row)?;
+        }
+        Ok(self.len())
+    }
+
+    /// Verify every operational piece-dictionary mapping against the fold bytes it names.
+    ///
+    /// Entries in declared-punched blocks are historical lookup residue and are deliberately
+    /// unavailable; callers must not use them for dedup. Every other hash/location pair is
+    /// authority-bearing even when no current record program references it.
+    pub(crate) fn verify_piece_dictionary_with_control(
+        &self,
+        fold: &Fold,
+        control: &crate::control::OperationControl,
+    ) -> Result<usize> {
+        let count = self.piece_count()?;
+        let mut verified = 0usize;
+        for ordinal in 0..count {
+            control.check("piece dictionary verification")?;
+            let (location, hash) = self.piece(ordinal)?;
+            fold.verify_location_shape(location).with_context(|| {
+                format!("piece dictionary ordinal {ordinal} has an invalid fold location")
+            })?;
+            if fold.is_punched(location.block_id) {
+                continue;
+            }
+            fold.read_verified(location, hash).with_context(|| {
+                format!("piece dictionary ordinal {ordinal} maps {hash} to invalid fold bytes")
+            })?;
+            verified = verified
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("verified piece count overflow"))?;
+        }
+        Ok(verified)
+    }
+
+    /// Rows this part deletes, ascending. Empty exactly when this part deletes nothing.
     pub fn tombstones(&self) -> Result<Arc<Vec<u64>>> {
         if !self.has("tomb") {
             return Ok(Arc::new(Vec::new()));
@@ -940,12 +1318,23 @@ impl Part {
         }
         let b = self.sect("tomb")?;
         let mut at = 0usize;
-        let n = get_varint(&b, &mut at)? as usize;
+        let n = usize::try_from(get_varint(&b, &mut at)?)
+            .context("tombstone count exceeds this platform's address space")?;
         let mut out = Vec::with_capacity(n.min(b.len()));
         let mut cur = 0u64;
-        for _ in 0..n {
-            cur += get_varint(&b, &mut at)?;
+        for index in 0..n {
+            let delta = get_varint(&b, &mut at)?;
+            if index > 0 && delta == 0 {
+                bail!("tombstone ordinals are not strictly increasing");
+            }
+            cur = cur.checked_add(delta).context("tombstone ordinal overflows")?;
+            if cur >= self.len() as u64 {
+                bail!("tombstone ordinal {cur} is outside this part");
+            }
             out.push(cur);
+        }
+        if at != b.len() {
+            bail!("tombstone section has {} trailing bytes", b.len() - at);
         }
         let a = Arc::new(out);
         self.cache.put(self.id, k, Held::Nums(a.clone()));
@@ -968,7 +1357,11 @@ impl Part {
     }
 
     pub fn piece_count(&self) -> Result<usize> {
-        Ok(self.sect("pdict.loc")?.len() / Loc::WIDTH)
+        let locations = self.sect("pdict.loc")?;
+        if locations.len() % Loc::WIDTH != 0 {
+            bail!("piece-location section has a partial {}-byte entry", Loc::WIDTH);
+        }
+        Ok(locations.len() / Loc::WIDTH)
     }
 
     /// **Tier-1 dedup.** Does this part already hold `h`, and if so, where in the fold?
@@ -977,8 +1370,8 @@ impl Part {
     /// question of every part and nearly all answers are "no". Only on a filter hit does the sorted
     /// permutation get searched, and only then is the answer definitive.
     ///
-    /// Parts written before this section existed simply answer `None`: an older part is allowed to
-    /// decline to participate in dedup, because a miss costs bytes and never correctness.
+    /// These indexes are advisory in the current format. A part that omits either declines to
+    /// participate in hash-indexed dedup; a miss costs work and bytes, never correctness.
     pub fn lookup_piece(&self, h: &PieceHash) -> Result<Option<Loc>> {
         if !self.has("pdict.bloom") || !self.has("pdict.hsort") {
             return Ok(None);
@@ -1010,19 +1403,25 @@ impl Part {
         Ok(None) // filter false positive
     }
 
+    /// Authoritative piece-dictionary lookup. Advisory indexes accelerate the common case; their
+    /// absence widens to a linear scan and can never make stored content disappear.
+    pub(crate) fn find_piece(&self, h: &PieceHash) -> Result<Option<Loc>> {
+        if let Some(loc) = self.lookup_piece(h)? {
+            return Ok(Some(loc));
+        }
+        for ordinal in 0..self.piece_count()? {
+            let (loc, candidate) = self.piece(ordinal)?;
+            if candidate == *h {
+                return Ok(Some(loc));
+            }
+        }
+        Ok(None)
+    }
+
     /// The named content columns this part declares, in canonical UTF-8 byte order.
     pub fn content_meta(&self) -> Result<Arc<Vec<ContentMeta>>> {
         if let Some(Held::ContentMeta(v)) = self.cache.get(self.id, &Kind::ContentMeta) {
             return Ok(v);
-        }
-        if self.version <= 1 {
-            let out = Arc::new(vec![ContentMeta {
-                name: BODY_CONTENT.to_string(),
-                occurrences: self.len(),
-                dense: true,
-            }]);
-            self.cache.put(self.id, Kind::ContentMeta, Held::ContentMeta(out.clone()));
-            return Ok(out);
         }
         let meta = self.sect("cmeta")?;
         let mut at = 0usize;
@@ -1048,6 +1447,9 @@ impl Part {
             let name = String::from_utf8(name_bytes)?;
             let occurrences = usize::try_from(get_varint(&meta, &mut at)?)
                 .context("content occurrence count exceeds this platform's address space")?;
+            if occurrences == 0 {
+                bail!("content column {i} has no occurrences");
+            }
             if occurrences > self.len() {
                 bail!(
                     "content {name:?} has {occurrences} occurrences across only {} rows",
@@ -1087,16 +1489,14 @@ impl Part {
             if !dense && !self.has(&rid) {
                 bail!("sparse content {name:?} is missing its row-id section");
             }
-            if self.version >= 2 {
-                if !self.has(&identity) {
-                    bail!("content {name:?} is missing its identity section");
-                }
-                let expected = (occurrences as u64)
-                    .checked_mul(33)
-                    .ok_or_else(|| anyhow::anyhow!("content identity section size overflows"))?;
-                if self.toc[&identity].raw as u64 != expected {
-                    bail!("content {name:?} has an identity count inconsistent with cmeta");
-                }
+            if !self.has(&identity) {
+                bail!("content {name:?} is missing its identity section");
+            }
+            let expected = (occurrences as u64)
+                .checked_mul(32)
+                .ok_or_else(|| anyhow::anyhow!("content identity section size overflows"))?;
+            if self.toc[&identity].raw as u64 != expected {
+                bail!("content {name:?} has an identity count inconsistent with cmeta");
             }
             out.push(ContentMeta { name, occurrences, dense });
         }
@@ -1159,10 +1559,13 @@ impl Part {
     fn program(&self, prog_name: &str, off_name: &str, occurrence: usize) -> Result<Vec<BodyOp>> {
         let prog = self.sect(prog_name)?;
         let offs = self.nums(off_name, 8)?;
-        if occurrence + 1 >= offs.len() {
+        if occurrence >= offs.len().saturating_sub(1) {
             bail!("content occurrence {occurrence} is outside {off_name}");
         }
-        let (start, end) = (offs[occurrence] as usize, offs[occurrence + 1] as usize);
+        let start = usize::try_from(offs[occurrence])
+            .context("content program start exceeds this platform")?;
+        let end = usize::try_from(offs[occurrence + 1])
+            .context("content program end exceeds this platform")?;
         if end > prog.len() || start > end {
             bail!("{off_name} names a program outside {prog_name}");
         }
@@ -1194,7 +1597,16 @@ impl Part {
                     .context("piece index exceeds this platform's address space")?;
                 let len = u32::try_from(get_varint(program, &mut at)?)
                     .context("piece length exceeds the format's u32 limit")?;
-                let (_, hash) = self.piece(idx)?;
+                if len == 0 {
+                    bail!("content program piece length must be non-zero");
+                }
+                let (location, hash) = self.piece(idx)?;
+                if location.raw != len {
+                    bail!(
+                        "content program says piece {hash} is {len} bytes but its dictionary says {}",
+                        location.raw
+                    );
+                }
                 out.push(BodyOp::Piece { hash, len });
             }
         }
@@ -1206,13 +1618,6 @@ impl Part {
 
     /// One named content program at row `r`, if present.
     pub fn content(&self, r: usize, name: &str) -> Result<Option<Vec<BodyOp>>> {
-        if self.version <= 1 {
-            return if name == BODY_CONTENT {
-                Ok(Some(self.program("prog", "prog.off", r)?))
-            } else {
-                Ok(None)
-            };
-        }
         let columns = self.content_meta()?;
         let Ok(col) = columns.binary_search_by(|c| c.name.as_bytes().cmp(name.as_bytes())) else {
             return Ok(None);
@@ -1223,17 +1628,11 @@ impl Part {
         Ok(Some(self.program(&format!("con.prog.{col}"), &format!("con.off.{col}"), occurrence)?))
     }
 
-    /// Exact reconstructed-byte identity for one named value, when its format carried one.
-    ///
-    /// `None` means either the value is absent or it came from a legacy/unidentified record; callers
-    /// that need to distinguish those states first ask [`Part::content`]. No program or fold block is
-    /// read.
+    /// Exact reconstructed-byte identity for one named value. `None` means the value is absent.
+    /// No program or fold block is read.
     pub fn content_identity(&self, r: usize, name: &str) -> Result<Option<ContentHash>> {
         if r >= self.len() {
             bail!("row {r} out of range");
-        }
-        if self.version <= 1 {
-            return Ok(None);
         }
         let columns = self.content_meta()?;
         let Ok(col) = columns.binary_search_by(|c| c.name.as_bytes().cmp(name.as_bytes())) else {
@@ -1244,24 +1643,15 @@ impl Part {
         };
         let identities = self.sect(&format!("con.id.{col}"))?;
         let at = occurrence
-            .checked_mul(33)
+            .checked_mul(32)
             .ok_or_else(|| anyhow::anyhow!("content identity offset overflows"))?;
         let end = at
-            .checked_add(33)
+            .checked_add(32)
             .ok_or_else(|| anyhow::anyhow!("content identity end offset overflows"))?;
         let encoded = identities
             .get(at..end)
             .ok_or_else(|| anyhow::anyhow!("content identity occurrence is truncated"))?;
-        match encoded[0] {
-            0 => {
-                if encoded[1..].iter().any(|&byte| byte != 0) {
-                    bail!("unavailable content identity has a nonzero digest");
-                }
-                Ok(None)
-            }
-            1 => Ok(Some(ContentHash(encoded[1..].try_into().unwrap()))),
-            marker => bail!("content identity has unknown availability marker {marker}"),
-        }
+        Ok(Some(ContentHash(encoded.try_into().unwrap())))
     }
 
     /// Every named content value at row `r`, in canonical name order.
@@ -1313,10 +1703,6 @@ impl Part {
         if names.is_empty() {
             return Ok(vec![Vec::new(); rows.len()]);
         }
-        if self.version <= 1 {
-            return rows.iter().map(|&row| self.contents_selected(row, names)).collect();
-        }
-
         for &row in rows {
             if row >= self.len() {
                 bail!("row {row} out of range");
@@ -1332,8 +1718,7 @@ impl Part {
             let off_name = format!("con.off.{col}");
             let prog = self.sect(&prog_name)?;
             let offs = self.nums(&off_name, 8)?;
-            let identities =
-                if self.version >= 2 { Some(self.sect(&format!("con.id.{col}"))?) } else { None };
+            let identities = self.sect(&format!("con.id.{col}"))?;
 
             for (output, &row) in rows.iter().enumerate() {
                 let occurrence = if meta.dense {
@@ -1359,31 +1744,16 @@ impl Part {
                 if end > prog.len() || start > end {
                     bail!("{off_name} names a program outside {prog_name}");
                 }
-                let identity = if let Some(identities) = &identities {
-                    let at = occurrence
-                        .checked_mul(33)
-                        .ok_or_else(|| anyhow::anyhow!("content identity offset overflows"))?;
-                    let end = at
-                        .checked_add(33)
-                        .ok_or_else(|| anyhow::anyhow!("content identity end offset overflows"))?;
-                    let encoded = identities.get(at..end).ok_or_else(|| {
-                        anyhow::anyhow!("content identity occurrence is truncated")
-                    })?;
-                    match encoded[0] {
-                        0 => {
-                            if encoded[1..].iter().any(|&byte| byte != 0) {
-                                bail!("unavailable content identity has a nonzero digest");
-                            }
-                            None
-                        }
-                        1 => Some(ContentHash(encoded[1..].try_into().unwrap())),
-                        marker => {
-                            bail!("content identity has unknown availability marker {marker}")
-                        }
-                    }
-                } else {
-                    None
-                };
+                let at = occurrence
+                    .checked_mul(32)
+                    .ok_or_else(|| anyhow::anyhow!("content identity offset overflows"))?;
+                let identity_end = at
+                    .checked_add(32)
+                    .ok_or_else(|| anyhow::anyhow!("content identity end offset overflows"))?;
+                let encoded = identities
+                    .get(at..identity_end)
+                    .ok_or_else(|| anyhow::anyhow!("content identity occurrence is truncated"))?;
+                let identity = Some(ContentHash(encoded.try_into().unwrap()));
                 let mut content = Content::new(&meta.name, self.decode_program(&prog[start..end])?);
                 content.identity = identity;
                 out[output].push(content);
@@ -1392,7 +1762,7 @@ impl Part {
         Ok(out)
     }
 
-    /// Compatibility body program. An absent `body` value reads as empty through this legacy API.
+    /// Convenience access to the conventional `body` content value.
     pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
         Ok(self.content(r, BODY_CONTENT)?.unwrap_or_default())
     }
@@ -1429,7 +1799,7 @@ impl Part {
     }
 
     /// Whether this part can possibly contain an occurrence satisfying one typed attribute
-    /// predicate. `false` is a proof from dictionary/zone metadata; every absent, legacy, NaN, or
+    /// predicate. `false` is a proof from dictionary/zone metadata; every absent, unknown, NaN, or
     /// malformed advisory fact widens to `true` so pruning can never change an answer.
     pub fn attr_predicate_may_match(
         &self,
@@ -1556,17 +1926,7 @@ impl Part {
             match op {
                 BodyOp::Lit(bytes) => out.extend_from_slice(bytes),
                 BodyOp::Piece { hash, len } => {
-                    let mut loc = self.lookup_piece(hash)?;
-                    if loc.is_none() {
-                        // Revision-0 parts may predate the optional hash-sorted dictionary index.
-                        for i in 0..self.piece_count()? {
-                            let (candidate_loc, candidate_hash) = self.piece(i)?;
-                            if candidate_hash == *hash {
-                                loc = Some(candidate_loc);
-                                break;
-                            }
-                        }
-                    }
+                    let loc = self.find_piece(hash)?;
                     let loc = loc.ok_or_else(|| {
                         anyhow::anyhow!("piece {hash} is not in the part dictionary")
                     })?;
@@ -1587,6 +1947,86 @@ impl Part {
             }
         }
         Ok(out)
+    }
+
+    /// Validate one projected content value through this Part's own piece dictionary while
+    /// hashing incrementally. The complete value is never materialized; Fold frames and Part
+    /// sections remain independently bounded by the caller's read profile.
+    pub(crate) fn verify_projected_content_with_control(
+        &self,
+        content: &Content,
+        fold: &Fold,
+        control: &crate::control::OperationControl,
+    ) -> Result<u64> {
+        let (bytes, complete) =
+            self.verify_projected_content_inner(content, fold, control, false)?;
+        debug_assert!(complete);
+        Ok(bytes)
+    }
+
+    /// Validate as much of a retained content value as the current punch declaration leaves
+    /// readable. A declared-punched piece has already ended that older view's readability, so its
+    /// complete value identity cannot be recomputed; every surviving piece and all locator
+    /// geometry remain mandatory.
+    pub(crate) fn verify_retained_projected_content_with_control(
+        &self,
+        content: &Content,
+        fold: &Fold,
+        control: &crate::control::OperationControl,
+    ) -> Result<u64> {
+        self.verify_projected_content_inner(content, fold, control, true).map(|(bytes, _)| bytes)
+    }
+
+    fn verify_projected_content_inner(
+        &self,
+        content: &Content,
+        fold: &Fold,
+        control: &crate::control::OperationControl,
+        allow_declared_punch: bool,
+    ) -> Result<(u64, bool)> {
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = 0u64;
+        let mut complete = true;
+        for op in &content.ops {
+            control.check("content identity verification")?;
+            match op {
+                BodyOp::Lit(literal) => {
+                    hasher.update(literal);
+                    bytes = bytes
+                        .checked_add(literal.len() as u64)
+                        .ok_or_else(|| anyhow::anyhow!("content byte count overflow"))?;
+                }
+                BodyOp::Piece { hash, len } => {
+                    let location = self.find_piece(hash)?.ok_or_else(|| {
+                        anyhow::anyhow!("piece {hash} is not in the owning part dictionary")
+                    })?;
+                    if location.raw != *len {
+                        bail!("piece {hash} is {} bytes but the program says {len}", location.raw);
+                    }
+                    fold.verify_location_shape(location)?;
+                    if allow_declared_punch && fold.is_punched(location.block_id) {
+                        complete = false;
+                    } else {
+                        fold.visit_verified(location, *hash, |piece| {
+                            hasher.update(piece);
+                        })?;
+                    }
+                    bytes = bytes
+                        .checked_add(u64::from(*len))
+                        .ok_or_else(|| anyhow::anyhow!("content byte count overflow"))?;
+                }
+            }
+        }
+        let expected = content.identity.ok_or_else(|| {
+            anyhow::anyhow!("content {:?} has no reconstructed-byte identity", content.name)
+        })?;
+        if complete {
+            let got = ContentHash(hasher.finalize().into());
+            if got != expected {
+                bail!("content {:?} hashes to {got} but claims {expected}", content.name);
+            }
+        }
+        Ok((bytes, complete))
     }
 
     /// Reconstruct by id.
@@ -1682,33 +2122,9 @@ impl Part {
     }
 }
 
-/// Hand-encode a genuine version-1 part: one body-centric program per row, no `cmeta`, no
-/// `con.*` sections. The migration tests need real legacy bytes produced independently of the
-/// current writer, which can no longer emit this layout.
 #[cfg(test)]
-pub(crate) fn build_revision_one_fixture(path: &Path, seq: u64, id: &str) -> Result<PartMeta> {
-    let (ids, restarts) = idcol::build(&[id.to_string()])?;
-    let mut prog = Vec::new();
-    put_varint(&mut prog, 1);
-    put_varint(&mut prog, (6u64 << 1) | OP_LIT);
-    prog.extend_from_slice(b"legacy");
-
-    let meta = PartMeta { n_records: 1, seq_lo: seq, seq_hi: seq };
-    let mut writer = Writer::new(path, 3)?;
-    writer.section("ids", &ids)?;
-    writer.section("ids.restart", &u32s(&restarts))?;
-    writer.section("prog", &prog)?;
-    writer.section("prog.off", &u64s(&[0, prog.len() as u64]))?;
-    writer.section("pdict.loc", &[])?;
-    writer.section("pdict.hash", &[])?;
-    writer.finish_version(meta, 1)?;
-    Ok(meta)
-}
-
-#[cfg(test)]
-mod compatibility_tests {
+mod tests {
     use super::*;
-    use crate::fold::FoldCfg;
 
     /// The sink seam's contract: a part assembled inside a container member is byte-identical to
     /// the same part assembled in a file of its own, the member handle's in-pass BLAKE3 equals a
@@ -1797,7 +2213,7 @@ mod compatibility_tests {
         let mut c = crate::container::Container::create(&ct).unwrap();
         let mut w = c.begin_member("doomed").unwrap();
         crate::vfs::ArtifactSink::write_all_at(&mut w, b"half an artifact", 0).unwrap();
-        c.abandon_member(w);
+        c.abandon_member(w).unwrap();
 
         c.put_bytes("kept", b"real").unwrap();
         c.commit().unwrap();
@@ -1851,33 +2267,393 @@ mod compatibility_tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    fn empty_current_writer(path: &Path) -> Writer<FilePartSink> {
+        let mut writer = Writer::new(path, 3).unwrap();
+        writer.section("ids", &[]).unwrap();
+        writer.section("ids.restart", &[]).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.section("pdict.loc", &[]).unwrap();
+        writer.section("pdict.hash", &[]).unwrap();
+        writer
+    }
+
     #[test]
-    fn a_revision_one_body_reads_as_named_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "turndb-part-v1-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("legacy.part");
-        build_revision_one_fixture(&path, 1, "legacy").unwrap();
+    fn every_required_section_and_disjoint_extent_is_enforced() {
+        let (dir, missing_path) = temp_part("missing-required");
+        let mut missing = Writer::new(&missing_path, 3).unwrap();
+        missing.section("cmeta", &[0]).unwrap();
+        missing.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        assert!(Part::open(&missing_path).is_err());
+
+        let overlap_path = dir.join("overlap.part");
+        let mut overlap = empty_current_writer(&overlap_path);
+        let ids = overlap.toc.iter().position(|(name, _)| name == "ids").unwrap();
+        let cmeta = overlap.toc.iter().position(|(name, _)| name == "cmeta").unwrap();
+        overlap.toc[ids].1.stored = 1;
+        overlap.toc[ids].1.raw = 1;
+        overlap.toc[cmeta].1.off = overlap.toc[ids].1.off;
+        overlap.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        let error = match Part::open(&overlap_path) {
+            Ok(_) => panic!("overlapping current sections must refuse"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("overlap"), "{error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn malformed_tombstone_ordinals_are_refused_during_open() {
+        let (dir, path) = temp_part("bad-tombstones");
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("ids", &[0]).unwrap();
+        writer.section("ids.restart", &0u32.to_le_bytes()).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.section("pdict.loc", &[]).unwrap();
+        writer.section("pdict.hash", &[]).unwrap();
+        writer.section("tomb", &[2, 0, 0]).unwrap();
+        writer.finish(PartMeta { n_records: 2, seq_lo: 1, seq_hi: 1 }).unwrap();
+        assert!(Part::open(&path).is_err(), "duplicate tombstone ordinals must refuse");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unknown_section_is_not_a_silent_extension_of_the_current_draft() {
+        let (dir, path) = temp_part("unknown-section");
+        let mut writer = empty_current_writer(&path);
+        writer.section("future.guess", b"not this draft").unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        let error = Part::open(&path)
+            .err()
+            .expect("an unlisted section must require a new physical identity")
+            .to_string();
+        assert!(error.contains("unknown section"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_piece_hash_order_section_must_be_an_exact_sorted_permutation() {
+        let (dir, path) = temp_part("bad-piece-permutation");
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("ids", &[]).unwrap();
+        writer.section("ids.restart", &[]).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        let mut locations = Vec::new();
+        locations.extend_from_slice(&Loc { block_id: 0, in_off: 0, raw: 1 }.encode());
+        locations.extend_from_slice(&Loc { block_id: 0, in_off: 1, raw: 1 }.encode());
+        writer.section("pdict.loc", &locations).unwrap();
+        let mut hashes = vec![0u8; 64];
+        hashes[32] = 1;
+        writer.section("pdict.hash", &hashes).unwrap();
+        writer.section("pdict.hsort", &u32s(&[0, 0])).unwrap();
+        let mut filter = bloom::Bloom::with_capacity(2);
+        let mut first = [0u8; 32];
+        first.copy_from_slice(&hashes[..32]);
+        let mut second = [0u8; 32];
+        second.copy_from_slice(&hashes[32..]);
+        filter.insert(&PieceHash(first));
+        filter.insert(&PieceHash(second));
+        writer.section("pdict.bloom", &filter.encode()).unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+
+        let error =
+            Part::open(&path).err().expect("a repeated piece ordinal must be refused").to_string();
+        assert!(error.contains("repeats ordinal"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_zero_length_piece_dictionary_entry_is_not_current_format() {
+        let (dir, path) = temp_part("zero-piece");
+        let mut writer = empty_current_writer(&path);
+        let loc = Loc { block_id: 0, in_off: 0, raw: 0 };
+        let hash = PieceHash::of(b"");
+        let loc_index = writer.toc.iter().position(|(name, _)| name == "pdict.loc").unwrap();
+        let hash_index = writer.toc.iter().position(|(name, _)| name == "pdict.hash").unwrap();
+        writer.toc.remove(hash_index.max(loc_index));
+        writer.toc.remove(hash_index.min(loc_index));
+        writer.section("pdict.loc", &loc.encode()).unwrap();
+        writer.section("pdict.hash", &hash.0).unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+
+        let error =
+            Part::open(&path).err().expect("a zero-length physical piece must refuse").to_string();
+        assert!(error.contains("zero-length piece"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn authoritative_piece_lookup_does_not_depend_on_advisory_indexes() {
+        let (dir, path) = temp_part("piece-lookup-without-advisory-indexes");
+        let loc = Loc { block_id: 7, in_off: 11, raw: 13 };
+        let hash = PieceHash::of(b"thirteen-byte piece");
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("ids", &[]).unwrap();
+        writer.section("ids.restart", &[]).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.section("pdict.loc", &loc.encode()).unwrap();
+        writer.section("pdict.hash", &hash.0).unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
 
         let part = Part::open(&path).unwrap();
         assert_eq!(
-            part.content_meta().unwrap().as_ref(),
-            &[ContentMeta { name: BODY_CONTENT.into(), occurrences: 1, dense: true }]
+            part.lookup_piece(&hash).unwrap(),
+            None,
+            "the fast index is deliberately absent"
         );
-        let record = part.record(0).unwrap();
-        assert_eq!(
-            record.contents,
-            vec![Content::new(BODY_CONTENT, vec![BodyOp::Lit(b"legacy".to_vec())])]
+        assert_eq!(part.find_piece(&hash).unwrap(), Some(loc));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn base_piece_dictionary_identities_are_unique_without_advisory_indexes() {
+        let (dir, path) = temp_part("duplicate-piece-identity-without-indexes");
+        let mut writer = Writer::new(&path, 3).unwrap();
+        writer.section("ids", &[]).unwrap();
+        writer.section("ids.restart", &[]).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        let mut locations = Vec::new();
+        locations.extend_from_slice(&Loc { block_id: 0, in_off: 0, raw: 1 }.encode());
+        locations.extend_from_slice(&Loc { block_id: 0, in_off: 1, raw: 1 }.encode());
+        writer.section("pdict.loc", &locations).unwrap();
+        let hash = PieceHash::of(b"x");
+        let mut hashes = Vec::new();
+        hashes.extend_from_slice(&hash.0);
+        hashes.extend_from_slice(&hash.0);
+        writer.section("pdict.hash", &hashes).unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+
+        let error = Part::open(&path)
+            .err()
+            .expect("duplicate base piece identities must refuse without advisory indexes")
+            .to_string();
+        assert!(error.contains("repeats a piece identity"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn advisory_piece_indexes_are_a_complete_non_false_negative_pair() {
+        let (dir, half_path) = temp_part("half-piece-index");
+        let mut half = empty_current_writer(&half_path);
+        half.section("pdict.hsort", &[]).unwrap();
+        half.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        let error = Part::open(&half_path)
+            .err()
+            .expect("a half-present advisory index pair must refuse")
+            .to_string();
+        assert!(error.contains("both be present or both be absent"), "unexpected refusal: {error}");
+
+        let false_negative_path = dir.join("false-negative.part");
+        let loc = Loc { block_id: 7, in_off: 11, raw: 13 };
+        let hash = PieceHash::of(b"thirteen-byte piece");
+        let mut writer = Writer::new(&false_negative_path, 3).unwrap();
+        writer.section("ids", &[]).unwrap();
+        writer.section("ids.restart", &[]).unwrap();
+        writer.section("cmeta", &[0]).unwrap();
+        writer.section("pdict.loc", &loc.encode()).unwrap();
+        writer.section("pdict.hash", &hash.0).unwrap();
+        writer.section("pdict.hsort", &0u32.to_le_bytes()).unwrap();
+        let mut bloom = bloom::Bloom::with_capacity(1).encode();
+        bloom[8..].fill(0);
+        writer.section("pdict.bloom", &bloom).unwrap();
+        writer.finish(PartMeta { n_records: 0, seq_lo: 1, seq_hi: 1 }).unwrap();
+        let error = Part::open(&false_negative_path)
+            .err()
+            .expect("an authenticated advisory false negative must refuse")
+            .to_string();
+        assert!(error.contains("false negative"), "unexpected refusal: {error}");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn full_semantic_verification_decodes_values_in_every_physical_row() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (dir, path) = temp_part("semantic-all-rows");
+        let records = vec![crate::types::Record {
+            id: "superseded:1".into(),
+            contents: vec![crate::types::Content::identified(
+                "body",
+                vec![crate::types::ContentOp::Lit(b"bytes".to_vec())],
+                crate::types::ContentHash::of(b"bytes"),
+            )],
+            attrs: vec![("flag".into(), AttrValue::Bool(true))],
+        }];
+        build_full(&path, &records, &[], 1, 1, 3, |_| None, &HashMap::new()).unwrap();
+        let mut part = Part::open(&path).unwrap();
+        let section = part.toc["col.val.0"].clone();
+        assert_eq!(section.stored, 1, "the boolean fixture is one stored byte");
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(section.off)).unwrap();
+        file.write_all(&[2]).unwrap();
+        file.sync_all().unwrap();
+        part.toc.get_mut("col.val.0").unwrap().xsum = crc32fast::hash(&[2]);
+
+        part.verify_sections().expect("the simulated current bytes have a matching checksum");
+        let error = part
+            .verify_semantics_with_control(&crate::control::OperationControl::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid boolean"), "unexpected semantic refusal: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn piece_dictionary_verification_checks_unreferenced_authority_against_fold_bytes() {
+        let (dir, path) = temp_part("piece-dictionary-fold-proof");
+        let fold_path = dir.join("fold");
+        let mut fold = Fold::open(&fold_path, crate::fold::FoldCfg::default()).unwrap();
+        let actual = fold.put(b"actual").unwrap();
+        fold.sync().unwrap();
+
+        let claimed = PieceHash::of(b"claims");
+        let retained = HashMap::from([(claimed, actual.loc)]);
+        build_full(&path, &[], &[], 1, 1, 3, |_| None, &retained).unwrap();
+        let part = Part::open(&path).unwrap();
+        let error = part
+            .verify_piece_dictionary_with_control(
+                &fold,
+                &crate::control::OperationControl::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid fold bytes"), "unexpected refusal: {error}");
+
+        let punched_shape_path = dir.join("punched-bad-shape.part");
+        let punched_hash = PieceHash::of(b"z");
+        let punched_shape = HashMap::from([(
+            punched_hash,
+            Loc { block_id: actual.loc.block_id, in_off: u32::MAX, raw: 1 },
+        )]);
+        build_full(&punched_shape_path, &[], &[], 1, 1, 3, |_| None, &punched_shape).unwrap();
+        let punched_shape_part = Part::open(&punched_shape_path).unwrap();
+        fold.declare_punched(&[(actual.loc.block_id, actual.loc.block_id)]);
+        let error = punched_shape_part
+            .verify_piece_dictionary_with_control(
+                &fold,
+                &crate::control::OperationControl::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid fold location"), "{error}");
+
+        let future_path = dir.join("future-punched-piece.part");
+        let future_hash = PieceHash::of(b"future");
+        let future = HashMap::from([(future_hash, Loc { block_id: 7, in_off: 0, raw: 6 })]);
+        build_full(&future_path, &[], &[], 1, 1, 3, |_| None, &future).unwrap();
+        let future_part = Part::open(&future_path).unwrap();
+        fold.declare_punched(&[(7, 7)]);
+        let error = future_part
+            .verify_piece_dictionary_with_control(
+                &fold,
+                &crate::control::OperationControl::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid fold location"), "{error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn attribute_layout_occurrences_must_match_their_column_row_ids() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (dir, path) = temp_part("layout-rid-agreement");
+        let records = vec![
+            crate::types::Record {
+                id: "a".into(),
+                contents: Vec::new(),
+                attrs: vec![
+                    ("dup".into(), AttrValue::Bool(true)),
+                    ("dup".into(), AttrValue::Bool(false)),
+                ],
+            },
+            crate::types::Record { id: "b".into(), contents: Vec::new(), attrs: Vec::new() },
+        ];
+        build_full(&path, &records, &[], 1, 1, 3, |_| None, &HashMap::new()).unwrap();
+        let mut part = Part::open(&path).unwrap();
+        let section = part.toc["col.rid.0"].clone();
+        assert_eq!((section.stored, section.raw, section.codec), (2, 2, 0));
+
+        // The writer encoded row ids [0, 0] as deltas [0, 0]. Authenticate the equally framed
+        // but contradictory [0, 1], while leaving the layout's two row-zero occurrences intact.
+        let replacement = [0u8, 1u8];
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(section.off)).unwrap();
+        file.write_all(&replacement).unwrap();
+        file.sync_all().unwrap();
+        part.toc.get_mut("col.rid.0").unwrap().xsum = crc32fast::hash(&replacement);
+        part.cache.forget(part.id);
+
+        let meta = attrs::read_meta(&part).unwrap();
+        let error = attrs::validate_layout(&part, &meta).unwrap_err().to_string();
+        assert!(error.contains("disagrees with its row ids"), "unexpected refusal: {error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn public_part_build_refuses_unreopenable_names_before_creating_an_artifact() {
+        let (dir, empty_id_path) = temp_part("writer-empty-id");
+        let empty_id =
+            crate::types::Record { id: String::new(), contents: Vec::new(), attrs: Vec::new() };
+        let error =
+            build_full(&empty_id_path, &[empty_id], &[], 1, 1, 3, |_| None, &HashMap::new())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("record id must not be empty"), "unexpected refusal: {error}");
+        assert!(!empty_id_path.exists(), "name validation must precede artifact creation");
+
+        let empty_key_path = dir.join("empty-key.part");
+        let empty_key = crate::types::Record {
+            id: "present".into(),
+            contents: Vec::new(),
+            attrs: vec![(String::new(), AttrValue::Null)],
+        };
+        let error =
+            build_full(&empty_key_path, &[empty_key], &[], 1, 1, 3, |_| None, &HashMap::new())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("attribute name must not be empty"), "unexpected refusal: {error}");
+        assert!(!empty_key_path.exists(), "name validation must precede artifact creation");
+
+        let mismatched_path = dir.join("mismatched-piece.part");
+        let hash = PieceHash::of(b"piece");
+        let record = crate::types::Record {
+            id: "piece-record".into(),
+            contents: vec![crate::types::Content::identified(
+                "body",
+                vec![BodyOp::Piece { hash, len: 5 }],
+                crate::types::ContentHash::of(b"piece"),
+            )],
+            attrs: Vec::new(),
+        };
+        let error = build_full(
+            &mismatched_path,
+            &[record],
+            &[],
+            1,
+            1,
+            3,
+            |_| Some(Loc { block_id: 0, in_off: 0, raw: 4 }),
+            &HashMap::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fold location says 4"), "unexpected refusal: {error}");
+        assert!(
+            !mismatched_path.exists(),
+            "piece mapping validation must precede artifact creation"
         );
-        assert_eq!(part.content_identity(0, BODY_CONTENT).unwrap(), None);
-        let fold = Fold::open(&dir.join("fold"), FoldCfg::default()).unwrap();
-        assert_eq!(
-            part.reconstruct_content(0, BODY_CONTENT, &fold).unwrap(),
-            Some(b"legacy".to_vec())
-        );
-        std::fs::remove_dir_all(&dir).ok();
+
+        let retained_path = dir.join("zero-retained-piece.part");
+        let retained =
+            HashMap::from([(PieceHash::of(b""), Loc { block_id: 0, in_off: 0, raw: 0 })]);
+        let error = build_full(&retained_path, &[], &[], 1, 1, 3, |_| None, &retained)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("zero-length fold location"), "unexpected refusal: {error}");
+        assert!(!retained_path.exists(), "retained mapping validation must precede creation");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

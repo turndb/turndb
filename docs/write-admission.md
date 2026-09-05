@@ -1,7 +1,7 @@
 # Write admission limits
 
 TurnDB bounds the amount of logical input one writer operation may admit before it changes the fold,
-WAL, or memtable. The policy is generic and per writer open. It does not know what an export, span,
+WAL, or pending change set. The policy is generic and per writer open. It does not know what an export, span,
 generation, activity, tenant, or trace means.
 
 ## Policy
@@ -11,7 +11,7 @@ generation, activity, tenant, or trace means.
 | limit | default | measures |
 |---|---:|---|
 | `max_record_bytes` | 64 MiB | worst-case complete WAL frame for one put or delete |
-| `max_batch_bytes` | 256 MiB | all member frames plus the batch commit-marker frame |
+| `max_batch_bytes` | 256 MiB | all member frames plus the batch-completion frame |
 | `max_batch_records` | 4,096 | ordered put/delete members in one atomic batch |
 | `max_identifier_bytes` | 4 KiB | UTF-8 bytes in an id, attribute name, or content name |
 
@@ -21,12 +21,12 @@ addresses.
 
 The settings are runtime admission policy, not format metadata. `Store::open` uses the defaults;
 `Store::open_with_limits` accepts an explicit policy. Reopening a store with lower limits affects
-future writes only. Recovery always replays intact accepted WAL frames without applying the current
+future writes only. WAL replay always applies intact accepted frames without applying the current
 open's limits, so an operator cannot make durable data unreadable by changing policy.
 
 ## The byte unit
 
-A record is charged as if TurnDB encoded its complete version-2 WAL frame and every folded piece in
+A record is charged as if TurnDB encoded its complete current-draft WAL frame and every folded piece in
 the input were novel. The count includes:
 
 - the frame tag, sequence, payload length, and checksum;
@@ -35,7 +35,7 @@ the input were novel. The count includes:
 - literal content bytes and piece-reference hashes/lengths;
 - a novel-piece hash, length, and bytes for every piece occurrence.
 
-The batch byte charge is the sum of those member charges plus the framed varint commit marker. A
+The batch byte charge is the sum of those member charges plus the framed varint completion marker. A
 delete is its frame overhead plus the id bytes. The comparison is inclusive: a value exactly equal
 to its ceiling is accepted.
 
@@ -59,7 +59,7 @@ Content names are map keys and therefore must be unique within one record.
 
 Single writes are fully validated and charged before folding a piece. Atomic batches are completely
 validated and charged before folding the first member. A rejected write changes no fold bytes,
-dedup-window state, WAL bytes, memtable entry, or visibility. A record-level refusal within a batch
+dedup-window state, WAL bytes, pending record version, or visibility. A record-level refusal within a batch
 reports its zero-based item index.
 
 `WriteAdmissionError` separates caller mistakes from capacity refusals:

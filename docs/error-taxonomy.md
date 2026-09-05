@@ -29,9 +29,9 @@ conflicts such as backup destination replacement use explicit engine variants ra
 every low-level `AlreadyExists` as a request error.
 
 The initial typed engine causes include scan request/cursor validation, scan and lifecycle
-interruption, write, atomic-frame, and persistent object-count admission, bounded-compaction
+interruption, write, atomic-frame, and persistent object-count admission, bounded part-merge
 planning, SQL planning/execution and memory admission, writer exclusion, backup/restore, manifest
-recovery, and explicit verification-integrity
+manifest promotion, and explicit verification-integrity
 failures. `IntegrityError` preserves a low-level source chain while identifying a verification
 failure as corruption. Unknown parser or invariant failures outside an integrity operation still
 remain `INTERNAL`; callers must not infer corruption from their message.

@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         f.put(&piece)?;
         written += piece.len() as u64;
         if f.window_len() > 4096 {
-            f.seal_window();
+            f.release_dedup_window();
         }
     }
     f.sync()?;
