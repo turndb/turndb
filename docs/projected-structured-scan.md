@@ -2,7 +2,7 @@
 
 The feature-independent structured pager resolves visibility first and decodes only the fields
 needed by projection or predicates. This is the storage-native small-query path; it does not route
-through Arrow or DataFusion and does not require a flush to see the writer's memtable.
+through Arrow or DataFusion and does not require a flush to see the writer's pending change set.
 
 ## Read shape
 
@@ -11,7 +11,7 @@ For each candidate id, TurnDB builds two name sets:
 - attribute names explicitly projected plus names used by attribute predicates;
 - content names explicitly projected plus names used by content-presence predicates.
 
-The committed read core locates the newest part row for the id, honors a tombstone before projection,
+The published read core locates the newest part row for the id, honors a tombstone before projection,
 and then constructs a partial semantic record from those sets. Attribute layout order and duplicate
 occurrences remain exact. A field used only by a predicate participates in evaluation but is not
 returned unless it was also projected. The same rule keeps predicate-only content out of result rows.
@@ -21,10 +21,10 @@ compare bit patterns (the exact stored NaN payload matches; `-0.0` and `0.0` are
 the ordering operators use IEEE partial order (no NaN satisfies any inequality; `-0.0` orders equal
 to `0.0`). Consequently `Eq` does not imply `LtEq`; IEEE equality is expressible as `LtEq && GtEq`.
 
-The writer checks its memtable first. A staged record is already resident as a semantic value, so it
-is filtered in memory; a staged tombstone returns absence. Only ids not present in the memtable reach
-the committed projected-read path. This preserves read-your-writes and ensures a rejected predicate
-can never reveal an older committed version.
+The writer checks its pending change set first. A pending record version is already resident as a semantic value, so it
+is filtered in memory; a pending tombstone returns absence. Only ids not present in the pending change set reach
+the published projected-read path. This preserves read-your-writes and ensures a rejected predicate
+can never reveal an older record version from a selected manifest revision.
 
 ## Physical sections
 
@@ -52,8 +52,8 @@ Projection does not change:
 - exact scalar types, float bit patterns, duplicate fields, or selected-field order;
 - missing versus explicit null;
 - forward/reverse checked-cursor pagination;
-- live memtable visibility;
-- live-candidate examination, pre-predicate resolution, and reconstructed-content byte budgets;
+- pending-change-set visibility;
+- resolved-candidate examination, pre-predicate resolution, and reconstructed-content byte budgets;
 - cooperative cancellation/deadline behavior.
 
 The existing structured scan request needs no compatibility adapter. The optimization lives behind

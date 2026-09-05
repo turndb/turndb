@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://turndb.dev/conformance/v1/capabilities.schema.json",
-  "title": "TurnDB capability contract v1",
+  "$id": "https://turndb.dev/conformance/v2/capabilities.schema.json",
+  "title": "TurnDB capability contract v2",
   "type": "object",
   "required": [
     "contractVersion",
     "profile",
     "operations",
-    "partFormat",
+    "draftFormatEpoch",
     "writerExclusion",
     "positionedIo",
     "threads",
@@ -18,7 +18,7 @@
     "cancellation"
   ],
   "properties": {
-    "contractVersion": { "const": 1 },
+    "contractVersion": { "const": 2 },
     "profile": {
       "type": "string",
       "enum": ["native", "wasi", "browser"]
@@ -28,15 +28,7 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/operation" }
     },
-    "partFormat": {
-      "type": "object",
-      "required": ["readMax"],
-      "properties": {
-        "write": { "type": "integer", "minimum": 1, "maximum": 255 },
-        "readMax": { "type": "integer", "minimum": 1, "maximum": 255 }
-      },
-      "additionalProperties": false
-    },
+    "draftFormatEpoch": { "type": "integer", "minimum": 1, "maximum": 255 },
     "writerExclusion": {
       "type": "string",
       "enum": ["os_enforced", "embedder_enforced", "read_only"]
@@ -48,7 +40,7 @@
     "arrowIpc": { "type": "boolean" },
     "reclamation": {
       "type": "string",
-      "enum": ["punch_or_refold", "refold_only", "none"]
+      "enum": ["content_punch_or_refold", "refold_only", "none"]
     },
     "cancellation": {
       "type": "object",
@@ -77,7 +69,7 @@
         "readContent",
         "snapshot",
         "querySql",
-        "seal",
+        "backup",
         "verify",
         "spaceUsage",
         "compactBounded",

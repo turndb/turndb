@@ -3,11 +3,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import './_artifact.mjs';
-import { open, openFile, singleFileKind, TurndbError } from '../index.mjs';
+import { open, openFile, TurndbError } from '../index.mjs';
 
 // npm/build.sh builds the CLI and exports this; it is the producer of the artifacts read below,
 // because atomic no-replace publication is unavailable in WASI Preview1, so this capability is
@@ -21,28 +21,22 @@ if (!existsSync(CLI)) {
   );
 }
 
-test('reads a store held in one file, live or sealed', async () => {
+test('reads a live store and its backup from one file', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-wasm-file-'));
   const container = join(root, 'store.turndb');
   const payload = JSON.stringify([{ role: 'user', content: 'one file' }]);
-  // The portable writer produces the single file directly; the CLI seals its snapshot because
-  // WASI Preview1 cannot provide the atomic no-replace publication that seal promises.
+  // The portable writer produces the single file directly; the native CLI installs a backup
+  // because WASI Preview1 cannot provide the required atomic no-replace operation.
   const store = await open(container);
   store.putBody('trace:1#input', payload, { model: 'm0' });
   store.sync();
   store.flush();
   store.close();
 
-  const plainDir = join(root, 'plain');
-  await mkdir(plainDir, { recursive: true });
-  assert.equal(await singleFileKind(plainDir), null, 'a directory carries neither magic');
+  const backup = join(root, 'snapshot.turndb');
+  execFileSync(CLI, ['backup', container, backup]);
 
-  const sealed = join(root, 'snapshot.turndb');
-  execFileSync(CLI, ['seal', container, sealed]);
-  assert.equal(await singleFileKind(container), 'container');
-  assert.equal(await singleFileKind(sealed), 'container');
-
-  for (const [label, file] of [['container', container], ['sealed snapshot', sealed]]) {
+  for (const [label, file] of [['container', container], ['backup', backup]]) {
     const ro = await openFile(file);
     assert.deepEqual(ro.scanIds(), ['trace:1#input'], `${label} pages the same ids`);
     assert.equal(new TextDecoder().decode(ro.get('trace:1#input')), payload, `${label} is byte-exact`);
@@ -62,9 +56,8 @@ test('reads a store held in one file, live or sealed', async () => {
 test('the first call a new user makes reports its own failure', async () => {
   const root = await mkdtemp(join(tmpdir(), 'turndb-first-contact-'));
 
-  // A store path whose parents do not exist yet is the overwhelmingly common first call, and
-  // the engine creates them exactly as the retired directory open always did — this binding must
-  // not diverge just because WASI preopens first.
+  // A store path whose parents do not exist yet is the overwhelmingly common first call. This
+  // binding must preserve that creation contract even though WASI preopens the parent first.
   const fresh = join(root, 'deep', 'nested', 'store.turndb');
   const store = await open(fresh);
   store.putBody('x', 'y');

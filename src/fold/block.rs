@@ -112,6 +112,14 @@ impl BlockHdr {
     }
 }
 
+/// Complete frame length in this process's address space. Persisted sizes are u32, but the header
+/// and checksum are additional bytes and can overflow usize on a 32-bit reader.
+pub fn frame_span_usize(stored: u32) -> Result<usize> {
+    usize::try_from(BLOCK_OVERHEAD as u64 + u64::from(stored)).map_err(|_| {
+        anyhow::anyhow!("fold block frame length exceeds this process's address space")
+    })
+}
+
 pub fn parse_hdr(b: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
     if b.len() < BLOCK_HDR_LEN {
         bail!("block header truncated: {} bytes", b.len());
@@ -125,6 +133,9 @@ pub fn parse_hdr(b: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
     }
     let raw = u32::from_le_bytes(b[2..6].try_into().unwrap());
     let stored = u32::from_le_bytes(b[6..10].try_into().unwrap());
+    if raw == 0 {
+        bail!("fold block raw length must be non-zero");
+    }
     // Guaranteed by the encoder's codec-0 fallback, so a violation means corruption.
     if stored > raw {
         bail!("block stored {stored} > raw {raw}");
@@ -142,7 +153,7 @@ pub fn parse_hdr(b: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
 /// The 4-byte tail checksum over `frame[0 .. BLOCK_HDR_LEN + stored]`.
 ///
 /// Not about content integrity — BLAKE3 identifies content. This is the only thing that can tell a
-/// **torn write** from a good block during tail recovery, before any decode is attempted.
+/// **torn write** from a good block during a crash-tail scan, before any decode is attempted.
 pub fn xsum(frame_prefix: &[u8]) -> [u8; BLOCK_XSUM_LEN] {
     let h = blake3::hash(frame_prefix);
     let b = h.as_bytes();
@@ -156,19 +167,25 @@ pub fn encode(
     codec: u8,
     raw_block: &[u8],
     payload: &[u8],
-) -> usize {
+) -> Result<usize> {
     debug_assert!(payload.len() <= raw_block.len(), "encoder must fall back to CODEC_STORED");
+    if raw_block.is_empty() {
+        bail!("cannot encode an empty fold block");
+    }
     let rh = blake3::hash(raw_block);
     out.clear();
-    out.reserve(BLOCK_OVERHEAD + payload.len());
     // `raw` and `stored` are u32 on disk. A silent truncation here writes a frame that decodes to
     // the wrong length, which is corruption a reader cannot distinguish from a bad disk.
-    assert!(
-        raw_block.len() as u64 <= u32::MAX as u64 && payload.len() as u64 <= u32::MAX as u64,
-        "block of {} raw / {} stored bytes exceeds the u32 frame fields; block_target must bound this",
-        raw_block.len(),
-        payload.len()
-    );
+    if raw_block.len() as u64 > u32::MAX as u64 || payload.len() as u64 > u32::MAX as u64 {
+        bail!(
+            "block of {} raw / {} stored bytes exceeds the u32 frame fields",
+            raw_block.len(),
+            payload.len()
+        );
+    }
+    let span = frame_span_usize(payload.len() as u32)?;
+    out.try_reserve_exact(span)
+        .map_err(|_| anyhow::anyhow!("cannot allocate {span} bytes for a fold block frame"))?;
     out.push(BLOCK_TAG);
     out.push(codec);
     out.extend_from_slice(&(raw_block.len() as u32).to_le_bytes());
@@ -178,15 +195,16 @@ pub fn encode(
     out.extend_from_slice(payload);
     let sum = xsum(&out[..]);
     out.extend_from_slice(&sum);
-    out.len()
+    Ok(out.len())
 }
 
 /// Verify a whole block frame's bytes without decoding the payload.
 pub fn verify_frame_bytes(frame: &[u8], seg_has_dict: bool) -> Result<BlockHdr> {
     let hdr = parse_hdr(frame, seg_has_dict)?;
-    let end = BLOCK_HDR_LEN + hdr.stored as usize;
-    if frame.len() < end + BLOCK_XSUM_LEN {
-        bail!("block truncated: have {} bytes, need {}", frame.len(), end + BLOCK_XSUM_LEN);
+    let span = frame_span_usize(hdr.stored)?;
+    let end = span - BLOCK_XSUM_LEN;
+    if frame.len() < span {
+        bail!("block truncated: have {} bytes, need {span}", frame.len());
     }
     if xsum(&frame[..end]) != frame[end..end + BLOCK_XSUM_LEN] {
         bail!("block checksum mismatch (torn write or corruption)");
@@ -209,7 +227,7 @@ mod tests {
     fn block_roundtrips_and_detects_tears() {
         let raw = "many pieces concatenated into one block. ".repeat(64).into_bytes();
         let mut buf = Vec::new();
-        let n = encode(&mut buf, 3, CODEC_STORED, &raw, &raw);
+        let n = encode(&mut buf, 3, CODEC_STORED, &raw, &raw).unwrap();
         assert_eq!(n, BLOCK_OVERHEAD + raw.len());
 
         let hdr = verify_frame_bytes(&buf, false).unwrap();
@@ -245,5 +263,20 @@ mod tests {
         b[2..6].copy_from_slice(&5u32.to_le_bytes());
         b[6..10].copy_from_slice(&10u32.to_le_bytes());
         assert!(parse_hdr(&b, false).is_err(), "stored > raw is corruption");
+
+        b[1] = CODEC_STORED;
+        b[2..10].fill(0);
+        assert!(parse_hdr(&b, false).is_err(), "an empty physical block is not current format");
+        assert!(encode(&mut Vec::new(), 0, CODEC_STORED, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn complete_frame_span_never_wraps_the_process_address_space() {
+        let got = frame_span_usize(u32::MAX);
+        if usize::BITS == 32 {
+            assert!(got.is_err());
+        } else {
+            assert_eq!(got.unwrap() as u64, u32::MAX as u64 + BLOCK_OVERHEAD as u64);
+        }
     }
 }

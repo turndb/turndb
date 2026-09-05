@@ -157,7 +157,7 @@ fn writer_truncates_a_torn_wal_suffix_before_appending_new_frames() {
         std::path::PathBuf::from(p)
     };
     let mut file = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
-    file.write_all(&[0x57, 9, 0, 0, 0, 0, 0, 0, 0, 200, 0, 0, 0]).unwrap();
+    file.write_all(&[0xD4, 9, 0, 0, 0, 0, 0, 0, 0, 200, 0, 0, 0]).unwrap();
     file.write_all(b"torn").unwrap();
     file.sync_all().unwrap();
     drop(file);
@@ -172,8 +172,7 @@ fn writer_truncates_a_torn_wal_suffix_before_appending_new_frames() {
     assert!(reopened.get("after").unwrap().is_some());
 }
 
-/// The migrated suites build single-file stores inside their temp directories: the parent is
-/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+/// Build the suite's single-file store inside its cleanup directory.
 fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).ok();
     dir.join("s.turndb")

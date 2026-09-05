@@ -126,7 +126,8 @@ impl AttrValue {
     }
 }
 
-/// The conventional name used by the compatibility body API.
+/// The conventional content name written by [`crate::store::Store::put`] and `put_body`, and read
+/// by every surface that offers a single unnamed value.
 pub const BODY_CONTENT: &str = "body";
 
 /// One step of a content value, as produced by the lens and stored in the WAL.
@@ -152,16 +153,13 @@ impl ContentOp {
         }
     }
 
-    /// Whether this op contributes no bytes. A zero-length piece is legal — an empty message part
-    /// carves to one — so this is a real question, not a lint appeasement.
+    /// Whether this op contributes no bytes. Public ingest accepts an empty piece span but
+    /// canonicalizes it to an empty literal, so persisted piece references always name real fold
+    /// bytes.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
-
-/// Pre-1.0 source compatibility for callers that construct body programs directly. New code should
-/// use [`ContentOp`]; a body is now merely content named [`BODY_CONTENT`].
-pub type BodyOp = ContentOp;
 
 /// One independently projectable, content-addressed value in a record.
 ///
@@ -172,8 +170,7 @@ pub type BodyOp = ContentOp;
 pub struct Content {
     pub name: String,
     pub ops: Vec<ContentOp>,
-    /// Exact reconstructed-byte identity when the ingest or on-disk format carried it. Legacy
-    /// records leave this unavailable rather than substituting a program or piece hash.
+    /// Exact reconstructed-byte identity. Newly constructed content receives it during ingest.
     pub identity: Option<ContentHash>,
 }
 
@@ -235,20 +232,9 @@ impl Record {
         self.contents.iter().find(|c| c.name == name)
     }
 
-    /// The compatibility body program, if content named `body` is present.
-    pub fn body(&self) -> Option<&[ContentOp]> {
-        self.content(BODY_CONTENT).map(|c| c.ops.as_slice())
-    }
-
     /// The reconstructed length of a named content value, without touching the fold.
     pub fn content_len(&self, name: &str) -> Option<u64> {
         self.content(name).map(Content::len)
-    }
-
-    /// Compatibility form of [`Record::content_len`]. An absent body reports zero, matching the
-    /// historical empty-program representation used by tombstone-shaped test records.
-    pub fn body_len(&self) -> u64 {
-        self.content_len(BODY_CONTENT).unwrap_or(0)
     }
 }
 
@@ -261,6 +247,9 @@ pub fn validate_contents(contents: &[Content]) -> anyhow::Result<()> {
         }
         if !names.insert(content.name.as_str()) {
             anyhow::bail!("duplicate content name {:?}", content.name);
+        }
+        if content.ops.iter().any(|op| matches!(op, ContentOp::Piece { len: 0, .. })) {
+            anyhow::bail!("a persisted piece reference must contain at least one byte");
         }
     }
     Ok(())

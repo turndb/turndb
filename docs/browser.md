@@ -3,7 +3,7 @@
 Phase 3b ships a read-only `wasm32-unknown-unknown` core and a one-file viewer. The Rust engine
 opens the ordinary container over `Arc<dyn ReadAt>`; buffer, Blob/File, and HTTP Range therefore
 share the same superblock, member-directory, part, fold, visibility, cursor, and scalar code as a
-native snapshot.
+native read view.
 
 The JavaScript transport maintains a bounded 64 KiB-block LRU. A synchronous wasm read that misses
 returns `TURNDB_RANGE:<offset>:<length>`; JavaScript fetches the intersecting blocks and retries the
@@ -14,9 +14,9 @@ turning the cache into an unbounded whole-file fallback. Every operation accepts
 between fills. The profile truthfully reports
 `threads: false`, `writerExclusion: read_only`, and no lifecycle operations.
 
-Structured scans prune a newest live row from part-wide metadata before opening selected value
+Structured scans prune a candidate row from part-wide metadata before opening selected value
 sections when a typed predicate is impossible: numeric/timestamp/bool zone maps, string
-dictionaries, and positive field-presence facts. Unknown/legacy metadata, NaN zones, absence
+dictionaries, and positive field-presence facts. Unknown metadata, NaN zones, absence
 predicates, and every malformed advisory fact widen to “may match.” `predicatePrunedRows` is the
 exact count avoided.
 
@@ -48,7 +48,7 @@ keeps the phases separate and also records their combined total; these are trans
 not network-latency benchmarks.
 
 The core contract underneath that measurement is independent of the 64 KiB HTTP cache:
-[`FORMAT.md`](../FORMAT.md#remote-open-locality) states the exact positioned-read formula, and the
+[`FORMAT.md`](../FORMAT.md#parts) states the range-readable part layout, and the
 container suite executes it over a multi-part, multi-segment store while proving that cold open
 touches no fold block payload. The AES-CTR/base64url payload generator is deterministic, while the
 JSON-array shape exercises the structural carving used by large trace payloads instead of

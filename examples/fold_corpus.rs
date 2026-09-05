@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 use turndb::fold::{Fold, FoldCfg};
-use turndb::{BodyOp, PieceHash};
+use turndb::{ContentOp, PieceHash};
 
 /// Byte ranges of the top-level elements of a JSON array, or None if this is not an array.
 /// String- and escape-aware so a `[`, `]` or `,` inside a string never splits an element.
@@ -153,7 +153,7 @@ fn main() -> anyhow::Result<()> {
         logical += body.len() as u64;
 
         // carve -> flat program
-        let mut prog: Vec<BodyOp> = Vec::new();
+        let mut prog: Vec<ContentOp> = Vec::new();
         for (foldable, r) in carve(&body) {
             let span = &body[r.clone()];
             if foldable {
@@ -167,10 +167,10 @@ fn main() -> anyhow::Result<()> {
                     hist[b].0 += 1;
                     hist[b].1 += p.loc.raw as u64;
                 }
-                prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
+                prog.push(ContentOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
                 lit_bytes += span.len() as u64;
-                prog.push(BodyOp::Lit(span.to_vec()));
+                prog.push(ContentOp::Lit(span.to_vec()));
             }
         }
 
@@ -178,8 +178,8 @@ fn main() -> anyhow::Result<()> {
         let mut rebuilt = Vec::with_capacity(body.len());
         for op in &prog {
             match op {
-                BodyOp::Lit(b) => rebuilt.extend_from_slice(b),
-                BodyOp::Piece { hash, len } => {
+                ContentOp::Lit(b) => rebuilt.extend_from_slice(b),
+                ContentOp::Piece { hash, len } => {
                     // resolve through the same path a reader would use
                     let loc = fold_lookup(&fold, *hash).expect("piece just written must resolve");
                     let bytes = fold.read_verified(loc, *hash)?;
@@ -280,7 +280,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The fold's own dedup window resolves a hash we just wrote. (A general hash->Loc lookup across sealed
+/// The fold's own dedup window resolves a hash we just wrote. (A general hash->Loc lookup across published
 /// parts arrives with the part layer; within one session everything is still in the window.)
 fn fold_lookup(fold: &Fold, h: PieceHash) -> Option<turndb::fold::Loc> {
     fold.lookup(h)

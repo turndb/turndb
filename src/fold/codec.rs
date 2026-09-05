@@ -109,13 +109,19 @@ pub fn encode<'a>(raw: &'a [u8], dict: Option<&[u8]>, level: i32) -> Result<(u8,
 /// `raw_len` comes from the block header and bounds the output — a payload that decodes to a different
 /// length is corruption and fails loud rather than returning short or over-long bytes.
 pub fn decode(codec: u8, payload: &[u8], raw_len: u32, dict: Option<&[u8]>) -> Result<Vec<u8>> {
-    let n = raw_len as usize;
+    let n = usize::try_from(raw_len).map_err(|_| {
+        anyhow::anyhow!("declared decoded length {raw_len} exceeds this process's address space")
+    })?;
     match codec {
         CODEC_STORED => {
             if payload.len() != n {
                 bail!("stored block payload {} != raw {}", payload.len(), n);
             }
-            Ok(payload.to_vec())
+            let mut out = Vec::new();
+            out.try_reserve_exact(n)
+                .map_err(|_| anyhow::anyhow!("cannot allocate {n} decoded fold bytes"))?;
+            out.extend_from_slice(payload);
+            Ok(out)
         }
         CODEC_ZSTD | CODEC_ZSTD_DICT => {
             let d =
@@ -126,7 +132,10 @@ pub fn decode(codec: u8, payload: &[u8], raw_len: u32, dict: Option<&[u8]>) -> R
                 } else {
                     None
                 };
-            let mut out = vec![0u8; n];
+            let mut out = Vec::new();
+            out.try_reserve_exact(n)
+                .map_err(|_| anyhow::anyhow!("cannot allocate {n} decoded fold bytes"))?;
+            out.resize(n, 0);
             let got = z::decompress_into(payload, d, &mut out)?;
             // A frame that decodes SHORT is as much a corruption as one that overruns; without
             // this the tail of the buffer would silently read back as zeros.

@@ -61,8 +61,9 @@ Predicates are typed:
 - `contentExists` tests named-content presence.
 
 Visibility resolves before predicates. The newest physical occurrence of an id wins; a newest
-tombstone makes the id absent, and a predicate cannot reveal an older version. A writer scan overlays
-its memtable and provides read-your-writes. An immutable snapshot sees exactly its published cut.
+tombstone makes the id absent, and a predicate cannot reveal an older version. A writer scan includes
+its pending change set and provides read-your-writes. An immutable read view sees exactly its selected
+store authority.
 
 For floats, `eq`/`ne` compare stored bits, so NaN payloads can match and the two zero signs differ.
 Ordering uses IEEE partial order: no NaN satisfies an inequality and the two zero signs order equal.
@@ -70,7 +71,7 @@ Predicates of a different scalar type do not coerce a stored value.
 
 ## Paging and work bounds
 
-`limit` bounds returned rows. `maxExamined` bounds live records evaluated against predicates.
+`limit` bounds returned rows. `maxExamined` bounds resolved records evaluated against predicates.
 `maxResolutionEntries` bounds physical newest-wins work; complete equal-id groups are atomic and the
 first oversized group is admitted so progress cannot deadlock. A tombstone-only page may contain no
 rows and still return `next`.
@@ -90,11 +91,11 @@ canonical decimal strings in JSON so no transport rounds them through IEEE-754.
 
 The statistics distinguish:
 
-- returned and predicate-examined live rows;
-- live rows proven impossible from part metadata before value projection;
+- returned and predicate-examined resolved rows;
+- candidate rows proven impossible from part metadata before value projection;
 - duplicate projected attribute occurrences;
 - content reconstruction work and its byte ceiling;
-- physical versions, superseded rows, tombstones, and writer-memtable entries used for resolution;
+- physical versions, superseded rows, tombstones, and pending record versions used for resolution;
 - part sections and fold blocks touched, cache hits/misses, stored bytes read, and raw bytes decoded.
 
 A metadata-only scan must report zero fold blocks and zero fold stored/raw bytes. Projecting one
@@ -119,11 +120,12 @@ requires a new contract version.
 
 [`conformance/v1/corpus.json`](../conformance/v1/corpus.json) is an independent sequence of writes
 and expected logical views. It exercises every scalar, duplicate attributes, missing versus null,
-empty and absent content, updates, tombstones, writer overlay, immutable snapshots, forward/reverse
+empty and absent content, updates, tombstones, writer overlay, immutable read views, forward/reverse
 paging, cursor validation, and metadata-only I/O. Rust, Node, Python, and browser runners consume the
 same file; binding-specific tests cover only scheduling and runtime mechanics around it.
 
 [`conformance/v1/fixture.turndb.hex`](../conformance/v1/fixture.turndb.hex) is the same corpus after
 its final publication, transported as reviewable lowercase hex. The Rust gate proves that replaying
 the operations produces those exact container bytes and that opening those bytes reproduces the
-published-v2 view. Read-only runners materialize the hex as a `.turndb`; they do not need a writer.
+published draft-epoch-1 view. Read-only runners materialize the hex as a `.turndb`; they do not need
+a writer.

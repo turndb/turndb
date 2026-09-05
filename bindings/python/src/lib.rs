@@ -1,4 +1,4 @@
-//! Python contract-v1 binding. One worker owns each mutable store; Python only submits commands.
+//! Python binding. One worker owns each mutable store; Python only submits commands.
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -84,7 +84,7 @@ enum Operation {
     Write { operations: Vec<WriteOp>, durable: bool },
     Sync,
     Flush,
-    Seal(PathBuf),
+    Backup(PathBuf),
     Scan(ScanRequest),
     Explain(ScanRequest),
     ReadContent { id: String, name: String },
@@ -221,7 +221,8 @@ fn run_actor(mut handle: Handle, rx: mpsc::Receiver<Command>) {
                         if durable {
                             store.sync().and_then(|_| store.close())
                         } else {
-                            store.close()
+                            drop(store);
+                            Ok(())
                         }
                     }
                     Handle::Reader(_) => Ok(()),
@@ -272,9 +273,9 @@ fn run_writer_operation(store: &mut EngineStore, operation: Operation) -> Result
         }
         Operation::Sync => store.sync().map(|_| Value::Null),
         Operation::Flush => store.flush().map(|part| Value::Bool(part.is_some())),
-        Operation::Seal(path) => store.backup(&path).map(|result| {
+        Operation::Backup(path) => store.backup(&path).map(|result| {
             json!({
-                "files": result.files.to_string(),
+                "members": result.members.to_string(),
                 "bytes": result.bytes.to_string(),
                 "commit": result.commit.to_string(),
             })
@@ -629,22 +630,21 @@ fn encode_schema(schema: Schema) -> Value {
 
 fn encode_verification(report: turndb::store::StoreVerification) -> Value {
     json!({
-        "scope": "committed_snapshot",
-        "state": if report.chain.undigested > 0 || report.unidentified_content_values > 0 { "incomplete" } else { "valid" },
+        "scope": "current_manifest_revision",
+        "state": "valid",
         "parts": report.parts,
         "partSections": report.part_sections,
         "records": report.records,
         "contentValues": report.content_values,
         "contentBytes": report.content_bytes.to_string(),
         "contentIdentities": report.content_identities,
-        "unidentifiedContentValues": report.unidentified_content_values,
     })
 }
 
 fn encode_space_usage(usage: turndb::store::StoreSpaceUsage) -> Value {
     fn amount(value: turndb::store::SpaceAmount) -> Value {
         json!({
-            "files": value.files,
+            "members": value.members,
             "logicalBytes": value.logical_bytes.to_string(),
             "allocatedBytes": value.allocated_bytes.map(|bytes| bytes.to_string()),
         })
@@ -811,11 +811,11 @@ impl PyStore {
         value.as_bool().ok_or_else(|| TurnDbError::new_err("invalid flush response"))
     }
 
-    fn seal(&self, py: Python<'_>, path: String) -> PyResult<PyObject> {
+    fn backup(&self, py: Python<'_>, path: String) -> PyResult<PyObject> {
         if path.is_empty() {
-            return Err(InvalidArgumentError::new_err("seal path must not be empty"));
+            return Err(InvalidArgumentError::new_err("backup path must not be empty"));
         }
-        run_value(py, &self.actor, Operation::Seal(PathBuf::from(path)))
+        run_value(py, &self.actor, Operation::Backup(PathBuf::from(path)))
     }
 
     fn scan(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> PyResult<PyObject> {
@@ -893,24 +893,40 @@ impl PyStore {
 #[pyfunction]
 fn capabilities(py: Python<'_>) -> PyResult<PyObject> {
     let compiled = turndb::capabilities::capabilities();
+    let operations = vec![
+        "openWriter",
+        "openSnapshot",
+        "compiledCapabilities",
+        "write",
+        "sync",
+        "flush",
+        "scan",
+        "explainScan",
+        "schema",
+        "readContent",
+        "snapshot",
+        "verify",
+        "spaceUsage",
+        "compactBounded",
+        "refold",
+        "erase",
+        "close",
+        "backup",
+    ];
     value_to_py(
         py,
         json!({
-            "contractVersion": 1,
+            "contractVersion": 2,
             "profile": "native",
-            "operations": [
-                "openWriter", "openSnapshot", "compiledCapabilities", "write", "sync", "flush",
-                "scan", "explainScan", "schema", "readContent", "snapshot", "seal", "verify", "spaceUsage",
-                "compactBounded", "refold", "erase", "close"
-            ],
-            "partFormat": { "write": compiled.part_format_write, "readMax": compiled.part_format_read_max },
+            "operations": operations,
+            "draftFormatEpoch": compiled.draft_format_epoch,
             "writerExclusion": "os_enforced",
             "positionedIo": compiled.positioned_io,
             "threads": true,
             "columnar": false,
             "sql": false,
             "arrowIpc": false,
-            "reclamation": if compiled.allocated_space_usage { "punch_or_refold" } else { "refold_only" },
+            "reclamation": if compiled.in_place_deallocation { "content_punch_or_refold" } else { "refold_only" },
             "cancellation": { "scan": false, "lifecycle": false },
             "binding": "python",
             "actorQueueDefault": DEFAULT_QUEUE_CAPACITY,

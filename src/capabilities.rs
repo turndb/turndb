@@ -12,15 +12,16 @@ use serde::Serialize;
 pub enum WriterExclusion {
     /// The operating system releases the advisory lock when the writer exits or crashes.
     OsEnforced,
-    /// The embedder must ensure that no other writer opens the same directory.
+    /// The embedder must ensure that no other writer opens the same store.
     EmbedderEnforced,
 }
 
 /// Capabilities of the compiled TurnDB core, independent of consumer policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Capabilities {
-    pub part_format_write: u8,
-    pub part_format_read_max: u8,
+    /// The shared draft-epoch discriminator required across the current physical planes.
+    /// The complete physical identity also includes each plane's exact magic and grammar.
+    pub draft_format_epoch: u8,
     pub writer_exclusion: WriterExclusion,
     pub positioned_io: bool,
     pub threads: bool,
@@ -31,8 +32,10 @@ pub struct Capabilities {
     pub read_admission_limits: bool,
     pub object_count_admission: bool,
     pub store_space_usage: bool,
+    /// Whether this build can deallocate an unreachable fold range in place.
+    pub in_place_deallocation: bool,
+    /// Whether store inventory reports measured filesystem allocation.
     pub allocated_space_usage: bool,
-    pub format_migration: bool,
     pub operation_metrics: bool,
     pub part_distribution: bool,
     pub content_liveness: bool,
@@ -53,8 +56,7 @@ pub struct Capabilities {
 /// Report what this build can actually guarantee.
 pub const fn capabilities() -> Capabilities {
     Capabilities {
-        part_format_write: crate::part::PART_VERSION,
-        part_format_read_max: crate::part::PART_VERSION,
+        draft_format_epoch: crate::store::DRAFT_FORMAT_EPOCH,
         writer_exclusion: if cfg!(any(unix, windows)) {
             WriterExclusion::OsEnforced
         } else {
@@ -69,8 +71,8 @@ pub const fn capabilities() -> Capabilities {
         read_admission_limits: true,
         object_count_admission: true,
         store_space_usage: true,
-        allocated_space_usage: cfg!(any(unix, windows)),
-        format_migration: true,
+        in_place_deallocation: cfg!(any(target_os = "linux", windows)),
+        allocated_space_usage: false,
         operation_metrics: true,
         part_distribution: true,
         content_liveness: true,
@@ -96,7 +98,7 @@ mod tests {
     #[test]
     fn feature_implications_are_reported_not_inferred_by_bindings() {
         let c = capabilities();
-        assert_eq!(c.part_format_write, crate::part::PART_VERSION);
+        assert_eq!(c.draft_format_epoch, crate::store::DRAFT_FORMAT_EPOCH);
         assert!(!c.sql || c.columnar, "SQL is an adapter over the columnar lens");
         assert_eq!(c.portable_wasm, cfg!(target_arch = "wasm32"));
         assert!(c.store_space_usage);
@@ -110,8 +112,8 @@ mod tests {
             c.max_decoded_frame_bytes_default,
             crate::read_limits::DEFAULT_MAX_DECODED_FRAME_BYTES
         );
-        assert_eq!(c.allocated_space_usage, cfg!(any(unix, windows)));
-        assert!(c.format_migration);
+        assert_eq!(c.in_place_deallocation, cfg!(any(target_os = "linux", windows)));
+        assert!(!c.allocated_space_usage);
         assert!(c.operation_metrics);
         assert!(c.part_distribution);
         assert!(c.content_liveness);

@@ -25,19 +25,26 @@ pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
 
 pub fn get_varint(b: &[u8], at: &mut usize) -> Result<u64> {
     let mut v = 0u64;
-    let mut shift = 0u32;
-    loop {
+    for index in 0..10u32 {
         let byte = *b.get(*at).ok_or_else(|| anyhow::anyhow!("varint truncated"))?;
         *at += 1;
-        v |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(v);
-        }
-        shift += 7;
-        if shift > 63 {
+        // A u64 has one useful bit in its tenth LEB128 byte. Checking before the shift matters:
+        // Rust's integer shift would otherwise discard an unrepresentable terminal payload.
+        if index == 9 && byte & 0xfe != 0 {
             bail!("varint overflow");
         }
+        let payload = byte & 0x7f;
+        v |= u64::from(payload) << (index * 7);
+        if byte & 0x80 == 0 {
+            // There is exactly one current encoding for every integer. In particular, 0x80 0x00
+            // is not a second spelling of zero.
+            if index > 0 && payload == 0 {
+                bail!("varint is not minimally encoded");
+            }
+            return Ok(v);
+        }
     }
+    bail!("varint overflow")
 }
 
 fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
@@ -47,6 +54,16 @@ fn shared_prefix(a: &[u8], b: &[u8]) -> usize {
         i += 1;
     }
     i
+}
+
+pub(crate) fn checked_stream_end(current: u64, encoded_entry_len: usize) -> Result<u64> {
+    let entry = u64::try_from(encoded_entry_len)
+        .map_err(|_| anyhow::anyhow!("encoded id entry exceeds the u64 length domain"))?;
+    let end = current.checked_add(entry).ok_or_else(|| anyhow::anyhow!("id stream overflows"))?;
+    if end > u64::from(u32::MAX) {
+        bail!("id stream length {end} exceeds its u32 offset domain");
+    }
+    Ok(end)
 }
 
 /// Encode a **sorted, distinct** id list. Returns `(stream, restart_offsets)`.
@@ -59,15 +76,17 @@ pub fn build(ids: &[String]) -> Result<(Vec<u8>, Vec<u32>)> {
         if i > 0 && cur <= prev {
             bail!("id column requires strictly increasing ids: {:?} then {:?}", prev, id);
         }
-        let shared = if i % RESTART == 0 {
-            restarts.push(stream.len() as u32);
-            0
-        } else {
-            shared_prefix(prev, cur)
-        };
-        put_varint(&mut stream, shared as u64);
-        put_varint(&mut stream, (cur.len() - shared) as u64);
-        stream.extend_from_slice(&cur[shared..]);
+        let restart = i % RESTART == 0;
+        let shared = if restart { 0 } else { shared_prefix(prev, cur) };
+        let mut entry = Vec::with_capacity(cur.len().saturating_add(20));
+        put_varint(&mut entry, shared as u64);
+        put_varint(&mut entry, (cur.len() - shared) as u64);
+        entry.extend_from_slice(&cur[shared..]);
+        checked_stream_end(stream.len() as u64, entry.len())?;
+        if restart {
+            restarts.push(u32::try_from(stream.len()).expect("stream length was bounded above"));
+        }
+        stream.extend_from_slice(&entry);
         prev = cur;
     }
     Ok((stream, restarts))
@@ -93,19 +112,71 @@ impl<'a> IdCol<'a> {
         self.len == 0
     }
 
+    /// Validate the complete canonical stream and restart table in one pass.
+    pub fn validate(&self) -> Result<()> {
+        let expected_restarts = self.len.div_ceil(RESTART);
+        if self.restarts.len() != expected_restarts {
+            bail!(
+                "id restart table has {} entries for {} ids; expected {expected_restarts}",
+                self.restarts.len(),
+                self.len
+            );
+        }
+        let mut at = 0usize;
+        let mut current = Vec::new();
+        let mut previous: Option<Vec<u8>> = None;
+        for index in 0..self.len {
+            if index % RESTART == 0 {
+                let recorded = usize::try_from(self.restarts[index / RESTART])
+                    .map_err(|_| anyhow::anyhow!("id restart offset exceeds this platform"))?;
+                if recorded != at {
+                    bail!("id restart {} points to {recorded}, expected {at}", index / RESTART);
+                }
+            }
+            let shared = usize::try_from(get_varint(self.stream, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("id shared-prefix length exceeds this platform"))?;
+            let suffix_len = usize::try_from(get_varint(self.stream, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("id suffix length exceeds this platform"))?;
+            if index % RESTART == 0 && shared != 0 {
+                bail!("id restart {index} has nonzero shared prefix {shared}");
+            }
+            if shared > current.len() || suffix_len > self.stream.len() - at {
+                bail!("corrupt id column entry");
+            }
+            current.truncate(shared);
+            current.extend_from_slice(&self.stream[at..at + suffix_len]);
+            at += suffix_len;
+            if current.is_empty() {
+                bail!("record id {index} is empty");
+            }
+            std::str::from_utf8(&current)?;
+            if previous.as_deref().is_some_and(|prior| prior >= current.as_slice()) {
+                bail!("record ids are duplicated or out of canonical order");
+            }
+            previous = Some(current.clone());
+        }
+        if at != self.stream.len() {
+            bail!("id column has {} trailing bytes", self.stream.len() - at);
+        }
+        Ok(())
+    }
+
     /// The id at index `i`, decoded by walking from its restart point.
     pub fn get(&self, i: usize) -> Result<Vec<u8>> {
         if i >= self.len {
             bail!("id index {i} out of range ({} ids)", self.len);
         }
         let group = i / RESTART;
-        let mut at =
-            *self.restarts.get(group).ok_or_else(|| anyhow::anyhow!("missing restart {group}"))?
-                as usize;
+        let mut at = usize::try_from(
+            *self.restarts.get(group).ok_or_else(|| anyhow::anyhow!("missing restart {group}"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("id restart offset exceeds this platform"))?;
         let mut cur: Vec<u8> = Vec::new();
         for _ in 0..=(i % RESTART) {
-            let shared = get_varint(self.stream, &mut at)? as usize;
-            let suffix_len = get_varint(self.stream, &mut at)? as usize;
+            let shared = usize::try_from(get_varint(self.stream, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("id shared-prefix length exceeds this platform"))?;
+            let suffix_len = usize::try_from(get_varint(self.stream, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("id suffix length exceeds this platform"))?;
             // `suffix_len > len - at` and not `at + suffix_len > len`: the sum can overflow.
             if shared > cur.len() || suffix_len > self.stream.len() - at {
                 bail!("corrupt id column entry");
@@ -193,8 +264,10 @@ impl<'a> IdCol<'a> {
         let mut at = 0usize;
         let mut cur: Vec<u8> = Vec::new();
         for _ in 0..self.len {
-            let shared = get_varint(self.stream, &mut at)? as usize;
-            let suffix_len = get_varint(self.stream, &mut at)? as usize;
+            let shared = usize::try_from(get_varint(self.stream, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("id shared-prefix length exceeds this platform"))?;
+            let suffix_len = usize::try_from(get_varint(self.stream, &mut at)?)
+                .map_err(|_| anyhow::anyhow!("id suffix length exceeds this platform"))?;
             if shared > cur.len() || suffix_len > self.stream.len() - at {
                 bail!("corrupt id column entry");
             }
@@ -227,8 +300,10 @@ impl<'a> IdCursor<'a> {
         if self.done >= self.len {
             return Ok(None);
         }
-        let shared = get_varint(self.stream, &mut self.at)? as usize;
-        let suffix_len = get_varint(self.stream, &mut self.at)? as usize;
+        let shared = usize::try_from(get_varint(self.stream, &mut self.at)?)
+            .map_err(|_| anyhow::anyhow!("id shared-prefix length exceeds this platform"))?;
+        let suffix_len = usize::try_from(get_varint(self.stream, &mut self.at)?)
+            .map_err(|_| anyhow::anyhow!("id suffix length exceeds this platform"))?;
         if shared > self.cur.len() || suffix_len > self.stream.len() - self.at {
             bail!("corrupt id column entry");
         }
@@ -309,6 +384,52 @@ mod tests {
     fn unsorted_or_duplicate_ids_refuse() {
         assert!(build(&["b".to_string(), "a".to_string()]).is_err(), "unsorted must refuse");
         assert!(build(&["a".to_string(), "a".to_string()]).is_err(), "duplicates must refuse");
+    }
+
+    #[test]
+    fn id_stream_offsets_refuse_before_crossing_the_u32_domain() {
+        assert_eq!(checked_stream_end(u64::from(u32::MAX) - 1, 1).unwrap(), u64::from(u32::MAX));
+        assert!(checked_stream_end(u64::from(u32::MAX), 1).is_err());
+        assert!(checked_stream_end(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn validation_refuses_noncanonical_stream_and_restart_bytes() {
+        let source = vec!["a".to_string(), "b".to_string()];
+        let (stream, restarts) = build(&source).unwrap();
+        IdCol::new(&stream, &restarts, source.len()).validate().unwrap();
+
+        let mut duplicate = stream.clone();
+        *duplicate.last_mut().unwrap() = b'a';
+        assert!(IdCol::new(&duplicate, &restarts, source.len()).validate().is_err());
+
+        let mut trailing = stream.clone();
+        trailing.push(0);
+        assert!(IdCol::new(&trailing, &restarts, source.len()).validate().is_err());
+
+        let mut displaced = restarts.clone();
+        displaced[0] = 1;
+        assert!(IdCol::new(&stream, &displaced, source.len()).validate().is_err());
+    }
+
+    #[test]
+    fn varint_has_one_exact_u64_encoding() {
+        for value in [0, 1, 127, 128, u32::MAX as u64, u64::MAX] {
+            let mut encoded = Vec::new();
+            put_varint(&mut encoded, value);
+            let mut at = 0;
+            assert_eq!(get_varint(&encoded, &mut at).unwrap(), value);
+            assert_eq!(at, encoded.len());
+        }
+
+        for invalid in [
+            &[0x80, 0x00][..],
+            &[0x81, 0x00][..],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02][..],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x81][..],
+        ] {
+            assert!(get_varint(invalid, &mut 0).is_err(), "accepted {invalid:02x?}");
+        }
     }
 
     #[test]

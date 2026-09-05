@@ -1,4 +1,4 @@
-//! The dedup accelerator: content hash → location, for pieces not yet sealed into a part.
+//! The dedup accelerator: content hash → location, for pieces not yet published in a part.
 //!
 //! # The asymmetry that dictates the design
 //!
@@ -13,8 +13,8 @@
 //!
 //! # Why it has no on-disk form
 //!
-//! There is no fact only this index knows. Pieces already sealed into parts are found through those
-//! parts' own dictionaries; pieces not yet sealed are replayed from the WAL, which carries the carved
+//! There is no fact only this index knows. Pieces already published in parts are found through those
+//! parts' own dictionaries; unpublished pieces are replayed from the WAL, which carries the carved
 //! result. Nothing to persist, corrupt, recover, or keep consistent.
 
 use super::block::Loc;
@@ -130,8 +130,8 @@ impl DedupTable {
         }
     }
 
-    /// Drop every entry — called once the window they cover has been sealed into a part, so resident
-    /// memory is bounded by the flush interval rather than by store size.
+    /// Drop every entry — called once a published part indexes the window, so resident memory is
+    /// bounded by the flush interval rather than by store size.
     pub fn clear(&mut self) {
         for s in &mut self.slots {
             s.hash = EMPTY;

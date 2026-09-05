@@ -7,6 +7,10 @@ TurnDB does not follow Semantic Versioning yet, because it is pre-1.0
 and nothing here is a compatibility promise. See **Stability** below
 before relying on anything in this file.
 
+> Historical entries name physical layouts and operations that no current reader or API retains.
+> They record what a release did; they are never implementation guidance. `FORMAT.md` is the only
+> current physical contract and accepts exactly its one unfrozen draft identity.
+
 ## [0.1.0] — 2026-08-06
 
 First release, published as three artifacts: the `turndb` crate on
@@ -14,15 +18,14 @@ crates.io, the portable `turndb` npm package, and `@turndb/native`.
 
 ### Stability
 
-**Pre-1.0. Format version 2. Not frozen.** [`FORMAT.md`](FORMAT.md) is
+**Pre-1.0. Physical format draft, not frozen.** [`FORMAT.md`](FORMAT.md) is
 normative: where it and the code disagree, one of them is a bug.
 
 Nothing below is a stability commitment. Specifically:
 
-- **The on-disk format is not frozen and does not need to be.** A
-  re-fold rewrites every part and the fold generation, so a format
-  change is a migration rather than a break — see
-  [`FORMAT.md`](FORMAT.md#compatibility).
+- **The on-disk format is not frozen.** An incompatible physical change replaces the draft
+  identity and every reader for the preceding draft rather than creating a compatibility range — see
+  [`FORMAT.md`](FORMAT.md#draft-identity-rule).
 - **The API is not frozen.** There is no prior release, so there is
   nothing to be compatible with and no deprecation policy yet.
 - **There is no supported-version window.** Security fixes land on
@@ -33,7 +36,7 @@ property rather than a feature gap:** the single-writer invariant is
 OS-enforced on Unix via `flock` and **is not enforced under WASI**,
 where it is the embedder's obligation. The measured consequence, and why
 a clean `verify()` does not settle it, is in
-[`FORMAT.md`](FORMAT.md#the-writer-lock).
+[`FORMAT.md`](FORMAT.md#store-shape).
 
 ### Added
 
@@ -42,7 +45,7 @@ First release, so everything is new.
 - **Durability** — WAL with an explicit ACK point, all-or-nothing batch
   replay, a single commit point (the manifest) with a checksummed commit
   log, snapshots, and explicit recovery. See
-  [`docs/recovery.md`](docs/recovery.md).
+  [`docs/manifest-promotion.md`](docs/manifest-promotion.md).
 - **Query** — bounded structured paging with Rust-owned cursors, an
   optional DataFusion lens, and a read-only SQL-to-Arrow stream. Named
   content is independently projectable and metadata queries open zero
@@ -53,7 +56,7 @@ First release, so everything is new.
 - **Compaction** — total merge at eight parts, plus work units bounded
   by exact input-part, row and byte limits applied simultaneously.
   Merges provably touch zero content bytes. See
-  [`docs/bounded-compaction.md`](docs/bounded-compaction.md).
+  [`docs/bounded-part-merge.md`](docs/bounded-part-merge.md).
 - **Deletion** — tombstone → settle → re-fold removes content *and*
   metadata; `punch` reclaims dead blocks in place without moving an
   offset. See [`docs/content-liveness.md`](docs/content-liveness.md),
@@ -80,7 +83,7 @@ First release, so everything is new.
 ### Known limitations
 
 - **Single-writer is not enforced under WASI** — see Stability above and
-  [`FORMAT.md`](FORMAT.md#the-writer-lock).
+  [`FORMAT.md`](FORMAT.md#store-shape).
 - **No encryption.** The format reserves a flag bit and refuses it.
 - **No parity or erasure coding.** Corruption is detected at every
   level; repair is the storage layer's job.

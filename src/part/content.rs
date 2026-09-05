@@ -1,4 +1,4 @@
-//! Sparse named content columns for part format revision 2.
+//! Sparse named content columns for the current draft part format.
 //!
 //! A content name is a physical column. Its programs and offsets are independent sections, so
 //! projecting one named value never decompresses another named value's programs. Every program still
@@ -6,7 +6,7 @@
 
 use super::idcol::put_varint;
 use super::{OP_LIT, OP_PIECE};
-use crate::types::{BodyOp, Content, PieceHash, Record};
+use crate::types::{Content, ContentOp, PieceHash, Record};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, HashMap};
 
@@ -30,21 +30,21 @@ pub(crate) struct Built {
 
 pub(crate) fn encode_program(
     out: &mut Vec<u8>,
-    ops: &[BodyOp],
+    ops: &[ContentOp],
     dict_index: &HashMap<PieceHash, u32>,
 ) -> Result<()> {
-    let emitted = ops.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
+    let emitted = ops.iter().filter(|op| !matches!(op, ContentOp::Lit(b) if b.is_empty())).count();
     put_varint(out, emitted as u64);
     for op in ops {
         match op {
-            BodyOp::Lit(b) => {
+            ContentOp::Lit(b) => {
                 if b.is_empty() {
                     continue;
                 }
                 put_varint(out, (b.len() as u64) << 1 | OP_LIT);
                 out.extend_from_slice(b);
             }
-            BodyOp::Piece { hash, len } => {
+            ContentOp::Piece { hash, len } => {
                 let idx = dict_index.get(hash).ok_or_else(|| {
                     anyhow::anyhow!("piece {hash} is outside the part's declared dictionary")
                 })?;
@@ -73,12 +73,12 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
         let mut prog = Vec::new();
         let mut offsets = Vec::with_capacity(values.len() + 1);
         let mut rid = Vec::new();
-        let mut identities = Vec::with_capacity(values.len() * 33);
+        let mut identities = Vec::with_capacity(values.len() * 32);
         let mut previous = 0usize;
         for (occurrence, (row, content)) in values.into_iter().enumerate() {
             offsets.push(prog.len() as u64);
             encode_program(&mut prog, &content.ops, dict_index)?;
-            encode_identity(&mut identities, content);
+            encode_identity(&mut identities, content)?;
             if !dense {
                 let delta = if occurrence == 0 { row } else { row - previous };
                 if occurrence > 0 && delta == 0 {
@@ -111,15 +111,10 @@ pub(crate) fn build(ordered: &[&Record], dict_index: &HashMap<PieceHash, u32>) -
     Ok(Built { meta, cols })
 }
 
-pub(crate) fn encode_identity(out: &mut Vec<u8>, content: &Content) {
-    match content.identity {
-        Some(identity) => {
-            out.push(1);
-            out.extend_from_slice(&identity.0);
-        }
-        None => {
-            out.push(0);
-            out.extend_from_slice(&[0; 32]);
-        }
-    }
+pub(crate) fn encode_identity(out: &mut Vec<u8>, content: &Content) -> Result<()> {
+    let identity = content.identity.ok_or_else(|| {
+        anyhow::anyhow!("content {:?} has no reconstructed-byte identity", content.name)
+    })?;
+    out.extend_from_slice(&identity.0);
+    Ok(())
 }

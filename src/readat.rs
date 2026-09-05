@@ -1,15 +1,15 @@
 //! Positioned reads behind a trait — the seam every future backend goes through.
 //!
 //! Everything that READS store bytes — part sections, fold blocks — bottoms out in "give me `n`
-//! bytes at offset `o`". That shape is exactly what a plain file provides, what an extent of a
-//! pack file provides, and what an object store's range request provides. Putting the trait in now,
+//! bytes at offset `o`". That shape is exactly what a plain file provides, what a container-member
+//! extent provides, and what an object store's range request provides. Putting the trait in now,
 //! while it costs one indirection and nothing else, is what keeps those backends a new impl each
-//! rather than a rewrite: a reader never learns whether its bytes came from a directory, a pack,
-//! or a socket.
+//! rather than a rewrite: a reader never learns whether its bytes came from a container or a
+//! socket.
 //!
 //! Deliberately READ-ONLY and deliberately minimal. The write path stays on real files in a real
-//! directory — append semantics, fsync, and rename atomicity are directory-store properties, and
-//! no other backend is asked to fake them.
+//! container file — append semantics and fsync are local-file properties, and no other backend is
+//! asked to fake them.
 
 use std::fs::File;
 use std::io;
@@ -25,7 +25,7 @@ pub trait ReadAt: Send + Sync {
     /// Total addressable length.
     fn len(&self) -> io::Result<u64>;
 
-    /// Whether the source holds no bytes at all — an empty file, or a zero-length pack extent.
+    /// Whether the source holds no bytes at all — an empty file or a zero-length member extent.
     fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
     }
@@ -58,7 +58,7 @@ impl<R: ReadAt + ?Sized> ReadAt for Box<R> {
     }
 }
 
-/// A bounded extent of another source — a file inside a pack. Offsets are relative to the slice,
+/// A bounded extent of another source — a member inside a container. Offsets are relative to the slice,
 /// and a read past its end is an error even when the underlying source has more bytes: the whole
 /// point of the bound is that a reader inside it cannot wander into a neighbour.
 pub struct Slice<R> {
@@ -102,8 +102,8 @@ impl<R: ReadAt> ReadAt for Slice<R> {
 /// with no idea the bytes are scattered — the translation lives here and nowhere else.
 ///
 /// Extents are logically dense by construction: extent *k+1* begins where *k* ends. A member
-/// staged whole has exactly one extent, and that case pays a single comparison — sealed and
-/// reclaimed containers never hold anything else.
+/// staged whole has exactly one extent, and that case pays a single comparison — fresh backups
+/// and reclaimed containers never hold anything else.
 pub struct Extents<R> {
     inner: R,
     /// `(logical_start, physical_off, len)`, logical_start strictly ascending and dense.

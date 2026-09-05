@@ -141,7 +141,7 @@ try {
       assert.equal(second.rows[0].contents[0].present, true);
       assert.equal(second.rows[0].contents[0].bytes, undefined);
 
-      // Reopen before flush: the durable acknowledgement is backed by WAL recovery, and content
+      // Reopen before flush: the durable acknowledgement is backed by WAL replay, and content
       // remains addressable through the same consumer-selected name.
       await store.close(false);
       store = await addon.NativeStore.open(directory);

@@ -58,7 +58,7 @@ export interface ProjectedContent {
   present: boolean;
   len?: bigint;
   pieces?: number;
-  /** BLAKE3 of the exact reconstructed bytes; unavailable for values written by legacy formats. */
+  /** BLAKE3 of the exact reconstructed bytes. */
   identity?: string;
   bytes?: Buffer;
 }
@@ -169,19 +169,17 @@ export interface SqlBatch {
 }
 
 export interface Capabilities {
-  /** Language-neutral binding contract; independent of package and part-format versions. */
-  contractVersion: 1;
+  /** Language-neutral binding contract for the current draft API. */
+  contractVersion: 2;
   profile: 'native';
   operations: Array<
     | 'openWriter' | 'openSnapshot' | 'compiledCapabilities' | 'write' | 'sync' | 'flush'
-    | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'seal' | 'verify'
+    | 'scan' | 'explainScan' | 'schema' | 'readContent' | 'snapshot' | 'querySql' | 'backup' | 'verify'
     | 'spaceUsage' | 'compactBounded' | 'refold' | 'erase' | 'close'
   >;
-  partFormat: { write: number; readMax: number };
-  reclamation: 'punch_or_refold' | 'refold_only';
+  draftFormatEpoch: number;
+  reclamation: 'content_punch_or_refold' | 'refold_only';
   cancellation: { scan: boolean; lifecycle: boolean };
-  partFormatWrite: number;
-  partFormatReadMax: number;
   writerExclusion: 'os_enforced' | 'embedder_enforced';
   positionedIo: boolean;
   threads: boolean;
@@ -196,8 +194,8 @@ export interface Capabilities {
   readAdmissionLimits: true;
   objectCountAdmission: true;
   storeSpaceUsage: true;
+  inPlaceDeallocation: boolean;
   allocatedSpaceUsage: boolean;
-  formatMigration: true;
   operationMetrics: true;
   partDistribution: true;
   contentLiveness: true;
@@ -218,7 +216,7 @@ export interface Capabilities {
   immutableSnapshots: true;
   lifecycleOperations: true;
   backupRestore: boolean;
-  recoveryControls: true;
+  manifestPromotionControls: true;
   healthSnapshots: true;
   schemaDiscovery: true;
   scanExplanation: true;
@@ -243,7 +241,7 @@ export interface OpenOptions {
   maxConcurrentSqlMemoryBytes?: bigint;
   /** Worst-case complete WAL frame bytes admitted for one record; defaults to 64 MiB. */
   maxRecordBytes?: bigint;
-  /** Member frames plus commit marker admitted for one atomic batch; defaults to 256 MiB. */
+  /** Member frames plus completion marker admitted for one atomic batch; defaults to 256 MiB. */
   maxBatchBytes?: bigint;
   /** Ordered members admitted in one atomic batch; defaults to 4,096. */
   maxBatchRecords?: number;
@@ -265,6 +263,13 @@ export interface OpenOptions {
   foldCacheBytes?: bigint;
   /** One decoded-section cache shared by all immutable parts; defaults to 512 MiB. */
   partCacheBytes?: bigint;
+  /**
+   * Verify every part pin, section, row, piece-dictionary entry, and visible content value for the
+   * current and every retained manifest revision before the first write, exactly as `verify()`
+   * would. Defaults to false: the cost is proportional to the whole store and its retained window,
+   * while the default open proves the structural evidence at a cost proportional to metadata.
+   */
+  deepVerificationOnOpen?: boolean;
   /** Fold segment roll threshold below 4 GiB; defaults to 1 GiB. */
   segmentMaxBytes?: bigint;
   /** Zstd write level from 1 through 22; defaults to 19. */
@@ -305,7 +310,7 @@ export interface StoreSchema {
 }
 
 export interface SpaceAmount {
-  files: bigint;
+  members: bigint;
   logicalBytes: bigint;
   /** Filesystem blocks in bytes; absent when the platform cannot report sparse allocation. */
   allocatedBytes?: bigint;
@@ -333,17 +338,17 @@ export interface OperationMetrics {
 }
 
 export interface StoreMetrics {
-  openRecovery: OperationMetrics;
+  openWalReplay: OperationMetrics;
   recoveredWalFrames: bigint;
   sync: OperationMetrics;
   flush: OperationMetrics;
-  compaction: OperationMetrics;
+  merge: OperationMetrics;
   backup: OperationMetrics;
   verification: OperationMetrics;
   verificationCorruptionFailures: bigint;
-  punch: OperationMetrics;
+  contentPunch: OperationMetrics;
   refold: OperationMetrics;
-  formatMigration: OperationMetrics;
+  erase: OperationMetrics;
   foldedContent: {
     pieces: bigint;
     dedupHits: bigint;
@@ -375,7 +380,9 @@ export interface FoldBlockSpace {
 }
 
 export interface ContentLiveness {
+  /** Distinct physical piece locations required by visible row programs. */
   livePieces: bigint;
+  /** Sum of the logical lengths of those physical locations. */
   liveLogicalBytes: bigint;
   deadLogicalBytes: bigint;
   /** Dead bytes sharing a compressed block with live content; reclaimable only by refold. */
@@ -388,8 +395,8 @@ export interface ContentLiveness {
 export interface LifecycleEvent {
   sequence: bigint;
   operation:
-    | 'open_recovery' | 'sync' | 'flush' | 'compaction' | 'backup'
-    | 'verification' | 'punch' | 'refold' | 'format_migration';
+    | 'open_wal_replay' | 'sync' | 'flush' | 'merge' | 'backup'
+    | 'verification' | 'content_punch' | 'refold' | 'erase';
   outcome: 'succeeded' | 'failed' | 'cancelled';
   /** Stable TurnDB error code; absent on success. */
   errorClass?: TurnDbErrorCode;
@@ -421,17 +428,17 @@ export interface CompactionBudget {
   maxInputParts: number;
   /** Maximum physical rows read from input parts. */
   maxInputRows: bigint;
-  /** Maximum exact on-disk bytes read from input part files. */
+  /** Maximum exact on-disk bytes read from input part members. */
   maxInputBytes: bigint;
 }
 
 export interface CompactionPlan {
-  /** Zero-based position in the current live part list. */
+  /** Zero-based position in the part list referenced by the current manifest revision. */
   startPart: bigint;
   inputParts: bigint;
   inputRows: bigint;
   inputBytes: bigint;
-  /** True only when this run covers the entire live part list. */
+  /** True only when this run covers every part referenced by the current manifest revision. */
   dropsTombstones: boolean;
 }
 
@@ -472,40 +479,6 @@ export interface RefoldSpaceEstimate {
   filesystemAvailableBytes?: bigint;
 }
 
-export interface FormatMigrationStatus {
-  targetPartVersion: number;
-  liveParts: bigint;
-  currentParts: bigint;
-  legacyParts: bigint;
-  legacyRows: bigint;
-  legacyBytes: bigint;
-  retainedLegacyParts: bigint;
-  retainedLegacyRows: bigint;
-  retainedLegacyBytes: bigint;
-}
-
-export interface FormatMigrationPlan {
-  partIndex: bigint;
-  sourcePartVersion: number;
-  seqLo: bigint;
-  seqHi: bigint;
-  inputRows: bigint;
-  inputBytes: bigint;
-  inputSections: bigint;
-  inputRawSectionBytes: bigint;
-  estimatedStageBytes: bigint;
-  estimateIsHardBound: false;
-  retainedInputBytesAfterCommit: bigint;
-  filesystemAvailableBytes?: bigint;
-}
-
-export interface FormatMigrationStep {
-  plan: FormatMigrationPlan;
-  outputBytes: bigint;
-  remainingLegacyParts: bigint;
-  rewrite: MergeStats;
-}
-
 export type TurnDbErrorCode =
   | 'INVALID_ARGUMENT'
   | 'BUSY'
@@ -526,14 +499,8 @@ export declare class TurnDbError extends Error {
 
 export declare function capabilities(): Capabilities;
 export declare function retainedCommits(path: string): Promise<bigint[]>;
-/**
- * Which single-file form a path holds, or `null` for a directory or a file carrying neither
- * magic. Reading does not need this — {@link NativeSnapshot.openFile} dispatches on its own — but
- * tooling that must know whether a file can still be appended to does.
- */
-export declare function singleFileKind(path: string): 'pack' | 'container' | null;
-export interface RecoveryOptions extends LifecycleOptions {
-  /** Maximum number of newer retained commits that recovery may abandon; defaults to zero. */
+export interface ManifestPromotionOptions extends LifecycleOptions {
+  /** Maximum number of newer retained manifest revisions that promotion may abandon; defaults to zero. */
   maxRollbackCommits?: bigint;
   maxStoredFrameBytes?: bigint;
   maxDecodedFrameBytes?: bigint;
@@ -550,10 +517,12 @@ export interface RestoreOptions extends LifecycleOptions {
 }
 export declare function recoverManifest(
   path: string,
-  options?: RecoveryOptions,
+  options?: ManifestPromotionOptions,
 ): Promise<{
   commit: bigint;
   rollbackCommits: bigint;
+  /** Older retained revisions abandoned because they no longer validated; retention shrank by this many. */
+  abandonedRetainedRevisions: bigint;
   records: bigint;
   contentValues: bigint;
   parts: bigint;
@@ -566,7 +535,12 @@ export declare function restoreBackup(
   backupPath: string,
   destinationPath: string,
   options?: RestoreOptions,
-): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
+): Promise<{
+  members: bigint;
+  bytes: bigint;
+  /** Public store-authority encoding: 0 is the canonical origin; positive is a manifest revision. */
+  commit: bigint;
+}>;
 
 export declare class NativeSqlQuery {
   readonly schemaIpc: Buffer;
@@ -579,12 +553,13 @@ export declare class NativeSqlQuery {
 export declare class NativeSnapshot {
   static open(path: string, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
   /**
-   * Open a store held in ONE FILE — a sealed pack or a growable container, told apart by magic
-   * rather than extension. Both answer reads identically; there is no writer role to take and no
-   * WAL to replay, so this cannot contend with a writer the way a directory open can.
+   * Open a TurnDB container read-only. There is no writer role to take and no WAL to replay, so
+   * this does not contend with a writer.
    */
   static openFile(path: string, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
+  /** Open a retained manifest revision; commit must be positive and never aliases the canonical origin. */
   static openAt(path: string, commit: bigint, options?: SnapshotOpenOptions): Promise<NativeSnapshot>;
+  /** Public store-authority encoding: 0 is the canonical origin; positive is a manifest revision. */
   readonly commit: bigint;
   readonly maxConcurrentSqlMemoryBytes: bigint;
   readonly maxStoredFrameBytes: bigint;
@@ -610,14 +585,14 @@ export declare class NativeStore {
    * durable companion is `<path>-wal`; a durable close publishes pending writes and removes the
    * emptied sidecar. After a crash the next open replays that sidecar. Writer exclusion is enforced
    * by an OS lock on the container itself. A close with `durable: false` deliberately leaves the
-   * sidecar for recovery instead of settling the store.
+   * sidecar for WAL replay instead of settling the store.
    */
   static openFile(path: string, options?: OpenOptions): Promise<NativeStore>;
   readonly commandQueueCapacity: number;
   readonly maxConcurrentSqlMemoryBytes: bigint;
   readonly reservedSqlMemoryBytes: bigint;
   write(ops: WriteOp[], durable?: boolean): Promise<void>;
-  /** Cancellation is observed before entering the WAL fsync boundary. */
+  /** Cancellation is observed before delayed authority acknowledgement, if needed, and WAL fsync. */
   sync(options?: LifecycleOptions): Promise<void>;
   /** Cancellation is observed before manifest publication; staged parts remain unreachable. */
   flush(options?: LifecycleOptions): Promise<boolean>;
@@ -635,7 +610,7 @@ export declare class NativeStore {
     partsAfter: bigint;
     merge?: MergeStats;
   }>;
-  /** Settles prior writes, then merges one contiguous run within exact physical-input limits. */
+  /** Synchronizes and publishes prior writes, then merges one contiguous run within exact physical-input limits. */
   compactBounded(budget: CompactionBudget, options?: LifecycleOptions): Promise<{
     flushed: boolean;
     partsBefore: bigint;
@@ -644,54 +619,46 @@ export declare class NativeStore {
     outputBytes?: bigint;
     merge?: MergeStats;
   }>;
-  /** Settles the actor cut, then returns exact estimate inputs and an explicitly advisory result. */
+  /** Synchronizes and publishes the actor boundary, then returns exact estimate inputs and an explicitly advisory result. */
   estimateCompactionSpace(
     budget: CompactionBudget,
     options?: LifecycleOptions,
   ): Promise<{ flushed: boolean; estimate?: CompactionSpaceEstimate }>;
-  formatMigrationStatus(options?: LifecycleOptions): Promise<FormatMigrationStatus>;
-  estimateFormatMigrationSpace(options?: LifecycleOptions): Promise<{
-    flushed: boolean;
-    status: FormatMigrationStatus;
-    estimate?: FormatMigrationPlan;
-  }>;
-  migrateFormatStep(options?: LifecycleOptions): Promise<{
-    flushed: boolean;
-    step?: FormatMigrationStep;
-  }>;
   verify(options?: LifecycleOptions): Promise<{
     manifestLinks: bigint;
     partDigests: bigint;
-    undigestedParts: bigint;
+    /** Parts referenced by current authority; retained-only parts are verified but not counted here. */
     parts: bigint;
+    /** Sections in current-authority parts; retained-only section work is outside this counter. */
     partSections: bigint;
     foldSegments: number;
     foldBlocks: bigint;
     foldBytes: bigint;
     trailingUncommittedBytes: bigint;
   }>;
-  /** Settles prior writes; cancellation never publishes the destination. */
+  /** Synchronizes and publishes prior writes; cancellation never installs the destination. */
   backup(
     path: string,
     options?: LifecycleOptions,
-  ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
-  /** Contract-v1 alias for publishing a verified immutable single-file snapshot. */
-  seal(
-    path: string,
-    options?: LifecycleOptions,
-  ): Promise<{ files: bigint; bytes: bigint; commit: bigint }>;
+  ): Promise<{
+    members: bigint;
+    bytes: bigint;
+    /** Public store-authority encoding: 0 is the canonical origin; positive is a manifest revision. */
+    commit: bigint;
+  }>;
   erase(ids: string[], options?: LifecycleOptions): Promise<{
     requested: bigint;
     tombstoned: bigint;
     absent: bigint;
     refold?: RefoldResult;
   }>;
-  punch(options?: LifecycleOptions): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
+  contentPunch(options?: LifecycleOptions): Promise<{ blocksExamined: bigint; blocksPunched: bigint }>;
   refold(options?: LifecycleOptions): Promise<RefoldResult>;
   estimateRefoldSpace(
     options?: LifecycleOptions,
   ): Promise<{ flushed: boolean; estimate?: RefoldSpaceEstimate }>;
   health(): Promise<{
+    /** Public store-authority encoding: 0 is the canonical origin; positive is a manifest revision. */
     commit: bigint;
     foldGeneration: number;
     parts: bigint;

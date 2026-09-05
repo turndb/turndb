@@ -57,8 +57,8 @@ async function main() {
   assert.equal(caps.profile, 'native');
   assert.equal(caps.writerExclusion, 'os_enforced');
   assert.equal(caps.positionedIo, true);
-  assert.equal(caps.allocatedSpaceUsage, true);
-  assert.equal(caps.reclamation, 'punch_or_refold');
+  assert.equal(caps.allocatedSpaceUsage, false);
+  assert.equal(caps.reclamation, 'content_punch_or_refold');
 
   const fixture = path.join(evidence, 'linux-reference.turndb');
   fs.writeFileSync(fixture, decodeHex(fixtureHex));
@@ -102,11 +102,6 @@ async function main() {
   await assert.rejects(native.NativeStore.openFile(absentStore), /publish-2-3/);
   assert.equal(fs.existsSync(pending), true, 'absent-store debris is reported, never removed');
 
-  const legacyStore = path.join(evidence, 'legacy.turndb');
-  fs.mkdirSync(`${legacyStore}-hot`);
-  await assert.rejects(native.NativeStore.openFile(legacyStore), /-hot/);
-  assert.equal(fs.existsSync(`${legacyStore}-hot`), true, 'legacy acknowledged-write directory is never removed');
-
   // Every component stays below NTFS's 255-character limit while the total path exceeds MAX_PATH.
   let deep = path.join(evidence, 'long-path');
   for (let i = 0; i < 14; i += 1) deep = path.join(deep, `segment-${String(i).padStart(2, '0')}-${'x'.repeat(18)}`);
@@ -117,7 +112,7 @@ async function main() {
   await store.close();
   assert(fs.statSync(deepStore).isFile());
 
-  // Erasure has its own proof: removing the only logical record refolds the sealed pieces out of
+  // Erasure has its own proof: removing the only logical record refolds the persisted pieces out of
   // the store. This is deliberately separate from punch, whose workload must retain unreachable
   // bytes rather than rewriting them away.
   const eraseStore = path.join(evidence, 'erase-refold.turndb');
@@ -133,7 +128,7 @@ async function main() {
   assert.equal(erased.tombstoned, 1n);
   assert.equal(erased.absent, 0n);
   assert(erased.refold, 'installed erasure must report the refold that removes content');
-  assert(erased.refold.piecesDropped > 0n, 'erasure refold must drop sealed pieces');
+  assert(erased.refold.piecesDropped > 0n, 'erasure refold must drop persisted pieces');
   assert(
     erased.refold.foldBytesAfter < erased.refold.foldBytesBefore,
     'erasure refold must reduce the fold that held the erased content',
@@ -159,7 +154,7 @@ async function main() {
   await store.flush();
 
   // Match the engine's erasure proof: supersede (do not erase/refold) and add enough unrelated
-  // live content to seal the old version outside the active segment, which is never punched.
+  // live content to publish the old version outside the active segment, which is never punched.
   const liveBytes = crypto.randomBytes(1024);
   const second = [{
     kind: 'put', id: 'replace-me', contents: [{ name: 'body', bytes: liveBytes }],
@@ -174,14 +169,13 @@ async function main() {
   await store.flush();
   const before = fs.readFileSync(punchStore);
   const beforeSpace = await store.spaceUsage();
-  const punched = await store.punch();
+  const punched = await store.contentPunch();
   const afterSpace = await store.spaceUsage();
   // #153: single-file accounting cannot attribute physical file blocks to its logical member
-  // buckets and currently carries a structural Some(0). Name that as unavailable rather than
-  // presenting the constant as a measurement; the build-level capability also covers directory
-  // stores and the Windows punch primitive, so it cannot express this per-layout distinction.
-  assert.equal(beforeSpace.total.allocatedBytes, 0n);
-  assert.equal(afterSpace.total.allocatedBytes, 0n);
+  // buckets, so allocation is reported as absent rather than as a structural zero that would
+  // read as a measurement. The evidence below records the absence by name for the same reason.
+  assert.equal(beforeSpace.total.allocatedBytes, undefined);
+  assert.equal(afterSpace.total.allocatedBytes, undefined);
   const after = fs.readFileSync(punchStore);
   assert(punched.blocksPunched > 0n, 'installed Windows addon must exercise zero-data punch');
   assert(
@@ -259,8 +253,8 @@ async function main() {
       issue: 'https://github.com/turndb/turndb/issues/153',
       logicalBefore: beforeSpace.total.logicalBytes.toString(),
       logicalAfter: afterSpace.total.logicalBytes.toString(),
-      rawStructuralValueBefore: beforeSpace.total.allocatedBytes.toString(),
-      rawStructuralValueAfter: afterSpace.total.allocatedBytes.toString(),
+      allocatedBytesBefore: beforeSpace.total.allocatedBytes === undefined ? 'absent' : beforeSpace.total.allocatedBytes.toString(),
+      allocatedBytesAfter: afterSpace.total.allocatedBytes === undefined ? 'absent' : afterSpace.total.allocatedBytes.toString(),
     },
     erasureRefold: {
       tombstoned: erased.tombstoned.toString(),

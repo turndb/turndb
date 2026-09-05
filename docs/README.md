@@ -1,8 +1,11 @@
 # Documentation index
 
-Every file under `docs/` other than this index, by its own title. `FORMAT.md` (normative on-disk
-format), `ROADMAP.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md` and `SUPPORT.md` live at the
-repository root.
+Every file under `docs/` other than this index, by its own title. `ONTOLOGY.md` (normative project
+vocabulary), `FORMAT.md` (normative physical format), `ROADMAP.md`, `CONTRIBUTING.md`, `CHANGELOG.md`,
+`SECURITY.md` and `SUPPORT.md` live at the repository root.
+
+The public operation vocabulary maps to the ontology through the normative
+[operation registry](operation-registry.md).
 
 Start with the [embedding contract](embedding-contract.md) if you are integrating TurnDB, the
 [install guide](install.md) if you want a packaged entrance, the
@@ -12,18 +15,17 @@ Start with the [embedding contract](embedding-contract.md) if you are integratin
 | file | title |
 |---|---|
 | [`backup-restore.md`](backup-restore.md) | Backup and restore |
-| [`bounded-compaction.md`](bounded-compaction.md) | Bounded incremental compaction |
+| [`bounded-part-merge.md`](bounded-part-merge.md) | Bounded incremental part merge |
 | [`browser-read-measurement.json`](browser-read-measurement.json) | data file |
 | [`browser.md`](browser.md) | Browser read path |
-| [`capability-contract.md`](capability-contract.md) | Capability contract v1 |
-| [`content-identity-v3.md`](content-identity-v3.md) | Exact named-content identity: part of format version 2 |
+| [`capability-contract.md`](capability-contract.md) | Capability contract v2 |
+| [`content-identity.md`](content-identity.md) | Exact named-content identity |
 | [`content-liveness.md`](content-liveness.md) | Content liveness and reclamation |
 | [`cross-runtime-compatibility.md`](cross-runtime-compatibility.md) | Cross-runtime compatibility |
 | [`differential-query-testing.md`](differential-query-testing.md) | Differential query correctness |
 | [`embedding-contract.md`](embedding-contract.md) | TurnDB embedding contract |
 | [`error-taxonomy.md`](error-taxonomy.md) | Error taxonomy |
-| [`field-types-v4.md`](field-types-v4.md) | General scalar field types: part of format version 2 |
-| [`format-migration.md`](format-migration.md) | Resumable format migration |
+| [`field-types.md`](field-types.md) | General scalar field types |
 | [`grouped-column-gather.md`](grouped-column-gather.md) | Grouped column gather |
 | [`install.md`](install.md) | Install TurnDB |
 | [`lifecycle-control.md`](lifecycle-control.md) | Lifecycle cancellation and deadlines |
@@ -32,13 +34,13 @@ Start with the [embedding contract](embedding-contract.md) if you are integratin
 | [`native-prebuilds.md`](native-prebuilds.md) | Native Node prebuild and release contract |
 | [`object-admission.md`](object-admission.md) | Persistent object-count admission |
 | [`operation-metrics.md`](operation-metrics.md) | Pull-based operation metrics |
+| [`operation-registry.md`](operation-registry.md) | Operation registry |
 | [`projected-structured-scan.md`](projected-structured-scan.md) | Projected structured scans |
 | [`query-contract.md`](query-contract.md) | Structured query contract v1 |
 | [`read-admission.md`](read-admission.md) | Atomic frame read admission |
-| [`record-model-v2.md`](record-model-v2.md) | General records and named content: format version 2 |
-| [`recovery.md`](recovery.md) | Manifest recovery |
+| [`record-model.md`](record-model.md) | Records and named content |
+| [`manifest-promotion.md`](manifest-promotion.md) | Manifest promotion |
 | [`reference-consumer-qualification.md`](reference-consumer-qualification.md) | Reference consumer qualification |
-| [`releases/native-0.1.0.md`](releases/native-0.1.0.md) | Native Node 0.1.0 release notes |
 | [`resolved-row-paging.md`](resolved-row-paging.md) | Resolved-row structured paging |
 | [`resource-budgets.md`](resource-budgets.md) | Resource budgets and overload behavior |
 | [`scan-explanation.md`](scan-explanation.md) | Structured scan explanation |

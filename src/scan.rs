@@ -208,7 +208,7 @@ pub struct ProjectedContent {
     pub len: Option<u64>,
     pub pieces: Option<usize>,
     /// BLAKE3 of the exact reconstructed bytes when carried by the record's format. This remains
-    /// unavailable for legacy values rather than substituting a program or piece identity.
+    /// absent for a projection that did not request content identity.
     pub identity: Option<ContentHash>,
     /// `Some` only for a present value selected with [`ContentMode::Bytes`].
     pub bytes: Option<Vec<u8>>,
@@ -290,7 +290,7 @@ pub struct ScanPage {
     pub stats: ScanStats,
 }
 
-/// A live row whose newest-wins origin was settled by the bounded range merge.
+/// A resolved row whose newest-wins origin was selected by the bounded range merge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ScanCandidate {
     Committed(crate::store::read::RowRef),

@@ -1,23 +1,24 @@
-# Bounded incremental compaction
+# Bounded incremental part merge
 
-TurnDB supports one schedulable compaction work unit at a time without embedding a retention or
+TurnDB supports one schedulable part-merge work unit at a time without embedding a retention or
 maintenance policy in the storage engine. The Rust entry points are `Store::plan_compaction`,
 `Store::compact_bounded`, and `Store::compact_bounded_with_control`; the native Node entry point is
-`NativeStore.compactBounded`.
+`NativeStore.compactBounded`. Those public spellings select the part-merge transition; they do not
+denote a broader maintenance action.
 
 This complements, rather than changes, the existing operations:
 
 - `auto_compact` retains TurnDB's measured total-at-eight default policy.
 - `merge_range` and `compact(true)` remain explicit maintenance-window controls.
-- Bounded compaction lets an embedder choose when to admit another measured unit of background work.
+- Bounded part merge lets an embedder choose when to admit another measured unit of background work.
 
 ## Budget contract
 
 A `CompactionBudget` has three mandatory limits:
 
-- `max_input_parts`: number of immutable part files, at least two;
-- `max_input_rows`: physical rows across those files, including superseded rows and tombstones;
-- `max_input_bytes`: exact current file lengths of those part files.
+- `max_input_parts`: number of immutable part members, at least two;
+- `max_input_rows`: physical rows across those members, including superseded rows and tombstones;
+- `max_input_bytes`: exact current logical lengths of those part members.
 
 All three limits apply simultaneously. They bound input work, not elapsed time, peak memory, output
 file size, or temporary disk space. Output bytes are reported after a successful merge so an
@@ -36,21 +37,24 @@ invalid limits return `CompactionError::InvalidBudget`.
 
 ## Tombstones and publication
 
-Only a run covering the complete current live part list may drop tombstones. Every partial merge
+Only a run covering every part referenced by the current manifest revision may drop tombstones. Every partial merge
 retains them, including a run starting at the oldest part, because a newer part outside that run may
 still rely on the delete marker for visibility. Repeated bounded steps can therefore consolidate a
-store safely; the final two-part total step settles tombstones.
+store safely; the final two-part total step can remove tombstones.
 
-A merge writes an unpublished staging part, checks interruption, atomically commits a manifest that
-replaces exactly the planned run, opens that output, and sweeps only unreachable files. Cancellation
-before publication removes staging and leaves the committed part list unchanged. Once publication
-occurs, the work unit is complete. Existing readers remain pinned to their prior manifests and input
-parts through the ordinary retention rules.
+A merge writes an unpublished staging part member, checks interruption, atomically publishes a manifest revision that
+replaces exactly the planned run, opens that output, and stages only unreachable container members
+as free. Cancellation before publication abandons staging and leaves the current manifest revision's part references unchanged. Once publication
+occurs, the logical work unit is selected. Its final durability barrier separately produces the
+publication acknowledgement; a successor selected without that acknowledgement is reported as an
+error without pretending that crash durability was established. Existing readers remain pinned to their
+selected manifest revisions and input parts through the ordinary retention rules.
 
 `compact_bounded` plans and executes under the `Store`'s exclusive mutable ownership. In the Node
-binding, the writer actor first syncs and flushes every earlier accepted write and only then plans the
+binding, the writer actor first synchronizes durability and publishes every earlier accepted mutation,
+then plans the
 run. Commands accepted later wait behind it. The returned input measurements therefore describe the
-exact actor-ordered cut that was executed, not a speculative JavaScript-side estimate.
+exact actor-ordered part set referenced by the current manifest revision, not a speculative JavaScript-side estimate.
 
 ## Native Node use
 
@@ -65,7 +69,8 @@ const result = await store.compactBounded({
 });
 ```
 
-A successful result reports whether settling flushed a part, part counts before and after, the exact
+A successful result reports whether the prelude published a pending-change-set part, part counts
+before and after, the exact
 selected plan, output bytes, and ordinary merge statistics. With fewer than two parts, `plan`,
 `outputBytes`, and `merge` are absent. Errors are stable scheduler inputs:
 
@@ -80,7 +85,7 @@ choose that policy or attach OpenTelemetry, trace, tenant, or retention semantic
 ## Space preflight
 
 `Store::estimate_compaction_space` and Node `estimateCompactionSpace` expose the exact selected
-input plan, compressed and raw section bytes, retained-snapshot pinning, and filesystem availability.
+input plan, compressed and raw section bytes, retained-manifest-revision pinning, and filesystem availability.
 They also report an explicitly advisory stage estimate; compression and rebuilt index layout prevent
 it from being a hard admission bound. See [maintenance space accounting and preflight](maintenance-space.md)
 for the inventory categories, estimate basis, and consumer policy boundary.

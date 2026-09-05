@@ -14,10 +14,10 @@ async function withStore(fn, opts) {
 
 test('capabilities describe the WASI guest rather than its host', async () => {
   const reachable = await capabilities();
-  assert.equal(reachable.contractVersion, 1);
+  assert.equal(reachable.contractVersion, 2);
   assert.equal(reachable.profile, 'wasi');
   assert.equal(reachable.writerExclusion, 'embedder_enforced');
-  assert.deepEqual(reachable.partFormat, { write: 2, readMax: 2 });
+  assert.equal(reachable.draftFormatEpoch, 1);
   assert.deepEqual(reachable.cancellation, { scan: true, lifecycle: true });
   assert.ok(reachable.operations.includes('scan'));
   assert.equal(reachable.binding, 'wasi');
@@ -26,21 +26,21 @@ test('capabilities describe the WASI guest rather than its host', async () => {
   }
   assert.equal(reachable.limits.lifecycleEvents, 256);
   assert.equal(reachable.unavailable.allocatedBytes, 'absent');
-  assert.equal(reachable.unavailable.atomicNoReplacePublication, 'absent');
-  assert.equal(reachable.operations.includes('seal'), false);
+  assert.equal(reachable.unavailable.atomicNoReplaceInstallation, 'absent');
+  assert.equal(reachable.operations.includes('backup'), false);
   const c = await compiledCapabilities();
   assert.equal(c.portable_wasm, true);
   assert.equal(c.writer_exclusion, 'embedder_enforced');
   assert.equal(c.threads, false);
   assert.equal(c.columnar, false);
   assert.equal(c.sql, false);
-  assert.equal(c.part_format_write, 2);
+  assert.equal(c.draft_format_epoch, 1);
   assert.equal(c.write_admission_limits, true);
   assert.equal(c.read_admission_limits, true);
   assert.equal(c.object_count_admission, true);
   assert.equal(c.store_space_usage, true);
+  assert.equal(c.in_place_deallocation, false);
   assert.equal(c.allocated_space_usage, false);
-  assert.equal(c.format_migration, true);
   assert.equal(c.operation_metrics, true);
   assert.equal(c.part_distribution, true);
   assert.equal(c.content_liveness, true);

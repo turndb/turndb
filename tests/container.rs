@@ -1,16 +1,15 @@
-//! The container gate: a store in one MUTABLE file answers exactly as the directory did, grows
-//! without invalidating what a reader already resolved, and survives a torn commit.
+//! The container gate: a store in one mutable file grows without invalidating what a reader
+//! already resolved and survives a torn commit.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use turndb::container::{
-    Container, ContainerReader, ALIGN, CONTAINER_VERSION, MAGIC, REGION_START, SLOT_LEN,
+    Container, ContainerReader, ALIGN, CONTAINER_DRAFT_EPOCH, MAGIC, REGION_START, SLOT_LEN,
 };
 use turndb::fold::FoldCfg;
 use turndb::readat::ReadAt as _;
-use turndb::store::{convert_to_file, open_read_container, Span, Store};
-use turndb::AttrValue;
+use turndb::store::{open_read_container, Span, Store};
 
 #[derive(Clone)]
 struct CountingSource {
@@ -51,6 +50,33 @@ fn tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("turndb-container-{tag}-{}-{n}", std::process::id()))
 }
 
+fn rewrite_manifest_field(bytes: &[u8], before: &str, after: &str) -> Vec<u8> {
+    let marker = b"\ncrc32=";
+    let split = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("manifest checksum trailer");
+    let payload = std::str::from_utf8(&bytes[..split]).unwrap();
+    assert_eq!(payload.matches(before).count(), 1, "manifest field must be unique: {before}");
+    let rewritten = payload.replacen(before, after, 1);
+    let checksum = crc32fast::hash(rewritten.as_bytes());
+    format!("{rewritten}\ncrc32={checksum:08x}").into_bytes()
+}
+
+fn rewrite_every_manifest(container: &mut Container, before: &str, after: &str) {
+    let names: Vec<String> = container
+        .names()
+        .filter(|name| *name == "MANIFEST" || name.starts_with("MANIFEST."))
+        .map(String::from)
+        .collect();
+    assert!(!names.is_empty(), "fixture must have manifest authority");
+    for name in names {
+        let bytes = container.read_file_bounded(&name, 1 << 20).unwrap();
+        let rewritten = rewrite_manifest_field(&bytes, before, after);
+        container.put_bytes(&name, &rewritten).unwrap();
+    }
+}
+
 fn cfg() -> FoldCfg {
     // small blocks and segments so the fixture carries a multi-segment fold with sidecars
     FoldCfg { block_target: 4 * 1024, seg_max: 16 * 1024, ..Default::default() }
@@ -84,40 +110,6 @@ fn newest_slot(bytes: &[u8]) -> usize {
     } else {
         0
     }
-}
-
-/// Materialize the checked-in 0.1.3 directory-store fixture — the retired layout as its last
-/// writer actually left it, non-empty WAL included. See tests/fixtures/directory-store-0.1.3.hex.
-fn unpack_fixture(into: &Path) {
-    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/directory-store-0.1.3.hex");
-    let text = std::fs::read_to_string(&hex_path).unwrap();
-    let mut name: Option<PathBuf> = None;
-    let mut hex = String::new();
-    let flush = |name: &Option<PathBuf>, hex: &str| {
-        if let Some(path) = name {
-            let bytes: Vec<u8> = (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                .collect();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, bytes).unwrap();
-        }
-    };
-    for line in text.lines() {
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("== ") {
-            flush(&name, &hex);
-            hex.clear();
-            let rel = rest.split_whitespace().next().unwrap();
-            name = Some(into.join(rel));
-        } else {
-            hex.push_str(line.trim());
-        }
-    }
-    flush(&name, &hex);
 }
 
 /// The generator's body function, byte for byte (xorshift64 over the seed).
@@ -209,6 +201,14 @@ fn cold_open_reads_only_metadata_while_a_missing_sidecar_remains_advisory() {
             "every committed segment, including the active one, needs open metadata: {sidecar}"
         );
     }
+    let indexed_blocks: usize = segment_names
+        .iter()
+        .map(|segment| {
+            let bytes =
+                container.read_file_bounded(&segment.replace(".fold", ".dir"), 1 << 20).unwrap();
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize
+        })
+        .sum();
     let payload_ranges = fold_payload_ranges(&container);
     drop(container);
 
@@ -223,12 +223,16 @@ fn cold_open_reads_only_metadata_while_a_missing_sidecar_remains_advisory() {
     let cold_reads = source.reads();
     assert_eq!(
         cold_reads.len(),
-        4 + 2 * segment_names.len() + 2 * part_count + dictionary_count,
-        "two slots, directory, manifest, one sidecar and header per segment, one whole read per dictionary, and footer plus TOC per part: {cold_reads:?}"
+        4 + 2 * segment_names.len() + indexed_blocks + 11 * part_count + dictionary_count,
+        "two slots, directory, manifest, one sidecar and segment header per segment, one frame-header proof per indexed block, one whole read per dictionary, and footer plus TOC plus checksum-authenticated structural metadata per part: {cold_reads:?}"
     );
     assert!(
-        cold_reads.iter().all(|read| payload_ranges.iter().all(|payload| !overlaps(read, payload))),
-        "a valid current container must not fetch fold payload merely to open: {cold_reads:?}"
+        cold_reads.iter().all(|read| {
+            payload_ranges.iter().all(|payload| {
+                !overlaps(read, payload) || read.1 == turndb::fold::block::BLOCK_HDR_LEN
+            })
+        }),
+        "a valid current container may prove frame headers but must not fetch fold payload merely to open: {cold_reads:?}"
     );
     assert_eq!(reader.reconstruct("trace/2/3").unwrap().unwrap().len(), 6 * 1024);
 
@@ -252,9 +256,10 @@ fn cold_open_reads_only_metadata_while_a_missing_sidecar_remains_advisory() {
     .unwrap();
     let fallback_reads = fallback.reads();
     assert!(
-        fallback_reads
-            .iter()
-            .any(|read| payload_ranges.iter().any(|payload| overlaps(read, payload))),
+        fallback_reads.iter().any(|read| {
+            read.1 > turndb::fold::block::BLOCK_HDR_LEN
+                && payload_ranges.iter().any(|payload| overlaps(read, payload))
+        }),
         "without advisory open metadata the reader must derive it from the active payload"
     );
     assert_eq!(reader.reconstruct("trace/2/3").unwrap().unwrap().len(), 6 * 1024);
@@ -263,62 +268,92 @@ fn cold_open_reads_only_metadata_while_a_missing_sidecar_remains_advisory() {
 }
 
 #[test]
-fn a_retired_directory_store_converts_whole_including_its_unflushed_wal() {
-    let root = tmp("convert-dir");
+fn committed_fold_bytes_after_the_last_complete_frame_are_refused_by_file_and_source_readers() {
+    let root = tmp("committed-fold-trailing-byte");
     std::fs::create_dir_all(&root).unwrap();
-    let dir = root.join("store");
-    unpack_fixture(&dir);
+    let path = root.join("store.turndb");
+    let mut store = Store::open_file(&path, cfg()).unwrap();
+    store.put_body("record", &noise(41, 12 * 1024), vec![]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.close().unwrap();
+    open_read_container(&path, cfg()).expect("nearest valid committed fold opens");
+
+    let mut container = Container::open(&path).unwrap();
+    let authority = container.read_file_bounded("MANIFEST", 1 << 20).unwrap();
+    let split = authority.windows(7).position(|window| window == b"\ncrc32=").unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&authority[..split]).unwrap();
+    let generation = manifest["fold_gen"].as_u64().unwrap();
+    let segment = manifest["fold_seg"].as_u64().unwrap();
+    let old_tail = manifest["fold_off"].as_u64().unwrap();
+    let prefix = if generation == 0 { "fold".to_string() } else { format!("fold-{generation:04}") };
+    let member = format!("{prefix}/seg-{segment:08}.fold");
+    container
+        .append_stream(&member, 1, |offset, into| {
+            assert_eq!(offset, 0);
+            into.fill(0x7f);
+            Ok(())
+        })
+        .unwrap();
+    rewrite_every_manifest(
+        &mut container,
+        &format!("\"fold_off\":{old_tail}"),
+        &format!("\"fold_off\":{}", old_tail + 1),
+    );
+    container.commit().unwrap();
+    drop(container);
+
+    let file_error = open_read_container(&path, cfg()).err().expect("file reader must refuse");
+    assert!(format!("{file_error:#}").contains("scans to"), "wrong refusal: {file_error:#}");
+    let source = CountingSource::new(std::fs::read(&path).unwrap());
+    let source_error = turndb::store::open_read_container_source(
+        Arc::new(source),
+        "memory://committed-fold-trailing-byte",
+        cfg(),
+        turndb::read_limits::ReadLimits::default(),
+    )
+    .err()
+    .expect("source reader must refuse");
+    assert!(format!("{source_error:#}").contains("scans to"), "wrong refusal: {source_error:#}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_manifest_cannot_declare_a_punched_block_that_does_not_exist() {
+    let root = tmp("impossible-punched-block");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.turndb");
+    let mut store = Store::open_file(&path, cfg()).unwrap();
+    store.put_body("record", &noise(42, 12 * 1024), vec![]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    store.close().unwrap();
+    open_read_container(&path, cfg()).expect("nearest valid manifest opens");
+
+    let mut container = Container::open(&path).unwrap();
+    rewrite_every_manifest(
+        &mut container,
+        "\"punched\":[]",
+        "\"punched\":[[4294967295,4294967295]]",
+    );
+    container.commit().unwrap();
+    drop(container);
+    let malicious = std::fs::read(&path).unwrap();
+
+    let read_error = open_read_container(&path, cfg()).err().expect("reader must refuse");
     assert!(
-        std::fs::metadata(dir.join("WAL")).unwrap().len() > 0,
-        "the fixture must carry an acknowledged, unflushed record in its WAL"
+        format!("{read_error:#}").contains("names a block that does not exist"),
+        "wrong refusal: {read_error:#}"
     );
-
-    let ct = root.join("store.turndb");
-    let stats = convert_to_file(&dir, &ct).unwrap();
-    assert!(stats.members > 3, "manifest + parts + segments: {stats:?}");
-    assert_eq!(Container::open(&ct).unwrap().verify().unwrap(), stats.members);
-
-    let rs = open_read_container(&ct, cfg()).unwrap();
-    for round in 0..2u64 {
-        for i in 0..6u64 {
-            let id = format!("fix:{round}:{i}");
-            if id == "fix:0:0" {
-                assert!(
-                    rs.reconstruct(&id).unwrap().is_none(),
-                    "the delete must hold through conversion"
-                );
-                continue;
-            }
-            let mut want = b"[".to_vec();
-            want.extend_from_slice(&fixture_body(round * 10 + i, 1800));
-            want.extend_from_slice(b"]");
-            assert_eq!(
-                rs.reconstruct(&id).unwrap().unwrap(),
-                want,
-                "{id} must reconstruct byte-exact out of the converted file"
-            );
-            let record = rs.get(&id).unwrap().unwrap();
-            assert_eq!(
-                record.attrs.iter().find(|(k, _)| k == "model").map(|(_, v)| v.clone()),
-                Some(AttrValue::Str(format!("m{}", i % 2))),
-                "{id} scalar metadata must survive"
-            );
-        }
-    }
-    // The record that lived ONLY in the WAL: synced by 0.1.3, never flushed. Conversion opens
-    // the writer role, which replays it — losing it would be losing an acknowledged write.
-    assert_eq!(
-        rs.reconstruct("fix:wal:only").unwrap().unwrap(),
-        fixture_body(999, 700),
-        "conversion must replay the acknowledged WAL record"
+    let writer_error = Store::open_file(&path, cfg()).err().expect("writer must refuse");
+    assert!(
+        format!("{writer_error:#}").contains("names a block that does not exist"),
+        "wrong refusal: {writer_error:#}"
     );
-    drop(rs);
-
-    // And the converted file is an ordinary live store: writable, and done with the directory.
-    let mut s = Store::open_file(&ct, cfg()).unwrap();
-    s.put("after:convert", &[Span::Piece(b"life goes on")], vec![]).unwrap();
-    s.sync().unwrap();
-    s.close().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), malicious, "refusal must not change the container");
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    assert!(!PathBuf::from(wal).exists(), "refusal must not create a WAL");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -451,6 +486,10 @@ fn a_container_refuses_what_it_must() {
     for bad in ["", "../escape", "/absolute", "back\\slash", "nested/../up"] {
         assert!(c.put_bytes(bad, b"x").is_err(), "{bad:?} must be refused as a member name");
     }
+    let longest = "n".repeat(4096);
+    c.put_bytes(&longest, b"edge").unwrap();
+    let too_long = "n".repeat(4097);
+    assert!(c.put_bytes(&too_long, b"x").is_err(), "the format's name ceiling is exact");
     c.put_bytes("fine/nested/name", b"ok").unwrap();
     c.commit().unwrap();
     drop(c);
@@ -473,6 +512,41 @@ fn a_container_refuses_what_it_must() {
     let c = Container::open(&ct).unwrap();
     assert!(c.verify().is_err(), "a mutated member must fail its checksum");
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn oversized_stream_ranges_refuse_before_mutating_the_container() {
+    let root = tmp("oversized-stream");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("oversized-stream.turndb");
+    let mut container = Container::create(&ct).unwrap();
+
+    let before = std::fs::read(&ct).unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(container
+        .put_stream("impossible", u64::MAX, |_, _| {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!called.get(), "range admission must precede the stream callback");
+    assert_eq!(std::fs::read(&ct).unwrap(), before, "a refused range must write no bytes");
+    assert!(!container.contains("impossible"));
+
+    container.put_bytes("member", b"x").unwrap();
+    let before = std::fs::read(&ct).unwrap();
+    called.set(false);
+    assert!(container
+        .append_stream("member", u64::MAX, |_, _| {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!called.get(), "append range admission must precede the stream callback");
+    assert_eq!(std::fs::read(&ct).unwrap(), before, "a refused append must write no bytes");
+    assert_eq!(container.read_file_bounded("member", 8).unwrap(), b"x");
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 /// A positioned source whose first answer to the length question is from before the last commit
@@ -568,7 +642,7 @@ fn a_commit_between_the_length_query_and_the_slot_read_is_not_truncation() {
 }
 
 #[test]
-fn the_container_plane_versions_independently() {
+fn a_container_refuses_every_other_draft_epoch() {
     let root = tmp("version");
     std::fs::create_dir_all(&root).unwrap();
     let ct = root.join("version.turndb");
@@ -578,12 +652,12 @@ fn the_container_plane_versions_independently() {
     c.commit().unwrap();
     drop(c);
 
-    // A superblock from a future container revision must be refused, not misparsed — and because
-    // the version byte is inside the checksummed prefix, forging one requires re-checksumming,
+    // A superblock from another draft epoch must be refused, not misparsed — and because the
+    // epoch byte is inside the checksummed prefix, forging one requires re-checksumming,
     // which is exactly what a future writer would do.
     let mut bytes = std::fs::read(&ct).unwrap();
     let live = newest_slot(&bytes);
-    bytes[live + 49] = CONTAINER_VERSION + 1;
+    bytes[live + 49] = CONTAINER_DRAFT_EPOCH + 1;
     let digest = blake3::hash(&bytes[live..live + 52]);
     bytes[live + 52..live + 56].copy_from_slice(&digest.as_bytes()[0..4]);
     std::fs::write(&ct, &bytes).unwrap();
@@ -593,11 +667,98 @@ fn the_container_plane_versions_independently() {
     // previous commit would serve a stale state while reporting success.
     let err = match Container::open(&ct) {
         Ok(_) => {
-            panic!("a container from a newer revision must reject forward rather than misread")
+            panic!("a container from another draft epoch must reject rather than misread")
         }
-        Err(e) => e.to_string(),
+        Err(e) => format!("{e:#}"),
     };
-    assert!(err.contains("version"), "the refusal must name the version lever, got: {err}");
+    assert!(err.contains("draft epoch"), "the refusal must name the epoch lever, got: {err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn an_authentic_malformed_older_slot_refuses_the_whole_container() {
+    let root = tmp("malformed-older-slot");
+    std::fs::create_dir_all(&root).unwrap();
+    let ct = root.join("malformed-older-slot.turndb");
+
+    let mut container = Container::create(&ct).unwrap();
+    container.put_bytes("first", b"one").unwrap();
+    container.commit().unwrap();
+    container.put_bytes("second", b"two").unwrap();
+    container.commit().unwrap();
+    drop(container);
+
+    let mut bytes = std::fs::read(&ct).unwrap();
+    let newest = newest_slot(&bytes);
+    let older = if newest == 0 { SLOT_LEN as usize } else { 0 };
+    assert_eq!(u64::from_le_bytes(bytes[older + 8..older + 16].try_into().unwrap()), 1);
+    bytes[older + 48] = 2; // authentic, but no such directory codec exists
+    let digest = blake3::hash(&bytes[older..older + 52]);
+    bytes[older + 52..older + 56].copy_from_slice(&digest.as_bytes()[..4]);
+    std::fs::write(&ct, bytes).unwrap();
+
+    let error = match Container::open(&ct) {
+        Ok(_) => panic!("a malformed authentic slot must refuse the container"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("unknown directory codec"),
+        "a malformed authentic claim must not be hidden by the newer valid slot: {error}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn a_container_from_the_discarded_format_is_refused_without_mutation() {
+    let root = tmp("discarded-format");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("old.turndb");
+    let mut container = Container::create(&path).unwrap();
+    container.put_bytes("member", b"payload").unwrap();
+    container.commit().unwrap();
+    drop(container);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    let slot_at = newest_slot(&bytes);
+    assert_eq!(bytes[slot_at..slot_at + 8], *MAGIC);
+    bytes[slot_at..slot_at + 8].copy_from_slice(b"TURNCTNR");
+    let digest = blake3::hash(&bytes[slot_at..slot_at + 52]);
+    bytes[slot_at + 52..slot_at + 56].copy_from_slice(&digest.as_bytes()[..4]);
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(
+        Container::open(&path).is_err(),
+        "an authentic discarded identity must refuse the whole open, not fall back to an older slot"
+    );
+    assert!(Store::open_file(&path, cfg()).is_err(), "a writer must not upgrade old bytes");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "refusal must not rewrite the artifact");
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal");
+    assert!(
+        !std::path::PathBuf::from(wal).exists(),
+        "refusing old bytes must not create writer state"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn arbitrary_short_final_name_artifacts_fail_closed_without_mutation() {
+    let root = tmp("short-unknown");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("unknown.turndb");
+    let bytes = vec![0u8; 100];
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(Store::open_file(&path, cfg()).is_err(), "unknown short bytes must fail closed");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "refusal must not rewrite unknown bytes");
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal");
+    assert!(!std::path::PathBuf::from(wal).exists(), "refusal must not create writer state");
+
+    let empty = root.join("empty-unknown.turndb");
+    std::fs::write(&empty, []).unwrap();
+    assert!(Store::open_file(&empty, cfg()).is_err(), "empty bytes carry no current identity");
+    assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0, "refusal rewrote an empty artifact");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -628,76 +789,6 @@ fn a_session_that_writes_nothing_still_leaves_a_container_that_opens() {
 
     let rs = open_read_container(&ct, cfg()).unwrap();
     assert_eq!(rs.reconstruct("later").unwrap().unwrap(), body, "the later write must survive");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn a_committed_tail_inside_a_sealed_segment_is_refused_not_rolled_back() {
-    use std::sync::Arc;
-    use turndb::fold::{Fold, FoldTail};
-    use turndb::readat::ReadAt;
-
-    let root = tmp("sealed-rollback");
-    std::fs::create_dir_all(&root).unwrap();
-    let fold_dir = root.join("fold");
-
-    // A fold several segments deep, so there is a sealed one to aim a tail into.
-    {
-        let mut f = Fold::open(&fold_dir, cfg()).unwrap();
-        for i in 0..24u64 {
-            f.put(&noise(i, 2000)).unwrap();
-        }
-        f.sync().unwrap();
-    }
-    let mut segs: Vec<u32> = std::fs::read_dir(&fold_dir)
-        .unwrap()
-        .flatten()
-        .filter_map(|e| turndb::fold::segment::parse_seg_name(&e.file_name().to_string_lossy()))
-        .collect();
-    segs.sort_unstable();
-    assert!(segs.len() >= 3, "the fixture must roll several segments: {segs:?}");
-
-    // Seal everything below the last one: hand it in as a reader and take it out of the directory,
-    // which is exactly the shape a container-backed open produces.
-    // An open handle outlives the unlink on Unix, which is how a reader keeps addressing bytes the
-    // directory no longer names — the same property a container extent has.
-    let last = *segs.last().unwrap();
-    let mut sealed: Vec<Arc<dyn ReadAt>> = Vec::new();
-    for n in 0..last {
-        let path = fold_dir.join(turndb::fold::segment::seg_name(n));
-        let file = std::fs::File::open(&path).unwrap();
-        sealed.push(Arc::new(file) as Arc<dyn ReadAt>);
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    // A tail inside a sealed segment means whatever supplied them is AHEAD of the manifest: state
-    // was sealed that was never committed. Rolling back would mean unlinking a segment that is not
-    // a file, so this must say so rather than try.
-    let refused = Fold::open_at_over_with_limits(
-        &fold_dir,
-        cfg(),
-        Some(FoldTail { seg: 0, off: 64 }),
-        &[],
-        sealed.clone(),
-        Default::default(),
-    );
-    match refused {
-        Ok(_) => panic!("a committed tail below the sealed floor must be refused"),
-        Err(e) => {
-            let text = format!("{e:#}");
-            assert!(
-                text.contains("sealed") && text.contains("ahead of the manifest"),
-                "the refusal must name the disagreement it found: {text}"
-            );
-        }
-    }
-
-    // The same open without that disagreement is the ordinary case and must still work.
-    if let Err(e) =
-        Fold::open_at_over_with_limits(&fold_dir, cfg(), None, &[], sealed, Default::default())
-    {
-        panic!("a fold over sealed segments must open: {e:#}");
-    }
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -790,30 +881,27 @@ fn reclaim_refuses_a_container_a_writer_may_be_holding() {
         "the refusal must be the typed contention error: {err:#}"
     );
 
-    // Closed but NOT settled: sync() then a plain drop leaves the acknowledged record in the WAL
-    // sidecar, and rewriting under it would strand what only its writer can settle.
+    // Closed but not settled: sync() then a plain drop leaves the acknowledged record as WAL replay
+    // input, and rewriting under it would strand what only a writer close can retire.
     drop(s);
     let wal = {
         let mut p = ct.clone().into_os_string();
         p.push("-wal");
         PathBuf::from(p)
     };
-    assert!(
-        std::fs::metadata(&wal).unwrap().len() > 0,
-        "the fixture must leave an unsettled WAL sidecar"
-    );
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0, "the fixture must leave WAL replay input");
     let err = match reclaim(&ct) {
-        Ok(stats) => panic!("reclaim must refuse an unsettled WAL, got {stats:?}"),
+        Ok(stats) => panic!("reclaim must refuse WAL replay input, got {stats:?}"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("write-ahead log"), "the refusal must name why, got: {err}");
+    assert!(err.contains("WAL replay input"), "the refusal must name why, got: {err}");
 
-    // Settle it properly and reclaim proceeds.
+    // Publish and retire the replay input; reclaim then proceeds.
     let mut s = Store::open_file(&ct, cfg()).unwrap();
     s.sync().unwrap();
     s.flush().unwrap();
     s.close().unwrap();
-    reclaim(&ct).expect("once the writer is gone and the WAL settled, reclaim proceeds");
+    reclaim(&ct).expect("once the writer is gone and WAL input is retired, reclaim proceeds");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -957,156 +1045,6 @@ fn an_extension_after_an_intervening_member_takes_a_fresh_aligned_extent() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-#[test]
-fn sealed_is_final() {
-    let root = tmp("sealed");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("sealed.turndb");
-
-    // Staged content commits and seals in one flip.
-    let mut c = Container::create(&ct).unwrap();
-    c.put_bytes("kept", b"the last bytes this file will ever gain").unwrap();
-    let seq = c.commit_sealed().unwrap();
-    assert_eq!(seq, 1);
-    assert!(c.sealed());
-
-    // Every mutation refuses, on this handle and on a fresh one.
-    assert!(c.put_bytes("more", b"x").unwrap_err().to_string().contains("sealed"));
-    assert!(c.append_stream("kept", 1, |_, _| Ok(())).unwrap_err().to_string().contains("sealed"));
-    assert!(c.remove("kept").unwrap_err().to_string().contains("sealed"));
-    assert!(c.commit().unwrap_err().to_string().contains("sealed"));
-    assert!(c.commit_sealed().unwrap_err().to_string().contains("sealed"));
-    drop(c);
-
-    let reopened = Container::open(&ct).unwrap();
-    assert!(reopened.sealed(), "the flag must survive a reopen");
-    assert_eq!(
-        reopened.read_file_bounded("kept", 1024).unwrap(),
-        b"the last bytes this file will ever gain"
-    );
-    assert_eq!(reopened.verify().unwrap(), 1, "sealed refuses writes, never reads");
-    drop(reopened);
-
-    // Reclaim rewrites, and a sealed container is final: refuse, do not quietly unseal.
-    assert!(turndb::container::reclaim(&ct).unwrap_err().to_string().contains("sealed"));
-
-    // The flag is byte 50 bit 0 of the live slot, inside the checksummed prefix.
-    let bytes = std::fs::read(&ct).unwrap();
-    let live = newest_slot(&bytes);
-    assert_eq!(bytes[live + 50] & 1, 1);
-
-    // Sealing with nothing staged is a pure flip: same directory, one more commit, final.
-    let ct2 = root.join("sealed-flip.turndb");
-    let mut c = Container::create(&ct2).unwrap();
-    c.put_bytes("kept", b"payload").unwrap();
-    c.commit().unwrap();
-    let sealed_at = c.commit_sealed().unwrap();
-    assert_eq!(sealed_at, 2, "a pure seal is its own commit");
-    drop(c);
-    let r = Container::open(&ct2).unwrap();
-    assert!(r.sealed());
-    assert_eq!(r.read_file_bounded("kept", 64).unwrap(), b"payload");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// The first published containers carried single-extent members and an unstamped free list. They
-/// must open exactly as written, and the first commit over one publishes the current revision —
-/// an upgrade the owner performs by writing, not a migration tool.
-#[test]
-fn the_first_published_revision_upgrades_on_first_commit() {
-    let root = tmp("first-revision");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("old.turndb");
-
-    fn vput(out: &mut Vec<u8>, mut v: u64) {
-        loop {
-            let b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(b);
-                break;
-            }
-            out.push(b | 0x80);
-        }
-    }
-
-    // Hand-build the old layout: two packed members with a dead gap between them (its free list
-    // recorded extents as bare pairs), then the directory, then a version-1 superblock.
-    let alpha = b"legacy payload".to_vec();
-    let beta = noise(9, 20);
-    let alpha_off = REGION_START;
-    let dead_off = alpha_off + alpha.len() as u64;
-    let beta_off = dead_off + 10;
-    let dir_off = beta_off + beta.len() as u64;
-
-    let mut payload = Vec::new();
-    vput(&mut payload, 2);
-    for (name, off, bytes) in [("alpha", alpha_off, &alpha), ("beta", beta_off, &beta)] {
-        vput(&mut payload, name.len() as u64);
-        payload.extend_from_slice(name.as_bytes());
-        vput(&mut payload, off);
-        vput(&mut payload, bytes.len() as u64);
-        payload.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
-    }
-    vput(&mut payload, 1);
-    vput(&mut payload, dead_off);
-    vput(&mut payload, 10);
-
-    let tail = dir_off + payload.len() as u64;
-    let mut slot = [0u8; SLOT_LEN as usize];
-    slot[0..8].copy_from_slice(MAGIC);
-    slot[8..16].copy_from_slice(&1u64.to_le_bytes()); // seq
-    slot[16..24].copy_from_slice(&dir_off.to_le_bytes());
-    slot[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    slot[28..32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    slot[32..36].copy_from_slice(&2u32.to_le_bytes()); // n_entries
-    slot[36..40].copy_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-    slot[40..48].copy_from_slice(&tail.to_le_bytes());
-    slot[48] = 0; // stored
-    slot[49] = 1; // the first published revision
-    let digest = blake3::hash(&slot[0..52]);
-    slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
-
-    let mut file = vec![0u8; REGION_START as usize];
-    file[0..SLOT_LEN as usize].copy_from_slice(&slot);
-    file.extend_from_slice(&alpha);
-    file.extend_from_slice(&noise(0, 10)); // the dead extent's bytes
-    file.extend_from_slice(&beta);
-    file.extend_from_slice(&payload);
-    std::fs::write(&ct, &file).unwrap();
-
-    // It opens exactly as written: members, bytes, and the waste it already carried.
-    let mut c = Container::open(&ct).unwrap();
-    assert_eq!(c.read_file_bounded("alpha", 64).unwrap(), alpha);
-    assert_eq!(c.read_file_bounded("beta", 64).unwrap(), beta);
-    assert_eq!(c.free_bytes(), 10, "the old free list must round-trip");
-    assert_eq!(c.verify().unwrap(), 2);
-
-    // Writing to it publishes the current revision; nothing it held is disturbed.
-    let delta = noise(11, 30);
-    c.append_stream("alpha", delta.len() as u64, |at, into| {
-        into.copy_from_slice(&delta[at as usize..at as usize + into.len()]);
-        Ok(())
-    })
-    .unwrap();
-    let seq = c.commit().unwrap();
-    assert_eq!(seq, 2);
-    drop(c);
-
-    let bytes = std::fs::read(&ct).unwrap();
-    let live = newest_slot(&bytes);
-    assert_eq!(bytes[live + 49], CONTAINER_VERSION, "a commit publishes the current revision");
-
-    let reopened = Container::open(&ct).unwrap();
-    let mut want = alpha.clone();
-    want.extend_from_slice(&delta);
-    assert_eq!(reopened.read_file_bounded("alpha", 64).unwrap(), want);
-    assert_eq!(reopened.read_file_bounded("beta", 64).unwrap(), beta);
-    assert!(reopened.free_bytes() >= 10, "old waste stays answerable after the upgrade");
-    assert_eq!(reopened.verify().unwrap(), 2);
-    std::fs::remove_dir_all(&root).ok();
-}
-
 /// A checksum-valid directory that lies about layout must refuse at open, before any read can be
 /// served bytes that are simultaneously someone else's. The random storm reaches these shapes by
 /// luck; this reaches each one on purpose.
@@ -1145,7 +1083,7 @@ fn a_directory_that_lies_about_layout_is_refused_at_open() {
         slot[36..40].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
         slot[40..48].copy_from_slice(&tail.to_le_bytes());
         slot[48] = 0; // stored
-        slot[49] = CONTAINER_VERSION;
+        slot[49] = CONTAINER_DRAFT_EPOCH;
         let digest = blake3::hash(&slot[0..52]);
         slot[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
 
@@ -1164,7 +1102,7 @@ fn a_directory_that_lies_about_layout_is_refused_at_open() {
     // Two members claiming overlapping extents.
     let mut p = Vec::new();
     vput(&mut p, 2);
-    for (name, off, len) in [("first", member_off, 4096u64), ("second", member_off + 100, 200u64)] {
+    for (name, off, len) in [("first", member_off, 4096u64), ("second", member_off, 200u64)] {
         vput(&mut p, name.len() as u64);
         p.extend_from_slice(name.as_bytes());
         vput(&mut p, 1); // n_extents
@@ -1185,7 +1123,7 @@ fn a_directory_that_lies_about_layout_is_refused_at_open() {
     vput(&mut p, 4096);
     p.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
     vput(&mut p, 1); // n_free
-    vput(&mut p, member_off + 1000);
+    vput(&mut p, member_off);
     vput(&mut p, 100);
     vput(&mut p, 1); // freed_seq
     assert!(build("free-overlap", &p, 1, 1).contains("overlapping"));
@@ -1200,7 +1138,7 @@ fn a_directory_that_lies_about_layout_is_refused_at_open() {
     vput(&mut p, 1 << 30);
     p.extend_from_slice(&0u32.to_le_bytes());
     vput(&mut p, 0);
-    assert!(build("past-tail", &p, 1, 1).contains("committed region"));
+    assert!(build("past-tail", &p, 1, 1).contains("member region"));
 
     // An empty extent, which addresses nothing and may not be encoded.
     let mut p = Vec::new();
@@ -1229,7 +1167,91 @@ fn a_directory_that_lies_about_layout_is_refused_at_open() {
     vput(&mut p, 99); // freed_seq far beyond seq 1
     assert!(build("future-free", &p, 1, 1).contains("has not happened"));
 
+    // Wire order is part of the directory's canonical identity; a map must not sort hostile bytes
+    // into legitimacy after the fact.
+    let mut p = Vec::new();
+    vput(&mut p, 2);
+    for (name, off, len) in [("z", member_off, 100u64), ("a", member_off + 100, 100u64)] {
+        vput(&mut p, name.len() as u64);
+        p.extend_from_slice(name.as_bytes());
+        vput(&mut p, 1);
+        vput(&mut p, off);
+        vput(&mut p, len);
+        p.extend_from_slice(
+            &crc32fast::hash(&body[(off - member_off) as usize..][..len as usize]).to_le_bytes(),
+        );
+    }
+    vput(&mut p, 0);
+    assert!(build("name-order", &p, 2, 1).contains("wire order"));
+
+    let mut trailing = Vec::new();
+    vput(&mut trailing, 0); // no members
+    vput(&mut trailing, 0); // no free extents
+    trailing.push(99);
+    assert!(build("directory-trailing", &trailing, 0, 1).contains("trailing"));
+
+    // Names are physical paths, not strings to normalize after parsing.
+    let mut p = Vec::new();
+    vput(&mut p, 1);
+    vput(&mut p, 4);
+    p.extend_from_slice(b"a//b");
+    vput(&mut p, 1);
+    vput(&mut p, member_off);
+    vput(&mut p, 100);
+    p.extend_from_slice(&crc32fast::hash(&body[..100]).to_le_bytes());
+    vput(&mut p, 0);
+    assert!(build("noncanonical-name", &p, 1, 1).contains("canonical"));
+
+    // Sequence zero has one exact representation: both birth slots and no encoded directory.
+    let mut p = Vec::new();
+    vput(&mut p, 0);
+    vput(&mut p, 0);
+    assert!(build("sequence-zero-directory", &p, 0, 0).contains("sequence-zero"));
+
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn superblock_reservations_and_the_empty_state_are_exact() {
+    let root = tmp("strict-superblock");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let reserved = root.join("reserved-tail.turndb");
+    let mut container = Container::create(&reserved).unwrap();
+    container.put_bytes("member", b"current").unwrap();
+    container.commit().unwrap();
+    drop(container);
+    let mut bytes = std::fs::read(&reserved).unwrap();
+    bytes[SLOT_LEN as usize + 56] = 1; // outside the checksum, but still defined as zero
+    std::fs::write(&reserved, bytes).unwrap();
+    assert!(Container::open(&reserved).is_err());
+
+    let noncanonical = root.join("noncanonical-empty.turndb");
+    Container::create(&noncanonical).unwrap();
+    let mut bytes = std::fs::read(&noncanonical).unwrap();
+    bytes[16..24].copy_from_slice(&(REGION_START + 1).to_le_bytes());
+    let digest = blake3::hash(&bytes[0..52]);
+    bytes[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
+    std::fs::write(&noncanonical, bytes).unwrap();
+    assert!(Container::open(&noncanonical).is_err());
+
+    // Two individually authentic slots cannot make contradictory claims at the same sequence.
+    let contradictory = root.join("contradictory-slots.turndb");
+    let mut container = Container::create(&contradictory).unwrap();
+    container.put_bytes("member", b"current").unwrap();
+    container.commit().unwrap();
+    drop(container);
+    let mut bytes = std::fs::read(&contradictory).unwrap();
+    let second_slot = bytes[SLOT_LEN as usize..2 * SLOT_LEN as usize].to_vec();
+    bytes[0..SLOT_LEN as usize].copy_from_slice(&second_slot);
+    let altered_tail = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) + 1;
+    bytes[40..48].copy_from_slice(&altered_tail.to_le_bytes());
+    let digest = blake3::hash(&bytes[0..52]);
+    bytes[52..56].copy_from_slice(&digest.as_bytes()[0..4]);
+    std::fs::write(&contradictory, bytes).unwrap();
+    assert!(Container::open(&contradictory).is_err());
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 // ── reclaim's publication protocol: anchor, candidate, locked handoff, recovery ──────────────
@@ -1298,6 +1320,61 @@ fn reclaim_leaves_exactly_one_file_and_the_store_serves_everything() {
 }
 
 #[test]
+fn reclaim_refuses_corrupt_source_members_instead_of_normalizing_them() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let root = tmp("reclaim-refuses-corrupt-source");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.turndb");
+    let mut container = Container::create(&path).unwrap();
+    container.put_bytes("member", &noise(50, 8 * 1024)).unwrap();
+    container.commit().unwrap();
+    container.put_bytes("member", &noise(51, 8 * 1024)).unwrap();
+    container.commit().unwrap();
+    let (offset, length) = container.member_extents("member").unwrap()[0];
+    assert!(container.free_bytes() > 0, "fixture must make reclaim do work");
+    drop(container);
+
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(offset + length / 2)).unwrap();
+    file.write_all(&[0x7f]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let corrupt = std::fs::read(&path).unwrap();
+
+    let error = turndb::container::reclaim(&path).unwrap_err();
+    assert!(format!("{error:#}").contains("not a valid current-format store"), "{error:#}");
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt, "reclaim rewrote corrupt input");
+    assert!(!root.join("source.turndb.reclaiming").exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reclaim_refuses_a_valid_outer_container_that_is_not_a_current_store() {
+    let root = tmp("reclaim-refuses-non-store");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.turndb");
+    let mut container = Container::create(&path).unwrap();
+    container.put_bytes("unknown-member", &noise(60, 8 * 1024)).unwrap();
+    container.commit().unwrap();
+    container.put_bytes("unknown-member", &noise(61, 8 * 1024)).unwrap();
+    container.commit().unwrap();
+    assert!(container.free_bytes() > 0, "fixture must give reclaim work to do");
+    assert!(container.verify().is_ok(), "outer container bytes are internally valid");
+    drop(container);
+    let before = std::fs::read(&path).unwrap();
+
+    let error = turndb::container::reclaim(&path).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not a valid current-format store"),
+        "the refusal must come from full store validation: {error:#}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "reclaim mutated non-store input");
+    assert!(!root.join("source.turndb.reclaiming").exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn an_absent_store_beside_a_whole_anchor_is_recovered_by_a_writer_open_and_refused_by_a_reader() {
     let root = tmp("reclaim-anchor");
     std::fs::create_dir_all(&root).unwrap();
@@ -1327,17 +1404,20 @@ fn a_corrupt_or_incomplete_anchor_is_refused_and_nothing_is_created() {
         std::fs::create_dir_all(&root).unwrap();
         let ct = root.join("s.turndb");
         let _ = wasteful_store(&ct);
+        let live_extent = if damage == 0 {
+            let c = Container::open(&ct).unwrap();
+            let part = c.names().find(|n| n.starts_with("part-")).unwrap().to_string();
+            Some(c.member_extents(&part).unwrap()[0])
+        } else {
+            None
+        };
         let anchor = root.join("s.turndb.reclaimed");
         std::fs::rename(&ct, &anchor).unwrap();
         let bytes = std::fs::read(&anchor).unwrap();
         let before = bytes.clone();
         if damage == 0 {
             // Inside a LIVE member: a flip in superseded space would validate legitimately.
-            let (off, len) = {
-                let c = Container::open(&anchor).unwrap();
-                let part = c.names().find(|n| n.starts_with("part-")).unwrap().to_string();
-                c.member_extents(&part).unwrap()[0]
-            };
+            let (off, len) = live_extent.expect("corrupt case records a live extent");
             let mut b = bytes;
             let at = (off + len / 2) as usize;
             b[at] ^= 0xff;
@@ -1457,47 +1537,5 @@ fn two_recovery_contenders_converge_on_one_store() {
     );
     assert_serves(&ct, &want, "after contention");
     assert_eq!(names(&ct), vec!["s.turndb".to_string()]);
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// A 0.1.x working session beside a store is refused by name by a writer open and by reclaim,
-/// and never removed — it may hold acknowledged writes only that release can settle.
-#[test]
-fn a_legacy_working_directory_is_refused_by_open_and_reclaim_and_never_removed() {
-    let root = tmp("legacy-hot");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("s.turndb");
-    let _ = wasteful_store(&ct);
-    let hot = root.join("s.turndb-hot");
-    std::fs::create_dir_all(&hot).unwrap();
-    std::fs::write(hot.join("WAL"), b"acked").unwrap();
-    let err = match Store::open_file(&ct, cfg()) {
-        Ok(_) => panic!("a writer open must refuse"),
-        Err(e) => e,
-    };
-    assert!(format!("{err:#}").contains("s.turndb-hot"), "{err:#}");
-    let err = turndb::container::reclaim(&ct).unwrap_err();
-    assert!(format!("{err:#}").contains("working directory"), "{err:#}");
-    assert!(hot.join("WAL").exists(), "never removed");
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// Beside an ABSENT store, a 0.1.x working directory refuses creation too: nothing is created,
-/// nothing is removed, the path is named.
-#[test]
-fn a_legacy_working_directory_beside_an_absent_store_refuses_creation() {
-    let root = tmp("legacy-hot-absent");
-    std::fs::create_dir_all(&root).unwrap();
-    let ct = root.join("s.turndb");
-    let hot = root.join("s.turndb-hot");
-    std::fs::create_dir_all(&hot).unwrap();
-    std::fs::write(hot.join("WAL"), b"acked").unwrap();
-    let err = match Store::open_file(&ct, cfg()) {
-        Ok(_) => panic!("must not create a store beside a 0.1.x working directory"),
-        Err(e) => e,
-    };
-    assert!(format!("{err:#}").contains("s.turndb-hot"), "{err:#}");
-    assert!(!ct.exists(), "nothing created");
-    assert!(hot.join("WAL").exists(), "nothing removed");
     std::fs::remove_dir_all(&root).ok();
 }

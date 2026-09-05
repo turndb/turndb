@@ -12,9 +12,9 @@ Each event contains:
 - the stable TurnDB error class for failures/cancellations; and
 - core execution duration in integer nanoseconds.
 
-The journal currently covers successful open/recovery plus sync, flush, compaction, backup,
-verification, punching, refold, and format migration attempts. As with operation metrics, a Node
-method may cause several core events when it first settles earlier writes. Durations exclude actor
+The journal currently covers successful open/WAL replay plus durability synchronization,
+publication, part merge, backup, verification, content punch, refold, and erasure attempts. As with operation metrics, a Node
+method may cause several core events when it first synchronizes, publishes, and settles earlier accepted mutations. Durations exclude actor
 queue wait. Consumers should add their own wall-clock receipt time and correlation context rather
 than asking the storage core to own a clock or tracing vocabulary.
 

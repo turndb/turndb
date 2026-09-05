@@ -108,15 +108,14 @@ function guarded(fn, operation) {
     }
     let lifecycleOptions;
     if ([
-      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup', 'seal',
+      'compact', 'compactBounded', 'estimateCompactionSpace', 'erase', 'backup',
       'recoverManifest',
     ].includes(operation)) {
       lifecycleOptions = args[1];
     } else if (['restoreBackup', 'querySql'].includes(operation)) {
       lifecycleOptions = args[2];
     } else if ([
-      'sync', 'flush', 'verify', 'punch', 'refold', 'estimateRefoldSpace', 'spaceUsage',
-      'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
+      'sync', 'flush', 'verify', 'contentPunch', 'refold', 'estimateRefoldSpace', 'spaceUsage',
       'partDistribution', 'contentLiveness',
     ].includes(operation)) {
       lifecycleOptions = args[0];
@@ -141,9 +140,8 @@ for (const Class of [native.NativeStore, native.NativeSnapshot, native.NativeSql
   for (const name of [
     'write', 'sync', 'flush', 'scan', 'explainScan', 'readContent', 'snapshot',
     'querySql', 'next', 'stats', 'compact', 'compactBounded', 'estimateCompactionSpace',
-    'verify', 'erase', 'punch', 'refold', 'estimateRefoldSpace',
-    'formatMigrationStatus', 'estimateFormatMigrationSpace', 'migrateFormatStep',
-    'backup', 'seal', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
+    'verify', 'erase', 'contentPunch', 'refold', 'estimateRefoldSpace',
+    'backup', 'health', 'metrics', 'lifecycleEvents', 'partDistribution', 'contentLiveness', 'spaceUsage',
     'schema', 'close',
   ]) {
     if (typeof Class.prototype[name] === 'function') {
@@ -169,21 +167,18 @@ const contractOperations = Object.freeze([
   'openWriter', 'openSnapshot', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
   'explainScan', 'schema', 'readContent', 'snapshot',
   ...(native.capabilities().sql ? ['querySql'] : []),
-  'seal', 'verify', 'spaceUsage', 'compactBounded', 'refold', 'erase', 'close',
+  ...(native.capabilities().backupRestore ? ['backup'] : []),
+  'verify', 'spaceUsage', 'compactBounded', 'refold', 'erase', 'close',
 ]);
 
 function capabilities() {
   const compiled = native.capabilities();
   return {
     ...compiled,
-    contractVersion: 1,
+    contractVersion: 2,
     profile: 'native',
     operations: [...contractOperations],
-    partFormat: {
-      write: compiled.partFormatWrite,
-      readMax: compiled.partFormatReadMax,
-    },
-    reclamation: compiled.allocatedSpaceUsage ? 'punch_or_refold' : 'refold_only',
+    reclamation: compiled.inPlaceDeallocation ? 'content_punch_or_refold' : 'refold_only',
     cancellation: {
       scan: compiled.scanCancellation,
       lifecycle: compiled.lifecycleCancellation,

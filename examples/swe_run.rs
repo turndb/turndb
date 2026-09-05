@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
-use turndb::{AttrValue, BodyOp, Record};
+use turndb::{AttrValue, ContentOp, Record};
 
 /// The engine's carve, as spans of (foldable, range). One historical difference, kept for
 /// comparability with earlier runs of this harness: a non-array body here folds WHOLE rather
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         nrec += 1;
         logical += body.len() as u64;
 
-        let mut prog: Vec<BodyOp> = Vec::new();
+        let mut prog: Vec<ContentOp> = Vec::new();
         for (foldable, r) in carve(&body) {
             let span = &body[r.clone()];
             if foldable {
@@ -107,9 +107,9 @@ fn main() -> anyhow::Result<()> {
                 if p.deduped {
                     dups += 1;
                 }
-                prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
+                prog.push(ContentOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
-                prog.push(BodyOp::Lit(span.to_vec()));
+                prog.push(ContentOp::Lit(span.to_vec()));
             }
         }
         if nrec % verify_every as u64 == 0 {
@@ -142,9 +142,9 @@ fn main() -> anyhow::Result<()> {
             pending.clear();
             samples.clear();
             seen_ids.clear();
-            // NOTE: the dedup window is deliberately NOT sealed here. This harness writes fold and
+            // NOTE: the dedup window is deliberately NOT released here. This harness writes fold and
             // parts directly, with no Store and therefore no Tier-1, so keeping the window resident is
-            // the only way it can measure TRUE GLOBAL dedup. `Store` now seals at every flush and
+            // the only way it can measure TRUE GLOBAL dedup. `Store` now releases it at every flush and
             // recovers the same dedup through Tier-1 lookups against parts' hash columns — so the
             // resident count printed below is the memory that posture COSTS, not a number to match.
             let el = t0.elapsed().as_secs_f64();
@@ -223,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         mib(logical) / secs
     );
     println!(
-        "{:<26}{} distinct pieces resident (global dedup window, not sealed)",
+        "{:<26}{} distinct pieces resident (global dedup window, not released)",
         "dedup window",
         fold.window_len()
     );

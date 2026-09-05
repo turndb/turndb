@@ -118,7 +118,7 @@ deliberately bypass repository scripts with the npm CLI.
 npm publication is not transactional. The platform package is published first so the visible root
 package can never name a dependency that does not exist. If the second publication fails, an
 installable but undiscoverable platform package may remain. The workflow deliberately does not
-unpublish or rewrite versions; an owner decides how to recover.
+unpublish or rewrite versions; an owner decides how to respond.
 
 Before the first release, repository owners must configure all external facts the source tree cannot:
 
@@ -133,10 +133,6 @@ The third-party report is generated from the locked, all-feature Linux native de
 `cargo-about 0.9.1`. `scripts/check-third-party-licenses.sh` regenerates it offline and byte-compares
 the result; dependency or license changes cannot silently leave the shipped attribution stale.
 
-The package version is not the on-disk format version. A `0.x` consumer must follow the compatibility
-policy: a minor release may advance the writer format or make a documented API break, and downgrade
-writing is not promised. This is suitable for an early production integration without pretending
-the format or API has reached the 1.0 freeze.
-
-The candidate's consumer-facing scope and known limits are collected in the
-[native 0.1.0 release notes](releases/native-0.1.0.md).
+The package version is not the physical draft identity. The current build accepts exactly the draft
+named by `FORMAT.md`; a later draft reset may make development artifacts unreadable and will not
+carry an old reader or downgrade writer. API semver is a separate policy.

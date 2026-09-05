@@ -47,6 +47,17 @@ pub struct IntegrityError {
     source: Box<dyn std::error::Error + Send + Sync + 'static>,
 }
 
+#[derive(Debug)]
+pub(crate) struct InvalidArgumentError(pub(crate) String);
+
+impl std::fmt::Display for InvalidArgumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidArgumentError {}
+
 impl IntegrityError {
     pub fn new(context: &'static str, source: anyhow::Error) -> IntegrityError {
         IntegrityError { context, source: source.into_boxed_dyn_error() }
@@ -67,14 +78,17 @@ impl std::error::Error for IntegrityError {
 
 /// Classify a rich TurnDB error chain without matching its rendered message.
 pub fn classify(error: &anyhow::Error) -> ErrorClass {
-    use crate::pack::BackupError;
-    use crate::store::{CompactionError, RecoveryError, WriteAdmissionError};
+    use crate::backup::BackupError;
+    use crate::store::{CompactionError, ManifestPromotionError, WriteAdmissionError};
 
     if error.chain().any(|cause| {
         cause.downcast_ref::<crate::scan::ScanInterrupted>().is_some()
             || cause.downcast_ref::<crate::control::OperationInterrupted>().is_some()
     }) {
         return ErrorClass::Cancelled;
+    }
+    if error.chain().any(|cause| cause.downcast_ref::<InvalidArgumentError>().is_some()) {
+        return ErrorClass::InvalidArgument;
     }
     if error.chain().any(|cause| cause.downcast_ref::<IntegrityError>().is_some()) {
         return ErrorClass::Corruption;
@@ -121,17 +135,21 @@ pub fn classify(error: &anyhow::Error) -> ErrorClass {
     }
     if let Some(backup) = error.chain().find_map(|cause| cause.downcast_ref::<BackupError>()) {
         return match backup {
-            BackupError::DestinationExists(_) => ErrorClass::InvalidArgument,
+            BackupError::DestinationExists(_) | BackupError::SourceStagingCollision { .. } => {
+                ErrorClass::InvalidArgument
+            }
             BackupError::InvalidBackup { .. } => ErrorClass::Corruption,
             BackupError::Unsupported(_) => ErrorClass::Unsupported,
         };
     }
-    if let Some(recovery) = error.chain().find_map(|cause| cause.downcast_ref::<RecoveryError>()) {
-        return match recovery {
-            RecoveryError::Healthy(_) | RecoveryError::RollbackLimit { .. } => {
+    if let Some(promotion) =
+        error.chain().find_map(|cause| cause.downcast_ref::<ManifestPromotionError>())
+    {
+        return match promotion {
+            ManifestPromotionError::Healthy(_) | ManifestPromotionError::RollbackLimit { .. } => {
                 ErrorClass::InvalidArgument
             }
-            RecoveryError::NoUsableCandidate { .. } => ErrorClass::Corruption,
+            ManifestPromotionError::NoUsableCandidate { .. } => ErrorClass::Corruption,
         };
     }
 

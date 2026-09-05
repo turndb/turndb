@@ -15,9 +15,18 @@ from turndb import Store
 
 db = Store.open("agent.turndb")
 db.write([{"kind": "put", "id": "trace/1", "attrs": [], "contents": []}], durable=True)
-db.seal("agent-snapshot.turndb")
+db.backup("agent-backup.turndb")
 db.close()
 ```
+
+The backup result's string-valued `commit` field is the public store-authority encoding: `"0"`
+means the canonical origin and a positive decimal value means that numbered manifest revision. Zero
+never denotes a manifest revision.
+
+`close()` releases the handle without synchronizing or publishing by default. Pass
+`close(durable=True)` to synchronize, publish the pending change set, leave the store settled, and
+remove the WAL sidecar; otherwise call `sync()` or `flush()` first according to the guarantee you
+need.
 
 Attributes, writes, scan requests, and scan results use the canonical data shapes in
 `conformance/v1/query.schema.json`. Content bytes in those serializable shapes are base64. The
@@ -32,7 +41,7 @@ provider.add_span_processor(BatchSpanProcessor(exporter))
 ```
 
 The exporter durably acknowledges each export by default, publishes after 512 spans or five
-seconds, and always syncs and flushes on `force_flush()` and `shutdown()`.
+seconds, and always synchronizes durability and publishes on `force_flush()` and `shutdown()`.
 
 Provider SDKs remain optional. `trace_gen_ai_call()` and `trace_gen_ai_call_async()` wrap any
 client closure in the canonical `gen_ai` CLIENT span, move input/output message arrays onto the

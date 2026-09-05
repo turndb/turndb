@@ -13,8 +13,8 @@ cargo build --manifest-path "$root/Cargo.toml" \
 cp "$root/target/wasm32-wasip1/wasm-release/turndb_wasm.wasm" "$pkg/turndb.wasm"
 cp "$root/LICENSE" "$root/NOTICE" "$pkg/"
 
-# The single-file suite reads packs and containers, and this binding can produce neither — it has
-# no pack or checkpoint surface, only the reader. The CLI is the producer, so it is built here
+# The single-file suite reads current containers, and this binding needs a producer fixture. The CLI
+# is that producer, so it is built here
 # rather than assumed: a test that silently skips when a binary is missing is a test that passes
 # on the machine that needed it most.
 cargo build --manifest-path "$root/Cargo.toml" --bin turndb

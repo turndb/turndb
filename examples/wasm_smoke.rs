@@ -1,4 +1,4 @@
-//! Round-trip proof for a non-native build: write a store, read it back byte-exact, seal it.
+//! Round-trip proof for a non-native build: write a store, flush it, and read it back byte-exact.
 //!
 //! Built for `wasm32-wasip1` and run under a WASI host, this exercises the whole engine through the
 //! platform floor in `sys.rs`. Built natively by `npm/interop.sh`, it supplies the reverse fixture

@@ -3,7 +3,7 @@ name = "turndb-python"
 version = "0.1.8"
 edition = "2021"
 publish = false
-description = "Python binding for TurnDB's contract-v1 embedded trace store"
+description = "Python binding for TurnDB's embedded trace store"
 license = "Apache-2.0"
 repository = "https://github.com/turndb/turndb"
 

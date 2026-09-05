@@ -1,6 +1,6 @@
 # TurnDB in the browser
 
-This package is the read-only contract-v1 core for `wasm32-unknown-unknown`. `BrowserDatabase`
+This package is the read-only browser core for `wasm32-unknown-unknown`. `BrowserDatabase`
 opens a `Uint8Array`, `Blob`/`File`, or HTTP URL. Blob and HTTP use a bounded 64 KiB block cache;
 the wasm engine reports an exact missing byte range and the JavaScript layer fills only that block.
 

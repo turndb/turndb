@@ -1,5 +1,5 @@
 {
-  "contractVersion": 1,
+  "contractVersion": 2,
   "invariants": [
     {
       "name": "sql-requires-columnar-and-arrow-ipc",
@@ -10,13 +10,12 @@
       "name": "read-only-profiles-have-no-writer",
       "if": { "writerExclusion": "read_only" },
       "then": {
-        "partFormatWriteAbsent": true,
         "operationsExclude": [
           "openWriter",
           "write",
           "sync",
           "flush",
-          "seal",
+          "backup",
           "compactBounded",
           "refold",
           "erase"

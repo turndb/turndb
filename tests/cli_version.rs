@@ -33,3 +33,11 @@ fn help_mentions_the_version_verb() {
         "help does not list `version`"
     );
 }
+
+#[test]
+fn help_names_backup_operation() {
+    let out = turndb().arg("help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("backup    <STORE> <OUT>"), "help does not list `backup`: {help}");
+}

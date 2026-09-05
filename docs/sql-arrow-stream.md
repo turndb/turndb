@@ -1,7 +1,7 @@
 # Read-only SQL and Arrow IPC streaming
 
 TurnDB's richer embedded query boundary lives in Rust. A binding supplies SQL text, positional typed
-values, and a resource option; Rust fixes the immutable snapshot, validates a read-only plan, executes
+values, and a resource option; Rust fixes the immutable read view, validates a read-only plan, executes
 the storage-backed columnar lens, and encodes results. This keeps DataFusion and Arrow on the database
 side of the Rust/JavaScript seam while allowing any Arrow-capable consumer to interpret the result.
 
@@ -29,18 +29,19 @@ base64, JSON, or row-by-row N-API conversion occurs. Only one pull may be in fli
 Closing the handle drops its DataFusion stream. A cancelled or timed-out pull also drops the stream,
 returns `CANCELLED`, and cannot be resumed as though execution state were unchanged.
 
-Snapshot ownership is explicit:
+Read-view ownership is explicit:
 
-- `NativeSnapshot.querySql` queries that immutable manifest and never publishes or mutates anything.
-- `NativeStore.querySql` first actor-serializes a snapshot, syncing and flushing accepted writes, then
+- `NativeSnapshot.querySql` queries its pinned store authority and never publishes or mutates anything.
+- `NativeStore.querySql` first actor-serializes a read-view creation, publishing and settling accepted mutations, then
   releases the writer actor and executes against the resulting immutable reader.
 
 This gives writer queries read-your-writes behavior without letting concurrent DataFusion tasks touch
 the mutable store. It also makes the publication cost visible in the API contract; callers issuing
-many queries should retain a snapshot instead of repeatedly querying through the writer.
-An already-expired planning deadline or pre-aborted signal refuses before submitting the snapshot
+many queries should retain a read view instead of repeatedly querying through the writer.
+An already-expired planning deadline or pre-aborted signal refuses before submitting the read-view
 command. Once a writer-backed query has submitted that command, later cancellation stops waiting and
-planning but does not retract actor-ordered sync/flush work that may already have published the cut.
+planning but does not retract actor-ordered publication work that may already have selected a new
+current store authority.
 
 Each query uses a separate DataFusion execution-memory pool, 256 MiB by default and configurable with
 `maxMemoryBytes`. Resource exhaustion is returned as `RESOURCE_EXHAUSTED`. The value bounds tracked
@@ -51,8 +52,8 @@ not participate in its pool.
 Concurrent queries also reserve their complete per-query ceilings from a shared `SqlBudget`. This is
 deliberately conservative: it bounds the sum of possible DataFusion execution-pool use rather than
 waiting for actual allocations to create memory pressure. The default native aggregate is 1 GiB and
-`maxConcurrentSqlMemoryBytes` configures it when opening a writer or independent snapshot. A writer
-and every snapshot derived from it share one budget. A query that cannot reserve its ceiling fails
+`maxConcurrentSqlMemoryBytes` configures it when opening a writer or independent read view. A writer
+and every read view derived from it share one budget. A query that cannot reserve its ceiling fails
 immediately with `RESOURCE_EXHAUSTED`; it does not wait in JavaScript or create an unbounded queue.
 Reservations are released at EOF, execution error, cancellation/close, or handle drop. The handle
 getters `maxConcurrentSqlMemoryBytes` and `reservedSqlMemoryBytes` expose the configured and current

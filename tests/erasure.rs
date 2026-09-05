@@ -118,7 +118,7 @@ fn an_unreadable_live_manifest_refuses_rather_than_declaring_nothing_erased() {
         Err(e) => {
             let msg = format!("{e:#}");
             assert!(
-                msg.contains("live manifest"),
+                msg.contains("current manifest authority"),
                 "the refusal must name what could not be read; got {msg:?}"
             );
         }
@@ -165,6 +165,52 @@ fn punching_does_not_disturb_live_reads() {
     }
     drop(s);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn merge_chooses_a_readable_reintroduced_piece_over_punched_dictionary_residue() {
+    let dir = tmp("merge-reintroduced-piece");
+    let path = store_file(&dir);
+    let mut store = Store::open_file(&path, cfg()).unwrap();
+    let content = noise(9_001, 64 * 1024);
+
+    store.put("old", &[Span::Piece(&content)], vec![]).unwrap();
+    for i in 0..24 {
+        store
+            .put(&format!("filler-{i:02}"), &[Span::Piece(&noise(10_000 + i, 64 * 1024))], vec![])
+            .unwrap();
+    }
+    store.sync().unwrap();
+    store.flush().unwrap();
+
+    store.delete("old").unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    let punched = store.punch_unreferenced().unwrap();
+    assert!(punched.blocks_punched > 0, "the original piece must become punched residue");
+
+    store.put("new", &[Span::Piece(&content)], vec![]).unwrap();
+    store.sync().unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.reconstruct("new").unwrap().unwrap(), content);
+
+    // This second reference is WAL-only and omits novel bytes against the readable replacement
+    // mapping. Reopen must skip the newer-looking punched residue by the same rule as acceptance.
+    store.put("pending", &[Span::Piece(&content)], vec![]).unwrap();
+    store.sync().unwrap();
+    drop(store);
+    let mut store = Store::open_file(&path, cfg()).unwrap();
+    assert_eq!(store.reconstruct("pending").unwrap().unwrap(), content);
+    store.flush().unwrap();
+
+    store.merge_range(0, store.part_count()).unwrap().unwrap();
+    assert_eq!(store.reconstruct("new").unwrap().unwrap(), content);
+    drop(store);
+
+    let reopened = Store::open_file(&path, cfg()).unwrap();
+    assert_eq!(reopened.reconstruct("new").unwrap().unwrap(), content);
+    drop(reopened);
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// A re-fold rewrites the world WITHOUT the erased content, so the new generation has no holes to
@@ -285,8 +331,7 @@ fn a_partially_erased_record_refuses_even_though_its_shared_piece_survives() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The migrated suites build single-file stores inside their temp directories: the parent is
-/// ensured, the store is one file within it, and every cleanup keeps operating on the directory.
+/// Build the suite's single-file store inside its cleanup directory.
 fn store_file(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).ok();
     dir.join("s.turndb")

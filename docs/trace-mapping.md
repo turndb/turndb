@@ -35,8 +35,9 @@ content, while an explicitly present empty collection is the exact bytes `[]`.
 
 ## Export cadence
 
-Tier 2 owns policy. The defaults acknowledge every export batch durably, publish a reader-visible
-cut after 512 accepted spans or five seconds, and always sync+flush on `forceFlush`/`shutdown`.
+Tier 2 owns policy. The defaults acknowledge every export batch durably, publish the pending change
+set after 512 accepted spans or five seconds, and always perform synchronization and publication on
+`forceFlush`/`shutdown` through `sync` and `flush`.
 Changing cadence changes visibility and compression economics, never Tier-1 durability semantics.
 An exporter serializes its calls through one queue; it does not issue concurrent store mutations.
 

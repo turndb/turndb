@@ -19,7 +19,7 @@ body:
         - **Exactly what you ran.** A package version if you installed a
           published artifact, or a commit if you built from source.
 
-        If a store directory or pack file reproduces it, say so before
+        If a TurnDB container file reproduces it, say so before
         attaching one — an adversarial store is a payload, and we may
         want a private channel. See SECURITY.md.
   - type: textarea

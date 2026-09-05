@@ -26,7 +26,7 @@ test('compiled facts and callable binding operations are separate questions', as
   assert.equal(reachable.binding, 'wasi');
   assert.deepEqual(reachable.unavailable, {
     allocatedBytes: 'absent',
-    atomicNoReplacePublication: 'absent',
+    atomicNoReplaceInstallation: 'absent',
     cancellationToken: 'absent',
   });
   assert.equal(reachable.limits.lifecycleEvents, 256);
@@ -116,7 +116,7 @@ test('a verification failure is callable through both the result and observabili
     // at member offset zero, and the damage lands there so verification exercises the section
     // checksum rather than the footer.
     const before = await readFile(dir);
-    const footer = before.indexOf(Buffer.from('TURNPART'));
+    const footer = before.indexOf(Buffer.from('TDBPRT01'));
     assert.ok(footer > 0, 'the flushed part must exist in the store file');
     const partStart = Math.floor(footer / 4096) * 4096;
     const after = Buffer.from(before);
@@ -143,7 +143,7 @@ test('the binding exposes lifecycle capacity as a limit and reports cursor gaps'
     const batch = store.lifecycleEvents({ after: 0n, limit: 1 });
     assert.equal(batch.capacity, 256);
     assert.equal(batch.gap, true);
-    assert.equal(batch.droppedEvents, 3n, 'open recovery plus 258 verifies exceeds capacity by three');
+    assert.equal(batch.droppedEvents, 3n, 'open WAL replay plus 258 verifies exceeds capacity by three');
     assert.ok(batch.oldestAvailableSequence > 1n);
     assert.equal(batch.events.length, 1);
   });

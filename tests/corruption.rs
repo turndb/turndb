@@ -13,10 +13,25 @@ use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
 use turndb::store::wal::Wal;
 use turndb::store::{Span, Store};
-use turndb::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
+use turndb::types::{AttrValue, Content, ContentOp, Record, BODY_CONTENT};
 
-fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
-    vec![Content::new(BODY_CONTENT, ops)]
+fn body_content(ops: Vec<ContentOp>) -> Vec<Content> {
+    let identity = match ops.as_slice() {
+        [ContentOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
+        ops if ops.iter().all(|op| matches!(op, ContentOp::Lit(_))) => {
+            let bytes = ops
+                .iter()
+                .flat_map(|op| match op {
+                    ContentOp::Lit(bytes) => bytes.as_slice(),
+                    ContentOp::Piece { .. } => unreachable!(),
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            turndb::ContentHash::of(&bytes)
+        }
+        _ => return vec![Content::new(BODY_CONTENT, ops)],
+    };
+    vec![Content::identified(BODY_CONTENT, ops, identity)]
 }
 
 fn tmp(tag: &str) -> PathBuf {
@@ -113,11 +128,15 @@ fn build_part(dir: &Path) -> (Vec<u8>, Fold) {
         let p = fold.put(body.as_bytes()).unwrap();
         records.push(Record {
             id: format!("rec:{i:03}"),
-            contents: body_content(vec![
-                BodyOp::Lit(b"[".to_vec()),
-                BodyOp::Piece { hash: p.hash, len: p.loc.raw },
-                BodyOp::Lit(b"]".to_vec()),
-            ]),
+            contents: vec![Content::identified(
+                BODY_CONTENT,
+                vec![
+                    ContentOp::Lit(b"[".to_vec()),
+                    ContentOp::Piece { hash: p.hash, len: p.loc.raw },
+                    ContentOp::Lit(b"]".to_vec()),
+                ],
+                turndb::ContentHash::of(format!("[{body}]").as_bytes()),
+            )],
             attrs: vec![
                 ("model".into(), AttrValue::Str(format!("m{}", i % 3))),
                 ("n".into(), AttrValue::Int(i as i64)),
@@ -155,7 +174,7 @@ fn part_parsers_never_panic_on_damage() {
         }
         let n = part.len().min(64);
         for r in 0..n {
-            let _ = part.body(r);
+            let _ = part.content(r, BODY_CONTENT);
             let _ = part.attrs(r);
             let _ = part.record(r);
             let _ = part.reconstruct(r, &fold);
@@ -177,7 +196,7 @@ fn wal_replay_never_panics_on_damage() {
             let h = turndb::PieceHash::of(&bytes);
             let r = Record {
                 id: format!("w:{i}"),
-                contents: body_content(vec![BodyOp::Piece { hash: h, len: bytes.len() as u32 }]),
+                contents: body_content(vec![ContentOp::Piece { hash: h, len: bytes.len() as u32 }]),
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
                     ("f".into(), AttrValue::Float(-0.0)),
@@ -188,7 +207,7 @@ fn wal_replay_never_panics_on_damage() {
         w.append_tomb(10, "w:3").unwrap();
         let extra = Record {
             id: "b:1".into(),
-            contents: body_content(vec![BodyOp::Lit(b"lit".to_vec())]),
+            contents: body_content(vec![ContentOp::Lit(b"lit".to_vec())]),
             attrs: vec![],
         };
         w.append_batch(11, &[(extra, Vec::new(), false)]).unwrap();
@@ -196,7 +215,7 @@ fn wal_replay_never_panics_on_damage() {
     }
     let pristine = std::fs::read(&path).unwrap();
     let target = dir.join("WAL.mutant");
-    storm("wal", &pristine, &target, 8000, 0x57A1, |p| {
+    storm("wal", &pristine, &target, 8000, 0xD4A1, |p| {
         let _ = Wal::replay(p);
     });
     std::fs::remove_dir_all(&dir).ok();
@@ -211,10 +230,14 @@ fn wal_record_decode_never_panics_on_damage() {
     let h = turndb::PieceHash::of(&body_bytes);
     let r = Record {
         id: "d:1".into(),
-        contents: body_content(vec![
-            BodyOp::Lit(b"[".to_vec()),
-            BodyOp::Piece { hash: h, len: body_bytes.len() as u32 },
-        ]),
+        contents: vec![Content::identified(
+            BODY_CONTENT,
+            vec![
+                ContentOp::Lit(b"[".to_vec()),
+                ContentOp::Piece { hash: h, len: body_bytes.len() as u32 },
+            ],
+            turndb::ContentHash::of(&[b"[".as_slice(), body_bytes.as_slice()].concat()),
+        )],
         attrs: vec![
             ("s".into(), AttrValue::Str("v".into())),
             ("i".into(), AttrValue::Int(-9)),
@@ -263,35 +286,6 @@ fn fold_open_never_panics_on_damage() {
         for (loc, hash) in locs.iter().take(16) {
             let _ = f.read_verified(*loc, *hash);
         }
-    });
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn pack_open_never_panics_on_damage() {
-    let dir = tmp("pack");
-    std::fs::create_dir_all(&dir).unwrap();
-    // The pack WRITER is gone; the checked-in version-one consumer artifact is the pack every
-    // surviving reader must still take, so it is also the pack the storm mutates.
-    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
-    let hex = std::fs::read_to_string(&hex_path).unwrap();
-    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
-    let pristine: Vec<u8> = digits
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect();
-    let target = dir.join("mutant.turndb");
-    storm("pack", &pristine, &target, 2500, 0x9AC4, |p| {
-        // the full read stack over a damaged pack: footer, TOC, manifest, fold, parts
-        let Ok(pack) = turndb::pack::Pack::open(p) else { return };
-        let _ = pack.verify();
-        let Ok(rs) = turndb::store::open_read_pack(p, FoldCfg::default()) else { return };
-        let _ = rs.ids();
-        let _ = rs.reconstruct("legacy/0001");
-        // And the surviving write-side door a pack still walks through: conversion.
-        let _ = turndb::store::convert_to_file(p, &p.with_extension("converted"));
-        let _ = std::fs::remove_file(p.with_extension("converted"));
     });
     std::fs::remove_dir_all(&dir).ok();
 }

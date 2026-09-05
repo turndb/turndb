@@ -345,11 +345,6 @@ fn failed_release_retries_build_the_intended_package_through_the_trusted_caller(
         wasm_leaf.contains("open(join(dir, \"smoke.turndb\"))"),
         "the installed package smoke must open a store file, not its temporary parent directory"
     );
-    assert!(
-        !wasm_leaf.contains("open(dir)"),
-        "the retired directory layout must not return through a release smoke"
-    );
-
     let python_leaf =
         fs::read_to_string(format!("{root}/.github/workflows/release-python.yml")).unwrap();
     assert!(

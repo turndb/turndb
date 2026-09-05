@@ -56,9 +56,8 @@ fn built(tag: &str) -> PathBuf {
     dir
 }
 
-/// Lay a store's members out as loose files under `dir` — the artifacts ARE the members, and
-/// these tests parse artifacts raw, so deconstruction is all the envelope owes them. The WAL
-/// sidecar, when present, lands under its retired in-directory name for the same reason.
+/// Materialize container members beneath `dir` so the tests can inspect each physical artifact
+/// directly. The hot WAL sidecar is copied beside those extracted members when present.
 fn materialize(store: &Path, dir: &std::path::Path) {
     let c = turndb::container::Container::open(store).unwrap();
     for name in c.names().map(String::from).collect::<Vec<_>>() {
@@ -130,7 +129,7 @@ fn decode_codec(codec: u8, stored: &[u8], raw: usize) -> Vec<u8> {
 /// them — offsets and varints by hand, no turndb decoder involved.
 fn raw_section(part: &[u8], want: &str) -> Vec<u8> {
     let f = part.len() - 56;
-    let version = part[f + 45];
+    assert_eq!(part[f + 45], 1, "part footer carries the one current draft epoch");
     let toc_off = le64(part, f + 8) as usize;
     let toc_stored = le32(part, f + 16) as usize;
     let toc_raw = le32(part, f + 20) as usize;
@@ -146,9 +145,7 @@ fn raw_section(part: &[u8], want: &str) -> Vec<u8> {
         let raw = varint(&toc, &mut at) as usize;
         let codec = toc[at];
         at += 1;
-        if version >= 1 {
-            at += 4; // per-section xsum, present by version
-        }
+        at += 4; // per-section checksum is mandatory in the current encoding
         if name == want {
             return decode_codec(codec, &part[off..off + stored], raw);
         }
@@ -166,7 +163,7 @@ fn segment_header_matches_the_document() {
     let b = segment(&dir);
     assert!(b.len() >= 48, "a segment is at least its 48-byte header");
 
-    assert_eq!(&b[0..8], b"TURNFOLD", "magic at offset 0, 8 bytes");
+    assert_eq!(&b[0..8], b"TDBFLD01", "magic at offset 0, 8 bytes");
     assert_eq!(le32(&b, 8), 0, "seg number at 8, and the first segment is 0");
     assert_eq!(le32(&b, 12), 0, "flags at 12 MUST BE ZERO — the reject-forward lever");
     assert_eq!(&b[16..48], &[0u8; 32], "dict_id at 16..48, all-zero for no dictionary");
@@ -254,7 +251,7 @@ fn part_footer_matches_the_document() {
     let n = b.len();
     let f = n - 56; // FOOTER_LEN, at EOF
 
-    assert_eq!(&b[f..f + 8], b"TURNPART", "magic at footer+0");
+    assert_eq!(&b[f..f + 8], b"TDBPRT01", "magic at footer+0");
     let toc_off = le64(&b, f + 8);
     let toc_stored = le32(&b, f + 16);
     let toc_raw = le32(&b, f + 20);
@@ -264,8 +261,8 @@ fn part_footer_matches_the_document() {
     // NOTE: this fixture has seq_lo == seq_hi, so it cannot distinguish the two fields on its own.
     // `merged_part_footer_distinguishes_seq_lo_from_seq_hi` is what pins their order.
     assert!(b[f + 44] <= 2, "toc_codec at footer+44");
-    assert_eq!(b[f + 45], 2, "version at footer+45: this revision writes part version 2");
-    assert_eq!(turndb::part::PART_VERSION, 2, "and PART_VERSION agrees with the document");
+    assert_eq!(b[f + 45], 1, "draft epoch at footer+45");
+    assert_eq!(turndb::part::PART_DRAFT_EPOCH, 1, "and PART_DRAFT_EPOCH agrees with the document");
     assert_eq!(&b[f + 50..f + 52], &[0u8; 2], "footer+50..52 is reserved and zero");
 
     let x = blake3::hash(&b[f..f + 52]);
@@ -373,7 +370,7 @@ fn a_part_declares_the_sections_the_document_lists() {
         hash.2 as usize / 32,
         "pdict.loc (12 B/piece) and pdict.hash (32 B/piece) must describe the same pieces"
     );
-    assert_eq!(identities.2, 30 * 33, "one fixed-width identity entry per content occurrence");
+    assert_eq!(identities.2, 30 * 32, "one fixed-width identity entry per content occurrence");
     let first_body: Vec<u8> =
         (0..400u32).flat_map(|j| blake3::hash(&j.to_le_bytes()).as_bytes()[..8].to_vec()).collect();
     assert_eq!(p.content_identity(0, "body").unwrap(), Some(ContentHash::of(&first_body)));
@@ -394,8 +391,8 @@ fn wal_frame_matches_the_document() {
     s.sync().unwrap();
     let b = std::fs::read(wal_sidecar(&store)).unwrap();
 
-    assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a version-2 record");
-    assert_eq!(le64(&b, 1), 0, "seq at 1");
+    assert_eq!(b[0], 0xD4, "tag at 0 is the current record tag");
+    assert_eq!(le64(&b, 1), 1, "the initial part-sequence target at byte 1");
     let len = le32(&b, 9) as usize;
     assert_eq!(13 + len + 4, b.len(), "header 13 + payload + crc 4 is the whole frame");
 
@@ -410,7 +407,7 @@ fn wal_frame_matches_the_document() {
     s.sync().unwrap();
     let b = std::fs::read(wal_sidecar(&store)).unwrap();
     let t = 13 + len + 4;
-    assert_eq!(b[t], 0x58, "tag 0x58 for a tombstone");
+    assert_eq!(b[t], 0xD1, "current tombstone tag");
     assert_eq!(&b[t + 13..t + 13 + 4], b"only", "a tombstone payload is the id alone");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -433,25 +430,25 @@ fn wal_batch_frames_carry_the_documented_tags() {
     drop(s);
     let b = std::fs::read(wal_sidecar(&store)).unwrap();
 
-    assert_eq!(b[0], 0x5D, "tag at 0 is 0x5D for a version-2 record inside a batch");
+    assert_eq!(b[0], 0xD5, "current in-batch record tag");
     let len0 = le32(&b, 9) as usize;
     let t1 = 13 + len0 + 4;
-    assert_eq!(b[t1], 0x5B, "tag 0x5B for a tombstone inside a batch");
+    assert_eq!(b[t1], 0xD3, "current in-batch tombstone tag");
     let len1 = le32(&b, t1 + 9) as usize;
     assert_eq!(&b[t1 + 13..t1 + 13 + len1], b"seed", "a batch tombstone payload is the id alone");
     let t2 = t1 + 13 + len1 + 4;
-    assert_eq!(b[t2], 0x59, "tag 0x59 is the batch commit marker");
+    assert_eq!(b[t2], 0xD2, "current batch completion marker");
     assert_eq!(le32(&b, t2 + 9), 1, "the marker payload is one varint");
-    assert_eq!(b[t2 + 13], 2, "sealing exactly the two members before it");
-    assert_eq!(b.len(), t2 + 13 + 1 + 4, "nothing follows the commit marker");
+    assert_eq!(b[t2 + 13], 2, "committing exactly the two members before it");
+    assert_eq!(b.len(), t2 + 13 + 1 + 4, "nothing follows the completion marker");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn wal_record_payload_matches_the_documented_layout() {
-    // FORMAT.md § The write-ahead log — the version-2 record payload, walked field by field at
+    // FORMAT.md § The write-ahead log — the current record payload, walked field by field at
     // hand-computed offsets. Every expected byte below derives from the documented layout, not
-    // from calling the encoder: identity marker placement, the plain-u8 op tag, and the value
+    // from calling the encoder: mandatory identity placement, the plain-u8 op tag, and the value
     // widths of attribute tags 4 (u64), 5 (binary), 6 (timestamp), 7 (explicit null).
     let dir = tmp("walpayload");
     std::fs::create_dir_all(&dir).unwrap();
@@ -472,10 +469,10 @@ fn wal_record_payload_matches_the_documented_layout() {
     drop(s);
     let b = std::fs::read(wal_sidecar(&store)).unwrap();
 
-    assert_eq!(b[0], 0x5C, "tag at 0 is 0x5C for a version-2 record");
+    assert_eq!(b[0], 0xD4, "tag at 0 is the current record tag");
     let len = le32(&b, 9) as usize;
-    assert_eq!(len, 81, "the documented layout of this record is exactly 81 bytes");
-    assert_eq!(b.len(), 13 + 81 + 4, "one frame: header 13, payload, crc 4");
+    assert_eq!(len, 80, "the documented layout of this record is exactly 80 bytes");
+    assert_eq!(b.len(), 13 + 80 + 4, "one frame: header 13, payload, crc 4");
     let p = &b[13..13 + len];
 
     assert_eq!(p[0], 3, "varint id_len at payload+0");
@@ -483,29 +480,28 @@ fn wal_record_payload_matches_the_documented_layout() {
     assert_eq!(p[4], 1, "varint n_contents at payload+4");
     assert_eq!(p[5], 4, "varint name_len at payload+5");
     assert_eq!(&p[6..10], b"body", "utf8 content name at payload+6");
-    assert_eq!(p[10], 1, "identity_present at payload+10");
     assert_eq!(
-        &p[11..43],
+        &p[10..42],
         blake3::hash(b"xy").as_bytes(),
-        "the 32-byte whole-value BLAKE3 immediately after the marker"
+        "the mandatory 32-byte whole-value BLAKE3 immediately follows the name"
     );
-    assert_eq!(p[43], 1, "varint n_ops at payload+43");
-    assert_eq!(p[44], 0, "op 0 (literal) is a PLAIN u8 in the log, unlike a part's packed varint");
-    assert_eq!(p[45], 2, "varint literal length");
-    assert_eq!(&p[46..48], b"xy", "literal bytes inline");
-    assert_eq!(p[48], 4, "varint n_attrs at payload+48");
+    assert_eq!(p[42], 1, "varint n_ops at payload+42");
+    assert_eq!(p[43], 0, "op 0 (literal) is a PLAIN u8 in the log, unlike a part's packed varint");
+    assert_eq!(p[44], 2, "varint literal length");
+    assert_eq!(&p[45..47], b"xy", "literal bytes inline");
+    assert_eq!(p[47], 4, "varint n_attrs at payload+47");
     // tag 4 (u64): 8 bytes, full unsigned range
-    assert_eq!(&p[49..52], &[1, b'u', 4], "key length, key, then type tag 4");
-    assert_eq!(&p[52..60], &[0xFF; 8], "u64::MAX as 8 little-endian bytes");
+    assert_eq!(&p[48..51], &[1, b'u', 4], "key length, key, then type tag 4");
+    assert_eq!(&p[51..59], &[0xFF; 8], "u64::MAX as 8 little-endian bytes");
     // tag 5 (binary): varint length then the bytes
-    assert_eq!(&p[60..63], &[1, b'b', 5], "key length, key, then type tag 5");
-    assert_eq!(&p[63..66], &[0x02, 0x00, 0xFF], "varint len 2 then the value bytes");
+    assert_eq!(&p[59..62], &[1, b'b', 5], "key length, key, then type tag 5");
+    assert_eq!(&p[62..65], &[0x02, 0x00, 0xFF], "varint len 2 then the value bytes");
     // tag 6 (timestamp): 8 bytes of signed UTC Unix nanoseconds
-    assert_eq!(&p[66..69], &[1, b't', 6], "key length, key, then type tag 6");
-    assert_eq!(&p[69..77], &(-2i64).to_le_bytes(), "signed nanoseconds, 8 bytes little-endian");
+    assert_eq!(&p[65..68], &[1, b't', 6], "key length, key, then type tag 6");
+    assert_eq!(&p[68..76], &(-2i64).to_le_bytes(), "signed nanoseconds, 8 bytes little-endian");
     // tag 7 (explicit null): zero value bytes
-    assert_eq!(&p[77..80], &[1, b'n', 7], "key length, key, then type tag 7 — and no value");
-    assert_eq!(p[80], 0, "varint n_novel at payload+80: a literal introduces no pieces");
+    assert_eq!(&p[76..79], &[1, b'n', 7], "key length, key, then type tag 7 — and no value");
+    assert_eq!(p[79], 0, "varint n_novel at payload+79: a literal introduces no pieces");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -630,7 +626,7 @@ fn manifest_carries_the_documented_fields() {
         assert!(v.get(field).is_some(), "FORMAT.md documents manifest field {field}: {raw}");
     }
     let p = &v["parts"][0];
-    for field in ["file", "seq_lo", "seq_hi", "records"] {
+    for field in ["member", "seq_lo", "seq_hi", "records", "b3"] {
         assert!(p.get(field).is_some(), "FORMAT.md documents part entry field {field}");
     }
     assert_eq!(v["fold_gen"], 0, "a store that has never re-folded is generation 0");
@@ -716,15 +712,15 @@ fn a_toc_pointing_past_itself_is_refused() {
 }
 
 #[test]
-fn a_future_version_is_refused_before_anything_is_parsed() {
+fn another_part_draft_epoch_is_refused_before_anything_is_parsed() {
     let dir = built("future");
     let p = part_path(&dir);
     edit_footer(&p, |f| f[45] = 200);
     let e = match turndb::part::Part::open(&p) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("a future format version must not open"),
+        Ok(_) => panic!("another part draft epoch must not open"),
     };
-    assert!(e.contains("format version"), "expected a version refusal, got: {e}");
+    assert!(e.contains("draft epoch"), "expected an epoch refusal, got: {e}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -870,13 +866,13 @@ fn the_body_op_escape_is_reserved_and_never_written() {
 
     // and the encoded program contains no zero tag
     let p = turndb::part::Part::open(&part_path(&dir)).unwrap();
-    let ops = p.body(0).unwrap();
+    let ops = p.content(0, turndb::BODY_CONTENT).unwrap().expect("body content");
     assert_eq!(ops.len(), 1, "the two empty literals are gone, the real one remains: {ops:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
+fn a_wal_frame_from_the_discarded_format_is_refused_not_silently_dropped() {
     // An unknown tag is ambiguous: a crash mid-append leaves garbage (the log ends), and a newer
     // writer's frame also lands here (refusing is the only safe reading). Treating both as "end of
     // log" meant a future frame type would silently discard every committed record after it. The crc
@@ -892,8 +888,8 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
     // append a well-formed frame with an unknown tag
     let path = wal_sidecar(&store);
     let mut b = std::fs::read(&path).unwrap();
-    let payload = b"a frame type this build does not know";
-    let mut hdr = vec![0x5Eu8];
+    let payload = b"discarded-format payload";
+    let mut hdr = vec![0x5Cu8];
     hdr.extend_from_slice(&99u64.to_le_bytes());
     hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     let mut h = crc32fast::Hasher::new();
@@ -919,57 +915,4 @@ fn a_wal_frame_from_a_newer_build_is_refused_not_silently_dropped() {
         .expect("a torn tail is the end of the log, not an error");
     assert_eq!(s.reconstruct("a").unwrap().unwrap(), b"first".to_vec());
     std::fs::remove_dir_all(&dir).ok();
-}
-
-// ---------------------------------------------------------------------------------------------
-// FORMAT.md § The pack
-// ---------------------------------------------------------------------------------------------
-
-#[test]
-fn pack_footer_matches_the_documented_layout() {
-    // Nothing writes packs any more; the checked-in version-one artifact is the layout's whole
-    // population, so it is also what the document is held against.
-    let hex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("bindings/node/qualification/fixtures/revision-one.turndb.hex");
-    let hex = std::fs::read_to_string(&hex_path).unwrap();
-    let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
-    let b: Vec<u8> = digits
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect();
-    let f = &b[b.len() - 40..];
-
-    assert_eq!(&f[0..8], b"TURNPACK", "magic at footer+0");
-    let toc_off = u64::from_le_bytes(f[8..16].try_into().unwrap());
-    let toc_stored = u32::from_le_bytes(f[16..20].try_into().unwrap());
-    let _toc_raw = u32::from_le_bytes(f[20..24].try_into().unwrap());
-    let n_files = u32::from_le_bytes(f[24..28].try_into().unwrap());
-    let _codec = f[28];
-    assert_eq!(f[29], 1, "this revision writes pack version 1 at footer+29");
-    assert_eq!(&f[30..32], &[0, 0], "reserved bytes at footer+30 are zero");
-    let toc_xsum = u32::from_le_bytes(f[32..36].try_into().unwrap());
-    let xsum = &f[36..40];
-
-    // the chain: footer checksums itself, and checksums the STORED TOC
-    assert_eq!(&blake3::hash(&f[..36]).as_bytes()[0..4], xsum, "footer BLAKE3 prefix at +36");
-    let toc = &b[toc_off as usize..toc_off as usize + toc_stored as usize];
-    assert_eq!(crc32fast::hash(toc), toc_xsum, "toc_xsum at footer+32 over the STORED TOC");
-
-    // files live strictly before the TOC; the TOC strictly before the footer
-    assert!(toc_off as usize + toc_stored as usize <= b.len() - 40);
-    assert!(n_files >= 3, "manifest + a part + a segment at minimum");
-
-    // and MANIFEST comes back intact through the reader — its own crc32 trailer is the proof
-    // of byte-fidelity when no loose original exists to compare against.
-    let tmp_pk = tmp("packfmt");
-    std::fs::create_dir_all(&tmp_pk).unwrap();
-    let pk = tmp_pk.join("revision-one.turndb");
-    std::fs::write(&pk, &b).unwrap();
-    let pack = turndb::pack::Pack::open(&pk).unwrap();
-    let manifest = pack.read_file("MANIFEST").unwrap();
-    let text = std::str::from_utf8(&manifest).unwrap();
-    let (json, trailer) = text.split_once('\n').expect("manifest carries its trailer line");
-    let want = format!("crc32={:08x}", crc32fast::hash(json.as_bytes()));
-    assert_eq!(trailer.trim_end(), want, "the inner MANIFEST verifies against its own trailer");
-    std::fs::remove_dir_all(&tmp_pk).ok();
 }

@@ -1,24 +1,24 @@
 # TurnDB conformance corpus
 
-`v1/` is the language-neutral semantic gate for Phase 3. Package versions and on-disk format
-versions can change without changing this directory; incompatible contract semantics require a new
-versioned directory.
+`v1/` is the language-neutral query and runner contract. `v2/` is the language-neutral capability
+contract. Neither path is a physical-format version; the current unfrozen format identity is
+defined only by `FORMAT.md`.
 
 The corpus is independent input and expected data. A runner must replay `corpus.json.steps`, compare
-point reads and scans with `views` and `queries`, and validate its public capability response against
-`capabilities.schema.json` and `capabilities.json`. It must not create expected results by asking a
-different binding at test time.
+point reads and scans with `v1/views` and `v1/queries`, and validate its public capability response
+against `v2/capabilities.schema.json` and `v2/capabilities.json`. It must not create expected results
+by asking a different binding at test time.
 
-`fixture.turndb.hex` is the byte-exact published-v2 container encoded as lowercase hex so repository
+`v1/fixture.turndb.hex` is byte-exact evidence of the current draft container, encoded as
+lowercase hex so repository
 patches and reviews remain textual. Runners decode whitespace-separated hex to obtain the actual
 `.turndb` file. The Rust gate proves both directions: replaying the operations produces exactly those
-bytes, and a reader opened on those bytes produces the published-v2 goldens. Read-only/browser
-runners use this fixture without needing a writer.
-
-Regenerate the fixture after an intentional writer-layout change with
+bytes, and a reader opened on those bytes produces the current goldens. Read-only/browser runners
+use this fixture without needing a writer. Because the physical format remains an unfrozen draft,
+an intentional layout change replaces this fixture in place. Regenerate it with
 `TURNDB_UPDATE_CONFORMANCE_FIXTURE=1 cargo test --test conformance
-rust_store_replays_the_shared_query_corpus`, review the textual diff, then rerun the command without
-the environment variable to prove that the generator and checked-in bytes agree.
+rust_store_replays_the_shared_query_corpus`, followed by the same command without the environment
+variable.
 
 ## Runner protocol v1
 

@@ -1,8 +1,9 @@
 # Contributing to turndb
 
-turndb is an embedded, content-addressed columnar store for AI traces. Before changing anything,
-read [FORMAT.md](FORMAT.md). It is **normative**: where it and the code disagree, one of them is a
-bug, and finding out which is the first job.
+turndb is an embedded, content-addressed columnar store for AI traces. Before changing public
+concepts or lifecycle claims, read [ONTOLOGY.md](ONTOLOGY.md); before changing storage behavior,
+read [FORMAT.md](FORMAT.md). Each is normative in its domain: where either and the code disagree,
+one of them is a bug, and finding out which is the first job.
 
 ## Branching
 
@@ -131,7 +132,7 @@ cargo test --no-default-features
 cargo test --release                      # debug-only panics behave differently
 cargo test --features dst --test dst      # the deterministic crash-state harness
 cargo test --test corruption              # the mutation storm; set STORM_XOR for a fresh seed
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 

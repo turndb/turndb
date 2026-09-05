@@ -37,34 +37,54 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// Physical bytes currently allocated to a regular file, where the platform exposes that fact.
+/// Whether two open handles name the same filesystem object.
 ///
-/// Logical length is not a substitute: punched fold blocks remain inside the file's length while
-/// consuming no blocks. `None` is an explicit capability absence rather than a fabricated value.
+/// Writer acquisition uses this after taking the lock: a reclaim may have replaced the path
+/// between the prospective writer's open and lock, and a lock on the displaced inode is not a
+/// writer lock for the store now at that path.
 #[cfg(unix)]
-pub(crate) fn allocated_bytes(_path: &Path, metadata: &std::fs::Metadata) -> Option<u64> {
+pub(crate) fn same_file(a: &File, b: &File) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    metadata.blocks().checked_mul(512)
+    let a = a.metadata()?;
+    let b = b.metadata()?;
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
-/// Windows has no allocation count on a metadata record; `GetCompressedFileSizeW` answers by name
-/// and, for a sparse or compressed file, reports the bytes actually allocated — which is what a
-/// punched range gives back. A failure is an explicit `None`, never a logical length in disguise.
+/// Windows identity is the volume serial number plus the 64-bit file index, read through
+/// `GetFileInformationByHandle`. `std`'s `MetadataExt::volume_serial_number` and `file_index`
+/// expose the same fields but sit behind the unstable `windows_by_handle` feature, so they cannot
+/// be used on the pinned stable toolchain.
 #[cfg(windows)]
-pub(crate) fn allocated_bytes(path: &Path, _metadata: &std::fs::Metadata) -> Option<u64> {
-    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
-    let wide = wide_path(path).ok()?;
-    let mut high: u32 = 0;
-    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
-    if low == INVALID_FILE_SIZE && io::Error::last_os_error().raw_os_error() != Some(0) {
-        return None;
+pub(crate) fn same_file(a: &File, b: &File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    fn identity(f: &File) -> io::Result<(u32, u32, u32)> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle stays open for the borrow of `f`, and `info` is a valid, writable
+        // out-parameter of exactly the type the call fills.
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
     }
-    Some(((high as u64) << 32) | low as u64)
+    Ok(identity(a)? == identity(b)?)
 }
 
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn allocated_bytes(_path: &Path, _metadata: &std::fs::Metadata) -> Option<u64> {
-    None
+#[cfg(target_os = "wasi")]
+pub(crate) fn same_file(a: &File, b: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // The descriptors come from live borrowed `File` handles and remain valid for both calls.
+    let a = unsafe { wasi::fd_filestat_get(a.as_raw_fd() as u32) }.map_err(wasi_err)?;
+    let b = unsafe { wasi::fd_filestat_get(b.as_raw_fd() as u32) }.map_err(wasi_err)?;
+    Ok(a.dev == b.dev && a.ino == b.ino)
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
+pub(crate) fn same_file(_a: &File, _b: &File) -> io::Result<bool> {
+    Ok(true)
 }
 
 /// A NUL-terminated UTF-16 path for the wide Win32 entry points, with the long-path handling
@@ -410,9 +430,8 @@ const LOCK_BYTE_OFFSET: u64 = u64::MAX - 1;
 /// back as zeros without the length changing, and "if the file is sparse or compressed, the NTFS
 /// file system *may* deallocate disk space" — in practice at NTFS's 64 KiB sparse granularity,
 /// so a hole smaller than that is zeroed but not returned. The erasure contract (bytes gone,
-/// offsets unmoved) therefore holds exactly on Windows; how much space comes back is what
-/// `allocated_bytes` measures rather than something this function promises. Everywhere else
-/// this returns [`io::ErrorKind::Unsupported`], which callers already treat as "re-fold
+/// offsets unmoved) therefore holds exactly on Windows; how much space comes back is not promised.
+/// Everywhere else this returns [`io::ErrorKind::Unsupported`], which callers already treat as "re-fold
 /// instead" — reclaiming the same space by rewriting rather than in place.
 #[inline]
 pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
@@ -497,9 +516,10 @@ pub(crate) fn punch_hole(f: &File, off: u64, len: u64) -> io::Result<()> {
 
 // ── Exclusive rename ──────────────────────────────────────────────────────
 
-/// Rename `from` to `to` while refusing to replace any existing filesystem object — on Linux
-/// (`renameat2(RENAME_NOREPLACE)`) and macOS (`renamex_np(RENAME_EXCL)`) as one atomic step; the
-/// Windows form below makes no atomicity claim.
+/// Install `from` at `to` while refusing to replace any existing filesystem object — on Linux
+/// (`renameat2(RENAME_NOREPLACE)`) and macOS (`renamex_np(RENAME_EXCL)`) as one atomic rename. WASI
+/// uses an atomic no-replace hard link followed by removal of the staging name. The Windows form
+/// below makes no atomicity claim.
 ///
 /// This is stronger than `exists()` followed by `std::fs::rename`: ordinary POSIX rename may
 /// replace an empty directory created between those calls. Backup restoration uses this as its
@@ -564,7 +584,23 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
+/// Preview1 has no rename-with-flags operation. `path_link` supplies the exact property container
+/// birth needs: one atomic directory-entry creation that fails if `to` exists. Removing the
+/// staging link afterward cannot make the already-installed complete bytes partial; a failed
+/// removal merely leaves recognized protocol debris.
+#[cfg(target_os = "wasi")]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "wasi",
+    windows
+)))]
 pub(crate) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -811,11 +847,6 @@ mod windows_tests {
         assert_eq!(&back[..65_536], &body[..65_536]);
         assert!(back[65_536..131_072].iter().all(|&b| b == 0), "punched range reads as zeros");
         assert_eq!(&back[131_072..], &body[131_072..]);
-        let allocated = allocated_bytes(&p, &f.metadata().unwrap());
-        println!(
-            "allocated after punch: {allocated:?} of {} logical (measured, not asserted)",
-            body.len()
-        );
         drop(f);
         let _ = std::fs::remove_file(&p);
     }
@@ -853,15 +884,13 @@ mod windows_tests {
             filesystem_available_bytes(bad).expect_err("free space").kind(),
             io::ErrorKind::InvalidInput
         );
-        let meta = std::fs::metadata(std::env::temp_dir()).unwrap();
-        assert_eq!(allocated_bytes(bad, &meta), None);
     }
 
     /// Every raw call here goes through `wide_path`, so the one thing that could silently regress
     /// against `std` is the classic 260-character limit. Build a path well past it — under the
     /// current directory, so the RELATIVE form is exercised deterministically rather than only
     /// when the temp directory happens to sit under cwd — and drive rename, no-replace rename,
-    /// free space and allocation through both forms.
+    /// and free-space measurement through both forms.
     #[test]
     fn paths_past_max_path_work_for_rename_and_the_space_measurements() {
         let base = Path::new("target").join(format!("turndb-long-{}", std::process::id()));
@@ -882,7 +911,6 @@ mod windows_tests {
             assert_eq!(std::fs::read(&b).unwrap(), b"a2");
             assert!(filesystem_available_bytes(&rel).unwrap().is_some());
             assert!(filesystem_available_bytes(&b).unwrap().is_some());
-            assert!(allocated_bytes(&b, &std::fs::metadata(&b).unwrap()).is_some());
         }
         // The absolute form of the same directory.
         let dir = std::path::absolute(&rel).unwrap();
@@ -899,10 +927,6 @@ mod windows_tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"a");
         assert!(filesystem_available_bytes(&dir).unwrap().is_some());
         assert!(filesystem_available_bytes(&b).unwrap().is_some());
-        assert_eq!(
-            allocated_bytes(&b, &std::fs::metadata(&b).unwrap()).map(|n| n >= 1),
-            Some(true)
-        );
         drop(std::fs::remove_dir_all(&base));
     }
 
