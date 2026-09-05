@@ -4038,3 +4038,61 @@ fn file_allocated_bytes(path: &std::path::Path, _meta: &std::fs::Metadata) -> u6
     );
     ((high as u64) << 32) | low as u64
 }
+
+/// Every input part's sequence interval is resolution history even when a refold eliminates the
+/// whole part, and the manifest requires the surviving parts to remain one contiguous history.
+/// Red-tested before the fix: refold on the empty-middle store below refused with "MANIFEST part
+/// sequence intervals must begin at one and remain contiguous; expected 2, found 3", while main
+/// refolded the same store, so `refold` was unusable on any store where a middle part had lost
+/// every row.
+#[test]
+fn refold_folds_eliminated_part_intervals_into_the_next_surviving_part() {
+    // (which parts to empty, expected surviving intervals)
+    type Case = (&'static [usize], &'static [(u64, u64)]);
+    let cases: [Case; 3] = [
+        (&[1], &[(1, 1), (2, 3)]), // empty middle: absorbed by the next surviving part
+        (&[0], &[(1, 2), (3, 3)]), // empty first: the first survivor still begins at one
+        (&[2], &[(1, 1), (2, 3)]), // empty last: the last survivor carries the cursor
+    ];
+    for (case, (emptied, want_intervals)) in cases.iter().enumerate() {
+        let dir = tmp(&format!("refold-eliminated-{case}"));
+        let path = store_file(&dir);
+        let mut s = Store::open_file(&path, cfg()).unwrap();
+        // Three single-record parts, then a fourth publication that tombstones the records of the
+        // parts this case empties, so those parts keep no surviving row.
+        let ids = ["p:0", "p:1", "p:2"];
+        let mut want = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            want.push(put(&mut s, id, format!("part {i} body").as_bytes()));
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        for &i in *emptied {
+            s.delete(ids[i]).unwrap();
+        }
+        s.sync().unwrap();
+        s.flush().unwrap();
+        // A total merge would hide the case, so refold the four parts directly.
+        let before = s.manifest().next_seq;
+        let stats = s.refold().unwrap();
+        assert!(stats.records_dropped >= emptied.len(), "case {case}: {stats:?}");
+        // The tombstone part (sequence 4) is always eliminated too, so the last survivor absorbs it.
+        let intervals: Vec<(u64, u64)> =
+            s.manifest().parts.iter().map(|p| (p.seq_lo, p.seq_hi)).collect();
+        let mut expected = want_intervals.to_vec();
+        expected.last_mut().unwrap().1 = before;
+        assert_eq!(intervals, expected, "case {case}");
+        assert_eq!(s.manifest().next_seq, before, "case {case}: the cursor is preserved");
+        s.close().unwrap();
+
+        let reopened = Store::open_file(&path, cfg()).unwrap();
+        let reader = turndb::store::open_read_container(&path, cfg()).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let expect = (!emptied.contains(&i)).then(|| want[i].clone());
+            assert_eq!(reopened.reconstruct(id).unwrap(), expect, "case {case}: {id} after reopen");
+            assert_eq!(reader.reconstruct(id).unwrap(), expect, "case {case}: {id} in a read view");
+        }
+        reopened.close().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

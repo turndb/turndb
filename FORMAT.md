@@ -465,7 +465,10 @@ semantically consistent. When the manifest revision references parts, `next_seq`
 highest `seq_hi`; a manifest revision with no parts has `next_seq == 0`.
 If a total merge or refold removes every row after sequences have been used, it emits one canonical
 zero-row part spanning the used interval; the empty part preserves physical evidence for the
-nonzero cursor rather than reverting to the no-part origin shape.
+nonzero cursor rather than reverting to the no-part origin shape. A refold that removes every row
+of some parts but not all folds each eliminated part's interval into the next surviving part, and
+into the last surviving part when no later part survives, so the published intervals stay
+contiguous and the last `seq_hi` remains the cursor.
 Across consecutive retained manifest revisions, `next_seq` never decreases; a publication may
 preserve the cursor or advance it, but cannot reuse an earlier record-version sequence.
 Within one fold generation, the `(fold_seg, fold_off)` tail likewise never decreases. Ordinary

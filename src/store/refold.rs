@@ -179,8 +179,16 @@ pub(crate) fn refold_into_container_with_control_and_limits(
         st.fold_bytes_after = nf.disk_bytes();
 
         let mut out = Vec::new();
-        let first_surviving = live.iter().position(|rows| !rows.is_empty());
         let last_surviving = live.iter().rposition(|rows| !rows.is_empty());
+        // A refold may eliminate an entire part because every version in it was superseded or
+        // tombstoned, and that part can sit anywhere in the input run. Its sequence interval is
+        // still resolution history, and the manifest requires the surviving parts to describe one
+        // contiguous history from the first input's `seq_lo` to the last input's `seq_hi`. So an
+        // eliminated interval is folded into the next surviving output, and the last surviving
+        // output absorbs every eliminated interval after it, keeping `seq_hi` the manifest's exact
+        // published mutation cursor. Resolution is unaffected: intervals only order parts, and an
+        // eliminated part had no version left to order.
+        let mut pending_lo = seqs.first().expect("refold has at least one input part").0;
         for (pi, rows) in live.iter().enumerate() {
             control.check("content refold")?;
             if rows.is_empty() {
@@ -188,20 +196,13 @@ pub(crate) fn refold_into_container_with_control_and_limits(
             }
             let recs: Vec<Record> =
                 rows.iter().map(|&r| parts[pi].record(r)).collect::<Result<_>>()?;
-            // A refold may eliminate an entire part because every version in it was superseded or
-            // tombstoned. Its sequence interval remains resolution history even though none of its
-            // rows survive. Preserve the complete input span on the boundary outputs so the last
-            // part's `seq_hi` remains the manifest's exact published mutation cursor.
-            let lo = if Some(pi) == first_surviving {
-                seqs.first().expect("parts and sequence ranges are parallel").0
-            } else {
-                seqs[pi].0
-            };
+            let lo = pending_lo;
             let hi = if Some(pi) == last_surviving {
                 seqs.last().expect("parts and sequence ranges are parallel").1
             } else {
                 seqs[pi].1
             };
+            pending_lo = hi.saturating_add(1);
             let file = format!("part-r{new_gen:04}-{lo:08}-{hi:08}.part");
             let member = container.lock().expect("container lock poisoned").begin_member(&file)?;
             let built = crate::part::build_full_into(
