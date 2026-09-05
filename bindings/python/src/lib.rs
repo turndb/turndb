@@ -893,7 +893,7 @@ impl PyStore {
 #[pyfunction]
 fn capabilities(py: Python<'_>) -> PyResult<PyObject> {
     let compiled = turndb::capabilities::capabilities();
-    let mut operations = vec![
+    let operations = vec![
         "openWriter",
         "openSnapshot",
         "compiledCapabilities",
@@ -911,10 +911,8 @@ fn capabilities(py: Python<'_>) -> PyResult<PyObject> {
         "refold",
         "erase",
         "close",
+        "backup",
     ];
-    if turndb::backup::ATOMIC_RESTORE {
-        operations.push("backup");
-    }
     value_to_py(
         py,
         json!({

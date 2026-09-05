@@ -55,7 +55,7 @@ language conveniences, but those do not become Tier 1 merely by existing.
 | `readContent` | reconstruct one named content value byte-exactly |
 | `snapshot` | publish the pending change set as needed and create a read view pinned to the resulting current store authority |
 | `querySql` | stream read-only SQL results as Arrow IPC |
-| `backup` | synchronize and publish pending source changes, verify a self-contained destination container, and atomically install it at a new path |
+| `backup` | synchronize and publish pending source changes, verify a self-contained destination container, and install it at a new path with a no-replace primitive |
 | `verify` | verify the current store authority, any retained manifest-revision chain, and byte-exact reconstruction |
 | `spaceUsage` | report reachability-aware storage accounting |
 | `compactBounded` | execute one exact-budget part-merge unit |
@@ -69,13 +69,14 @@ Native Unix writers report OS-enforced exclusion. The portable WASI writer repor
 embedder-enforced exclusion even on a Unix host. Browser readers report `read_only`, omit every
 mutating operation, and report `reclamation: "none"`.
 
-WASI Preview1 lacks the atomic no-replace rename required by the backup/restore protocol. Container
-birth can safely install one already-synchronized inode with WASI's atomic no-replace hard-link
-creation, but that narrower primitive does not satisfy the advertised artifact-installation
-contract. The portable profile therefore reports `atomicNoReplaceInstallation: "absent"` and omits
-`backup`; it does not weaken backup into an unsafe copy. Native Node and Python expose the normative
-backup operation only on targets whose compiled core reports the required no-replace installation
-guarantee.
+WASI Preview1 lacks a no-replace rename. Container birth can safely install one already-synchronized
+inode with WASI's atomic no-replace hard-link creation, but that narrower primitive does not satisfy
+the artifact-installation contract. The portable profile therefore reports
+`atomicNoReplaceInstallation: "absent"` and omits `backup`; it does not weaken backup into an unsafe
+copy. Native Node and Python expose the normative backup operation; `backupRestore` in the native
+capability report says whether that installation is crash-atomic on the running target, which it
+is on Linux and macOS and is not on Windows, where a crash can leave the artifact absent but never
+torn.
 
 Different profiles may truthfully expose different operation sets under contract v2. Semantic
 drift inside an operation they both expose is not a capability difference: `scan`, for example,

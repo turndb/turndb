@@ -2916,12 +2916,6 @@ pub fn restore_file_with_control_and_limits(
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
 ) -> Result<crate::backup::RestoreStats> {
-    if !crate::backup::ATOMIC_RESTORE {
-        return Err(crate::backup::BackupError::Unsupported(
-            "this target has no atomic no-replace artifact-installation primitive".to_string(),
-        )
-        .into());
-    }
     let read_limits = read_limits.validate()?;
     debris::validate_store_path(src)?;
     debris::validate_store_path(dst)?;
@@ -4185,12 +4179,6 @@ impl Store {
     ) -> Result<crate::backup::BackupStats> {
         self.ensure_writer_usable()?;
         control.check("backup")?;
-        if !crate::backup::ATOMIC_RESTORE {
-            return Err(crate::backup::BackupError::Unsupported(
-                "this target has no atomic no-replace artifact-installation primitive".to_string(),
-            )
-            .into());
-        }
         crate::backup::ensure_destination_available(out)?;
         let staging = artifact_staging_path(out, "backing-up");
         crate::backup::ensure_source_is_not_staging(&self.path, &staging)?;

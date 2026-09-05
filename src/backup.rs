@@ -7,7 +7,10 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Whether this target has an atomic rename primitive that refuses replacement.
+/// Whether this target installs backup and restore artifacts with a crash-atomic no-replace
+/// rename. Reported, not enforced: every target with a no-replace primitive performs backup and
+/// restore, and where the primitive is not crash-atomic the artifact is still whole or absent at
+/// its final name, never torn. A target with no such primitive refuses at the installing rename.
 pub const ATOMIC_RESTORE: bool =
     cfg!(any(target_os = "linux", target_os = "macos", target_os = "ios"));
 
