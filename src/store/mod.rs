@@ -3311,12 +3311,10 @@ impl Store {
         // Only now has every committed storage plane and WAL frame proved intelligible.
         let debris_removed = debris::remove_beside_present_store(path, read_limits)?;
 
-        // Stage the sweep's frees now; they publish with the first flip that has anything else
-        // to say. Nothing reads a free-listed member meanwhile — no manifest names it.
-        {
-            let mut c = container.lock().expect("container lock poisoned");
-            sweep_unreachable_container(&mut c, &manifest, read_limits)?;
-        }
+        // No member sweep here: the selected container state was already proved to name only
+        // members some current or retained manifest revision requires, so there is nothing to
+        // free. Every publication that prunes retention frees what it stops retaining in the same
+        // container state, which is what keeps that proof true.
         // A crashed merge leaves its spool scratch beside the store — pre-commit garbage, removed
         // whole. The member it was assembling is uncommitted noise needing nothing.
         let tmp_dir = file_tmp_dir(path);
@@ -5177,9 +5175,13 @@ impl Store {
                 let tail = self.fold.sync()?;
                 manifest.fold_seg = tail.seg;
                 manifest.fold_off = tail.off;
-                manifest.commit_into_container(
-                    &mut self.container.lock().expect("container lock poisoned"),
-                )?;
+                let mut container = self.container.lock().expect("container lock poisoned");
+                manifest.commit_into_container(&mut container)?;
+                // The declaration is a manifest-revision publication like any other: it prunes
+                // the oldest retained revision, so members only that revision pinned must join
+                // the free list in the same container state. Every open validates the exact
+                // member namespace, and a part no manifest names would otherwise refuse the store.
+                sweep_unreachable_container(&mut container, &manifest, self.read_limits)?;
                 Ok(manifest)
             })();
             let m = match prepared {

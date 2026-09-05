@@ -4096,3 +4096,76 @@ fn refold_folds_eliminated_part_intervals_into_the_next_surviving_part() {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Parts named by the container must always be parts some current or retained manifest revision
+/// requires, because every open validates exactly that namespace. So a publication that prunes the
+/// oldest retained revision must free the members only that revision pinned, whichever operation
+/// publishes it. Red-tested with the content-punch sweep removed: after the punch below pruned
+/// revision 2, `part-00000001.part` stayed a named member, and the writer reopen failed with
+/// "container member \"part-00000001.part\" is outside the current Store member namespace".
+#[test]
+fn every_publication_that_prunes_retention_frees_what_it_stops_retaining() {
+    let dir = tmp("prune-sweep");
+    let path = store_file(&dir);
+    let fold = cfg();
+
+    fn assert_members_are_all_retained(path: &Path, what: &str) {
+        let cfg = cfg();
+        let reader = turndb::store::open_read_container(path, cfg)
+            .unwrap_or_else(|e| panic!("{what}: read view refused: {e:#}"));
+        let mut admitted: std::collections::BTreeSet<String> =
+            reader.manifest().parts.iter().map(|p| p.member.clone()).collect();
+        for commit in turndb::store::retained_commits_file(path).unwrap() {
+            let retained = turndb::store::open_read_container_at(path, cfg, commit).unwrap();
+            admitted.extend(retained.manifest().parts.iter().map(|p| p.member.clone()));
+        }
+        let container = turndb::container::Container::open(path).unwrap();
+        let parts: std::collections::BTreeSet<String> =
+            container.names().filter(|n| n.starts_with("part-")).map(String::from).collect();
+        assert_eq!(parts, admitted, "{what}: named parts must be exactly the retained parts");
+        let writer = Store::open_file(path, cfg)
+            .unwrap_or_else(|e| panic!("{what}: writer reopen refused: {e:#}"));
+        writer.close().unwrap();
+    }
+
+    let mut s = Store::open_file(&path, fold).unwrap();
+    // Content nothing else references, so deleting `a` leaves its whole fold block dead.
+    s.put("a", &[Span::Piece(&[0xa5u8; 5000])], vec![]).unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap(); // revision 1: part-1
+    put(&mut s, "b", b"second part");
+    s.sync().unwrap();
+    s.flush().unwrap(); // revision 2: part-2
+    s.merge_range(0, 2).unwrap(); // revision 3: part-1-2 replaces both, which retention still pins
+    put(&mut s, "c", b"third part");
+    s.sync().unwrap();
+    s.flush().unwrap(); // revision 4
+    s.delete("a").unwrap();
+    s.sync().unwrap();
+    s.flush().unwrap(); // revision 5 prunes revision 1; revision 2 still pins part-1 and part-2
+    assert_eq!(s.manifest().commit, 5);
+    s.close().unwrap();
+    assert_members_are_all_retained(&path, "after five flush/merge publications");
+
+    let mut s = Store::open_file(&path, fold).unwrap();
+    let punched = s.punch_unreferenced().unwrap();
+    assert!(punched.blocks_punched > 0, "the deleted record's block must be dead: {punched:?}");
+    assert_eq!(s.manifest().commit, 6, "the declaration is a publication that prunes revision 2");
+    s.close().unwrap();
+    assert_members_are_all_retained(&path, "after the content-punch declaration");
+
+    let mut s = Store::open_file(&path, fold).unwrap();
+    put(&mut s, "d", b"fourth part");
+    s.sync().unwrap();
+    s.flush().unwrap(); // revision 7 prunes revision 3
+    s.close().unwrap();
+    assert_members_are_all_retained(&path, "after a flush past the punch");
+
+    let mut s = Store::open_file(&path, fold).unwrap();
+    s.refold().unwrap(); // revision 8 keeps only itself
+    assert_eq!(s.reconstruct("a").unwrap(), None);
+    assert!(s.reconstruct("b").unwrap().is_some());
+    s.close().unwrap();
+    assert_members_are_all_retained(&path, "after refold");
+    std::fs::remove_dir_all(&dir).ok();
+}
