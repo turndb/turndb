@@ -176,7 +176,7 @@ These names describe semantic changes. They are not a registry of public method 
 | **publication** | Writes and orders the required physical artifacts, then atomically makes a successor container state selectable; it may also publish a new manifest revision. Success of its final durability barrier produces a publication acknowledgement and makes included accepted mutations durable. |
 | **settlement** | Removes all remaining WAL replay input after the pending change set is empty, making the store settled. |
 | **WAL replay** | Reconstructs the pending change set from complete, valid WAL input after resolving the current store authority. |
-| **manifest promotion** | Validates a retained manifest revision, publishes a container state selecting it as current, and abandons newer retained authority and physical tail state. |
+| **manifest promotion** | Validates a retained manifest revision together with the retained history it keeps, publishes a container state selecting it as current, and abandons newer retained authority, physical tail state, and any older retained authority that no longer validates. |
 | **deletion** | Accepts a tombstone for a record ID. |
 | **merge** | Rewrites selected parts into replacement parts without rewriting fold content. |
 | **refold** | Writes a new fold generation and rebuilds every part against it. |
@@ -335,8 +335,10 @@ current, retained, pending, earlier, and later use the admitted states and order
 19. Verification detects within its stated scope and changes neither logical nor physical state.
     Inspection likewise changes neither logical nor physical state and establishes only its reported
     facts.
-20. Manifest promotion includes validation and publication. It changes current authority, may make
-    later record versions no longer visible, and neither repairs corrupt bytes nor replays the WAL.
+20. Manifest promotion includes validation and publication. It selects current authority, which
+    may be the revision already current when only retained history needs repair; it may make later
+    record versions no longer visible, may end retention of older revisions, and neither repairs
+    corrupt bytes nor replays the WAL.
 21. Content decomposition may change physical deduplication and compression outcomes but the
     resulting content program always describes the same byte value.
 22. The canonical origin is a real empty store authority, not a synthetic manifest revision. The

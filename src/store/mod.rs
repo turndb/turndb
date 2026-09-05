@@ -2181,6 +2181,9 @@ pub struct ManifestPromotionOptions {
 pub struct ManifestPromotionReport {
     pub commit: u64,
     pub rollback_commits: u64,
+    /// Retained revisions older than the promoted one that were abandoned because they, or the
+    /// link joining them to the survivors, no longer validated. Retention shrinks by this many.
+    pub abandoned_retained_revisions: usize,
     pub records: usize,
     pub content_values: usize,
     pub parts: usize,
@@ -2202,7 +2205,7 @@ impl std::fmt::Display for ManifestPromotionError {
         match self {
             ManifestPromotionError::Healthy(path) => write!(
                 f,
-                "MANIFEST at {} is intact; refusing manifest promotion for an intact store",
+                "MANIFEST at {} is intact and its retained history validates; refusing manifest promotion for an intact store",
                 path.display()
             ),
             ManifestPromotionError::RollbackLimit { needed, allowed } => write!(
@@ -2219,97 +2222,137 @@ impl std::fmt::Display for ManifestPromotionError {
 
 impl std::error::Error for ManifestPromotionError {}
 
+/// Failures that say nothing about the bytes: interruption, admission, and the filesystem itself.
+/// Manifest promotion propagates these instead of treating them as damage to work around.
+fn environmental_failure(error: &anyhow::Error) -> bool {
+    matches!(
+        crate::error::classify(error),
+        crate::error::ErrorClass::Cancelled
+            | crate::error::ErrorClass::ResourceExhausted
+            | crate::error::ErrorClass::Io
+            | crate::error::ErrorClass::NotFound
+            | crate::error::ErrorClass::Unsupported
+    )
+}
+
 fn validate_surviving_promotion_history(
     container: &crate::container::Container,
     path: &Path,
     cfg: FoldCfg,
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
-    selected_commit: u64,
-) -> Result<HashSet<String>> {
-    let commits = container_retained_commits(container)
+    selected: &Manifest,
+) -> Result<SurvivingHistory> {
+    let mut admitted_parts: HashSet<String> =
+        selected.parts.iter().map(|part| part.member.clone()).collect();
+    let mut abandoned_older = Vec::new();
+    let mut newer = selected.clone();
+    let older = container_retained_commits(container)
         .into_iter()
-        .filter(|commit| *commit <= selected_commit)
-        .collect::<Vec<_>>();
-    if commits.last().copied() != Some(selected_commit) {
-        bail!("selected manifest revision {selected_commit} has no retained member");
-    }
-    let mut previous_commit: Option<u64> = None;
-    let mut previous_bytes: Option<Vec<u8>> = None;
-    let mut previous_next_seq: Option<u64> = None;
-    let mut previous_fold_tail: Option<(u32, u32)> = None;
-    let mut fold_generation = None;
-    let mut admitted_parts = HashSet::new();
-    for commit in commits {
+        .filter(|commit| *commit < selected.commit)
+        .rev();
+    for commit in older {
         control.check("manifest promotion retained-history validation")?;
+        if !abandoned_older.is_empty() {
+            // Nothing older than a break can be linked to the survivors, so it is abandoned
+            // with the revision that broke the chain.
+            abandoned_older.push(commit);
+            continue;
+        }
         let bytes =
             container.read_file_bounded(&format!("MANIFEST.{commit:08}"), MAX_MANIFEST_BYTES)?;
-        let manifest = Manifest::parse(&bytes)
-            .with_context(|| format!("surviving retained manifest revision {commit} is invalid"))?;
-        if manifest.commit != commit {
-            bail!(
-                "retained member MANIFEST.{commit:08} contains manifest revision {}",
-                manifest.commit
-            );
-        }
-        if let Some(expected_generation) = fold_generation {
-            if manifest.fold_gen != expected_generation {
-                bail!(
-                    "surviving retained history crosses fold generations {expected_generation} and {}",
-                    manifest.fold_gen
-                );
-            }
-        } else {
-            fold_generation = Some(manifest.fold_gen);
-        }
-        if let Some(previous) = previous_commit {
-            let expected = previous
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("retained manifest revision order overflows"))?;
-            if commit != expected {
-                bail!(
-                    "surviving manifest chain has a revision gap: {previous} is followed by {commit}"
-                );
-            }
-            let expected_hash =
-                blake3::hash(previous_bytes.as_ref().expect("previous commit has retained bytes"))
-                    .to_hex()
-                    .to_string();
-            if manifest.prev.as_deref() != Some(expected_hash.as_str()) {
-                bail!("surviving manifest chain is broken at revision {commit}");
-            }
-        }
-        if previous_next_seq.is_some_and(|previous| manifest.next_seq < previous) {
-            bail!(
-                "surviving manifest chain moves the record-version cursor backward from {} to {} at revision {commit}",
-                previous_next_seq.expect("checked as present"),
-                manifest.next_seq
-            );
-        }
-        let fold_tail = (manifest.fold_seg, manifest.fold_off);
-        if previous_fold_tail.is_some_and(|previous| fold_tail < previous) {
-            bail!(
-                "surviving manifest chain moves the fold tail backward from {:?} to {:?} at revision {commit}",
-                previous_fold_tail.expect("checked as present"),
-                fold_tail
-            );
-        }
-        admitted_parts.extend(manifest.parts.iter().map(|part| part.member.clone()));
-        let next_seq = manifest.next_seq;
-        validate_recovery_candidate_container(
+        match validate_retained_predecessor(
             container,
             path,
             cfg,
-            manifest,
             read_limits,
             control,
-        )?;
-        previous_commit = Some(commit);
-        previous_next_seq = Some(next_seq);
-        previous_fold_tail = Some(fold_tail);
-        previous_bytes = Some(bytes);
+            &bytes,
+            &newer,
+        ) {
+            Ok(manifest) => {
+                admitted_parts.extend(manifest.parts.iter().map(|part| part.member.clone()));
+                newer = manifest;
+            }
+            Err(error) if environmental_failure(&error) => return Err(error),
+            Err(_) => abandoned_older.push(commit),
+        }
     }
-    Ok(admitted_parts)
+    Ok(SurvivingHistory { admitted_parts, abandoned_older })
+}
+
+/// The retained history that survives beside a promotion candidate.
+struct SurvivingHistory {
+    /// Parts named by the candidate or by any surviving older revision.
+    admitted_parts: HashSet<String>,
+    /// Older retained revisions abandoned because they, or the link that would join them to the
+    /// survivors, no longer validate. Retention ends for them in the promoting flip.
+    abandoned_older: Vec<u64>,
+}
+
+/// Prove that `bytes` is the immediate, fully usable predecessor of `newer`: adjacent revision
+/// number, valid current-format manifest, the same fold generation, named by `newer`'s `prev`,
+/// monotonic cursor and tail, and content that reconstructs at its own tail.
+fn validate_retained_predecessor(
+    container: &crate::container::Container,
+    path: &Path,
+    cfg: FoldCfg,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+    bytes: &[u8],
+    newer: &Manifest,
+) -> Result<Manifest> {
+    let manifest = Manifest::parse(bytes).context("retained manifest revision is invalid")?;
+    let expected = newer.commit.checked_sub(1).context("retained revision order underflows")?;
+    if manifest.commit != expected {
+        bail!(
+            "retained revision {} does not immediately precede revision {}",
+            manifest.commit,
+            newer.commit
+        );
+    }
+    if manifest.fold_gen != newer.fold_gen {
+        bail!(
+            "retained revision {} references fold generation {} but revision {} references {}",
+            manifest.commit,
+            manifest.fold_gen,
+            newer.commit,
+            newer.fold_gen
+        );
+    }
+    let link = blake3::hash(bytes).to_hex().to_string();
+    if newer.prev.as_deref() != Some(link.as_str()) {
+        bail!(
+            "retained revision {} does not name revision {} as its predecessor",
+            newer.commit,
+            manifest.commit
+        );
+    }
+    if manifest.next_seq > newer.next_seq {
+        bail!(
+            "retained history moves the record-version cursor backward from {} to {} at revision {}",
+            manifest.next_seq,
+            newer.next_seq,
+            newer.commit
+        );
+    }
+    if (manifest.fold_seg, manifest.fold_off) > (newer.fold_seg, newer.fold_off) {
+        bail!(
+            "retained history moves the fold tail backward from {:?} to {:?} at revision {}",
+            (manifest.fold_seg, manifest.fold_off),
+            (newer.fold_seg, newer.fold_off),
+            newer.commit
+        );
+    }
+    validate_recovery_candidate_container(
+        container,
+        path,
+        cfg,
+        manifest.clone(),
+        read_limits,
+        control,
+    )?;
+    Ok(manifest)
 }
 
 /// Checked manifest promotion for a single-file store: OS-enforced writer role on native container
@@ -2350,7 +2393,14 @@ pub fn promote_manifest_file_with_limits_and_control(
     if container.contains("MANIFEST") {
         let current = container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?;
         if Manifest::parse(&current).is_ok() {
-            return Err(ManifestPromotionError::Healthy(path.to_path_buf()).into());
+            // Intact current authority alone is not health: retained history that no longer
+            // validates refuses every open just as surely, and promotion at rollback zero is the
+            // one operation authorized to end retention of what cannot be reopened.
+            match verify_chain_container(&container, read_limits, control) {
+                Ok(_) => return Err(ManifestPromotionError::Healthy(path.to_path_buf()).into()),
+                Err(error) if environmental_failure(&error) => return Err(error),
+                Err(_) => {}
+            }
         }
     }
     let commits = container_retained_commits(&container);
@@ -2411,30 +2461,24 @@ pub fn promote_manifest_file_with_limits_and_control(
                     }
                     .into());
                 }
-                let admitted_parts = match validate_surviving_promotion_history(
+                let history = match validate_surviving_promotion_history(
                     &container,
                     path,
                     cfg,
                     read_limits,
                     control,
-                    c,
+                    &manifest,
                 ) {
-                    Ok(parts) => parts,
+                    Ok(history) => history,
                     Err(error) => {
-                        if matches!(
-                            crate::error::classify(&error),
-                            crate::error::ErrorClass::Cancelled
-                                | crate::error::ErrorClass::ResourceExhausted
-                                | crate::error::ErrorClass::Io
-                                | crate::error::ErrorClass::NotFound
-                                | crate::error::ErrorClass::Unsupported
-                        ) {
+                        if environmental_failure(&error) {
                             return Err(error);
                         }
                         last_reason = error.to_string();
                         continue;
                     }
                 };
+                let abandoned: HashSet<u64> = history.abandoned_older.iter().copied().collect();
                 // No cancellation checkpoint after this point: promotion is one flip, and its
                 // selected authority or an explicit ambiguous-durability error must be reported.
                 control.check("manifest promotion publication")?;
@@ -2443,13 +2487,13 @@ pub fn promote_manifest_file_with_limits_and_control(
                     if let Some(revision) =
                         name.strip_prefix("MANIFEST.").and_then(|suffix| suffix.parse::<u64>().ok())
                     {
-                        if revision > c {
+                        if revision > c || abandoned.contains(&revision) {
                             container.remove(&name)?;
                         }
                         continue;
                     }
-                    let unreferenced_part =
-                        canonical_part_member_shape(&name) && !admitted_parts.contains(&name);
+                    let unreferenced_part = canonical_part_member_shape(&name)
+                        && !history.admitted_parts.contains(&name);
                     let abandoned_fold = exact_fold_member_name(&name)
                         && fold_generation_of_member(&name) != Some(cand_gen);
                     if unreferenced_part || abandoned_fold {
@@ -2507,17 +2551,11 @@ pub fn promote_manifest_file_with_limits_and_control(
                 }
                 report.commit = c;
                 report.rollback_commits = rollback_commits;
+                report.abandoned_retained_revisions = history.abandoned_older.len();
                 return Ok(report);
             }
             Err(error) => {
-                if matches!(
-                    crate::error::classify(&error),
-                    crate::error::ErrorClass::Cancelled
-                        | crate::error::ErrorClass::ResourceExhausted
-                        | crate::error::ErrorClass::Io
-                        | crate::error::ErrorClass::NotFound
-                        | crate::error::ErrorClass::Unsupported
-                ) {
+                if environmental_failure(&error) {
                     return Err(error);
                 }
                 last_reason = error.to_string();

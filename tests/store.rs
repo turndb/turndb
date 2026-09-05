@@ -1396,9 +1396,13 @@ fn manifest_promotion_removes_canonical_members_not_authorized_by_surviving_hist
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// The newest usable candidate is kept even when older retained history is damaged: the damaged
+/// revision and everything older stop being retained, and no acknowledged mutation is abandoned.
+/// Before this, a damaged older copy made every newer candidate unusable, and this store rolled
+/// back two revisions to promote revision 1, discarding two acknowledged records.
 #[test]
-fn manifest_promotion_searches_past_a_candidate_with_damaged_surviving_history() {
-    let dir = tmp("promotion-skips-broken-surviving-history");
+fn manifest_promotion_keeps_the_newest_candidate_and_abandons_damaged_older_history() {
+    let dir = tmp("promotion-abandons-broken-older-history");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.turndb");
     let mut store = Store::open_file(&path, cfg()).unwrap();
@@ -1420,12 +1424,14 @@ fn manifest_promotion_searches_past_a_candidate_with_damaged_surviving_history()
         turndb::store::ManifestPromotionOptions { max_rollback_commits: 2 },
     )
     .unwrap();
-    assert_eq!(report.commit, 1);
-    assert_eq!(report.rollback_commits, 2);
+    assert_eq!(report.commit, 3, "the newest retained revision is fully usable on its own");
+    assert_eq!(report.rollback_commits, 0);
+    assert_eq!(report.abandoned_retained_revisions, 2, "the damaged copy and the one behind it");
+    assert_eq!(turndb::store::retained_commits_file(&path).unwrap(), vec![3]);
     let reader = turndb::store::open_read_container(&path, cfg()).unwrap();
-    assert!(reader.get("r:1").unwrap().is_some());
-    assert!(reader.get("r:2").unwrap().is_none());
-    assert!(reader.get("r:3").unwrap().is_none());
+    for revision in 1..=3 {
+        assert!(reader.get(&format!("r:{revision}")).unwrap().is_some(), "r:{revision}");
+    }
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -4168,4 +4174,88 @@ fn every_publication_that_prunes_retention_frees_what_it_stops_retaining() {
     s.close().unwrap();
     assert_members_are_all_retained(&path, "after refold");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A retained manifest copy is authority a reader may still open at, so damage to it refuses every
+/// open even while the current `MANIFEST` is intact. Before this, promotion refused such a store as
+/// healthy, and no TurnDB operation could bring it back; main opened it and served every record.
+/// Promotion at rollback zero now re-selects the current revision and ends retention of the damaged
+/// copy and everything older, which the chain could no longer reach anyway.
+#[test]
+fn manifest_promotion_repairs_damaged_retained_history_at_rollback_zero() {
+    let cases: [(&str, u64, &[u64], usize); 2] =
+        [("oldest", 1, &[2, 3], 1), ("middle", 2, &[3], 2)];
+    for (case, damaged, want_retained, want_abandoned) in cases {
+        let dir = tmp(&format!("retained-repair-{case}"));
+        let path = store_file(&dir);
+        let mut s = Store::open_file(&path, cfg()).unwrap();
+        let mut want = Vec::new();
+        for i in 0..3 {
+            want.push(put(&mut s, &format!("r:{i}"), format!("revision {i}").as_bytes()));
+            s.sync().unwrap();
+            s.flush().unwrap();
+        }
+        s.close().unwrap();
+
+        // One flipped byte in the retained copy's checksum trailer: authentic to the container,
+        // no longer a valid manifest.
+        let name = format!("MANIFEST.{damaged:08}");
+        let mut container = turndb::container::Container::open(&path).unwrap();
+        let mut bytes = container.read_file_bounded(&name, 1 << 20).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        container.put_bytes(&name, &bytes).unwrap();
+        container.commit().unwrap();
+        drop(container);
+
+        let error = Store::open_file(&path, cfg())
+            .err()
+            .unwrap_or_else(|| panic!("{case}: damaged retained history must refuse writer open"));
+        assert_eq!(turndb::error::classify(&error), turndb::error::ErrorClass::Corruption);
+        assert!(turndb::store::open_read_container(&path, cfg()).is_err(), "{case}: read view");
+
+        let report = turndb::store::promote_manifest_file(
+            &path,
+            cfg(),
+            turndb::store::ManifestPromotionOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("{case}: rollback zero must repair retained history: {e:#}"));
+        assert_eq!(report.commit, 3, "{case}: the current revision is re-selected");
+        assert_eq!(report.rollback_commits, 0, "{case}");
+        assert_eq!(report.abandoned_retained_revisions, want_abandoned, "{case}");
+        assert_eq!(turndb::store::retained_commits_file(&path).unwrap(), want_retained, "{case}");
+
+        let reopened = Store::open_file(&path, cfg())
+            .unwrap_or_else(|e| panic!("{case}: repaired store must open: {e:#}"));
+        for (i, body) in want.iter().enumerate() {
+            assert_eq!(
+                reopened.reconstruct(&format!("r:{i}")).unwrap().as_ref(),
+                Some(body),
+                "{case}"
+            );
+        }
+        reopened.close().unwrap();
+        assert!(
+            turndb::store::open_read_container_at(&path, cfg(), want_retained[0]).is_ok(),
+            "{case}: surviving retained history still opens"
+        );
+        assert!(
+            turndb::store::open_read_container_at(&path, cfg(), damaged).is_err(),
+            "{case}: the abandoned revision is no longer retained"
+        );
+        let error = turndb::store::promote_manifest_file(
+            &path,
+            cfg(),
+            turndb::store::ManifestPromotionOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<turndb::store::ManifestPromotionError>(),
+                Some(turndb::store::ManifestPromotionError::Healthy(_))
+            ),
+            "{case}: the repaired store is healthy again: {error:#}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

@@ -19,3 +19,6 @@ independently; restore is a verified no-replace copy. Backup staging is named
 TurnDB meaning. The language-neutral capability profile advances to contract v2 and no v1
 capability responder or adapter remains; the separately versioned structured-query contract stays
 at v1.
+
+Manifest promotion at rollback zero repairs retained history that no longer validates beneath an
+intact current manifest, and reports how many older retained revisions it abandoned.

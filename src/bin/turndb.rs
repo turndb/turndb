@@ -46,7 +46,8 @@ usage: turndb <verb> [args]
                                  Does not promise media-byte
                                  non-recoverability; prints the measurable result
     recover   <STORE> [--max-rollback N]
-                                 validate and promote a retained manifest revision; rollback defaults to 0
+                                 validate and promote a retained manifest revision, abandoning
+                                 retained history that no longer validates; rollback defaults to 0
     reclaim   <STORE>            rewrite the file without the extents nothing names any more —
                                  returns edge bytes and fragmentation in-place deallocation cannot
 
@@ -207,6 +208,13 @@ fn run(args: &[String]) -> Result<()> {
                 "promoted retained manifest revision {} to MANIFEST (rollback {}, {} records, {} content values verified)",
                 report.commit, report.rollback_commits, report.records, report.content_values
             );
+            if report.abandoned_retained_revisions > 0 {
+                println!(
+                    "abandoned {} older retained revision{} that no longer validated",
+                    report.abandoned_retained_revisions,
+                    if report.abandoned_retained_revisions == 1 { "" } else { "s" }
+                );
+            }
             Ok(())
         }
         "snapshots" => {

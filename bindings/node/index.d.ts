@@ -514,6 +514,8 @@ export declare function recoverManifest(
 ): Promise<{
   commit: bigint;
   rollbackCommits: bigint;
+  /** Older retained revisions abandoned because they no longer validated; retention shrank by this many. */
+  abandonedRetainedRevisions: bigint;
   records: bigint;
   contentValues: bigint;
   parts: bigint;

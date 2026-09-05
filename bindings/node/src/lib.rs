@@ -598,6 +598,7 @@ pub struct NativeRestoreOptions {
 pub struct NativeManifestPromotionResult {
     pub commit: BigInt,
     pub rollback_commits: BigInt,
+    pub abandoned_retained_revisions: BigInt,
     pub records: BigInt,
     pub content_values: BigInt,
     pub parts: BigInt,
@@ -1380,6 +1381,7 @@ pub fn recover_manifest<'env>(
         .map(|report| NativeManifestPromotionResult {
             commit: BigInt::from(report.commit),
             rollback_commits: BigInt::from(report.rollback_commits),
+            abandoned_retained_revisions: BigInt::from(report.abandoned_retained_revisions as u64),
             records: BigInt::from(report.records as u64),
             content_values: BigInt::from(report.content_values as u64),
             parts: BigInt::from(report.parts as u64),
