@@ -340,10 +340,7 @@ pub mod record {
             Some(0) => {
                 f.set(None);
                 WRITE_FIRED.with(|x| x.set(Some(attempt)));
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    InjectedWriteFailure { attempt },
-                ))
+                Err(std::io::Error::other(InjectedWriteFailure { attempt }))
             }
             Some(left) => {
                 f.set(Some(left - 1));

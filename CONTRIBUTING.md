@@ -132,7 +132,7 @@ cargo test --no-default-features
 cargo test --release                      # debug-only panics behave differently
 cargo test --features dst --test dst      # the deterministic crash-state harness
 cargo test --test corruption              # the mutation storm; set STORM_XOR for a fresh seed
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 

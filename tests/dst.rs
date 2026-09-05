@@ -2926,7 +2926,7 @@ fn a_failed_final_container_sync_reconciles_or_poisoned_refuses_handle_reuse() {
     container.put_bytes("two", b"second").unwrap();
 
     let guard = record::fail_sync_after(1);
-    let error = container.commit().err().expect("the final publication sync must fail");
+    let error = container.commit().expect_err("the final publication sync must fail");
     assert_eq!(guard.fired_at(), Some(1));
     assert_eq!(injected_cause(&error), Some(1));
     drop(guard);
@@ -2983,7 +2983,7 @@ fn a_store_adopts_a_selected_manifest_before_returning_its_final_sync_error() {
     let path = root.join("store.turndb");
     let mut store = prepared(&path);
     let guard = record::fail_sync_after(target);
-    let error = store.flush().err().expect("the final publication sync must fail");
+    let error = store.flush().expect_err("the final publication sync must fail");
     assert_eq!(guard.fired_at(), Some(target));
     assert_eq!(injected_cause(&error), Some(target));
     drop(guard);
@@ -3019,7 +3019,7 @@ fn a_store_adopts_a_selected_manifest_before_returning_its_final_sync_error() {
     let reopened_path = root.join("reopened.turndb");
     let mut failed = prepared(&reopened_path);
     let guard = record::fail_sync_after(target);
-    let error = failed.flush().err().expect("the reopened case must reach the same final barrier");
+    let error = failed.flush().expect_err("the reopened case must reach the same final barrier");
     assert_eq!(guard.fired_at(), Some(target));
     assert_eq!(injected_cause(&error), Some(target));
     drop(guard);
@@ -3198,7 +3198,7 @@ fn a_store_requires_reopen_when_a_failed_slot_write_leaves_the_predecessor_selec
     let path = root.join("store.turndb");
     let mut store = prepared(&path);
     let guard = record::fail_write_after(target);
-    let error = store.flush().err().expect("the authority-slot write must fail");
+    let error = store.flush().expect_err("the authority-slot write must fail");
     assert_eq!(guard.fired_at(), Some(target));
     assert_eq!(injected_write_cause(&error), Some(target));
     drop(guard);
@@ -3508,7 +3508,7 @@ fn close_retries_wal_settlement_after_publication_outlives_a_truncate_sync_failu
     let wal = wal_path(&path);
     let mut store = staged(&path);
     let guard = record::fail_sync_after(target);
-    let error = store.flush().err().expect("the WAL truncate sync must fail");
+    let error = store.flush().expect_err("the WAL truncate sync must fail");
     assert_eq!(guard.fired_at(), Some(target));
     assert_eq!(injected_cause(&error), Some(target));
     drop(guard);
@@ -3613,7 +3613,7 @@ fn backup_retries_redundant_wal_settlement_before_installing_the_artifact() {
     let artifact = root.join("backup.turndb");
     let mut store = staged(&path);
     let guard = record::fail_sync_after(target);
-    let error = store.flush().err().expect("the WAL truncate sync must fail");
+    let error = store.flush().expect_err("the WAL truncate sync must fail");
     assert_eq!(guard.fired_at(), Some(target));
     assert_eq!(injected_cause(&error), Some(target));
     drop(guard);
