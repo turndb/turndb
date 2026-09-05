@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
-use turndb::{BodyOp, Record};
+use turndb::{ContentOp, Record};
 
 /// Byte ranges of the top-level elements of a JSON array, or None if this is not an array.
 /// String- and escape-aware so a `[`, `]` or `,` inside a string never splits an element.
@@ -204,7 +204,7 @@ fn main() -> anyhow::Result<()> {
         nrec += 1;
         logical += body.len() as u64;
 
-        let mut prog: Vec<BodyOp> = Vec::new();
+        let mut prog: Vec<ContentOp> = Vec::new();
         for (foldable, r) in carve(&body) {
             let span = &body[r.clone()];
             if foldable {
@@ -213,9 +213,9 @@ fn main() -> anyhow::Result<()> {
                 if p.deduped {
                     dups += 1;
                 }
-                prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
+                prog.push(ContentOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
-                prog.push(BodyOp::Lit(span.to_vec()));
+                prog.push(ContentOp::Lit(span.to_vec()));
             }
         }
         // ids must be unique within a part; skip an exact repeat rather than fail the run

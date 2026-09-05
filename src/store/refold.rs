@@ -42,7 +42,7 @@
 
 use crate::fold::{Fold, FoldCfg, Loc};
 use crate::part::Part;
-use crate::types::{BodyOp, PieceHash, Record};
+use crate::types::{ContentOp, PieceHash, Record};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -97,7 +97,7 @@ fn plan_refold(
             control.check("content refold")?;
             for content in parts[pi].record(row)?.contents {
                 for op in content.ops {
-                    let BodyOp::Piece { hash, .. } = op else { continue };
+                    let ContentOp::Piece { hash, .. } = op else { continue };
                     if wanted.contains_key(&hash) {
                         continue;
                     }

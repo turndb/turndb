@@ -44,7 +44,7 @@ use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
 use crate::part::{self, Part};
 use crate::read_limits::ReadLimits;
-use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+use crate::types::{AttrValue, Content, ContentHash, ContentOp, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1386,10 +1386,10 @@ fn verify_replay_identities(frames: &[wal::Frame], current: &ReadStore) -> Resul
             let mut hasher = blake3::Hasher::new();
             for op in &content.ops {
                 match op {
-                    BodyOp::Lit(bytes) => {
+                    ContentOp::Lit(bytes) => {
                         hasher.update(bytes);
                     }
-                    BodyOp::Piece { hash, len } => {
+                    ContentOp::Piece { hash, len } => {
                         let owned;
                         let bytes = if let Some(bytes) = pending.get(hash) {
                             bytes.as_slice()
@@ -1476,7 +1476,7 @@ fn live_fold_pieces_with_control(
             control.check("content reachability")?;
             for content in part.record(row)?.contents {
                 for operation in content.ops {
-                    let BodyOp::Piece { hash, len } = operation else { continue };
+                    let ContentOp::Piece { hash, len } = operation else { continue };
                     let location = part.find_piece(&hash)?.ok_or_else(|| {
                         anyhow::anyhow!(
                             "a record resolved by current authority references absent piece {hash} in its owning Part"
@@ -3908,12 +3908,12 @@ impl Store {
             match s {
                 Span::Lit(b) => {
                     identity.update(b);
-                    ops.push(BodyOp::Lit(b.to_vec()));
+                    ops.push(ContentOp::Lit(b.to_vec()));
                 }
                 Span::Piece(b) => {
                     identity.update(b);
                     if b.is_empty() {
-                        ops.push(BodyOp::Lit(Vec::new()));
+                        ops.push(ContentOp::Lit(Vec::new()));
                         continue;
                     }
                     let put = self.fold_piece(b)?;
@@ -3922,7 +3922,7 @@ impl Store {
                         // anything the fold wrote past the tail referenced by current authority.
                         novel.push((put.hash, b.to_vec()));
                     }
-                    ops.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
+                    ops.push(ContentOp::Piece { hash: put.hash, len: b.len() as u32 });
                 }
             }
         }
@@ -4044,19 +4044,22 @@ impl Store {
                             match s {
                                 OwnedSpan::Lit(b) => {
                                     identity.update(b);
-                                    ops.push(BodyOp::Lit(b.clone()));
+                                    ops.push(ContentOp::Lit(b.clone()));
                                 }
                                 OwnedSpan::Piece(b) => {
                                     identity.update(b);
                                     if b.is_empty() {
-                                        ops.push(BodyOp::Lit(Vec::new()));
+                                        ops.push(ContentOp::Lit(Vec::new()));
                                         continue;
                                     }
                                     let put = self.fold_piece(b)?;
                                     if !put.deduped {
                                         novel.push((put.hash, b.clone()));
                                     }
-                                    ops.push(BodyOp::Piece { hash: put.hash, len: b.len() as u32 });
+                                    ops.push(ContentOp::Piece {
+                                        hash: put.hash,
+                                        len: b.len() as u32,
+                                    });
                                 }
                             }
                         }
@@ -4288,7 +4291,7 @@ impl Store {
                 for content in &record.contents {
                     for op in &content.ops {
                         control.check("memtable flush planning")?;
-                        let BodyOp::Piece { hash, .. } = op else { continue };
+                        let ContentOp::Piece { hash, .. } = op else { continue };
                         if locs.contains_key(hash) {
                             continue;
                         }
@@ -4904,8 +4907,8 @@ impl Store {
         let mut out = Vec::new();
         for op in &content.ops {
             match op {
-                BodyOp::Lit(b) => out.extend_from_slice(b),
-                BodyOp::Piece { hash, .. } => {
+                ContentOp::Lit(b) => out.extend_from_slice(b),
+                ContentOp::Piece { hash, .. } => {
                     let loc = self
                         .locate(hash)?
                         .ok_or_else(|| anyhow::anyhow!("piece {hash} not resolvable"))?;
@@ -6144,8 +6147,8 @@ fn approx_bytes(r: &Record) -> usize {
                         .ops
                         .iter()
                         .map(|o| match o {
-                            BodyOp::Lit(b) => b.len() + 8,
-                            BodyOp::Piece { .. } => 40,
+                            ContentOp::Lit(b) => b.len() + 8,
+                            ContentOp::Piece { .. } => 40,
                         })
                         .sum::<usize>()
             })
@@ -6165,7 +6168,7 @@ mod tests {
     fn manifest_promotion_validates_piece_locations_through_each_rows_owning_part() {
         use crate::fold::block::{self, Loc, CODEC_STORED};
         use crate::fold::segment::SegHeader;
-        use crate::types::{BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+        use crate::types::{Content, ContentHash, ContentOp, PieceHash, Record, BODY_CONTENT};
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -6200,7 +6203,7 @@ mod tests {
                 id,
                 vec![Content::identified(
                     BODY_CONTENT,
-                    vec![BodyOp::Piece { hash, len: bytes.len() as u32 }],
+                    vec![ContentOp::Piece { hash, len: bytes.len() as u32 }],
                     ContentHash(hash.0),
                 )],
                 Vec::new(),
@@ -6253,7 +6256,7 @@ mod tests {
     fn content_reachability_preserves_every_owning_location_for_one_piece_identity() {
         use crate::fold::block::{self, Loc, CODEC_STORED};
         use crate::fold::segment::SegHeader;
-        use crate::types::{BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+        use crate::types::{Content, ContentHash, ContentOp, PieceHash, Record, BODY_CONTENT};
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -6287,7 +6290,7 @@ mod tests {
                 id,
                 vec![Content::identified(
                     BODY_CONTENT,
-                    vec![BodyOp::Piece { hash, len: bytes.len() as u32 }],
+                    vec![ContentOp::Piece { hash, len: bytes.len() as u32 }],
                     ContentHash(hash.0),
                 )],
                 Vec::new(),

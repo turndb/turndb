@@ -5,15 +5,15 @@
 use std::path::PathBuf;
 use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
-use turndb::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
+use turndb::{AttrValue, Content, ContentOp, Record, BODY_CONTENT};
 
-fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
+fn body_content(ops: Vec<ContentOp>) -> Vec<Content> {
     let identity = match ops.as_slice() {
-        [BodyOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
-        ops if ops.iter().all(|op| matches!(op, BodyOp::Lit(_))) => {
+        [ContentOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
+        ops if ops.iter().all(|op| matches!(op, ContentOp::Lit(_))) => {
             let mut bytes = Vec::new();
             for op in ops {
-                if let BodyOp::Lit(literal) = op {
+                if let ContentOp::Lit(literal) = op {
                     bytes.extend_from_slice(literal);
                 }
             }
@@ -40,7 +40,7 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         Record {
             // duplicate keys, mixed types on one key, NaN, -0.0, and a non-ASCII id
             id: "genai:aé#input".into(),
-            contents: body_content(vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }]),
+            contents: body_content(vec![ContentOp::Piece { hash: p1.hash, len: p1.loc.raw }]),
             attrs: vec![
                 ("z.last".into(), AttrValue::Str("v".into())),
                 ("dup".into(), AttrValue::Int(1)),
@@ -56,7 +56,7 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         },
         Record {
             id: "genai:aè#input".into(),
-            contents: body_content(vec![BodyOp::Piece { hash: p1.hash, len: p1.loc.raw }]),
+            contents: body_content(vec![ContentOp::Piece { hash: p1.hash, len: p1.loc.raw }]),
             // the SAME key at a different type — must become a separate column
             attrs: vec![
                 ("mixed".into(), AttrValue::Str("7".into())),
@@ -69,11 +69,11 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
             contents: vec![Content::identified(
                 BODY_CONTENT,
                 vec![
-                    BodyOp::Lit(b"[".to_vec()),
-                    BodyOp::Piece { hash: p2.hash, len: p2.loc.raw },
-                    BodyOp::Lit(b",".to_vec()),
-                    BodyOp::Piece { hash: p3.hash, len: p3.loc.raw },
-                    BodyOp::Lit(b"]".to_vec()),
+                    ContentOp::Lit(b"[".to_vec()),
+                    ContentOp::Piece { hash: p2.hash, len: p2.loc.raw },
+                    ContentOp::Lit(b",".to_vec()),
+                    ContentOp::Piece { hash: p3.hash, len: p3.loc.raw },
+                    ContentOp::Lit(b"]".to_vec()),
                 ],
                 turndb::ContentHash::of(
                     &[
@@ -94,7 +94,7 @@ fn fixture(fold: &mut Fold) -> Vec<Record> {
         },
         Record {
             id: "rec:no-attrs".into(),
-            contents: body_content(vec![BodyOp::Lit(b"bare".to_vec())]),
+            contents: body_content(vec![ContentOp::Lit(b"bare".to_vec())]),
             attrs: Vec::new(),
         },
         Record {
@@ -138,10 +138,10 @@ fn records_round_trip_byte_exact() {
 
         // and the content itself reconstructs byte-exact out of the fold
         let mut expect = Vec::new();
-        for op in r.body().unwrap() {
+        for op in &r.content(BODY_CONTENT).expect("body content").ops {
             match op {
-                BodyOp::Lit(b) => expect.extend_from_slice(b),
-                BodyOp::Piece { hash, .. } => {
+                ContentOp::Lit(b) => expect.extend_from_slice(b),
+                ContentOp::Piece { hash, .. } => {
                     expect.extend_from_slice(&fold.read(fold.lookup(*hash).unwrap()).unwrap())
                 }
             }
@@ -212,7 +212,7 @@ fn scales_to_many_records_with_shared_content() {
                 .iter()
                 .map(|&index| {
                     let p = &pieces[index];
-                    BodyOp::Piece { hash: p.hash, len: p.loc.raw }
+                    ContentOp::Piece { hash: p.hash, len: p.loc.raw }
                 })
                 .collect();
             let bytes = indexes
@@ -276,7 +276,7 @@ fn piece_dictionary_is_in_fold_order() {
                 let p = fold
                     .put(format!("piece {i} with enough bytes to matter for blocking").as_bytes())
                     .unwrap();
-                BodyOp::Piece { hash: p.hash, len: p.loc.raw }
+                ContentOp::Piece { hash: p.hash, len: p.loc.raw }
             }]),
             attrs: Vec::new(),
         })
@@ -371,7 +371,7 @@ fn a_toc_pointing_past_the_file_is_refused() {
             let p = fold.put(&body).unwrap();
             Record {
                 id: format!("k{i:03}"),
-                contents: body_content(vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }]),
+                contents: body_content(vec![ContentOp::Piece { hash: p.hash, len: p.loc.raw }]),
                 attrs: vec![("v".into(), AttrValue::Int(i))],
             }
         })
@@ -424,7 +424,7 @@ fn a_part(d: &std::path::Path) -> (std::path::PathBuf, Fold) {
             let p = fold.put(&body).unwrap();
             Record {
                 id: format!("k{i:03}"),
-                contents: body_content(vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }]),
+                contents: body_content(vec![ContentOp::Piece { hash: p.hash, len: p.loc.raw }]),
                 attrs: vec![("v".into(), AttrValue::Str(format!("value {i}")))],
             }
         })
@@ -652,7 +652,7 @@ fn the_streaming_builder_is_byte_identical_to_build_full() {
     for r in &records {
         for content in &r.contents {
             for op in &content.ops {
-                if let BodyOp::Piece { hash, .. } = op {
+                if let ContentOp::Piece { hash, .. } = op {
                     dict_map.entry(*hash).or_insert_with(|| fold.lookup(*hash).unwrap());
                 }
             }
@@ -770,7 +770,7 @@ fn streaming_builder_emits_only_self_openable_current_parts() {
             false,
             &[Content::identified(
                 BODY_CONTENT,
-                vec![BodyOp::Piece { hash: missing, len: 1 }],
+                vec![ContentOp::Piece { hash: missing, len: 1 }],
                 turndb::ContentHash(missing.0),
             )],
             &[],
@@ -799,7 +799,7 @@ fn zone_maps_bound_columns_and_refuse_to_lie() {
     let fold = Fold::open(&d.join("fold"), FoldCfg::default()).unwrap();
     let rec = |id: &str, n: i64, t: f64, nanf: f64| Record {
         id: id.into(),
-        contents: body_content(vec![BodyOp::Lit(b"x".to_vec())]),
+        contents: body_content(vec![ContentOp::Lit(b"x".to_vec())]),
         attrs: vec![
             ("n".into(), AttrValue::Int(n)),
             ("t".into(), AttrValue::Float(t)),

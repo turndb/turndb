@@ -15,7 +15,7 @@
 //! ```
 
 use crate::part::idcol::{get_varint, put_varint};
-use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record};
+use crate::types::{AttrValue, Content, ContentHash, ContentOp, PieceHash, Record};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -86,15 +86,15 @@ fn take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8]> {
     Ok(s)
 }
 
-fn put_ops(out: &mut Vec<u8>, ops: &[BodyOp]) {
+fn put_ops(out: &mut Vec<u8>, ops: &[ContentOp]) {
     put_varint(out, ops.len() as u64);
     for op in ops {
         match op {
-            BodyOp::Lit(b) => {
+            ContentOp::Lit(b) => {
                 out.push(0);
                 put_bytes(out, b);
             }
-            BodyOp::Piece { hash, len } => {
+            ContentOp::Piece { hash, len } => {
                 out.push(1);
                 out.extend_from_slice(&hash.0);
                 put_varint(out, *len as u64);
@@ -103,7 +103,7 @@ fn put_ops(out: &mut Vec<u8>, ops: &[BodyOp]) {
     }
 }
 
-fn get_ops(b: &[u8], at: &mut usize) -> Result<Vec<BodyOp>> {
+fn get_ops(b: &[u8], at: &mut usize) -> Result<Vec<ContentOp>> {
     let n_ops = usize::try_from(get_varint(b, at)?)
         .context("wal: content-op count exceeds this platform's address space")?;
     let mut ops = Vec::with_capacity(n_ops.min(b.len()));
@@ -111,7 +111,7 @@ fn get_ops(b: &[u8], at: &mut usize) -> Result<Vec<BodyOp>> {
         let tag = *b.get(*at).ok_or_else(|| anyhow::anyhow!("wal: truncated content op"))?;
         *at += 1;
         match tag {
-            0 => ops.push(BodyOp::Lit(get_bytes(b, at)?.to_vec())),
+            0 => ops.push(ContentOp::Lit(get_bytes(b, at)?.to_vec())),
             1 => {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(take(b, at, 32)?);
@@ -120,7 +120,7 @@ fn get_ops(b: &[u8], at: &mut usize) -> Result<Vec<BodyOp>> {
                 if len == 0 {
                     bail!("wal: piece length must be non-zero");
                 }
-                ops.push(BodyOp::Piece { hash: PieceHash(h), len });
+                ops.push(ContentOp::Piece { hash: PieceHash(h), len });
             }
             t => bail!("wal: unknown content op tag {t}"),
         }
@@ -222,10 +222,10 @@ fn verify_frame_local_identities(record: &Record, novel: &[(PieceHash, Vec<u8>)]
         let mut complete = true;
         for op in &content.ops {
             match op {
-                BodyOp::Lit(bytes) => {
+                ContentOp::Lit(bytes) => {
                     hasher.update(bytes);
                 }
-                BodyOp::Piece { hash, len } => match pieces.get(hash) {
+                ContentOp::Piece { hash, len } => match pieces.get(hash) {
                     Some(bytes) => {
                         if bytes.len() != usize::try_from(*len).unwrap_or(usize::MAX) {
                             bail!(
@@ -773,8 +773,8 @@ mod tests {
                 contents: vec![Content::identified(
                     BODY_CONTENT,
                     vec![
-                        BodyOp::Lit(b"[".to_vec()),
-                        BodyOp::Piece { hash: h, len: bytes.len() as u32 },
+                        ContentOp::Lit(b"[".to_vec()),
+                        ContentOp::Piece { hash: h, len: bytes.len() as u32 },
                     ],
                     ContentHash::of(&[b"[".as_slice(), bytes.as_slice()].concat()),
                 )],
@@ -863,7 +863,7 @@ mod tests {
         put_varint(&mut false_identity, 1);
         put_bytes(&mut false_identity, b"body");
         false_identity.extend_from_slice(&ContentHash::of(b"different").0);
-        put_ops(&mut false_identity, &[BodyOp::Lit(b"actual".to_vec())]);
+        put_ops(&mut false_identity, &[ContentOp::Lit(b"actual".to_vec())]);
         put_attrs(&mut false_identity, &[]);
         put_novel(&mut false_identity, &[]);
         assert!(decode_record(&false_identity).is_err());
@@ -880,7 +880,7 @@ mod tests {
         put_varint(&mut zero_piece, 1);
         put_bytes(&mut zero_piece, b"body");
         zero_piece.extend_from_slice(&ContentHash::of(b"").0);
-        put_ops(&mut zero_piece, &[BodyOp::Piece { hash: PieceHash::of(b""), len: 0 }]);
+        put_ops(&mut zero_piece, &[ContentOp::Piece { hash: PieceHash::of(b""), len: 0 }]);
         put_attrs(&mut zero_piece, &[]);
         put_novel(&mut zero_piece, &[]);
         assert!(decode_record(&zero_piece).is_err(), "a zero-length piece op must refuse");
@@ -919,7 +919,7 @@ mod tests {
             id: "zero-piece".into(),
             contents: vec![Content::identified(
                 "body",
-                vec![BodyOp::Piece { hash: PieceHash::of(b""), len: 0 }],
+                vec![ContentOp::Piece { hash: PieceHash::of(b""), len: 0 }],
                 ContentHash::of(b""),
             )],
             attrs: Vec::new(),

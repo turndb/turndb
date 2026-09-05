@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
-use turndb::{AttrValue, BodyOp, Record};
+use turndb::{AttrValue, ContentOp, Record};
 
 /// The engine's carve, as spans of (foldable, range). One historical difference, kept for
 /// comparability with earlier runs of this harness: a non-array body here folds WHOLE rather
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         nrec += 1;
         logical += body.len() as u64;
 
-        let mut prog: Vec<BodyOp> = Vec::new();
+        let mut prog: Vec<ContentOp> = Vec::new();
         for (foldable, r) in carve(&body) {
             let span = &body[r.clone()];
             if foldable {
@@ -107,9 +107,9 @@ fn main() -> anyhow::Result<()> {
                 if p.deduped {
                     dups += 1;
                 }
-                prog.push(BodyOp::Piece { hash: p.hash, len: span.len() as u32 });
+                prog.push(ContentOp::Piece { hash: p.hash, len: span.len() as u32 });
             } else {
-                prog.push(BodyOp::Lit(span.to_vec()));
+                prog.push(ContentOp::Lit(span.to_vec()));
             }
         }
         if nrec % verify_every as u64 == 0 {

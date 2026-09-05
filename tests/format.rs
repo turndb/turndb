@@ -866,7 +866,7 @@ fn the_body_op_escape_is_reserved_and_never_written() {
 
     // and the encoded program contains no zero tag
     let p = turndb::part::Part::open(&part_path(&dir)).unwrap();
-    let ops = p.body(0).unwrap();
+    let ops = p.content(0, turndb::BODY_CONTENT).unwrap().expect("body content");
     assert_eq!(ops.len(), 1, "the two empty literals are gone, the real one remains: {ops:?}");
     std::fs::remove_dir_all(&dir).ok();
 }

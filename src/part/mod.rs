@@ -43,7 +43,7 @@ pub mod merge;
 
 use crate::fold::{Fold, Loc};
 use crate::readat::ReadAt;
-use crate::types::{AttrValue, BodyOp, Content, ContentHash, PieceHash, Record, BODY_CONTENT};
+use crate::types::{AttrValue, Content, ContentHash, ContentOp, PieceHash, Record, BODY_CONTENT};
 use anyhow::{bail, Context, Result};
 use cache::{Held, Kind, SectionCache};
 use idcol::{get_varint, put_varint, IdCol};
@@ -249,7 +249,7 @@ fn collect_piece_dictionary(
         crate::types::validate_contents(&record.contents)?;
         for content in &record.contents {
             for op in &content.ops {
-                let BodyOp::Piece { hash, len } = op else { continue };
+                let ContentOp::Piece { hash, len } = op else { continue };
                 if let Some(previous) = expected_lengths.insert(*hash, *len) {
                     if previous != *len {
                         bail!(
@@ -1556,7 +1556,12 @@ impl Part {
         Ok(rows.binary_search(&row).ok())
     }
 
-    fn program(&self, prog_name: &str, off_name: &str, occurrence: usize) -> Result<Vec<BodyOp>> {
+    fn program(
+        &self,
+        prog_name: &str,
+        off_name: &str,
+        occurrence: usize,
+    ) -> Result<Vec<ContentOp>> {
         let prog = self.sect(prog_name)?;
         let offs = self.nums(off_name, 8)?;
         if occurrence >= offs.len().saturating_sub(1) {
@@ -1572,7 +1577,7 @@ impl Part {
         self.decode_program(&prog[start..end])
     }
 
-    fn decode_program(&self, program: &[u8]) -> Result<Vec<BodyOp>> {
+    fn decode_program(&self, program: &[u8]) -> Result<Vec<ContentOp>> {
         let mut at = 0usize;
         let n = usize::try_from(get_varint(program, &mut at)?)
             .context("content-op count exceeds this platform's address space")?;
@@ -1590,7 +1595,7 @@ impl Part {
                 if len > program.len() - at {
                     bail!("literal runs past the program");
                 }
-                out.push(BodyOp::Lit(program[at..at + len].to_vec()));
+                out.push(ContentOp::Lit(program[at..at + len].to_vec()));
                 at += len;
             } else {
                 let idx = usize::try_from(tagged >> 1)
@@ -1607,7 +1612,7 @@ impl Part {
                         location.raw
                     );
                 }
-                out.push(BodyOp::Piece { hash, len });
+                out.push(ContentOp::Piece { hash, len });
             }
         }
         if at != program.len() {
@@ -1617,7 +1622,7 @@ impl Part {
     }
 
     /// One named content program at row `r`, if present.
-    pub fn content(&self, r: usize, name: &str) -> Result<Option<Vec<BodyOp>>> {
+    pub fn content(&self, r: usize, name: &str) -> Result<Option<Vec<ContentOp>>> {
         let columns = self.content_meta()?;
         let Ok(col) = columns.binary_search_by(|c| c.name.as_bytes().cmp(name.as_bytes())) else {
             return Ok(None);
@@ -1760,11 +1765,6 @@ impl Part {
             }
         }
         Ok(out)
-    }
-
-    /// Convenience access to the conventional `body` content value.
-    pub fn body(&self, r: usize) -> Result<Vec<BodyOp>> {
-        Ok(self.content(r, BODY_CONTENT)?.unwrap_or_default())
     }
 
     /// Row `r`'s attributes, in their exact original order, duplicates included.
@@ -1924,8 +1924,8 @@ impl Part {
         let mut out = Vec::new();
         for op in &content.ops {
             match op {
-                BodyOp::Lit(bytes) => out.extend_from_slice(bytes),
-                BodyOp::Piece { hash, len } => {
+                ContentOp::Lit(bytes) => out.extend_from_slice(bytes),
+                ContentOp::Piece { hash, len } => {
                     let loc = self.find_piece(hash)?;
                     let loc = loc.ok_or_else(|| {
                         anyhow::anyhow!("piece {hash} is not in the part dictionary")
@@ -1990,13 +1990,13 @@ impl Part {
         for op in &content.ops {
             control.check("content identity verification")?;
             match op {
-                BodyOp::Lit(literal) => {
+                ContentOp::Lit(literal) => {
                     hasher.update(literal);
                     bytes = bytes
                         .checked_add(literal.len() as u64)
                         .ok_or_else(|| anyhow::anyhow!("content byte count overflow"))?;
                 }
-                BodyOp::Piece { hash, len } => {
+                ContentOp::Piece { hash, len } => {
                     let location = self.find_piece(hash)?.ok_or_else(|| {
                         anyhow::anyhow!("piece {hash} is not in the owning part dictionary")
                     })?;
@@ -2623,7 +2623,7 @@ mod tests {
             id: "piece-record".into(),
             contents: vec![crate::types::Content::identified(
                 "body",
-                vec![BodyOp::Piece { hash, len: 5 }],
+                vec![ContentOp::Piece { hash, len: 5 }],
                 crate::types::ContentHash::of(b"piece"),
             )],
             attrs: Vec::new(),

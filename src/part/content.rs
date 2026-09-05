@@ -6,7 +6,7 @@
 
 use super::idcol::put_varint;
 use super::{OP_LIT, OP_PIECE};
-use crate::types::{BodyOp, Content, PieceHash, Record};
+use crate::types::{Content, ContentOp, PieceHash, Record};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, HashMap};
 
@@ -30,21 +30,21 @@ pub(crate) struct Built {
 
 pub(crate) fn encode_program(
     out: &mut Vec<u8>,
-    ops: &[BodyOp],
+    ops: &[ContentOp],
     dict_index: &HashMap<PieceHash, u32>,
 ) -> Result<()> {
-    let emitted = ops.iter().filter(|op| !matches!(op, BodyOp::Lit(b) if b.is_empty())).count();
+    let emitted = ops.iter().filter(|op| !matches!(op, ContentOp::Lit(b) if b.is_empty())).count();
     put_varint(out, emitted as u64);
     for op in ops {
         match op {
-            BodyOp::Lit(b) => {
+            ContentOp::Lit(b) => {
                 if b.is_empty() {
                     continue;
                 }
                 put_varint(out, (b.len() as u64) << 1 | OP_LIT);
                 out.extend_from_slice(b);
             }
-            BodyOp::Piece { hash, len } => {
+            ContentOp::Piece { hash, len } => {
                 let idx = dict_index.get(hash).ok_or_else(|| {
                     anyhow::anyhow!("piece {hash} is outside the part's declared dictionary")
                 })?;

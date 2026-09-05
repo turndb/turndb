@@ -20,7 +20,7 @@ use std::sync::mpsc::sync_channel;
 use std::time::Instant;
 use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
-use turndb::{AttrValue, BodyOp, PieceHash, Record};
+use turndb::{AttrValue, ContentOp, PieceHash, Record};
 
 fn split_json_array(s: &[u8]) -> Option<Vec<(usize, usize)>> {
     let mut i = 0;
@@ -225,7 +225,7 @@ fn main() -> anyhow::Result<()> {
         let mut prog = Vec::with_capacity(p.ops.len());
         for op in &p.ops {
             match op {
-                PreOp::Lit(r) => prog.push(BodyOp::Lit(p.body[r.clone()].to_vec())),
+                PreOp::Lit(r) => prog.push(ContentOp::Lit(p.body[r.clone()].to_vec())),
                 PreOp::Piece { hash, at } => {
                     // the only serialized work: probe + (on a miss) a memcpy into the open block
                     let put = fold.put_hashed(&p.body[at.clone()], *hash)?;
@@ -233,7 +233,7 @@ fn main() -> anyhow::Result<()> {
                     if put.deduped {
                         dups += 1;
                     }
-                    prog.push(BodyOp::Piece { hash: *hash, len: (at.end - at.start) as u32 });
+                    prog.push(ContentOp::Piece { hash: *hash, len: (at.end - at.start) as u32 });
                 }
             }
         }

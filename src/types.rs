@@ -126,7 +126,8 @@ impl AttrValue {
     }
 }
 
-/// The conventional name used by the compatibility body API.
+/// The conventional content name written by [`crate::store::Store::put`] and `put_body`, and read
+/// by every surface that offers a single unnamed value.
 pub const BODY_CONTENT: &str = "body";
 
 /// One step of a content value, as produced by the lens and stored in the WAL.
@@ -159,10 +160,6 @@ impl ContentOp {
         self.len() == 0
     }
 }
-
-/// Pre-1.0 source compatibility for callers that construct body programs directly. New code should
-/// use [`ContentOp`]; a body is now merely content named [`BODY_CONTENT`].
-pub type BodyOp = ContentOp;
 
 /// One independently projectable, content-addressed value in a record.
 ///
@@ -235,20 +232,9 @@ impl Record {
         self.contents.iter().find(|c| c.name == name)
     }
 
-    /// The compatibility body program, if content named `body` is present.
-    pub fn body(&self) -> Option<&[ContentOp]> {
-        self.content(BODY_CONTENT).map(|c| c.ops.as_slice())
-    }
-
     /// The reconstructed length of a named content value, without touching the fold.
     pub fn content_len(&self, name: &str) -> Option<u64> {
         self.content(name).map(Content::len)
-    }
-
-    /// Compatibility form of [`Record::content_len`]. An absent body reports zero, matching the
-    /// historical empty-program representation used by tombstone-shaped test records.
-    pub fn body_len(&self) -> u64 {
-        self.content_len(BODY_CONTENT).unwrap_or(0)
     }
 }
 

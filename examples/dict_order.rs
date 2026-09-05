@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use turndb::part::Part;
-use turndb::BodyOp;
+use turndb::ContentOp;
 
 fn varint_len(mut v: u64) -> usize {
     let mut n = 1;
@@ -53,8 +53,8 @@ fn main() -> anyhow::Result<()> {
         // reference counts per ordinal
         let mut freq = vec![0u64; n];
         for r in 0..part.len() {
-            for op in part.body(r)? {
-                if let BodyOp::Piece { hash, .. } = op {
+            for op in part.content(r, turndb::BODY_CONTENT)?.unwrap_or_default() {
+                if let ContentOp::Piece { hash, .. } = op {
                     freq[ord[&hash.0]] += 1;
                 }
             }

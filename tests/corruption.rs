@@ -13,17 +13,17 @@ use turndb::fold::{Fold, FoldCfg};
 use turndb::part::{self, Part};
 use turndb::store::wal::Wal;
 use turndb::store::{Span, Store};
-use turndb::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
+use turndb::types::{AttrValue, Content, ContentOp, Record, BODY_CONTENT};
 
-fn body_content(ops: Vec<BodyOp>) -> Vec<Content> {
+fn body_content(ops: Vec<ContentOp>) -> Vec<Content> {
     let identity = match ops.as_slice() {
-        [BodyOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
-        ops if ops.iter().all(|op| matches!(op, BodyOp::Lit(_))) => {
+        [ContentOp::Piece { hash, .. }] => turndb::ContentHash(hash.0),
+        ops if ops.iter().all(|op| matches!(op, ContentOp::Lit(_))) => {
             let bytes = ops
                 .iter()
                 .flat_map(|op| match op {
-                    BodyOp::Lit(bytes) => bytes.as_slice(),
-                    BodyOp::Piece { .. } => unreachable!(),
+                    ContentOp::Lit(bytes) => bytes.as_slice(),
+                    ContentOp::Piece { .. } => unreachable!(),
                 })
                 .copied()
                 .collect::<Vec<_>>();
@@ -131,9 +131,9 @@ fn build_part(dir: &Path) -> (Vec<u8>, Fold) {
             contents: vec![Content::identified(
                 BODY_CONTENT,
                 vec![
-                    BodyOp::Lit(b"[".to_vec()),
-                    BodyOp::Piece { hash: p.hash, len: p.loc.raw },
-                    BodyOp::Lit(b"]".to_vec()),
+                    ContentOp::Lit(b"[".to_vec()),
+                    ContentOp::Piece { hash: p.hash, len: p.loc.raw },
+                    ContentOp::Lit(b"]".to_vec()),
                 ],
                 turndb::ContentHash::of(format!("[{body}]").as_bytes()),
             )],
@@ -174,7 +174,7 @@ fn part_parsers_never_panic_on_damage() {
         }
         let n = part.len().min(64);
         for r in 0..n {
-            let _ = part.body(r);
+            let _ = part.content(r, BODY_CONTENT);
             let _ = part.attrs(r);
             let _ = part.record(r);
             let _ = part.reconstruct(r, &fold);
@@ -196,7 +196,7 @@ fn wal_replay_never_panics_on_damage() {
             let h = turndb::PieceHash::of(&bytes);
             let r = Record {
                 id: format!("w:{i}"),
-                contents: body_content(vec![BodyOp::Piece { hash: h, len: bytes.len() as u32 }]),
+                contents: body_content(vec![ContentOp::Piece { hash: h, len: bytes.len() as u32 }]),
                 attrs: vec![
                     ("k".into(), AttrValue::Str("v".into())),
                     ("f".into(), AttrValue::Float(-0.0)),
@@ -207,7 +207,7 @@ fn wal_replay_never_panics_on_damage() {
         w.append_tomb(10, "w:3").unwrap();
         let extra = Record {
             id: "b:1".into(),
-            contents: body_content(vec![BodyOp::Lit(b"lit".to_vec())]),
+            contents: body_content(vec![ContentOp::Lit(b"lit".to_vec())]),
             attrs: vec![],
         };
         w.append_batch(11, &[(extra, Vec::new(), false)]).unwrap();
@@ -233,8 +233,8 @@ fn wal_record_decode_never_panics_on_damage() {
         contents: vec![Content::identified(
             BODY_CONTENT,
             vec![
-                BodyOp::Lit(b"[".to_vec()),
-                BodyOp::Piece { hash: h, len: body_bytes.len() as u32 },
+                ContentOp::Lit(b"[".to_vec()),
+                ContentOp::Piece { hash: h, len: body_bytes.len() as u32 },
             ],
             turndb::ContentHash::of(&[b"[".as_slice(), body_bytes.as_slice()].concat()),
         )],

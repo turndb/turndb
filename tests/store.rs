@@ -2138,8 +2138,8 @@ fn a_visible_record_in_a_declared_punched_block_refuses_deep_open_and_every_read
         .ops
         .iter()
         .find_map(|op| match op {
-            turndb::BodyOp::Piece { hash, .. } => Some(*hash),
-            turndb::BodyOp::Lit(_) => None,
+            turndb::ContentOp::Piece { hash, .. } => Some(*hash),
+            turndb::ContentOp::Lit(_) => None,
         })
         .expect("the fixture must use a Fold piece");
     let location = part.lookup_piece(&hash).unwrap().unwrap();

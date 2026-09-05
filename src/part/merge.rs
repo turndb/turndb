@@ -340,7 +340,7 @@ pub(crate) fn merge_into_with_control_for_operation<S: crate::vfs::ArtifactSink>
 mod tests {
     use super::*;
     use crate::fold::{Fold, FoldCfg};
-    use crate::types::{AttrValue, BodyOp, Content, Record, BODY_CONTENT};
+    use crate::types::{AttrValue, Content, ContentOp, Record, BODY_CONTENT};
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let n =
@@ -365,7 +365,7 @@ mod tests {
                     id: (*id).to_string(),
                     contents: vec![Content::identified(
                         BODY_CONTENT,
-                        vec![BodyOp::Piece { hash: p.hash, len: p.loc.raw }],
+                        vec![ContentOp::Piece { hash: p.hash, len: p.loc.raw }],
                         crate::types::ContentHash(p.hash.0),
                     )],
                     attrs: vec![("v".into(), AttrValue::Str((*body).to_string()))],
