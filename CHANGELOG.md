@@ -326,7 +326,7 @@ re-fold performs its generation swap, its retained-log purge, and its space free
 state**, so the window where erased content stayed readable through a retained name — which the
 directory protocol closes with propagated unlinks and an open-time reconciliation pass — cannot
 occur; verification walks members with the same chain-and-pin standard; recovery
-(`promote_manifest_file`) validates candidates at their exact tails and promotes with one flip.
+(`recover_manifest_file`) validates candidates at their exact tails and promotes with one flip.
 **Backup of a single-file store now produces a sealed container**: the committed snapshot, every
 member one aligned extent, flagged final so no writer will ever open it, verified whole, published
 only through a rename that refuses to replace.

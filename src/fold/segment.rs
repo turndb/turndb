@@ -326,7 +326,7 @@ pub fn scan_tail_controlled_with_limits(
         }
         let h = parsed.expect("checked above");
         // Unlike checksum damage, a valid header outside runtime policy is not a crash-tail
-        // boundary. Surface the typed refusal so directory-fold writer open never truncates a valid
+        // boundary. Surface the typed refusal so a file-backed writer open never truncates a valid
         // block merely because this process was opened with a smaller budget.
         read_limits.admit(
             format!("fold block {}", h.block_id),
@@ -415,7 +415,7 @@ pub(crate) fn parse_dir_tmp_name(name: &str) -> Option<u32> {
     rest.parse::<u32>().ok()
 }
 
-/// Write a directory-layout sidecar for a sealed segment. ADVISORY, so tmp + rename but no fsync
+/// Write a file-backed sidecar for a closed segment. ADVISORY, so tmp + rename but no fsync
 /// anywhere: a sidecar lost to a crash costs one rescan at the next open, and a torn one fails its
 /// checksum and costs the same. Nothing durable depends on it.
 pub fn write_dir_sidecar(dir: &Path, n: u32, tail: u32, entries: &[(u32, u32)]) -> Result<()> {
@@ -446,7 +446,7 @@ pub fn encode_dir_sidecar(n: u32, tail: u32, entries: &[(u32, u32)]) -> Vec<u8> 
 /// The sidecar's entries, or `None` — absent, damaged, or not describing this file's bytes. The
 /// caller rescans on `None`; it must never trust a sidecar this refused.
 ///
-/// `tail == file_len` is the staleness gate, not a nicety: directory-fold crash-tail repair can truncate a once-sealed
+/// `tail == file_len` is the staleness gate, not a nicety: file-backed crash-tail repair can truncate a once-closed
 /// segment back into being the active one, and its leftover sidecar then describes blocks past
 /// the committed tail. A sealed segment ends exactly at its last block, so any length mismatch
 /// means the sidecar and the segment parted ways.

@@ -43,7 +43,7 @@ current physical count.
 
 Replay admits the next count before allocating or decoding its payload. It also returns the exact
 byte and physical-frame boundary safe for continued writing. A torn frame and an uncommitted batch tail
-are truncated before a recovered writer can append behind them; otherwise the next reopen would stop
+are truncated before a reopened writer can append behind them; otherwise the next reopen would stop
 at the old tear and silently hide the new suffix. A valid WAL rejected only by a stricter count or
 byte profile is not truncated.
 

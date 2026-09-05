@@ -37,7 +37,7 @@ These names are exhaustive protocol state beside a store:
 | shape | owner |
 |---|---|
 | `<final>.publish-<pid>-<n>` | Windows staging for installation of any newly created protocol file (the suffix is a physical protocol spelling) |
-| `<final>.creating-<pid>-<n>` | container or standalone fold-segment birth before final-name installation |
+| `<store>.creating-<pid>-<n>` | container birth before final-name installation |
 | `<store>.reclaiming` | reclaim staging |
 | `<store>.reclaimed` | reclaim anchor |
 | `<store>.reclaim-candidate` and `.tmp` | Windows reclaim candidate |

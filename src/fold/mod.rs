@@ -360,6 +360,11 @@ pub struct Fold {
 }
 
 impl Fold {
+    /// Open or create a file-backed fold under `dir`: one segment file per segment, sidecars
+    /// beside them, and a lock file. This is the staging form the part builders, tests, and
+    /// benchmarks use; a store's fold lives in its container and is opened through
+    /// [`Fold::open_container_writer`]. The names this creates under `dir` are not store protocol
+    /// state and the debris inventory does not recognize them.
     pub fn open(dir: &Path, cfg: FoldCfg) -> Result<Fold> {
         Fold::open_with_limits(dir, cfg, crate::read_limits::ReadLimits::default())
     }
@@ -757,7 +762,7 @@ impl Fold {
     /// the selected container directory's extent lists ARE the truncation. Bytes a crash left past the
     /// published state are outside every selected extent and therefore do not exist; a segment
     /// created after the last container-state publication is in no directory and therefore does not exist. The two
-    /// crash-tail truncation and cleanup that the directory fold performs at writer open are
+    /// crash-tail truncation and cleanup that the file-backed staging fold performs at open are
     /// replaced by selection through the container directory.
     ///
     /// The caller owes: `committed` from the manifest this container carries, `punched` from that
