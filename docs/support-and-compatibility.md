@@ -128,8 +128,8 @@ Consumers should branch on them rather than the host OS or package name. In part
   it must know: advisory locking, in-place content punch, and threads;
 - native Linux reports OS-enforced writer exclusion, threads, and content-punch-or-refold reclamation;
 - native Windows reports OS-enforced writer exclusion, threads, and content-punch-or-refold reclamation,
-  where "content punch" guarantees zeroed bytes. Allocation accounting currently exposes a structural
-  zero, not a per-member measurement, on every platform;
+  where "content punch" guarantees zeroed bytes. Allocation accounting is reported as absent, not
+  as a per-member measurement, on every platform;
 - Python reports the mechanisms in its native, actor-owned build;
 - the browser reports a read-only, single-threaded structured-query profile and no reclamation;
 - Rust features decide whether the columnar lens and SQL exist;

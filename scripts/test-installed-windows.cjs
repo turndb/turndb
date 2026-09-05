@@ -172,11 +172,10 @@ async function main() {
   const punched = await store.contentPunch();
   const afterSpace = await store.spaceUsage();
   // #153: single-file accounting cannot attribute physical file blocks to its logical member
-  // buckets and currently carries a structural Some(0). Name that as unavailable rather than
-  // presenting the constant as a measurement; the build-level capability also covers directory
-  // stores and the Windows punch primitive, so it cannot express this per-layout distinction.
-  assert.equal(beforeSpace.total.allocatedBytes, 0n);
-  assert.equal(afterSpace.total.allocatedBytes, 0n);
+  // buckets, so allocation is reported as absent rather than as a structural zero that would
+  // read as a measurement. The evidence below records the absence by name for the same reason.
+  assert.equal(beforeSpace.total.allocatedBytes, undefined);
+  assert.equal(afterSpace.total.allocatedBytes, undefined);
   const after = fs.readFileSync(punchStore);
   assert(punched.blocksPunched > 0n, 'installed Windows addon must exercise zero-data punch');
   assert(
@@ -254,8 +253,8 @@ async function main() {
       issue: 'https://github.com/turndb/turndb/issues/153',
       logicalBefore: beforeSpace.total.logicalBytes.toString(),
       logicalAfter: afterSpace.total.logicalBytes.toString(),
-      rawStructuralValueBefore: beforeSpace.total.allocatedBytes.toString(),
-      rawStructuralValueAfter: afterSpace.total.allocatedBytes.toString(),
+      allocatedBytesBefore: beforeSpace.total.allocatedBytes === undefined ? 'absent' : beforeSpace.total.allocatedBytes.toString(),
+      allocatedBytesAfter: afterSpace.total.allocatedBytes === undefined ? 'absent' : afterSpace.total.allocatedBytes.toString(),
     },
     erasureRefold: {
       tombstoned: erased.tombstoned.toString(),
