@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 use turndb::fold::FoldCfg;
 use turndb::read_limits::ReadLimits;
-use turndb::store::{CompactionBudget, CompactionError, ContentSpans, Span, Store, StoreOptions};
+use turndb::store::{
+    CompactionBudget, CompactionError, ContentSpans, OpenVerification, Span, Store, StoreOptions,
+};
 use turndb::AttrValue;
 
 fn tmp(tag: &str) -> PathBuf {
@@ -1953,7 +1955,7 @@ fn retained_history_cannot_move_the_fold_tail_backward() {
 }
 
 #[test]
-fn writer_preflight_reconstructs_retained_only_content_identities() {
+fn deep_writer_open_reconstructs_retained_only_content_identities() {
     let dir = tmp("retained-content-identity");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.turndb");
@@ -2028,7 +2030,24 @@ fn writer_preflight_reconstructs_retained_only_content_identities() {
     container.commit().unwrap();
     drop(container);
 
-    let error = Store::open_file(&path, cfg()).err().expect("retained identity drift must refuse");
+    // The default open proves the chain's links and the presence of every named part at a cost
+    // proportional to metadata; it must not pay to reconstruct retained-only content. Explicit
+    // verification and a deep open both must.
+    let mut structural =
+        Store::open_file(&path, cfg()).expect("structural open reads no retained content");
+    let error = structural.verify().expect_err("verification must refuse the drift");
+    assert!(format!("{error:#}").contains("hashes to"), "{error:#}");
+    structural.close().unwrap();
+    let error = Store::open_file_with_options(
+        &path,
+        StoreOptions {
+            fold: cfg(),
+            open_verification: OpenVerification::Deep,
+            ..StoreOptions::default()
+        },
+    )
+    .err()
+    .expect("deep open must refuse retained identity drift");
     assert!(format!("{error:#}").contains("hashes to"), "{error:#}");
     std::fs::remove_dir_all(dir).ok();
 }
@@ -2105,7 +2124,7 @@ fn writer_refusal_preserves_debris_when_a_committed_part_is_invalid() {
 }
 
 #[test]
-fn writer_preflight_refuses_a_visible_record_whose_block_is_declared_punched() {
+fn a_visible_record_in_a_declared_punched_block_refuses_deep_open_and_every_read() {
     let dir = tmp("visible-record-declared-punched");
     std::fs::create_dir_all(&dir).unwrap();
     let path = store_file(&dir);
@@ -2144,13 +2163,26 @@ fn writer_preflight_refuses_a_visible_record_whose_block_is_declared_punched() {
     let before = std::fs::read(&path).unwrap();
     let debris = PathBuf::from(format!("{}.backing-up-123-1", path.display()));
     std::fs::write(&debris, b"recognized adjacent evidence").unwrap();
-    let error = match Store::open_file(&path, cfg()) {
+    let deep = StoreOptions {
+        fold: cfg(),
+        open_verification: OpenVerification::Deep,
+        ..StoreOptions::default()
+    };
+    let error = match Store::open_file_with_options(&path, deep) {
         Ok(_) => panic!("visible content cannot live in a declared-punched block"),
         Err(error) => format!("{error:#}"),
     };
     assert!(error.contains("ERASED"), "unexpected refusal: {error}");
-    assert_eq!(std::fs::read(&path).unwrap(), before, "writer preflight mutated invalid authority");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "deep preflight mutated invalid authority");
     assert_eq!(std::fs::read(&debris).unwrap(), b"recognized adjacent evidence");
+    // The structural open admits the authority, because nothing proportional to metadata can see
+    // the contradiction; every read of the record and explicit verification then report it.
+    let mut structural = Store::open_file(&path, cfg()).expect("structural open");
+    let read = format!("{:#}", structural.reconstruct("visible").unwrap_err());
+    assert!(read.contains("ERASED"), "unexpected read failure: {read}");
+    let verify = format!("{:#}", structural.verify().unwrap_err());
+    assert!(verify.contains("ERASED"), "unexpected verification failure: {verify}");
+    structural.close().unwrap();
     std::fs::remove_dir_all(dir).ok();
 }
 

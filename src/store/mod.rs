@@ -92,6 +92,28 @@ impl Default for WriteLimits {
     }
 }
 
+/// How much of the store a writer open verifies before it accepts a mutation.
+///
+/// Writer open always proves the current store authority intelligible before any cleanup or
+/// mutation: the container directory and its checksum, the current manifest revision, every
+/// retained revision's canonical name, parse, adjacency, `prev` link, cursor and tail order, the
+/// presence of every part any of them names, every current part's schema, every fold segment's
+/// framing, and the identity of every WAL frame that replay will apply. That work is proportional
+/// to metadata, fold framing, and WAL size, never to content. Deep verification is the same
+/// evidence [`Store::verify`] produces, obtained before the first mutation instead of on request:
+/// every part pin, section, and physical row, every piece-dictionary entry against the fold, and
+/// every visible content value reconstructed, for the current revision and each retained one. Its
+/// cost is proportional to the whole store multiplied by the retained window, which is why it is
+/// not the default for a database open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenVerification {
+    /// Structural evidence only, proportional to metadata and framing.
+    #[default]
+    Structural,
+    /// Everything [`Store::verify`] checks, before the writer accepts a mutation.
+    Deep,
+}
+
 /// Runtime writer configuration. None of these values are persisted format commitments.
 #[derive(Clone, Copy, Debug)]
 pub struct StoreOptions {
@@ -101,6 +123,8 @@ pub struct StoreOptions {
     pub read_limits: ReadLimits,
     /// One decompressed-section cache budget shared by every immutable part in this handle.
     pub part_cache_bytes: usize,
+    /// Verification performed by writer open before the first mutation.
+    pub open_verification: OpenVerification,
 }
 
 impl Default for StoreOptions {
@@ -110,6 +134,7 @@ impl Default for StoreOptions {
             write_limits: WriteLimits::default(),
             read_limits: ReadLimits::default(),
             part_cache_bytes: crate::part::cache::BUDGET_DEFAULT,
+            open_verification: OpenVerification::Structural,
         }
     }
 }
@@ -1929,6 +1954,19 @@ fn verify_chain_container(
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
 ) -> Result<ChainReport> {
+    verify_chain_container_scoped(c, read_limits, control, true)
+}
+
+/// [`verify_chain_container`] with the part checks optional. Without them the walk still proves
+/// every retained revision's name, parse, adjacency, `prev` link, cursor and tail order, generation,
+/// equality between current and newest retained bytes, and the presence of every named part; it
+/// reads no part bytes, so its cost is proportional to the retained manifests alone.
+fn verify_chain_container_scoped(
+    c: &crate::container::Container,
+    read_limits: ReadLimits,
+    control: &crate::control::OperationControl,
+    check_parts: bool,
+) -> Result<ChainReport> {
     let names = c.names().map(String::from).collect::<Vec<_>>();
     let current = if c.contains("MANIFEST") {
         Some(Manifest::parse(&c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?)
@@ -2019,6 +2057,15 @@ fn verify_chain_container(
         }
         for p in &m.parts {
             control.check("manifest verification")?;
+            if !check_parts {
+                if !c.contains(&p.member) {
+                    bail!(
+                        "part {} named by commit {commit} is not held by the container",
+                        p.member
+                    );
+                }
+                continue;
+            }
             {
                 let want = &p.b3;
                 let reader = c.extent(&p.member).ok_or_else(|| {
@@ -2068,6 +2115,15 @@ fn verify_chain_container(
         let manifest = Manifest::parse(&bytes).context("current manifest is corrupt")?;
         for part in &manifest.parts {
             control.check("manifest verification")?;
+            if !check_parts {
+                if !c.contains(&part.member) {
+                    bail!(
+                        "part {} named by the current manifest revision is not held by the container",
+                        part.member
+                    );
+                }
+                continue;
+            }
             {
                 let want = &part.b3;
                 let reader = c.extent(&part.member).ok_or_else(|| {
@@ -3204,7 +3260,13 @@ impl Store {
     /// [`Store::open_file`] with explicit storage, cache, and admission configuration.
     pub fn open_file_with_options(path: &Path, options: StoreOptions) -> Result<Store> {
         let recovery_started = std::time::Instant::now();
-        let StoreOptions { fold: cfg, write_limits, read_limits, part_cache_bytes } = options;
+        let StoreOptions {
+            fold: cfg,
+            write_limits,
+            read_limits,
+            part_cache_bytes,
+            open_verification,
+        } = options;
         debris::validate_store_path(path)?;
         crate::fold::validate_cfg(cfg)?;
         let write_limits = write_limits.validate()?;
@@ -3290,24 +3352,27 @@ impl Store {
         if manifest.commit != 0 {
             replay.frames.retain(|frame| frame.seq != manifest.next_seq);
         }
+        let deep = open_verification == OpenVerification::Deep;
         let chain = verification_integrity(
             "preflight retained manifest chain",
-            verify_chain_container(&container, read_limits, &verification_control),
+            verify_chain_container_scoped(&container, read_limits, &verification_control, deep),
         )?;
-        verification_integrity(
-            "preflight complete current store authority",
-            verify_committed_store(&current.parts, &current.fold, chain, &verification_control),
-        )?;
-        verification_integrity(
-            "preflight retained-authority piece dictionaries",
-            verify_retained_piece_dictionaries(
-                &container,
-                path,
-                cfg,
-                read_limits,
-                &verification_control,
-            ),
-        )?;
+        if deep {
+            verification_integrity(
+                "preflight complete current store authority",
+                verify_committed_store(&current.parts, &current.fold, chain, &verification_control),
+            )?;
+            verification_integrity(
+                "preflight retained-authority piece dictionaries",
+                verify_retained_piece_dictionaries(
+                    &container,
+                    path,
+                    cfg,
+                    read_limits,
+                    &verification_control,
+                ),
+            )?;
+        }
         drop(current);
         let retained_commit_count = container_retained_commits(&container).len();
         let container = std::sync::Arc::new(std::sync::Mutex::new(container));

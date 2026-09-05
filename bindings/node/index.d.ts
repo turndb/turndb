@@ -263,6 +263,13 @@ export interface OpenOptions {
   foldCacheBytes?: bigint;
   /** One decoded-section cache shared by all immutable parts; defaults to 512 MiB. */
   partCacheBytes?: bigint;
+  /**
+   * Verify every part pin, section, row, piece-dictionary entry, and visible content value for the
+   * current and every retained manifest revision before the first write, exactly as `verify()`
+   * would. Defaults to false: the cost is proportional to the whole store and its retained window,
+   * while the default open proves the structural evidence at a cost proportional to metadata.
+   */
+  deepVerificationOnOpen?: boolean;
   /** Fold segment roll threshold below 4 GiB; defaults to 1 GiB. */
   segmentMaxBytes?: bigint;
   /** Zstd write level from 1 through 22; defaults to 19. */

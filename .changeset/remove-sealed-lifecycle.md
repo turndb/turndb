@@ -20,5 +20,9 @@ TurnDB meaning. The language-neutral capability profile advances to contract v2 
 capability responder or adapter remains; the separately versioned structured-query contract stays
 at v1.
 
+Writer open proves the structural evidence at a cost proportional to metadata, fold framing, and
+the WAL; `StoreOptions::open_verification` and the native Node `deepVerificationOnOpen` option
+request everything `verify` checks before the first write instead.
+
 Manifest promotion at rollback zero repairs retained history that no longer validates beneath an
 intact current manifest, and reports how many older retained revisions it abandoned.

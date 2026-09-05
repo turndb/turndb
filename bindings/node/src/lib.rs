@@ -453,6 +453,7 @@ pub struct NativeOpenOptions {
     pub fold_cache_bytes: Option<BigInt>,
     /// Shared immutable-part section-cache budget. Defaults to 512 MiB.
     pub part_cache_bytes: Option<BigInt>,
+    pub deep_verification_on_open: Option<bool>,
     /// Fold segment roll threshold. Defaults to 1 GiB.
     pub segment_max_bytes: Option<BigInt>,
     /// Zstd write level in 1..=22. Defaults to 19.
@@ -2526,6 +2527,14 @@ fn decode_store_options(options: Option<&NativeOpenOptions>) -> Result<StoreOpti
             options.and_then(|value| value.max_fold_blocks.clone()),
         )?,
         part_cache_bytes,
+        open_verification: if options
+            .and_then(|options| options.deep_verification_on_open)
+            .unwrap_or(false)
+        {
+            turndb::store::OpenVerification::Deep
+        } else {
+            turndb::store::OpenVerification::Structural
+        },
     })
 }
 
