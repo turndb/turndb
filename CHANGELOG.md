@@ -94,6 +94,188 @@ First release, so everything is new.
   as of 2026-08-03 and is not an independent third-party audit.
 
 [0.1.0]: https://github.com/turndb/turndb/releases/tag/v0.1.0
+## 0.2.0 (2026-09-05)
+
+### Breaking Changes
+
+#### One unfrozen physical draft replaces every discarded layout
+
+TurnDB now has one writable single-file store shape and one exact draft-format identity. The
+container, part, fold segment, fold sidecar, WAL, and manifest carry only the identities listed in
+`FORMAT.md`, and every other byte structure fails closed. The former directory store, the archive
+pack, the converter, the resumable format migration, the compatibility readers for earlier
+container and part revisions, the fixtures kept as their evidence, and every preceding-format
+promise are deleted rather than retired. `ONTOLOGY.md` closes the project vocabulary that every
+surface now shares, and `docs/operation-registry.md` maps each public spelling onto it.
+
+The container-level `SEALED` state and the `seal` operation are gone. Backup is the one
+snapshot-copy operation everywhere: it produces an ordinary, fully verified, self-contained
+container that readers query directly and writers continue independently, staged under
+`<artifact>.backing-up-<pid>-<n>` and installed by a no-replace primitive that never replaces a
+destination. Restore is a verified no-replace copy staged under `<destination>.restoring-<pid>-<n>`.
+The discarded `.sealing`, `.converting`, and `-hot` names have no TurnDB meaning. Unknown members,
+identities, epochs, and semantically impossible current bytes refuse before cleanup or mutation,
+and every open now refuses a store whose retained manifest history no longer validates; manifest
+promotion repairs that (see Features). The language-neutral capability contract advances to v2 with
+no v1 responder or adapter remaining; the separately versioned structured-query contract stays at
+v1.
+
+### Upgrading
+
+This is an intentional hard reset of an unfrozen development format, not an upgrade path. Nothing
+in this release reads what 0.1.x wrote: a 0.1.x directory store, pack, or `.turndb` container is
+refused as an unrecognized identity. Export or regenerate development data with the build that
+created it before moving to this release. Stores this release writes are readable by every
+entrance of this release, and `FORMAT.md` states the identity a future incompatible change would
+rotate.
+
+### Renamed and removed surfaces
+
+Rust crate `turndb`:
+
+- `store::recover_manifest_file`, `recover_manifest_file_with_limits_and_control`,
+  `RecoveryOptions`, `RecoveryReport`, and `RecoveryError` are `promote_manifest_file`,
+  `promote_manifest_file_with_limits_and_control`, `ManifestPromotionOptions`,
+  `ManifestPromotionReport`, and `ManifestPromotionError`.
+- The `pack` module, `Pack`, `PackLimits`, `open_read_pack`, `open_read_pack_with_limits`,
+  `convert_to_file`, `ConvertStats`, `single_file_kind`, `SingleFileKind`, `looks_like_store`,
+  and the directory-store refold helpers are removed. The `backup` module carries `BackupStats`,
+  `RestoreStats`, `BackupError`, and `ATOMIC_RESTORE`; `BackupStats::files` and
+  `RestoreStats::files` are `members`.
+- `Store::format_migration_status`, `estimate_format_migration_space`, `migrate_format_step`, their
+  controlled variants, `FormatMigrationStatus`, `FormatMigrationPlan`, `FormatMigrationStep`, and
+  `Part::format_version` are removed.
+- `PunchStats` is `ContentPunchStats`; `Fold::seal_window` is `release_dedup_window`;
+  `Container::sealed`, `Container::commit_sealed`, `SB_FLAG_SEALED`, and `HOT_SUFFIX` are removed.
+- `capabilities()` replaces `part_format_write`, `part_format_read_max`, and `format_migration`
+  with `draft_format_epoch` and `in_place_deallocation`.
+- `StoreMetrics::open_recovery`, `compaction`, and `punch` are `open_wal_replay`, `merge`, and
+  `content_punch`; `format_migration` is removed. `SpaceAmount::files` is `members`.
+  `ChainReport::undigested` and `StoreVerification::unidentified_content_values` are removed,
+  because every part is pinned and every content value carries its identity.
+- `Manifest` requires `draft_epoch`; `PartRef::file` is `member` and `b3` is required.
+- `DebrisKind` drops the directory-layout variants `ManifestStaging`, `ExcessRetainedManifest`,
+  `SegmentSidecarStaging`, `PartBuilderSpool`, and `LegacyHotDirectory`, and adds
+  `CreationStaging` for `<store>.creating-<pid>-<n>`.
+- `types::BodyOp`, `Record::body`, `Record::body_len`, and `Part::body` are removed; use
+  `ContentOp` and `Record::content(BODY_CONTENT)`.
+- The WAL tag constants are `TOMB_TAG`, `BATCH_COMPLETE_TAG`, `BATCH_TOMB_TAG`, `RECORD_TAG`, and
+  `BATCH_RECORD_TAG` with the current values, and every magic constant is the new identity.
+
+CLI `turndb`:
+
+- `seal` is `backup`; `punch` is `content-punch` for declared block deallocation and
+  `free-space-punch` for free-extent interiors; `convert` is removed.
+- `inspect` reports the manifest revision, the container state sequence, the records in the
+  current read view, and the retained manifest revisions under those names.
+
+Native Node `@turndb/native`:
+
+- `seal` is removed in favour of `backup`; `punch` is `contentPunch`; `singleFileKind`,
+  `formatMigrationStatus`, `estimateFormatMigrationSpace`, and `migrateFormatStep` are removed.
+- `RecoveryOptions` is `ManifestPromotionOptions`; `recoverManifest` keeps its name.
+- Backup, restore, and `spaceUsage` results report `members` rather than `files`; `verify`
+  results drop `undigestedParts`.
+- `capabilities()` reports `contractVersion: 2`, `draftFormatEpoch`, `inPlaceDeallocation`,
+  `manifestPromotionControls`, and `reclamation: 'content_punch_or_refold'`, and no longer reports
+  `partFormat`, `formatMigration`, or `recoveryControls`. Metrics use `openWalReplay`, `merge`,
+  `contentPunch`, and `erase`, with no `formatMigration`.
+
+Python `turndb`:
+
+- `seal` is `backup`. `capabilities()` reports `contractVersion: 2` and `draftFormatEpoch`.
+  `verify()` reports `scope: "current_manifest_revision"` and no `unidentifiedContentValues`.
+
+Portable npm `turndb`:
+
+- `singleFileKind` is removed. `capabilities()` reports `contractVersion: 2`, `draftFormatEpoch`,
+  and `atomicNoReplaceInstallation` in place of `partFormat` and `atomicNoReplacePublication`.
+- Metrics keys match the native binding. `verify()` results carry
+  `scope: 'current_manifest_revision'`, `state: 'valid'` only, and no `unidentifiedContentValues`
+  or `chain.undigestedParts`.
+- The low-level WASI exports `tdb_open_v2`, `tdb_open_v3`, and `tdb_single_file_kind` are gone;
+  `tdb_open` takes the complete admission profile.
+
+Browser reader and conformance:
+
+- The capability contract and its schema live at `conformance/v2`; the query and runner contract
+  stays at `conformance/v1`, and its fixture is regenerated under the current identity.
+
+### Features
+
+#### Writer open verifies structure; deep verification is a request
+
+Writer open proves the structural evidence before it accepts a mutation: the container directory
+and its checksum, the current manifest revision, every retained revision's name, parse, adjacency,
+`prev` link, cursor and tail order, the presence of every part they name, every current part's
+schema, every fold segment's framing, and the identity of every WAL frame that replay applies. That
+costs time proportional to metadata, fold framing, and the WAL, never to content.
+
+Everything `verify` checks can be obtained before the first write instead: `StoreOptions {
+open_verification: OpenVerification::Deep, .. }` in Rust and `deepVerificationOnOpen: true` in
+`@turndb/native`. Its cost is proportional to the whole store and its retained window. Measured on
+a release build against a 32 MiB, 512-record store, the structural open took 14 to 20 ms and the
+deep open 270 ms.
+
+#### Manifest promotion repairs retained history
+
+A retained manifest copy is authority a reader may still open at, so a store whose retained
+history no longer validates refuses every open, exactly as one with a damaged current `MANIFEST`
+does. `turndb recover`, `recoverManifest`, and `promote_manifest_file` now treat that as
+promotable: beside an intact current manifest, promotion at rollback zero re-selects the current
+revision and ends retention of the first older revision that fails to validate and of everything
+behind it, and reports the count as `abandoned_retained_revisions` in Rust and
+`abandonedRetainedRevisions` in Node. A store whose current manifest is intact and whose retained
+chain validates still refuses as healthy.
+
+Candidate search changed with it. A damaged older copy no longer disqualifies the newest usable
+candidate, so promotion keeps the newest acknowledged revisions and abandons the damaged history
+behind them instead of rolling back past it.
+
+### Fixes
+
+#### TurnDB has a closed semantic ontology
+
+`ONTOLOGY.md` now defines the project vocabulary, relations, states, transitions, observations,
+evidence, and invariants that every public surface must share. Its closed-world rule prevents an API
+spelling or plausible local explanation from silently introducing a new lifecycle concept. The
+ontology separates acceptance, durability, publication, and settlement; distinguishes manifest,
+part-sequence, and container ordering; and rejects `sealed` as a product lifecycle state while the
+existing physical format marker remains delegated to `FORMAT.md`.
+
+#### Linux arm64 is built, tested and driven on arm64 hardware
+
+The `@turndb/cli` Linux arm64 slice shipped at 0.1.8 cross-compiled on an x86-64 runner, and no job
+in this repository had ever executed on arm64 hardware, so nothing proved that binary ran. GitHub's
+hosted `ubuntu-22.04-arm` runner is real arm64 hardware, free on a public repository, and every
+Linux arm64 claim now rests on it: the crate's clippy, debug, SQL-off, corruption and release-profile
+suites, the crash sweeps under both durability models, and the reference store byte-compared in both
+directions against the x86-64 Linux fixture are required gates on every push and pull request; the
+CLI slice is built there, installed from its packed tarball and driven, in CI and in the release
+install matrix. The support policy states what is qualified for Linux arm64 and, for the first time,
+what is and is not proven for macOS, where the CLI slices are driven but the engine suite does not
+run. No native Node or Python package is added for either.
+
+#### Reclaim is one rename again everywhere but Windows
+
+0.1.7 made `reclaim` publish through an anchor and a locked candidate copy on every platform, so
+that one protocol could be proven under both durability models. That made Linux and macOS pay for a
+Windows constraint: a second full copy of the compacted container per reclaim.
+
+The platform layer now declares what each platform guarantees for a replace over an open
+destination — atomic under POSIX `rename(2)`; lagged on Windows, whose documented route for
+replacing an open file has no write-through form — and `reclaim` chooses its protocol by that
+guarantee, never by platform name. Where the replace is atomic, the fresh container is writer-locked
+under its staging name and put at the store's name by one rename: no copy, no anchor. Windows keeps
+the anchor protocol. Recovery from an anchor runs on every platform, because an anchor is a file
+beside its store and travels with it.
+
+The deterministic simulator proves each protocol under the model of the guarantee it is specified
+for, on every host, and shows the rename protocol losing the store under the Windows model — the
+reason the choice is made by guarantee. The public `ReclaimProtocol` enum names the two protocols,
+and `ReclaimProtocol::for_this_platform()` reports the choice. No format bytes change; a store
+reclaimed by either protocol opens on every platform as before.
+
 ## 0.1.8 (2026-09-01)
 
 ### Fixes
