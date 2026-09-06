@@ -380,6 +380,21 @@ impl ContainerReader {
         Some(Extents::new(self.source.clone(), &member.extents))
     }
 
+    /// A member's `(offset, length)` extents in logical order, in the source's byte space.
+    pub fn member_extents(&self, name: &str) -> Option<Vec<(u64, u64)>> {
+        self.dir.get(name).map(|m| m.extents.clone())
+    }
+
+    /// A member's logical length.
+    pub fn member_len(&self, name: &str) -> Option<u64> {
+        self.dir.get(name).map(|m| m.len)
+    }
+
+    /// Bytes the members themselves occupy.
+    pub fn member_bytes(&self) -> u64 {
+        self.dir.values().map(|m| m.len).sum()
+    }
+
     pub fn read_file_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
         let member = self.dir.get(name).ok_or_else(|| {
             anyhow::anyhow!("container member not found in {}: {name}", self.label)
@@ -397,6 +412,98 @@ impl ContainerReader {
         bytes.resize(len, 0);
         reader.read_exact_at(&mut bytes, 0)?;
         Ok(bytes)
+    }
+}
+
+/// What the store layer needs from a selected container state in order to open and verify it,
+/// whether the bytes sit in a writer's file or behind an arbitrary positioned source.
+///
+/// [`Container`] and [`ContainerReader`] parse the same superblocks and directory; this is the
+/// read-only intersection of their surfaces. The store's opener, chain walk, retained-authority
+/// checks and punched-member classification are written against it once, so a browser range
+/// source receives exactly the checks a filesystem handle does rather than a second, drifting
+/// copy of them.
+pub(crate) trait ContainerView {
+    /// The name the container is reported under: a path for a file, a label for a source.
+    fn label(&self) -> &Path;
+    /// Committed sequence of the selected container state.
+    fn seq(&self) -> u64;
+    /// Member names in sorted order.
+    fn member_names(&self) -> Vec<String>;
+    fn contains(&self, name: &str) -> bool;
+    fn member_count(&self) -> usize;
+    fn committed_is_empty_birth(&self) -> bool;
+    fn member_len(&self, name: &str) -> Option<u64>;
+    /// The directory's recorded crc32 over the member's logical bytes.
+    fn member_checksum(&self, name: &str) -> Option<u32>;
+    /// A member as a positioned reader over its logical bytes.
+    fn extent_dyn(&self, name: &str) -> Option<Arc<dyn ReadAt>>;
+    fn read_file_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>>;
+}
+
+impl ContainerView for Container {
+    fn label(&self) -> &Path {
+        &self.path
+    }
+    fn seq(&self) -> u64 {
+        Container::seq(self)
+    }
+    fn member_names(&self) -> Vec<String> {
+        self.names().map(String::from).collect()
+    }
+    fn contains(&self, name: &str) -> bool {
+        Container::contains(self, name)
+    }
+    fn member_count(&self) -> usize {
+        self.len()
+    }
+    fn committed_is_empty_birth(&self) -> bool {
+        Container::committed_is_empty_birth(self)
+    }
+    fn member_len(&self, name: &str) -> Option<u64> {
+        Container::member_len(self, name)
+    }
+    fn member_checksum(&self, name: &str) -> Option<u32> {
+        self.dir.get(name).map(|m| m.xsum)
+    }
+    fn extent_dyn(&self, name: &str) -> Option<Arc<dyn ReadAt>> {
+        self.extent(name).map(|extent| Arc::new(extent) as Arc<dyn ReadAt>)
+    }
+    fn read_file_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        Container::read_file_bounded(self, name, max_bytes)
+    }
+}
+
+impl ContainerView for ContainerReader {
+    fn label(&self) -> &Path {
+        Path::new(&self.label)
+    }
+    fn seq(&self) -> u64 {
+        ContainerReader::seq(self)
+    }
+    fn member_names(&self) -> Vec<String> {
+        self.names().map(String::from).collect()
+    }
+    fn contains(&self, name: &str) -> bool {
+        ContainerReader::contains(self, name)
+    }
+    fn member_count(&self) -> usize {
+        self.len()
+    }
+    fn committed_is_empty_birth(&self) -> bool {
+        ContainerReader::committed_is_empty_birth(self)
+    }
+    fn member_len(&self, name: &str) -> Option<u64> {
+        ContainerReader::member_len(self, name)
+    }
+    fn member_checksum(&self, name: &str) -> Option<u32> {
+        self.dir.get(name).map(|m| m.xsum)
+    }
+    fn extent_dyn(&self, name: &str) -> Option<Arc<dyn ReadAt>> {
+        self.extent(name).map(|extent| Arc::new(extent) as Arc<dyn ReadAt>)
+    }
+    fn read_file_bounded(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        ContainerReader::read_file_bounded(self, name, max_bytes)
     }
 }
 
@@ -1226,10 +1333,6 @@ impl Container {
 
     pub(crate) fn ensure_store_writer_usable(&self) -> Result<()> {
         self.ensure_writable()
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 
     pub(crate) fn is_current_path_file(&self, path: &Path) -> Result<bool> {

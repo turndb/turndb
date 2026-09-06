@@ -67,7 +67,9 @@ language conveniences, but those do not become Tier 1 merely by existing.
 
 Native Unix writers report OS-enforced exclusion. The portable WASI writer reports
 embedder-enforced exclusion even on a Unix host. Browser readers report `read_only`, omit every
-mutating operation, and report `reclamation: "none"`.
+mutating operation, report `reclamation: "none"`, and expose `verify` over any positioned source
+in declared units (see [`browser.md`](browser.md#verification)); a browser `verify` that has not run
+every unit is scoped evidence, never a whole-store result.
 
 WASI Preview1 lacks a no-replace rename. Container birth can safely install one already-synchronized
 inode with WASI's atomic no-replace hard-link creation, but that narrower primitive does not satisfy

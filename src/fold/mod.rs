@@ -1872,6 +1872,73 @@ impl Fold {
         Ok(report)
     }
 
+    /// The verification a [`Fold::scrub`] performs on one window `[start, stop)` of one segment's
+    /// frames, for a verifier that declares its byte footprint before reading. Windows must begin
+    /// on a frame boundary and be walked in order up to the segment's length; the last window of
+    /// the active segment may end early on crash residue, which is reported as
+    /// `trailing_uncommitted`, and any other early end is corruption exactly as the whole-segment
+    /// scrub judges it.
+    pub(crate) fn scrub_window_with_control(
+        &self,
+        seg: u32,
+        start: u64,
+        stop: u64,
+        control: &crate::control::OperationControl,
+    ) -> Result<FoldScrub> {
+        let index = usize::try_from(seg).context("segment number exceeds this platform")?;
+        let (header, reader) = match (self.headers.get(index), self.readers.get(index)) {
+            (Some(header), Some(reader)) => (header, reader),
+            _ => bail!("fold has no segment {seg}"),
+        };
+        let len = reader.len()?;
+        if stop > len {
+            bail!("fold frame window [{start}, {stop}) runs past segment {seg}'s {len} bytes");
+        }
+        let (end, entries) = segment::scan_frames_window(
+            &**reader,
+            start,
+            stop,
+            header.has_dict(),
+            &self.punched,
+            control,
+            "fold verification",
+            self.read_limits,
+        )?;
+        let mut report =
+            FoldScrub { blocks: entries.len(), bytes: end - start, ..FoldScrub::default() };
+        if end < stop {
+            if header.seg == self.active && stop == len {
+                report.trailing_uncommitted = len - end;
+            } else {
+                bail!(
+                    "sealed segment {} holds valid frames only to byte {end} of {stop} — corruption",
+                    header.seg
+                );
+            }
+        }
+        Ok(report)
+    }
+
+    /// Length of segment `seg` as its source reports it.
+    pub(crate) fn segment_len(&self, seg: u32) -> Result<u64> {
+        let index = usize::try_from(seg).context("segment number exceeds this platform")?;
+        self.readers
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("fold has no segment {seg}"))?
+            .len()
+            .map_err(Into::into)
+    }
+
+    /// The `(segment, offset)` of every block the directory can address, by block id.
+    pub(crate) fn block_locations(&self) -> &[Option<(u32, u32)>] {
+        &self.blockdir
+    }
+
+    /// The manifest-declared punched block ranges this fold was opened with.
+    pub(crate) fn punched_ranges(&self) -> &[(u32, u32)] {
+        &self.punched
+    }
+
     pub fn cache_stats(&self) -> CacheStats {
         let c = self.cache.lock().unwrap();
         CacheStats { hits: c.hits, misses: c.misses, bytes: c.bytes, budget: c.budget }
