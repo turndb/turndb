@@ -94,6 +94,61 @@ First release, so everything is new.
   as of 2026-08-03 and is not an independent third-party audit.
 
 [0.1.0]: https://github.com/turndb/turndb/releases/tag/v0.1.0
+## 0.2.1 (2026-09-06)
+
+### Features
+
+#### A memory host for the portable engine
+
+`turndb/memory` runs the same `wasm32-wasip1` engine over an in-memory directory with a
+purpose-built WASI Preview 1 host (`wasi-memfs.mjs`): the twenty-two imports the engine uses and no
+others, so a browser Web Worker, a Cloudflare Worker, Bun, or Deno can write a store and read the
+settled container bytes back out. `MemoryHost.create({ module })` takes a compiled module, a
+`Response`, or the bytes; `open`, `openFile`, `read`, `write`, `list`, and `remove` are the door to
+its directory, and several stores may be open on one host.
+
+`index.mjs` is now the Node host over a shared `core.mjs`; its API and behaviour are unchanged
+(the existing 67-test suite passes unmodified). The host states what it gives up: durability
+barriers are no-ops over memory, and the store lives in the host's memory until the host is
+dropped. `npm/turndb/test/memory-host.mjs` holds the WASI layer to POSIX semantics call by call and
+proves an exported container is one the Node host opens and the native CLI verifies deep.
+
+#### Verification over a positioned source, in declared units
+
+`turndb::store::SourceVerifier` performs the whole-artifact verification — every member's recorded
+checksum, the retained manifest chain, every manifest's part digest, every part section and row
+grammar, every operational piece-dictionary entry against its fold bytes, every fold frame, every
+live named content value's identity, and every retained authority — over any `ReadAt` source as an
+ordered list of units, each declaring the byte ranges it will read before it runs. A host that
+fetches by range fills exactly those ranges and the unit completes in one pass; a unit that fails
+leaves the verifier's state untouched, so the host fetches what the failure named and reruns it.
+Once every unit has run the composed result equals `Store::verify` over the same bytes. Before
+that the evidence is scoped to the units that ran and `report` refuses to call it more.
+
+The browser core exposes it as `verifySource` and the resumable `verifyUnits`, and the browser
+profile now lists `verify`. `BlockReadAt` is exported so a host can subclass it with its own range
+fetcher. The transport's retry loop pins every range it fetches for an operation until that
+operation completes: previously an operation whose working set exceeded the block cache evicted
+its own first block while fetching its last and restarted for ever, and a two-block cache now
+completes any operation at the memory cost of that operation's working set.
+
+Measured with `cargo test --test verify_source` (6 tests): the composed report equals the
+writer-side report field by field over a six-publication fixture, and every unit's reads lie inside
+its declared footprint or the metadata the open already read. The browser conformance run verifies
+the shared 53,406-byte fixture over a Blob whose cache holds two 4 KiB blocks and gets the same
+report as over the whole buffer, in 100 units and 127 range fetches.
+
+### Fixes
+
+#### The portable binding settles a writer on close
+
+`close()` on the portable (`wasm32-wasip1`) `Store` now performs settlement when the handle has no
+pending change set: the redundant write-ahead log is truncated and removed, so a clean close leaves
+exactly the one container file `FORMAT.md` promises. Previously `tdb_close` dropped the handle
+without settling, which left a zero-length `-wal` beside every store this binding ever closed —
+observed on Node with `node:wasi` and on the memory host alike. A writer with accepted, unpublished
+mutations keeps its WAL for replay; `close()` still publishes nothing the caller did not ask for.
+
 ## 0.2.0 (2026-09-05)
 
 ### Breaking Changes
