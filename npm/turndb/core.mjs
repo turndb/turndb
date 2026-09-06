@@ -1,0 +1,1165 @@
+/**
+ * The host-agnostic half of the portable binding: everything that moves bytes across the wasm
+ * boundary and turns status codes into exceptions, with no opinion about where the guest's
+ * filesystem lives.
+ *
+ * `index.mjs` is the Node host — `node:wasi` over a real directory. `memory.mjs` is the memory
+ * host — an in-memory directory that runs wherever JavaScript does. Both construct the same
+ * {@link Store} over a `runtime` of the shape `{ instance, release() }`: the wasm instance the
+ * handle lives in, and what to do when the handle closes.
+ *
+ * Attributes cross as a tagged array, not an object, because the engine preserves attribute ORDER
+ * and DUPLICATE KEYS; content bytes cross base64-encoded inside JSON. Every fallible call returns
+ * `>= 0` on success and `-1` with a message and a stable class on failure, and the full message
+ * always reaches the caller.
+ */
+
+/** Base64 without `Buffer`, so the core runs in a browser worker; `Buffer` is used where present. */
+export function toBase64(bytes) {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
+  }
+  let binary = '';
+  for (let at = 0; at < bytes.length; at += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(at, at + 0x8000));
+  }
+  return btoa(binary);
+}
+
+export function fromBase64(text) {
+  if (typeof Buffer !== 'undefined') return Buffer.from(text, 'base64');
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+/** Thrown for every engine-reported failure, carrying its stable class and full message. */
+export class TurndbError extends Error {
+  constructor(message, code = 'INTERNAL') {
+    super(message);
+    this.name = 'TurndbError';
+    this.code = code;
+  }
+}
+
+/**
+ * Refuse a string JS can hold but UTF-8 cannot represent.
+ *
+ * JS strings are UTF-16 and may contain unpaired surrogates; `TextEncoder` maps those to U+FFFD
+ * *silently*. So `putBody('a\uD800', …)` and `putBody('a\uDC00', …)` both land on `a�` and the
+ * second overwrites the first — two records the caller believes are distinct become one, with no
+ * error, in a store whose cardinal invariant is byte-exact reconstruction. Refusing is the engine's
+ * own discipline: a store that cannot be written is recoverable, one that lies is not.
+ */
+export function assertEncodable(s, what) {
+  // Deliberately silent on non-strings: existing paths already reject or coerce them, and the
+  // engine's batch error names the offending item index, which is better than anything thrown here.
+  if (typeof s !== 'string') return s;
+  const ok =
+    typeof s.isWellFormed === 'function'
+      ? s.isWellFormed()
+      : !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s);
+  if (!ok) {
+    throw new TurndbError(
+      `${what} contains an unpaired surrogate, which UTF-8 cannot represent — refusing rather ` +
+        `than substituting U+FFFD, which would silently alias it onto a different id`,
+    );
+  }
+  return s;
+}
+
+/**
+ * An id must be a string, and must be one UTF-8 can represent.
+ *
+ * Coercion is not a convenience here, it is an aliasing bug: `#putText` would have encoded `{}` as
+ * `"[object Object]"`, which collides with the literal string of the same name — measured, three
+ * writes producing two records with one body lost. That is the same silent-overwrite this module
+ * refuses unpaired surrogates for, arriving through a different door, and the colliding value is a
+ * string a real serialization bug has already produced in this codebase.
+ *
+ * `applyBatch` deliberately does NOT use this: the engine rejects a non-string id there with a
+ * message naming the offending item's index, which is more useful than anything thrown from here.
+ */
+export function assertId(id, what = 'id') {
+  if (typeof id !== 'string') {
+    throw new TurndbError(
+      `${what} must be a string, got ${typeof id} — refusing rather than coercing, because ` +
+        `String(value) silently aliases distinct inputs onto one record`,
+    );
+  }
+  return assertEncodable(id, what);
+}
+
+export function openLimit(value, name) {
+  if (value === undefined) return 0;
+  if (!Number.isInteger(value) || value < 1 || value > 0xffff_ffff) {
+    throw new TurndbError(`${name} must be an integer between 1 and 4294967295`);
+  }
+  return value;
+}
+
+export function timeoutMs(value) {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new TurndbError('timeoutMs must be an integer between 0 and 4294967295');
+  }
+  return value;
+}
+
+/**
+ * The first id that cannot start with `prefix` — the exclusive upper bound of its range — or
+ * `null` when no such id exists and the range is therefore unbounded above.
+ *
+ * Computed over CODE POINTS, carrying left across trailing U+10FFFF. The obvious version bumps the
+ * last UTF-16 code *unit*, which is wrong three ways: it breaks surrogate pairs into unpaired ones,
+ * it wraps at U+FFFF to produce a bound BELOW the prefix (an inverted, silently-empty range), and
+ * it has no answer for a prefix of all-maximal scalars. Carrying handles the first two; the third
+ * genuinely has no upper bound, because no valid Unicode string sorts above that prefix family —
+ * and `null` says so rather than inventing a boundary.
+ *
+ * Exported for tests: the boundary cases are the whole point and they deserve direct assertions.
+ */
+export function prefixUpperBound(prefix) {
+  // Guarded here rather than only at the call site: this is exported and documented as contract, so
+  // a caller may use it to build `from`/`to` directly. Unguarded, a malformed prefix carried into a
+  // malformed bound — `'\uD800'` produced `'\uD801'`, which encodes to U+FFFD — reintroducing the
+  // wrong-boundary defect through the very helper added to remove it.
+  assertEncodable(prefix, 'prefix');
+  const cps = Array.from(prefix);
+  for (let i = cps.length - 1; i >= 0; i--) {
+    const cp = cps[i].codePointAt(0);
+    if (cp < 0x10ffff) {
+      // D800..DFFF are surrogate code points, not scalars — step over the hole.
+      const next = cp + 1 === 0xd800 ? 0xe000 : cp + 1;
+      return cps.slice(0, i).join('') + String.fromCodePoint(next);
+    }
+    // A trailing U+10FFFF cannot be incremented; drop it and carry into the scalar to its left.
+  }
+  return null;
+}
+
+export function readProfile(runtime, exportName) {
+  const e = runtime.instance.exports;
+  const code = e[exportName]();
+  const mem = new Uint8Array(e.memory.buffer);
+  if (code < 0) {
+    const message = new TextDecoder().decode(
+      mem.subarray(e.tdb_err_ptr(), e.tdb_err_ptr() + e.tdb_err_len()),
+    );
+    const code = new TextDecoder().decode(
+      mem.subarray(e.tdb_err_code_ptr(), e.tdb_err_code_ptr() + e.tdb_err_code_len()),
+    );
+    throw new TurndbError(message, code || 'INTERNAL');
+  }
+  const json = new TextDecoder().decode(
+    mem.subarray(e.tdb_out_ptr(), e.tdb_out_ptr() + e.tdb_out_len()),
+  );
+  return JSON.parse(json);
+}
+
+const contractOperations = Object.freeze([
+  'openWriter', 'compiledCapabilities', 'write', 'sync', 'flush', 'scan',
+  'verify', 'spaceUsage', 'refold', 'erase', 'close',
+]);
+
+export function contractProfile(runtime, extra = {}) {
+  const binding = readProfile(runtime, 'tdb_binding_capabilities');
+  const compiled = readProfile(runtime, 'tdb_capabilities');
+  return {
+    ...binding,
+    ...extra,
+    contractVersion: 2,
+    profile: 'wasi',
+    operations: [...contractOperations],
+    bindingOperations: binding.operations,
+    draftFormatEpoch: compiled.draft_format_epoch,
+    writerExclusion: 'embedder_enforced',
+    positionedIo: compiled.positioned_io,
+    threads: compiled.threads,
+    columnar: compiled.columnar,
+    sql: false,
+    arrowIpc: false,
+    reclamation: 'refold_only',
+    // Relative deadlines use the same cooperative checkpoints as native cancellation. An
+    // AbortSignal is separately and truthfully absent in `unavailable` below.
+    cancellation: { scan: true, lifecycle: true },
+  };
+}
+
+/**
+ * Encode attributes into the ABI's tagged form: `[[key, tag, value], ...]`.
+ *
+ * turndb preserves attribute ORDER and DUPLICATE KEYS because byte-exact reconstruction depends on
+ * both, and a JS object can represent neither — so an object input is a convenience that quietly
+ * gives up those properties, while an array of `[key, value]` pairs keeps them. The tag is explicit
+ * because `1` and `1.0` are the same JS number but different stored values.
+ */
+function encodeAttrs(attrs) {
+  if (attrs == null) return '[]';
+  const pairs = Array.isArray(attrs) ? attrs : Object.entries(attrs);
+  const out = [];
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || pair.length < 2) {
+      throw new TypeError('each attribute must be a [key, value] pair');
+    }
+    const [k, v] = pair;
+    if (typeof k !== 'string') throw new TypeError(`attribute key must be a string, got ${typeof k}`);
+    assertEncodable(k, 'attribute key');
+    if (typeof v === 'string') out.push([k, 's', assertEncodable(v, `attribute ${k}`)]);
+    else if (typeof v === 'boolean') out.push([k, 'b', v]);
+    else if (typeof v === 'bigint') out.push([k, 'i', v.toString()]);
+    else if (v === null) out.push([k, 'n', null]);
+    else if (v instanceof Uint8Array) out.push([k, 'x', Array.from(v)]);
+    else if (typeof v === 'number') {
+      // Integer-valued floats are stored as ints, which is almost always what a caller means.
+      // Pass a BigInt, or `{ f: n }`, when the distinction matters the other way.
+      if (Number.isInteger(v)) {
+        if (!Number.isSafeInteger(v)) {
+          throw new TypeError(
+            `integer attribute ${k} is outside JavaScript's exact Number range; pass a BigInt`,
+          );
+        }
+        out.push([k, 'i', v.toString()]);
+      } else out.push([k, 'f', encodeFloat(v)]);
+    } else if (v && typeof v === 'object' && 'fBits' in v) {
+      const bits = v.fBits;
+      if (typeof bits !== 'string' || !/^[0-9a-f]{16}$/.test(bits)) {
+        throw new TypeError(`float attribute ${k} bits must be sixteen lowercase hexadecimal digits`);
+      }
+      out.push([k, 'f', `bits:${bits}`]);
+    }
+    else if (v && typeof v === 'object' && 'f' in v) {
+      out.push([k, 'f', encodeFloat(Number(v.f))]);
+    }
+    else if (v && typeof v === 'object' && 'i' in v) {
+      const i = v.i;
+      if (typeof i === 'bigint') out.push([k, 'i', i.toString()]);
+      else if (typeof i === 'number' && Number.isSafeInteger(i)) out.push([k, 'i', i.toString()]);
+      else throw new TypeError(`integer attribute ${k} must be a safe integer or BigInt`);
+    }
+    else if (v && typeof v === 'object' && 'u' in v) {
+      const u = v.u;
+      if (typeof u === 'bigint' && u >= 0n && u <= 18446744073709551615n) {
+        out.push([k, 'u', u.toString()]);
+      } else if (typeof u === 'number' && Number.isSafeInteger(u) && u >= 0) {
+        out.push([k, 'u', u.toString()]);
+      } else throw new TypeError(`unsigned attribute ${k} must be a non-negative u64`);
+    }
+    else if (v && typeof v === 'object' && 'timestampNs' in v) {
+      const timestamp = v.timestampNs;
+      if (typeof timestamp === 'bigint') out.push([k, 't', timestamp.toString()]);
+      else if (typeof timestamp === 'number' && Number.isSafeInteger(timestamp)) {
+        out.push([k, 't', timestamp.toString()]);
+      } else throw new TypeError(`timestamp attribute ${k} must be a signed i64 BigInt`);
+    }
+    else throw new TypeError(`attribute ${k} has unsupported type ${typeof v}`);
+  }
+  return JSON.stringify(out);
+}
+
+function encodeFloat(v) {
+  if (Number.isNaN(v)) return 'NaN';
+  if (v === Infinity) return 'inf';
+  if (v === -Infinity) return '-inf';
+  return v;
+}
+
+function decodeAttrs(tagged) {
+  return tagged.map(([k, tag, v]) => [
+    k,
+    tag === 'i'
+      ? BigInt(v)
+      : tag === 'u'
+        ? { u: BigInt(v) }
+        : tag === 't'
+          ? { timestampNs: BigInt(v) }
+      : tag === 'f'
+        ? decodeFloat(v)
+        : tag === 'x'
+          ? Uint8Array.from(v)
+          : v,
+  ]);
+}
+
+function decodeFloat(v) {
+  if (typeof v === 'string' && v.startsWith('bits:')) return { fBits: v.slice(5) };
+  if (v === 'inf') return Infinity;
+  if (v === '-inf') return -Infinity;
+  return Number(v);
+}
+
+/** One `[name, tag, value]` triple, tagged by exactly the rules the writer uses. */
+function encodeAttrTriple(name, value) {
+  return JSON.parse(encodeAttrs([[name, value]]))[0];
+}
+
+function encodePredicate(p, i) {
+  if (!p || typeof p !== 'object') throw new TypeError(`predicate ${i} must be an object`);
+  switch (p.kind) {
+    case 'id':
+      if (typeof p.value !== 'string') throw new TypeError(`predicate ${i} needs a string value`);
+      return { kind: 'id', op: p.op, value: assertEncodable(p.value, `predicate ${i} value`) };
+    case 'attr':
+      if (typeof p.name !== 'string') throw new TypeError(`predicate ${i} needs a name`);
+      return { kind: 'attr', op: p.op, attr: encodeAttrTriple(p.name, p.value) };
+    case 'attr_exists':
+    case 'content_exists':
+      if (typeof p.name !== 'string') throw new TypeError(`predicate ${i} needs a name`);
+      if (typeof p.present !== 'boolean') {
+        throw new TypeError(`predicate ${i} needs a boolean \`present\``);
+      }
+      return { kind: p.kind, name: assertEncodable(p.name, `predicate ${i} name`), present: p.present };
+    default:
+      throw new TypeError(`predicate ${i} has unknown kind ${JSON.stringify(p.kind)}`);
+  }
+}
+
+/**
+ * Every key {@link Store.scan} understands.
+ *
+ * The engine refuses an unknown field too, but this layer builds the wire object key by key — so
+ * without this check a misspelling would be dropped here and never reach the engine to be refused.
+ * The caller would get a silent default and no indication anything was wrong.
+ */
+const SCAN_REQUEST_KEYS = new Set([
+  'from',
+  'to',
+  'prefix',
+  'direction',
+  'cursor',
+  'limit',
+  'maxExamined',
+  'maxResolutionEntries',
+  'maxReconstructedBytes',
+  'attrs',
+  'contents',
+  'predicates',
+  'timeoutMs',
+]);
+
+function encodeScanRequest(opts) {
+  if (opts == null || typeof opts !== 'object') {
+    throw new TypeError('scan request must be an object');
+  }
+  for (const key of Object.keys(opts)) {
+    if (!SCAN_REQUEST_KEYS.has(key)) {
+      throw new TypeError(`scan request has unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  let { from, to, prefix } = opts;
+  if (prefix != null) {
+    assertEncodable(prefix, 'prefix');
+    from = prefix;
+    to = prefixUpperBound(prefix) ?? undefined;
+  }
+  const req = {};
+  if (from != null) req.from = assertEncodable(from, 'from');
+  if (to != null) req.to = assertEncodable(to, 'to');
+  if (opts.direction != null) req.direction = opts.direction;
+  if (opts.cursor != null) req.cursor = opts.cursor;
+  if (opts.limit != null) req.limit = opts.limit;
+  if (opts.maxExamined != null) req.maxExamined = opts.maxExamined;
+  if (opts.maxResolutionEntries != null) req.maxResolutionEntries = opts.maxResolutionEntries;
+  // Decimal text, because a JSON number cannot carry every u64 exactly.
+  if (opts.maxReconstructedBytes != null) {
+    req.maxReconstructedBytes = opts.maxReconstructedBytes.toString();
+  }
+  if (opts.attrs != null) req.attrs = opts.attrs;
+  if (opts.contents != null) req.contents = opts.contents;
+  if (opts.predicates != null) req.predicates = opts.predicates.map(encodePredicate);
+  if (opts.timeoutMs != null) req.timeoutMs = timeoutMs(opts.timeoutMs);
+  return req;
+}
+
+function decodeScanPage(v) {
+  return {
+    rows: v.rows.map((row) => ({
+      id: row.id,
+      attrs: decodeAttrs(row.attrs),
+      contents: row.contents.map((c) => {
+        const out = { name: c.name, present: c.present };
+        if (c.len !== undefined) out.len = BigInt(c.len);
+        if (c.pieces !== undefined) out.pieces = c.pieces;
+        if (c.identity !== undefined) out.identity = c.identity;
+        if (c.bytes !== undefined) out.bytes = fromBase64(c.bytes);
+        return out;
+      }),
+    })),
+    ...(v.next == null ? {} : { next: v.next }),
+    stats: {
+      durationNs: BigInt(v.stats.durationNs),
+      examined: v.stats.examined,
+      returned: v.stats.returned,
+      predicatePrunedRows: BigInt(v.stats.predicatePrunedRows),
+      duplicateAttrOccurrences: v.stats.duplicateAttrOccurrences,
+      contentValuesReconstructed: v.stats.contentValuesReconstructed,
+      reconstructedBytes: BigInt(v.stats.reconstructedBytes),
+      reconstructionBudgetExhausted: v.stats.reconstructionBudgetExhausted,
+      io: Object.fromEntries(Object.entries(v.stats.io).map(([k, n]) => [k, BigInt(n)])),
+      resolution: {
+        physicalRows: BigInt(v.stats.resolution.physicalRows),
+        supersededRows: BigInt(v.stats.resolution.supersededRows),
+        tombstones: BigInt(v.stats.resolution.tombstones),
+        memtableEntries: BigInt(v.stats.resolution.memtableEntries),
+        budgetExhausted: v.stats.resolution.budgetExhausted,
+      },
+    },
+  };
+}
+
+const storeFinalizer = new FinalizationRegistry(({ runtime, handle }) => {
+  // A forgotten close must not wedge this process forever. Finalization is only a fallback: it
+  // cannot report either error and gives no timing guarantee, so callers still close explicitly.
+  try {
+    runtime.instance.exports.tdb_close(handle);
+  } finally {
+    try {
+      runtime.release();
+    } catch {}
+  }
+});
+
+/** An open turndb store. Create with {@link open}. */
+export class Store {
+  #runtime;
+  #exports;
+  #handle;
+  #enc = new TextEncoder();
+  #dec = new TextDecoder();
+  #readLimits;
+
+  constructor(runtime, handle, readLimits) {
+    this.#runtime = runtime;
+    this.#exports = runtime.instance.exports;
+    this.#handle = handle;
+    this.#readLimits = readLimits;
+    storeFinalizer.register(this, { runtime, handle }, this);
+  }
+
+  get closed() {
+    return this.#handle < 0;
+  }
+
+  /** Operations and limits reachable through this binding. */
+  capabilities() {
+    this.#alive();
+    return contractProfile(this.#runtime);
+  }
+
+  /** Exact frame-byte and persistent object-count admission configured for this handle. */
+  readLimits() {
+    this.#alive();
+    return { ...this.#readLimits };
+  }
+
+  #mem() {
+    // Re-read every time: the buffer is DETACHED and replaced whenever linear memory grows, so a
+    // cached view silently becomes a view over nothing.
+    return new Uint8Array(this.#exports.memory.buffer);
+  }
+
+  /** Copy bytes into the instance and return `[ptr, len]`, both zero for empty. */
+  #put(bytes) {
+    if (!bytes || bytes.length === 0) return [0, 0];
+    const ptr = this.#exports.tdb_alloc(bytes.length);
+    if (ptr === 0) throw new TurndbError(`failed to allocate ${bytes.length} bytes in the instance`);
+    this.#mem().set(bytes, ptr);
+    return [ptr, bytes.length];
+  }
+
+  #putText(s) {
+    return this.#put(this.#enc.encode(s ?? ''));
+  }
+
+  #free(pairs) {
+    for (const [ptr, len] of pairs) if (ptr !== 0) this.#exports.tdb_free(ptr, len);
+  }
+
+  /** The engine's stable class and full message — neither is inferred from the other. */
+  #err() {
+    const ptr = this.#exports.tdb_err_ptr();
+    const len = this.#exports.tdb_err_len();
+    const codePtr = this.#exports.tdb_err_code_ptr();
+    const codeLen = this.#exports.tdb_err_code_len();
+    return {
+      message:
+        len === 0
+          ? 'turndb reported a failure with no message'
+          : this.#dec.decode(this.#mem().subarray(ptr, ptr + len)),
+      code:
+        codeLen === 0
+          ? 'INTERNAL'
+          : this.#dec.decode(this.#mem().subarray(codePtr, codePtr + codeLen)),
+    };
+  }
+
+  #check(code) {
+    if (code < 0) {
+      const error = this.#err();
+      throw new TurndbError(error.message, error.code);
+    }
+    return code;
+  }
+
+  /** A copy of the output buffer. Copied because the next call overwrites it. */
+  #out() {
+    const ptr = this.#exports.tdb_out_ptr();
+    const len = this.#exports.tdb_out_len();
+    return this.#mem().slice(ptr, ptr + len);
+  }
+
+  #outText() {
+    return this.#dec.decode(this.#out());
+  }
+
+  #alive() {
+    if (this.#handle < 0) throw new TurndbError('store is closed');
+  }
+
+  /**
+   * Write one record. NOT durable until {@link sync}.
+   *
+   * @param {string} id  Sort key as well as identity. Ids sort lexicographically, so an id designed
+   *   with the query in mind (`member/timestamp/...`) gives prefix-then-time paging out of
+   *   {@link scanIds} with no secondary index.
+   * @param {Uint8Array|Buffer|string} body
+   * @param {Record<string,unknown>|Array<[string,unknown]>} [attrs]
+   */
+  putBody(id, body, attrs) {
+    this.#alive();
+    assertId(id);
+    const bytes = typeof body === 'string' ? this.#enc.encode(body) : body;
+    // Validate and encode the attributes BEFORE reserving anything in the instance. `encodeAttrs`
+    // throws on a malformed attribute, and it used to be called inside the array literal that also
+    // performed the id and body allocations — so a throw escaped before `a` was bound, the
+    // `finally` never ran, and the id and body allocations leaked. Refusing an input must not cost
+    // the process memory it cannot get back: a rejected write has to stay recoverable.
+    const attrsText = encodeAttrs(attrs);
+    const a = [this.#putText(id), this.#put(bytes), this.#putText(attrsText)];
+    try {
+      this.#check(this.#exports.tdb_put_body(this.#handle, ...a[0], ...a[1], ...a[2]));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * Apply many records atomically — the batch replays all-or-nothing, so a crash cannot leave a
+   * partial export committed. This is the shape an OTLP export should use: one call per export.
+   *
+   * @param {Array<{id: string, body?: Uint8Array|string, attrs?: object, delete?: boolean}>} records
+   * @returns {number} records applied
+   */
+  applyBatch(records) {
+    this.#alive();
+    const items = records.map((r) => {
+      assertEncodable(r.id, 'id');
+      if (r.delete) return ['del', r.id];
+      const bytes = typeof r.body === 'string' ? this.#enc.encode(r.body) : r.body;
+      return ['put', r.id, toBase64(bytes ?? new Uint8Array()), JSON.parse(encodeAttrs(r.attrs))];
+    });
+    const a = [this.#putText(JSON.stringify(items))];
+    try {
+      return this.#check(this.#exports.tdb_apply(this.#handle, ...a[0]));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * Apply generic records and deletions atomically.
+   *
+   * A successful result says whether this exact batch is durable. With `durable: true`, the engine
+   * syncs before returning; a caller may discard its source copy only after receiving
+   * `{ durable: true }`. A thrown error is deliberately not an acknowledgement.
+   *
+   * Named contents are an ordered array rather than an object. Content names must be unique within
+   * one record, while attributes deliberately keep order and duplicate names.
+   *
+   * @param {Array<{kind:'put', id:string,
+   *   contents:Array<{name:string,bytes:Uint8Array|Buffer|string}>, attrs?:object|Array<[string,unknown]>}
+   *   | {kind:'delete',id:string}>} operations
+   * @param {{durable?:boolean}} [options]
+   * @returns {{applied:number,durable:boolean}}
+   */
+  write(operations, options = {}) {
+    this.#alive();
+    if (!Array.isArray(operations)) throw new TypeError('write operations must be an array');
+    const durable = options.durable ?? false;
+    if (typeof durable !== 'boolean') throw new TypeError('write durable option must be a boolean');
+    const items = operations.map((operation, i) => {
+      if (!operation || typeof operation !== 'object') {
+        throw new TypeError(`write operation ${i} must be an object`);
+      }
+      assertId(operation.id);
+      if (operation.kind === 'delete') {
+        if ('contents' in operation || 'attrs' in operation) {
+          throw new TypeError(`delete write operation ${i} must not carry contents or attrs`);
+        }
+        return ['del', operation.id];
+      }
+      if (operation.kind !== 'put') {
+        throw new TypeError(`write operation ${i} kind must be "put" or "delete"`);
+      }
+      if (!Array.isArray(operation.contents)) {
+        throw new TypeError(`put write operation ${i} contents must be an array`);
+      }
+      const contents = operation.contents.map((content, contentIndex) => {
+        if (!content || typeof content !== 'object' || typeof content.name !== 'string') {
+          throw new TypeError(`write operation ${i} content ${contentIndex} needs a string name`);
+        }
+        assertEncodable(content.name, `write operation ${i} content ${contentIndex} name`);
+        const bytes = typeof content.bytes === 'string' ? this.#enc.encode(content.bytes) : content.bytes;
+        if (!(bytes instanceof Uint8Array)) {
+          throw new TypeError(`write operation ${i} content ${contentIndex} bytes must be bytes or a string`);
+        }
+        return [content.name, toBase64(bytes)];
+      });
+      return ['put', operation.id, contents, JSON.parse(encodeAttrs(operation.attrs))];
+    });
+    const a = [this.#putText(JSON.stringify(items))];
+    try {
+      this.#check(this.#exports.tdb_write(this.#handle, ...a[0], durable ? 1 : 0));
+      return JSON.parse(this.#outText());
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** Tombstone a record. Not durable until {@link sync}. */
+  delete(id) {
+    this.#alive();
+    assertId(id);
+    const a = [this.#putText(id)];
+    try {
+      this.#check(this.#exports.tdb_delete(this.#handle, ...a[0]));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** Make everything written so far durable. **This is the ACK point.** */
+  sync({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_sync(this.#handle)
+      : this.#exports.tdb_sync_with_timeout(this.#handle, value));
+  }
+
+  /**
+   * Publish the memtable as an immutable part.
+   *
+   * Separate from {@link sync} on purpose: this handle already sees its own unflushed writes, so
+   * flushing is about making them visible to OTHER readers and to the columnar plane. Flushing too
+   * often costs compression — blocks sealed short compress worse — so batch it.
+   */
+  flush({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_flush(this.#handle)
+      : this.#exports.tdb_flush_with_timeout(this.#handle, value));
+  }
+
+  /**
+   * Total merge when the referenced part list reaches the engine's threshold. Returns whether a merge ran.
+   *
+   * The stall is the caller's: this build runs the merge on the calling thread, and a total
+   * merge's wall time is linear in the store's on-disk content (~5s/GB at level 19, wasm —
+   * measured on synthetic stores up to 1.9 GB, a single workstation; level 3 unmeasured). It never fires
+   * on its own — nothing compacts inside `putBody`/`sync`/`flush` — so
+   * schedule it when a multi-second pause is acceptable, or use {@link Store.maybeCompact} to
+   * bound the pause instead. Total merges are also the only ones that drop tombstones: a tombstone
+   * can only be dropped when the merge covers every part referenced by the current manifest revision.
+   */
+  autoCompact({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    return this.#check(value === undefined
+      ? this.#exports.tdb_auto_compact(this.#handle)
+      : this.#exports.tdb_auto_compact_with_timeout(this.#handle, value)) === 1;
+  }
+
+  /**
+   * Bounded compaction: if at least `trigger` parts are live, merge the oldest `run` of them.
+   * Returns whether a merge ran.
+   *
+   * The dial for callers with a latency budget: the merge's input — and therefore the stall — is
+   * capped at the oldest `run` parts instead of the whole store. Call it after flushes; repeated
+   * calls amortize what {@link Store.autoCompact} would do in one linear-in-the-store pause.
+   * The trade: bounded merges never drop tombstones (they are carried forward), so run a
+   * total merge occasionally if the store sees deletions.
+   *
+   * @param {{trigger?: number, run?: number}} [opts]  Defaults `trigger: 8` (the engine's own
+   *   total-merge threshold) and `run: 4`.
+   * @returns {boolean}
+   */
+  maybeCompact(opts = {}) {
+    this.#alive();
+    const trigger = opts.trigger ?? 8;
+    const run = opts.run ?? 4;
+    const timeout = timeoutMs(opts.timeoutMs);
+    if (!Number.isInteger(trigger) || trigger < 2 || !Number.isInteger(run) || run < 2) {
+      throw new TurndbError(
+        `maybeCompact: trigger and run must be integers >= 2 (got trigger=${trigger}, run=${run})`,
+      );
+    }
+    return this.#check(timeout === undefined
+      ? this.#exports.tdb_maybe_compact(this.#handle, trigger, run)
+      : this.#exports.tdb_maybe_compact_with_timeout(this.#handle, trigger, run, timeout)) === 1;
+  }
+
+  /**
+   * The record's body, byte-exact, or `null` if absent or deleted.
+   * @returns {Uint8Array|null}
+   */
+  get(id) {
+    this.#alive();
+    assertId(id);
+    const a = [this.#putText(id)];
+    try {
+      return this.#check(this.#exports.tdb_reconstruct(this.#handle, ...a[0])) === 1 ? this.#out() : null;
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** The body decoded as UTF-8 text, or `null`. */
+  getText(id) {
+    const b = this.get(id);
+    return b === null ? null : this.#dec.decode(b);
+  }
+
+  /**
+   * The full record — body plus attributes, with order and duplicate keys intact.
+   * @returns {{id: string, body: Uint8Array, attrs: Array<[string, unknown]>}|null}
+   */
+  getRecord(id) {
+    this.#alive();
+    assertId(id);
+    const a = [this.#putText(id)];
+    try {
+      if (this.#check(this.#exports.tdb_get_record(this.#handle, ...a[0])) !== 1) return null;
+      const v = JSON.parse(this.#outText());
+      return { id: v.id, body: fromBase64(v.body), attrs: decodeAttrs(v.attrs) };
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * Live ids in `[from, to)`, in id order, at most `limit`.
+   *
+   * The paging primitive. Ids sort lexicographically, so a `prefix/` range is a contiguous run and
+   * costs a binary search plus a walk of exactly that run — not a scan of the store.
+   *
+   * @param {{from?: string, to?: string, prefix?: string, limit?: number, reverse?: boolean}} [opts]
+   * @returns {string[]}
+   */
+  scanIds(opts = {}) {
+    this.#alive();
+    let { from = '', to = '', prefix, limit = 100, reverse = false } = opts;
+    if (prefix != null) {
+      // The half-open range holding exactly the ids that start with `prefix`. An empty prefix, and
+      // one made entirely of U+10FFFF, both have no upper bound — which is the unbounded scan, not
+      // an empty one. `''` is how the ABI spells unbounded on either end.
+      assertEncodable(prefix, 'prefix');
+      from = prefix;
+      to = prefixUpperBound(prefix) ?? '';
+    }
+    assertEncodable(from, 'from');
+    assertEncodable(to, 'to');
+    const a = [this.#putText(from), this.#putText(to)];
+    try {
+      this.#check(this.#exports.tdb_scan_ids(this.#handle, ...a[0], ...a[1], limit, reverse ? 1 : 0));
+      return JSON.parse(this.#outText());
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /**
+   * One structured page: projected attributes, named-content metadata or bytes, a checked
+   * continuation cursor, and the page's exact work statistics.
+   *
+   * The difference from {@link Store.scanIds} is that the engine does the filtering and the
+   * projection. `attrs` and `contents` are projections — a page that selects no content opens no
+   * fold block, which is what makes a metadata-only timeline cheap. `predicates` are evaluated in
+   * Rust against exact stored values, so a float comparison honours the stored NaN payload rather
+   * than whatever JavaScript would have done to it.
+   *
+   * `cursor` is opaque and checked: pass back `next` with the same range, direction, and
+   * predicates. Projection and page size may change between pages.
+   *
+   * `timeoutMs` is a cooperative deadline checked against the guest's WASI clock. `AbortSignal`
+   * remains unavailable: this engine is single-threaded, so no caller can flip a token during the
+   * synchronous operation; accepting one and silently ignoring it would be worse than absence.
+   *
+   * @param {object} [request]
+   * @returns {{rows: Array<{id: string, attrs: Array<[string, unknown]>, contents: object[]}>, next?: string, stats: object}}
+   */
+  scan(request = {}) {
+    this.#alive();
+    const a = [this.#putText(JSON.stringify(encodeScanRequest(request)))];
+    try {
+      this.#check(this.#exports.tdb_scan(this.#handle, ...a[0]));
+      return decodeScanPage(JSON.parse(this.#outText()));
+    } finally {
+      this.#free(a);
+    }
+  }
+
+  /** @returns {{records: number, parts: number}} */
+  stats() {
+    this.#alive();
+    this.#check(this.#exports.tdb_stats(this.#handle));
+    return JSON.parse(this.#outText());
+  }
+
+  /**
+   * Verify current store authority and return exact evidence for every integrity leg.
+   *
+   * Staged writes are outside this scope. Call {@link sync} and {@link flush} first when they must
+   * be included. Corruption throws `TurndbError` with `code === 'CORRUPTION'`.
+   */
+  verify({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_verify(this.#handle)
+      : this.#exports.tdb_verify_with_timeout(this.#handle, value));
+    const report = JSON.parse(this.#outText());
+    report.fold.bytes = BigInt(report.fold.bytes);
+    report.fold.trailingUncommittedBytes = BigInt(report.fold.trailingUncommittedBytes);
+    report.contentBytes = BigInt(report.contentBytes);
+    return report;
+  }
+
+  /**
+   * Cheap operational facts. `state: 'available'` means the handle answered; it is NOT an integrity
+   * verdict. Call {@link verify} for that.
+   */
+  health() {
+    this.#alive();
+    this.#check(this.#exports.tdb_health(this.#handle));
+    const health = JSON.parse(this.#outText());
+    for (const key of [
+      'commit',
+      'partRows',
+      'walBytes',
+      'walFrames',
+      'foldDiskBytes',
+      'foldCacheHits',
+      'foldCacheMisses',
+      'maxStoredFrameBytes',
+      'maxDecodedFrameBytes',
+      'maxDirectoryEntries',
+      'maxWalFrames',
+      'maxFoldBlocks',
+      'punchedBlocks',
+    ]) {
+      health[key] = BigInt(health[key]);
+    }
+    return health;
+  }
+
+  /** Cumulative operation counters and durations since this handle opened. */
+  metrics() {
+    this.#alive();
+    this.#check(this.#exports.tdb_metrics(this.#handle));
+    const metrics = JSON.parse(this.#outText());
+    const operationKeys = [
+      'openWalReplay', 'sync', 'flush', 'merge', 'backup', 'verification', 'contentPunch',
+      'refold', 'erase',
+    ];
+    for (const key of operationKeys) {
+      for (const field of [
+        'attempts', 'succeeded', 'failed', 'cancelled', 'totalDurationNs', 'lastDurationNs',
+        'maxDurationNs',
+      ]) metrics[key][field] = BigInt(metrics[key][field]);
+    }
+    metrics.recoveredWalFrames = BigInt(metrics.recoveredWalFrames);
+    metrics.verificationCorruptionFailures = BigInt(metrics.verificationCorruptionFailures);
+    for (const field of ['pieces', 'dedupHits', 'logicalBytes', 'novelBytes']) {
+      metrics.foldedContent[field] = BigInt(metrics.foldedContent[field]);
+    }
+    return metrics;
+  }
+
+  /** Non-destructive lifecycle journal read after an independent sequence cursor. */
+  lifecycleEvents({ after = 0n, limit } = {}) {
+    this.#alive();
+    if (typeof after !== 'bigint' || after < 0n) {
+      throw new TypeError('lifecycle after must be a non-negative bigint');
+    }
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
+      throw new TypeError('lifecycle limit must be a non-negative integer');
+    }
+    const input = this.#putText(JSON.stringify({ after: after.toString(), ...(limit === undefined ? {} : { limit }) }));
+    try {
+      this.#check(this.#exports.tdb_lifecycle_events(this.#handle, ...input));
+      const batch = JSON.parse(this.#outText());
+      batch.oldestAvailableSequence = batch.oldestAvailableSequence == null
+        ? null
+        : BigInt(batch.oldestAvailableSequence);
+      batch.latestSequence = BigInt(batch.latestSequence);
+      batch.droppedEvents = BigInt(batch.droppedEvents);
+      for (const event of batch.events) {
+        event.sequence = BigInt(event.sequence);
+        event.durationNs = BigInt(event.durationNs);
+      }
+      return batch;
+    } finally {
+      this.#free([input]);
+    }
+  }
+
+  /** Exact live/dead/reclaimable content facts for a read view pinned to current store authority. */
+  contentLiveness({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_content_liveness(this.#handle)
+      : this.#exports.tdb_content_liveness_with_timeout(this.#handle, value));
+    const report = JSON.parse(this.#outText());
+    for (const field of [
+      'livePieces', 'liveLogicalBytes', 'deadLogicalBytes', 'strandedDeadLogicalBytes',
+    ]) report[field] = BigInt(report[field]);
+    for (const block of [report.liveBlocks, report.reclaimableBlocks]) {
+      for (const field of ['blocks', 'rawBytes', 'storedBytes']) block[field] = BigInt(block[field]);
+    }
+    return report;
+  }
+
+  /** Reachability-aware file usage; allocated bytes are explicitly absent on WASI. */
+  spaceUsage({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_space_usage(this.#handle)
+      : this.#exports.tdb_space_usage_with_timeout(this.#handle, value));
+    const usage = JSON.parse(this.#outText());
+    for (const amount of [usage.live, usage.retainedOnly, usage.unclassified, usage.total]) {
+      amount.logicalBytes = BigInt(amount.logicalBytes);
+      if (amount.allocatedBytes.state === 'measured') {
+        amount.allocatedBytes.bytes = BigInt(amount.allocatedBytes.bytes);
+      }
+    }
+    if (usage.filesystemAvailableBytes.state === 'measured') {
+      usage.filesystemAvailableBytes.bytes = BigInt(usage.filesystemAvailableBytes.bytes);
+    }
+    return usage;
+  }
+
+  /** Advisory duplicate-generation preflight. Does not write. Requires a flushed memtable. */
+  estimateRefoldSpace({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_estimate_refold_space(this.#handle)
+      : this.#exports.tdb_estimate_refold_space_with_timeout(this.#handle, value));
+    const estimate = JSON.parse(this.#outText());
+    if (estimate === null) return null;
+    for (const field of [
+      'sourceFoldLogicalBytes', 'sourcePartBytes', 'sourcePartRawSectionBytes',
+      'retainedOnlyLogicalBytesBefore', 'estimatedStageBytes',
+    ]) estimate[field] = BigInt(estimate[field]);
+    if (estimate.filesystemAvailableBytes.state === 'measured') {
+      estimate.filesystemAvailableBytes.bytes = BigInt(estimate.filesystemAvailableBytes.bytes);
+    }
+    return estimate;
+  }
+
+  /**
+   * Rewrite content from the live-reference set and report logical output facts.
+   *
+   * This can establish query absence, logical file-length reclamation, and an auditable lifecycle
+   * event. It cannot establish media-byte non-recoverability: not on arbitrary or copy-on-write
+   * filesystems, not through WASI, and not for copies made before this call.
+   */
+  refold({ timeoutMs: timeout } = {}) {
+    this.#alive();
+    const value = timeoutMs(timeout);
+    this.#check(value === undefined
+      ? this.#exports.tdb_refold(this.#handle)
+      : this.#exports.tdb_refold_with_timeout(this.#handle, value));
+    const result = JSON.parse(this.#outText());
+    result.foldLogicalBytesBefore = BigInt(result.foldLogicalBytesBefore);
+    result.foldLogicalBytesAfter = BigInt(result.foldLogicalBytesAfter);
+    if (result.reclamation.state === 'measured') {
+      result.reclamation.logicalBytes = BigInt(result.reclamation.logicalBytes);
+    }
+    return result;
+  }
+
+  /** Erase named ids and return this operation's logical and reclamation outcomes. */
+  eraseIds(ids, { timeoutMs: timeout } = {}) {
+    this.#alive();
+    if (!Array.isArray(ids) || ids.some((id) => typeof id !== 'string')) {
+      throw new TypeError('eraseIds needs an array of string ids');
+    }
+    const input = this.#putText(JSON.stringify(ids));
+    try {
+      const value = timeoutMs(timeout);
+      this.#check(value === undefined
+        ? this.#exports.tdb_erase_ids(this.#handle, ...input)
+        : this.#exports.tdb_erase_ids_with_timeout(this.#handle, ...input, value));
+      const result = JSON.parse(this.#outText());
+      if (result.reclamation.state === 'measured') {
+        result.reclamation.logicalBytes = BigInt(result.reclamation.logicalBytes);
+      }
+      return result;
+    } finally {
+      this.#free([input]);
+    }
+  }
+
+  /**
+   * Close the store and release its handle.
+   *
+   * Deliberately not "releases the writer lock": this build holds no advisory lock to release (see
+   * the note on single-writer above). Closing frees the handle; it does not hand exclusion back to
+   * anyone, because the engine never had it.
+   *
+   * Does NOT sync — call {@link sync} first if the writes must survive. Deliberately explicit:
+   * a close that silently synced would hide a failing disk behind a method nobody checks.
+   */
+  close() {
+    if (this.#handle < 0) return;
+    const h = this.#handle;
+    this.#handle = -1;
+    storeFinalizer.unregister(this);
+    let failure;
+    try {
+      this.#check(this.#exports.tdb_close(h));
+    } catch (e) {
+      failure = e;
+    }
+    try {
+      this.#runtime.release();
+    } catch (e) {
+      failure ??= e;
+    }
+    if (failure) throw failure;
+  }
+}
+
+
+function readError(instance, prefix) {
+  const mem = new Uint8Array(instance.exports.memory.buffer);
+  const ep = instance.exports.tdb_err_ptr();
+  const el = instance.exports.tdb_err_len();
+  const msg = new TextDecoder().decode(mem.subarray(ep, ep + el));
+  const cp = instance.exports.tdb_err_code_ptr();
+  const cl = instance.exports.tdb_err_code_len();
+  const code = new TextDecoder().decode(mem.subarray(cp, cp + cl));
+  return new TurndbError(`${prefix}: ${msg}`, code || 'INTERNAL');
+}
+
+function withGuestPath(instance, guestPath, call) {
+  const path = new TextEncoder().encode(guestPath);
+  const ptr = instance.exports.tdb_alloc(path.length);
+  new Uint8Array(instance.exports.memory.buffer).set(path, ptr);
+  try {
+    return call(ptr, path.length);
+  } finally {
+    instance.exports.tdb_free(ptr, path.length);
+  }
+}
+
+function readLimitsFor(runtime, chosen) {
+  const profile = readProfile(runtime, 'tdb_capabilities');
+  return {
+    maxStoredFrameBytes: chosen.maxStoredFrameBytes || profile.max_stored_frame_bytes_default,
+    maxDecodedFrameBytes: chosen.maxDecodedFrameBytes || profile.max_decoded_frame_bytes_default,
+    maxDirectoryEntries: chosen.maxDirectoryEntries || profile.max_directory_entries_default,
+    maxWalFrames: chosen.maxWalFrames || profile.max_wal_frames_default,
+    maxFoldBlocks: chosen.maxFoldBlocks || profile.max_fold_blocks_default,
+  };
+}
+
+/**
+ * Open a writer over `guestPath` inside `runtime` — the engine call every host shares. `label`
+ * names the store in errors the way the host's caller knows it. The host owns the runtime's
+ * lifecycle; this releases it only when the engine refuses the open.
+ */
+export function openWriterHandle(runtime, guestPath, opts = {}, label = guestPath) {
+  const limits = {
+    maxRecordBytes: openLimit(opts.maxRecordBytes, 'maxRecordBytes'),
+    maxBatchBytes: openLimit(opts.maxBatchBytes, 'maxBatchBytes'),
+    maxBatchRecords: openLimit(opts.maxBatchRecords, 'maxBatchRecords'),
+    maxIdentifierBytes: openLimit(opts.maxIdentifierBytes, 'maxIdentifierBytes'),
+    maxStoredFrameBytes: openLimit(opts.maxStoredFrameBytes, 'maxStoredFrameBytes'),
+    maxDecodedFrameBytes: openLimit(opts.maxDecodedFrameBytes, 'maxDecodedFrameBytes'),
+    maxDirectoryEntries: openLimit(opts.maxDirectoryEntries, 'maxDirectoryEntries'),
+    maxWalFrames: openLimit(opts.maxWalFrames, 'maxWalFrames'),
+    maxFoldBlocks: openLimit(opts.maxFoldBlocks, 'maxFoldBlocks'),
+  };
+  const { instance } = runtime;
+  let handle;
+  try {
+    handle = withGuestPath(instance, guestPath, (ptr, len) =>
+      instance.exports.tdb_open(
+        ptr,
+        len,
+        opts.blockTarget ?? 0,
+        opts.level ?? 3,
+        limits.maxRecordBytes,
+        limits.maxBatchBytes,
+        limits.maxBatchRecords,
+        limits.maxIdentifierBytes,
+        limits.maxStoredFrameBytes,
+        limits.maxDecodedFrameBytes,
+        limits.maxDirectoryEntries,
+        limits.maxWalFrames,
+        limits.maxFoldBlocks,
+      ),
+    );
+    if (handle < 0) throw readError(instance, `opening ${label}`);
+  } catch (e) {
+    try {
+      runtime.release();
+    } catch (closeError) {
+      e.cause ??= closeError;
+    }
+    throw e;
+  }
+  return new Store(runtime, handle, readLimitsFor(runtime, limits));
+}
+
+/** Open a read-only single-file handle over `guestPath`; see {@link openWriterHandle}. */
+export function openReaderHandle(runtime, guestPath, opts = {}, label = guestPath) {
+  const limits = {
+    maxStoredFrameBytes: openLimit(opts.maxStoredFrameBytes, 'maxStoredFrameBytes'),
+    maxDecodedFrameBytes: openLimit(opts.maxDecodedFrameBytes, 'maxDecodedFrameBytes'),
+    maxDirectoryEntries: openLimit(opts.maxDirectoryEntries, 'maxDirectoryEntries'),
+    maxWalFrames: openLimit(opts.maxWalFrames, 'maxWalFrames'),
+    maxFoldBlocks: openLimit(opts.maxFoldBlocks, 'maxFoldBlocks'),
+  };
+  const { instance } = runtime;
+  let handle;
+  try {
+    handle = withGuestPath(instance, guestPath, (ptr, len) =>
+      instance.exports.tdb_open_file(
+        ptr,
+        len,
+        limits.maxStoredFrameBytes,
+        limits.maxDecodedFrameBytes,
+        limits.maxDirectoryEntries,
+        limits.maxWalFrames,
+        limits.maxFoldBlocks,
+      ),
+    );
+    if (handle < 0) throw readError(instance, `opening ${label}`);
+  } catch (e) {
+    try {
+      runtime.release();
+    } catch (closeError) {
+      e.cause ??= closeError;
+    }
+    throw e;
+  }
+  return new Store(runtime, handle, readLimitsFor(runtime, limits));
+}
