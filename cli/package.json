@@ -1,6 +1,6 @@
 {
   "name": "@turndb/cli",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "private": true,
   "description": "The turndb command line: inspect, verify, query, and ship a store without a server running",
   "license": "Apache-2.0",
@@ -36,11 +36,11 @@
     "node": ">=22"
   },
   "optionalDependencies": {
-    "@turndb/cli-linux-x64-gnu": "0.1.8",
-    "@turndb/cli-linux-arm64-gnu": "0.1.8",
-    "@turndb/cli-darwin-x64": "0.1.8",
-    "@turndb/cli-darwin-arm64": "0.1.8",
-    "@turndb/cli-win32-x64-msvc": "0.1.8"
+    "@turndb/cli-linux-x64-gnu": "0.2.0",
+    "@turndb/cli-linux-arm64-gnu": "0.2.0",
+    "@turndb/cli-darwin-x64": "0.2.0",
+    "@turndb/cli-darwin-arm64": "0.2.0",
+    "@turndb/cli-win32-x64-msvc": "0.2.0"
   },
   "scripts": {
     "pack:release": "node scripts/pack-cli.cjs",
