@@ -646,16 +646,27 @@ pub unsafe extern "C" fn tdb_open_file(
 #[no_mangle]
 pub extern "C" fn tdb_close(h: i32) -> i32 {
     clear_err();
-    STORES.with(|s| {
+    let taken = STORES.with(|s| {
         let mut s = s.borrow_mut();
         match usize::try_from(h).ok().and_then(|i| s.get_mut(i)) {
-            Some(slot) if slot.is_some() => {
-                *slot = None;
-                0
-            }
-            _ => fail(format!("store handle {h} is not open")),
+            Some(slot) if slot.is_some() => Ok(slot.take()),
+            _ => Err(fail(format!("store handle {h} is not open"))),
         }
-    })
+    });
+    match taken {
+        // A writer with no pending change set is settled on the way out: the redundant WAL is
+        // truncated and removed, so a clean close leaves exactly the one container file the
+        // format promises. A writer with accepted, unpublished mutations keeps its WAL — this
+        // `close` publishes nothing the caller did not ask for, and the WAL is what replays those
+        // mutations on the next open. Dropping the handle used to skip settlement in both cases,
+        // which left a zero-length `-wal` beside every store this binding ever closed.
+        Ok(Some(Handle::Writer(store))) if store.memtable_len() == 0 => match store.close() {
+            Ok(()) => 0,
+            Err(error) => fail_engine(error),
+        },
+        Ok(_) => 0,
+        Err(code) => code,
+    }
 }
 
 // ── Writes ──────────────────────────────────────────────────────────────────

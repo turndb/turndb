@@ -79,3 +79,29 @@ test('database retries exact missing ranges instead of falling back to whole-fil
   assert.deepEqual(await db.scan({ contractVersion: 1 }), { rows: ['ok'] });
   assert(db.fetchStats().cachedBlocks <= 64);
 });
+
+test('a declared footprint is fetched ahead as transient ranges and released after', async () => {
+  const requests = [];
+  const source = new BlobReadAt(new Blob([bytes]), { blockSize: 4096, maxBlocks: 2 });
+  const fetchRange = source.fetchRange.bind(source);
+  source.fetchRange = async (start, end, signal) => {
+    requests.push([start, end]);
+    return fetchRange(start, end, signal);
+  };
+  // Two ranges one block apart merge into one request; a distant range is its own.
+  await source.ensureRanges([
+    { offset: '100', length: '50' },
+    { offset: '4200', length: '10' },
+    { offset: '150000', length: '3000' },
+  ]);
+  assert.deepEqual(requests, [[100n, 4210n], [150000n, 153000n]]);
+  assert.deepEqual(source.readSync(120n, 30), bytes.slice(120, 150), 'served from the transient range');
+  assert.deepEqual(source.readSync(151000n, 2000), bytes.slice(151000, 153000));
+  assert.equal(source.readSync(4300n, 10), undefined, 'bytes outside the footprint are still misses');
+  assert.equal(source.blocks.size, 0, 'a footprint never displaces the LRU');
+  // A range already held transient is not fetched again.
+  await source.ensureRanges([{ offset: '110', length: '20' }]);
+  assert.equal(requests.length, 2);
+  source.releaseTransient();
+  assert.equal(source.readSync(120n, 30), undefined, 'released footprints are gone');
+});

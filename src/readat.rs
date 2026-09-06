@@ -111,6 +111,29 @@ pub struct Extents<R> {
     len: u64,
 }
 
+/// The physical `(offset, len)` runs that a logical window `[off, off + len)` of a member occupies,
+/// given the member's `(physical_off, len)` extents in logical order — the inverse question of
+/// [`Extents::read_exact_at`], answered without reading. A verifier declares what a unit will read
+/// in these terms so a range-fetching source can fill exactly that before the unit runs.
+///
+/// A window past the member's end is clamped to the member: declaring bytes that do not exist
+/// would send a source fetching them. Zero-length extents contribute nothing.
+pub fn physical_ranges(extents: &[(u64, u64)], off: u64, len: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut logical = 0u64;
+    let end = off.saturating_add(len);
+    for &(phys, run_len) in extents {
+        let run_end = logical.saturating_add(run_len);
+        if run_len > 0 && run_end > off && logical < end {
+            let from = off.max(logical);
+            let to = end.min(run_end);
+            out.push((phys + (from - logical), to - from));
+        }
+        logical = run_end;
+    }
+    out
+}
+
 impl<R: ReadAt> Extents<R> {
     /// Build from `(physical_off, len)` pairs in logical order. Zero-length extents are dropped —
     /// they address nothing and would only complicate the search.

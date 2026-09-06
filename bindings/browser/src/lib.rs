@@ -124,7 +124,7 @@ mod wasm {
             output(json!({
                 "contractVersion": 2,
                 "profile": "browser",
-                "operations": ["openSnapshot", "compiledCapabilities", "scan", "explainScan", "schema", "readContent", "close"],
+                "operations": ["openSnapshot", "compiledCapabilities", "scan", "explainScan", "schema", "readContent", "verify", "close"],
                 "draftFormatEpoch": compiled.draft_format_epoch,
                 "writerExclusion": "read_only",
                 "positionedIo": true,
@@ -168,6 +168,147 @@ mod wasm {
 
         /// Release the wasm-owned snapshot and its caches deterministically.
         pub fn close(self) {}
+    }
+
+    /// Verification over the same callback source, in declared units. The JavaScript layer asks
+    /// for a unit's footprint, fills exactly those ranges, runs the unit, and repeats; a cache
+    /// miss surfaces as the same `TURNDB_RANGE` refusal the read path uses, and rerunning the
+    /// unit after the fill is safe because a failed unit leaves the verifier's state untouched.
+    #[wasm_bindgen]
+    pub struct BrowserVerifier {
+        verifier: turndb::store::SourceVerifier,
+    }
+
+    #[wasm_bindgen]
+    impl BrowserVerifier {
+        #[wasm_bindgen(js_name = open)]
+        pub fn open(
+            read: Function,
+            length: u64,
+            label: Option<String>,
+        ) -> Result<BrowserVerifier, JsValue> {
+            let source = Arc::new(CallbackSource { read, len: length });
+            let verifier = turndb::store::SourceVerifier::open(
+                source,
+                label.as_deref().unwrap_or("browser://source"),
+                FoldCfg::default(),
+                turndb::read_limits::ReadLimits::default(),
+                &turndb::control::OperationControl::default(),
+            )
+            .map_err(failure)?;
+            Ok(BrowserVerifier { verifier })
+        }
+
+        /// The planned units in the order windows must run.
+        pub fn units(&self) -> Result<JsValue, JsValue> {
+            output(Value::Array(self.verifier.units().iter().map(encode_unit).collect()))
+        }
+
+        /// `{ done, total }`.
+        pub fn progress(&self) -> Result<JsValue, JsValue> {
+            let (done, total) = self.verifier.progress();
+            output(json!({ "done": done, "total": total }))
+        }
+
+        /// The source byte ranges unit `index` reads, as `[{ offset, length }]` with decimal
+        /// strings, coalesced and sorted.
+        pub fn footprint(&self, index: usize) -> Result<JsValue, JsValue> {
+            let ranges = self.verifier.footprint(index).map_err(failure)?;
+            output(Value::Array(
+                ranges
+                    .into_iter()
+                    .map(|(offset, length)| {
+                        json!({ "offset": offset.to_string(), "length": length.to_string() })
+                    })
+                    .collect(),
+            ))
+        }
+
+        /// Run unit `index`; a unit that already ran is a no-op.
+        pub fn run(&mut self, index: usize) -> Result<(), JsValue> {
+            self.verifier.run(index, &turndb::control::OperationControl::default()).map_err(failure)
+        }
+
+        /// The composed result once every unit has run; refused before that.
+        pub fn report(&self) -> Result<JsValue, JsValue> {
+            let report = self.verifier.report().map_err(failure)?;
+            output(encode_verification(report))
+        }
+
+        pub fn close(self) {}
+    }
+
+    fn encode_authority(authority: turndb::store::Authority) -> Value {
+        match authority {
+            turndb::store::Authority::Current => json!("current"),
+            turndb::store::Authority::Retained(commit) => json!({ "retained": commit.to_string() }),
+        }
+    }
+
+    fn encode_unit(unit: &turndb::store::VerifyUnit) -> Value {
+        use turndb::store::VerifyUnit as U;
+        let mut value = json!({ "kind": unit.kind() });
+        match unit {
+            U::MemberChecksum { member, start, stop } | U::PartDigest { member, start, stop } => {
+                value["member"] = json!(member);
+                value["start"] = json!(start.to_string());
+                value["stop"] = json!(stop.to_string());
+            }
+            U::ManifestChain => {}
+            U::PartSection { member, section } => {
+                value["member"] = json!(member);
+                value["section"] = json!(section);
+            }
+            U::PartGrammar { member } => value["member"] = json!(member),
+            U::PartPieces { member, authority } => {
+                value["member"] = json!(member);
+                value["authority"] = encode_authority(*authority);
+            }
+            U::FoldFrames { seg, start, stop } => {
+                value["segment"] = json!(seg);
+                value["start"] = json!(start.to_string());
+                value["stop"] = json!(stop.to_string());
+            }
+            U::Content { authority, part, rows } => {
+                value["authority"] = encode_authority(*authority);
+                value["part"] = json!(part);
+                value["rows"] = json!({ "from": rows.start, "to": rows.end });
+            }
+        }
+        value
+    }
+
+    /// The same shape the portable and native bindings return from `verify`, plus the container
+    /// facts a source verification establishes.
+    fn encode_verification(report: turndb::store::SourceVerification) -> Value {
+        let store = report.store;
+        json!({
+            "scope": "current_manifest_revision",
+            "state": "valid",
+            "members": report.members,
+            "memberBytes": report.member_bytes.to_string(),
+            "commit": report.commit.to_string(),
+            "retainedManifests": {
+                "state": if store.chain.retained_manifests == 0 { "not_applicable" } else { "verified" },
+                "count": store.chain.retained_manifests,
+            },
+            "chain": {
+                "links": store.chain.links,
+                "partDigests": store.chain.part_digests,
+            },
+            "parts": store.parts,
+            "partSections": store.part_sections,
+            "fold": {
+                "segments": store.fold.segments,
+                "blocks": store.fold.blocks,
+                "bytes": store.fold.bytes.to_string(),
+                "trailingUncommittedBytes": store.fold.trailing_uncommitted.to_string(),
+            },
+            "records": store.records,
+            "contentValues": store.content_values,
+            "contentBytes": store.content_bytes.to_string(),
+            "contentIdentities": store.content_identities,
+        })
     }
 
     fn decode_scan(value: Value) -> Result<ScanRequest> {

@@ -41,9 +41,34 @@ export class BufferReadAt {
   }
 
   async ensure() {}
+
+  async ensureRanges() {}
 }
 
-class BlockReadAt {
+/** Merge `[{ offset, length }]` ranges whose gaps are at most `gap` bytes, ascending. */
+function mergeRanges(ranges, gap) {
+  const sorted = ranges
+    .map((range) => ({ start: BigInt(range.offset), end: BigInt(range.offset) + BigInt(range.length) }))
+    .filter((range) => range.end > range.start)
+    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  const out = [];
+  for (const range of sorted) {
+    const last = out[out.length - 1];
+    if (last && range.start <= last.end + BigInt(gap)) {
+      if (range.end > last.end) last.end = range.end;
+    } else {
+      out.push({ ...range });
+    }
+  }
+  return out;
+}
+
+/**
+ * A block-cached source over any range fetcher. Exported so a host can subclass it with its own
+ * `fetchRange` — an object-store binding, a message port — and get the block LRU, the transient
+ * footprints, and the pinned retries the HTTP and Blob transports use.
+ */
+export class BlockReadAt {
   constructor(length, { blockSize = 64 * 1024, maxBlocks = 64, label = 'range source' } = {}) {
     if (!Number.isSafeInteger(blockSize) || blockSize < 4096) throw new RangeError('blockSize must be at least 4096');
     if (!Number.isSafeInteger(maxBlocks) || maxBlocks < 2) throw new RangeError('maxBlocks must be at least 2');
@@ -58,6 +83,15 @@ class BlockReadAt {
 
   releaseTransient() {
     this.transient = [];
+  }
+
+  /** Hold an already-ensured range transient until `releaseTransient()`, whatever the LRU does. */
+  pin(offset, length) {
+    if (length === 0) return;
+    const end = offset + BigInt(length);
+    if (this.transient.some((held) => held.start <= offset && held.end >= end)) return;
+    const bytes = this.readSync(offset, length);
+    if (bytes) this.transient.push({ start: offset, end, bytes });
   }
 
   readSync(offset, length) {
@@ -145,6 +179,27 @@ class BlockReadAt {
       while (this.blocks.size > this.maxBlocks) this.blocks.delete(this.blocks.keys().next().value);
     }
   }
+
+  /**
+   * Fill a declared footprint — the `[{ offset, length }]` ranges a verification unit will read —
+   * ahead of the unit, as transient exact ranges rather than LRU blocks. A unit's footprint can
+   * exceed the block cache many times over; served through the LRU it would evict its own early
+   * blocks and the unit would restart on every miss. Held transient, the unit runs in one pass
+   * and `releaseTransient()` returns the memory when it is done. Ranges separated by at most one
+   * block are fetched together so a footprint of many small pieces costs few requests.
+   */
+  async ensureRanges(ranges, signal) {
+    for (const range of mergeRanges(ranges, this.blockSize)) {
+      abort(signal);
+      const covered = this.transient.some((held) => held.start <= range.start && held.end >= range.end);
+      if (covered) continue;
+      const bytes = await this.fetchRange(range.start, range.end, signal);
+      if (bytes.byteLength !== Number(range.end - range.start)) {
+        throw new Error(`${this.label} returned ${bytes.byteLength} bytes for [${range.start}, ${range.end})`);
+      }
+      this.transient.push({ start: range.start, end: range.end, bytes });
+    }
+  }
 }
 
 export class BlobReadAt extends BlockReadAt {
@@ -218,6 +273,108 @@ export class HttpRangeReadAt extends BlockReadAt {
   }
 }
 
+/**
+ * Run a synchronous wasm operation over `source`, filling each range the core reports missing
+ * and retrying until it completes. Transient ranges are released on completion and on failure.
+ */
+async function retrying(source, operation, signal) {
+  while (true) {
+    abort(signal);
+    try {
+      const result = operation();
+      source.releaseTransient?.();
+      return result;
+    } catch (error) {
+      const range = missing(error);
+      if (!range) {
+        source.releaseTransient?.();
+        throw normalize(error, 'INTERNAL');
+      }
+      try {
+        await source.ensure(range.offset, range.length, signal);
+        // Pin what was just fetched until this operation completes. The LRU alone is not enough:
+        // an operation whose working set exceeds the cache would evict its own first block while
+        // fetching its last and restart forever. Pinned, every retry keeps what earlier retries
+        // fetched, so each retry makes progress whatever the cache size; the pins go with the
+        // transient set when the operation completes or fails.
+        source.pin?.(range.offset, range.length);
+      } catch (ensureError) {
+        source.releaseTransient?.();
+        throw normalize(ensureError);
+      }
+    }
+  }
+}
+
+/**
+ * Verify a container over any source: the same evidence the native `verify` produces, in
+ * declared units. Each unit's byte footprint is fetched ahead of it, so a unit runs in one pass
+ * whatever the block cache holds; `onProgress` sees `{ done, total, unit }` after each unit.
+ * The result is `{ report, units }`, where `report` composes only once every unit ran.
+ */
+export async function verifySource(wasm, source, { signal, onProgress } = {}) {
+  let from = 0;
+  for (;;) {
+    const step = await verifyUnits(wasm, source, { from, signal, onProgress });
+    if (step.report) return { report: step.report, units: step.total };
+    from = step.next;
+  }
+}
+
+/**
+ * The resumable form of {@link verifySource}: run the units from `from` until every unit has run,
+ * `limit` units have run, or `deadlineMs` of wall clock has passed, and return where to resume.
+ *
+ * The plan is a pure function of the container bytes, so a fresh verifier over the same bytes
+ * plans the same units in the same order; a host whose work is cut into bounded steps (an edge
+ * worker with a CPU budget per invocation) opens one per step and continues from `next`. The
+ * result carries `report` only once the last unit has run in this call; before that it is
+ * `null`, because a partial run is scoped evidence and never a whole-store result.
+ */
+export async function verifyUnits(wasm, source, { from = 0, limit = Infinity, deadlineMs = Infinity, signal, onProgress } = {}) {
+  const read = source.readSync.bind(source);
+  const verifier = await retrying(
+    source,
+    () => wasm.BrowserVerifier.open(read, source.length, source.label),
+    signal,
+  );
+  try {
+    const units = verifier.units();
+    const started = Date.now();
+    let index = from;
+    while (index < units.length) {
+      const footprint = await retrying(source, () => verifier.footprint(index), signal);
+      try {
+        await source.ensureRanges?.(footprint, signal);
+      } catch (error) {
+        source.releaseTransient?.();
+        throw normalize(error);
+      }
+      // `retrying` releases the transient footprint when the unit completes or fails.
+      await retrying(source, () => verifier.run(index), signal);
+      index += 1;
+      onProgress?.({ done: index, total: units.length, unit: units[index - 1] });
+      if (index - from >= limit || Date.now() - started >= deadlineMs) break;
+    }
+    // Units before `from` are assumed to have run in an earlier call over the same bytes; the
+    // report is composed only when this call ran the last unit, and the verifier refuses to
+    // report before every unit it planned has run — so a resumed run must restart at zero if
+    // it needs the composed report from one verifier. Hosts that step through the plan keep
+    // the composed report from the call that finished it.
+    const finished = index >= units.length;
+    let report = null;
+    if (finished) {
+      for (let earlier = 0; earlier < from; earlier++) {
+        await retrying(source, () => verifier.run(earlier), signal);
+      }
+      report = verifier.report();
+    }
+    return { next: index, total: units.length, report };
+  } finally {
+    verifier.close();
+  }
+}
+
 export class BrowserDatabase {
   constructor(wasm, source, handle) {
     this.wasm = wasm;
@@ -227,26 +384,17 @@ export class BrowserDatabase {
 
   static async open(wasm, source, { signal } = {}) {
     const read = source.readSync.bind(source);
-    while (true) {
-      abort(signal);
-      try {
-        const handle = wasm.BrowserStore.open(read, source.length, source.label);
-        source.releaseTransient?.();
-        return new BrowserDatabase(wasm, source, handle);
-      } catch (error) {
-        const range = missing(error);
-        if (!range) {
-          source.releaseTransient?.();
-          throw normalize(error, 'INTERNAL');
-        }
-        try {
-          await source.ensure(range.offset, range.length, signal);
-        } catch (ensureError) {
-          source.releaseTransient?.();
-          throw normalize(ensureError);
-        }
-      }
-    }
+    const handle = await retrying(
+      source,
+      () => wasm.BrowserStore.open(read, source.length, source.label),
+      signal,
+    );
+    return new BrowserDatabase(wasm, source, handle);
+  }
+
+  /** {@link verifySource} over this database's source, from a fresh verifier. */
+  static verify(wasm, source, options) {
+    return verifySource(wasm, source, options);
   }
 
   static openBuffer(wasm, bytes, options) {
@@ -266,27 +414,8 @@ export class BrowserDatabase {
     }
   }
 
-  async retry(operation, signal) {
-    while (true) {
-      abort(signal);
-      try {
-        const result = operation();
-        this.source.releaseTransient?.();
-        return result;
-      } catch (error) {
-        const range = missing(error);
-        if (!range) {
-          this.source.releaseTransient?.();
-          throw normalize(error, 'INTERNAL');
-        }
-        try {
-          await this.source.ensure(range.offset, range.length, signal);
-        } catch (ensureError) {
-          this.source.releaseTransient?.();
-          throw normalize(ensureError);
-        }
-      }
-    }
+  retry(operation, signal) {
+    return retrying(this.source, operation, signal);
   }
 
   scan(request, { signal } = {}) {

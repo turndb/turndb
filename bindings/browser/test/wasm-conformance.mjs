@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-import { BrowserDatabase, BufferReadAt, TurnDbError } from '../index.mjs';
+import { BlobReadAt, BrowserDatabase, BufferReadAt, TurnDbError, verifySource } from '../index.mjs';
 import { reproducibleCargoEnv } from '../cargo-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -106,6 +106,53 @@ try {
   );
   database.close();
   database.close();
+  assert(capabilities.operations.includes('verify'));
+
+  // Verification in declared units: the same result over a whole buffer and over a Blob whose
+  // cache holds two 4 KiB blocks, where a single-pass verification would restart on every miss.
+  const whole = await verifySource(wasm, new BufferReadAt(bytes, 'fixture.turndb'));
+  assert.equal(whole.report.state, 'valid');
+  assert.equal(whole.report.records, view.records.length, 'every visible record is reconstructed');
+  assert(whole.report.contentIdentities > 0 && Number(whole.report.contentBytes) > 0);
+  assert(whole.units > 8, `a store this shape plans many units, got ${whole.units}`);
+  const progress = [];
+  const small = new BlobReadAt(new Blob([bytes]), { blockSize: 4096, maxBlocks: 2, label: 'fixture.turndb' });
+  let fetches = 0;
+  const fetchRange = small.fetchRange.bind(small);
+  small.fetchRange = (start, end, signal) => {
+    fetches++;
+    return fetchRange(start, end, signal);
+  };
+  const ranged = await verifySource(wasm, small, { onProgress: (step) => progress.push(step) });
+  assert.deepEqual(ranged.report, whole.report, 'a range source composes the same evidence');
+  assert.equal(progress.length, ranged.units);
+  assert(progress.every((step, index) => step.done === index + 1 && step.total === ranged.units));
+  const kinds = new Set(progress.map((step) => step.unit.kind));
+  for (const kind of ['memberChecksum', 'manifestChain', 'partDigest', 'partSection', 'partGrammar', 'partPieces', 'foldFrames', 'content']) {
+    assert(kinds.has(kind), `the plan exercises ${kind}`);
+  }
+  // Footprints are fetched whole ahead of each unit, so requests scale with units, not with
+  // misses: a bound of a few requests per unit plus the open's block reads holds, where a
+  // miss-driven walk over a two-block cache would issue one request per 4 KiB touched.
+  const requestBound = ranged.units * 4 + Math.ceil(bytes.length / 4096);
+  assert(fetches > 0 && fetches <= requestBound, `verification issued ${fetches} range fetches over ${ranged.units} units; bound ${requestBound}`);
+  assert.equal(small.transient.length, 0, 'footprints are released after their unit');
+  // One flipped byte inside a member's checked bytes — located through the plan itself, so the
+  // damage cannot land in alignment padding — is refused with the engine's stable class.
+  const probeSource = new BufferReadAt(bytes, 'probe.turndb');
+  const probe = wasm.BrowserVerifier.open(probeSource.readSync.bind(probeSource), probeSource.length, 'probe.turndb');
+  const plan = probe.units();
+  const first = plan.findIndex((unit) => unit.kind === 'memberChecksum' && BigInt(unit.stop) > BigInt(unit.start) + 8n);
+  assert(first >= 0, 'the plan checks a member with bytes');
+  const [range] = probe.footprint(first);
+  probe.close();
+  const flipped = Uint8Array.from(bytes);
+  flipped[Number(range.offset) + 5] ^= 0xff;
+  await assert.rejects(
+    verifySource(wasm, new BufferReadAt(flipped, 'damaged.turndb')),
+    (error) => error instanceof TurnDbError && error.code === 'CORRUPTION',
+  );
+  console.log(`browser wasm: verification composed over ${ranged.units} units with ${fetches} range fetches`);
   console.log('browser wasm: shared snapshot-v2 corpus passed');
 } finally {
   await rm(scratch, { recursive: true, force: true });

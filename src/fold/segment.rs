@@ -272,11 +272,39 @@ pub fn scan_tail_controlled_with_limits(
     operation: &'static str,
     read_limits: crate::read_limits::ReadLimits,
 ) -> Result<(u64, Vec<(u32, u32)>)> {
+    scan_frames_window(f, SEG_HDR_LEN, file_len, has_dict, punched, control, operation, read_limits)
+}
+
+/// The frame walk behind [`scan_tail_controlled_with_limits`], over one window `[start, stop)` of
+/// a segment instead of the whole of it.
+///
+/// A verifier that declares what it will read before reading it needs the walk in windows: a
+/// segment can be a gigabyte, and a range-fetching source cannot hold that. `start` must be a
+/// frame boundary — the segment header end, or an offset the block directory names — and `stop`
+/// is where the walk ends: a later frame boundary, or the segment's length. The walk stops early
+/// exactly where the whole-segment scan would, at a frame that does not complete before `stop`;
+/// the caller decides whether that is the active segment's crash residue or corruption, which is
+/// the same decision [`crate::fold::Fold::scrub`] makes with `stop` at the segment's end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_frames_window(
+    f: &dyn ReadAt,
+    start: u64,
+    stop: u64,
+    has_dict: bool,
+    punched: &[(u32, u32)],
+    control: &crate::control::OperationControl,
+    operation: &'static str,
+    read_limits: crate::read_limits::ReadLimits,
+) -> Result<(u64, Vec<(u32, u32)>)> {
     let read_limits = read_limits.validate()?;
-    if file_len > SEG_MAX_LIMIT {
-        bail!("segment is {file_len} bytes, over the {SEG_MAX_LIMIT} format bound");
+    if stop > SEG_MAX_LIMIT {
+        bail!("segment is {stop} bytes, over the {SEG_MAX_LIMIT} format bound");
     }
-    let mut off = SEG_HDR_LEN;
+    if start < SEG_HDR_LEN || start > stop {
+        bail!("fold frame window [{start}, {stop}) does not lie inside the segment's frames");
+    }
+    let file_len = stop;
+    let mut off = start;
     let mut hdr = [0u8; BLOCK_HDR_LEN];
     let mut payload = Vec::new();
     // Blocks land in COMPLETION order, so position no longer implies identity — the directory is

@@ -10,11 +10,20 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./index.mjs"
-    }
+    },
+    "./memory": {
+      "types": "./memory.d.ts",
+      "default": "./memory.mjs"
+    },
+    "./turndb.wasm": "./turndb.wasm"
   },
   "files": [
     "index.mjs",
     "index.d.ts",
+    "core.mjs",
+    "memory.mjs",
+    "memory.d.ts",
+    "wasi-memfs.mjs",
     "turndb.wasm",
     "LICENSE",
     "NOTICE",

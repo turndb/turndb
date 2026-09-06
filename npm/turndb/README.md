@@ -108,10 +108,43 @@ directory is mounted. A consumer that must hold multiple stores open concurrentl
 processes.
 
 Call `close()` explicitly. It releases the handle but does not synchronize accepted mutations or
-publish the pending change set; call `sync()` or `flush()` first according to the guarantee you need. A dropped handle is
+publish the pending change set; call `sync()` or `flush()` first according to the guarantee you need.
+When the handle has no pending change set, `close()` settles the store: the redundant write-ahead
+log is removed and exactly one file remains. A dropped handle is
 reclaimed when JavaScript eventually collects it, so forgetting `close()` does not wedge the
 process forever, but collection has no timing guarantee and the next `open()` refuses while the old
 handle is still open.
+
+## The memory host
+
+`turndb/memory` runs the same engine over an in-memory directory, for every runtime without
+`node:wasi` — a browser Web Worker, a Cloudflare Worker, Bun, Deno — and for Node when a store
+must never touch a disk:
+
+```js
+import { MemoryHost } from 'turndb/memory';
+
+const host = await MemoryHost.create({ module: WebAssembly.compileStreaming(fetch(wasmUrl)) });
+const store = host.open('trace.turndb');
+store.write([{ kind: 'put', id: 'span/…', contents: [{ name: 'gen_ai.input.messages', bytes }], attrs }]);
+store.sync();
+store.flush();
+store.close();
+const container = host.read('trace.turndb');   // the settled container, byte-exact
+```
+
+`wasmUrl` is this package's `turndb.wasm` (`import wasmUrl from 'turndb/turndb.wasm?url'` under
+Vite); `module` also accepts a `WebAssembly.Module`, a `Response`, or the bytes. The host's
+`open`, `openFile`, `write`, `read`, `list` and `remove` are the door to its directory; several
+stores may be open on one host at once.
+
+What this host gives up is stated rather than hidden. Durability barriers are no-ops over memory:
+`sync()` and `flush()` still order the engine's own state, and a store exported after `close()` is a
+settled container, but nothing survives the host being dropped except what you copied out. Writer
+exclusion is the embedder's, as on every WASI host. The WASI layer behind it (`wasi-memfs.mjs`)
+implements exactly the twenty-two imports the engine uses; `npm/turndb/test/memory-host.mjs`
+holds it to POSIX semantics call by call and proves an exported container is one the Node host and
+the native CLI accept as their own.
 
 ## Integrity and health
 

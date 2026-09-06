@@ -20,6 +20,38 @@ dictionaries, and positive field-presence facts. Unknown metadata, NaN zones, ab
 predicates, and every malformed advisory fact widen to “may match.” `predicatePrunedRows` is the
 exact count avoided.
 
+## Verification
+
+`verifySource(wasm, source, { signal, onProgress })` — also `BrowserDatabase.verify` — performs
+the whole-artifact verification over any transport the read path accepts, and returns the same
+report the native and portable `verify` return, plus the container's member count, member bytes,
+and current `commit`. It is the engine's `SourceVerifier` (`src/store/verify.rs`): the checks are
+planned as an ordered list of units — member checksums, the retained manifest chain, part digests,
+part sections, part row grammar, piece dictionaries, fold frames, and named-content identities,
+for the current and every retained authority — and each unit declares the byte ranges it will
+read before it runs. The JavaScript layer fetches that footprint as transient exact ranges, runs
+the unit in one pass, and releases the ranges; `onProgress` sees `{ done, total, unit }` after
+each. A unit that fails leaves the verifier's state untouched, so a range the source could not
+serve is fetched and the same unit rerun.
+
+The claim is exact and the tests hold it: `tests/verify_source.rs` records every read a unit
+makes and asserts each lies inside that unit's footprint or the metadata the open already read,
+and proves the composed report equals `Store::verify` field by field. The conformance run
+verifies the shared fixture over a Blob whose cache holds two 4 KiB blocks and gets the same report
+as over the whole buffer, in a number of range fetches bounded by the number of units rather than
+by the number of blocks.
+
+Memory: a unit's footprint is bounded by [`WINDOW_BYTES`](../src/store/verify.rs) for windowed
+members and frames, by one part's content sections plus the frames its rows reference for
+content units, and by one whole part for the row-grammar unit. A source verification that has
+not run every unit is scoped evidence; `report` refuses to produce a whole-store result before
+then.
+
+Retries and cache size: the transport's retry loop pins every range it fetches for one operation
+until that operation completes, so an operation whose working set exceeds the block cache still
+completes — at the cost of holding that working set — where it would previously have evicted its
+own first block while fetching its last and restarted forever.
+
 ## SQL decision
 
 The first viewer is structured-scan only. The columnar core compiles for

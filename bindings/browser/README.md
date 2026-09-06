@@ -7,6 +7,10 @@ the wasm engine reports an exact missing byte range and the JavaScript layer fil
 HTTP servers must return `206` plus an exact `Content-Range` and allow `Range`/`Content-Range`
 through CORS. A `200` whole-file fallback is refused.
 
+`verifySource(wasm, source, { signal, onProgress })` verifies a container over any of those
+transports in declared units, each fetched ahead of the unit it serves, and returns the same
+report the native and portable `verify` return; see [`docs/browser.md`](../../docs/browser.md#verification).
+
 Query failures are `TurnDbError` instances with the same stable engine `code` taxonomy as the
 native SDKs. Transport failures use `IO`; an HTTP status or malformed `Content-Range` is never
 silently turned into a full-file read.

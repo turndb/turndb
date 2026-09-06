@@ -1231,27 +1231,53 @@ impl Part {
         control: &crate::control::OperationControl,
     ) -> Result<usize> {
         let mut checked = 0usize;
-        for (name, s) in &self.toc {
-            control.check("part verification")?;
-            let mut remaining = u64::from(s.stored);
-            let mut offset = s.off;
-            let mut hasher = crc32fast::Hasher::new();
-            let mut buf = vec![0u8; (1 << 20).min(remaining.max(1) as usize)];
-            while remaining > 0 {
-                control.check("part verification")?;
-                let take = buf.len().min(remaining as usize);
-                self.f.read_exact_at(&mut buf[..take], offset)?;
-                hasher.update(&buf[..take]);
-                offset += take as u64;
-                remaining -= take as u64;
-            }
-            let got = hasher.finalize();
-            if got != s.xsum {
-                bail!("section {name} fails its checksum ({got:#010x} != {:#010x})", s.xsum);
-            }
+        for name in self.toc.keys() {
+            self.verify_section_with_control(name, control)?;
             checked += 1;
         }
         Ok(checked)
+    }
+
+    /// One section of [`Part::verify_sections_with_control`]: the stored bytes of `name` against
+    /// the checksum the TOC recorded for them.
+    pub(crate) fn verify_section_with_control(
+        &self,
+        name: &str,
+        control: &crate::control::OperationControl,
+    ) -> Result<()> {
+        control.check("part verification")?;
+        let s = self.toc.get(name).ok_or_else(|| anyhow::anyhow!("part has no section {name}"))?;
+        let mut remaining = u64::from(s.stored);
+        let mut offset = s.off;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; (1 << 20).min(remaining.max(1) as usize)];
+        while remaining > 0 {
+            control.check("part verification")?;
+            let take = buf.len().min(remaining as usize);
+            self.f.read_exact_at(&mut buf[..take], offset)?;
+            hasher.update(&buf[..take]);
+            offset += take as u64;
+            remaining -= take as u64;
+        }
+        let got = hasher.finalize();
+        if got != s.xsum {
+            bail!("section {name} fails its checksum ({got:#010x} != {:#010x})", s.xsum);
+        }
+        Ok(())
+    }
+
+    /// Every section's `(name, part offset, stored bytes)` in part-offset order: the byte
+    /// footprint a section-by-section verification declares before it reads.
+    pub(crate) fn section_ranges(&self) -> Vec<(String, u64, u64)> {
+        let mut out: Vec<(String, u64, u64)> =
+            self.toc.iter().map(|(name, s)| (name.clone(), s.off, u64::from(s.stored))).collect();
+        out.sort_by_key(|(_, off, _)| *off);
+        out
+    }
+
+    /// The part's total byte length as its source reports it.
+    pub(crate) fn byte_len(&self) -> Result<u64> {
+        Ok(self.f.len()?)
     }
 
     /// Decode the complete logical grammar of every physical row and dictionary entry.

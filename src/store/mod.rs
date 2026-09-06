@@ -36,9 +36,11 @@
 pub mod debris;
 pub mod read;
 pub mod refold;
+pub mod verify;
 pub mod wal;
 
 pub use debris::{debris_report, debris_report_with_limits, DebrisEntry, DebrisKind, DebrisReport};
+pub use verify::{verify_source, Authority, SourceVerification, SourceVerifier, VerifyUnit};
 
 use crate::fold::{Fold, FoldCfg, FoldTail, Loc};
 use crate::part::cache::SectionCache;
@@ -1042,7 +1044,7 @@ fn checksum_trailer(bytes: &[u8]) -> Option<(&[u8], u32)> {
 }
 
 fn container_sidecar_bytes(
-    container: &crate::container::Container,
+    container: &dyn crate::container::ContainerView,
     name: &str,
     segment_len: u64,
     read_limits: ReadLimits,
@@ -1055,26 +1057,11 @@ fn container_sidecar_bytes(
     ))
 }
 
-fn container_reader_sidecar_bytes(
-    container: &crate::container::ContainerReader,
-    name: &str,
-    segment_len: u64,
-    read_limits: ReadLimits,
-) -> Result<Option<Vec<u8>>> {
-    let Some(extent) = container.extent(name) else { return Ok(None) };
-    let stored = crate::readat::ReadAt::len(&extent)?;
-    read_limits.admit_stored(format!("fold directory sidecar {name}"), stored)?;
-    Ok(Some(
-        container
-            .read_file_bounded(name, crate::fold::segment::max_dir_sidecar_bytes(segment_len))?,
-    ))
-}
-
 /// Open the exact fold view described by `manifest` from the supplied container handle. Keeping
 /// the extents tied to this handle matters during verification: a concurrent path replacement
 /// must never cause bytes from another inode to determine which checksums are exempt here.
 fn open_fold_from_container(
-    container: &crate::container::Container,
+    container: &dyn crate::container::ContainerView,
     manifest: &Manifest,
     cfg: FoldCfg,
     label: &Path,
@@ -1082,7 +1069,7 @@ fn open_fold_from_container(
 ) -> Result<Fold> {
     let fold_rel = crate::fold::fold_member_prefix(manifest.fold_gen);
     let fold_tail = manifest.fold_tail();
-    let names = container.names().map(String::from).collect::<Vec<_>>();
+    let names = container.member_names();
     let mut segs = Vec::new();
     let mut present_segments = HashSet::new();
     let mut dict_files = Vec::new();
@@ -1091,7 +1078,7 @@ fn open_fold_from_container(
         let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
         if let Some(number) = crate::fold::segment::parse_seg_name(rest) {
             present_segments.insert(number);
-            let extent = container.extent(&name).expect("name came from this container");
+            let extent = container.extent_dyn(&name).expect("name came from this container");
             let segment_len = crate::readat::ReadAt::len(&extent)?;
             let tail = fold_tail.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1114,7 +1101,7 @@ fn open_fold_from_container(
             let reader: Arc<dyn crate::readat::ReadAt> = if number == tail.seg {
                 Arc::new(crate::readat::Slice::new(extent, 0, u64::from(tail.off)))
             } else {
-                Arc::new(extent)
+                extent
             };
             segs.push(crate::fold::SegmentInput {
                 seg: number,
@@ -1188,8 +1175,8 @@ fn open_read_container_with_limits_internal(
 /// Build the current read view entirely from one already-open container handle. Integrity and
 /// writer-preflight callers must never combine a directory/manifest from one inode with parts or a
 /// fold reopened from another path identity.
-fn open_read_container_handle(
-    container: &crate::container::Container,
+pub(crate) fn open_read_container_handle(
+    container: &dyn crate::container::ContainerView,
     cfg: FoldCfg,
     label: &Path,
     read_limits: ReadLimits,
@@ -1210,7 +1197,7 @@ fn open_read_container_handle(
             label.display(),
         );
     };
-    let names = container.names().map(String::from).collect::<Vec<_>>();
+    let names = container.member_names();
     validate_store_member_namespace(&names, has_manifest.then_some(&manifest), |name| {
         container.read_file_bounded(name, MAX_MANIFEST_BYTES)
     })?;
@@ -1220,7 +1207,7 @@ fn open_read_container_handle(
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     for p in &manifest.parts {
-        let ext = container.extent(&p.member).ok_or_else(|| {
+        let ext = container.extent_dyn(&p.member).ok_or_else(|| {
             anyhow::anyhow!(
                 "container manifest names {} but the container does not hold it",
                 p.member
@@ -1245,115 +1232,7 @@ pub fn open_read_container_source(
     let read_limits = read_limits.validate()?;
     let container =
         crate::container::ContainerReader::open_with_limits(source, label, read_limits)?;
-    let has_manifest = container.contains("MANIFEST");
-    let manifest = if has_manifest {
-        Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?
-    } else if container.committed_is_empty_birth() {
-        Manifest::default()
-    } else {
-        bail!("container {label} has no MANIFEST authority but is not the exact empty sequence-zero birth state")
-    };
-    let names = container.names().map(String::from).collect::<Vec<_>>();
-    validate_store_member_namespace(&names, has_manifest.then_some(&manifest), |name| {
-        container.read_file_bounded(name, MAX_MANIFEST_BYTES)
-    })?;
-    let fold_rel = if manifest.fold_gen == 0 {
-        "fold".to_string()
-    } else {
-        format!("fold-{:04}", manifest.fold_gen)
-    };
-    let fold_tail = manifest.fold_tail();
-    let mut segs = Vec::new();
-    let mut present_segments = HashSet::new();
-    let mut dict_files = Vec::new();
-    let mut sidecars = HashSet::new();
-    for name in names {
-        let Some(rest) = name.strip_prefix(&format!("{fold_rel}/")) else { continue };
-        if let Some(number) = crate::fold::segment::parse_seg_name(rest) {
-            present_segments.insert(number);
-            let extent = container.extent(&name).expect("name came from this directory");
-            let segment_len = crate::readat::ReadAt::len(&extent)?;
-            let tail = fold_tail.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "container has fold segment {number} but its manifest declares no fold tail"
-                )
-            })?;
-            if number > tail.seg {
-                bail!(
-                    "container has fold segment {number} beyond manifest tail segment {}",
-                    tail.seg
-                );
-            }
-            if number == tail.seg && segment_len != u64::from(tail.off) {
-                bail!(
-                    "manifest fold tail is segment {}, offset {}, but that member is {segment_len} bytes",
-                    tail.seg,
-                    tail.off
-                );
-            }
-            let reader: Arc<dyn crate::readat::ReadAt> = if number == tail.seg {
-                Arc::new(crate::readat::Slice::new(extent, 0, u64::from(tail.off)))
-            } else {
-                Arc::new(extent)
-            };
-            segs.push(crate::fold::SegmentInput {
-                seg: number,
-                reader,
-                sidecar: container_reader_sidecar_bytes(
-                    &container,
-                    &format!("{fold_rel}/seg-{number:08}.dir"),
-                    segment_len,
-                    read_limits,
-                )?,
-            });
-        } else if let Some(number) = fold_sidecar_member(rest) {
-            // Opened alongside its exact segment name above; advisory absence is allowed.
-            sidecars.insert(number);
-        } else if valid_fold_dictionary_member(rest) {
-            let bytes = container.read_file_bounded(&name, crate::fold::MAX_DICTIONARY_BYTES)?;
-            let exact = format!("zdict-{}.zd", PieceHash::of(&bytes).to_hex());
-            if rest != exact {
-                bail!("fold dictionary member {name:?} does not match its content identity");
-            }
-            dict_files.push(bytes);
-        } else {
-            bail!("container member {name:?} is not in the current fold namespace");
-        }
-    }
-    if let Some(orphan) = sidecars.iter().find(|number| !segs.iter().any(|seg| seg.seg == **number))
-    {
-        bail!("fold sidecar seg-{orphan:08}.dir has no corresponding segment");
-    }
-    if let Some(tail) = fold_tail {
-        if !present_segments.contains(&tail.seg) {
-            bail!("manifest fold tail names absent segment {}", tail.seg);
-        }
-    }
-    let fold = Fold::open_read_from_with_limits(
-        segs,
-        dict_files,
-        cfg,
-        Path::new(label),
-        &manifest.punched,
-        read_limits,
-    )?;
-    let pcache = SectionCache::shared();
-    let mut parts = Vec::with_capacity(manifest.parts.len());
-    for part in &manifest.parts {
-        let extent = container.extent(&part.member).ok_or_else(|| {
-            anyhow::anyhow!(
-                "container manifest names {} but the container does not hold it",
-                part.member
-            )
-        })?;
-        parts.push(Arc::new(open_manifest_part(
-            Box::new(extent),
-            part,
-            pcache.clone(),
-            read_limits,
-        )?));
-    }
-    Ok(ReadStore { fold: Arc::new(fold), parts, manifest, read_limits })
+    open_read_container_handle(&container, cfg, Path::new(label), read_limits)
 }
 
 /// Prove the whole-value identities asserted by WAL replay before writer open mutates any store byte.
@@ -1551,8 +1430,8 @@ pub fn open_read_container_at_with_limits(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_retained_from_container(
-    c: &crate::container::Container,
+pub(crate) fn open_retained_from_container(
+    c: &dyn crate::container::ContainerView,
     path: &Path,
     cfg: FoldCfg,
     commit: u64,
@@ -1581,7 +1460,7 @@ fn open_retained_from_container(
         let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else { continue };
         if let Some(n) = crate::fold::segment::parse_seg_name(rest) {
             present_segments.insert(n);
-            let extent = c.extent(&name).expect("name came from this container");
+            let extent = c.extent_dyn(&name).expect("name came from this container");
             let full_len = crate::readat::ReadAt::len(&extent)?;
             let (reader, len, whole): (Arc<dyn crate::readat::ReadAt>, u64, bool) = match tail {
                 Some(t) if n > t.seg => continue,
@@ -1590,7 +1469,7 @@ fn open_retained_from_container(
                     u64::from(t.off),
                     u64::from(t.off) == full_len,
                 ),
-                _ => (Arc::new(extent), full_len, true),
+                _ => (extent, full_len, true),
             };
             segs.push(crate::fold::SegmentInput {
                 seg: n,
@@ -1638,7 +1517,7 @@ fn open_retained_from_container(
     let pcache = SectionCache::shared();
     let mut parts = Vec::with_capacity(manifest.parts.len());
     for p in &manifest.parts {
-        let ext = c.extent(&p.member).ok_or_else(|| {
+        let ext = c.extent_dyn(&p.member).ok_or_else(|| {
             anyhow::anyhow!(
                 "retained commit {commit} names {} but the container does not hold it",
                 p.member
@@ -1806,8 +1685,8 @@ fn verify_committed_store(
     })
 }
 
-fn verify_retained_piece_dictionaries(
-    container: &crate::container::Container,
+pub(crate) fn verify_retained_piece_dictionaries(
+    container: &dyn crate::container::ContainerView,
     path: &Path,
     cfg: FoldCfg,
     read_limits: ReadLimits,
@@ -1817,7 +1696,7 @@ fn verify_retained_piece_dictionaries(
         return Ok(0);
     }
     let current = Manifest::parse(&container.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?;
-    let names = container.names().map(String::from).collect::<Vec<_>>();
+    let names = container.member_names();
     let mut verified_pieces = 0usize;
     for commit in container_retained_commits(container) {
         control.check("piece dictionary verification")?;
@@ -1949,8 +1828,8 @@ fn backup_container_copy(
 
 /// [`verify_chain`] over a single-file store's members: the same walk and claims, with no
 /// filesystem namespace between the evidence and the check.
-fn verify_chain_container(
-    c: &crate::container::Container,
+pub(crate) fn verify_chain_container(
+    c: &dyn crate::container::ContainerView,
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
 ) -> Result<ChainReport> {
@@ -1961,13 +1840,13 @@ fn verify_chain_container(
 /// every retained revision's name, parse, adjacency, `prev` link, cursor and tail order, generation,
 /// equality between current and newest retained bytes, and the presence of every named part; it
 /// reads no part bytes, so its cost is proportional to the retained manifests alone.
-fn verify_chain_container_scoped(
-    c: &crate::container::Container,
+pub(crate) fn verify_chain_container_scoped(
+    c: &dyn crate::container::ContainerView,
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
     check_parts: bool,
 ) -> Result<ChainReport> {
-    let names = c.names().map(String::from).collect::<Vec<_>>();
+    let names = c.member_names();
     let current = if c.contains("MANIFEST") {
         Some(Manifest::parse(&c.read_file_bounded("MANIFEST", MAX_MANIFEST_BYTES)?)?)
     } else {
@@ -1979,12 +1858,12 @@ fn verify_chain_container_scoped(
     let mut report = ChainReport::default();
     let part_cache = SectionCache::shared();
     let mut verified_parts = HashSet::new();
-    for name in c.names().filter(|name| name.starts_with("MANIFEST.")) {
+    for name in names.iter().filter(|name| name.starts_with("MANIFEST.")) {
         let rest = &name["MANIFEST.".len()..];
         let commit = rest
             .parse::<u64>()
             .with_context(|| format!("retained manifest member {name:?} has no commit number"))?;
-        if name != format!("MANIFEST.{commit:08}") {
+        if *name != format!("MANIFEST.{commit:08}") {
             bail!("retained manifest member {name:?} is not in canonical commit form");
         }
     }
@@ -2068,13 +1947,13 @@ fn verify_chain_container_scoped(
             }
             {
                 let want = &p.b3;
-                let reader = c.extent(&p.member).ok_or_else(|| {
+                let reader = c.extent_dyn(&p.member).ok_or_else(|| {
                     anyhow::anyhow!(
                         "part {} named by commit {commit} is not held by the container",
                         p.member
                     )
                 })?;
-                let got = hash_reader_with_control(&reader, control, "manifest verification")
+                let got = hash_reader_with_control(&*reader, control, "manifest verification")
                     .with_context(|| format!("part {} named by commit {commit}", p.member))?
                     .to_hex()
                     .to_string();
@@ -2084,7 +1963,7 @@ fn verify_chain_container_scoped(
                 report.part_digests += 1;
             }
             if verified_parts.insert(p.member.clone()) {
-                let reader = c.extent(&p.member).expect("part presence proved while hashing");
+                let reader = c.extent_dyn(&p.member).expect("part presence proved while hashing");
                 let part = open_manifest_part(Box::new(reader), p, part_cache.clone(), read_limits)
                     .with_context(|| {
                         format!("open part {} named by retained manifest {commit}", p.member)
@@ -2126,13 +2005,13 @@ fn verify_chain_container_scoped(
             }
             {
                 let want = &part.b3;
-                let reader = c.extent(&part.member).ok_or_else(|| {
+                let reader = c.extent_dyn(&part.member).ok_or_else(|| {
                     anyhow::anyhow!(
                         "part {} named by the current manifest revision is not held by the container",
                         part.member
                     )
                 })?;
-                let got = hash_reader_with_control(&reader, control, "manifest verification")?
+                let got = hash_reader_with_control(&*reader, control, "manifest verification")?
                     .to_hex()
                     .to_string();
                 if *want != got {
@@ -2144,7 +2023,8 @@ fn verify_chain_container_scoped(
                 report.part_digests += 1;
             }
             if verified_parts.insert(part.member.clone()) {
-                let reader = c.extent(&part.member).expect("part presence proved while hashing");
+                let reader =
+                    c.extent_dyn(&part.member).expect("part presence proved while hashing");
                 let opened =
                     open_manifest_part(Box::new(reader), part, part_cache.clone(), read_limits)
                         .with_context(|| {
@@ -2214,7 +2094,7 @@ pub(crate) fn verify_container_artifact(
     Ok((members, member_bytes, commit, report))
 }
 
-fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
+pub(crate) fn verification_integrity<T>(context: &'static str, result: Result<T>) -> Result<T> {
     result.map_err(|error| {
         if crate::error::classify(&error) == crate::error::ErrorClass::Internal {
             crate::error::IntegrityError::new(context, error).into()
@@ -2963,9 +2843,10 @@ pub fn restore_file_with_control_and_limits(
 
 /// Retained commit numbers held as `MANIFEST.NNNNNNNN` members, parsed numerically exactly as
 /// their file forms are, ascending.
-fn container_retained_commits(c: &crate::container::Container) -> Vec<u64> {
+pub(crate) fn container_retained_commits(c: &dyn crate::container::ContainerView) -> Vec<u64> {
     let mut commits: Vec<u64> = c
-        .names()
+        .member_names()
+        .iter()
         .filter_map(|name| name.strip_prefix("MANIFEST."))
         .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|rest| rest.parse::<u64>().ok())
@@ -2996,7 +2877,7 @@ fn fold_generation_of_member(name: &str) -> Option<u32> {
 /// punch. Their frame-level validation remains mandatory; only the redundant whole-member CRC is
 /// inapplicable after an authorized payload has been deallocated or partially deallocated.
 pub(crate) fn verified_punched_fold_members(
-    container: &crate::container::Container,
+    container: &dyn crate::container::ContainerView,
     cfg: FoldCfg,
     read_limits: ReadLimits,
     control: &crate::control::OperationControl,
@@ -3008,7 +2889,7 @@ pub(crate) fn verified_punched_fold_members(
     if manifest.punched.is_empty() {
         return Ok(HashSet::new());
     }
-    let fold = open_fold_from_container(container, &manifest, cfg, container.path(), read_limits)?;
+    let fold = open_fold_from_container(container, &manifest, cfg, container.label(), read_limits)?;
     fold.scrub_with_control(control)?;
     let prefix = crate::fold::fold_member_prefix(manifest.fold_gen);
     let punched =
@@ -5503,7 +5384,7 @@ impl Store {
             // The purge, staged into the SAME commit: every retained manifest except this
             // commit's own goes, because a retained name would keep the superseded generation —
             // deleted content included — readable for MANIFEST_RETAIN more commits.
-            for commit in container_retained_commits(&c) {
+            for commit in container_retained_commits(&*c) {
                 if commit != m.commit {
                     c.remove(&format!("MANIFEST.{commit:08}"))?;
                 }
