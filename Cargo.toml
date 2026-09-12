@@ -98,7 +98,7 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "wasi")'.dependencies]
 # Positioned reads via the preview1 syscalls. `std::os::wasi::fs::FileExt` would do the same thing
 # but is still unstable (`wasi_ext`), and an engine that builds only on nightly is not shippable.
-wasi = "0.11"
+wasi = "0.14"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The same zstd format, implemented in Rust, because the C one needs a C toolchain that a wasm
