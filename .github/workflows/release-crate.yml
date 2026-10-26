@@ -114,7 +114,7 @@ jobs:
           test "$(git describe --tags --exact-match HEAD)" = "$RELEASE_REF"
           test "$(git cat-file -t "$RELEASE_REF")" = tag
       - name: mint a short-lived crates.io token
-        uses: rust-lang/crates-io-auth-action@v1.0.5
+        uses: rust-lang/crates-io-auth-action@v1.0.6
         id: auth
       - name: publish
         env:
